@@ -1,0 +1,19 @@
+.{
+    .name = .mlx_zig,
+    .version = "0.3.0",
+    .fingerprint = 0x6c784013e41268f7,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .zig_regex = .{
+            .url = "https://github.com/zig-utils/zig-regex/archive/49fae00540d26fd3e7bdeda70864021c90d3e38f.tar.gz",
+            .hash = "zig_regex-0.1.1-omky0bjpBgCGUfsM_BacZnvhSz__1KxvI8gTJ8EFFkXl",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+        "LICENSE",
+    },
+}

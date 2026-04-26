@@ -1,0 +1,76 @@
+mlx version: 0.31.1
+Running scaled_dot_product_attention behavior tests...
+
+=== no_mask ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== causal_mask ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== invalid_mask_mode ===
+  EXCEPTION: ValueError: [scaled_dot_product_attention] invalid mask option 'invalid_mode_xyz'. Must be 'causal', or an array.
+  Traceback (most recent call last):
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 22, in run_case
+      result = fn()
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 61, in test_invalid_mask_mode
+      out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="invalid_mode_xyz")
+  ValueError: [scaled_dot_product_attention] invalid mask option 'invalid_mode_xyz'. Must be 'causal', or an array.
+  
+
+=== empty_string_mask_mode ===
+  EXCEPTION: ValueError: [scaled_dot_product_attention] invalid mask option ''. Must be 'causal', or an array.
+  Traceback (most recent call last):
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 22, in run_case
+      result = fn()
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 71, in test_empty_string_mask_mode
+      out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="")
+  ValueError: [scaled_dot_product_attention] invalid mask option ''. Must be 'causal', or an array.
+  
+
+=== bool_mask_array ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== additive_mask_array ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== grouped_query_attention ===
+  result shape: (2, 8, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== multi_query_attention ===
+  result shape: (2, 8, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== mismatched_qk_lengths ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== incompatible_mask_shape ===
+  EXCEPTION: ValueError: [broadcast_shapes] Shapes (2,4,8,9) and (2,4,8,8) cannot be broadcast.
+  Traceback (most recent call last):
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 22, in run_case
+      result = fn()
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 135, in test_incompatible_mask_shape
+      out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+  ValueError: [broadcast_shapes] Shapes (2,4,8,9) and (2,4,8,8) cannot be broadcast.
+  
+
+=== sinks_none ===
+  result shape: (2, 4, 8, 16), dtype: mlx.core.float32
+  OK (evaluated)
+
+=== sinks_array ===
+  EXCEPTION: ValueError: [scaled_dot_product_attention] Received invalid shape for sinks (2).
+  Traceback (most recent call last):
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 22, in run_case
+      result = fn()
+    File "/Users/zouyee/work/code/mlx-zig/tests/golden/test_sdpa.py", line 156, in test_sinks_array
+      out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask="causal", sinks=sinks)
+  ValueError: [scaled_dot_product_attention] Received invalid shape for sinks (2).
+  
+
+=== All tests completed ===

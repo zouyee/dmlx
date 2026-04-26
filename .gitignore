@@ -1,0 +1,41 @@
+# Zig build artifacts
+zig-out/
+.zig-cache/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model files
+*.safetensors
+*.gguf
+*.npy
+*.npz
+
+# Metal compiled libraries
+*.metallib
+
+# Compiled objects
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+
+# Debug
+*.pdb
+*.dSYM/
+
+# Misc
+out.txt
+.sisyphus.json
+.sisyphus/
