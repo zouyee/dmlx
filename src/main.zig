@@ -868,6 +868,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     std.log.info("Starting generation...", .{});
+    std.log.info("Prompt text: '{s}'", .{prompt_text});
+    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
     const all_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
     defer allocator.free(all_tokens);
 

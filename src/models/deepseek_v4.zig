@@ -2660,6 +2660,42 @@ pub const DSV4Model = struct {
             const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
+            // Diagnostic: show logits stats for first token
+            {
+                const logits_data = try f32_logits.dataSlice(f32);
+                var max_val: f32 = -std.math.inf(f32);
+                var min_val: f32 = std.math.inf(f32);
+                var max_idx: usize = 0;
+                var sum: f64 = 0;
+                var nan_count: usize = 0;
+                var inf_count: usize = 0;
+                for (logits_data, 0..) |v, idx| {
+                    if (std.math.isNan(v)) { nan_count += 1; continue; }
+                    if (std.math.isInf(v)) { inf_count += 1; continue; }
+                    sum += v;
+                    if (v > max_val) { max_val = v; max_idx = idx; }
+                    if (v < min_val) { min_val = v; }
+                }
+                const mean = sum / @as(f64, @floatFromInt(logits_data.len));
+                std.log.info("Logits: len={d} max={d:.4} min={d:.4} mean={d:.4} argmax={d} nan={d} inf={d}", .{
+                    logits_data.len, max_val, min_val, mean, max_idx, nan_count, inf_count,
+                });
+                // Show top-5 token IDs
+                var top5 = [_]struct { idx: usize, val: f32 }{ .{ .idx = 0, .val = -std.math.inf(f32) } } ** 5;
+                for (logits_data, 0..) |v, idx| {
+                    if (std.math.isNan(v) or std.math.isInf(v)) continue;
+                    for (&top5) |*t| {
+                        if (v > t.val) {
+                            t.* = .{ .idx = idx, .val = v };
+                            break;
+                        }
+                    }
+                }
+                std.log.info("Top tokens: [{d}]={d:.2} [{d}]={d:.2} [{d}]={d:.2}", .{
+                    top5[0].idx, top5[0].val, top5[1].idx, top5[1].val, top5[2].idx, top5[2].val,
+                });
+            }
+
             const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
             tokens[current_len] = next_token;
             current_len += 1;
