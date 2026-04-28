@@ -12,6 +12,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const c = @import("c.zig");
 const memory = @import("memory.zig");
+const safetensors_reader = @import("io/safetensors_reader.zig");
 const quantize_mod = @import("quantize.zig");
 
 const Array = root.Array;
@@ -744,6 +745,83 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     // 4. Build model
     var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
     defer model.deinit();
+
+    // 4b. Wire expert streaming when smelt is enabled (loads experts from SSD on demand)
+    var expert_sp: ?*root.expert_stream.ExpertStreamProvider = null;
+    var tensor_index: ?*safetensors_reader.TensorIndex = null;
+    defer if (expert_sp) |sp| { sp.deinit(); allocator.destroy(sp); };
+    defer if (tensor_index) |idx| { idx.deinit(); allocator.destroy(idx); };
+
+    if (cmd.smelt and !model.hasExpertsLoaded()) {
+        // Build tensor index for random-access reading
+        const idx = try allocator.create(safetensors_reader.TensorIndex);
+        idx.* = try safetensors_reader.buildIndexFromDirectory(allocator, cmd.model_path);
+        tensor_index = idx;
+
+        // Build per-layer metadata
+        const num_layers = ds_config.num_hidden_layers;
+        var layer_meta = try allocator.alloc(root.expert_stream.LayerExpertMeta, num_layers);
+        for (0..num_layers) |i| {
+            // Compute expert row bytes from tensor index
+            const gate_name = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.experts.gate_proj.weight", .{i});
+            // Try fused switch_mlp format first
+            const fused_gate_name = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.weight", .{i});
+            defer allocator.free(gate_name);
+
+            const actual_gate_name = if (idx.entries.contains(fused_gate_name)) fused_gate_name else gate_name;
+            _ = actual_gate_name;
+
+            // Use HF naming convention for switch_mlp
+            const hf_gate = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.gate_proj.weight", .{i});
+            const hf_up = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.up_proj.weight", .{i});
+            const hf_down = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.down_proj.weight", .{i});
+            const hf_gate_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.gate_proj.scales", .{i});
+            const hf_up_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.up_proj.scales", .{i});
+            const hf_down_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.down_proj.scales", .{i});
+
+            // Calculate row bytes from tensor info
+            var row_bytes: usize = 0;
+            var scale_row_bytes: usize = 0;
+            if (idx.entries.get(hf_gate)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+            if (idx.entries.get(hf_gate_s)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                scale_row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+
+            layer_meta[i] = .{
+                .gate_proj_name = hf_gate,
+                .up_proj_name = hf_up,
+                .down_proj_name = hf_down,
+                .gate_scales_name = if (idx.entries.contains(hf_gate_s)) hf_gate_s else blk: { allocator.free(hf_gate_s); break :blk null; },
+                .up_scales_name = if (idx.entries.contains(hf_up_s)) hf_up_s else blk: { allocator.free(hf_up_s); break :blk null; },
+                .down_scales_name = if (idx.entries.contains(hf_down_s)) hf_down_s else blk: { allocator.free(hf_down_s); break :blk null; },
+                .expert_row_bytes = row_bytes,
+                .expert_scale_row_bytes = scale_row_bytes,
+                .n_experts = ds_config.n_routed_experts,
+            };
+        }
+
+        const sp = try allocator.create(root.expert_stream.ExpertStreamProvider);
+        sp.* = .{
+            .allocator = allocator,
+            .index = idx,
+            .layer_meta = layer_meta,
+            .ctx = ctx,
+            .is_quantized = ds_config.quantize_default_bits > 0,
+            .quant_group_size = ds_config.quantize_default_group_size,
+            .quant_bits = if (ds_config.quantize_default_bits > 0) ds_config.quantize_default_bits else 4,
+            .quant_mode = ds_config.quantize_default_mode,
+            .swiglu_limit = ds_config.swiglu_limit,
+        };
+        expert_sp = sp;
+
+        // Wire stream provider into each MoE layer
+        model.setExpertStreamProvider(sp);
+        std.log.info("Expert streaming enabled: loading experts from SSD on demand", .{});
+    }
 
     // 5. Format prompt with chat template
     var chat_template = root.tokenizer.ChatTemplate.initDeepSeek(allocator);

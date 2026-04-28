@@ -176,7 +176,7 @@ pub const TensorIndex = struct {
 };
 
 /// Map safetensors dtype string to mlx-c dtype enum.
-fn dtypeFromString(s: []const u8) ?c.c.mlx_dtype {
+pub fn dtypeFromString(s: []const u8) ?c.c.mlx_dtype {
     if (std.mem.eql(u8, s, "F32")) return c.c.MLX_FLOAT32;
     if (std.mem.eql(u8, s, "F16")) return c.c.MLX_FLOAT16;
     if (std.mem.eql(u8, s, "BF16")) return c.c.MLX_BFLOAT16;

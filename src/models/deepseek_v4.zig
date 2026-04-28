@@ -21,6 +21,7 @@ const lora_mod = @import("../lora.zig");
 const fast_mod = @import("../ops/fast.zig");
 const array_arena_mod = @import("../array_arena.zig");
 const quantize_mod = @import("../quantize.zig");
+const expert_stream = @import("expert_stream.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -886,14 +887,20 @@ pub const DSV4MoE = struct {
     /// When smelt slices fused weights, maps original expert ID → sliced row index.
     /// null when all experts are loaded (no remapping needed).
     expert_remap: ?Array,
-    /// When true, switch_mlp experts are loaded. When false (aggressive smelt), only shared expert is used.
+    /// When true, switch_mlp experts are loaded. When false, uses stream_provider or shared-expert-only.
     experts_loaded: bool,
+    /// Expert streaming provider — loads expert weights from SSD on demand.
+    /// When set, forward uses streaming instead of pre-loaded fused weights.
+    stream_provider: ?*expert_stream.ExpertStreamProvider = null,
+    /// Layer index for streaming (each MoE layer needs to know its index).
+    layer_idx: usize = 0,
 
     pub fn deinit(self: *DSV4MoE) void {
         self.gate.deinit();
         if (self.experts_loaded) self.switch_mlp.deinit();
         self.shared_expert.deinit();
         if (self.expert_remap) |r| r.deinit();
+        // stream_provider is owned by the model, not individual MoE layers
     }
 
     pub fn forward(self: *DSV4MoE, hidden_states: Array, input_ids: Array, stream: c.c.mlx_stream) !Array {
@@ -910,26 +917,30 @@ pub const DSV4MoE = struct {
         const shared_out = try self.shared_expert.forward(flat, stream);
         defer shared_out.deinit();
 
-        if (!self.experts_loaded) {
-            // Aggressive smelt: only shared expert, skip routed experts entirely
-            return ops.reshape(self.ctx, shared_out, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(dim) });
-        }
-
         // Gate routing: returns (scores [N, topk], indices [N, topk])
         const weights_arr, const indices = try self.gate.forward(flat, input_ids, stream);
         defer weights_arr.deinit();
         defer indices.deinit();
 
-        // Remap expert indices if smelt sliced the fused weights
-        const remapped_indices = if (self.expert_remap) |remap| blk: {
-            var res = c.c.mlx_array_new();
-            try c.check(c.c.mlx_take(&res, remap.inner, indices.inner, self.ctx.stream.inner));
-            break :blk Array.fromHandle(res);
-        } else indices;
-        defer if (self.expert_remap != null) remapped_indices.deinit();
-
-        // Expert dispatch via fused gather_mm
-        const y = try self.switch_mlp.forward(flat, remapped_indices, weights_arr, stream);
+        // Expert dispatch — choose path based on available resources
+        const y = if (self.stream_provider) |sp| blk: {
+            // Streaming path: load expert weights from SSD on demand
+            break :blk try sp.streamForward(self.layer_idx, flat, indices, weights_arr);
+        } else if (self.experts_loaded) blk: {
+            // Pre-loaded path: use fused weights in memory
+            const remapped_indices = if (self.expert_remap) |remap| blk2: {
+                var res = c.c.mlx_array_new();
+                try c.check(c.c.mlx_take(&res, remap.inner, indices.inner, self.ctx.stream.inner));
+                break :blk2 Array.fromHandle(res);
+            } else indices;
+            defer if (self.expert_remap != null) remapped_indices.deinit();
+            break :blk try self.switch_mlp.forward(flat, remapped_indices, weights_arr, stream);
+        } else blk: {
+            // No experts available — return zeros (shared expert only)
+            var zeros_raw = c.c.mlx_array_new();
+            try c.check(c.c.mlx_zeros_like(&zeros_raw, shared_out.inner, self.ctx.stream.inner));
+            break :blk Array.fromHandle(zeros_raw);
+        };
         defer y.deinit();
 
         // Add shared expert
@@ -2555,6 +2566,22 @@ pub const DSV4Model = struct {
             hh.deinit();
         }
         self.lm_head.deinit();
+    }
+
+    /// Check if any layer has expert weights loaded in memory.
+    pub fn hasExpertsLoaded(self: *DSV4Model) bool {
+        for (self.layers) |*layer| {
+            if (layer.ffn.experts_loaded) return true;
+        }
+        return false;
+    }
+
+    /// Set expert stream provider on all MoE layers.
+    pub fn setExpertStreamProvider(self: *DSV4Model, sp: *expert_stream.ExpertStreamProvider) void {
+        for (self.layers, 0..) |*layer, i| {
+            layer.ffn.stream_provider = sp;
+            layer.ffn.layer_idx = i;
+        }
     }
 
     pub fn forward(
