@@ -68,9 +68,16 @@ pub const Array = struct {
         _ = c.c.mlx_array_free(self.inner);
     }
 
-    /// Evaluate the array (for lazy arrays).
+    /// Evaluate the array (handles cross-device scheduling).
     pub fn eval(self: Array) !void {
-        return c.check(c.c.mlx_array_eval(self.inner));
+        // Use mlx_eval (vector version) which handles cross-device scheduling
+        // (e.g., Load primitives on CPU, compute on GPU).
+        // mlx_array_eval only evaluates on the array's stream which may fail
+        // for Load primitives on GPU stream.
+        const vec = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(vec);
+        try c.check(c.c.mlx_vector_array_append_data(vec, &self.inner, 1));
+        try c.check(c.c.mlx_eval(vec));
     }
 
     // === Properties ===

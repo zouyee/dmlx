@@ -86,16 +86,20 @@ pub fn loadFromSafetensorsPaths(
     }
 
     // Construct model (with quantized weight detection)
-    return try buildModel(allocator, config, &weights, ctx, stream);
+    const eagle_path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(paths[0]) orelse ".", "eagle_draft_head.safetensors" });
+    defer allocator.free(eagle_path);
+    return try buildModel(allocator, config, &weights, ctx, stream, eagle_path);
 }
 
 /// Construct LlamaModel from a map of internal-name -> Array.
+/// `eagle_path` is an optional path to EAGLE draft head safetensors.
 pub fn buildModel(
     allocator: std.mem.Allocator,
     config: *const LlamaConfig,
     weights: *std.StringHashMap(Array),
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    eagle_path: ?[]const u8,
 ) !LlamaModel {
     const num_layers = config.num_hidden_layers;
     const hidden_size = config.hidden_size;
@@ -176,6 +180,51 @@ pub fn buildModel(
         std.log.warn("Unused weight: {s}", .{entry.key_ptr.*});
     }
 
+    // === EAGLE Draft Head (optional) ===
+    var eagle_drafter: ?@import("../speculative.zig").EagleDrafter = null;
+    if (eagle_path) |ep| {
+        var eagle_loaded = false;
+        var eagle_st = blk: {
+            const st = io.loadSafetensors(allocator, ep) catch |err| {
+                std.log.warn("EAGLE draft head not found at {s}: {}, skipping", .{ ep, err });
+                break :blk null;
+            };
+            eagle_loaded = true;
+            break :blk st;
+        };
+        if (eagle_loaded) {
+            defer {
+                var w_it = eagle_st.?.weights.iterator();
+                while (w_it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    entry.value_ptr.*.deinit();
+                }
+                eagle_st.?.weights.deinit();
+                var m_it = eagle_st.?.metadata.iterator();
+                while (m_it.next()) |entry| {
+                    allocator.free(entry.key_ptr.*);
+                    allocator.free(entry.value_ptr.*);
+                }
+                eagle_st.?.metadata.deinit();
+            }
+
+            var ed = @import("../speculative.zig").EagleDrafter.init(hidden_size, vocab_size);
+            if (eagle_st.?.weights.get("weight")) |w| {
+                const bias = eagle_st.?.weights.get("bias");
+                // Copy arrays so the drafter owns them independently
+                var w_copy = c.c.mlx_array_new();
+                _ = c.c.mlx_array_set(&w_copy, w.inner);
+                const bias_copy = if (bias) |b| blk: {
+                    var bc = c.c.mlx_array_new();
+                    _ = c.c.mlx_array_set(&bc, b.inner);
+                    break :blk Array.fromHandle(bc);
+                } else null;
+                ed.loadWeights(Array.fromHandle(w_copy), bias_copy);
+                eagle_drafter = ed;
+            }
+        }
+    }
+
     return LlamaModel{
         .allocator = allocator,
         .ctx = ctx,
@@ -187,6 +236,7 @@ pub fn buildModel(
         .lm_head_quant = lm_head_quant,
         .lm_head_tied = lm_head_tied,
         .lora = null,
+        .eagle_drafter = eagle_drafter,
     };
 }
 

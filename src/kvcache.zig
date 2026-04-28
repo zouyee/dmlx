@@ -65,6 +65,11 @@ pub const TurboQuantState = turboquant.TurboQuantState;
 pub const TurboQuantConfig = turboquant.TurboQuantConfig;
 pub const TurboQuantCodebook = turboquant.Codebook;
 
+pub const dsv4_cache = @import("kvcache/deepseek_v4_cache.zig");
+pub const DeepseekV4Cache = dsv4_cache.DeepseekV4Cache;
+pub const BranchState = dsv4_cache.BranchState;
+pub const createDeepseekV4Cache = dsv4_cache.createDeepseekV4Cache;
+
 // Convenience factory re-exports
 pub const createStandard = standard.createStandard;
 pub const createRotating = rotating.createRotating;

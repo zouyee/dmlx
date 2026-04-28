@@ -44,7 +44,6 @@
 ///   5. Each rank holds a full copy of embeddings and layer norms
 ///
 /// This minimizes communication while distributing the compute-heavy operations.
-///
 const std = @import("std");
 const c = @import("c.zig");
 const array_mod = @import("array.zig");
@@ -62,28 +61,28 @@ pub const DistributedGroup = struct {
     /// If `strict` is true, returns an error if initialization fails.
     /// If `strict` is false, creates an uninitialized group (single-rank mode).
     pub fn init(strict: bool) !DistributedGroup {
-        var group = c.c.mlx_distributed_group_new();
-        const rc = c.c.mlx_distributed_init(&group, strict);
-        if (rc != 0 and strict) {
-            _ = c.c.mlx_distributed_group_free(group);
+        const group = c.c.mlx_distributed_init(strict, null);
+        const is_initialized = group.ctx != null;
+        if (!is_initialized and strict) {
             return error.DistributedInitFailed;
         }
         return .{
             .inner = group,
-            .initialized = rc == 0,
+            .initialized = is_initialized,
         };
     }
 
     /// Create a non-initialized group (for single-rank operation).
     pub fn initEmpty() DistributedGroup {
         return .{
-            .inner = c.c.mlx_distributed_group_new(),
+            .inner = .{ .ctx = null },
             .initialized = false,
         };
     }
 
     pub fn deinit(self: *DistributedGroup) void {
-        _ = c.c.mlx_distributed_group_free(self.inner);
+        _ = self;
+        // mlx_distributed_group has no explicit free in this mlx-c version
     }
 
     /// Check if the distributed runtime was successfully initialized.
@@ -189,6 +188,21 @@ pub fn recv(
 }
 
 // ------------------------------------------------------------------
+// Synchronization
+// ------------------------------------------------------------------
+
+/// Barrier: synchronize all ranks in the group.
+/// Uses a scalar all-reduce as a synchronization primitive.
+pub fn barrier(group: DistributedGroup, stream: c.c.mlx_stream) !void {
+    const scalar_data: f32 = 1.0;
+    const scalar_arr = c.c.mlx_array_new_data(&scalar_data, &[_]i32{1}, 1, c.c.MLX_FLOAT32);
+    defer _ = c.c.mlx_array_free(scalar_arr);
+    var res = c.c.mlx_array_new();
+    defer _ = c.c.mlx_array_free(res);
+    try c.check(c.c.mlx_distributed_all_sum(&res, scalar_arr, group.inner, stream));
+}
+
+// ------------------------------------------------------------------
 // Unit Tests
 // ------------------------------------------------------------------
 
@@ -196,4 +210,13 @@ test "DistributedGroup: initEmpty creates non-initialized group" {
     var group = DistributedGroup.initEmpty();
     defer group.deinit();
     try std.testing.expect(!group.isInitialized());
+}
+
+test "DistributedGroup: barrier with empty group is safe" {
+    var group = DistributedGroup.initEmpty();
+    defer group.deinit();
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+    // Barrier on empty group should be a no-op (scalar all-reduce with null group)
+    try barrier(group, stream);
 }

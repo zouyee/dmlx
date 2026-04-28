@@ -54,6 +54,7 @@ pub const TieredKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = null,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -290,6 +291,13 @@ pub const TieredKVCache = struct {
         self.cold_blocks.clearAndFree();
         self.access_recency.clearAndFree();
         self.access_counter = 0;
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *TieredKVCache = @ptrCast(@alignCast(ctx));
+        if (PagedKVCache.vtable.rollback) |f| {
+            f(self.hot, to_len);
+        }
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {

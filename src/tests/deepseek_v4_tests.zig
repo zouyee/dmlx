@@ -412,6 +412,7 @@ test "DSV4Model dummy build and forward+generate" {
         .num_key_value_heads = 1,
         .q_lora_rank = 4,
         .o_lora_rank = 4,
+        .o_groups = 1,
         .qk_rope_head_dim = 4,
         .max_position_embeddings = 128,
         .n_routed_experts = 2,
@@ -473,7 +474,7 @@ test "DSV4Model dummy build and forward+generate" {
     try W.put(&weights, allocator, "layers.0.attn_norm.weight", &[_]i32{16});
     try W.put(&weights, allocator, "layers.0.ffn_norm.weight", &[_]i32{16});
 
-    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner);
+    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner, .{});
     defer model.deinit();
 
     const input_ids = try Array.fromData(allocator, u32, &[_]u32{ 1, 2, 3 }, &[_]i32{ 1, 3 });
@@ -524,6 +525,7 @@ test "DSV4Model with MHC enabled" {
         .num_key_value_heads = 1,
         .q_lora_rank = 4,
         .o_lora_rank = 4,
+        .o_groups = 1,
         .qk_rope_head_dim = 4,
         .max_position_embeddings = 128,
         .n_routed_experts = 2,
@@ -593,7 +595,7 @@ test "DSV4Model with MHC enabled" {
     try W.put(&weights, allocator, "layers.0.hc_ffn_base", &[_]i32{8});
     try W.put(&weights, allocator, "layers.0.hc_ffn_scale", &[_]i32{3});
 
-    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner);
+    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner, .{});
     defer model.deinit();
 
     const input_ids = try Array.fromData(allocator, u32, &[_]u32{ 1, 2, 3 }, &[_]i32{ 1, 3 });

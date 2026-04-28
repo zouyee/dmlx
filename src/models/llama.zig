@@ -16,6 +16,7 @@ const tree_mod = @import("../tree.zig");
 const lora_mod = @import("../lora.zig");
 const array_arena_mod = @import("../array_arena.zig");
 const quantize_mod = @import("../quantize.zig");
+const distributed_mod = @import("../distributed.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -52,6 +53,10 @@ pub const LlamaConfig = struct {
     quantize_group_size: i32 = 64,
     /// EOS token ID from config.json (null if not specified)
     eos_token_id: ?u32 = null,
+    /// RoPE scaling config (Phi-4, LLaMA-3.1 long context)
+    rope_scaling_type: ?[]const u8 = null,
+    rope_scaling_factor: f32 = 1.0,
+    rope_scaling_original_max_position_embeddings: ?usize = null,
 
     /// Get the effective head dimension.
     pub fn getHeadDim(self: LlamaConfig) usize {
@@ -88,6 +93,12 @@ pub const LlamaAttention = struct {
     q_norm: ?nn.RMSNorm,
     k_norm: ?nn.RMSNorm,
     rope: nn.RoPE,
+    /// Optional distributed group for tensor parallelism.
+    distributed_group: ?@import("../distributed.zig").DistributedGroup = null,
+
+    pub fn setDistributedGroup(self: *LlamaAttention, group: ?@import("../distributed.zig").DistributedGroup) void {
+        self.distributed_group = group;
+    }
 
     pub fn deinit(self: *LlamaAttention, allocator: std.mem.Allocator) void {
         // Free quantized weights (owns data + scales + biases + original_shape).
@@ -172,9 +183,7 @@ pub const LlamaAttention = struct {
         defer v_t.deinit();
 
         // 4. Apply RoPE (with Q/K norm order depending on architecture)
-        // Qwen3: norm → RoPE (norm before RoPE)
-        // Qwen2: RoPE → norm (norm after RoPE)
-        // When q_norm/k_norm are present, apply them BEFORE RoPE (Qwen3 style)
+        // When q_norm/k_norm are present, apply them BEFORE RoPE (Qwen3/Qwen2 style)
         var q_pre_rope = q_t;
         var k_pre_rope = k_t;
         if (self.q_norm) |*qn| {
@@ -188,8 +197,10 @@ pub const LlamaAttention = struct {
         defer if (self.q_norm != null) q_pre_rope.deinit();
         defer if (self.k_norm != null) k_pre_rope.deinit();
 
-        var q_rot = try self.rope.apply(q_pre_rope);
-        var k_rot = try self.rope.apply(k_pre_rope);
+        // RoPE offset = number of tokens already in KV cache (for incremental decoding)
+        const rope_offset: i32 = if (cache) |kv_cache| @intCast(kv_cache.currentLen()) else 0;
+        var q_rot = try self.rope.applyWithOffset(q_pre_rope, rope_offset);
+        var k_rot = try self.rope.applyWithOffset(k_pre_rope, rope_offset);
         defer q_rot.deinit();
         defer k_rot.deinit();
 
@@ -265,6 +276,14 @@ pub const LlamaAttention = struct {
                 out = out_new;
             }
         }
+
+        // Tensor parallelism: all-reduce after attention output projection
+        if (self.distributed_group) |group| {
+            const reduced = try distributed_mod.allSum(out, group, self.ctx.stream.inner);
+            out.deinit();
+            out = reduced;
+        }
+
         return out;
     }
 };
@@ -309,6 +328,12 @@ pub const LlamaMLP = struct {
     gate_proj_quant: ?QuantizedWeight = null,
     up_proj_quant: ?QuantizedWeight = null,
     down_proj_quant: ?QuantizedWeight = null,
+    /// Optional distributed group for tensor parallelism.
+    distributed_group: ?distributed_mod.DistributedGroup = null,
+
+    pub fn setDistributedGroup(self: *LlamaMLP, group: ?distributed_mod.DistributedGroup) void {
+        self.distributed_group = group;
+    }
 
     pub fn deinit(self: *LlamaMLP, allocator: std.mem.Allocator) void {
         if (self.gate_proj_quant) |qw| { var m = qw; m.deinit(allocator); } else self.gate_proj.deinit();
@@ -381,6 +406,14 @@ pub const LlamaMLP = struct {
                 out = o_new;
             }
         }
+
+        // Tensor parallelism: all-reduce after MLP down projection
+        if (self.distributed_group) |group| {
+            const reduced = try distributed_mod.allSum(out, group, self.ctx.stream.inner);
+            out.deinit();
+            out = reduced;
+        }
+
         return out;
     }
 };
@@ -444,6 +477,10 @@ pub const LlamaModel = struct {
     lm_head_quant: ?QuantizedWeight,
     lm_head_tied: bool, // true when lm_head == embed_tokens.weight (don't double-free)
     lora: ?*lora_mod.LoRAModel,
+    /// Optional EAGLE draft head for speculative decoding.
+    eagle_drafter: ?@import("../speculative.zig").EagleDrafter = null,
+    /// Optional distributed group for tensor parallelism.
+    distributed_group: ?distributed_mod.DistributedGroup = null,
 
     pub fn deinit(self: *LlamaModel) void {
         self.embed_tokens.weight.deinit();
@@ -460,6 +497,18 @@ pub const LlamaModel = struct {
             } else {
                 self.lm_head.deinit();
             }
+        }
+        if (self.eagle_drafter) |*ed| {
+            ed.deinit();
+        }
+    }
+
+    /// Set distributed group for tensor parallelism on all layers.
+    pub fn setDistributedGroup(self: *LlamaModel, group: ?distributed_mod.DistributedGroup) void {
+        self.distributed_group = group;
+        for (self.layers) |*layer| {
+            layer.attention.setDistributedGroup(group);
+            layer.mlp.setDistributedGroup(group);
         }
     }
 
@@ -518,6 +567,47 @@ pub const LlamaModel = struct {
             }
         }
         return logits;
+    }
+
+    /// Forward pass that returns both logits and the last-layer hidden states.
+    /// Required for EAGLE speculative decoding.
+    pub fn forwardWithHidden(
+        self: *LlamaModel,
+        input_ids: Array,
+        mask: ?Array,
+        caches: ?[]kvcache.KVCacheStrategy,
+    ) !@import("../generation.zig").ForwardWithHiddenResult {
+        var arena = ScopedArrayArena.init(self.allocator);
+        defer arena.deinit();
+
+        // input_ids: [batch, seq_len]
+        var hidden = try arena.track(try self.embed_tokens.forward(input_ids));
+
+        for (self.layers, 0..) |*layer, i| {
+            const cache = if (caches) |cache_list| (if (i < cache_list.len) cache_list[i] else null) else null;
+            hidden = try arena.track(try layer.forward(hidden, mask, cache, self.lora));
+        }
+
+        const normed = try arena.track(try self.norm.forward(hidden));
+
+        // logits = normed @ lm_head^T
+        var logits = if (self.lm_head_quant) |qw|
+            try quantize_mod.quantizedMatmul(self.ctx, normed, qw, true)
+        else blk: {
+            const lm_head_t = try arena.track(try ops.transpose(self.ctx, self.lm_head));
+            break :blk try ops.matmul(self.ctx, normed, lm_head_t);
+        };
+        if (self.lora) |lm| {
+            if (lm.getAdapter("lm_head")) |adapter| {
+                const logits_new = try adapter.apply(logits, normed);
+                logits.deinit();
+                logits = logits_new;
+            }
+        }
+
+        // Copy normed hidden states since arena will be freed
+        const hidden_copy = try ops.copy(self.ctx, normed);
+        return .{ .logits = logits, .hidden = hidden_copy };
     }
 
     /// Generate tokens autoregressively.
@@ -583,7 +673,7 @@ pub const LlamaModel = struct {
 
             // Sample (update context for repetition penalty)
             sampler_config.context_tokens = tokens;
-            const next_token = try sampler_config.sample(logits_f32, self.allocator);
+            const next_token = (try sampler_config.sample(logits_f32, self.allocator)).token;
 
             // Check EOS stop condition
             if (options.eos_token_id) |eos_id| {

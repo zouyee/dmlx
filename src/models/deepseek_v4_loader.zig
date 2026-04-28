@@ -4,18 +4,199 @@
 /// - Single-file model.safetensors
 /// - Sharded model-00001-of-NNNNN.safetensors with index.json
 /// - Direct DeepSeek weight naming (no HF mapping needed)
+/// - mlx-community HF naming (model.* prefix, gate_proj/up_proj/down_proj)
 const std = @import("std");
 const c = @import("../c.zig");
 const array_mod = @import("../array.zig");
 const ops = @import("../ops.zig");
 const nn = @import("../ops/nn.zig");
 const io = @import("../io/mlx_io.zig");
+const safetensors_reader = @import("../io/safetensors_reader.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
+const quantize_mod = @import("../quantize.zig");
+const shape_mod = @import("../ops/shape.zig");
+const cmp_mod = @import("../ops/comparison.zig");
+const math_mod = @import("../ops/math.zig");
+const kvcache = @import("../kvcache.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const DSV4Config = deepseek_v4.DSV4Config;
 const DSV4Model = deepseek_v4.DSV4Model;
+
+/// Consume a weight key and its associated quantized metadata (.scales, .biases) from the HashMap.
+/// This prevents "Unused weight" warnings for quantized models where each weight has 3 keys.
+fn consumeWeightKey(allocator: std.mem.Allocator, weights: *std.StringHashMap(Array), base_name: []const u8) void {
+    // Try removing base_name itself (for keys like "attn.attn_sink", "attn.compressor.ape")
+    if (weights.fetchRemove(base_name)) |kv| allocator.free(kv.key);
+
+    // Try removing base_name.weight
+    const suffixes = [_][]const u8{ ".weight", ".scales", ".biases" };
+    for (suffixes) |suffix| {
+        // Build key: base_name + suffix
+        const key = std.fmt.allocPrint(allocator, "{s}{s}", .{ base_name, suffix }) catch continue;
+        defer allocator.free(key);
+        if (weights.fetchRemove(key)) |kv| allocator.free(kv.key);
+    }
+}
+
+/// Check if a HF weight name is an expert weight (switch_mlp or ffn.experts).
+fn isExpertWeight(name: []const u8) bool {
+    return std.mem.indexOf(u8, name, "switch_mlp") != null or
+        (std.mem.indexOf(u8, name, "ffn.experts.") != null and
+        std.mem.indexOf(u8, name, "shared_experts") == null);
+}
+
+/// Parse expert index from HF weight name.
+fn parseExpertIndexFromHF(name: []const u8) ?usize {
+    if (std.mem.indexOf(u8, name, "switch_mlp") != null) return null;
+    const prefix = "ffn.experts.";
+    const idx = std.mem.indexOf(u8, name, prefix) orelse return null;
+    const start = idx + prefix.len;
+    var end = start;
+    while (end < name.len and name[end] >= '0' and name[end] <= '9') end += 1;
+    if (end == start) return null;
+    return std.fmt.parseInt(usize, name[start..end], 10) catch null;
+}
+
+/// Dequantize a weight if it has associated .scales in the HashMap.
+/// Returns the dequantized weight (or original if not quantized).
+fn dequantIfNeeded(
+    allocator: std.mem.Allocator,
+    weights: *std.StringHashMap(Array),
+    base_name: []const u8,
+    weight: Array,
+    config: *const DSV4Config,
+    ctx: EagerContext,
+) !Array {
+    const scales_key = try std.fmt.allocPrint(allocator, "{s}.scales", .{base_name});
+    defer allocator.free(scales_key);
+    const scales = weights.get(scales_key) orelse {
+        std.log.warn("dequantIfNeeded: scales not found for {s} (key: {s})", .{ base_name, scales_key });
+        return weight;
+    };
+
+    const biases_key = try std.fmt.allocPrint(allocator, "{s}.biases", .{base_name});
+    defer allocator.free(biases_key);
+    const biases = weights.get(biases_key);
+
+    const null_array: c.c.mlx_array = .{ .ctx = null };
+    const biases_inner = if (biases) |b| b.inner else null_array;
+    const gs = config.quantize_default_group_size;
+    const bits_val: i32 = @intCast(if (config.quantize_default_bits > 0) config.quantize_default_bits else 4);
+    const opt_group: c.c.mlx_optional_int = .{ .value = gs, .has_value = true };
+    const opt_bits: c.c.mlx_optional_int = .{ .value = bits_val, .has_value = true };
+    const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_BFLOAT16, .has_value = true };
+
+    var res = c.c.mlx_array_new();
+    try c.check(c.c.mlx_dequantize(&res, weight.inner, scales.inner, biases_inner, opt_group, opt_bits, "affine", null_array, no_dtype, ctx.stream.inner));
+
+    if (weights.fetchRemove(scales_key)) |kv| allocator.free(kv.key);
+    if (weights.fetchRemove(biases_key)) |kv| allocator.free(kv.key);
+
+    return Array.fromHandle(res);
+}
+
+/// Map HF/mlx-lm weight names to our internal V4 naming convention.
+fn mapV4WeightName(allocator: std.mem.Allocator, hf_name: []const u8) !?[]const u8 {
+    // If it doesn't start with "model.", it's already internal format
+    if (!std.mem.startsWith(u8, hf_name, "model.")) {
+        // Handle lm_head → head mapping (lm_head is at top level, no model. prefix)
+        if (std.mem.startsWith(u8, hf_name, "lm_head.")) {
+            // lm_head.weight → head.weight, lm_head.scales → head.weight.scales, etc.
+            const suffix = hf_name["lm_head.".len..];
+            if (std.mem.eql(u8, suffix, "weight")) {
+                return try allocator.dupe(u8, "head.weight");
+            } else if (std.mem.eql(u8, suffix, "scales")) {
+                return try allocator.dupe(u8, "head.weight.scales");
+            } else if (std.mem.eql(u8, suffix, "biases")) {
+                return try allocator.dupe(u8, "head.weight.biases");
+            }
+        }
+        return null; // Already internal format
+    }
+
+    // Strip "model." prefix
+    const stripped = hf_name["model.".len..];
+
+    // embed_tokens → embed
+    if (std.mem.startsWith(u8, stripped, "embed_tokens.")) {
+        const suffix = stripped["embed_tokens.".len..];
+        if (std.mem.eql(u8, suffix, "weight")) {
+            return try allocator.dupe(u8, "embed.weight");
+        } else if (std.mem.eql(u8, suffix, "scales")) {
+            return try allocator.dupe(u8, "embed.weight.scales");
+        } else if (std.mem.eql(u8, suffix, "biases")) {
+            return try allocator.dupe(u8, "embed.weight.biases");
+        }
+        return try allocator.dupe(u8, stripped);
+    }
+
+    // norm.weight → norm.weight (just strip model. prefix)
+    if (std.mem.eql(u8, stripped, "norm.weight")) {
+        return try allocator.dupe(u8, "norm.weight");
+    }
+
+    // hc_head.* → hc_head.* (just strip model. prefix)
+    if (std.mem.startsWith(u8, stripped, "hc_head.")) {
+        return try allocator.dupe(u8, stripped);
+    }
+
+    // layers.N.* — need to map component names
+    if (std.mem.startsWith(u8, stripped, "layers.")) {
+        return try mapV4LayerWeight(allocator, stripped);
+    }
+
+    // Default: just strip model. prefix
+    return try allocator.dupe(u8, stripped);
+}
+
+/// Map layer-level weight names.
+/// Input: "layers.N.component.subcomponent..."
+/// Handles MLP name mapping (gate_proj→w1, up_proj→w3, down_proj→w2)
+/// and e_score_correction_bias → gate.bias
+fn mapV4LayerWeight(allocator: std.mem.Allocator, name: []const u8) ![]const u8 {
+    // Replace gate_proj→w1, up_proj→w3, down_proj→w2 in shared_experts and switch_mlp
+    var result = try allocator.dupe(u8, name);
+    errdefer allocator.free(result);
+
+    // Check for MLP name patterns and replace
+    const replacements = [_]struct { from: []const u8, to: []const u8 }{
+        .{ .from = "shared_experts.gate_proj.", .to = "shared_experts.w1." },
+        .{ .from = "shared_experts.up_proj.", .to = "shared_experts.w3." },
+        .{ .from = "shared_experts.down_proj.", .to = "shared_experts.w2." },
+        .{ .from = "shared_experts.gate_proj", .to = "shared_experts.w1" },
+        .{ .from = "shared_experts.up_proj", .to = "shared_experts.w3" },
+        .{ .from = "shared_experts.down_proj", .to = "shared_experts.w2" },
+        .{ .from = "switch_mlp.gate_proj.", .to = "switch_mlp.w1." },
+        .{ .from = "switch_mlp.up_proj.", .to = "switch_mlp.w3." },
+        .{ .from = "switch_mlp.down_proj.", .to = "switch_mlp.w2." },
+        .{ .from = "switch_mlp.gate_proj", .to = "switch_mlp.w1" },
+        .{ .from = "switch_mlp.up_proj", .to = "switch_mlp.w3" },
+        .{ .from = "switch_mlp.down_proj", .to = "switch_mlp.w2" },
+        .{ .from = "ffn.gate.e_score_correction_bias", .to = "ffn.gate.bias" },
+        .{ .from = "attn_hc.fn", .to = "hc_attn_fn" },
+        .{ .from = "attn_hc.base", .to = "hc_attn_base" },
+        .{ .from = "attn_hc.scale", .to = "hc_attn_scale" },
+        .{ .from = "ffn_hc.fn", .to = "hc_ffn_fn" },
+        .{ .from = "ffn_hc.base", .to = "hc_ffn_base" },
+        .{ .from = "ffn_hc.scale", .to = "hc_ffn_scale" },
+    };
+
+    for (replacements) |r| {
+        if (std.mem.indexOf(u8, result, r.from)) |idx| {
+            const new_len = result.len - r.from.len + r.to.len;
+            const new_result = try allocator.alloc(u8, new_len);
+            @memcpy(new_result[0..idx], result[0..idx]);
+            @memcpy(new_result[idx .. idx + r.to.len], r.to);
+            @memcpy(new_result[idx + r.to.len ..], result[idx + r.from.len ..]);
+            allocator.free(result);
+            return new_result;
+        }
+    }
+
+    return result;
+}
 
 /// Error set for loading.
 pub const LoadError = error{
@@ -24,6 +205,48 @@ pub const LoadError = error{
     MissingWeight,
     InvalidConfig,
     UnsupportedArchitecture,
+};
+
+/// Smelt Mode configuration for partial expert loading.
+/// When enabled, only a subset of experts are loaded into memory.
+/// The router is biased to avoid selecting unloaded experts.
+pub const SmeltConfig = struct {
+    pub const Strategy = enum { uniform, first };
+
+    /// Enable Smelt mode
+    enabled: bool = false,
+    /// Fraction of experts to load per layer (0.0-1.0).
+    /// e.g., 0.5 means load 50% of routed experts.
+    load_fraction: f32 = 1.0,
+    /// Strategy for selecting which experts to load.
+    /// "uniform": evenly spaced across expert indices.
+    /// "first": load the first N experts.
+    strategy: Strategy = .uniform,
+
+    /// Build a per-expert residency mask for the given number of experts.
+    /// Caller owns the returned slice and must free with allocator.
+    pub fn buildMask(self: SmeltConfig, allocator: std.mem.Allocator, n_experts: usize) ![]bool {
+        var mask = try allocator.alloc(bool, n_experts);
+        @memset(mask, false);
+        if (!self.enabled or self.load_fraction >= 1.0) {
+            @memset(mask, true);
+            return mask;
+        }
+        const n_load = @max(1, @as(usize, @intFromFloat(@round(self.load_fraction * @as(f32, @floatFromInt(n_experts))))));
+        switch (self.strategy) {
+            .first => {
+                for (0..n_load) |i| mask[i] = true;
+            },
+            .uniform => {
+                const step = @as(f32, @floatFromInt(n_experts - 1)) / @as(f32, @floatFromInt(n_load - 1));
+                for (0..n_load) |i| {
+                    const idx = @min(n_experts - 1, @as(usize, @intFromFloat(@round(step * @as(f32, @floatFromInt(i))))));
+                    mask[idx] = true;
+                }
+            },
+        }
+        return mask;
+    }
 };
 
 /// Parse DeepSeek-V4 config.json into DSV4Config.
@@ -79,6 +302,31 @@ pub fn parseDSV4Config(allocator: std.mem.Allocator, json_text: []const u8) !DSV
         }
     }
 
+    // Auto-fill compress_ratios if missing or empty, matching mlx-lm default:
+    // [0, 128, 4, 128, 4, ...] (first and last layer = 0, alternating 128/4 in between)
+    const n_layers: usize = @intCast(getInt(obj, "num_hidden_layers") orelse 43);
+    if (compress_ratios.items.len == 0) {
+        try compress_ratios.append(allocator, 0);
+        const middle_layers = if (n_layers >= 2) n_layers - 2 else 0;
+        var i: usize = 0;
+        while (i < middle_layers) : (i += 1) {
+            // i=0 -> 128, i=1 -> 4, i=2 -> 128, ...
+            const ratio: usize = if (i % 2 == 0) 128 else 4;
+            try compress_ratios.append(allocator, ratio);
+        }
+        if (n_layers >= 2) {
+            try compress_ratios.append(allocator, 0);
+        }
+    }
+
+    // Validate: truncate/pad to exactly num_hidden_layers
+    if (compress_ratios.items.len > n_layers) {
+        compress_ratios.shrinkRetainingCapacity(n_layers);
+    }
+    while (compress_ratios.items.len < n_layers) {
+        try compress_ratios.append(allocator, 0);
+    }
+
     // Parse rope_scaling
     var rope_scaling: ?DSV4Config.YarnRoPEConfig = null;
     if (obj.get("rope_scaling")) |rs| {
@@ -111,6 +359,7 @@ pub fn parseDSV4Config(allocator: std.mem.Allocator, json_text: []const u8) !DSV
         .num_key_value_heads = @intCast(getInt(obj, "num_key_value_heads") orelse 1),
         .q_lora_rank = @intCast(getInt(obj, "q_lora_rank") orelse 1024),
         .o_lora_rank = @intCast(getInt(obj, "o_lora_rank") orelse 1024),
+        .o_groups = @intCast(getInt(obj, "o_groups") orelse 8),
         .qk_rope_head_dim = @intCast(getInt(obj, "qk_rope_head_dim") orelse 64),
         .max_position_embeddings = @intCast(getInt(obj, "max_position_embeddings") orelse 1048576),
         .n_routed_experts = @intCast(getInt(obj, "n_routed_experts") orelse 256),
@@ -175,14 +424,111 @@ pub fn loadDSV4Config(allocator: std.mem.Allocator, io_ctx: std.Io, dir_path: []
     return parseDSV4Config(allocator, content);
 }
 
+/// Load strategy for weight loading.
+pub const LoadStrategy = enum { eager, selective };
+
+/// Load weights using selective strategy — returns a lazy provider that loads tensors on-demand.
+/// Only reads safetensors headers (~few KB per shard). Actual tensor data is loaded
+/// from disk only when buildDSV4Model accesses each weight.
+pub fn loadWeightsSelectiveLazy(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) !struct { index: *safetensors_reader.TensorIndex, provider: *safetensors_reader.LazyWeightProvider } {
+    const index = try allocator.create(safetensors_reader.TensorIndex);
+    index.* = try safetensors_reader.buildIndexFromDirectory(allocator, dir_path);
+    std.log.info("Indexed {d} tensors across shards", .{index.entries.count()});
+
+    const provider = try allocator.create(safetensors_reader.LazyWeightProvider);
+    provider.* = safetensors_reader.LazyWeightProvider.init(allocator, index, &mapV4WeightName);
+    try provider.buildReverseMap();
+    std.log.info("Built reverse map with {d} entries", .{provider.reverse_map.count()});
+
+    return .{ .index = index, .provider = provider };
+}
+
+/// Load weights using selective strategy — loads all needed tensors into HashMap.
+/// For machines with enough memory to hold all weights (~37GB for V4 Flash 4-bit).
+pub fn loadWeightsSelective(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+    smelt: SmeltConfig,
+) !std.StringHashMap(Array) {
+    // Build tensor index from shard headers (only reads first few KB per file)
+    var index = try safetensors_reader.buildIndexFromDirectory(allocator, dir_path);
+    defer index.deinit();
+
+    std.log.info("Indexed {d} tensors across shards", .{index.entries.count()});
+
+    // Build smelt mask
+    var smelt_mask: ?[]bool = null;
+    defer if (smelt_mask) |m| allocator.free(m);
+    if (smelt.enabled and smelt.load_fraction < 1.0) {
+        smelt_mask = try smelt.buildMask(allocator, 256);
+    }
+
+    // Load each tensor individually
+    var weights = std.StringHashMap(Array).init(allocator);
+    errdefer {
+        var it = weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        weights.deinit();
+    }
+
+    var loaded_count: usize = 0;
+    var skipped_count: usize = 0;
+    var idx_it = index.entries.iterator();
+    while (idx_it.next()) |entry| {
+        const hf_name = entry.key_ptr.*;
+
+        // Skip expert weights for unloaded experts
+        if (smelt_mask != null and isExpertWeight(hf_name)) {
+            const eid = parseExpertIndexFromHF(hf_name);
+            if (eid) |e| {
+                if (e < smelt_mask.?.len and !smelt_mask.?[e]) { skipped_count += 1; continue; }
+            }
+        }
+
+        // Skip __metadata__ and mtp.* weights
+        if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) {
+            skipped_count += 1;
+            continue;
+        }
+
+        // Load tensor from file at offset
+        const tensor = index.loadTensor(hf_name) catch |err| {
+            std.log.warn("Failed to load tensor {s}: {}", .{ hf_name, err });
+            skipped_count += 1;
+            continue;
+        };
+
+        // Apply name mapping
+        const mapped = try mapV4WeightName(allocator, hf_name);
+        const key = mapped orelse try allocator.dupe(u8, hf_name);
+        try weights.put(key, tensor);
+
+        loaded_count += 1;
+        if (loaded_count % 200 == 0) {
+            std.log.info("Loaded {d} tensors ({d} skipped)...", .{ loaded_count, skipped_count });
+        }
+    }
+
+    std.log.info("Loaded {d} weights selectively", .{weights.count()});
+    return weights;
+}
+
 /// Load weights from a model directory.
 /// Automatically detects sharded vs single-file models.
+/// `smelt` controls partial expert loading to reduce memory usage.
 pub fn loadWeightsFromDirectory(
     allocator: std.mem.Allocator,
     io_ctx: std.Io,
     dir_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    smelt: SmeltConfig,
 ) !std.StringHashMap(Array) {
     // Try sharded loading first
     const index_path = try std.fs.path.join(allocator, &.{ dir_path, "model.safetensors.index.json" });
@@ -196,7 +542,10 @@ pub fn loadWeightsFromDirectory(
     };
 
     if (has_index) {
-        return try loadShardedWeights(allocator, io_ctx, dir_path, index_path, ctx, stream);
+        var weights = try loadShardedWeights(allocator, io_ctx, dir_path, index_path, ctx, stream, smelt);
+        try splitFusedExperts(allocator, &weights, ctx, smelt);
+        std.log.info("Weights loaded: {d} entries (lazy, pre-buildDSV4Model)", .{weights.count()});
+        return weights;
     }
 
     // Fall back to single file
@@ -231,17 +580,274 @@ pub fn loadWeightsFromDirectory(
 
     var it = st.weights.iterator();
     while (it.next()) |entry| {
-        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        // Apply HF → internal name mapping
+        const mapped = try mapV4WeightName(allocator, entry.key_ptr.*);
+        const key = mapped orelse try allocator.dupe(u8, entry.key_ptr.*);
         const weight = entry.value_ptr.*;
-        // Convert BF16 to F32 for CPU eager layers
-        const f32_weight = if (weight.dtype() == .bfloat16)
-            try ops.astype(ctx, weight, .float32)
-        else
-            weight;
-        try weights.put(key, f32_weight);
+        // Keep weights in original dtype — no bfloat16→float32 conversion.
+        try weights.put(key, weight);
     }
 
+    try splitFusedExperts(allocator, &weights, ctx, smelt);
     return weights;
+}
+
+/// Parse expert index from a weight key such as "layers.0.ffn.experts.5.w1.weight".
+/// Returns null if the key does not contain an expert index.
+fn parseExpertIndex(key: []const u8) ?usize {
+    const prefix = "ffn.experts.";
+    const idx = std.mem.indexOf(u8, key, prefix) orelse return null;
+    const start = idx + prefix.len;
+    var end = start;
+    while (end < key.len and std.ascii.isDigit(key[end])) end += 1;
+    if (end == start) return null;
+    return std.fmt.parseInt(usize, key[start..end], 10) catch null;
+}
+
+/// Convert scale array to float32. If scale is uint8, interpret as FP8 E8M0
+/// exponent: result = exp((scale - 127) * ln(2)).
+fn scaleToFloat(ctx: EagerContext, scale: Array) !Array {
+    if (scale.dtype() == .uint8) {
+        const scale_f32 = try ops.astype(ctx, scale, .float32);
+        defer scale_f32.deinit();
+        const offset = try ops.scalarF32(ctx, 127.0);
+        defer offset.deinit();
+        const shifted = try ops.subtract(ctx, scale_f32, offset);
+        defer shifted.deinit();
+        const ln2 = try ops.scalarF32(ctx, @log(2.0));
+        defer ln2.deinit();
+        const exponent = try ops.multiply(ctx, shifted, ln2);
+        defer exponent.deinit();
+        return ops.exp(ctx, exponent);
+    }
+    return ops.astype(ctx, scale, .float32);
+}
+
+/// Dequantize FP4-packed expert weights using lookup table (matching mlx-lm sanitize).
+/// Each uint8 byte packs two FP4 values: low nibble and high nibble.
+/// Table: [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+fn dequantFp4(ctx: EagerContext, weight: Array, scale: Array, block_size: i32) !Array {
+    const table_data = [16]f32{ 0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0 };
+    const table = try Array.fromData(ctx.allocator, f32, &table_data, &[_]i32{16});
+    defer table.deinit();
+
+    // Cast to uint8 for bitwise ops
+    const packed_bytes = try ops.astype(ctx, weight, .uint8);
+    defer packed_bytes.deinit();
+
+    // Low nibble: packed & 0x0F
+    const mask_0f = try Array.fromData(ctx.allocator, u8, &[_]u8{0x0F}, &[_]i32{1});
+    defer mask_0f.deinit();
+    const low = try cmp_mod.bitwiseAnd(ctx, packed_bytes, mask_0f);
+    defer low.deinit();
+
+    // High nibble: (packed >> 4) & 0x0F — use integer division by 16 as right shift
+    const sixteen = try Array.fromData(ctx.allocator, u8, &[_]u8{16}, &[_]i32{1});
+    defer sixteen.deinit();
+    const shifted = try ops.divide(ctx, packed_bytes, sixteen);
+    defer shifted.deinit();
+    const high = try cmp_mod.bitwiseAnd(ctx, shifted, mask_0f);
+    defer high.deinit();
+
+    // Lookup: table[low], table[high]
+    const low_i32 = try ops.astype(ctx, low, .int32);
+    defer low_i32.deinit();
+    const high_i32 = try ops.astype(ctx, high, .int32);
+    defer high_i32.deinit();
+    const val_low = try shape_mod.take(ctx, table, low_i32);
+    defer val_low.deinit();
+    const val_high = try shape_mod.take(ctx, table, high_i32);
+    defer val_high.deinit();
+
+    // Stack [low, high] along last axis and reshape to [rows, cols*2]
+    // val_low, val_high: [rows, cols] → expand to [rows, cols, 1] each, concat on axis 2
+    const low_exp = try ops.expandDims(ctx, val_low, -1);
+    defer low_exp.deinit();
+    const high_exp = try ops.expandDims(ctx, val_high, -1);
+    defer high_exp.deinit();
+    const stacked = try shape_mod.concatenateAxis(ctx, &[_]Array{ low_exp, high_exp }, -1);
+    defer stacked.deinit();
+
+    // Reshape to [rows, cols*2]
+    const w_shape = weight.shape();
+    const rows = w_shape[0];
+    const cols = w_shape[1];
+    const unpacked = try ops.reshape(ctx, stacked, &[_]i32{ rows, cols * 2 });
+    defer unpacked.deinit();
+
+    // Scale: repeat scale_to_float(scale) by block_size along last axis
+    const scale_f32 = try scaleToFloat(ctx, scale);
+    defer scale_f32.deinit();
+    const scale_rep = try shape_mod.repeatAxis(ctx, scale_f32, block_size, -1);
+    defer scale_rep.deinit();
+
+    // Result: (unpacked * scale).astype(bfloat16)
+    const scaled = try ops.multiply(ctx, unpacked, scale_rep);
+    defer scaled.deinit();
+    return ops.astype(ctx, scaled, .bfloat16);
+}
+
+/// Dequantize FP8-packed weights with block-wise scaling (matching mlx-lm sanitize).
+/// weight is uint8 FP8 E4M3, scale has shape [m/block_size, n/block_size].
+fn dequantFp8(ctx: EagerContext, weight: Array, scale: Array, block_size: i32) !Array {
+    // Convert FP8 to bfloat16
+    const w_bf16 = try quantize_mod.fromFp8(ctx, weight, .bfloat16);
+    defer w_bf16.deinit();
+
+    const scale_f32 = try scaleToFloat(ctx, scale);
+    defer scale_f32.deinit();
+
+    const w_shape = weight.shape();
+    const m: i32 = w_shape[0];
+    const n: i32 = w_shape[1];
+    const bs = block_size;
+
+    // Compute padding needed for block alignment
+    const pad_m = @mod(-m, bs);
+    const pad_n = @mod(-n, bs);
+
+    // Pad weight if needed
+    var w_padded: Array = undefined;
+    var needs_pad_free = false;
+    if (pad_m > 0 or pad_n > 0) {
+        // Create zero-padded array by concatenating zeros
+        const pm: i32 = m + pad_m;
+        const pn: i32 = n + pad_n;
+        var padded_raw = c.c.mlx_array_new();
+        try c.check(c.c.mlx_zeros(&padded_raw, (&[_]i32{ pm, pn }).ptr, 2, c.c.MLX_BFLOAT16, ctx.stream.inner));
+        const padded = Array.fromHandle(padded_raw);
+        defer padded.deinit();
+        // Copy original into top-left corner via slice_update
+        w_padded = try shape_mod.sliceUpdate(ctx, padded, w_bf16, &[_]i32{ 0, 0 }, &[_]i32{ m, n }, &[_]i32{});
+        needs_pad_free = true;
+    } else {
+        w_padded = w_bf16;
+    }
+    defer if (needs_pad_free) w_padded.deinit();
+
+    const pm: i32 = m + pad_m;
+    const pn: i32 = n + pad_n;
+
+    // Reshape to [m/bs, bs, n/bs, bs]
+    const reshaped = try ops.reshape(ctx, w_padded, &[_]i32{ @divExact(pm, bs), bs, @divExact(pn, bs), bs });
+    defer reshaped.deinit();
+
+    // Multiply by scale[:, None, :, None]
+    const scale_exp = try ops.expandDims(ctx, scale_f32, 1);
+    defer scale_exp.deinit();
+    const scale_exp2 = try ops.expandDims(ctx, scale_exp, 3);
+    defer scale_exp2.deinit();
+
+    // Cast reshaped to float32 for multiplication
+    const reshaped_f32 = try ops.astype(ctx, reshaped, .float32);
+    defer reshaped_f32.deinit();
+    const scaled = try ops.multiply(ctx, reshaped_f32, scale_exp2);
+    defer scaled.deinit();
+
+    // Reshape back to [pm, pn]
+    const flat = try ops.reshape(ctx, scaled, &[_]i32{ pm, pn });
+    defer flat.deinit();
+
+    // Truncate padding: [:m, :n]
+    if (pad_m > 0 or pad_n > 0) {
+        const truncated = try ops.slice(ctx, flat, &[_]i32{ 0, 0 }, &[_]i32{ m, n }, &[_]i32{});
+        defer truncated.deinit();
+        return ops.astype(ctx, truncated, .bfloat16);
+    }
+    return ops.astype(ctx, flat, .bfloat16);
+}
+
+/// Detect if a weight key + data matches the FP4 expert pattern.
+/// Returns true if: key contains ".ffn.experts." (not shared), dtype is int8/uint8,
+/// and scale.shape[-1] * 16 == weight.shape[-1] (FP4 packing ratio).
+fn isFp4ExpertWeight(key: []const u8, weight: Array, scale: Array) bool {
+    if (std.mem.indexOf(u8, key, ".ffn.experts.") == null) return false;
+    if (std.mem.indexOf(u8, key, ".shared_experts.") != null) return false;
+    const dt = weight.dtype();
+    if (dt != .int8 and dt != .uint8) return false;
+    const w_shape = weight.shape();
+    const s_shape = scale.shape();
+    if (w_shape.len < 2 or s_shape.len < 1) return false;
+    const w_cols = w_shape[w_shape.len - 1];
+    const s_cols = s_shape[s_shape.len - 1];
+    return s_cols * 16 == w_cols;
+}
+
+/// Remove all weights (including .weight, .scales, .biases) for experts
+/// that are not resident according to `mask`.
+fn removeUnloadedExperts(allocator: std.mem.Allocator, weights: *std.StringHashMap(Array), mask: []const bool) !void {
+    var keys_to_remove = std.ArrayList([]u8).empty;
+    defer {
+        for (keys_to_remove.items) |k| allocator.free(k);
+        keys_to_remove.deinit(allocator);
+    }
+
+    var iter = weights.iterator();
+    while (iter.next()) |entry| {
+        if (parseExpertIndex(entry.key_ptr.*)) |eid| {
+            if (eid < mask.len and !mask[eid]) {
+                try keys_to_remove.append(allocator, try allocator.dupe(u8, entry.key_ptr.*));
+            }
+        }
+    }
+
+    for (keys_to_remove.items) |key| {
+        if (weights.fetchRemove(key)) |kv| {
+            allocator.free(kv.key);
+            kv.value.deinit();
+        }
+        allocator.free(key);
+    }
+}
+
+/// Split fused switch_mlp expert weights [n_experts, out, in] into individual
+/// expert weights [out, in] as layers.N.ffn.experts.E.w{1,2,3}.weight.
+/// Also handles quantized .scales suffixes.
+/// Respects `smelt` to skip splitting / dequantizing unloaded experts.
+fn splitFusedExperts(allocator: std.mem.Allocator, weights: *std.StringHashMap(Array), ctx: EagerContext, smelt: SmeltConfig) !void {
+    _ = ctx; // No longer used — dequantization moved to buildDSV4Model
+    // --- Pre-compute Smelt mask if needed ---
+    // Infer total number of experts from fused tensors or existing split keys.
+    var n_experts: usize = 0;
+    var iter = weights.iterator();
+    while (iter.next()) |entry| {
+        if (std.mem.indexOf(u8, entry.key_ptr.*, "ffn.switch_mlp.") != null) {
+            const arr = entry.value_ptr.*;
+            const shape = arr.shape();
+            if (shape.len == 3 and @as(usize, @intCast(shape[0])) > n_experts) {
+                n_experts = @intCast(shape[0]);
+            }
+        } else if (parseExpertIndex(entry.key_ptr.*)) |eid| {
+            if (eid + 1 > n_experts) n_experts = eid + 1;
+        }
+    }
+
+    var smelt_mask: ?[]bool = null;
+    defer if (smelt_mask) |m| allocator.free(m);
+    if (smelt.enabled and smelt.load_fraction < 1.0 and n_experts > 0) {
+        smelt_mask = try smelt.buildMask(allocator, n_experts);
+    }
+
+    // === Step 1: Keep fused expert tensors as-is ===
+    // Previously this step split fused switch_mlp weights into individual experts.
+    // Now we keep them fused for gather_mm dispatch. The layer construction loop
+    // in loadDSV4Model handles both fused and individual expert formats.
+    // We only need to handle the dequantization step below.
+
+    // === Step 2: Skip dequantization ===
+    // All quantized weights stay packed. Dequantization happens lazily:
+    // - Attention weights: quantizedMatmul in forward pass
+    // - Expert weights: gatherQmm in forward pass
+    // - Embedding/lm_head: dequantized in buildDSV4Model (needed for mlx_take)
+    // - wo_a: dequantized in buildDSV4Model (needed for reshape)
+    // - Shared expert: dequantized lazily in buildDSV4Model
+
+    // === Step 3: Remove any remaining weights for unloaded experts ===
+    // This handles both (a) already-split weights that were not fused, and
+    // (b) any leftover metadata keys for skipped experts.
+    if (smelt_mask) |mask| {
+        try removeUnloadedExperts(allocator, weights, mask);
+    }
 }
 
 /// Load sharded safetensors using index.json.
@@ -252,8 +858,10 @@ fn loadShardedWeights(
     index_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    smelt: SmeltConfig,
 ) !std.StringHashMap(Array) {
     _ = stream;
+    _ = ctx;
     // Read index.json
     const index_content = try std.Io.Dir.cwd().readFileAlloc(io_ctx, index_path, allocator, .limited(50 * 1024 * 1024));
     defer allocator.free(index_content);
@@ -264,18 +872,38 @@ fn loadShardedWeights(
     const weight_map = parsed.value.object.get("weight_map") orelse return LoadError.MissingIndexJson;
     const wm_obj = weight_map.object;
 
-    // Collect unique shard filenames
+    // Build smelt mask to determine which expert weights to skip
+    var smelt_mask: ?[]bool = null;
+    defer if (smelt_mask) |m| allocator.free(m);
+    if (smelt.enabled and smelt.load_fraction < 1.0) {
+        smelt_mask = try smelt.buildMask(allocator, 256); // V4 has 256 experts
+    }
+
+    // Determine which shards to load: skip shards that ONLY contain unneeded expert weights
     var shard_set = std.StringHashMap(void).init(allocator);
     defer shard_set.deinit();
 
     var wm_it = wm_obj.iterator();
     while (wm_it.next()) |entry| {
+        const weight_name = entry.key_ptr.*;
         const shard_file = entry.value_ptr.*.string;
+
+        // Check if this weight should be skipped (unloaded expert)
+        if (smelt_mask != null and isExpertWeight(weight_name)) {
+            const eid = parseExpertIndexFromHF(weight_name);
+            if (eid) |e| {
+                if (e < smelt_mask.?.len and !smelt_mask.?[e]) continue; // Skip this weight
+            }
+        }
+
+        // This shard contains a needed weight — mark it for loading
         if (!shard_set.contains(shard_file)) {
             const key = try allocator.dupe(u8, shard_file);
             try shard_set.put(key, {});
         }
     }
+
+    std.log.info("Loading {d} of {d} shards (smelt filtering)", .{ shard_set.count(), wm_obj.count() });
 
     // Result weights map
     var weights = std.StringHashMap(Array).init(allocator);
@@ -288,7 +916,7 @@ fn loadShardedWeights(
         weights.deinit();
     }
 
-    // Load each shard and merge
+    // Load each shard, extract needed weights, free shard immediately
     var shard_it = shard_set.keyIterator();
     while (shard_it.next()) |shard_file_ptr| {
         const shard_file = shard_file_ptr.*;
@@ -298,12 +926,8 @@ fn loadShardedWeights(
         std.log.info("Loading shard: {s}", .{shard_file});
 
         var st = try io.loadSafetensors(allocator, shard_path);
-        defer {
-            var w_it = st.weights.iterator();
-            while (w_it.next()) |entry| {
-                allocator.free(entry.key_ptr.*);
-            }
-            st.weights.deinit();
+        // Free metadata immediately — we don't need it
+        {
             var m_it = st.metadata.iterator();
             while (m_it.next()) |entry| {
                 allocator.free(entry.key_ptr.*);
@@ -312,16 +936,35 @@ fn loadShardedWeights(
             st.metadata.deinit();
         }
 
+        // Extract needed weights, free everything else
         var w_it = st.weights.iterator();
         while (w_it.next()) |entry| {
-            const key = try allocator.dupe(u8, entry.key_ptr.*);
-            const weight = entry.value_ptr.*;
-            const f32_weight = if (weight.dtype() == .bfloat16)
-                try ops.astype(ctx, weight, .float32)
-            else
-                weight;
-            try weights.put(key, f32_weight);
+            const hf_name = entry.key_ptr.*;
+            var keep = true;
+
+            // Skip expert weights for unloaded experts (smelt mode)
+            if (smelt_mask != null and isExpertWeight(hf_name)) {
+                const eid = parseExpertIndexFromHF(hf_name);
+                if (eid) |e| {
+                    if (e < smelt_mask.?.len and !smelt_mask.?[e]) {
+                        keep = false;
+                    }
+                }
+            }
+
+            if (keep) {
+                const mapped = try mapV4WeightName(allocator, hf_name);
+                const key = mapped orelse try allocator.dupe(u8, hf_name);
+                try weights.put(key, entry.value_ptr.*);
+            } else {
+                // Free unneeded array to reclaim memory immediately
+                entry.value_ptr.*.deinit();
+            }
+            // Free the original key string from safetensors
+            allocator.free(entry.key_ptr.*);
         }
+        st.weights.deinit();
+        // Shard data is now freed — only extracted weights remain in `weights` HashMap
     }
 
     // Free shard_set keys
@@ -332,12 +975,14 @@ fn loadShardedWeights(
 }
 
 /// Build DSV4Model from loaded weights.
+/// `smelt` controls partial expert loading (Smelt mode).
 pub fn buildDSV4Model(
     allocator: std.mem.Allocator,
     config: *const DSV4Config,
     weights: *std.StringHashMap(Array),
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    smelt: SmeltConfig,
 ) !DSV4Model {
     _ = stream;
     const num_layers = config.num_hidden_layers;
@@ -346,10 +991,34 @@ pub fn buildDSV4Model(
     const head_dim = config.head_dim;
     const rope_dim = config.qk_rope_head_dim;
     const n_routed_experts = config.n_routed_experts;
-    const moe_inter_dim = config.moe_intermediate_size;
+    _ = config.moe_intermediate_size;
 
     // === Embedding ===
-    const embed_weight = weights.get("embed.weight") orelse return LoadError.MissingWeight;
+    // Embedding weights must be dequantized because mlx_take (used in Embedding.forward)
+    // doesn't support quantized packed arrays.
+    var embed_weight = weights.get("embed.weight") orelse {
+        std.log.err("Missing weight: embed.weight", .{});
+        var dbg_it = weights.iterator();
+        while (dbg_it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.key_ptr.*, "embed")) {
+                std.log.info("  Available: {s}", .{entry.key_ptr.*});
+            }
+        }
+        return LoadError.MissingWeight;
+    };
+    // Dequantize if quantized (has .scales)
+    const embed_scales = weights.get("embed.weight.scales");
+    if (embed_scales != null) {
+        const embed_biases = weights.get("embed.weight.biases");
+        const null_array: c.c.mlx_array = .{ .ctx = null };
+        const biases_inner = if (embed_biases) |b| b.inner else null_array;
+        const opt_group: c.c.mlx_optional_int = .{ .value = config.quantize_default_group_size, .has_value = true };
+        const opt_bits: c.c.mlx_optional_int = .{ .value = @as(i32, @intCast(if (config.quantize_default_bits > 0) config.quantize_default_bits else 4)), .has_value = true };
+        const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_BFLOAT16, .has_value = true };
+        var deq_res = c.c.mlx_array_new();
+        try c.check(c.c.mlx_dequantize(&deq_res, embed_weight.inner, embed_scales.?.inner, biases_inner, opt_group, opt_bits, "affine", null_array, no_dtype, ctx.stream.inner));
+        embed_weight = Array.fromHandle(deq_res);
+    }
     const embed = nn.Embedding{
         .ctx = ctx,
         .num_embeddings = vocab_size,
@@ -357,6 +1026,7 @@ pub fn buildDSV4Model(
         .weight = embed_weight,
     };
     if (weights.fetchRemove("embed.weight")) |kv| allocator.free(kv.key);
+    consumeWeightKey(allocator, weights, "embed.weight");
 
     // === Output norms ===
     const norm_weight = weights.get("norm.weight") orelse return LoadError.MissingWeight;
@@ -365,53 +1035,134 @@ pub fn buildDSV4Model(
     norm.weight = norm_weight;
     if (weights.fetchRemove("norm.weight")) |kv| allocator.free(kv.key);
 
-    var head_norm: ?nn.RMSNorm = null;
-    if (weights.get("head_norm.weight")) |hn| {
-        head_norm = try nn.RMSNorm.init(ctx, hidden_size, config.rms_norm_eps);
-        head_norm.?.weight.deinit();
-        head_norm.?.weight = hn;
-        if (weights.fetchRemove("head_norm.weight")) |kv| allocator.free(kv.key);
+    // === HyperHead (hc_head) weights ===
+    // Keys may be "hc_head.fn" (from HF format) or "hc_head_fn" (legacy internal)
+    var hc_head: ?deepseek_v4.HyperHead = null;
+    const hc_fn = weights.get("hc_head.fn") orelse weights.get("hc_head_fn");
+    const hc_base = weights.get("hc_head.base") orelse weights.get("hc_head_base");
+    const hc_scale = weights.get("hc_head.scale") orelse weights.get("hc_head_scale");
+    if (hc_fn != null and hc_base != null and hc_scale != null) {
+        // Remove all possible key variants
+        inline for (.{ "hc_head.fn", "hc_head_fn" }) |k| {
+            if (weights.fetchRemove(k)) |kv| allocator.free(kv.key);
+        }
+        inline for (.{ "hc_head.base", "hc_head_base" }) |k| {
+            if (weights.fetchRemove(k)) |kv| allocator.free(kv.key);
+        }
+        inline for (.{ "hc_head.scale", "hc_head_scale" }) |k| {
+            if (weights.fetchRemove(k)) |kv| allocator.free(kv.key);
+        }
+        hc_head = deepseek_v4.HyperHead{
+            .ctx = ctx,
+            .fn_weight = hc_fn.?,
+            .base = hc_base.?,
+            .scale = hc_scale.?,
+            .hc_mult = config.hc_mult,
+            .norm_eps = config.rms_norm_eps,
+        };
     }
 
     // === LM Head ===
-    const lm_head_weight = weights.get("head.weight") orelse weights.get("lm_head.weight") orelse return LoadError.MissingWeight;
+    var lm_head_weight = weights.get("head.weight") orelse weights.get("lm_head.weight") orelse return LoadError.MissingWeight;
+    lm_head_weight = try dequantIfNeeded(allocator, weights, "head.weight", lm_head_weight, config, ctx);
     const lm_head = lm_head_weight;
     if (weights.fetchRemove("head.weight")) |kv| allocator.free(kv.key);
     if (weights.fetchRemove("lm_head.weight")) |kv| allocator.free(kv.key);
+    consumeWeightKey(allocator, weights, "head.weight");
+    consumeWeightKey(allocator, weights, "lm_head.weight");
 
     // === Layers ===
     const layers = try allocator.alloc(deepseek_v4.DSV4TransformerBlock, num_layers);
     errdefer allocator.free(layers);
 
     for (0..num_layers) |i| {
+        if (i % 10 == 0) std.log.info("Building layer {d}/{d}...", .{ i, num_layers });
         const idx_fmt = try std.fmt.allocPrint(allocator, "layers.{d}.", .{i});
         defer allocator.free(idx_fmt);
 
-        // --- Attention weights ---
+        // --- Attention weights (keep quantized — use quantizedMatmul in forward) ---
         const wq_a_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_a.weight", .{idx_fmt});
         defer allocator.free(wq_a_name);
         const wq_a = weights.get(wq_a_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wq_a_name)) |kv| allocator.free(kv.key);
+        const wq_a_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_a.scales", .{idx_fmt});
+        defer allocator.free(wq_a_s_name);
+        const wq_a_scales: ?Array = blk_s: { const v = weights.get(wq_a_s_name); if (v != null) { if (weights.fetchRemove(wq_a_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wq_a_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_a.biases", .{idx_fmt});
+        defer allocator.free(wq_a_b_name);
+        const wq_a_biases: ?Array = blk_b: { const v = weights.get(wq_a_b_name); if (v != null) { if (weights.fetchRemove(wq_a_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
 
         const wq_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.weight", .{idx_fmt});
         defer allocator.free(wq_b_name);
         const wq_b = weights.get(wq_b_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wq_b_name)) |kv| allocator.free(kv.key);
+        const wq_b_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.scales", .{idx_fmt});
+        defer allocator.free(wq_b_s_name);
+        const wq_b_scales: ?Array = blk_s: { const v = weights.get(wq_b_s_name); if (v != null) { if (weights.fetchRemove(wq_b_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wq_b_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.biases", .{idx_fmt});
+        defer allocator.free(wq_b_b_name);
+        const wq_b_biases: ?Array = blk_b: { const v = weights.get(wq_b_b_name); if (v != null) { if (weights.fetchRemove(wq_b_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
 
         const wkv_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.weight", .{idx_fmt});
         defer allocator.free(wkv_name);
         const wkv = weights.get(wkv_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wkv_name)) |kv| allocator.free(kv.key);
+        const wkv_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.scales", .{idx_fmt});
+        defer allocator.free(wkv_s_name);
+        const wkv_scales: ?Array = blk_s: { const v = weights.get(wkv_s_name); if (v != null) { if (weights.fetchRemove(wkv_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wkv_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.biases", .{idx_fmt});
+        defer allocator.free(wkv_b_name);
+        const wkv_biases: ?Array = blk_b: { const v = weights.get(wkv_b_name); if (v != null) { if (weights.fetchRemove(wkv_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
 
         const wo_a_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_a.weight", .{idx_fmt});
         defer allocator.free(wo_a_name);
-        const wo_a = weights.get(wo_a_name) orelse return LoadError.MissingWeight;
+        const wo_a_raw = weights.get(wo_a_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wo_a_name)) |kv| allocator.free(kv.key);
+        // wo_a needs dequantize for reshape (grouped LoRA) — single lazy node, minimal memory
+        const wo_a_base = try std.fmt.allocPrint(allocator, "{s}attn.wo_a", .{idx_fmt});
+        defer allocator.free(wo_a_base);
+        const wo_a_deq = try dequantIfNeeded(allocator, weights, wo_a_base, wo_a_raw, config, ctx);
+
+        // Debug: check if dequantize actually changed the shape
+        {
+            const raw_shape = wo_a_raw.shape();
+            const deq_shape = wo_a_deq.shape();
+            std.log.info("wo_a debug: raw ndim={d} shape[0]={d} shape[1]={d} dtype={any} | deq ndim={d} shape[0]={d} shape[1]={d} dtype={any} | same_ptr={}", .{
+                raw_shape.len, raw_shape[0], raw_shape[1], wo_a_raw.dtype(),
+                deq_shape.len, deq_shape[0], deq_shape[1], wo_a_deq.dtype(),
+                wo_a_raw.inner.ctx == wo_a_deq.inner.ctx,
+            });
+        }
+
+        // If wo_a is 2D but o_groups > 1, reshape to 3D for grouped LoRA path
+        // mlx-lm stores wo_a as Linear weight [out_features, in_features];
+        // we reshape to [o_groups, o_lora_rank, group_feat] to match our grouped matmul.
+        var wo_a = wo_a_deq;
+        const attn_o_groups = config.o_groups;
+        const attn_o_lora_rank = config.o_lora_rank;
+        const attn_num_heads = config.num_attention_heads;
+        const attn_head_dim = config.head_dim;
+        if (wo_a.ndim() == 2 and attn_o_groups > 1 and attn_num_heads % attn_o_groups == 0) {
+            const group_feat = (attn_num_heads * attn_head_dim) / attn_o_groups;
+            const deq_s = wo_a_deq.shape();
+            std.log.info("wo_a reshape: o_groups={d} o_lora_rank={d} group_feat={d} target_total={d} deq_size={d}x{d}={d}", .{
+                attn_o_groups, attn_o_lora_rank, group_feat,
+                attn_o_groups * attn_o_lora_rank * group_feat,
+                deq_s[0], deq_s[1], @as(i64, deq_s[0]) * @as(i64, deq_s[1]),
+            });
+            wo_a = try ops.reshape(ctx, wo_a_deq, &[_]i32{ @intCast(attn_o_groups), @intCast(attn_o_lora_rank), @intCast(group_feat) });
+        }
 
         const wo_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_b.weight", .{idx_fmt});
         defer allocator.free(wo_b_name);
         const wo_b = weights.get(wo_b_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wo_b_name)) |kv| allocator.free(kv.key);
+        const wo_b_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_b.scales", .{idx_fmt});
+        defer allocator.free(wo_b_s_name);
+        const wo_b_scales: ?Array = blk_s: { const v = weights.get(wo_b_s_name); if (v != null) { if (weights.fetchRemove(wo_b_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wo_b_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_b.biases", .{idx_fmt});
+        defer allocator.free(wo_b_b_name);
+        const wo_b_biases: ?Array = blk_b: { const v = weights.get(wo_b_b_name); if (v != null) { if (weights.fetchRemove(wo_b_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
 
         // Attention norms
         const q_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.q_norm.weight", .{idx_fmt});
@@ -444,70 +1195,216 @@ pub fn buildDSV4Model(
         const rope_config = config.rope_scaling orelse DSV4Config.YarnRoPEConfig{};
         const rope = try deepseek_v4.DSV4YarnRoPE.init(ctx, rope_dim, config.max_position_embeddings, config.rope_theta, rope_config);
 
-        // Compressor weights (optional, only for CSA/HCA layers with compress_ratio > 1)
+        // Compressor module (for CSA/HCA layers with compress_ratio > 0)
+        var compressor: ?deepseek_v4.Compressor = null;
         var compress_gate_weight: ?Array = null;
         var compress_pos_bias: ?Array = null;
-        if (compress_ratio > 1) {
-            const cgw_name = try std.fmt.allocPrint(allocator, "{s}attn.compress_gate_weight", .{idx_fmt});
-            defer allocator.free(cgw_name);
-            if (weights.get(cgw_name)) |cgw| {
-                compress_gate_weight = cgw;
-                if (weights.fetchRemove(cgw_name)) |kv| allocator.free(kv.key);
-            }
+        if (compress_ratio > 0) {
+            const comp_wkv_name = try std.fmt.allocPrint(allocator, "{s}attn.compressor.wkv.weight", .{idx_fmt});
+            defer allocator.free(comp_wkv_name);
+            const comp_wgate_name = try std.fmt.allocPrint(allocator, "{s}attn.compressor.wgate.weight", .{idx_fmt});
+            defer allocator.free(comp_wgate_name);
+            const comp_ape_name = try std.fmt.allocPrint(allocator, "{s}attn.compressor.ape", .{idx_fmt});
+            defer allocator.free(comp_ape_name);
+            const comp_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.compressor.norm.weight", .{idx_fmt});
+            defer allocator.free(comp_norm_name);
 
-            const cpb_name = try std.fmt.allocPrint(allocator, "{s}attn.compress_pos_bias", .{idx_fmt});
-            defer allocator.free(cpb_name);
-            if (weights.get(cpb_name)) |cpb| {
-                compress_pos_bias = cpb;
-                if (weights.fetchRemove(cpb_name)) |kv| allocator.free(kv.key);
+            // Try loading new-style Compressor weights
+            const comp_wkv = weights.get(comp_wkv_name);
+            const comp_wgate = weights.get(comp_wgate_name);
+            const comp_ape = weights.get(comp_ape_name);
+            const comp_norm = weights.get(comp_norm_name);
+
+            if (comp_wkv != null and comp_wgate != null and comp_ape != null and comp_norm != null) {
+                if (weights.fetchRemove(comp_wkv_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(comp_wgate_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(comp_ape_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(comp_norm_name)) |kv| allocator.free(kv.key);
+                // Also consume quantized metadata (.scales/.biases)
+                const comp_base = try std.fmt.allocPrint(allocator, "{s}attn.compressor.wkv", .{idx_fmt});
+                defer allocator.free(comp_base);
+                consumeWeightKey(allocator, weights, comp_base);
+                const comp_gate_base = try std.fmt.allocPrint(allocator, "{s}attn.compressor.wgate", .{idx_fmt});
+                defer allocator.free(comp_gate_base);
+                consumeWeightKey(allocator, weights, comp_gate_base);
+
+                const comp_overlap = compress_ratio == 4;
+                const comp_out_dim = if (comp_overlap) head_dim * 2 else head_dim;
+                _ = comp_out_dim;
+
+                compressor = deepseek_v4.Compressor{
+                    .ctx = ctx,
+                    .wkv = comp_wkv.?,
+                    .wgate = comp_wgate.?,
+                    .ape = comp_ape.?,
+                    .norm_weight = comp_norm.?,
+                    .compress_ratio = compress_ratio,
+                    .head_dim = head_dim,
+                    .rope_head_dim = rope_dim,
+                    .overlap = comp_overlap,
+                    .out_dim = if (comp_overlap) head_dim * 2 else head_dim,
+                    .norm_eps = config.rms_norm_eps,
+                };
+            }
+            // Also try loading old-style compress_gate_weight (backward compat)
+            if (compressor == null) {
+                const cgw_name = try std.fmt.allocPrint(allocator, "{s}attn.compress_gate_weight", .{idx_fmt});
+                defer allocator.free(cgw_name);
+                if (weights.get(cgw_name)) |cgw| {
+                    compress_gate_weight = cgw;
+                    if (weights.fetchRemove(cgw_name)) |kv| allocator.free(kv.key);
+                }
+                const cpb_name = try std.fmt.allocPrint(allocator, "{s}attn.compress_pos_bias", .{idx_fmt});
+                defer allocator.free(cpb_name);
+                if (weights.get(cpb_name)) |cpb| {
+                    compress_pos_bias = cpb;
+                    if (weights.fetchRemove(cpb_name)) |kv| allocator.free(kv.key);
+                }
             }
         }
 
-        // Lightning Indexer weights (optional, only for CSA layers with compress_ratio > 1)
-        var indexer: ?deepseek_v4.LightningIndexer = null;
-        if (compress_ratio > 1) {
-            const wq_idx_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wq.weight", .{idx_fmt});
-            defer allocator.free(wq_idx_name);
-            const wk_idx_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wk.weight", .{idx_fmt});
-            defer allocator.free(wk_idx_name);
+        // Indexer module (for CSA layers with compress_ratio == 4)
+        var indexer_new: ?deepseek_v4.Indexer = null;
+        var indexer_legacy: ?deepseek_v4.LightningIndexer = null;
+        if (compress_ratio == 4) {
+            // Try new-style Indexer weights first
+            const idx_wqb_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wq_b.weight", .{idx_fmt});
+            defer allocator.free(idx_wqb_name);
+            const idx_wp_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.weights_proj.weight", .{idx_fmt});
+            defer allocator.free(idx_wp_name);
 
-            const wq_idx = weights.get(wq_idx_name);
-            const wk_idx = weights.get(wk_idx_name);
+            const idx_wqb = weights.get(idx_wqb_name);
+            const idx_wp = weights.get(idx_wp_name);
 
-            if (wq_idx != null and wk_idx != null) {
-                if (weights.fetchRemove(wq_idx_name)) |kv| allocator.free(kv.key);
-                if (weights.fetchRemove(wk_idx_name)) |kv| allocator.free(kv.key);
-                indexer = deepseek_v4.LightningIndexer{
+            if (idx_wqb != null and idx_wp != null and compressor != null) {
+                if (weights.fetchRemove(idx_wqb_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(idx_wp_name)) |kv| allocator.free(kv.key);
+                // Consume quantized metadata for indexer weights
+                const idx_wqb_base = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wq_b", .{idx_fmt});
+                defer allocator.free(idx_wqb_base);
+                consumeWeightKey(allocator, weights, idx_wqb_base);
+                const idx_wp_base = try std.fmt.allocPrint(allocator, "{s}attn.indexer.weights_proj", .{idx_fmt});
+                defer allocator.free(idx_wp_base);
+                consumeWeightKey(allocator, weights, idx_wp_base);
+
+                // Load nested Indexer.compressor weights
+                const idx_comp_wkv_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.wkv.weight", .{idx_fmt});
+                defer allocator.free(idx_comp_wkv_name);
+                const idx_comp_wgate_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.wgate.weight", .{idx_fmt});
+                defer allocator.free(idx_comp_wgate_name);
+                const idx_comp_ape_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.ape", .{idx_fmt});
+                defer allocator.free(idx_comp_ape_name);
+                const idx_comp_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.norm.weight", .{idx_fmt});
+                defer allocator.free(idx_comp_norm_name);
+
+                const ic_wkv = weights.get(idx_comp_wkv_name) orelse return LoadError.MissingWeight;
+                const ic_wgate = weights.get(idx_comp_wgate_name) orelse return LoadError.MissingWeight;
+                const ic_ape = weights.get(idx_comp_ape_name) orelse return LoadError.MissingWeight;
+                const ic_norm = weights.get(idx_comp_norm_name) orelse return LoadError.MissingWeight;
+                if (weights.fetchRemove(idx_comp_wkv_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(idx_comp_wgate_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(idx_comp_ape_name)) |kv| allocator.free(kv.key);
+                if (weights.fetchRemove(idx_comp_norm_name)) |kv| allocator.free(kv.key);
+                // Consume quantized metadata for nested indexer.compressor
+                const ic_wkv_base = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.wkv", .{idx_fmt});
+                defer allocator.free(ic_wkv_base);
+                consumeWeightKey(allocator, weights, ic_wkv_base);
+                const ic_wgate_base = try std.fmt.allocPrint(allocator, "{s}attn.indexer.compressor.wgate", .{idx_fmt});
+                defer allocator.free(ic_wgate_base);
+                consumeWeightKey(allocator, weights, ic_wgate_base);
+
+                const idx_head_dim = config.index_head_dim;
+                const idx_overlap = compress_ratio == 4;
+
+                indexer_new = deepseek_v4.Indexer{
                     .ctx = ctx,
-                    .wq_index = wq_idx.?,
-                    .wk_index = wk_idx.?,
-                    .index_n_heads = config.index_n_heads,
-                    .index_head_dim = config.index_head_dim,
+                    .n_heads = config.index_n_heads,
+                    .head_dim = idx_head_dim,
                     .index_topk = config.index_topk,
+                    .wq_b = idx_wqb.?,
+                    .weights_proj = idx_wp.?,
+                    .compressor = deepseek_v4.Compressor{
+                        .ctx = ctx,
+                        .wkv = ic_wkv,
+                        .wgate = ic_wgate,
+                        .ape = ic_ape,
+                        .norm_weight = ic_norm,
+                        .compress_ratio = compress_ratio,
+                        .head_dim = idx_head_dim,
+                        .rope_head_dim = rope_dim,
+                        .overlap = idx_overlap,
+                        .out_dim = if (idx_overlap) idx_head_dim * 2 else idx_head_dim,
+                        .norm_eps = config.rms_norm_eps,
+                    },
+                    .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(idx_head_dim))),
                 };
+            } else {
+                // Fallback: try legacy LightningIndexer weights
+                const wq_idx_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wq.weight", .{idx_fmt});
+                defer allocator.free(wq_idx_name);
+                const wk_idx_name = try std.fmt.allocPrint(allocator, "{s}attn.indexer.wk.weight", .{idx_fmt});
+                defer allocator.free(wk_idx_name);
+
+                const wq_idx = weights.get(wq_idx_name);
+                const wk_idx = weights.get(wk_idx_name);
+
+                if (wq_idx != null and wk_idx != null) {
+                    if (weights.fetchRemove(wq_idx_name)) |kv| allocator.free(kv.key);
+                    if (weights.fetchRemove(wk_idx_name)) |kv| allocator.free(kv.key);
+                    indexer_legacy = deepseek_v4.LightningIndexer{
+                        .ctx = ctx,
+                        .wq_index = wq_idx.?,
+                        .wk_index = wk_idx.?,
+                        .index_n_heads = config.index_n_heads,
+                        .index_head_dim = config.index_head_dim,
+                        .index_topk = config.index_topk,
+                    };
+                }
             }
         }
 
         // --- Attention struct ---
+        const qgs = config.quantize_default_group_size;
+        const qbits: u8 = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4;
         const attention = deepseek_v4.DSV4Attention{
             .ctx = ctx,
             .config = config,
             .layer_idx = i,
             .wq_a = wq_a,
+            .wq_a_scales = wq_a_scales,
+            .wq_a_biases = wq_a_biases,
             .wq_b = wq_b,
+            .wq_b_scales = wq_b_scales,
+            .wq_b_biases = wq_b_biases,
             .q_norm = q_norm,
             .wkv = wkv,
+            .wkv_scales = wkv_scales,
+            .wkv_biases = wkv_biases,
             .kv_norm = kv_norm,
-            .kv_b = null, // V4 doesn't use kv_b
+            .kv_b = null,
             .wo_a = wo_a,
             .wo_b = wo_b,
+            .wo_b_scales = wo_b_scales,
+            .wo_b_biases = wo_b_biases,
+            .attn_quant_group_size = qgs,
+            .attn_quant_bits = qbits,
             .rope = rope,
             .compress_ratio = compress_ratio,
             .compress_gate_weight = compress_gate_weight,
             .compress_pos_bias = compress_pos_bias,
-            .indexer = indexer,
+            .indexer = indexer_legacy,
             .sink_logits = sink_logits,
         };
+
+        // Consume quantized metadata for attention weights
+        {
+            const attn_bases = [_][]const u8{ "attn.wq_a", "attn.wq_b", "attn.wkv", "attn.wo_a", "attn.wo_b" };
+            for (attn_bases) |base| {
+                const full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ idx_fmt, base });
+                defer allocator.free(full);
+                consumeWeightKey(allocator, weights, full);
+            }
+        }
 
         // --- MoE weights ---
         // Gate
@@ -533,6 +1430,8 @@ pub fn buildDSV4Model(
         }
 
         const is_hash = i < config.num_hash_layers;
+        const smelt_mask = try smelt.buildMask(allocator, n_routed_experts);
+        defer if (!smelt.enabled) allocator.free(smelt_mask);
         const gate = deepseek_v4.DSV4Gate{
             .ctx = ctx,
             .weight = gate_weight,
@@ -543,9 +1442,11 @@ pub fn buildDSV4Model(
             .route_scale = config.routed_scaling_factor,
             .scoring_func = config.scoring_func,
             .is_hash = is_hash,
+            .smelt_mask = if (smelt.enabled) smelt_mask else null,
+            .allocator = if (smelt.enabled) allocator else null,
         };
 
-        // Shared expert
+        // Shared expert — keep quantized (lazy, no memory allocation)
         const shared_w1_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w1.weight", .{idx_fmt});
         defer allocator.free(shared_w1_name);
         const shared_w1 = weights.get(shared_w1_name) orelse return LoadError.MissingWeight;
@@ -561,52 +1462,191 @@ pub fn buildDSV4Model(
         const shared_w2 = weights.get(shared_w2_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(shared_w2_name)) |kv| allocator.free(kv.key);
 
+        // Load shared expert quantized scales/biases
+        const se_w1_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w1.scales", .{idx_fmt});
+        defer allocator.free(se_w1_s_name);
+        const se_w1_scales: ?Array = blk_s: { const v = weights.get(se_w1_s_name); if (v != null) { if (weights.fetchRemove(se_w1_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w1_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w1.biases", .{idx_fmt});
+        defer allocator.free(se_w1_b_name);
+        const se_w1_biases: ?Array = blk_b: { const v = weights.get(se_w1_b_name); if (v != null) { if (weights.fetchRemove(se_w1_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+
+        const se_w3_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w3.scales", .{idx_fmt});
+        defer allocator.free(se_w3_s_name);
+        const se_w3_scales: ?Array = blk_s: { const v = weights.get(se_w3_s_name); if (v != null) { if (weights.fetchRemove(se_w3_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w3_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w3.biases", .{idx_fmt});
+        defer allocator.free(se_w3_b_name);
+        const se_w3_biases: ?Array = blk_b: { const v = weights.get(se_w3_b_name); if (v != null) { if (weights.fetchRemove(se_w3_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+
+        const se_w2_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w2.scales", .{idx_fmt});
+        defer allocator.free(se_w2_s_name);
+        const se_w2_scales: ?Array = blk_s: { const v = weights.get(se_w2_s_name); if (v != null) { if (weights.fetchRemove(se_w2_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w2_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w2.biases", .{idx_fmt});
+        defer allocator.free(se_w2_b_name);
+        const se_w2_biases: ?Array = blk_b: { const v = weights.get(se_w2_b_name); if (v != null) { if (weights.fetchRemove(se_w2_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+
         const shared_expert = deepseek_v4.DSV4Expert{
             .ctx = ctx,
             .w1 = shared_w1,
             .w2 = shared_w2,
             .w3 = shared_w3,
-            .swiglu_limit = 0, // shared expert has no limit
+            .w1_scales = se_w1_scales,
+            .w1_biases = se_w1_biases,
+            .w2_scales = se_w2_scales,
+            .w2_biases = se_w2_biases,
+            .w3_scales = se_w3_scales,
+            .w3_biases = se_w3_biases,
+            .quant_group_size = config.quantize_default_group_size,
+            .quant_bits = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4,
+            .swiglu_limit = 0,
         };
-
-        // Routed experts
-        const experts = try allocator.alloc(deepseek_v4.DSV4Expert, n_routed_experts);
-        errdefer allocator.free(experts);
-
-        for (0..n_routed_experts) |e| {
-            const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
-            defer allocator.free(ew1_name);
-            const ew1 = weights.get(ew1_name); // may be missing for some experts
-            if (weights.fetchRemove(ew1_name)) |kv| allocator.free(kv.key);
-
-            const ew3_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w3.weight", .{ idx_fmt, e });
-            defer allocator.free(ew3_name);
-            const ew3 = weights.get(ew3_name);
-            if (weights.fetchRemove(ew3_name)) |kv| allocator.free(kv.key);
-
-            const ew2_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w2.weight", .{ idx_fmt, e });
-            defer allocator.free(ew2_name);
-            const ew2 = weights.get(ew2_name);
-            if (weights.fetchRemove(ew2_name)) |kv| allocator.free(kv.key);
-
-            // If expert weights are missing, create zero arrays as placeholders
-            const w1_actual = ew1 orelse try array_mod.zeros(allocator, &[_]i32{ @intCast(moe_inter_dim), @intCast(hidden_size) }, .float32);
-            const w3_actual = ew3 orelse try array_mod.zeros(allocator, &[_]i32{ @intCast(moe_inter_dim), @intCast(hidden_size) }, .float32);
-            const w2_actual = ew2 orelse try array_mod.zeros(allocator, &[_]i32{ @intCast(hidden_size), @intCast(moe_inter_dim) }, .float32);
-
-            experts[e] = deepseek_v4.DSV4Expert{
-                .ctx = ctx,
-                .w1 = w1_actual,
-                .w2 = w2_actual,
-                .w3 = w3_actual,
-                .swiglu_limit = config.swiglu_limit,
-            };
+        // Consume any remaining shared expert quantized metadata
+        {
+            const se_bases = [_][]const u8{ "ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3" };
+            for (se_bases) |base| {
+                const full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ idx_fmt, base });
+                defer allocator.free(full);
+                consumeWeightKey(allocator, weights, full);
+            }
         }
 
         const moe = deepseek_v4.DSV4MoE{
             .ctx = ctx,
             .gate = gate,
-            .experts = experts,
+            .switch_mlp = blk: {
+                // Try to load fused switch_mlp weights first (mlx-lm format)
+                const gate_proj_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.weight", .{idx_fmt});
+                defer allocator.free(gate_proj_name);
+                const up_proj_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.weight", .{idx_fmt});
+                defer allocator.free(up_proj_name);
+                const down_proj_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.weight", .{idx_fmt});
+                defer allocator.free(down_proj_name);
+
+                var fused_gate = weights.get(gate_proj_name);
+                var fused_up = weights.get(up_proj_name);
+                var fused_down = weights.get(down_proj_name);
+
+                if (fused_gate != null and fused_up != null and fused_down != null) {
+                    // Fused format available — use directly
+                    if (weights.fetchRemove(gate_proj_name)) |kv| allocator.free(kv.key);
+                    if (weights.fetchRemove(up_proj_name)) |kv| allocator.free(kv.key);
+                    if (weights.fetchRemove(down_proj_name)) |kv| allocator.free(kv.key);
+                } else {
+                    // Individual experts — stack into fused format
+                    // This handles checkpoints with experts.{e}.w1.weight format
+                    var gate_list = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(gate_list);
+                    var up_list = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(up_list);
+                    var down_list = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(down_list);
+
+                    for (0..n_routed_experts) |e| {
+                        const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
+                        defer allocator.free(ew1_name);
+                        const ew3_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w3.weight", .{ idx_fmt, e });
+                        defer allocator.free(ew3_name);
+                        const ew2_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w2.weight", .{ idx_fmt, e });
+                        defer allocator.free(ew2_name);
+
+                        gate_list[e] = weights.get(ew1_name) orelse return LoadError.MissingWeight;
+                        up_list[e] = weights.get(ew3_name) orelse return LoadError.MissingWeight;
+                        down_list[e] = weights.get(ew2_name) orelse return LoadError.MissingWeight;
+
+                        if (weights.fetchRemove(ew1_name)) |kv| allocator.free(kv.key);
+                        if (weights.fetchRemove(ew3_name)) |kv| allocator.free(kv.key);
+                        if (weights.fetchRemove(ew2_name)) |kv| allocator.free(kv.key);
+                    }
+
+                    // Stack: [n_experts] × [out, in] → [n_experts, out, in]
+                    // Use expandDims + concatenate as stack equivalent
+                    var gate_expanded = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(gate_expanded);
+                    var up_expanded = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(up_expanded);
+                    var down_expanded = try allocator.alloc(Array, n_routed_experts);
+                    defer allocator.free(down_expanded);
+
+                    for (0..n_routed_experts) |e| {
+                        gate_expanded[e] = try ops.expandDims(ctx, gate_list[e], 0);
+                        up_expanded[e] = try ops.expandDims(ctx, up_list[e], 0);
+                        down_expanded[e] = try ops.expandDims(ctx, down_list[e], 0);
+                    }
+                    defer for (0..n_routed_experts) |e| {
+                        gate_expanded[e].deinit();
+                        up_expanded[e].deinit();
+                        down_expanded[e].deinit();
+                    };
+
+                    fused_gate = try shape_mod.concatenateAxis(ctx, gate_expanded, 0);
+                    fused_up = try shape_mod.concatenateAxis(ctx, up_expanded, 0);
+                    fused_down = try shape_mod.concatenateAxis(ctx, down_expanded, 0);
+                }
+
+                break :blk blk2: {
+                    // Check if quantized scales exist for fused weights
+                    const gate_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.scales", .{idx_fmt});
+                    defer allocator.free(gate_scales_name);
+                    const up_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.scales", .{idx_fmt});
+                    defer allocator.free(up_scales_name);
+                    const down_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.scales", .{idx_fmt});
+                    defer allocator.free(down_scales_name);
+
+                    const gate_scales = weights.get(gate_scales_name);
+                    const up_scales = weights.get(up_scales_name);
+                    const down_scales = weights.get(down_scales_name);
+
+                    const is_quant = gate_scales != null and up_scales != null and down_scales != null;
+
+                    // Load biases if present
+                    var gate_biases: ?Array = null;
+                    var up_biases: ?Array = null;
+                    var down_biases: ?Array = null;
+                    if (is_quant) {
+                        if (weights.fetchRemove(gate_scales_name)) |kv| allocator.free(kv.key);
+                        if (weights.fetchRemove(up_scales_name)) |kv| allocator.free(kv.key);
+                        if (weights.fetchRemove(down_scales_name)) |kv| allocator.free(kv.key);
+
+                        const gate_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.biases", .{idx_fmt});
+                        defer allocator.free(gate_biases_name);
+                        const up_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.biases", .{idx_fmt});
+                        defer allocator.free(up_biases_name);
+                        const down_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.biases", .{idx_fmt});
+                        defer allocator.free(down_biases_name);
+
+                        gate_biases = weights.get(gate_biases_name);
+                        up_biases = weights.get(up_biases_name);
+                        down_biases = weights.get(down_biases_name);
+                        if (gate_biases != null) { if (weights.fetchRemove(gate_biases_name)) |kv| allocator.free(kv.key); }
+                        if (up_biases != null) { if (weights.fetchRemove(up_biases_name)) |kv| allocator.free(kv.key); }
+                        if (down_biases != null) { if (weights.fetchRemove(down_biases_name)) |kv| allocator.free(kv.key); }
+                    }
+
+                    // Expert weights always use mxfp4 (group_size=32, no biases)
+                    // This is specified in the per-weight quantization_config in config.json
+                    const qmode: []const u8 = if (gate_biases == null) "mxfp4" else config.quantize_default_mode;
+                    const expert_qbits: u8 = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4;
+                    const qgroup: i32 = if (gate_biases == null) 32 else config.quantize_default_group_size;
+
+                    break :blk2 deepseek_v4.DSV4SwitchGLU{
+                        .ctx = ctx,
+                        .gate_proj = fused_gate.?,
+                        .up_proj = fused_up.?,
+                        .down_proj = fused_down.?,
+                        .gate_proj_scales = gate_scales,
+                        .gate_proj_biases = gate_biases,
+                        .up_proj_scales = up_scales,
+                        .up_proj_biases = up_biases,
+                        .down_proj_scales = down_scales,
+                        .down_proj_biases = down_biases,
+                        .is_quantized = is_quant,
+                        .quant_group_size = qgroup,
+                        .quant_bits = expert_qbits,
+                        .quant_mode = qmode,
+                        .swiglu_limit = config.swiglu_limit,
+                        .sort_threshold = 8,
+                    };
+                };
+            },
             .shared_expert = shared_expert,
             .n_routed_experts = n_routed_experts,
             .n_activated_experts = config.num_experts_per_tok,
@@ -692,12 +1732,19 @@ pub fn buildDSV4Model(
         };
     }
 
-    // Check for unmapped weights
+    // Consume top-level quantized metadata that buildDSV4Model doesn't directly use
+    consumeWeightKey(allocator, weights, "embed.weight");
+    consumeWeightKey(allocator, weights, "head.weight");
+    consumeWeightKey(allocator, weights, "lm_head.weight");
+
+    // Check for unmapped weights (skip quantization metadata suffixes)
     var remaining = weights.iterator();
     while (remaining.next()) |entry| {
-        // Skip scale tensors (quantization metadata)
-        if (std.mem.endsWith(u8, entry.key_ptr.*, ".scale")) continue;
-        std.log.warn("Unused weight: {s}", .{entry.key_ptr.*});
+        const k = entry.key_ptr.*;
+        if (std.mem.endsWith(u8, k, ".scale")) continue;
+        if (std.mem.endsWith(u8, k, ".scales")) continue;
+        if (std.mem.endsWith(u8, k, ".biases")) continue;
+        std.log.warn("Unused weight: {s}", .{k});
     }
 
     return deepseek_v4.DSV4Model{
@@ -707,7 +1754,40 @@ pub fn buildDSV4Model(
         .embed_tokens = embed,
         .layers = layers,
         .norm = norm,
-        .head_norm = head_norm,
+        .hc_head = hc_head,
         .lm_head = lm_head,
     };
+}
+
+/// Create per-layer KV caches matching mlx-lm's Model.make_cache().
+/// Layers with compress_ratio > 0 get DeepseekV4Cache (with compressor/indexer state).
+/// Layers with compress_ratio == 0 get standard RotatingKVCache.
+pub fn makeV4Caches(
+    allocator: std.mem.Allocator,
+    config: *const DSV4Config,
+    stream: c.c.mlx_stream,
+) ![]kvcache.KVCacheStrategy {
+    const num_layers = config.num_hidden_layers;
+    const caches = try allocator.alloc(kvcache.KVCacheStrategy, num_layers);
+    errdefer allocator.free(caches);
+
+    for (0..num_layers) |i| {
+        const compress_ratio = if (i < config.compress_ratios.len) config.compress_ratios[i] else 0;
+        const layer_config = kvcache.LayerConfig{
+            .batch_size = 1,
+            .num_heads = config.num_attention_heads,
+            .num_kv_heads = 1,
+            .head_dim = config.head_dim,
+            .max_seq_len = @min(config.max_position_embeddings, 8192),
+            .dtype = .float32,
+        };
+
+        if (compress_ratio > 0) {
+            caches[i] = try kvcache.createDeepseekV4Cache(allocator, layer_config, config.sliding_window, stream);
+        } else {
+            caches[i] = try kvcache.createRotatingWithWindow(allocator, layer_config, config.sliding_window, stream);
+        }
+    }
+
+    return caches;
 }

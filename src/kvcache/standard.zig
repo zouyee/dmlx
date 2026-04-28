@@ -39,6 +39,7 @@ pub const StandardKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -148,6 +149,11 @@ pub const StandardKVCache = struct {
     fn resetImpl(ctx: *anyopaque) void {
         const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
         self.offset = 0;
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
+        self.offset = to_len;
     }
 
     fn filterImpl(

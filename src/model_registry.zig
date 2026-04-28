@@ -18,6 +18,7 @@ const llama = @import("models/llama.zig");
 const llama_loader = @import("models/llama_loader.zig");
 const deepseek_v4 = @import("models/deepseek_v4.zig");
 const deepseek_v4_loader = @import("models/deepseek_v4_loader.zig");
+const llava_loader = @import("models/llava_loader.zig");
 const hf_config = @import("hf_config.zig");
 
 const Array = array_mod.Array;
@@ -44,6 +45,8 @@ pub const ModelLoader = *const fn (
     model_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
 ) anyerror!ModelVTable;
 
 // ============================================================
@@ -60,6 +63,7 @@ pub const model_registry = std.StaticStringMap(ModelLoader).initComptime(.{
     .{ "Glm4ForCausalLM", glm4Loader }, // GLM-4 uses LLaMA arch with attention bias
     .{ "PhiForCausalLM", llamaLoader }, // Phi uses LLaMA-like arch
     .{ "Phi3ForCausalLM", llamaLoader }, // Phi-3 uses LLaMA-like arch
+    .{ "LlavaForConditionalGeneration", llavaLoader },
 });
 
 /// All architecture names known to the registry.
@@ -73,6 +77,7 @@ pub const supported_architectures = [_][]const u8{
     "Glm4ForCausalLM",
     "PhiForCausalLM",
     "Phi3ForCausalLM",
+    "LlavaForConditionalGeneration",
 };
 
 // ============================================================
@@ -91,7 +96,8 @@ pub fn getLoader(arch_name: []const u8) RegistryError!ModelLoader {
         std.log.warn("Unsupported model architecture: \"{s}\". Supported architectures: " ++
             "LlamaForCausalLM, DeepseekV4ForCausalLM, MistralForCausalLM, " ++
             "Qwen2ForCausalLM, Qwen3ForCausalLM, GemmaForCausalLM, " ++
-            "Glm4ForCausalLM, PhiForCausalLM, Phi3ForCausalLM", .{arch_name});
+            "Glm4ForCausalLM, PhiForCausalLM, Phi3ForCausalLM, " ++
+            "LlavaForConditionalGeneration", .{arch_name});
         return RegistryError.UnsupportedArchitecture;
     };
 }
@@ -109,6 +115,11 @@ const LlamaVTableAdapter = struct {
         return self.model.forward(input, mask, caches);
     }
 
+    fn forwardWithHidden(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!generation.ForwardWithHiddenResult {
+        const self: *LlamaVTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        return self.model.forwardWithHidden(input, mask, caches);
+    }
+
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *LlamaVTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         self.model.deinit();
@@ -123,7 +134,11 @@ fn llamaLoader(
     model_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
 ) anyerror!ModelVTable {
+    _ = io;
+    _ = smelt;
     const llama_config = try hf_config.parseLlamaConfig(allocator, config_json);
 
     // Find safetensors file
@@ -143,6 +158,7 @@ fn llamaLoader(
 
     return ModelVTable{
         .forward = &LlamaVTableAdapter.forward,
+        .forwardWithHidden = &LlamaVTableAdapter.forwardWithHidden,
         .deinit = &LlamaVTableAdapter.deinitFn,
         .config = ModelConfig{
             .num_layers = llama_config.num_hidden_layers,
@@ -190,20 +206,17 @@ fn deepseekV4Loader(
     model_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
 ) anyerror!ModelVTable {
-    _ = model_path; // weights loaded separately via loadWeightsFromDirectory
-
     const dsv4_config = try deepseek_v4_loader.parseDSV4Config(allocator, config_json);
 
-    // Build model from an empty weight map — the caller is expected to
-    // populate weights via loadWeightsFromDirectory before calling forward.
-    // For a full integration the caller would load weights and pass them
-    // through; this loader demonstrates the VTable wiring.
-    var weights = std.StringHashMap(Array).init(allocator);
+    var weights = try deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, model_path, ctx, stream, smelt);
     defer {
         var it = weights.iterator();
         while (it.next()) |entry| {
             allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
         }
         weights.deinit();
     }
@@ -211,7 +224,7 @@ fn deepseekV4Loader(
     const model_ptr = try allocator.create(deepseek_v4.DSV4Model);
     errdefer allocator.destroy(model_ptr);
 
-    model_ptr.* = try deepseek_v4_loader.buildDSV4Model(allocator, &dsv4_config, &weights, ctx, stream);
+    model_ptr.* = try deepseek_v4_loader.buildDSV4Model(allocator, &dsv4_config, &weights, ctx, stream, smelt);
 
     const adapter = try allocator.create(DeepseekV4VTableAdapter);
     errdefer allocator.destroy(adapter);
@@ -249,10 +262,12 @@ fn gemmaLoader(
     model_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
 ) anyerror!ModelVTable {
     // Gemma shares enough structure with LLaMA that the same loader works
     // for basic inference. GeGLU vs SwiGLU difference is minor for initial support.
-    return llamaLoader(allocator, config_json, model_path, ctx, stream);
+    return llamaLoader(allocator, config_json, model_path, ctx, stream, io, smelt);
 }
 
 // ============================================================
@@ -268,17 +283,95 @@ fn glm4Loader(
     model_path: []const u8,
     ctx: EagerContext,
     stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
 ) anyerror!ModelVTable {
     // GLM-4 shares the same decoder-only transformer architecture as LLaMA
     // with attention bias (like Qwen2). The LLaMA loader handles bias weights.
-    return llamaLoader(allocator, config_json, model_path, ctx, stream);
+    return llamaLoader(allocator, config_json, model_path, ctx, stream, io, smelt);
+}
+
+// ============================================================
+// VTable adapter: LLaVA
+// ============================================================
+
+const llava = @import("vision/llava.zig");
+
+/// Wraps a heap-allocated `LlavaModel` behind the `ModelVTable` interface.
+const LlavaVTableAdapter = struct {
+    model: *llava.LlavaModel,
+
+    fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
+        const self: *LlavaVTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        return self.model.forward(input, mask, caches);
+    }
+
+    fn forwardWithHidden(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!generation.ForwardWithHiddenResult {
+        const self: *LlavaVTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        return self.model.forwardWithHidden(input, mask, caches);
+    }
+
+    fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *LlavaVTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        self.model.deinit();
+        allocator.destroy(self.model);
+        allocator.destroy(self);
+    }
+};
+
+fn llavaLoader(
+    allocator: std.mem.Allocator,
+    config_json: []const u8,
+    model_path: []const u8,
+    ctx: EagerContext,
+    stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
+) anyerror!ModelVTable {
+    _ = io;
+    _ = smelt;
+    // Parse the full LLaVA config to extract text_config
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, config_json, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const text_config_value = root.get("text_config") orelse parsed.value;
+    const text_config_json = try std.json.Stringify.valueAlloc(allocator, text_config_value, .{});
+    defer allocator.free(text_config_json);
+
+    const llama_config = try hf_config.parseLlamaConfig(allocator, text_config_json);
+
+    const model_ptr = try allocator.create(llava.LlavaModel);
+    errdefer allocator.destroy(model_ptr);
+
+    model_ptr.* = try llava_loader.loadLlavaModelFromConfig(allocator, model_path, &llama_config, ctx, stream);
+
+    const adapter = try allocator.create(LlavaVTableAdapter);
+    errdefer allocator.destroy(adapter);
+    adapter.* = .{ .model = model_ptr };
+
+    const head_dim = llama_config.getHeadDim();
+
+    return ModelVTable{
+        .forward = &LlavaVTableAdapter.forward,
+        .forwardWithHidden = &LlavaVTableAdapter.forwardWithHidden,
+        .deinit = &LlavaVTableAdapter.deinitFn,
+        .config = ModelConfig{
+            .num_layers = llama_config.num_hidden_layers,
+            .num_kv_heads = llama_config.num_key_value_heads,
+            .head_dim = head_dim,
+            .vocab_size = llama_config.vocab_size,
+            .hidden_size = llama_config.hidden_size,
+        },
+        .ptr = adapter,
+    };
 }
 
 // ============================================================
 // Tests
 // ============================================================
 
-test "registry contains all nine architectures" {
+test "registry contains all ten architectures" {
     const expected = [_][]const u8{
         "LlamaForCausalLM",
         "DeepseekV4ForCausalLM",
@@ -289,6 +382,7 @@ test "registry contains all nine architectures" {
         "Glm4ForCausalLM",
         "PhiForCausalLM",
         "Phi3ForCausalLM",
+        "LlavaForConditionalGeneration",
     };
     for (expected) |arch| {
         try std.testing.expect(model_registry.get(arch) != null);
@@ -302,6 +396,12 @@ test "registry lookup fails for unknown architecture" {
 
 test "getLoader returns loader for registered architectures" {
     const loader = try getLoader("LlamaForCausalLM");
+    try std.testing.expect(@intFromPtr(loader) != 0);
+}
+
+test "registry contains LlavaForConditionalGeneration" {
+    try std.testing.expect(model_registry.get("LlavaForConditionalGeneration") != null);
+    const loader = try getLoader("LlavaForConditionalGeneration");
     try std.testing.expect(@intFromPtr(loader) != 0);
 }
 

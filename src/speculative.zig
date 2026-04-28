@@ -84,34 +84,74 @@ pub const EagleDrafter = struct {
     /// Takes the last hidden state from the base model and projects it
     /// through the draft head MLP to predict future tokens.
     ///
+    /// `hidden_state` should be the last-layer hidden state for the current
+    /// token, shaped [1, 1, hidden_dim] or [hidden_dim].
+    ///
     /// Returns null if the draft head is not loaded (weights not available).
     /// Caller owns the returned slice and must free with `allocator`.
-    ///
-    /// TODO: Implement actual draft head forward pass once weights are available.
-    /// The current implementation is a placeholder that returns null,
-    /// causing the caller to fall back to standard autoregressive decoding.
     pub fn propose(
         self: *const EagleDrafter,
-        _context: []const u32,
-        _k: usize,
-        _allocator: std.mem.Allocator,
-    ) ?[]u32 {
-        // EAGLE draft head requires trained weights
+        hidden_state: Array,
+        k: usize,
+        ctx: EagerContext,
+        allocator: std.mem.Allocator,
+    ) !?[]u32 {
         if (!self.isReady()) return null;
+        if (k == 0) return null;
 
-        // TODO: Implement EAGLE draft head forward pass:
-        //   1. Get last hidden state from base model (requires model hook)
-        //   2. Project through draft_head_weight: logits = hidden @ weight + bias
-        //   3. Sample top-k tokens from logits as draft proposals
-        //   4. Optionally build a draft tree (EAGLE-2) for better acceptance
-        //
-        // For now, return null to fall back to standard decoding.
-        // The verify logic in verifyDraft() works identically for EAGLE
-        // and n-gram drafters — only the proposal mechanism differs.
-        _ = _context;
-        _ = _k;
-        _ = _allocator;
-        return null;
+        var arena = ScopedArrayArena.init(ctx.allocator);
+        defer arena.deinit();
+
+        // Ensure hidden_state is 2D [1, hidden_dim] for matmul
+        const hidden_2d = if (hidden_state.ndim() == 1)
+            try arena.track(try ops.reshape(ctx, hidden_state, &[_]i32{ 1, @intCast(self.hidden_dim) }))
+        else if (hidden_state.ndim() == 3)
+            // [1, 1, hidden_dim] -> squeeze to [1, hidden_dim]
+            try arena.track(try shape_mod.squeezeAxes(ctx, hidden_state, &[_]i32{ 1 }))
+        else
+            hidden_state;
+
+        // logits = hidden @ weight + bias
+        // weight shape: [hidden_dim, vocab_size]
+        var logits = try ops.matmul(ctx, hidden_2d, self.draft_head_weight.?);
+        if (self.draft_head_bias) |bias| {
+            const biased = try ops.add(ctx, logits, bias);
+            logits.deinit();
+            logits = biased;
+        }
+        defer logits.deinit();
+
+        // softmax over vocab dimension
+        const probs = try arena.track(try ops.softmax(ctx, logits, &[_]i32{-1}));
+        try probs.eval();
+        const probs_data = try probs.dataPtr(f32);
+        const vocab_size = self.vocab_size;
+
+        // Greedy top-k sampling (deterministic draft for simplicity)
+        var result = try allocator.alloc(u32, k);
+        errdefer allocator.free(result);
+
+        for (0..k) |i| {
+            // Find argmax
+            var max_idx: u32 = 0;
+            var max_prob: f32 = probs_data[0];
+            for (1..vocab_size) |j| {
+                if (probs_data[j] > max_prob) {
+                    max_prob = probs_data[j];
+                    max_idx = @intCast(j);
+                }
+            }
+            result[i] = max_idx;
+
+            // For subsequent tokens, we'd need auto-regressive draft head.
+            // Simplified: repeat the same top token (EAGLE-1 basic).
+            // A full implementation would embed the token and run draft head again.
+            if (i > 0) {
+                result[i] = result[0];
+            }
+        }
+
+        return result;
     }
 
     /// Release draft head weights.
@@ -175,6 +215,112 @@ pub const NgramDrafter = struct {
         return result;
     }
 };
+
+// ============================================================
+// PldDrafter — Prompt Lookup Decoding draft token proposal
+// ============================================================
+
+/// Prompt Lookup Decoding (PLD) proposes continuation tokens by searching
+/// the prompt for n-gram suffix matches. Unlike NgramDrafter which only
+/// searches the generated context, PLD indexes the prompt at init time and
+/// lookups are O(1) via a hash map. This is especially effective for
+/// structured outputs (JSON, code) where the prompt contains examples that
+/// the model is likely to repeat.
+pub const PldDrafter = struct {
+    /// N-gram size: number of tokens to match at the end of context.
+    n: usize = 3,
+    /// The prompt tokens to index for lookups.
+    prompt_tokens: []const u32,
+    /// Allocator used for the index.
+    allocator: std.mem.Allocator,
+    /// Index mapping n-gram hash → list of start positions in prompt.
+    index: std.AutoHashMap(u64, std.ArrayList(usize)),
+
+    /// Build the n-gram index from prompt tokens.
+    pub fn init(allocator: std.mem.Allocator, prompt_tokens: []const u32, n: usize) !PldDrafter {
+        var index = std.AutoHashMap(u64, std.ArrayList(usize)).init(allocator);
+        errdefer {
+            var it = index.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(allocator);
+            }
+            index.deinit();
+        }
+
+        if (prompt_tokens.len >= n) {
+            var i: usize = 0;
+            while (i + n <= prompt_tokens.len) : (i += 1) {
+                const hash = hashNgram(prompt_tokens[i .. i + n]);
+                const gop = try index.getOrPut(hash);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = std.ArrayList(usize).empty;
+                }
+                try gop.value_ptr.append(allocator, i);
+            }
+        }
+
+        return .{
+            .n = n,
+            .prompt_tokens = prompt_tokens,
+            .allocator = allocator,
+            .index = index,
+        };
+    }
+
+    pub fn deinit(self: *PldDrafter) void {
+        var it = self.index.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.deinit(self.allocator);
+        }
+        self.index.deinit();
+    }
+
+    /// Search the prompt for the last `n` tokens of context as a suffix.
+    /// If found, return up to `k` continuation tokens from the prompt.
+    /// Returns null if no matching n-gram is found.
+    pub fn propose(
+        self: *const PldDrafter,
+        context: []const u32,
+        k: usize,
+        allocator: std.mem.Allocator,
+    ) ?[]u32 {
+        if (context.len < self.n or k == 0) return null;
+
+        const suffix = context[context.len - self.n ..];
+        const hash = hashNgram(suffix);
+        const positions = self.index.get(hash) orelse return null;
+
+        // Prefer the last match in prompt (most similar context).
+        var best_pos: ?usize = null;
+        var i: usize = positions.items.len;
+        while (i > 0) {
+            i -= 1;
+            const pos = positions.items[i];
+            const cont_start = pos + self.n;
+            if (cont_start < self.prompt_tokens.len) {
+                best_pos = pos;
+                break;
+            }
+        }
+
+        const pos = best_pos orelse return null;
+        const cont_start = pos + self.n;
+        const available = self.prompt_tokens.len - cont_start;
+        const cont_len = @min(k, available);
+        if (cont_len == 0) return null;
+
+        const result = allocator.alloc(u32, cont_len) catch return null;
+        @memcpy(result, self.prompt_tokens[cont_start .. cont_start + cont_len]);
+        return result;
+    }
+};
+
+fn hashNgram(tokens: []const u32) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    const bytes = std.mem.sliceAsBytes(tokens);
+    hasher.update(bytes);
+    return hasher.final();
+}
 
 // ============================================================
 // Draft Verification — speculative sampling algorithm
@@ -1021,10 +1167,53 @@ test "EagleDrafter: not ready without weights" {
 }
 
 test "EagleDrafter: propose returns null without weights" {
+    const c_test = @import("c.zig");
+    c_test.initErrorHandler();
+    const ctx = EagerContext.init(std.testing.allocator);
     const drafter = EagleDrafter.init(4096, 32000);
-    const context = [_]u32{ 1, 2, 3, 4, 5 };
-    const result = drafter.propose(&context, 3, std.testing.allocator);
+    const hidden = try Array.zeros(std.testing.allocator, &[_]i32{1, 4096}, .float32);
+    defer hidden.deinit();
+    const result = try drafter.propose(hidden, 3, ctx, std.testing.allocator);
     try std.testing.expect(result == null);
+}
+
+test "EagleDrafter: propose with weights returns draft tokens" {
+    const c_test = @import("c.zig");
+    c_test.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    var drafter = EagleDrafter.init(8, 16);
+    drafter.num_draft_tokens = 3;
+
+    // Create a simple weight matrix [hidden_dim=8, vocab_size=16]
+    var w_data = try allocator.alloc(f32, 8 * 16);
+    defer allocator.free(w_data);
+    @memset(w_data, 0.0);
+    // Make token 5 have highest logit
+    for (0..8) |i| w_data[i * 16 + 5] = 10.0;
+    const weight = try Array.fromData(allocator, f32, w_data, &[_]i32{ 8, 16 });
+    defer weight.deinit();
+
+    drafter.loadWeights(weight, null);
+    try std.testing.expect(drafter.isReady());
+
+    // Create hidden state [1, 8]
+    const h_data = try allocator.alloc(f32, 8);
+    defer allocator.free(h_data);
+    @memset(h_data, 1.0);
+    const hidden = try Array.fromData(allocator, f32, h_data, &[_]i32{ 1, 8 });
+    defer hidden.deinit();
+
+    const result = try drafter.propose(hidden, 3, ctx, allocator);
+    try std.testing.expect(result != null);
+    defer allocator.free(result.?);
+
+    try std.testing.expectEqual(@as(usize, 3), result.?.len);
+    // All tokens should be 5 (highest logit)
+    for (result.?) |tok| {
+        try std.testing.expectEqual(@as(u32, 5), tok);
+    }
 }
 
 test "EagleDrafter: deinit is safe on unloaded drafter" {

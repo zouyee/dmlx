@@ -43,6 +43,7 @@ pub const RotatingKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -154,6 +155,16 @@ pub const RotatingKVCache = struct {
         const self: *RotatingKVCache = @ptrCast(@alignCast(ctx));
         self.total_tokens = 0;
         self.cursor = 0;
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *RotatingKVCache = @ptrCast(@alignCast(ctx));
+        self.total_tokens = to_len;
+        if (to_len <= self.window_size) {
+            self.cursor = to_len;
+        } else {
+            self.cursor = to_len % self.window_size;
+        }
     }
 
     fn filterImpl(

@@ -267,6 +267,12 @@ fn sampleFromProbs(probs: []const f32, n: usize, rand: std.Random) u32 {
     return @intCast(n - 1);
 }
 
+/// Result of sampling a token from logits.
+pub const SampleResult = struct {
+    token: u32,
+    logprob: f32,
+};
+
 /// Configurable sampler that bundles temperature, top_k, top_p, repetition_penalty.
 pub const SamplerConfig = struct {
     temperature: f32 = 1.0,
@@ -289,7 +295,7 @@ pub const SamplerConfig = struct {
         };
     }
 
-    pub fn sample(self: *SamplerConfig, logits: Array, allocator: std.mem.Allocator) !u32 {
+    pub fn sample(self: *SamplerConfig, logits: Array, allocator: std.mem.Allocator) !SampleResult {
         // Apply repetition penalty if enabled
         var penalized_logits = logits;
         var owned_penalty_array = false;
@@ -304,13 +310,15 @@ pub const SamplerConfig = struct {
             }
         }
 
-        if (self.temperature <= 0.0) {
-            return greedy(penalized_logits, allocator, self.temperature);
-        }
-        if (self.top_p >= 1.0 and self.top_k >= penalized_logits.size()) {
-            return temperatureSample(penalized_logits, allocator, self.temperature, self.prng.random());
-        }
-        return topKTopPSampler(penalized_logits, allocator, self.temperature, self.top_k, self.top_p, self.prng.random());
+        const token: u32 = if (self.temperature <= 0.0)
+            try greedy(penalized_logits, allocator, self.temperature)
+        else if (self.top_p >= 1.0 and self.top_k >= penalized_logits.size())
+            try temperatureSample(penalized_logits, allocator, self.temperature, self.prng.random())
+        else
+            try topKTopPSampler(penalized_logits, allocator, self.temperature, self.top_k, self.top_p, self.prng.random());
+
+        const logprob = try computeLogprob(penalized_logits, token, allocator);
+        return SampleResult{ .token = token, .logprob = logprob };
     }
 };
 
@@ -341,4 +349,69 @@ fn applyRepetitionPenalty(logits: Array, context_tokens: []const u32, penalty: f
 
     // Create new Array from penalized logits
     return Array.fromData(allocator, f32, penalized, &[_]i32{@intCast(vocab_size)});
+}
+
+/// Compute the log-probability of a specific token given logits.
+fn computeLogprob(logits: Array, target_token: u32, allocator: std.mem.Allocator) !f32 {
+    _ = allocator;
+    try logits.eval();
+    const data = try logits.dataPtr(f32);
+    const vocab_size = logits.size();
+    if (target_token >= vocab_size) return -std.math.inf(f32);
+
+    var max_logit: f32 = data[0];
+    for (1..vocab_size) |i| {
+        if (data[i] > max_logit) max_logit = data[i];
+    }
+
+    var sum_exp: f32 = 0;
+    for (0..vocab_size) |i| {
+        sum_exp += @exp(data[i] - max_logit);
+    }
+
+    const log_sum_exp = max_logit + @log(sum_exp);
+    return data[target_token] - log_sum_exp;
+}
+
+/// Extract the top-K tokens and their log-probabilities from logits.
+/// Caller owns the returned slice and must free with allocator.
+pub fn extractTopLogprobs(logits: Array, k: usize, allocator: std.mem.Allocator) ![]const struct { token: u32, logprob: f32 } {
+    try logits.eval();
+    const data = try logits.dataPtr(f32);
+    const vocab_size = logits.size();
+
+    var max_logit: f32 = data[0];
+    for (1..vocab_size) |i| {
+        if (data[i] > max_logit) max_logit = data[i];
+    }
+
+    var sum_exp: f32 = 0;
+    for (0..vocab_size) |i| {
+        sum_exp += @exp(data[i] - max_logit);
+    }
+    const log_sum_exp = max_logit + @log(sum_exp);
+
+    const actual_k = @min(k, vocab_size);
+    var scored = try allocator.alloc(struct { token: u32, logprob: f32 }, vocab_size);
+    defer allocator.free(scored);
+
+    for (0..vocab_size) |i| {
+        scored[i] = .{
+            .token = @intCast(i),
+            .logprob = data[i] - log_sum_exp,
+        };
+    }
+
+    // Sort descending by logprob
+    std.sort.insertion(struct { token: u32, logprob: f32 }, scored[0..vocab_size], {}, struct {
+        fn lessThan(_: void, a: @TypeOf(scored[0]), b: @TypeOf(scored[0])) bool {
+            return a.logprob > b.logprob;
+        }
+    }.lessThan);
+
+    const result = try allocator.alloc(struct { token: u32, logprob: f32 }, actual_k);
+    for (0..actual_k) |i| {
+        result[i] = scored[i];
+    }
+    return result;
 }

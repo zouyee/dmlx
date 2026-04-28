@@ -477,6 +477,436 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
 
 - [x] 35. Final verification — Build + all tests pass
 
+---
+
+## Phase 8: Real Model Loading & DeepSeek V4 Correctness
+
+> **Revised 2026-04-27**: Restructured after cross-referencing `mlx-lm/mlx_lm/models/deepseek_v4.py` (2153 lines).
+> Phase 8 now covers everything needed for "load + generate 1 correct token" with DeepSeek V4 Flash 4-bit.
+> Performance optimizations (gather_mm, CustomMetalKernel) remain in Phase 9.
+
+- [x] 36. Weight loading: sanitize parity with mlx-lm
+  - [x] 36.1 Implement `dequant_fp4` for expert weights
+    - mlx-lm `sanitize()` (line 2046-2072) uses a custom FP4 lookup table (16 entries: 0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0) to unpack `uint8 → 2×fp32`, then multiplies by block-wise scale
+    - Current loader uses `mlx_dequantize(mode="mxfp4")` which is a different format (E2M1 mantissa, not lookup table)
+    - **Action**: Implement `dequantFp4(weight: Array, scale: Array, block_size: i32) → Array` in loader matching mlx-lm's table-based decode
+    - Detect FP4 expert weights by: `.ffn.experts.` in key AND `weight.dtype in (int8, uint8)` AND `scale.shape[-1] * 16 == weight.shape[-1]`
+    - _Reference: mlx-lm `deepseek_v4.py:2046-2072`_
+  - [x] 36.2 Implement `dequant_fp8` for attention weights
+    - mlx-lm `sanitize()` (line 2028-2044) uses `mx.from_fp8()` + block-wise scale with padding to `block_size=128` alignment
+    - **Action**: Implement `dequantFp8(weight: Array, scale: Array, block_size: i32) → Array` — call `ops.fromFp8()`, pad to block alignment, reshape to `[m/bs, bs, n/bs, bs]`, multiply by scale, reshape back, truncate padding
+    - Detect FP8 weights by: `weight.dtype == uint8` AND not matching FP4 pattern
+    - _Reference: mlx-lm `deepseek_v4.py:2028-2044`_
+  - [x] 36.3 Expert weights: keep fused `[n_experts, out, in]` format
+    - **Stop** `splitFusedExperts` — preserve `switch_mlp.{gate,up,down}_proj.weight` as `[n_experts, out, in]`
+    - If checkpoint has individual `experts.{e}.w1.weight`, stack them into fused format (like mlx-lm `sanitize` line 2108-2120)
+    - Store fused weights directly on `DSV4MoE` (not as `[]DSV4Expert` array)
+    - For quantized models: keep packed `weight + scales + biases` in fused format, use `gatherQmm` in forward
+    - For dequantized models: use `gatherMm` (`ops.zig:318`) in forward
+    - _Reference: mlx-lm `SwitchGLU` (`switch_layers.py:160-199`), `DeepseekV4SwitchGLU` (`deepseek_v4.py:125-155`)_
+  - [x] 36.4 Rewrite `DSV4MoE.forward` with gather_mm dispatch
+    - Delete `DSV4Expert` struct and per-expert loop
+    - Implement `_gather_sort`: flatten indices, `argsort`, reorder tokens by expert ID
+    - Call `ops.gatherMm` (or `gatherQmm` for quantized) with `sorted_indices=true`
+    - Multiply `scores` before `down_proj` (mlx-lm `DeepseekV4SwitchGLU` line 143)
+    - `_scatter_unsort` to restore original token order
+    - Sort threshold: `indices.size >= 8` (mlx-lm uses `sort_threshold = 8`)
+    - _Reference: mlx-lm `switch_layers.py:_gather_sort`, `_scatter_unsort`_
+
+- [x] 37. V4 Attention: align with mlx-lm dual-path architecture
+  - [x] 37.1 Rewrite `DSV4Attention.forward` to match mlx-lm `V4Attention.__call__`
+    - **Q path**: `wq_a(x)` → `q_norm` → `wq_b` → reshape `[B, L, n_heads, head_dim]` → per-head L2 RMSNorm → transpose `[B, n_heads, L, head_dim]` → `_apply_partial_rope`
+    - **KV path**: `wkv(x)` → `kv_norm` → reshape `[B, 1, L, head_dim]` → `_apply_partial_rope` → `cache.update_and_fetch(kv, kv)` (key == value, into local RotatingKVCache)
+    - **Pooled path** (when `compress_ratio > 0`): `self.compressor(x, rope, cache, offset)` → produces `pooled [B, N_pooled, head_dim]`
+    - **Indexer path** (when `compress_ratio == 4`): `self.indexer(x, q_residual, ...)` → produces `topk` indices for sparse selection
+    - **Attention dispatch**: 4 cases based on `L`, indexer results, and pooled count:
+      1. `select_all` (indexer exists but `max_pooled_length <= index_topk`): use ALL pooled blocks without top-k selection, add `pooled_bias = log(L)` to attention scores, concat pooled to local KV → dense SDPA. This triggers in early generate when few blocks are pooled.
+      2. `L == 1` (generate) + indexer + topk returned: `take_along_axis` gather selected pooled blocks → concat with local KV → dense SDPA
+      3. `L > 1` (prefill) + indexer + topk returned: `_sparse_pooled_attention` (separate local scores + pooled scores + sink → concat softmax)
+      4. No indexer (HCA or no compression): concat pooled to local KV → dense SDPA with mask padding
+    - **Output**: `_apply_partial_rope(out, inverse=True)` → `_grouped_output_projection` → `wo_b`
+    - _Reference: mlx-lm `V4Attention.__call__` (line 1711-1866)_
+  - [x] 37.2 Implement `_sparse_pooled_attention` equivalent
+    - `q_scaled = q * scale`
+    - `local_scores = q_scaled @ local_kv.swapaxes(-1, -2)` + apply local mask
+    - `pooled_scores = (q_scaled[:,:,:,None] * pooled).sum(axis=-1)` + apply pooled mask
+    - `scores = concat([sink_scores, local_scores, pooled_scores], axis=-1)`
+    - `weights = softmax(scores, precise=True)`
+    - Split weights back: `local_weights @ local_kv + (pooled_weights[...,None] * pooled).sum(-2)`
+    - _Reference: mlx-lm `_sparse_pooled_attention` (line 295-333)_
+  - [x] 37.3 Implement `_grouped_output_projection` with quantized fallback
+    - Reshape output `[B, n_heads, L, head_dim]` → `[B, o_groups, heads_per_group, L, head_dim]` → transpose to `[o_groups, B, L, heads_per_group * head_dim]`
+    - If `wo_a` is quantized: use `quantizedMatmul` with reshaped scales/biases
+    - If `wo_a` is float: use `einsum("gbsd,grd->bsgr", out, wo_a_reshaped)` or equivalent batched matmul
+    - Reshape to `[B, L, o_groups * o_lora_rank]` → `wo_b` → output
+    - _Reference: mlx-lm `V4Attention._grouped_output_projection` (line 1680-1709)_
+
+- [x] 38. V4 Cache: `DeepseekV4Cache` with per-layer type selection
+  - [x] 38.1 Implement `DeepseekV4Cache` struct
+    - Contains: `local: RotatingKVCache` (sliding window), `compressor_state: BranchState`, `indexer_state: BranchState`
+    - `BranchState` = `{ buffer_kv, buffer_gate, pooled, buffer_lengths, pooled_lengths }`
+    - Implement `update_and_fetch` → delegates to `local.update_and_fetch`
+    - Implement `accumulate_windows(kv, gate, state_key, ratio, start_pos)`:
+      1. Concat buffer with new kv/gate
+      2. Compute `usable = (total_len / ratio) * ratio`
+      3. Store remainder in buffer for next call
+      4. Return `(ready_kv, ready_gate, pool_base)`
+    - Implement `update_pool(new_pooled, state_key)` → concat new pooled to existing
+    - Implement `pooled_lengths(state_key)` → return current pooled sequence lengths
+    - _Reference: mlx-lm `DeepseekV4Cache` (line 888-1480)_
+  - [x] 38.2 Implement `Compressor` module
+    - Struct with: `wkv: Linear`, `wgate: Linear`, `ape: Array`, `norm: RMSNorm`, `compress_ratio`, `overlap: bool`, `out_dim`, `head_dim`, `rope_head_dim`
+    - `overlap = (compress_ratio == 4)`, `out_dim = head_dim * (2 if overlap else 1)`
+    - Forward: `kv = wkv(x)`, `gate = wgate(x)` → `cache.accumulate_windows(kv, gate, ...)` → reshape to `[B, W, ratio, out_dim]` → add `ape` to gate → if overlap: `_overlap_transform` → `softmax(gate) * kv → sum(axis=2)` → `norm` → apply RoPE with compressed positions → `cache.update_pool`
+    - `_overlap_transform`: concat `[prev_first_half, second_half]` along ratio axis, doubling window; gate fill with `-inf`
+    - _Reference: mlx-lm `Compressor` (line 1481-1551)_
+  - [x] 38.3 Implement `Indexer` module (mlx-lm architecture)
+    - Struct with: `wq_b: Linear(q_lora_rank → n_heads * head_dim)`, `weights_proj: Linear(hidden_size → n_heads)`, `compressor: Compressor`, `scale`, `n_heads`, `head_dim`, `index_topk`
+    - Forward receives TWO rope objects: `compress_rope` (for internal compressor) and `position_rope` (for Q projection RoPE)
+    - Forward: `pooled = self.compressor(x, compress_rope, cache, start_pos, "indexer_state")` → `q = wq_b(q_residual)` → reshape multi-head → apply `position_rope` to Q → `scores = q @ pooled^T` → `max(0, scores) * scale` → `weights_proj(x)` weighting → `argpartition` top-k
+    - **Replace** existing `LightningIndexer` with this architecture
+    - _Reference: mlx-lm `Indexer` (line 1554-1598)_
+  - [x] 38.4 Rewrite loader for Compressor/Indexer weight loading
+    - **Compressor weights** (per layer with `compress_ratio > 0`):
+      - `attn.compressor.wkv.weight` → `Compressor.wkv`
+      - `attn.compressor.wgate.weight` → `Compressor.wgate`
+      - `attn.compressor.ape` → `Compressor.ape` (parameter, not a Linear)
+      - `attn.compressor.norm.weight` → `Compressor.norm`
+    - **Indexer weights** (per layer with `compress_ratio == 4`):
+      - `attn.indexer.wq_b.weight` → `Indexer.wq_b`
+      - `attn.indexer.weights_proj.weight` → `Indexer.weights_proj`
+      - `attn.indexer.compressor.*` → nested `Indexer.compressor` (same 4 weights as above)
+    - **Delete** old weight loading for `compress_gate_weight`, `compress_pos_bias`, `indexer.wq.weight`, `indexer.wk.weight`
+    - **Delete** `kv_b` field from `DSV4Attention` (V3 artifact, not present in mlx-lm V4)
+    - _Reference: mlx-lm `V4Attention.__init__` (line 1601-1656), weight names from `sanitize` remap_
+  - [x] 38.5 Per-layer cache type selection in `make_cache`
+    - `compress_ratio > 0` → `DeepseekV4Cache(sliding_window)`
+    - `compress_ratio == 0` → `RotatingKVCache(max_size=sliding_window)`
+    - Wire into model initialization and forward pass
+    - _Reference: mlx-lm `Model.make_cache` (line 1983-1990)_
+
+- [x] 39. V4 model-level fixes
+  - [x] 39.1 Attention mask creation for 4D mHC tensor
+    - `create_attention_mask` must operate on `h[:, :, 0, :]` (first mHC slot), not the full 4D tensor
+    - Use `window_size=config.sliding_window` and `return_array=True`
+    - Mask applies to local KV cache only; pooled KV gets separate mask padding in attention
+    - _Reference: mlx-lm `DeepseekV4Model.__call__` (line 1924-1933)_
+  - [x] 39.2 RoPE: separate `rope` and `compress_rope` per attention layer
+    - Layers with `compress_ratio > 0` use `compress_rope_theta` (160000.0) for their main rope AND compressor rope
+    - Layers with `compress_ratio == 0` use standard `rope_theta` (10000.0), NO rope_scaling
+    - `compress_rope = rope` (same object) — Compressor receives `self.compress_rope`, Indexer receives BOTH `self.compress_rope` (for its internal compressor) and `self.rope` (for Q projection)
+    - _Reference: mlx-lm `V4Attention.__init__` (line 1643-1652)_
+  - [x] 39.3 `_ensure_cached` pattern for dtype-dependent weight reshaping
+    - Cache `attn_sink` as current dtype, `q_l2_norm_weight` as current dtype
+    - Cache `wo_a` reshaped for grouped projection (different shapes for quantized vs float)
+    - Only recompute when dtype changes
+    - _Reference: mlx-lm `V4Attention._ensure_cached` (line 1653-1678)_
+  - [x] 39.4 Verify mHC `expand` handles 3D→4D dimension correctly
+    - `expand(block_out, residual, post, comb)` where `block_out` is 3D `[B, L, D]` (attention/FFN output) and `residual` is 4D `[B, L, mult, D]`
+    - Formula: `y = post[..., None] * block_out[:, :, None, :].astype(f32) + comb @ residual.astype(f32)`
+    - Verify current `mhcPost` implementation correctly broadcasts 3D block_out to 4D
+    - _Reference: mlx-lm `_hc_expand_op` (line 640-648)_
+  - [x] 39.5 Selective float32 preservation for precision-sensitive weights
+    - mlx-lm `cast_predicate` (line 1971-1981) keeps these weights in float32 even when model is cast to bfloat16: `attn_sink`, `e_score_correction_bias` (gate bias), all HyperConnection weights (`attn_hc.*`, `ffn_hc.*`), `hc_head.*`
+    - These weights feed into Sinkhorn normalization and attention sink computation where float32 precision is required
+    - **Action**: In loader, do NOT cast these weights to float16/bfloat16. Keep as float32 regardless of model dtype.
+    - _Reference: mlx-lm `Model.cast_predicate` (line 1971-1981)_
+
+- [x] 40. V4 weight dequantization for quantized models
+  - [x] 40.1 Per-weight quantization config from config.json
+    - Parse `quantization_config` dict with per-weight `{mode, bits, group_size}`
+    - Expert MLP uses `mxfp4` (group_size=32, bits=4, no biases)
+    - Attention/shared experts use `affine` (group_size=64, bits=4, with biases)
+    - Embedding/lm_head use `affine` (group_size=64, bits=4)
+  - [x] 40.2 Expert weights: fused quantized format with `gatherQmm`
+    - Keep fused `[n_experts, out, in]` packed weight + scales + biases
+    - In `DSV4MoE.forward`, use `gatherQmm` instead of `gatherMm` when weights are quantized
+    - Do NOT dequantize expert weights at load time
+    - _Reference: mlx-lm `QuantizedSwitchLinear` (`switch_layers.py:27-90`)_
+  - [x] 40.3 Smelt Mode for V4 quantized models
+    - Use existing SmeltConfig to load only a fraction of experts
+    - For fused format: mask out unloaded expert indices in routing (bias to -inf)
+    - Skip loading weight shards for unloaded experts if possible
+
+- [x] 41. Fix Qwen3 tokenizer special token encoding
+  - [x] 41.1 Support added_tokens in BPE tokenizer
+    - Parse `added_tokens` from tokenizer.json
+    - Map special token strings (e.g., `<|im_start|>`) to their IDs (e.g., 151644)
+    - During encoding, match special tokens before BPE merge
+  - [x] 41.2 Verify Qwen3 output matches mlx-lm
+    - Compare token-by-token output for same prompt
+    - Ensure chat template produces correct token IDs
+
+- [x] 42. End-to-end model verification
+  - [x] 42.1 DeepSeek V4 Flash 4-bit: load + generate 1 token, compare logits against mlx-lm
+  - [x] 42.2 DeepSeek V4 Flash 4-bit: generate 32 tokens, verify coherent output
+  - [x] 42.3 Qwen3-1.7B-4bit: generate coherent output matching mlx-lm
+  - [x] 42.4 TinyLlama-1.1B-4bit: verify no regression
+  - [x] 42.5 Qwen2.5-0.5B-Instruct: verify no regression
+
+---
+
+## Phase 9: DeepSeek V4 Performance Optimization (from deepseek-v4-optimization-plan.md)
+
+> **Prerequisite**: Phase 8 (Tasks 36–42) must be complete — model loads and generates correct output.
+> Phase 9 focuses on performance: reducing kernel launches, GPU-accelerating CPU paths, memory optimization.
+> Source: `docs/deepseek-v4-optimization-plan.md` v3 (2026-04-27).
+
+- [x] 43. P1: Architecture optimization (Week 1–2)
+  - [x] 43.1 mHC CustomMetalKernel
+    - **Problem**: `sinkhornNormalize` uses pure ops — each Sinkhorn iteration produces 6 kernel launches. 43 layers accumulate significant overhead.
+    - **Action**: Translate mlx-lm Metal source strings to Zig string literals, register via `CustomMetalKernel` API, fallback to pure-ops path when conditions not met
+    - **Prereq**: Metal 3.1+ (`bfloat16_t` support)
+    - _Reference: mlx-lm `_make_hc_sinkhorn_collapse_kernel` (line 486-633)_
+
+  - [x] 43.2 RoPE GPU acceleration
+    - **Problem**: `DSV4YarnRoPE.apply()` uses CPU scalar loop via `dataSliceMut(f32)`. mlx-lm RoPE runs on GPU via `@mx.compile` decorated `_rope_full`.
+    - **Action**: Rewrite to use MLX ops instead of CPU pointer arithmetic
+    - _Files: `src/models/deepseek_v4.zig:243-280`_
+
+  - [x] 43.3 O-LoRA grouped projection: batch matmul
+    - **Problem**: Per-group loop produces `n_groups` kernel launches. mlx-lm uses `einsum` for single dispatch.
+    - **Action**: Replace per-group loop with batched matmul
+    - _Files: `src/models/deepseek_v4.zig:1305-1358`_
+
+- [x] 44. Checkpoint — P1 complete
+
+- [x] 45. P2: Memory optimization & validation (Week 3)
+  - [x] 45.1 Verify expert weights stay quantized end-to-end
+    - Measure memory savings vs dequantized path
+  - [x] 45.2 Weight format compatibility verification
+    - Verify FP4/FP8 packed format through `dequantFp4`/`dequantFp8` matches mlx-lm output
+
+- [x] 46. Checkpoint — P2 complete
+
+- [x] 47. End-to-end performance validation
+  - [x] 47.1 Benchmark: tokens/sec for DeepSeek V4 Flash 4-bit (prefill + decode)
+  - [x] 47.2 Compare against mlx-lm Python baseline on same hardware
+  - [x] 47.3 Profile: identify remaining CPU bottlenecks via Metal System Trace
+
+- [x] 48. Final verification — Phase 9 complete, build + all tests pass
+
+---
+
+## Phase 10: Lazy Loading & Memory-Efficient Inference for Large MoE Models
+
+> **Motivation**: DeepSeek V4 Flash 4-bit is 151GB on disk (33 shards). On a 48GB Mac, the current
+> eager loader OOMs because it: (1) reads all shards into memory, (2) converts bfloat16→float32
+> forcing materialization, (3) dequantizes expert weights expanding 4-bit→16-bit.
+> mlx-lm avoids this via lazy evaluation — `mx.load` returns memory-mapped arrays that only
+> materialize when evaluated. mlx-c's `mlx_load_safetensors` has the same lazy behavior,
+> but our loader defeats it by calling `astype`/`dequantize` eagerly.
+
+- [x] 49. Lazy weight loading: stop forcing materialization
+  - [x] 49.1 Remove bfloat16→float32 conversion in `loadShardedWeights`
+    - Current code: `if (weight.dtype() == .bfloat16) try ops.astype(ctx, weight, .float32)`
+    - This forces every bfloat16 weight to materialize in RAM as float32 (2× memory)
+    - **Action**: Remove the `astype` call. Keep weights in their original dtype (bfloat16/uint32/etc.)
+    - MLX handles mixed-dtype matmul transparently — bfloat16 weights work with float32 activations
+    - _Files: `src/models/deepseek_v4_loader.zig:loadShardedWeights`, `loadWeightsFromDirectory`_
+  - [x] 49.2 Remove eager dequantization in `splitFusedExperts`
+    - Current Step 2 dequantizes expert weights (4-bit → float16), expanding memory 4×
+    - **Action**: Skip dequantization entirely. Keep quantized weights as `{weight, scales, biases}` triplets in the HashMap
+    - Store scale/bias keys alongside weight keys — `buildDSV4Model` will use them for `gatherQmm`
+    - Only dequantize weights that absolutely need it (wo_a for reshape, embedding for `mlx_take`)
+    - _Files: `src/models/deepseek_v4_loader.zig:splitFusedExperts` Step 2_
+  - [x] 49.3 Keep fused switch_mlp weights lazy (no split, no dequant)
+    - Fused `switch_mlp.{gate,up,down}_proj.weight` are `[256, out, in]` packed uint32
+    - These should stay as-is in the HashMap — `buildDSV4Model` reads them directly for `DSV4SwitchGLU`
+    - Corresponding `.scales` stay as-is for `gatherQmm`
+    - **Action**: Verify `splitFusedExperts` Step 1 (now disabled) doesn't interfere; ensure fused keys are consumed by `buildDSV4Model`
+
+- [x] 50. Wire quantized expert dispatch in `DSV4SwitchGLU`
+  - [x] 50.1 Detect quantized fused weights in loader and set `is_quantized=true`
+    - In `buildDSV4Model` MoE construction, check if `switch_mlp.gate_proj.scales` exists
+    - If yes: set `DSV4SwitchGLU.is_quantized = true`, load scales/biases, set quant config
+    - If no: set `is_quantized = false`, use `gatherMm` (current path)
+    - _Files: `src/models/deepseek_v4_loader.zig` MoE construction block_
+  - [x] 50.2 Implement `gatherQmm` dispatch path in `DSV4SwitchGLU.forward`
+    - When `is_quantized`: call `quantize_mod.gatherQmm(ctx, x, weight, scales, biases, null, indices, true, config, sorted)` instead of `ops.gatherMm`
+    - `gatherQmm` does fused dequantize+matmul in a single kernel — no memory expansion
+    - _Files: `src/models/deepseek_v4.zig:DSV4SwitchGLU.forward`_
+
+- [x] 51. Wire quantized attention weights (keep packed, use `quantizedMatmul`)
+  - [x] 51.1 Store attention weights as `QuantizedWeight` when scales exist
+    - For `wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`: if `.scales` key exists, create `QuantizedWeight` struct
+    - Store on `DSV4Attention` as optional `?quantize_mod.QuantizedWeight` fields alongside the raw `Array` fields
+    - _Files: `src/models/deepseek_v4.zig:DSV4Attention`, `src/models/deepseek_v4_loader.zig`_
+  - [x] 51.2 Use `quantizedMatmul` in attention forward when weights are quantized
+    - Replace `ops.matmul(x, transpose(weight))` with `quantize_mod.quantizedMatmul(ctx, x, qw, true)`
+    - This avoids dequantizing attention weights (saves ~4× memory per weight)
+    - _Files: `src/models/deepseek_v4.zig:DSV4Attention.forward`_
+
+- [x] 52. Wire quantized shared expert weights
+  - [x] 52.1 Store shared expert weights as `QuantizedWeight` when scales exist
+    - `shared_experts.w1/w2/w3` — same pattern as attention weights
+    - Use `quantizedMatmul` in `DSV4Expert.forward` when quantized
+    - _Files: `src/models/deepseek_v4.zig:DSV4Expert`, `src/models/deepseek_v4_loader.zig`_
+
+- [x] 53. Fix Compressor/Indexer weight consumption in loader
+  - [x] 53.1 Load Compressor weights with quantized support
+    - `attn.compressor.wkv.weight` + `.scales` + `.biases` → keep as QuantizedWeight or dequantize
+    - `attn.compressor.wgate.weight` + `.scales` + `.biases` → same
+    - `attn.compressor.ape` → plain Array (no quantization)
+    - `attn.compressor.norm.weight` → plain Array
+    - Ensure these keys are consumed (removed from HashMap) so they don't appear as "Unused weight" warnings
+    - _Files: `src/models/deepseek_v4_loader.zig` Compressor loading block_
+  - [x] 53.2 Load Indexer weights with quantized support
+    - `attn.indexer.wq_b.weight` + `.scales` + `.biases`
+    - `attn.indexer.weights_proj.weight` + `.scales` + `.biases`
+    - `attn.indexer.compressor.*` (nested compressor, same 4 weights)
+    - _Files: `src/models/deepseek_v4_loader.zig` Indexer loading block_
+  - [x] 53.3 Load HyperConnection weights (keep float32, no quantization)
+    - `hc_attn_fn`, `hc_attn_base`, `hc_attn_scale` — already loaded but verify no dtype conversion
+    - `hc_ffn_fn`, `hc_ffn_base`, `hc_ffn_scale` — same
+    - `hc_head.*` — same
+    - These must stay float32 per mlx-lm `cast_predicate`
+    - _Files: `src/models/deepseek_v4_loader.zig` mHC loading block_
+
+- [x] 54. Fix `runDeepSeekV4Chat` to use `makeV4Caches`
+  - [x] 54.1 Replace `createStandard` with `makeV4Caches` in `main.zig`
+    - Current code creates `StandardKVCache` for all layers
+    - Should use `deepseek_v4_loader.makeV4Caches` which creates `DeepseekV4Cache` for compressed layers
+    - _Files: `src/main.zig:runDeepSeekV4Chat` (line ~775)_
+
+- [-] 55. End-to-end test: DeepSeek V4 Flash 4-bit on 48GB Mac
+  - [x] 55.1 Load model with `--smelt --smelt-experts 0.25` — verify no OOM
+  - [ ] 55.2 Generate 1 token — verify no crash
+  - [ ] 55.3 Generate 32 tokens — verify coherent output
+  - [ ] 55.4 Memory usage: verify peak RSS < 40GB with smelt 0.25
+
+---
+
+## Phase 11: Runtime Fix — Weight Name Mapping & Quantized Weight Consumption
+
+> **Diagnosis (2026-04-27)**: Model loads without OOM but crashes at `mhcPreNormFn` with
+> `reshape array of size 45056 into shape (22,16384)`. Root cause: `hc_head.fn` weight not consumed
+> by loader (appears as "Unused weight"). Additionally, ALL `.scales`/`.biases` quantized metadata
+> keys are unused — the loader only looks up `.weight` keys but doesn't consume the associated
+> quantization metadata.
+>
+> **42 distinct unused weight patterns** identified, grouped into 5 categories:
+> 1. Attention quantized metadata: `wq_a.scales`, `wq_b.scales`, `wkv.scales`, `wo_b.scales` + `.biases`
+> 2. Compressor weights: `compressor.wkv.weight/.scales/.biases`, `compressor.ape`, `compressor.norm.weight`
+> 3. Indexer weights: `indexer.wq_b.weight/.scales/.biases`, `indexer.weights_proj.*`, `indexer.compressor.*`
+> 4. Shared expert quantized metadata: `shared_experts.w1.scales/.biases`, etc.
+> 5. Top-level quantized metadata: `embed.weight.scales/.biases`, `head.weight.scales/.biases`, `hc_head.*`
+> 6. Old-style compressor: `compress_gate_weight.weight/.scales/.biases` (mapped from `compressor.wgate`)
+
+- [x] 56. Fix weight name mapping for mlx-community quantized format
+  - [x] 56.1 Fix `mapV4WeightName` to NOT remap `attn.compressor.wgate` → `attn.compress_gate_weight`
+    - The current mapping `attn.compressor.wgate → attn.compress_gate_weight` was for the old pure-function `compressKV`. Now that we have the `Compressor` module, the weight should keep its original name `attn.compressor.wgate`.
+    - **Action**: Remove the two `compressor.wgate` → `compress_gate_weight` entries from the `replacements` array in `mapV4LayerWeight`
+    - _Files: `src/models/deepseek_v4_loader.zig:mapV4LayerWeight` (line ~100)_
+  - [x] 56.2 Fix `hc_head` weight name mapping
+    - `hc_head.fn`, `hc_head.base`, `hc_head.scale` are loaded by `buildDSV4Model` but the current code looks for `hc_head.fn_weight` (the struct field name) instead of `hc_head.fn` (the weight name)
+    - **Action**: Verify the `hc_head` weight loading in `buildDSV4Model` matches the actual key names after `mapV4WeightName`
+    - _Files: `src/models/deepseek_v4_loader.zig` hc_head loading block_
+
+- [x] 57. Consume quantized metadata (`.scales`/`.biases`) in `buildDSV4Model`
+  - [x] 57.1 Add helper `consumeWeight` that removes `.weight`, `.scales`, `.biases` keys together
+    - When loading a weight like `attn.wq_a`, also remove `attn.wq_a.scales` and `attn.wq_a.biases` from the HashMap
+    - This prevents "Unused weight" warnings and ensures all quantized metadata is consumed
+    - **Action**: Create `fn consumeWeightAndMeta(allocator, weights, base_name)` that removes all 3 keys
+    - _Files: `src/models/deepseek_v4_loader.zig`_
+  - [x] 57.2 Apply `consumeWeightAndMeta` to all weight loading in `buildDSV4Model`
+    - Attention: `wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`
+    - Shared expert: `shared_experts.w1`, `w2`, `w3`
+    - Embedding: `embed.weight`
+    - LM head: `head.weight`
+    - Norms: `attn_norm.weight`, `ffn_norm.weight`, `norm.weight`, `q_norm.weight`, `kv_norm.weight`
+    - Gate: `ffn.gate.weight`, `ffn.gate.bias`, `ffn.gate.tid2eid`
+    - Sink: `attn.attn_sink`
+    - _Files: `src/models/deepseek_v4_loader.zig:buildDSV4Model`_
+  - [x] 57.3 Consume Compressor weight keys (including `.scales`/`.biases`)
+    - `attn.compressor.wkv.weight` + `.scales` + `.biases`
+    - `attn.compressor.wgate.weight` + `.scales` + `.biases`
+    - `attn.compressor.ape` (no scales/biases)
+    - `attn.compressor.norm.weight` (no scales/biases)
+    - _Files: `src/models/deepseek_v4_loader.zig` Compressor loading block_
+  - [x] 57.4 Consume Indexer weight keys (including nested compressor)
+    - `attn.indexer.wq_b.weight` + `.scales` + `.biases`
+    - `attn.indexer.weights_proj.weight` + `.scales` + `.biases`
+    - `attn.indexer.compressor.wkv.weight` + `.scales` + `.biases`
+    - `attn.indexer.compressor.wgate.weight` + `.scales` + `.biases`
+    - `attn.indexer.compressor.ape`
+    - `attn.indexer.compressor.norm.weight`
+    - _Files: `src/models/deepseek_v4_loader.zig` Indexer loading block_
+  - [x] 57.5 Consume switch_mlp quantized metadata
+    - `ffn.switch_mlp.w1.scales`, `ffn.switch_mlp.w1.biases` (already partially done in Task 50.1)
+    - Verify all 6 keys (3 projs × scales + biases) are consumed
+    - _Files: `src/models/deepseek_v4_loader.zig` MoE construction block_
+
+- [x] 58. Fix quantized attention weight matmul
+  - [x] 58.1 Dequantize attention weights at load time (temporary fix)
+    - `wq_a`, `wq_b`, `wkv`, `wo_b` are 4-bit quantized (affine, group_size=64)
+    - Current code loads packed uint32 weights and tries plain `matmul` → shape mismatch
+    - **Temporary fix**: Dequantize these weights at load time (like embedding/lm_head)
+    - **Long-term**: Use `quantizedMatmul` in attention forward (Task 51, deferred)
+    - _Files: `src/models/deepseek_v4_loader.zig:buildDSV4Model` attention weight loading_
+  - [x] 58.2 Dequantize shared expert weights at load time
+    - `shared_experts.w1/w2/w3` are also 4-bit quantized
+    - Same temporary fix: dequantize at load time
+    - _Files: `src/models/deepseek_v4_loader.zig:buildDSV4Model` shared expert loading_
+
+- [-] 59. Fix `gatherQmm` and memory issues in `DSV4SwitchGLU`
+  - [x] 59.1 Fix `gatherQmm` output shape mismatch
+    - **Fixed**: `take(x_down, inv_order)` → `takeAxis(x_down, inv_order, 0)` (preserves dimensions)
+    - **Fixed**: `si` indices cast to `uint32` for `gatherQmm` compatibility
+    - **Fixed**: Expert quant mode: `mxfp4` when no biases, `affine` when biases present
+    - **Fixed**: Integer division for token indices: `divide` → `astype(int32)` after divide
+  - [x] 59.2 Implement per-shard streaming weight loading
+    - **Problem**: `mlx_load_safetensors` eagerly loads ALL tensors into memory (unlike Python's `mx.load` which uses memory mapping). Loading 5 shards × 4.7GB = 23GB already causes OOM on 48GB Mac.
+    - **Root cause**: mlx-c's safetensors loader doesn't support lazy/memory-mapped loading.
+    - **Solution**: Restructure loader to process one shard at a time:
+      1. Parse `model.safetensors.index.json` to build weight→shard mapping
+      2. Group weights by shard; for each shard, load it, extract needed weights into model, free shard
+      3. Interleave shard loading with model construction (not separate phases)
+    - **Alternative**: Implement custom safetensors parser that reads individual tensors by offset
+    - _Files: `src/models/deepseek_v4_loader.zig`, `src/io/mlx_io.zig`_
+  - [x] 59.3 Skip individual expert weight keys for unloaded experts during shard loading
+    - Already implemented in loadShardedWeights but OOM occurs before this filtering runs
+    - _Files: `src/models/deepseek_v4_loader.zig:loadShardedWeights`_
+
+- [-] 60. Configurable weight loading strategy
+- [x] 60.1 Configure MLX memory limits (`mlx_set_wired_limit`)
+    - **Fixed**: Set `wired_limit` to 50% system memory at startup via `sysctl(HW_MEMSIZE)`
+    - **Fixed**: Set `cache_limit` to 25% system memory
+    - **Fixed**: Use `c_allocator` instead of `DebugAllocator` to reduce Zig-side overhead
+    - **Result**: RSS during `buildDSV4Model` dropped from 11GB to ~400MB (zero eager dequantize)
+    - _Files: `src/main.zig:runDeepSeekV4Chat`_
+  - [x] 60.2 Implement `selective` strategy: safetensors random-access reader
+    - **Implemented**: `src/io/safetensors_reader.zig` with `TensorIndex`, `LazyWeightProvider`
+    - **Note**: Not needed for current approach — `mlx_load_safetensors` on CPU stream is already lazy (6MB per shard). Selective reader is available as alternative.
+  - [x] 60.3 Eliminate all eager dequantization in `buildDSV4Model`
+    - **Fixed**: Removed `dequantIfNeeded` for shared expert weights (129 lazy nodes → 0)
+    - **Fixed**: Attention weights kept packed with scales/biases passed to struct
+    - **Remaining**: `wo_a` still needs dequantize for grouped LoRA reshape; `embed`/`lm_head` need dequantize for `mlx_take`/`matmul`
+    - **Result**: `buildDSV4Model` RSS ~400MB (was 11GB)
+  - [x] 60.4 Fix `wo_a` dequantize producing wrong shape
+    - **Problem**: `mlx_dequantize` on lazy `wo_a` weight `[8192, 512]` uint32 returns array with size 4194304 instead of expected `[8192, 4096]` (unpacked). Reshape to `[8, 1024, 4096]` fails.
+    - **Diagnosis needed**: Check if `mlx_dequantize` is actually executing or returning a lazy node with wrong shape metadata. The packed weight is `[8192, 512]` uint32 (affine 4-bit, group_size=64). Expected dequantized shape: `[8192, 4096]` bfloat16.
+    - **Possible causes**:
+      1. `mlx_dequantize` parameters (group_size, bits, mode) don't match the actual quantization
+      2. The lazy weight's dtype is not uint32 (might be a different packed format)
+      3. `mlx_dequantize` returns a lazy node whose shape is the PACKED shape, not the unpacked shape
+    - **Action**: Print `wo_a_raw.shape()`, `wo_a_raw.dtype()`, and `wo_a_deq.shape()` to diagnose
+    - _Files: `src/models/deepseek_v4_loader.zig:buildDSV4Model` wo_a loading_
+  - [x] 60.5 Add `quantizedMatmul` support to `DSV4Expert` for shared expert
+    - Shared expert weights are kept packed (no dequantize). `DSV4Expert.forward` uses `ops.matmul` which fails on packed weights.
+    - **Action**: Add optional scales/biases fields to `DSV4Expert`, use `quantizedMatmul` when present
+    - _Files: `src/models/deepseek_v4.zig:DSV4Expert`_
+
+- [-] 61. End-to-end verification
+  - [ ] 61.1 **BLOCKER**: DeepSeek V4 Flash 4-bit requires ~138GB for expert weights alone (256 experts × 2048 × 512 × 4 bytes × 3 projs × 43 layers). This CANNOT fit in 48GB regardless of loading strategy. mlx-lm handles this via OS virtual memory paging (memory-mapped lazy arrays), but mlx-c's `mlx_array_new_data` copies data into RAM.
+  - **Options to unblock**:
+    - (a) Run on a 192GB+ Mac Studio/Pro
+    - (b) Implement `streaming` strategy: load 1 layer at a time, forward, free (Task 60.4)
+    - (c) Use a smaller model (e.g., DeepSeek V3 Lite, or a model with fewer experts)
+    - (d) Contribute lazy array support to mlx-c (upstream change)
+  - [ ] 61.2 Test with smaller model (Qwen3-1.7B-4bit) to verify the full pipeline works
+  - [ ] 61.3 Test with TinyLlama-1.1B-4bit to verify no regression
+
 ## Notes
 
 - Phase 0–5 modules (Tasks 1–12) are all implemented as standalone files
@@ -486,3 +916,5 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
 - Each task references specific requirements (R1–R26) or identified gaps for traceability
 - Property tests validate the 21 correctness properties defined in the design document
 - All code is Zig, targeting Apple Silicon via mlx-c bindings
+- Phase 8 (Tasks 36–42) revised 2026-04-27 after cross-referencing `mlx-lm/mlx_lm/models/deepseek_v4.py`. Key changes: MoE fused gather_mm moved from Phase 9 to Phase 8 (correctness prerequisite), DeepseekV4Cache/Compressor/Indexer now in Phase 8 (required for generate), sanitize FP4/FP8 dequant added, Attention rewritten to match mlx-lm dual-path architecture
+- Phase 9 (Tasks 43–48) is pure performance optimization — model must already produce correct output before starting

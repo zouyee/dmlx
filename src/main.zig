@@ -30,6 +30,9 @@ const ChatCommand = struct {
     top_p: f32 = 1.0,
     seed: ?u64 = null,
     max_kv_size: memory.MaxKvSize = .auto,
+    smelt: bool = false,
+    smelt_experts: f32 = 0.15,
+    distributed: bool = false,
 };
 
 const ServerCommand = struct {
@@ -48,6 +51,9 @@ const ServerCommand = struct {
     kv_cold_dir: ?[]const u8 = null,
     prompt_cache_file: ?[]const u8 = null,
     speculative_ngram: ?usize = null,
+    smelt: bool = false,
+    smelt_experts: f32 = 0.15,
+    distributed: bool = false,
 };
 
 const ConvertCommand = struct {
@@ -91,8 +97,24 @@ const EvaluateCommand = struct {
     context_size: usize = 1024,
 };
 
+const JangConvertCommand = struct {
+    model_path: []const u8,
+    output_path: []const u8,
+    profile: []const u8,
+};
+
+const ImageGenCommand = struct {
+    model_path: []const u8,
+    prompt: []const u8,
+    height: usize = 512,
+    width: usize = 512,
+    steps: usize = 20,
+    output_path: []const u8,
+};
+
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    // Use c_allocator for large model loading (DebugAllocator has too much overhead)
+    const allocator = std.heap.c_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -159,6 +181,8 @@ pub fn main(init: std.process.Init) !void {
             .kv_cold_dir = cmd.kv_cold_dir,
             .prompt_cache_file = cmd.prompt_cache_file,
             .speculative_ngram = cmd.speculative_ngram,
+            .smelt = cmd.smelt,
+            .smelt_experts = cmd.smelt_experts,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -179,6 +203,22 @@ pub fn main(init: std.process.Init) !void {
             allocator.free(cmd.data_path);
         }
         try runEvaluate(allocator, init.io, cmd);
+    } else if (std.mem.eql(u8, command, "jang-convert")) {
+        const cmd = try parseJangConvertArgs(allocator, args[2..]);
+        defer {
+            allocator.free(cmd.model_path);
+            allocator.free(cmd.output_path);
+            allocator.free(cmd.profile);
+        }
+        try runJangConvert(allocator, init.io, cmd);
+    } else if (std.mem.eql(u8, command, "image-gen")) {
+        const cmd = try parseImageGenArgs(allocator, args[2..]);
+        defer {
+            allocator.free(cmd.model_path);
+            allocator.free(cmd.prompt);
+            allocator.free(cmd.output_path);
+        }
+        try runImageGen(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "version")) {
         std.debug.print("mlx-zig {s}\n", .{root.version});
     } else {
@@ -217,6 +257,9 @@ fn printUsage() void {
         \\    --kv-cold-dir <p>   SSD cold-tier directory (required when --kv-tier ssd)
         \\    --prompt-cache-file <path>  Prompt cache file for KV state persistence
         \\    --speculative-ngram <n>     Enable speculative decoding with n-gram size
+        \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
+        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0)
+        \\    --distributed               Enable distributed tensor parallelism
         \\
         \\  mlx-zig benchmark [options]
         \\    --model <path>      Path to model directory
@@ -252,6 +295,19 @@ fn printUsage() void {
         \\    --alpha <a>         LoRA alpha (default: 32)
         \\    --lr <lr>           Learning rate (default: 1e-4)
         \\    --epochs <n>        Number of epochs (default: 3)
+        \\
+        \\  mlx-zig jang-convert [options]
+        \\    --model <path>      Path to FP16 model directory
+        \\    --output <path>     Output path for JANG quantized model
+        \\    --profile <name>    JANG profile: 2M|2L|3M|4M|6M
+        \\
+        \\  mlx-zig image-gen [options]
+        \\    --model <path>      Path to Flux model directory
+        \\    --prompt <text>     Text prompt for image generation
+        \\    --height <n>        Image height (default: 512)
+        \\    --width <n>         Image width (default: 512)
+        \\    --steps <n>         Denoising steps (default: 20)
+        \\    --output <path>     Output image path
         \\
         \\  mlx-zig version
         \\    Show version information
@@ -325,6 +381,16 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.prompt_cache_file = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--speculative-ngram")) {
             cmd.speculative_ngram = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--smelt")) {
+            cmd.smelt = true;
+            // Boolean flag: don't consume a value, step back so next iteration
+            // processes the same value as a flag (or adjust loop logic)
+            i -= 1;
+        } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
+            cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--distributed")) {
+            cmd.distributed = true;
+            i -= 1;
         }
     }
 
@@ -363,6 +429,14 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.system_prompt = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--max-kv-size")) {
             cmd.max_kv_size = memory.parseMaxKvSize(value) catch return error.InvalidArgument;
+        } else if (std.mem.eql(u8, flag, "--smelt")) {
+            cmd.smelt = true;
+            i -= 1;
+        } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
+            cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--distributed")) {
+            cmd.distributed = true;
+            i -= 1;
         }
     }
 
@@ -623,6 +697,24 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
 fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx: EagerContext, stream: c.c.mlx_stream, config_content: []const u8) !void {
     const ds_config = try root.deepseek_v4_loader.parseDSV4Config(allocator, config_content);
 
+    // 1b. Configure MLX memory limits for large MoE models
+    // Set wired_limit so MLX knows how much GPU memory it can use, enabling automatic eviction
+    {
+        const sysctl_c = @cImport(@cInclude("sys/sysctl.h"));
+        var memsize: u64 = 0;
+        var len: usize = @sizeOf(u64);
+        var mib = [_]c_int{ sysctl_c.CTL_HW, sysctl_c.HW_MEMSIZE };
+        _ = sysctl_c.sysctl(&mib, 2, &memsize, &len, null, 0);
+        // Use 30GB as wired limit to avoid hang on constrained machines
+        const limit: usize = @min(@as(usize, 30 * 1024 * 1024 * 1024), @as(usize, @intCast(memsize * 3 / 4)));
+        var old_wired: usize = 0;
+        _ = c.c.mlx_set_wired_limit(&old_wired, limit);
+        // Also set cache limit to help with intermediate buffer management
+        var old_cache: usize = 0;
+        _ = c.c.mlx_set_cache_limit(&old_cache, limit / 2);
+        std.log.info("MLX memory: wired_limit={d}MB cache_limit={d}MB (system={d}MB)", .{ limit / 1024 / 1024, limit / 2 / 1024 / 1024, memsize / 1024 / 1024 });
+    }
+
     // 2. Load tokenizer
     const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
@@ -632,7 +724,13 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     const tokenizer = tokenizer_backend.asStrategy();
 
     // 3. Load model weights (sharded or single-file)
-    var weights = try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream);
+    const smelt_config = root.deepseek_v4_loader.SmeltConfig{
+        .enabled = cmd.smelt,
+        .load_fraction = cmd.smelt_experts,
+    };
+    // Use original eager loading with streaming shard cleanup
+    // mlx_load_safetensors returns lazy/memory-mapped arrays that don't consume RAM until evaluated
+    var weights = try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream, smelt_config);
     defer {
         var it = weights.iterator();
         while (it.next()) |entry| {
@@ -643,7 +741,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     // 4. Build model
-    var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream);
+    var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
     defer model.deinit();
 
     // 5. Format prompt with chat template
@@ -680,27 +778,16 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     sampler_config.top_k = cmd.top_k;
     sampler_config.top_p = cmd.top_p;
 
-    // Create per-layer KV caches for DeepSeek V4
-    var caches = try allocator.alloc(root.kvcache.KVCacheStrategy, ds_config.num_hidden_layers);
+    // Create per-layer KV caches for DeepSeek V4 (matching mlx-lm make_cache)
+    const caches = try root.deepseek_v4_loader.makeV4Caches(allocator, &ds_config, stream);
     defer {
         for (caches) |cache| {
             cache.deinit(allocator);
         }
         allocator.free(caches);
     }
-    const cache_max_seq = 8192; // Practical limit for inference
-    for (0..ds_config.num_hidden_layers) |i| {
-        const layer_config = root.kvcache.LayerConfig{
-            .batch_size = 1,
-            .num_heads = ds_config.num_attention_heads,
-            .num_kv_heads = ds_config.num_key_value_heads,
-            .head_dim = ds_config.head_dim,
-            .max_seq_len = cache_max_seq,
-            .dtype = .float32,
-        };
-        caches[i] = try root.kvcache.standard.createStandard(allocator, layer_config, stream);
-    }
 
+    std.log.info("Starting generation...", .{});
     const all_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
     defer allocator.free(all_tokens);
 
@@ -779,7 +866,7 @@ fn runBenchmark(allocator: std.mem.Allocator, io: std.Io, cmd: BenchmarkCommand)
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     // 3. Create KV caches
@@ -962,7 +1049,7 @@ fn runQuantize(allocator: std.mem.Allocator, io: std.Io, cmd: QuantizeCommand) !
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     std.log.info("Model loaded ({s}). Quantization to {d}-bit with group_size={d} would be applied to weights.", .{
@@ -1043,7 +1130,7 @@ fn runEvaluate(allocator: std.mem.Allocator, io: std.Io, cmd: EvaluateCommand) !
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     // 3. Load tokenizer
@@ -1356,4 +1443,124 @@ fn runLoraTrain(allocator: std.mem.Allocator, io: std.Io, cmd: LoraTrainCommand)
     }
 
     std.log.info("Training complete. Output saved to {s}", .{cmd.output_path});
+}
+
+// ------------------------------------------------------------------
+// JANG Convert Command
+// ------------------------------------------------------------------
+
+fn parseJangConvertArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !JangConvertCommand {
+    var cmd = JangConvertCommand{
+        .model_path = "",
+        .output_path = "",
+        .profile = "",
+    };
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 >= args.len) break;
+        const flag = args[i];
+        const value = args[i + 1];
+
+        if (std.mem.eql(u8, flag, "--model")) {
+            cmd.model_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--output")) {
+            cmd.output_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--profile")) {
+            cmd.profile = try allocator.dupe(u8, value);
+        }
+    }
+
+    if (cmd.model_path.len == 0 or cmd.output_path.len == 0 or cmd.profile.len == 0) {
+        return error.MissingRequiredArgument;
+    }
+
+    return cmd;
+}
+
+fn parseJangProfile(profile_str: []const u8) !root.jang_quantizer.JangProfile {
+    if (std.mem.eql(u8, profile_str, "2M")) return .JANG_2M;
+    if (std.mem.eql(u8, profile_str, "2L")) return .JANG_2L;
+    if (std.mem.eql(u8, profile_str, "3M")) return .JANG_3M;
+    if (std.mem.eql(u8, profile_str, "4M")) return .JANG_4M;
+    if (std.mem.eql(u8, profile_str, "6M")) return .JANG_6M;
+    return error.InvalidArgument;
+}
+
+fn runJangConvert(allocator: std.mem.Allocator, io: std.Io, cmd: JangConvertCommand) !void {
+    _ = io;
+    const profile = try parseJangProfile(cmd.profile);
+
+    std.log.info("JANG conversion: model={s} output={s} profile={s}", .{
+        cmd.model_path, cmd.output_path, cmd.profile,
+    });
+
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    try root.jang_quantizer.quantizeModel(allocator, cmd.model_path, cmd.output_path, profile, null, ctx);
+    std.log.info("JANG conversion complete.", .{});
+}
+
+// ------------------------------------------------------------------
+// Image Generation Command
+// ------------------------------------------------------------------
+
+fn parseImageGenArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !ImageGenCommand {
+    var cmd = ImageGenCommand{
+        .model_path = "",
+        .prompt = "",
+        .output_path = "",
+    };
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 >= args.len) break;
+        const flag = args[i];
+        const value = args[i + 1];
+
+        if (std.mem.eql(u8, flag, "--model")) {
+            cmd.model_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--prompt")) {
+            cmd.prompt = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--height")) {
+            cmd.height = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--width")) {
+            cmd.width = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--steps")) {
+            cmd.steps = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--output")) {
+            cmd.output_path = try allocator.dupe(u8, value);
+        }
+    }
+
+    if (cmd.model_path.len == 0 or cmd.prompt.len == 0 or cmd.output_path.len == 0) {
+        return error.MissingRequiredArgument;
+    }
+
+    return cmd;
+}
+
+fn runImageGen(allocator: std.mem.Allocator, io: std.Io, cmd: ImageGenCommand) !void {
+    _ = io;
+    std.log.info("Image generation: model={s} prompt=\"{s}\" height={d} width={d} steps={d} output={s}", .{
+        cmd.model_path, cmd.prompt, cmd.height, cmd.width, cmd.steps, cmd.output_path,
+    });
+
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    // Stub: use default Flux config; full integration would load from model_path
+    const config = root.diffusion_flux.FluxConfig{};
+    var pipeline = try root.diffusion_flux.FluxPipeline.init(allocator, config, ctx);
+    defer pipeline.deinit();
+
+    // Stub prompt embeddings (text encoder not yet integrated)
+    const prompt_embeds = try root.array.zeros(allocator, &[_]i32{ 1, 1, @intCast(config.hidden_size) }, .float32);
+    defer prompt_embeds.deinit();
+
+    const result = try pipeline.generate(ctx, prompt_embeds, cmd.height, cmd.width, cmd.steps);
+    defer result.deinit();
+
+    std.log.info("Image generation complete. Output would be saved to {s} (VAE decode stub).", .{cmd.output_path});
 }

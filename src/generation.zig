@@ -38,6 +38,12 @@ pub const ModelConfig = struct {
     compress_ratios: []const usize = &.{},
 };
 
+/// Result of forwardWithHidden — logits and last-layer hidden states.
+pub const ForwardWithHiddenResult = struct {
+    logits: Array,
+    hidden: Array,
+};
+
 pub const ModelVTable = struct {
     forward: *const fn (
         ctx: *anyopaque,
@@ -45,6 +51,14 @@ pub const ModelVTable = struct {
         mask: ?Array,
         caches: ?[]KVCacheStrategy,
     ) anyerror!Array,
+    /// Optional: forward pass that also returns the last-layer hidden states.
+    /// Required for EAGLE speculative decoding.
+    forwardWithHidden: ?*const fn (
+        ctx: *anyopaque,
+        input: Array,
+        mask: ?Array,
+        caches: ?[]KVCacheStrategy,
+    ) anyerror!ForwardWithHiddenResult = null,
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     config: ModelConfig,
     ptr: *anyopaque,
@@ -61,6 +75,8 @@ pub const GenerateConfig = struct {
     top_p: f32 = 1.0,
     stop_tokens: []const u32 = &.{},
     seed: u64 = 0,
+    /// Repetition penalty (1.0 = no penalty, >1.0 reduces repeated tokens).
+    repetition_penalty: f32 = 1.0,
 };
 
 // ============================================================
@@ -73,14 +89,14 @@ pub const GenerateConfig = struct {
 /// the model forward pass, extracts the last-position logits, and samples
 /// a token using the provided sampler configuration.
 ///
-/// Returns the sampled token ID.
+/// Returns the sampled token and its log-probability.
 pub fn generateStep(
     model: ModelVTable,
     tokens: Array,
     caches: []KVCacheStrategy,
     sampler: *SamplerConfig,
     ctx: EagerContext,
-) !u32 {
+) !sampling_mod.SampleResult {
     var arena = ScopedArrayArena.init(ctx.allocator);
     defer arena.deinit();
 
@@ -135,6 +151,7 @@ pub fn streamGenerate(
         .top_k = config.top_k,
         .top_p = config.top_p,
         .prng = std.Random.DefaultPrng.init(config.seed),
+        .repetition_penalty = config.repetition_penalty,
     };
 
     // Prefill: run the full prompt through the model
@@ -147,20 +164,25 @@ pub fn streamGenerate(
         );
         defer prompt_arr.deinit();
 
-        const first_token = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        var generated_tokens = std.ArrayList(u32).empty;
+        defer generated_tokens.deinit(ctx.allocator);
 
-        if (isStopToken(first_token, config.stop_tokens)) {
-            callback(first_token, true);
+        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+
+        if (isStopToken(first_result.token, config.stop_tokens)) {
+            callback(first_result.token, true);
             return;
         }
         if (config.max_tokens <= 1) {
-            callback(first_token, true);
+            callback(first_result.token, true);
             return;
         }
-        callback(first_token, false);
+        callback(first_result.token, false);
+        try generated_tokens.append(ctx.allocator, first_result.token);
+        sampler.context_tokens = generated_tokens.items;
 
         // Decode loop: feed one token at a time
-        var prev_token = first_token;
+        var prev_token = first_result.token;
         var generated: usize = 1;
 
         while (generated < config.max_tokens) {
@@ -172,17 +194,19 @@ pub fn streamGenerate(
             );
             defer input_arr.deinit();
 
-            const next_token = try generateStep(model, input_arr, caches, &sampler, ctx);
+            const next_result = try generateStep(model, input_arr, caches, &sampler, ctx);
             generated += 1;
 
-            const is_stop = isStopToken(next_token, config.stop_tokens);
+            const is_stop = isStopToken(next_result.token, config.stop_tokens);
             const is_done = is_stop or generated >= config.max_tokens;
 
-            callback(next_token, is_done);
+            callback(next_result.token, is_done);
 
             if (is_done) return;
 
-            prev_token = next_token;
+            try generated_tokens.append(ctx.allocator, next_result.token);
+            sampler.context_tokens = generated_tokens.items;
+            prev_token = next_result.token;
         }
     }
 }
@@ -209,6 +233,7 @@ pub fn generate(
         .top_k = config.top_k,
         .top_p = config.top_p,
         .prng = std.Random.DefaultPrng.init(config.seed),
+        .repetition_penalty = config.repetition_penalty,
     };
 
     var result = std.ArrayList(u32).empty;
@@ -224,15 +249,20 @@ pub fn generate(
         );
         defer prompt_arr.deinit();
 
-        const first_token = try generateStep(model, prompt_arr, caches, &sampler, ctx);
-        try result.append(ctx.allocator, first_token);
+        var generated_tokens = std.ArrayList(u32).empty;
+        defer generated_tokens.deinit(ctx.allocator);
 
-        if (isStopToken(first_token, config.stop_tokens) or config.max_tokens <= 1) {
+        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        try result.append(ctx.allocator, first_result.token);
+        try generated_tokens.append(ctx.allocator, first_result.token);
+        sampler.context_tokens = generated_tokens.items;
+
+        if (isStopToken(first_result.token, config.stop_tokens) or config.max_tokens <= 1) {
             return result.toOwnedSlice(ctx.allocator);
         }
 
         // Decode loop: feed one token at a time
-        var prev_token = first_token;
+        var prev_token = first_result.token;
 
         while (result.items.len < config.max_tokens) {
             const input_arr = try Array.fromData(
@@ -243,21 +273,335 @@ pub fn generate(
             );
             defer input_arr.deinit();
 
-            const next_token = try generateStep(model, input_arr, caches, &sampler, ctx);
-            try result.append(ctx.allocator, next_token);
+            const next_result = try generateStep(model, input_arr, caches, &sampler, ctx);
+            try result.append(ctx.allocator, next_result.token);
+            try generated_tokens.append(ctx.allocator, next_result.token);
+            sampler.context_tokens = generated_tokens.items;
 
-            if (isStopToken(next_token, config.stop_tokens)) break;
+            if (isStopToken(next_result.token, config.stop_tokens)) break;
 
-            prev_token = next_token;
+            prev_token = next_result.token;
         }
     }
 
     return result.toOwnedSlice(ctx.allocator);
 }
 
+/// Speculative decoding generation loop using a PLD drafter.
+/// Falls back to single-token generation when no draft is proposed.
+/// KV cache is rolled back on partial draft rejection to maintain correctness.
+pub fn streamGenerateSpeculative(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    drafter: *const @import("speculative.zig").PldDrafter,
+    callback: *const fn (token: u32, is_done: bool) void,
+) !void {
+    var sampler = SamplerConfig{
+        .temperature = config.temperature,
+        .top_k = config.top_k,
+        .top_p = config.top_p,
+        .prng = std.Random.DefaultPrng.init(config.seed),
+        .repetition_penalty = config.repetition_penalty,
+    };
+
+    var context = std.ArrayList(u32).empty;
+    defer context.deinit(ctx.allocator);
+    try context.appendSlice(ctx.allocator, prompt_tokens);
+
+    // Prefill: run the full prompt through the model
+    if (prompt_tokens.len > 0) {
+        const prompt_arr = try Array.fromData(
+            ctx.allocator,
+            u32,
+            prompt_tokens,
+            &[_]i32{ 1, @intCast(prompt_tokens.len) },
+        );
+        defer prompt_arr.deinit();
+
+        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+
+        if (isStopToken(first_result.token, config.stop_tokens)) {
+            callback(first_result.token, true);
+            return;
+        }
+        if (config.max_tokens <= 1) {
+            callback(first_result.token, true);
+            return;
+        }
+        callback(first_result.token, false);
+        try context.append(ctx.allocator, first_result.token);
+        sampler.context_tokens = context.items;
+
+        // Decode loop with speculative decoding
+        var generated: usize = 1;
+        while (generated < config.max_tokens) {
+            // Save KV cache lengths for potential rollback
+            const cache_lens = try ctx.allocator.alloc(usize, caches.len);
+            defer ctx.allocator.free(cache_lens);
+            for (caches, 0..) |cache, i| {
+                cache_lens[i] = cache.currentLen();
+            }
+
+            const draft = drafter.propose(context.items, drafter.n, ctx.allocator);
+            if (draft) |d| {
+                defer ctx.allocator.free(d);
+                const vr = try @import("speculative.zig").verifyDraft(
+                    model,
+                    context.items,
+                    d,
+                    caches,
+                    ctx,
+                    config.seed + generated,
+                );
+                defer ctx.allocator.free(vr.tokens);
+
+                // Roll back rejected draft token KV entries
+                if (vr.accepted < d.len) {
+                    for (caches, 0..) |cache, i| {
+                        cache.rollback(cache_lens[i] + vr.accepted);
+                    }
+                }
+
+                // Emit accepted draft tokens
+                for (0..vr.accepted) |j| {
+                    generated += 1;
+                    const is_stop = isStopToken(vr.tokens[j], config.stop_tokens);
+                    const is_done = is_stop or generated >= config.max_tokens;
+                    callback(vr.tokens[j], is_done);
+                    try context.append(ctx.allocator, vr.tokens[j]);
+                    sampler.context_tokens = context.items;
+                    if (is_done) return;
+                }
+
+                // The last token (bonus or resampled) needs a single-token forward
+                // to correctly update KV cache, because verifyDraft's forward
+                // either didn't cover it (bonus) or covered a different token (rejected).
+                const last_token = vr.tokens[vr.accepted];
+                const input_arr = try Array.fromData(
+                    ctx.allocator,
+                    u32,
+                    &[_]u32{last_token},
+                    &[_]i32{ 1, 1 },
+                );
+                defer input_arr.deinit();
+                const logits = try model.forward(model.ptr, input_arr, null, caches);
+                defer logits.deinit();
+
+                generated += 1;
+                const is_stop = isStopToken(last_token, config.stop_tokens);
+                const is_done = is_stop or generated >= config.max_tokens;
+                callback(last_token, is_done);
+                try context.append(ctx.allocator, last_token);
+                sampler.context_tokens = context.items;
+                if (is_done) return;
+            } else {
+                // Fallback: single-token autoregressive generation
+                const input_arr = try Array.fromData(
+                    ctx.allocator,
+                    u32,
+                    &[_]u32{context.items[context.items.len - 1]},
+                    &[_]i32{ 1, 1 },
+                );
+                defer input_arr.deinit();
+
+                const next_result = try generateStep(model, input_arr, caches, &sampler, ctx);
+                generated += 1;
+                sampler.context_tokens = context.items;
+                const is_stop = isStopToken(next_result.token, config.stop_tokens);
+                const is_done = is_stop or generated >= config.max_tokens;
+                callback(next_result.token, is_done);
+                try context.append(ctx.allocator, next_result.token);
+                if (is_done) return;
+            }
+        }
+    }
+}
+
 // ============================================================
 // Helpers
 // ============================================================
+
+/// EAGLE speculative decoding generation loop.
+/// Uses the base model's hidden states to drive an EAGLE draft head.
+/// Falls back to single-token generation when EAGLE drafter is not ready.
+pub fn streamGenerateEagle(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    eagle_drafter: *const @import("speculative.zig").EagleDrafter,
+    callback: *const fn (token: u32, is_done: bool) void,
+) !void {
+    var sampler = SamplerConfig{
+        .temperature = config.temperature,
+        .top_k = config.top_k,
+        .top_p = config.top_p,
+        .prng = std.Random.DefaultPrng.init(config.seed),
+        .repetition_penalty = config.repetition_penalty,
+    };
+
+    var context = std.ArrayList(u32).empty;
+    defer context.deinit(ctx.allocator);
+    try context.appendSlice(ctx.allocator, prompt_tokens);
+
+    // Prefill: run the full prompt through the model
+    if (prompt_tokens.len > 0) {
+        const prompt_arr = try Array.fromData(
+            ctx.allocator,
+            u32,
+            prompt_tokens,
+            &[_]i32{ 1, @intCast(prompt_tokens.len) },
+        );
+        defer prompt_arr.deinit();
+
+        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+
+        if (isStopToken(first_result.token, config.stop_tokens)) {
+            callback(first_result.token, true);
+            return;
+        }
+        if (config.max_tokens <= 1) {
+            callback(first_result.token, true);
+            return;
+        }
+        callback(first_result.token, false);
+        try context.append(ctx.allocator, first_result.token);
+        sampler.context_tokens = context.items;
+
+        // Decode loop with EAGLE speculative decoding
+        var generated: usize = 1;
+        while (generated < config.max_tokens) {
+            // Single-token forward to get hidden state for EAGLE draft
+            const last_token = context.items[context.items.len - 1];
+            const input_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                &[_]u32{last_token},
+                &[_]i32{ 1, 1 },
+            );
+            defer input_arr.deinit();
+
+            // Need forwardWithHidden to get hidden states
+            if (model.forwardWithHidden) |fwh| {
+                const fw_result = try fwh(model.ptr, input_arr, null, caches);
+                defer fw_result.logits.deinit();
+                defer fw_result.hidden.deinit();
+
+                // Save KV cache lengths for potential rollback
+                const cache_lens = try ctx.allocator.alloc(usize, caches.len);
+                defer ctx.allocator.free(cache_lens);
+                for (caches, 0..) |cache, i| {
+                    cache_lens[i] = cache.currentLen();
+                }
+
+                // Get draft tokens from EAGLE draft head
+                const draft = try eagle_drafter.propose(
+                    fw_result.hidden,
+                    eagle_drafter.num_draft_tokens,
+                    ctx,
+                    ctx.allocator,
+                );
+
+                if (draft) |d| {
+                    defer ctx.allocator.free(d);
+
+                    // Rollback KV cache to before the single-token forward
+                    // (we'll re-verify with the full draft sequence)
+                    for (caches, 0..) |cache, i| {
+                        cache.rollback(cache_lens[i]);
+                    }
+
+                    const vr = try @import("speculative.zig").verifyDraft(
+                        model,
+                        context.items,
+                        d,
+                        caches,
+                        ctx,
+                        config.seed + generated,
+                    );
+                    defer ctx.allocator.free(vr.tokens);
+
+                    // Roll back rejected draft token KV entries
+                    if (vr.accepted < d.len) {
+                        for (caches, 0..) |cache, i| {
+                            cache.rollback(cache_lens[i] + vr.accepted);
+                        }
+                    }
+
+                    // Emit accepted draft tokens
+                    for (0..vr.accepted) |j| {
+                        generated += 1;
+                        const is_stop = isStopToken(vr.tokens[j], config.stop_tokens);
+                        const is_done = is_stop or generated >= config.max_tokens;
+                        callback(vr.tokens[j], is_done);
+                        try context.append(ctx.allocator, vr.tokens[j]);
+                        sampler.context_tokens = context.items;
+                        if (is_done) return;
+                    }
+
+                    // The last token (bonus or resampled)
+                    const last_draft_token = vr.tokens[vr.accepted];
+                    const bonus_input = try Array.fromData(
+                        ctx.allocator,
+                        u32,
+                        &[_]u32{last_draft_token},
+                        &[_]i32{ 1, 1 },
+                    );
+                    defer bonus_input.deinit();
+                    const bonus_logits = try model.forward(model.ptr, bonus_input, null, caches);
+                    defer bonus_logits.deinit();
+
+                    generated += 1;
+                    const is_stop = isStopToken(last_draft_token, config.stop_tokens);
+                    const is_done = is_stop or generated >= config.max_tokens;
+                    callback(last_draft_token, is_done);
+                    try context.append(ctx.allocator, last_draft_token);
+                    sampler.context_tokens = context.items;
+                    if (is_done) return;
+                } else {
+                    // EAGLE returned no draft, fall back to standard generation
+                    // (the single-token forward already updated KV cache)
+                    generated += 1;
+                    // Extract token from the logits we already computed
+                    const last_logits = try ops.slice(
+                        ctx,
+                        fw_result.logits,
+                        &[_]i32{ 0, 0, 0 },
+                        &[_]i32{ 1, 1, @intCast(model.config.vocab_size) },
+                        &[_]i32{ 1, 1, 1 },
+                    );
+                    defer last_logits.deinit();
+                    const squeezed = try shape_mod.squeezeAxes(ctx, last_logits, &[_]i32{ 0, 1 });
+                    defer squeezed.deinit();
+                    const logits_f32 = try ops.astype(ctx, squeezed, .float32);
+                    defer logits_f32.deinit();
+                    const result = sampler.sample(logits_f32, ctx.allocator);
+
+                    const is_stop = isStopToken(result.token, config.stop_tokens);
+                    const is_done = is_stop or generated >= config.max_tokens;
+                    callback(result.token, is_done);
+                    try context.append(ctx.allocator, result.token);
+                    sampler.context_tokens = context.items;
+                    if (is_done) return;
+                }
+            } else {
+                // Model doesn't support forwardWithHidden, fall back to standard generation
+                const next_result = try generateStep(model, input_arr, caches, &sampler, ctx);
+                generated += 1;
+                const is_stop = isStopToken(next_result.token, config.stop_tokens);
+                const is_done = is_stop or generated >= config.max_tokens;
+                callback(next_result.token, is_done);
+                try context.append(ctx.allocator, next_result.token);
+                sampler.context_tokens = context.items;
+                if (is_done) return;
+            }
+        }
+    }
+}
 
 fn isStopToken(token: u32, stop_tokens: []const u32) bool {
     for (stop_tokens) |st| {

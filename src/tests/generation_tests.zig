@@ -98,6 +98,7 @@ const StubKVCache = struct {
         .currentLen = @ptrCast(&currentLen),
         .reset = @ptrCast(&reset),
         .filter = null,
+        .rollback = null,
         .deinit = @ptrCast(&deinitFn),
     };
 
@@ -131,10 +132,10 @@ test "generateStep returns a single token" {
     const prompt = try Array.fromData(allocator, u32, &[_]u32{ 1, 2, 3 }, &[_]i32{ 1, 3 });
     defer prompt.deinit();
 
-    const token = try generation.generateStep(vtable, prompt, &caches, &sampler, ctx);
+    const result = try generation.generateStep(vtable, prompt, &caches, &sampler, ctx);
 
     // Mock model call_count was 0, so target token = 0 % 32 = 0
-    try std.testing.expectEqual(@as(u32, 0), token);
+    try std.testing.expectEqual(@as(u32, 0), result.token);
 }
 
 test "generate returns sequence with length ≤ max_tokens" {

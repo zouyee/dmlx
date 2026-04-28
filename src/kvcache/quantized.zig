@@ -75,6 +75,7 @@ pub const QuantizedKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -227,6 +228,11 @@ pub const QuantizedKVCache = struct {
     fn resetImpl(ctx: *anyopaque) void {
         const self: *QuantizedKVCache = @ptrCast(@alignCast(ctx));
         self.offset = 0;
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *QuantizedKVCache = @ptrCast(@alignCast(ctx));
+        self.offset = to_len;
     }
 
     fn filterImpl(

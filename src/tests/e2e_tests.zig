@@ -109,7 +109,7 @@ test "tiny random model forward" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     // Forward pass with batch=1, seq_len=4
@@ -153,7 +153,7 @@ test "tiny random model generate" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     const layer_config = mlx.kvcache.LayerConfig{
@@ -222,7 +222,7 @@ test "tiny random model forward with GQA" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     const input_ids_data = [_]u32{ 1, 2, 3, 4 };
@@ -265,7 +265,7 @@ test "tiny random model generate with GQA" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     const layer_config = mlx.kvcache.LayerConfig{

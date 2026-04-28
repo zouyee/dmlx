@@ -107,12 +107,30 @@ pub const BpeTokenizer = struct {
         const merges_arr = model.object.get("merges");
         if (merges_arr) |ma| {
             for (ma.array.items, 0..) |item, rank| {
-                const merge_str = item.string;
-                // merge_str format: "first second"
-                // Find the space separator
-                const space_idx = std.mem.indexOfScalar(u8, merge_str, ' ') orelse continue;
-                const first = merge_str[0..space_idx];
-                const second = merge_str[space_idx + 1 ..];
+                // Merges can be either:
+                // - string format: "first second" (GPT-2 style)
+                // - array format: ["first", "second"] (Qwen3 style)
+                var first: []const u8 = undefined;
+                var second: []const u8 = undefined;
+                switch (item) {
+                    .string => |merge_str| {
+                        const space_idx = std.mem.indexOfScalar(u8, merge_str, ' ') orelse continue;
+                        first = merge_str[0..space_idx];
+                        second = merge_str[space_idx + 1 ..];
+                    },
+                    .array => |arr| {
+                        if (arr.items.len < 2) continue;
+                        first = switch (arr.items[0]) {
+                            .string => |s| s,
+                            else => continue,
+                        };
+                        second = switch (arr.items[1]) {
+                            .string => |s| s,
+                            else => continue,
+                        };
+                    },
+                    else => continue,
+                }
                 const key_len = first.len + 1 + second.len;
                 const owned = try self.allocator.alloc(u8, key_len);
                 errdefer self.allocator.free(owned);

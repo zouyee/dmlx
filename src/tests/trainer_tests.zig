@@ -102,7 +102,7 @@ test "SFTTrainer trainStep on tiny model" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     var optimizer = try mlx.optim.AdamW.initFromStruct(allocator, &model, 1e-3, 0.9, 0.999, 1e-8, 0.0, stream);
@@ -161,7 +161,7 @@ test "SFTTrainer trainEpoch on tiny model" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     var optimizer = try mlx.optim.AdamW.initFromStruct(allocator, &model, 1e-3, 0.9, 0.999, 1e-8, 0.0, stream);

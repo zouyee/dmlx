@@ -45,6 +45,11 @@ pub const VTable = struct {
         allocator: std.mem.Allocator,
     ) anyerror!void,
 
+    /// Roll back the cache to a previous sequence length.
+    /// Used in speculative decoding when draft tokens are rejected.
+    /// null if the strategy does not support rollback.
+    rollback: ?*const fn (ctx: *anyopaque, to_len: usize) void,
+
     /// Release all resources held by this strategy.
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
 };
@@ -90,6 +95,13 @@ pub const KVCacheStrategy = struct {
             return f(self.ptr, indices, allocator);
         }
         return error.FilterNotSupported;
+    }
+
+    /// Roll back to a previous sequence length.
+    pub fn rollback(self: KVCacheStrategy, to_len: usize) void {
+        if (self.vtable.rollback) |f| {
+            return f(self.ptr, to_len);
+        }
     }
 
     /// Release resources.

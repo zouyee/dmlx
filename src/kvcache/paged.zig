@@ -334,6 +334,7 @@ pub const PagedKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -855,6 +856,21 @@ pub const PagedKVCache = struct {
         for (self.sequences.items, 0..) |*seq, i| {
             seq.pages.clearRetainingCapacity();
             seq.cached_len = 0;
+            self.freeCached(i);
+        }
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *PagedKVCache = @ptrCast(@alignCast(ctx));
+        for (self.sequences.items, 0..) |*seq, i| {
+            const new_pages_needed = (to_len + self.page_size - 1) / self.page_size;
+            while (seq.pages.items.len > new_pages_needed) {
+                const pt = seq.pages.pop().?;
+                const page = &self.pages.items[pt.physical];
+                page.used = false;
+                page.ref_count = 0;
+            }
+            seq.cached_len = to_len;
             self.freeCached(i);
         }
     }
