@@ -2659,9 +2659,6 @@ pub const DSV4Model = struct {
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
-
-            // Clear MLX cache between generation steps to free intermediate GPU buffers
-            _ = c.c.mlx_clear_cache();
         }
 
         // Return only generated tokens (skip prompt)
