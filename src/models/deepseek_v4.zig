@@ -883,11 +883,17 @@ pub const DSV4MoE = struct {
     shared_expert: DSV4Expert,
     n_routed_experts: usize,
     n_activated_experts: usize,
+    /// When smelt slices fused weights, maps original expert ID → sliced row index.
+    /// null when all experts are loaded (no remapping needed).
+    expert_remap: ?Array,
+    /// When true, switch_mlp experts are loaded. When false (aggressive smelt), only shared expert is used.
+    experts_loaded: bool,
 
     pub fn deinit(self: *DSV4MoE) void {
         self.gate.deinit();
-        self.switch_mlp.deinit();
+        if (self.experts_loaded) self.switch_mlp.deinit();
         self.shared_expert.deinit();
+        if (self.expert_remap) |r| r.deinit();
     }
 
     pub fn forward(self: *DSV4MoE, hidden_states: Array, input_ids: Array, stream: c.c.mlx_stream) !Array {
@@ -900,18 +906,33 @@ pub const DSV4MoE = struct {
         const flat = try ops.reshape(self.ctx, hidden_states, &[_]i32{ @intCast(batch * seq_len), @intCast(dim) });
         defer flat.deinit();
 
+        // Shared expert always runs
+        const shared_out = try self.shared_expert.forward(flat, stream);
+        defer shared_out.deinit();
+
+        if (!self.experts_loaded) {
+            // Aggressive smelt: only shared expert, skip routed experts entirely
+            return ops.reshape(self.ctx, shared_out, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(dim) });
+        }
+
         // Gate routing: returns (scores [N, topk], indices [N, topk])
         const weights_arr, const indices = try self.gate.forward(flat, input_ids, stream);
         defer weights_arr.deinit();
         defer indices.deinit();
 
+        // Remap expert indices if smelt sliced the fused weights
+        const remapped_indices = if (self.expert_remap) |remap| blk: {
+            var res = c.c.mlx_array_new();
+            try c.check(c.c.mlx_take(&res, remap.inner, indices.inner, self.ctx.stream.inner));
+            break :blk Array.fromHandle(res);
+        } else indices;
+        defer if (self.expert_remap != null) remapped_indices.deinit();
+
         // Expert dispatch via fused gather_mm
-        const y = try self.switch_mlp.forward(flat, indices, weights_arr, stream);
+        const y = try self.switch_mlp.forward(flat, remapped_indices, weights_arr, stream);
         defer y.deinit();
 
         // Add shared expert
-        const shared_out = try self.shared_expert.forward(flat, stream);
-        defer shared_out.deinit();
         const final_out = try ops.add(self.ctx, y, shared_out);
         defer final_out.deinit();
 

@@ -47,6 +47,35 @@ fn isExpertWeight(name: []const u8) bool {
         std.mem.indexOf(u8, name, "shared_experts") == null);
 }
 
+/// Slice a fused expert tensor [n_experts, ...] to keep only experts marked true in the mask.
+/// Returns a new tensor [n_loaded, ...] containing only the selected expert rows.
+fn sliceFusedExperts(allocator: std.mem.Allocator, tensor: Array, mask: []const bool, ctx: EagerContext) !Array {
+    // Count loaded experts and build index array
+    var count: usize = 0;
+    for (mask) |m| {
+        if (m) count += 1;
+    }
+    if (count == 0 or count == mask.len) return tensor; // No slicing needed
+
+    // Build indices array of loaded expert IDs
+    var indices = try allocator.alloc(i32, count);
+    defer allocator.free(indices);
+    var idx: usize = 0;
+    for (mask, 0..) |m, i| {
+        if (m) {
+            indices[idx] = @intCast(i);
+            idx += 1;
+        }
+    }
+
+    // Use mlx_take_axis to gather selected expert rows along axis 0
+    const indices_arr = try Array.fromData(allocator, i32, indices, &[_]i32{@intCast(count)});
+    defer indices_arr.deinit();
+    var res = c.c.mlx_array_new();
+    try c.check(c.c.mlx_take_axis(&res, tensor.inner, indices_arr.inner, 0, ctx.stream.inner));
+    return Array.fromHandle(res);
+}
+
 /// Parse expert index from HF weight name.
 fn parseExpertIndexFromHF(name: []const u8) ?usize {
     if (std.mem.indexOf(u8, name, "switch_mlp") != null) return null;
@@ -950,6 +979,11 @@ fn loadShardedWeights(
                         keep = false;
                     }
                 }
+                // For fused switch_mlp weights: skip entirely in aggressive smelt mode
+                // The model will fall back to shared expert only
+                if (eid == null and std.mem.indexOf(u8, hf_name, "switch_mlp") != null) {
+                    keep = false;
+                }
             }
 
             if (keep) {
@@ -965,6 +999,8 @@ fn loadShardedWeights(
         }
         st.weights.deinit();
         // Shard data is now freed — only extracted weights remain in `weights` HashMap
+        // Clear MLX cache to release any internal buffers from this shard
+        _ = c.c.mlx_clear_cache();
     }
 
     // Free shard_set keys
@@ -1077,6 +1113,8 @@ pub fn buildDSV4Model(
 
     for (0..num_layers) |i| {
         if (i % 10 == 0) std.log.info("Building layer {d}/{d}...", .{ i, num_layers });
+        // Periodically clear MLX cache to reduce memory pressure during model construction
+        if (i % 5 == 0) _ = c.c.mlx_clear_cache();
         const idx_fmt = try std.fmt.allocPrint(allocator, "layers.{d}.", .{i});
         defer allocator.free(idx_fmt);
 
@@ -1123,17 +1161,6 @@ pub fn buildDSV4Model(
         defer allocator.free(wo_a_base);
         const wo_a_deq = try dequantIfNeeded(allocator, weights, wo_a_base, wo_a_raw, config, ctx);
 
-        // Debug: check if dequantize actually changed the shape
-        {
-            const raw_shape = wo_a_raw.shape();
-            const deq_shape = wo_a_deq.shape();
-            std.log.info("wo_a debug: raw ndim={d} shape[0]={d} shape[1]={d} dtype={any} | deq ndim={d} shape[0]={d} shape[1]={d} dtype={any} | same_ptr={}", .{
-                raw_shape.len, raw_shape[0], raw_shape[1], wo_a_raw.dtype(),
-                deq_shape.len, deq_shape[0], deq_shape[1], wo_a_deq.dtype(),
-                wo_a_raw.inner.ctx == wo_a_deq.inner.ctx,
-            });
-        }
-
         // If wo_a is 2D but o_groups > 1, reshape to 3D for grouped LoRA path
         // mlx-lm stores wo_a as Linear weight [out_features, in_features];
         // we reshape to [o_groups, o_lora_rank, group_feat] to match our grouped matmul.
@@ -1144,12 +1171,6 @@ pub fn buildDSV4Model(
         const attn_head_dim = config.head_dim;
         if (wo_a.ndim() == 2 and attn_o_groups > 1 and attn_num_heads % attn_o_groups == 0) {
             const group_feat = (attn_num_heads * attn_head_dim) / attn_o_groups;
-            const deq_s = wo_a_deq.shape();
-            std.log.info("wo_a reshape: o_groups={d} o_lora_rank={d} group_feat={d} target_total={d} deq_size={d}x{d}={d}", .{
-                attn_o_groups, attn_o_lora_rank, group_feat,
-                attn_o_groups * attn_o_lora_rank * group_feat,
-                deq_s[0], deq_s[1], @as(i64, deq_s[0]) * @as(i64, deq_s[1]),
-            });
             wo_a = try ops.reshape(ctx, wo_a_deq, &[_]i32{ @intCast(attn_o_groups), @intCast(attn_o_lora_rank), @intCast(group_feat) });
         }
 
@@ -1509,6 +1530,15 @@ pub fn buildDSV4Model(
             }
         }
 
+        // Check if expert weights are available (smelt may have skipped them)
+        const has_fused_experts = blk_check: {
+            const check_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.weight", .{idx_fmt});
+            defer allocator.free(check_name);
+            const check_name2 = try std.fmt.allocPrint(allocator, "{s}ffn.experts.0.w1.weight", .{idx_fmt});
+            defer allocator.free(check_name2);
+            break :blk_check weights.get(check_name) != null or weights.get(check_name2) != null;
+        };
+
         const moe = deepseek_v4.DSV4MoE{
             .ctx = ctx,
             .gate = gate,
@@ -1525,11 +1555,47 @@ pub fn buildDSV4Model(
                 var fused_up = weights.get(up_proj_name);
                 var fused_down = weights.get(down_proj_name);
 
+                // If smelt skipped all expert weights, create a dummy SwitchGLU
+                if (fused_gate == null and fused_up == null and fused_down == null) {
+                    // Check if individual experts exist
+                    const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.0.w1.weight", .{idx_fmt});
+                    defer allocator.free(ew1_name);
+                    if (weights.get(ew1_name) == null) {
+                        // No expert weights at all — shared-expert-only mode
+                        // Create a minimal dummy SwitchGLU (won't be called in forward)
+                        var dummy_raw = c.c.mlx_array_new();
+                        const dummy_shape = [_]i32{1, 1, 1};
+                        try c.check(c.c.mlx_zeros(&dummy_raw, &dummy_shape, 3, c.c.MLX_FLOAT32, ctx.stream.inner));
+                        const dummy = Array.fromHandle(dummy_raw);
+                        break :blk deepseek_v4.DSV4SwitchGLU{
+                            .ctx = ctx,
+                            .gate_proj = dummy,
+                            .up_proj = dummy,
+                            .down_proj = dummy,
+                            .gate_proj_scales = null,
+                            .gate_proj_biases = null,
+                            .up_proj_scales = null,
+                            .up_proj_biases = null,
+                            .down_proj_scales = null,
+                            .down_proj_biases = null,
+                            .is_quantized = false,
+                            .quant_group_size = 32,
+                            .quant_bits = 4,
+                            .quant_mode = "mxfp4",
+                            .swiglu_limit = config.swiglu_limit,
+                            .sort_threshold = 8,
+                        };
+                    }
+                }
+
                 if (fused_gate != null and fused_up != null and fused_down != null) {
                     // Fused format available — use directly
                     if (weights.fetchRemove(gate_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(up_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(down_proj_name)) |kv| allocator.free(kv.key);
+                } else if (fused_gate == null and fused_up == null and fused_down == null) {
+                    // Already handled above (dummy)
+                    unreachable;
                 } else {
                     // Individual experts — stack into fused format
                     // This handles checkpoints with experts.{e}.w1.weight format
@@ -1650,6 +1716,25 @@ pub fn buildDSV4Model(
             .shared_expert = shared_expert,
             .n_routed_experts = n_routed_experts,
             .n_activated_experts = config.num_experts_per_tok,
+            .experts_loaded = has_fused_experts,
+            .expert_remap = if (smelt.enabled and smelt.load_fraction < 1.0 and has_fused_experts) blk_remap: {
+                // Build remap: original_expert_id → sliced_row_index
+                // For unloaded experts, map to 0 (will be masked by gate scores anyway)
+                const mask = try smelt.buildMask(allocator, n_routed_experts);
+                defer allocator.free(mask);
+                var remap_data = try allocator.alloc(i32, n_routed_experts);
+                defer allocator.free(remap_data);
+                var sliced_idx: i32 = 0;
+                for (mask, 0..) |m, ei| {
+                    if (m) {
+                        remap_data[ei] = sliced_idx;
+                        sliced_idx += 1;
+                    } else {
+                        remap_data[ei] = 0; // Map unloaded experts to row 0
+                    }
+                }
+                break :blk_remap try Array.fromData(allocator, i32, remap_data, &[_]i32{@intCast(n_routed_experts)});
+            } else null,
         };
 
         // --- Layer norms ---
