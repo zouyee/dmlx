@@ -811,10 +811,10 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             .index = idx,
             .layer_meta = layer_meta,
             .ctx = ctx,
-            .is_quantized = ds_config.quantize_default_bits > 0,
-            .quant_group_size = ds_config.quantize_default_group_size,
-            .quant_bits = if (ds_config.quantize_default_bits > 0) ds_config.quantize_default_bits else 4,
-            .quant_mode = ds_config.quantize_default_mode,
+            .is_quantized = true, // switch_mlp is always quantized in 4-bit models
+            .quant_group_size = 32, // mxfp4 uses group_size=32
+            .quant_bits = 4,
+            .quant_mode = "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
             .swiglu_limit = ds_config.swiglu_limit,
         };
         expert_sp = sp;
