@@ -971,16 +971,18 @@ fn loadShardedWeights(
             const hf_name = entry.key_ptr.*;
             var keep = true;
 
-            // Skip expert weights for unloaded experts (smelt mode)
-            if (smelt_mask != null and isExpertWeight(hf_name)) {
+            // Skip expert weights in smelt mode (will be streamed from SSD on demand)
+            if (smelt.enabled and isExpertWeight(hf_name)) {
                 const eid = parseExpertIndexFromHF(hf_name);
                 if (eid) |e| {
-                    if (e < smelt_mask.?.len and !smelt_mask.?[e]) {
-                        keep = false;
+                    // Individual expert format: skip based on mask
+                    if (smelt_mask) |mask| {
+                        if (e < mask.len and !mask[e]) {
+                            keep = false;
+                        }
                     }
                 }
-                // For fused switch_mlp weights: skip entirely in aggressive smelt mode
-                // The model will fall back to shared expert only
+                // Fused switch_mlp weights: always skip in smelt mode (streamed from SSD)
                 if (eid == null and std.mem.indexOf(u8, hf_name, "switch_mlp") != null) {
                     keep = false;
                 }

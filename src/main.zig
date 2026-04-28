@@ -769,15 +769,16 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             defer allocator.free(gate_name);
 
             const actual_gate_name = if (idx.entries.contains(fused_gate_name)) fused_gate_name else gate_name;
+            defer allocator.free(fused_gate_name);
             _ = actual_gate_name;
 
             // Use HF naming convention for switch_mlp
-            const hf_gate = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.gate_proj.weight", .{i});
-            const hf_up = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.up_proj.weight", .{i});
-            const hf_down = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.down_proj.weight", .{i});
-            const hf_gate_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.gate_proj.scales", .{i});
-            const hf_up_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.up_proj.scales", .{i});
-            const hf_down_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.switch_mlp.down_proj.scales", .{i});
+            const hf_gate = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.weight", .{i});
+            const hf_up = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.weight", .{i});
+            const hf_down = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.weight", .{i});
+            const hf_gate_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.scales", .{i});
+            const hf_up_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.scales", .{i});
+            const hf_down_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.scales", .{i});
 
             // Calculate row bytes from tensor info
             var row_bytes: usize = 0;

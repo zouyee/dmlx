@@ -222,10 +222,12 @@ pub const ExpertStreamProvider = struct {
             const qconfig = quantize_mod.QuantConfig{
                 .group_size = self.quant_group_size,
                 .bits = self.quant_bits,
+                .mode = if (std.mem.eql(u8, self.quant_mode, "mxfp4")) .mxfp4 else .affine,
             };
-            const x_gate = try quantize_mod.gatherQmm(self.ctx, sx, gate_w, gate_t, gate_s, null, flat_indices, false, qconfig, false);
+            // gatherQmm: x, w (packed), scales, biases, lhs_indices, rhs_indices, transpose, config, sorted
+            const x_gate = try quantize_mod.gatherQmm(self.ctx, sx, gate_w, gate_s.?, null, null, flat_indices, true, qconfig, false);
             defer x_gate.deinit();
-            const x_up = try quantize_mod.gatherQmm(self.ctx, sx, up_w, up_t, up_s, null, flat_indices, false, qconfig, false);
+            const x_up = try quantize_mod.gatherQmm(self.ctx, sx, up_w, up_s.?, null, null, flat_indices, true, qconfig, false);
             defer x_up.deinit();
 
             // SwiGLU
@@ -235,7 +237,7 @@ pub const ExpertStreamProvider = struct {
             defer hidden.deinit();
 
             // Down projection
-            var x_down = try quantize_mod.gatherQmm(self.ctx, hidden, down_w, down_t, down_s, null, flat_indices, false, qconfig, false);
+            var x_down = try quantize_mod.gatherQmm(self.ctx, hidden, down_w, down_s.?, null, null, flat_indices, true, qconfig, false);
             defer x_down.deinit();
 
             // Multiply by routing scores
