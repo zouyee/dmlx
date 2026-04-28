@@ -1431,6 +1431,8 @@ pub const DSV4Attention = struct {
 
     // O projection with lora (may be quantized)
     wo_a: Array,
+    wo_a_scales: ?Array,
+    wo_a_biases: ?Array,
     wo_b: Array,
     wo_b_scales: ?Array,
     wo_b_biases: ?Array,
@@ -1466,6 +1468,8 @@ pub const DSV4Attention = struct {
         if (self.wkv_biases) |b| b.deinit();
         if (self.kv_b) |kb| kb.deinit();
         self.wo_a.deinit();
+        if (self.wo_a_scales) |s| s.deinit();
+        if (self.wo_a_biases) |b| b.deinit();
         self.wo_b.deinit();
         if (self.wo_b_scales) |s| s.deinit();
         if (self.wo_b_biases) |b| b.deinit();
@@ -1582,6 +1586,7 @@ pub const DSV4Attention = struct {
         defer out_deroped.deinit();
 
         const out = if (self.wo_a.ndim() == 3) blk: {
+            // Grouped LoRA path: wo_a is [n_groups, o_lora_rank, group_feat]
             const wo_a_shape = self.wo_a.shape();
             const n_groups = @as(usize, @intCast(wo_a_shape[0]));
             const o_lora_rank = @as(usize, @intCast(wo_a_shape[1]));
@@ -1621,13 +1626,26 @@ pub const DSV4Attention = struct {
                 break :blk2 try ops.matmul(self.ctx, rs, wbt);
             };
         } else blk: {
+            // Non-grouped path: wo_a is 2D
             const ot = try ops.transposeAxes(self.ctx, out_deroped, &[_]i32{ 0, 2, 1, 3 });
             defer ot.deinit();
             const of = try ops.reshape(self.ctx, ot, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads * head_dim) });
             defer of.deinit();
-            const wat = try ops.transpose(self.ctx, self.wo_a);
-            defer wat.deinit();
-            const oa = try ops.matmul(self.ctx, of, wat);
+            // Use quantizedMatmul if wo_a has scales
+            const oa = if (self.wo_a_scales != null) blk_qa: {
+                const qw = quantize_mod.QuantizedWeight{
+                    .data = self.wo_a,
+                    .scales = self.wo_a_scales.?,
+                    .biases = self.wo_a_biases orelse Array.fromHandle(c.c.mlx_array_new()),
+                    .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits },
+                    .original_shape = &[_]i32{},
+                };
+                break :blk_qa try quantize_mod.quantizedMatmul(self.ctx, of, qw, true);
+            } else blk_qa: {
+                const wat = try ops.transpose(self.ctx, self.wo_a);
+                defer wat.deinit();
+                break :blk_qa try ops.matmul(self.ctx, of, wat);
+            };
             defer oa.deinit();
             break :blk if (self.wo_b_scales != null) blk2: {
                 const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };

@@ -1156,14 +1156,12 @@ pub fn buildDSV4Model(
         defer allocator.free(wo_a_name);
         const wo_a_raw = weights.get(wo_a_name) orelse return LoadError.MissingWeight;
         if (weights.fetchRemove(wo_a_name)) |kv| allocator.free(kv.key);
-        // wo_a needs dequantize for reshape (grouped LoRA) — single lazy node, minimal memory
+        // wo_a needs dequantize for reshape (grouped LoRA) — lazy node
         const wo_a_base = try std.fmt.allocPrint(allocator, "{s}attn.wo_a", .{idx_fmt});
         defer allocator.free(wo_a_base);
         const wo_a_deq = try dequantIfNeeded(allocator, weights, wo_a_base, wo_a_raw, config, ctx);
 
         // If wo_a is 2D but o_groups > 1, reshape to 3D for grouped LoRA path
-        // mlx-lm stores wo_a as Linear weight [out_features, in_features];
-        // we reshape to [o_groups, o_lora_rank, group_feat] to match our grouped matmul.
         var wo_a = wo_a_deq;
         const attn_o_groups = config.o_groups;
         const attn_o_lora_rank = config.o_lora_rank;
@@ -1404,6 +1402,8 @@ pub fn buildDSV4Model(
             .kv_norm = kv_norm,
             .kv_b = null,
             .wo_a = wo_a,
+            .wo_a_scales = null,
+            .wo_a_biases = null,
             .wo_b = wo_b,
             .wo_b_scales = wo_b_scales,
             .wo_b_biases = wo_b_biases,
