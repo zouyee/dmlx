@@ -705,14 +705,15 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         var len: usize = @sizeOf(u64);
         var mib = [_]c_int{ sysctl_c.CTL_HW, sysctl_c.HW_MEMSIZE };
         _ = sysctl_c.sysctl(&mib, 2, &memsize, &len, null, 0);
-        // Use 30GB as wired limit to avoid hang on constrained machines
-        const limit: usize = @min(@as(usize, 30 * 1024 * 1024 * 1024), @as(usize, @intCast(memsize * 3 / 4)));
+        // Use ~85% of system memory as wired limit — maximize GPU cache for large models
+        const limit: usize = @intCast(memsize * 85 / 100);
         var old_wired: usize = 0;
         _ = c.c.mlx_set_wired_limit(&old_wired, limit);
-        // Also set cache limit to help with intermediate buffer management
+        // Cache limit at ~80% — keep materialized weights in GPU memory between forward passes
         var old_cache: usize = 0;
-        _ = c.c.mlx_set_cache_limit(&old_cache, limit / 2);
-        std.log.info("MLX memory: wired_limit={d}MB cache_limit={d}MB (system={d}MB)", .{ limit / 1024 / 1024, limit / 2 / 1024 / 1024, memsize / 1024 / 1024 });
+        const cache_lim: usize = @intCast(memsize * 4 / 5);
+        _ = c.c.mlx_set_cache_limit(&old_cache, cache_lim);
+        std.log.info("MLX memory: wired_limit={d}MB cache_limit={d}MB (system={d}MB)", .{ limit / 1024 / 1024, cache_lim / 1024 / 1024, memsize / 1024 / 1024 });
     }
 
     // 2. Load tokenizer
