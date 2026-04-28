@@ -31,7 +31,7 @@ const ChatCommand = struct {
     seed: ?u64 = null,
     max_kv_size: memory.MaxKvSize = .auto,
     smelt: bool = false,
-    smelt_experts: f32 = 0.15,
+    smelt_experts: f32 = 1.0,
     distributed: bool = false,
 };
 
@@ -52,7 +52,7 @@ const ServerCommand = struct {
     prompt_cache_file: ?[]const u8 = null,
     speculative_ngram: ?usize = null,
     smelt: bool = false,
-    smelt_experts: f32 = 0.15,
+    smelt_experts: f32 = 1.0,
     distributed: bool = false,
 };
 

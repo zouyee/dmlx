@@ -76,7 +76,7 @@ pub const ServerConfig = struct {
     kv_cold_dir: ?[]const u8 = null,
     allow_unsafe_tools: bool = false,
     smelt: bool = false,
-    smelt_experts: f32 = 0.15,
+    smelt_experts: f32 = 1.0,
 };
 
 // ------------------------------------------------------------------
