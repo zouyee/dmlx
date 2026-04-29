@@ -17,6 +17,7 @@ pub const BpeTokenizer = struct {
     vocab: std.StringHashMap(u32),
     ids_to_tokens: std.AutoHashMap(u32, []const u8),
     merges: std.StringHashMap(usize), // "first second" -> rank
+    added_tokens: std.StringHashMap(u32), // Special tokens that should not be split
 
     unk_id: ?u32,
     bos_id: ?u32,
@@ -33,6 +34,7 @@ pub const BpeTokenizer = struct {
             .vocab = std.StringHashMap(u32).init(allocator),
             .ids_to_tokens = std.AutoHashMap(u32, []const u8).init(allocator),
             .merges = std.StringHashMap(usize).init(allocator),
+            .added_tokens = std.StringHashMap(u32).init(allocator),
             .unk_id = null,
             .bos_id = null,
             .eos_id = null,
@@ -48,6 +50,12 @@ pub const BpeTokenizer = struct {
             self.allocator.free(entry.key_ptr.*);
         }
         self.vocab.deinit();
+
+        var at_it = self.added_tokens.iterator();
+        while (at_it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
+        self.added_tokens.deinit();
 
         var it2 = self.ids_to_tokens.iterator();
         while (it2.next()) |entry| {
@@ -155,6 +163,11 @@ pub const BpeTokenizer = struct {
                     else => continue,
                 };
 
+                // Store in added_tokens map for special handling during encoding
+                const added_token_key = try self.allocator.dupe(u8, token_str);
+                errdefer self.allocator.free(added_token_key);
+                try self.added_tokens.put(added_token_key, id);
+
                 if (self.vocab.contains(token_str)) {
                     self.vocab.getPtr(token_str).?.* = id;
                 } else {
@@ -217,6 +230,104 @@ pub const BpeTokenizer = struct {
             if (self.bos_id) |id| try result.append(self.allocator, id);
         }
 
+        // Pre-split text by added_tokens (special tokens that should not be BPE-encoded)
+        var segments = try self.splitByAddedTokens(text);
+        defer {
+            for (segments.items) |seg| {
+                if (seg.is_special_token) {
+                    // Token ID already stored, no need to free
+                } else {
+                    self.allocator.free(seg.text);
+                }
+            }
+            segments.deinit(self.allocator);
+        }
+
+        for (segments.items) |seg| {
+            if (seg.is_special_token) {
+                // Directly add the special token ID
+                try result.append(self.allocator, seg.token_id);
+            } else {
+                // Apply normal BPE encoding to this segment
+                try self.encodeBpeSegment(seg.text, &result);
+            }
+        }
+
+        if (add_special_tokens) {
+            if (self.eos_id) |id| try result.append(self.allocator, id);
+        }
+
+        return result.toOwnedSlice(self.allocator);
+    }
+
+    const TextSegment = struct {
+        text: []const u8,
+        is_special_token: bool,
+        token_id: u32, // Only valid if is_special_token == true
+    };
+
+    fn splitByAddedTokens(self: *BpeTokenizer, text: []const u8) !std.ArrayList(TextSegment) {
+        var segments = std.ArrayList(TextSegment).empty;
+        errdefer {
+            for (segments.items) |seg| {
+                if (!seg.is_special_token) self.allocator.free(seg.text);
+            }
+            segments.deinit(self.allocator);
+        }
+
+        var pos: usize = 0;
+        while (pos < text.len) {
+            // Try to match any added_token at current position
+            var matched = false;
+            var it = self.added_tokens.iterator();
+            while (it.next()) |entry| {
+                const token_str = entry.key_ptr.*;
+                const token_id = entry.value_ptr.*;
+                if (pos + token_str.len <= text.len and std.mem.eql(u8, text[pos..pos + token_str.len], token_str)) {
+                    // Found a special token
+                    try segments.append(self.allocator, .{
+                        .text = token_str,
+                        .is_special_token = true,
+                        .token_id = token_id,
+                    });
+                    pos += token_str.len;
+                    matched = true;
+                    break;
+                }
+            }
+
+            if (!matched) {
+                // Find the next special token or end of string
+                var next_special_pos = text.len;
+                var it2 = self.added_tokens.iterator();
+                while (it2.next()) |entry| {
+                    const token_str = entry.key_ptr.*;
+                    if (std.mem.indexOf(u8, text[pos..], token_str)) |offset| {
+                        const abs_pos = pos + offset;
+                        if (abs_pos < next_special_pos) {
+                            next_special_pos = abs_pos;
+                        }
+                    }
+                }
+
+                // Add the text segment before the next special token
+                const segment_text = text[pos..next_special_pos];
+                if (segment_text.len > 0) {
+                    const owned_text = try self.allocator.dupe(u8, segment_text);
+                    try segments.append(self.allocator, .{
+                        .text = owned_text,
+                        .is_special_token = false,
+                        .token_id = 0,
+                    });
+                }
+                pos = next_special_pos;
+            }
+        }
+
+        return segments;
+    }
+
+    fn encodeBpeSegment(self: *BpeTokenizer, text: []const u8, result: *std.ArrayList(u32)) !void {
         // Detect legacy mode (old tokenizer.json without config fields)
         const is_legacy = (self.normalizer == .none and self.pre_tokenizer == null and self.decoder == null);
 
@@ -288,12 +399,6 @@ pub const BpeTokenizer = struct {
                 try result.append(self.allocator, id);
             }
         }
-
-        if (add_special_tokens) {
-            if (self.eos_id) |id| try result.append(self.allocator, id);
-        }
-
-        return result.toOwnedSlice(self.allocator);
     }
 
     pub fn decode(self: *BpeTokenizer, ids: []const u32) ![]const u8 {

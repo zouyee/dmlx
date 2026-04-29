@@ -842,19 +842,19 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
 
-    // Validate prompt format: first token should be BOS (100000)
+    // Validate prompt format: first token should be BOS (0 for DeepSeek-V4-Flash)
     if (prompt_tokens.len == 0) {
         std.log.err("Empty prompt after tokenization", .{});
         return error.InvalidPromptFormat;
     }
     
-    const expected_bos: u32 = 100000; // <|begin_of_sentence|>
+    const expected_bos: u32 = 0; // <｜begin▁of▁sentence｜> token ID
     if (prompt_tokens[0] != expected_bos) {
         std.log.err("❌ BOS token mismatch! Expected {d}, got {d}", .{ expected_bos, prompt_tokens[0] });
         std.log.err("Prompt text: '{s}'", .{prompt_text});
         std.log.err("First 10 tokens: {any}", .{prompt_tokens[0..@min(prompt_tokens.len, 10)]});
-        std.log.err("This indicates the chat template is using incorrect special tokens.", .{});
-        std.log.err("DeepSeek V4 requires: <|begin_of_sentence|> (not <｜begin▁of▁sentence｜>)", .{});
+        std.log.err("This indicates the chat template format doesn't match the tokenizer.", .{});
+        std.log.err("DeepSeek V4 Flash uses: <｜begin▁of▁sentence｜> (token ID 0)", .{});
         return error.InvalidPromptFormat;
     }
 

@@ -10,6 +10,7 @@ const c = @import("../c.zig");
 const array_mod = @import("../array.zig");
 const ops = @import("../ops.zig");
 const nn = @import("../ops/nn.zig");
+const creation = @import("../ops/creation.zig");
 const io = @import("../io/mlx_io.zig");
 const safetensors_reader = @import("../io/safetensors_reader.zig");
 const deepseek_v4 = @import("deepseek_v4.zig");
@@ -1453,8 +1454,39 @@ pub fn buildDSV4Model(
         }
 
         const is_hash = i < config.num_hash_layers;
-        const smelt_mask = try smelt.buildMask(allocator, n_routed_experts);
-        defer if (!smelt.enabled) allocator.free(smelt_mask);
+        
+        // Build smelt_mask - auto-detect available experts if not explicitly using smelt
+        var smelt_mask: []bool = undefined;
+        var smelt_mask_owned: bool = false;
+        
+        if (smelt.enabled) {
+            // User explicitly enabled smelt - use configured fraction
+            smelt_mask = try smelt.buildMask(allocator, n_routed_experts);
+            smelt_mask_owned = true;
+        } else {
+            // Auto-detect available experts
+            smelt_mask = try allocator.alloc(bool, n_routed_experts);
+            smelt_mask_owned = true;
+            @memset(smelt_mask, false);
+            
+            var n_available: usize = 0;
+            for (0..n_routed_experts) |e| {
+                const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
+                defer allocator.free(ew1_name);
+                if (weights.get(ew1_name) != null) {
+                    smelt_mask[e] = true;
+                    n_available += 1;
+                }
+            }
+            
+            if (n_available < n_routed_experts and n_available > 0) {
+                std.log.warn("⚠️  Layer {d}: Partial expert model detected: {d}/{d} experts available", .{ i, n_available, n_routed_experts });
+                std.log.warn("Auto-enabling smelt mode for this layer.", .{});
+            }
+        }
+        
+        defer if (smelt_mask_owned) allocator.free(smelt_mask);
+        
         const gate = deepseek_v4.DSV4Gate{
             .ctx = ctx,
             .weight = gate_weight,
@@ -1465,8 +1497,8 @@ pub fn buildDSV4Model(
             .route_scale = config.routed_scaling_factor,
             .scoring_func = config.scoring_func,
             .is_hash = is_hash,
-            .smelt_mask = if (smelt.enabled) smelt_mask else null,
-            .allocator = if (smelt.enabled) allocator else null,
+            .smelt_mask = if (smelt.enabled or smelt_mask_owned) smelt_mask else null,
+            .allocator = if (smelt.enabled or smelt_mask_owned) allocator else null,
         };
 
         // Shared expert — keep quantized (lazy, no memory allocation)
@@ -1597,14 +1629,61 @@ pub fn buildDSV4Model(
                     if (weights.fetchRemove(down_proj_name)) |kv| allocator.free(kv.key);
                     // Individual experts — stack into fused format
                     // This handles checkpoints with experts.{e}.w1.weight format
-                    var gate_list = try allocator.alloc(Array, n_routed_experts);
+                    
+                    // First pass: detect which experts are actually available
+                    var available_experts = std.ArrayList(usize).empty;
+                    defer available_experts.deinit(allocator);
+                    
+                    for (0..n_routed_experts) |e| {
+                        const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
+                        defer allocator.free(ew1_name);
+                        if (weights.get(ew1_name) != null) {
+                            try available_experts.append(allocator, e);
+                        }
+                    }
+                    
+                    const n_available = available_experts.items.len;
+                    
+                    // If no experts or only partial experts, auto-enable smelt mode
+                    if (n_available == 0) {
+                        std.log.warn("⚠️  No expert weights found in model files", .{});
+                        std.log.warn("This model may be shared-expert-only or incorrectly formatted.", .{});
+                        // Continue with dummy SwitchGLU (already handled above)
+                        const dummy = try creation.zeros(ctx, &[_]i32{1, 1, 1}, .float32);
+                        break :blk deepseek_v4.DSV4SwitchGLU{
+                            .ctx = ctx,
+                            .gate_proj = dummy,
+                            .up_proj = dummy,
+                            .down_proj = dummy,
+                            .gate_proj_scales = null,
+                            .gate_proj_biases = null,
+                            .up_proj_scales = null,
+                            .up_proj_biases = null,
+                            .down_proj_scales = null,
+                            .down_proj_biases = null,
+                            .is_quantized = false,
+                            .quant_group_size = 32,
+                            .quant_bits = 4,
+                            .quant_mode = "mxfp4",
+                            .swiglu_limit = config.swiglu_limit,
+                            .sort_threshold = 8,
+                        };
+                    }
+                    
+                    if (n_available < n_routed_experts) {
+                        std.log.warn("⚠️  Partial expert model detected: {d}/{d} experts available", .{ n_available, n_routed_experts });
+                        std.log.warn("Auto-enabling smelt mode for partial expert loading.", .{});
+                        std.log.warn("💡 Tip: Use --smelt flag explicitly to suppress this warning.", .{});
+                    }
+                    
+                    var gate_list = try allocator.alloc(Array, n_available);
                     defer allocator.free(gate_list);
-                    var up_list = try allocator.alloc(Array, n_routed_experts);
+                    var up_list = try allocator.alloc(Array, n_available);
                     defer allocator.free(up_list);
-                    var down_list = try allocator.alloc(Array, n_routed_experts);
+                    var down_list = try allocator.alloc(Array, n_available);
                     defer allocator.free(down_list);
 
-                    for (0..n_routed_experts) |e| {
+                    for (available_experts.items, 0..) |e, idx| {
                         const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
                         defer allocator.free(ew1_name);
                         const ew3_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w3.weight", .{ idx_fmt, e });
@@ -1612,33 +1691,42 @@ pub fn buildDSV4Model(
                         const ew2_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w2.weight", .{ idx_fmt, e });
                         defer allocator.free(ew2_name);
 
-                        gate_list[e] = weights.get(ew1_name) orelse return LoadError.MissingWeight;
-                        up_list[e] = weights.get(ew3_name) orelse return LoadError.MissingWeight;
-                        down_list[e] = weights.get(ew2_name) orelse return LoadError.MissingWeight;
+                        gate_list[idx] = weights.get(ew1_name) orelse {
+                            std.log.err("❌ Inconsistent expert weights: {s} missing but was detected earlier", .{ew1_name});
+                            return LoadError.MissingWeight;
+                        };
+                        up_list[idx] = weights.get(ew3_name) orelse {
+                            std.log.err("❌ Inconsistent expert weights: {s} missing", .{ew3_name});
+                            return LoadError.MissingWeight;
+                        };
+                        down_list[idx] = weights.get(ew2_name) orelse {
+                            std.log.err("❌ Inconsistent expert weights: {s} missing", .{ew2_name});
+                            return LoadError.MissingWeight;
+                        };
 
                         if (weights.fetchRemove(ew1_name)) |kv| allocator.free(kv.key);
                         if (weights.fetchRemove(ew3_name)) |kv| allocator.free(kv.key);
                         if (weights.fetchRemove(ew2_name)) |kv| allocator.free(kv.key);
                     }
 
-                    // Stack: [n_experts] × [out, in] → [n_experts, out, in]
+                    // Stack: [n_available] × [out, in] → [n_available, out, in]
                     // Use expandDims + concatenate as stack equivalent
-                    var gate_expanded = try allocator.alloc(Array, n_routed_experts);
+                    var gate_expanded = try allocator.alloc(Array, n_available);
                     defer allocator.free(gate_expanded);
-                    var up_expanded = try allocator.alloc(Array, n_routed_experts);
+                    var up_expanded = try allocator.alloc(Array, n_available);
                     defer allocator.free(up_expanded);
-                    var down_expanded = try allocator.alloc(Array, n_routed_experts);
+                    var down_expanded = try allocator.alloc(Array, n_available);
                     defer allocator.free(down_expanded);
 
-                    for (0..n_routed_experts) |e| {
-                        gate_expanded[e] = try ops.expandDims(ctx, gate_list[e], 0);
-                        up_expanded[e] = try ops.expandDims(ctx, up_list[e], 0);
-                        down_expanded[e] = try ops.expandDims(ctx, down_list[e], 0);
+                    for (0..n_available) |idx| {
+                        gate_expanded[idx] = try ops.expandDims(ctx, gate_list[idx], 0);
+                        up_expanded[idx] = try ops.expandDims(ctx, up_list[idx], 0);
+                        down_expanded[idx] = try ops.expandDims(ctx, down_list[idx], 0);
                     }
-                    defer for (0..n_routed_experts) |e| {
-                        gate_expanded[e].deinit();
-                        up_expanded[e].deinit();
-                        down_expanded[e].deinit();
+                    defer for (0..n_available) |idx| {
+                        gate_expanded[idx].deinit();
+                        up_expanded[idx].deinit();
+                        down_expanded[idx].deinit();
                     };
 
                     fused_gate = try shape_mod.concatenateAxis(ctx, gate_expanded, 0);

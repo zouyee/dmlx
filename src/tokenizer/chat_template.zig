@@ -44,8 +44,8 @@ pub const ChatTemplate = struct {
         return .{
             .allocator = allocator,
             .template_type = .deepseek,
-            .bos_token = "<|begin_of_sentence|>",
-            .eos_token = "<|end_of_sentence|>",
+            .bos_token = "<｜begin▁of▁sentence｜>",
+            .eos_token = "<｜end▁of▁sentence｜>",
         };
     }
 
@@ -84,9 +84,10 @@ pub const ChatTemplate = struct {
     }
 
     fn applyDeepSeek(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
-        // DeepSeek-V3/V4 format:
-        // <|begin_of_sentence|>{system}\n\n<|User|>: {user}\n\n<|Assistant|>: {assistant}<|end_of_sentence|>
-        // Special token IDs: BOS=100000, EOS=100001, User=100003, Assistant=100006
+        // DeepSeek-V4-Flash format (4-bit quantized model):
+        // <｜begin▁of▁sentence｜>{system}\n\n<｜User｜>{user}\n\n<｜Assistant｜>{assistant}<｜end▁of▁sentence｜>
+        // Special token IDs: BOS=0, EOS=1, User=128803, Assistant=128804
+        // Note: Uses full-width pipe ｜ (U+FF5C) and special space ▁ (U+2581)
         try result.appendSlice(self.allocator, self.bos_token);
 
         for (messages) |msg| {
@@ -94,11 +95,11 @@ pub const ChatTemplate = struct {
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, "\n\n");
             } else if (std.mem.eql(u8, msg.role, "user")) {
-                try result.appendSlice(self.allocator, "<|User|>: ");
+                try result.appendSlice(self.allocator, "<｜User｜>");
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, "\n\n");
             } else if (std.mem.eql(u8, msg.role, "assistant")) {
-                try result.appendSlice(self.allocator, "<|Assistant|>: ");
+                try result.appendSlice(self.allocator, "<｜Assistant｜>");
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, self.eos_token);
                 try result.appendSlice(self.allocator, "\n\n");
@@ -106,7 +107,7 @@ pub const ChatTemplate = struct {
         }
 
         if (add_generation_prompt) {
-            try result.appendSlice(self.allocator, "<|Assistant|>: ");
+            try result.appendSlice(self.allocator, "<｜Assistant｜>");
         }
     }
 
