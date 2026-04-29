@@ -744,8 +744,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
 
     // 4. Build model
     var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
-    defer model.deinit();
-
+    // Don't defer model cleanup - we'll do it manually to control order
+    
     // 4b. Wire expert streaming when smelt is enabled (loads experts from SSD on demand)
     var expert_sp: ?*root.expert_stream.ExpertStreamProvider = null;
     var tensor_index: ?*safetensors_reader.TensorIndex = null;
@@ -888,11 +888,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     std.log.info("Starting generation...", .{});
-    const all_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
-    defer allocator.free(all_tokens);
-
-    // Extract only newly generated tokens
-    const new_tokens = if (all_tokens.len > prompt_tokens.len) all_tokens[prompt_tokens.len..] else all_tokens;
+    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
+    defer allocator.free(new_tokens);
 
     // Validate generated tokens
     if (new_tokens.len == 0) {
@@ -907,6 +904,9 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     defer allocator.free(output_text);
 
     std.debug.print("\n{s}\n", .{output_text});
+    
+    // Manual cleanup to control order
+    model.deinit();
 }
 
 // ------------------------------------------------------------------

@@ -2719,6 +2719,12 @@ pub const DSV4Model = struct {
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
+            
+            // Check for EOS token (ID 1 for DeepSeek V4)
+            if (next_token == 1) {
+                std.log.info("EOS token generated, stopping", .{});
+                break;
+            }
         }
 
         // Return only generated tokens (skip prompt)

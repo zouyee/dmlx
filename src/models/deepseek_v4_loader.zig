@@ -1485,7 +1485,8 @@ pub fn buildDSV4Model(
             }
         }
         
-        defer if (smelt_mask_owned) allocator.free(smelt_mask);
+        // Don't defer free - gate takes ownership of smelt_mask
+        // defer if (smelt_mask_owned) allocator.free(smelt_mask);
         
         const gate = deepseek_v4.DSV4Gate{
             .ctx = ctx,
@@ -1736,11 +1737,11 @@ pub fn buildDSV4Model(
 
                 break :blk blk2: {
                     // Check if quantized scales exist for fused weights
-                    const gate_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.scales", .{idx_fmt});
+                    const gate_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.gate_proj.scales", .{idx_fmt});
                     defer allocator.free(gate_scales_name);
-                    const up_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.scales", .{idx_fmt});
+                    const up_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.up_proj.scales", .{idx_fmt});
                     defer allocator.free(up_scales_name);
-                    const down_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.scales", .{idx_fmt});
+                    const down_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.down_proj.scales", .{idx_fmt});
                     defer allocator.free(down_scales_name);
 
                     const gate_scales = weights.get(gate_scales_name);
@@ -1758,11 +1759,11 @@ pub fn buildDSV4Model(
                         if (weights.fetchRemove(up_scales_name)) |kv| allocator.free(kv.key);
                         if (weights.fetchRemove(down_scales_name)) |kv| allocator.free(kv.key);
 
-                        const gate_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.biases", .{idx_fmt});
+                        const gate_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.gate_proj.biases", .{idx_fmt});
                         defer allocator.free(gate_biases_name);
-                        const up_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.biases", .{idx_fmt});
+                        const up_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.up_proj.biases", .{idx_fmt});
                         defer allocator.free(up_biases_name);
-                        const down_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.biases", .{idx_fmt});
+                        const down_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.down_proj.biases", .{idx_fmt});
                         defer allocator.free(down_biases_name);
 
                         gate_biases = weights.get(gate_biases_name);
