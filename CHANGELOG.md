@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **DeepSeek V4 chat template special tokens**: Corrected special token format from
+  full-width characters (`<｜begin▁of▁sentence｜>`) to half-width ASCII
+  (`<|begin_of_sentence|>`). This fixes garbled output caused by tokenizer
+  splitting special tokens into sub-tokens. Added prompt validation to detect
+  formatting errors early. (Issue: BOS token ID should be 100000, not split tokens)
+- **DeepSeek V4 prompt formatting**: Added proper spacing and newlines in chat
+  template (`<|User|>: {content}\n\n` instead of `<|User|>{content}`). Matches
+  official DeepSeek V4 format specification.
+
+### Added
+- Comprehensive troubleshooting guide for DeepSeek V4 (`docs/deepseek-v4-troubleshooting.md`)
+- Chat template unit tests to validate special token formatting
+- Automatic prompt validation with detailed error messages for debugging
+
 ## [0.3.0] - 2026-04-21
 
 ### Breaking

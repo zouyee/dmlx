@@ -1595,10 +1595,6 @@ pub fn buildDSV4Model(
                     if (weights.fetchRemove(gate_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(up_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(down_proj_name)) |kv| allocator.free(kv.key);
-                } else if (fused_gate == null and fused_up == null and fused_down == null) {
-                    // Already handled above (dummy)
-                    unreachable;
-                } else {
                     // Individual experts — stack into fused format
                     // This handles checkpoints with experts.{e}.w1.weight format
                     var gate_list = try allocator.alloc(Array, n_routed_experts);
@@ -1760,6 +1756,8 @@ pub fn buildDSV4Model(
         const hc_attn_fn_name = try std.fmt.allocPrint(allocator, "{s}hc_attn_fn", .{idx_fmt});
         defer allocator.free(hc_attn_fn_name);
         const hc_attn_fn = weights.get(hc_attn_fn_name);
+        if (hc_attn_fn == null and i == 0) std.log.warn("mHC: hc_attn_fn NOT found for layer 0 (key: {s})", .{hc_attn_fn_name});
+        if (hc_attn_fn != null and i == 0) std.log.info("mHC: hc_attn_fn found for layer 0, ndim={d}", .{hc_attn_fn.?.ndim()});
         if (weights.fetchRemove(hc_attn_fn_name)) |kv| allocator.free(kv.key);
 
         const hc_attn_base_name = try std.fmt.allocPrint(allocator, "{s}hc_attn_base", .{idx_fmt});

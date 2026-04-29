@@ -842,6 +842,26 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
 
+    // Validate prompt format: first token should be BOS (100000)
+    if (prompt_tokens.len == 0) {
+        std.log.err("Empty prompt after tokenization", .{});
+        return error.InvalidPromptFormat;
+    }
+    
+    const expected_bos: u32 = 100000; // <|begin_of_sentence|>
+    if (prompt_tokens[0] != expected_bos) {
+        std.log.err("❌ BOS token mismatch! Expected {d}, got {d}", .{ expected_bos, prompt_tokens[0] });
+        std.log.err("Prompt text: '{s}'", .{prompt_text});
+        std.log.err("First 10 tokens: {any}", .{prompt_tokens[0..@min(prompt_tokens.len, 10)]});
+        std.log.err("This indicates the chat template is using incorrect special tokens.", .{});
+        std.log.err("DeepSeek V4 requires: <|begin_of_sentence|> (not <｜begin▁of▁sentence｜>)", .{});
+        return error.InvalidPromptFormat;
+    }
+
+    std.log.info("✅ Prompt correctly formatted with BOS token {d}", .{expected_bos});
+    std.log.info("Prompt text: '{s}'", .{prompt_text});
+    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+
     const prompt_arr = c.c.mlx_array_new_data(
         prompt_tokens.ptr,
         &[_]c_int{ 1, @intCast(prompt_tokens.len) },
@@ -868,13 +888,19 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     std.log.info("Starting generation...", .{});
-    std.log.info("Prompt text: '{s}'", .{prompt_text});
-    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
     const all_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
     defer allocator.free(all_tokens);
 
     // Extract only newly generated tokens
     const new_tokens = if (all_tokens.len > prompt_tokens.len) all_tokens[prompt_tokens.len..] else all_tokens;
+
+    // Validate generated tokens
+    if (new_tokens.len == 0) {
+        std.log.warn("No tokens generated", .{});
+        return;
+    }
+
+    std.log.info("Generated {d} tokens: {any}", .{ new_tokens.len, new_tokens[0..@min(new_tokens.len, 10)] });
 
     // 8. Decode and print
     const output_text = try tokenizer.decode(new_tokens, allocator);
