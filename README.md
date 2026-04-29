@@ -28,6 +28,10 @@ machine learning framework, built on top of the official `mlx-c` C library.
 - **LLM inference engine**: Production-grade inference with LLaMA and DeepSeek V4 support,
   OpenAI-compatible HTTP server with SSE streaming, continuous batching, speculative decoding,
   and guided decoding (JSON schema / regex).
+  
+  > **Note:** DeepSeek V4 chat template was fixed in commit `a18bc24` to use correct ASCII
+  > special tokens. If you experience garbled output, see [`docs/QUICKFIX-DEEPSEEK-V4.md`](docs/QUICKFIX-DEEPSEEK-V4.md)
+  > for verification steps.
 
 - **KV cache**: 6 strategies (Standard, Rotating, Quantized 4/8-bit, Paged with CoW,
   Paged+Quantized, Tiered RAM+SSD) with prefix caching and on-disk shared-prefix reuse.
