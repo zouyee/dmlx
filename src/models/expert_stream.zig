@@ -296,12 +296,15 @@ pub const ExpertStreamProvider = struct {
         }
 
         // 3. Build remap: original_expert_id → mini_fused_row_index
+        // For stream mode: ALL experts are "loaded" (on-demand), so remap is identity
+        // But we only load the unique_ids that were actually selected
         var remap_data = try self.allocator.alloc(i32, meta.n_experts);
         defer self.allocator.free(remap_data);
-        @memset(remap_data, 0);
+        @memset(remap_data, 0); // Default to 0 (will map to first loaded expert if not found)
         for (unique_ids, 0..) |eid, i| {
             remap_data[eid] = @intCast(i);
         }
+        
         const remap_arr = try Array.fromData(self.allocator, i32, remap_data, &[_]i32{@intCast(meta.n_experts)});
         defer remap_arr.deinit();
 
@@ -310,44 +313,16 @@ pub const ExpertStreamProvider = struct {
         try c.check(c.c.mlx_take(&remapped_raw, remap_arr.inner, indices.inner, self.ctx.stream.inner));
         const remapped = Array.fromHandle(remapped_raw);
         defer remapped.deinit();
+        
         const remapped_u32 = try ops.astype(self.ctx, remapped, .uint32);
         defer remapped_u32.deinit();
 
         // 4. Run gather_mm / gather_qmm with the mini fused weights
+        // CRITICAL: Match DSV4SwitchGLU.forward behavior exactly
         const x_4d = try ops.expandDims(self.ctx, flat_x, -2);
         defer x_4d.deinit();
         const x_exp = try ops.expandDims(self.ctx, x_4d, -2);
         defer x_exp.deinit();
-
-        const total_indices = indices.size();
-        const route_shape = indices.shape();
-        const topk = @as(usize, @intCast(route_shape[route_shape.len - 1]));
-
-        // Flatten indices for gather dispatch
-        const flat_indices = try ops.reshape(self.ctx, remapped_u32, &[_]i32{@intCast(total_indices)});
-        defer flat_indices.deinit();
-        const flat_scores = try ops.reshape(self.ctx, scores, &[_]i32{@intCast(total_indices)});
-        defer flat_scores.deinit();
-
-        // For quantized weights, DON'T transpose - gatherQmm expects [n, out, in] format
-        // For float weights, transpose to [n, in, out]
-        // This matches DSV4SwitchGLU.dispatchGatherMm behavior
-
-        // Expand x for each token's topk experts
-        const x_flat = try shape_mod.flatten(self.ctx, x_exp, 0, @as(i32, @intCast(x_exp.ndim())) - 3);
-        defer x_flat.deinit();
-        const topk_scalar = try ops.scalarI32(self.ctx, @intCast(topk));
-        defer topk_scalar.deinit();
-
-        // Token indices for gathering
-        const idx_range = try ops.arange(self.ctx, 0, @floatFromInt(total_indices), 1, .int32);
-        defer idx_range.deinit();
-        const token_idx = try ops.divide(self.ctx, idx_range, topk_scalar);
-        defer token_idx.deinit();
-        const token_idx_i32 = try ops.astype(self.ctx, token_idx, .int32);
-        defer token_idx_i32.deinit();
-        const sx = try shape_mod.takeAxis(self.ctx, x_flat, token_idx_i32, 0);
-        defer sx.deinit();
 
         // Dispatch matmul (float path — quantized path uses gatherQmm)
         if (self.is_quantized) {
@@ -356,40 +331,45 @@ pub const ExpertStreamProvider = struct {
                 .bits = self.quant_bits,
                 .mode = if (std.mem.eql(u8, self.quant_mode, "mxfp4")) .mxfp4 else .affine,
             };
-            // gatherQmm: x, w (packed, NOT transposed), scales, biases, lhs_indices, rhs_indices, transpose, config, sorted
-            // Use original weights (gate_w, up_w, down_w) without transpose
-            const x_gate = try quantize_mod.gatherQmm(self.ctx, sx, gate_w, gate_s.?, null, null, flat_indices, true, qconfig, false);
+            
+            // Use remapped_u32 (not flattened) and x_exp (not flattened) - matches DSV4SwitchGLU
+            const x_gate = try quantize_mod.gatherQmm(self.ctx, x_exp, gate_w, gate_s.?, null, null, remapped_u32, true, qconfig, false);
             defer x_gate.deinit();
-            const x_up = try quantize_mod.gatherQmm(self.ctx, sx, up_w, up_s.?, null, null, flat_indices, true, qconfig, false);
+            
+            const x_up = try quantize_mod.gatherQmm(self.ctx, x_exp, up_w, up_s.?, null, null, remapped_u32, true, qconfig, false);
             defer x_up.deinit();
 
             // SwiGLU
-            const silu_gate = try ops.multiply(self.ctx, x_gate, try ops.sigmoid(self.ctx, x_gate));
+            const sigmoid_gate = try ops.sigmoid(self.ctx, x_gate);
+            defer sigmoid_gate.deinit();
+            const silu_gate = try ops.multiply(self.ctx, x_gate, sigmoid_gate);
             defer silu_gate.deinit();
             const hidden = try ops.multiply(self.ctx, silu_gate, x_up);
             defer hidden.deinit();
 
-            // Down projection
-            var x_down = try quantize_mod.gatherQmm(self.ctx, hidden, down_w, down_s.?, null, null, flat_indices, true, qconfig, false);
-            defer x_down.deinit();
-
-            // Multiply by routing scores
-            const scores_exp = try ops.expandDims(self.ctx, flat_scores, -1);
+            // Multiply by routing scores BEFORE down projection
+            const scores_exp = try ops.expandDims(self.ctx, scores, -1);
             defer scores_exp.deinit();
             const scores_exp2 = try ops.expandDims(self.ctx, scores_exp, -1);
             defer scores_exp2.deinit();
-            const weighted = try ops.multiply(self.ctx, x_down, scores_exp2);
+            const weighted = try ops.multiply(self.ctx, hidden, scores_exp2);
             defer weighted.deinit();
 
-            // Reshape and sum over topk
-            const n_tokens = total_indices / topk;
-            const hidden_dim = @as(usize, @intCast(flat_x.shape()[1]));
-            const reshaped = try ops.reshape(self.ctx, weighted, &[_]i32{ @intCast(n_tokens), @intCast(topk), 1, @intCast(hidden_dim) });
-            defer reshaped.deinit();
-            const squeezed = try shape_mod.squeezeAxes(self.ctx, reshaped, &[_]i32{2});
+            // Down projection
+            const x_down = try quantize_mod.gatherQmm(self.ctx, weighted, down_w, down_s.?, null, null, remapped_u32, true, qconfig, false);
+            defer x_down.deinit();
+
+            // Squeeze and sum over topk - matches DSV4SwitchGLU
+            const squeezed = try ops.squeeze(self.ctx, x_down);
             defer squeezed.deinit();
             const reduce_mod = @import("../ops/reduce.zig");
-            return reduce_mod.sumAxis(self.ctx, squeezed, 1, false);
+            const summed = try reduce_mod.sumAxis(self.ctx, squeezed, -2, false);
+            defer summed.deinit();
+            
+            // Reshape to [n_tokens, hidden_dim]
+            const n_tokens = @as(usize, @intCast(flat_x.shape()[0]));
+            const hidden_dim = @as(usize, @intCast(flat_x.shape()[1]));
+            return ops.reshape(self.ctx, summed, &[_]i32{ @intCast(n_tokens), @intCast(hidden_dim) });
         } else {
             // Float path with gatherMm - needs transposed weights
             const gate_t = try ops.transposeAxes(self.ctx, gate_w, &[_]i32{ 0, 2, 1 });
@@ -399,34 +379,43 @@ pub const ExpertStreamProvider = struct {
             const down_t = try ops.transposeAxes(self.ctx, down_w, &[_]i32{ 0, 2, 1 });
             defer down_t.deinit();
             
-            const x_gate = try ops.gatherMm(self.ctx, sx, gate_t, null, flat_indices, false);
+            // Use remapped_u32 (not flattened) and x_exp (not flattened) - matches DSV4SwitchGLU
+            const x_gate = try ops.gatherMm(self.ctx, x_exp, gate_t, null, remapped_u32, false);
             defer x_gate.deinit();
-            const x_up = try ops.gatherMm(self.ctx, sx, up_t, null, flat_indices, false);
+            const x_up = try ops.gatherMm(self.ctx, x_exp, up_t, null, remapped_u32, false);
             defer x_up.deinit();
 
-            const silu_gate = try ops.multiply(self.ctx, x_gate, try ops.sigmoid(self.ctx, x_gate));
+            // SwiGLU
+            const sigmoid_gate = try ops.sigmoid(self.ctx, x_gate);
+            defer sigmoid_gate.deinit();
+            const silu_gate = try ops.multiply(self.ctx, x_gate, sigmoid_gate);
             defer silu_gate.deinit();
             const hidden = try ops.multiply(self.ctx, silu_gate, x_up);
             defer hidden.deinit();
 
-            const x_down = try ops.gatherMm(self.ctx, hidden, down_t, null, flat_indices, false);
-            defer x_down.deinit();
-
-            const scores_exp = try ops.expandDims(self.ctx, flat_scores, -1);
+            // Multiply by routing scores BEFORE down projection
+            const scores_exp = try ops.expandDims(self.ctx, scores, -1);
             defer scores_exp.deinit();
             const scores_exp2 = try ops.expandDims(self.ctx, scores_exp, -1);
             defer scores_exp2.deinit();
-            const weighted = try ops.multiply(self.ctx, x_down, scores_exp2);
+            const weighted = try ops.multiply(self.ctx, hidden, scores_exp2);
             defer weighted.deinit();
 
-            const n_tokens = total_indices / topk;
-            const hidden_dim = @as(usize, @intCast(flat_x.shape()[1]));
-            const reshaped = try ops.reshape(self.ctx, weighted, &[_]i32{ @intCast(n_tokens), @intCast(topk), 1, @intCast(hidden_dim) });
-            defer reshaped.deinit();
-            const squeezed = try shape_mod.squeezeAxes(self.ctx, reshaped, &[_]i32{2});
+            // Down projection
+            const x_down = try ops.gatherMm(self.ctx, weighted, down_t, null, remapped_u32, false);
+            defer x_down.deinit();
+
+            // Squeeze and sum over topk - matches DSV4SwitchGLU
+            const squeezed = try ops.squeeze(self.ctx, x_down);
             defer squeezed.deinit();
             const reduce_mod = @import("../ops/reduce.zig");
-            return reduce_mod.sumAxis(self.ctx, squeezed, 1, false);
+            const summed = try reduce_mod.sumAxis(self.ctx, squeezed, -2, false);
+            defer summed.deinit();
+            
+            // Reshape to [n_tokens, hidden_dim]
+            const n_tokens = @as(usize, @intCast(flat_x.shape()[0]));
+            const hidden_dim = @as(usize, @intCast(flat_x.shape()[1]));
+            return ops.reshape(self.ctx, summed, &[_]i32{ @intCast(n_tokens), @intCast(hidden_dim) });
         }
     }
 };
