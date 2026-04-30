@@ -204,32 +204,15 @@ pub const ExpertStreamProvider = struct {
         
         const info = self.index.entries.get(tensor_name) orelse return error.TensorNotFound;
         
-        std.log.info("Loading full tensor: {s}, shape=[{d},{d}], dtype={s}", .{
-            tensor_name,
-            info.shape[0],
-            info.shape[1],
-            info.dtype_str,
-        });
-        
         // Load the FULL tensor from disk (this is the key fix!)
         const full_tensor = try self.index.loadTensor(tensor_name);
         defer full_tensor.deinit();
         
-        const full_shape = full_tensor.shape();
-        std.log.info("Full tensor loaded: shape=[{d},{d}], dtype={any}", .{
-            full_shape[0],
-            full_shape[1],
-            full_tensor.dtype(),
-        });
-        
         // If all experts are selected, return the full tensor
         const n_experts = @as(usize, @intCast(info.shape[0]));
         if (expert_ids.len >= n_experts) {
-            std.log.info("All experts selected, returning full tensor", .{});
             return ops.copy(self.ctx, full_tensor);
         }
-        
-        std.log.info("Slicing {d} experts from {d} total", .{ expert_ids.len, n_experts });
         
         // Slice to get only the selected experts: full_tensor[expert_ids, ...]
         // Convert expert_ids to an MLX array for indexing
@@ -241,12 +224,9 @@ pub const ExpertStreamProvider = struct {
         defer indices_i32.deinit();
         
         const sliced = try shape_mod.takeAxis(self.ctx, full_tensor, indices_i32, 0);
-        const sliced_shape = sliced.shape();
-        std.log.info("Sliced tensor: shape=[{d},{d}], dtype={any}", .{
-            sliced_shape[0],
-            sliced_shape[1],
-            sliced.dtype(),
-        });
+        
+        // Force evaluation to materialize the sliced data
+        try sliced.eval();
         
         return sliced;
     }
