@@ -272,10 +272,15 @@ pub const ExpertStreamProvider = struct {
         // Note: row_bytes parameter removed - we now load full tensor then slice
         const gate_w = try self.loadExpertSlices(meta.gate_proj_name, unique_ids, 0);
         defer gate_w.deinit();
+        std.log.info("Layer {d}: gate_w shape: {any}", .{ layer_idx, gate_w.shape() });
+        
         const up_w = try self.loadExpertSlices(meta.up_proj_name, unique_ids, 0);
         defer up_w.deinit();
+        std.log.info("Layer {d}: up_w shape: {any}", .{ layer_idx, up_w.shape() });
+        
         const down_w = try self.loadExpertSlices(meta.down_proj_name, unique_ids, 0);
         defer down_w.deinit();
+        std.log.info("Layer {d}: down_w shape: {any}", .{ layer_idx, down_w.shape() });
 
         // Load scales if quantized
         var gate_s: ?Array = null;
