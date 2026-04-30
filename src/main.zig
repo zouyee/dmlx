@@ -733,9 +733,15 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     const tokenizer = tokenizer_backend.asStrategy();
 
     // 3. Load model weights (sharded or single-file)
+    const smelt_strategy: root.deepseek_v4_loader.SmeltConfig.LoadMode = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
+        .stream
+    else
+        .preload;
+    
     const smelt_config = root.deepseek_v4_loader.SmeltConfig{
         .enabled = cmd.smelt,
         .load_fraction = cmd.smelt_experts,
+        .load_mode = smelt_strategy,
     };
     // Use original eager loading with streaming shard cleanup
     // mlx_load_safetensors returns lazy/memory-mapped arrays that don't consume RAM until evaluated

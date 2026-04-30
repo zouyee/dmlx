@@ -244,6 +244,10 @@ pub const ExpertStreamProvider = struct {
 
         // 1. Collect unique expert IDs from indices
         const indices_data = try indices.dataSlice(u32);
+        
+        // DEBUG: Log which experts were selected by router
+        std.log.info("Layer {d}: Router selected experts: {any}", .{ layer_idx, indices_data[0..@min(indices_data.len, 20)] });
+        
         var unique_set = std.AutoHashMap(u32, void).init(self.allocator);
         defer unique_set.deinit();
         for (indices_data) |eid| {
@@ -261,6 +265,8 @@ pub const ExpertStreamProvider = struct {
         }
         // Sort for sequential disk access (though we now load full tensor, sorting still helps cache)
         std.mem.sort(u32, unique_ids, {}, std.sort.asc(u32));
+        
+        std.log.info("Layer {d}: Loading {d} unique experts: {any}", .{ layer_idx, unique_ids.len, unique_ids });
 
         // 2. Load only the needed expert weight slices from SSD
         // Note: row_bytes parameter removed - we now load full tensor then slice

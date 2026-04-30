@@ -242,6 +242,7 @@ pub const LoadError = error{
 /// The router is biased to avoid selecting unloaded experts.
 pub const SmeltConfig = struct {
     pub const Strategy = enum { uniform, first };
+    pub const LoadMode = enum { preload, stream };
 
     /// Enable Smelt mode
     enabled: bool = false,
@@ -252,6 +253,9 @@ pub const SmeltConfig = struct {
     /// "uniform": evenly spaced across expert indices.
     /// "first": load the first N experts.
     strategy: Strategy = .uniform,
+    /// Load mode: preload (load subset at init) or stream (load on-demand from disk).
+    /// In stream mode, smelt_mask is NOT used - router can select any expert.
+    load_mode: LoadMode = .preload,
 
     /// Build a per-expert residency mask for the given number of experts.
     /// Caller owns the returned slice and must free with allocator.
@@ -1459,10 +1463,21 @@ pub fn buildDSV4Model(
         var smelt_mask: []bool = undefined;
         var smelt_mask_owned: bool = false;
         
-        if (smelt.enabled) {
-            // User explicitly enabled smelt - use configured fraction
+        if (smelt.enabled and smelt.load_mode == .preload) {
+            // Preload mode: create smelt_mask to restrict router to loaded experts
             smelt_mask = try smelt.buildMask(allocator, n_routed_experts);
             smelt_mask_owned = true;
+            std.log.info("Layer {d}: Preload mode - router restricted to {d}/{d} experts", .{
+                i,
+                @as(usize, @intFromFloat(@as(f32, @floatFromInt(n_routed_experts)) * smelt.load_fraction)),
+                n_routed_experts,
+            });
+        } else if (smelt.enabled and smelt.load_mode == .stream) {
+            // Stream mode: NO smelt_mask - router can select any expert (0-255)
+            // Experts will be loaded on-demand from disk
+            std.log.info("Layer {d}: Stream mode - router can select any expert (on-demand loading)", .{i});
+            smelt_mask = undefined; // Don't allocate - we won't use it
+            smelt_mask_owned = false;
         } else {
             // Auto-detect available experts
             smelt_mask = try allocator.alloc(bool, n_routed_experts);
@@ -1498,8 +1513,8 @@ pub fn buildDSV4Model(
             .route_scale = config.routed_scaling_factor,
             .scoring_func = config.scoring_func,
             .is_hash = is_hash,
-            .smelt_mask = if (smelt.enabled or smelt_mask_owned) smelt_mask else null,
-            .allocator = if (smelt.enabled or smelt_mask_owned) allocator else null,
+            .smelt_mask = if (smelt_mask_owned and smelt.load_mode == .preload) smelt_mask else null,
+            .allocator = if (smelt_mask_owned and smelt.load_mode == .preload) allocator else null,
         };
 
         // Shared expert — keep quantized (lazy, no memory allocation)
