@@ -203,13 +203,9 @@ pub const ExpertStreamProvider = struct {
         const flat_scores = try ops.reshape(self.ctx, scores, &[_]i32{@intCast(total_indices)});
         defer flat_scores.deinit();
 
-        // Transpose weights for matmul: [n, out, in] → [n, in, out]
-        const gate_t = try ops.transposeAxes(self.ctx, gate_w, &[_]i32{ 0, 2, 1 });
-        defer gate_t.deinit();
-        const up_t = try ops.transposeAxes(self.ctx, up_w, &[_]i32{ 0, 2, 1 });
-        defer up_t.deinit();
-        const down_t = try ops.transposeAxes(self.ctx, down_w, &[_]i32{ 0, 2, 1 });
-        defer down_t.deinit();
+        // For quantized weights, DON'T transpose - gatherQmm expects [n, out, in] format
+        // For float weights, transpose to [n, in, out]
+        // This matches DSV4SwitchGLU.dispatchGatherMm behavior
 
         // Expand x for each token's topk experts
         const x_flat = try shape_mod.flatten(self.ctx, x_exp, 0, @as(i32, @intCast(x_exp.ndim())) - 3);
@@ -234,7 +230,8 @@ pub const ExpertStreamProvider = struct {
                 .bits = self.quant_bits,
                 .mode = if (std.mem.eql(u8, self.quant_mode, "mxfp4")) .mxfp4 else .affine,
             };
-            // gatherQmm: x, w (packed), scales, biases, lhs_indices, rhs_indices, transpose, config, sorted
+            // gatherQmm: x, w (packed, NOT transposed), scales, biases, lhs_indices, rhs_indices, transpose, config, sorted
+            // Use original weights (gate_w, up_w, down_w) without transpose
             const x_gate = try quantize_mod.gatherQmm(self.ctx, sx, gate_w, gate_s.?, null, null, flat_indices, true, qconfig, false);
             defer x_gate.deinit();
             const x_up = try quantize_mod.gatherQmm(self.ctx, sx, up_w, up_s.?, null, null, flat_indices, true, qconfig, false);
@@ -268,7 +265,14 @@ pub const ExpertStreamProvider = struct {
             const reduce_mod = @import("../ops/reduce.zig");
             return reduce_mod.sumAxis(self.ctx, squeezed, 1, false);
         } else {
-            // Float path with gatherMm
+            // Float path with gatherMm - needs transposed weights
+            const gate_t = try ops.transposeAxes(self.ctx, gate_w, &[_]i32{ 0, 2, 1 });
+            defer gate_t.deinit();
+            const up_t = try ops.transposeAxes(self.ctx, up_w, &[_]i32{ 0, 2, 1 });
+            defer up_t.deinit();
+            const down_t = try ops.transposeAxes(self.ctx, down_w, &[_]i32{ 0, 2, 1 });
+            defer down_t.deinit();
+            
             const x_gate = try ops.gatherMm(self.ctx, sx, gate_t, null, flat_indices, false);
             defer x_gate.deinit();
             const x_up = try ops.gatherMm(self.ctx, sx, up_t, null, flat_indices, false);
@@ -279,7 +283,7 @@ pub const ExpertStreamProvider = struct {
             const hidden = try ops.multiply(self.ctx, silu_gate, x_up);
             defer hidden.deinit();
 
-            var x_down = try ops.gatherMm(self.ctx, hidden, down_t, null, flat_indices, false);
+            const x_down = try ops.gatherMm(self.ctx, hidden, down_t, null, flat_indices, false);
             defer x_down.deinit();
 
             const scores_exp = try ops.expandDims(self.ctx, flat_scores, -1);
