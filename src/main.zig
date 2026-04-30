@@ -33,6 +33,7 @@ const ChatCommand = struct {
     max_kv_size: memory.MaxKvSize = .auto,
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     distributed: bool = false,
 };
 
@@ -54,6 +55,7 @@ const ServerCommand = struct {
     speculative_ngram: ?usize = null,
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     distributed: bool = false,
 };
 
@@ -259,7 +261,8 @@ fn printUsage() void {
         \\    --prompt-cache-file <path>  Prompt cache file for KV state persistence
         \\    --speculative-ngram <n>     Enable speculative decoding with n-gram size
         \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
-        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0)
+        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
+        \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
         \\    --distributed               Enable distributed tensor parallelism
         \\
         \\  mlx-zig benchmark [options]
@@ -389,6 +392,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             i -= 1;
         } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
+            cmd.smelt_strategy = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
@@ -435,6 +440,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             i -= 1;
         } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
+            cmd.smelt_strategy = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
@@ -806,17 +813,41 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         }
 
         const sp = try allocator.create(root.expert_stream.ExpertStreamProvider);
-        sp.* = .{
-            .allocator = allocator,
-            .index = idx,
-            .layer_meta = layer_meta,
-            .ctx = ctx,
-            .is_quantized = true, // switch_mlp is always quantized in 4-bit models
-            .quant_group_size = 32, // mxfp4 uses group_size=32
-            .quant_bits = 4,
-            .quant_mode = "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
-            .swiglu_limit = ds_config.swiglu_limit,
-        };
+        
+        // Determine strategy
+        const strategy: root.expert_stream.ExpertLoadStrategy = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
+            .stream
+        else
+            .preload;
+        
+        // Calculate number of experts to load (for preload mode)
+        const n_experts_to_load = @as(usize, @intFromFloat(@as(f32, @floatFromInt(ds_config.n_routed_experts)) * cmd.smelt_experts));
+        var expert_ids = try allocator.alloc(u32, n_experts_to_load);
+        defer allocator.free(expert_ids);
+        for (0..n_experts_to_load) |i| {
+            expert_ids[i] = @intCast(i);
+        }
+        
+        std.log.info("Expert strategy: {s}, loading {d}/{d} experts ({d:.1}%)", .{
+            @tagName(strategy),
+            n_experts_to_load,
+            ds_config.n_routed_experts,
+            cmd.smelt_experts * 100.0,
+        });
+        
+        sp.* = try root.expert_stream.ExpertStreamProvider.initWithStrategy(
+            allocator,
+            ctx,
+            idx,
+            strategy,
+            expert_ids,
+            layer_meta,
+            true, // switch_mlp is always quantized in 4-bit models
+            32,   // mxfp4 uses group_size=32
+            4,    // 4-bit quantization
+            "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
+            ds_config.swiglu_limit,
+        );
         expert_sp = sp;
 
         // Wire stream provider into each MoE layer

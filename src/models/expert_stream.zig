@@ -1,12 +1,20 @@
-/// Expert weight streaming for memory-constrained MoE inference.
+/// Expert weight management for memory-constrained MoE inference.
 ///
-/// Instead of loading all 256 experts into memory, this module loads only
-/// the experts selected by the router on each forward pass, directly from
-/// safetensors files on SSD via pread random access.
+/// Supports two strategies:
+/// 1. Preload (Option 1): Load expert subset at initialization, use throughout inference
+///    - Matches Python vmlx implementation (proven to work)
+///    - Higher memory but stable and fast
+///    - See expert_preload.zig for implementation
+///
+/// 2. Stream (Option 2): Load experts on-demand from disk during inference
+///    - Lower memory footprint
+///    - More complex, requires correct mxfp4 handling
+///    - Experimental
 ///
 /// On a 48GB Mac running DeepSeek V4 Flash 4-bit (151GB on disk):
-/// - Without streaming: OOM (needs ~138GB for expert weights alone)
-/// - With streaming: ~10GB (attention + shared expert + 8 active experts per step)
+/// - Without smelt: OOM (needs ~138GB for expert weights alone)
+/// - With preload (50%): ~70GB (attention + shared + 128 experts)
+/// - With stream: ~10GB (attention + shared expert + 8 active experts per step)
 const std = @import("std");
 const c = @import("../c.zig");
 const array_mod = @import("../array.zig");
@@ -14,10 +22,17 @@ const ops = @import("../ops.zig");
 const safetensors_reader = @import("../io/safetensors_reader.zig");
 const quantize_mod = @import("../quantize.zig");
 const shape_mod = @import("../ops/shape.zig");
+const expert_preload = @import("expert_preload.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const TensorIndex = safetensors_reader.TensorIndex;
+
+/// Expert loading strategy.
+pub const ExpertLoadStrategy = enum {
+    preload,  // Option 1: Preload subset at init (matches Python vmlx)
+    stream,   // Option 2: Stream on-demand from disk (experimental)
+};
 
 /// Per-layer expert weight metadata for streaming.
 pub const LayerExpertMeta = struct {
@@ -34,19 +49,33 @@ pub const LayerExpertMeta = struct {
     n_experts: usize,
 };
 
-/// Streams expert weights from SSD on demand.
+/// Unified expert provider supporting both preload and streaming strategies.
 pub const ExpertStreamProvider = struct {
     allocator: std.mem.Allocator,
     index: *TensorIndex,
-    layer_meta: []LayerExpertMeta,
     ctx: EagerContext,
+    strategy: ExpertLoadStrategy,
+    
+    // Common fields
     is_quantized: bool,
     quant_group_size: i32,
     quant_bits: u8,
     quant_mode: []const u8,
     swiglu_limit: f32,
+    
+    // Strategy-specific implementations
+    preload_provider: ?*expert_preload.ExpertPreloadProvider = null,
+    
+    // Stream-specific fields (Option 2)
+    layer_meta: []LayerExpertMeta,
 
     pub fn deinit(self: *ExpertStreamProvider) void {
+        if (self.preload_provider) |provider| {
+            provider.deinit();
+            self.allocator.destroy(provider);
+        }
+        
+        // Clean up stream-specific metadata
         for (self.layer_meta) |meta| {
             self.allocator.free(meta.gate_proj_name);
             self.allocator.free(meta.up_proj_name);
@@ -57,69 +86,174 @@ pub const ExpertStreamProvider = struct {
         }
         self.allocator.free(self.layer_meta);
     }
+    
+    /// Initialize provider with specified strategy.
+    pub fn initWithStrategy(
+        allocator: std.mem.Allocator,
+        ctx: EagerContext,
+        index: *TensorIndex,
+        strategy: ExpertLoadStrategy,
+        expert_ids: []const u32,
+        layer_meta: []LayerExpertMeta,
+        is_quantized: bool,
+        quant_group_size: i32,
+        quant_bits: u8,
+        quant_mode: []const u8,
+        swiglu_limit: f32,
+    ) !ExpertStreamProvider {
+        var provider = ExpertStreamProvider{
+            .allocator = allocator,
+            .index = index,
+            .ctx = ctx,
+            .strategy = strategy,
+            .is_quantized = is_quantized,
+            .quant_group_size = quant_group_size,
+            .quant_bits = quant_bits,
+            .quant_mode = quant_mode,
+            .swiglu_limit = swiglu_limit,
+            .layer_meta = layer_meta,
+        };
+        
+        switch (strategy) {
+            .preload => {
+                std.log.info("Initializing expert provider with PRELOAD strategy", .{});
+                
+                // Convert LayerExpertMeta to expert_preload.LayerMeta
+                var preload_meta = try allocator.alloc(expert_preload.LayerMeta, layer_meta.len);
+                defer allocator.free(preload_meta);
+                
+                for (layer_meta, 0..) |meta, i| {
+                    preload_meta[i] = expert_preload.LayerMeta{
+                        .gate_proj_name = meta.gate_proj_name,
+                        .up_proj_name = meta.up_proj_name,
+                        .down_proj_name = meta.down_proj_name,
+                        .gate_scales_name = meta.gate_scales_name,
+                        .up_scales_name = meta.up_scales_name,
+                        .down_scales_name = meta.down_scales_name,
+                        .n_experts = meta.n_experts,
+                    };
+                }
+                
+                // Initialize preload provider
+                const preload_impl = try allocator.create(expert_preload.ExpertPreloadProvider);
+                preload_impl.* = try expert_preload.ExpertPreloadProvider.init(
+                    allocator,
+                    ctx,
+                    index,
+                    expert_ids,
+                    preload_meta,
+                    is_quantized,
+                    quant_group_size,
+                    quant_bits,
+                    quant_mode,
+                );
+                provider.preload_provider = preload_impl;
+            },
+            .stream => {
+                std.log.info("Initializing expert provider with STREAM strategy (experimental)", .{});
+                // Stream mode doesn't need initialization - loads on demand
+            },
+        }
+        
+        return provider;
+    }
+    
+    /// Forward pass - dispatches to appropriate strategy implementation.
+    pub fn streamForward(
+        self: *ExpertStreamProvider,
+        layer_idx: usize,
+        flat_x: Array,
+        indices: Array,
+        scores: Array,
+    ) !Array {
+        return switch (self.strategy) {
+            .preload => blk: {
+                if (self.preload_provider) |provider| {
+                    break :blk provider.forward(layer_idx, flat_x, indices, scores);
+                }
+                return error.PreloadProviderNotInitialized;
+            },
+            .stream => self.streamingForward(layer_idx, flat_x, indices, scores),
+        };
+    }
+    
+    /// Get cache bias for router (only for preload strategy).
+    pub fn getCacheBias(self: *ExpertStreamProvider, layer_idx: usize) ?Array {
+        if (self.strategy == .preload) {
+            if (self.preload_provider) |provider| {
+                return provider.getCacheBias(layer_idx);
+            }
+        }
+        return null;
+    }
 
     /// Load a subset of experts from a fused tensor on disk.
     /// Returns a mini fused tensor [n_selected, ...] containing only the requested expert rows.
     /// `expert_ids` is a sorted, deduplicated list of expert indices to load.
+    /// 
+    /// CRITICAL: For quantized mxfp4 format, we MUST load the full tensor first, then slice it.
+    /// Creating a new tensor from concatenated expert rows breaks the packing format.
+    /// This matches the Python vmlx implementation (_load_expert_subset).
     fn loadExpertSlices(
         self: *ExpertStreamProvider,
         tensor_name: []const u8,
         expert_ids: []const u32,
         row_bytes: usize,
     ) !Array {
+        _ = row_bytes; // Not used in the new approach
+        
         const info = self.index.entries.get(tensor_name) orelse return error.TensorNotFound;
-
-        const posix = @cImport(@cInclude("fcntl.h"));
-        const unistd = @cImport(@cInclude("unistd.h"));
-
-        const path_z = try self.allocator.dupeZ(u8, info.shard_path);
-        defer self.allocator.free(path_z);
-        const fd = posix.open(path_z.ptr, posix.O_RDONLY);
-        if (fd < 0) return error.FileNotFound;
-        defer _ = unistd.close(fd);
-
-        const n_selected = expert_ids.len;
-        const total_bytes = n_selected * row_bytes;
-        const buf = try self.allocator.alloc(u8, total_bytes);
-        defer self.allocator.free(buf); // Safe to free after MLX copies the data
-
-        // Read each expert's row via pread
-        for (expert_ids, 0..) |eid, i| {
-            const offset: i64 = @intCast(info.data_offset_start + @as(u64, eid) * @as(u64, row_bytes));
-            const dest = buf[i * row_bytes .. (i + 1) * row_bytes];
-            const r = unistd.pread(fd, dest.ptr, row_bytes, offset);
-            if (r < @as(isize, @intCast(row_bytes))) {
-                std.log.err("Failed to read expert {d} from {s}: read {d} bytes, expected {d}", .{eid, tensor_name, r, row_bytes});
-                return error.IncompleteRead;
-            }
+        
+        std.log.info("Loading full tensor: {s}, shape=[{d},{d}], dtype={s}", .{
+            tensor_name,
+            info.shape[0],
+            info.shape[1],
+            info.dtype_str,
+        });
+        
+        // Load the FULL tensor from disk (this is the key fix!)
+        const full_tensor = try self.index.loadTensor(tensor_name);
+        defer full_tensor.deinit();
+        
+        const full_shape = full_tensor.shape();
+        std.log.info("Full tensor loaded: shape=[{d},{d}], dtype={any}", .{
+            full_shape[0],
+            full_shape[1],
+            full_tensor.dtype(),
+        });
+        
+        // If all experts are selected, return the full tensor
+        const n_experts = @as(usize, @intCast(info.shape[0]));
+        if (expert_ids.len >= n_experts) {
+            std.log.info("All experts selected, returning full tensor", .{});
+            return ops.copy(self.ctx, full_tensor);
         }
-
-        // Build shape: [n_selected, rest_of_dims...]
-        var shape_i32 = try self.allocator.alloc(i32, info.shape.len);
-        defer self.allocator.free(shape_i32);
-        shape_i32[0] = @intCast(n_selected);
-        for (info.shape[1..], 1..) |s, idx| {
-            shape_i32[idx] = @intCast(s);
-        }
-
-        const mlx_dtype = safetensors_reader.dtypeFromString(info.dtype_str) orelse return error.UnsupportedDtype;
         
-        // Create array from data - MLX will copy the data internally
-        const arr_raw = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
-        const arr = Array.fromHandle(arr_raw);
+        std.log.info("Slicing {d} experts from {d} total", .{ expert_ids.len, n_experts });
         
-        // Force evaluation to ensure data is copied before we free buf
-        try arr.eval();
+        // Slice to get only the selected experts: full_tensor[expert_ids, ...]
+        // Convert expert_ids to an MLX array for indexing
+        const indices_arr = try Array.fromData(self.allocator, u32, expert_ids, &[_]i32{@intCast(expert_ids.len)});
+        defer indices_arr.deinit();
         
-        return arr;
+        // Use take_axis to slice along axis 0 (expert dimension)
+        const indices_i32 = try ops.astype(self.ctx, indices_arr, .int32);
+        defer indices_i32.deinit();
+        
+        const sliced = try shape_mod.takeAxis(self.ctx, full_tensor, indices_i32, 0);
+        const sliced_shape = sliced.shape();
+        std.log.info("Sliced tensor: shape=[{d},{d}], dtype={any}", .{
+            sliced_shape[0],
+            sliced_shape[1],
+            sliced.dtype(),
+        });
+        
+        return sliced;
     }
 
-    /// Load the selected experts for a given layer and run the SwiGLU forward pass.
-    /// `flat_x`: [N, hidden_size] input tokens
-    /// `indices`: [N, topk] expert IDs from router
-    /// `scores`: [N, topk] routing weights
-    /// Returns: [N, hidden_size] expert output
-    pub fn streamForward(
+    /// Streaming forward (Option 2): Load experts on-demand from disk.
+    /// This is the experimental approach with lower memory but more complexity.
+    fn streamingForward(
         self: *ExpertStreamProvider,
         layer_idx: usize,
         flat_x: Array,
@@ -145,15 +279,16 @@ pub const ExpertStreamProvider = struct {
                 i += 1;
             }
         }
-        // Sort for sequential disk access
+        // Sort for sequential disk access (though we now load full tensor, sorting still helps cache)
         std.mem.sort(u32, unique_ids, {}, std.sort.asc(u32));
 
         // 2. Load only the needed expert weight slices from SSD
-        const gate_w = try self.loadExpertSlices(meta.gate_proj_name, unique_ids, meta.expert_row_bytes);
+        // Note: row_bytes parameter removed - we now load full tensor then slice
+        const gate_w = try self.loadExpertSlices(meta.gate_proj_name, unique_ids, 0);
         defer gate_w.deinit();
-        const up_w = try self.loadExpertSlices(meta.up_proj_name, unique_ids, meta.expert_row_bytes);
+        const up_w = try self.loadExpertSlices(meta.up_proj_name, unique_ids, 0);
         defer up_w.deinit();
-        const down_w = try self.loadExpertSlices(meta.down_proj_name, unique_ids, meta.expert_row_bytes);
+        const down_w = try self.loadExpertSlices(meta.down_proj_name, unique_ids, 0);
         defer down_w.deinit();
 
         // Load scales if quantized
@@ -164,9 +299,9 @@ pub const ExpertStreamProvider = struct {
         defer if (up_s) |a| a.deinit();
         defer if (down_s) |a| a.deinit();
         if (self.is_quantized) {
-            if (meta.gate_scales_name) |n| { gate_s = try self.loadExpertSlices(n, unique_ids, meta.expert_scale_row_bytes); }
-            if (meta.up_scales_name) |n| { up_s = try self.loadExpertSlices(n, unique_ids, meta.expert_scale_row_bytes); }
-            if (meta.down_scales_name) |n| { down_s = try self.loadExpertSlices(n, unique_ids, meta.expert_scale_row_bytes); }
+            if (meta.gate_scales_name) |n| { gate_s = try self.loadExpertSlices(n, unique_ids, 0); }
+            if (meta.up_scales_name) |n| { up_s = try self.loadExpertSlices(n, unique_ids, 0); }
+            if (meta.down_scales_name) |n| { down_s = try self.loadExpertSlices(n, unique_ids, 0); }
         }
 
         // 3. Build remap: original_expert_id → mini_fused_row_index
