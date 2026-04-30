@@ -54,6 +54,9 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
 - [x] 3. Phase 1: Inference Engine — Generation API, model registry, prompt cache, fusion (R5–R8)
   - [x] 3.1 Implement three-layer generation API in `src/generation.zig`
     - _Requirements: R5.1, R5.2, R5.3, R5.4_
+    <!-- AUDIT: 2026-04-29 — Added `forwardWithHidden` to ModelVTable and
+         `compress_ratios` to ModelConfig for EAGLE + DeepSeek V4 support.
+         design-inference-engine.md updated. -->
   - [x] 3.2 Write property test for generation API consistency (Property 3)
   - [x] 3.3 Implement model architecture registry in `src/model_registry.zig`
     - _Requirements: R6.1, R6.2, R6.3, R6.4_
@@ -95,6 +98,9 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
   - [x] 7.4 Write property test for block hash determinism and prefix reuse (Property 13)
   - [x] 7.5 Implement speculative decoding in `src/speculative.zig`
     - _Requirements: R16.1, R16.2, R16.3_
+    <!-- NOTE: FIXED 2026-04-29 — design-inference-engine.md now documents
+         both `streamGenerateSpeculative` (PLD) and `streamGenerateEagle`
+         (EAGLE) in §2.1.4 and §2.1.5. -->
   - [x] 7.6 Write property tests for speculative decoding (Properties 14, 15)
   - [x] 7.7 Implement guided decoding in `src/guided.zig`
     - _Requirements: R17.1, R17.2, R17.3_
@@ -484,6 +490,9 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
 > **Revised 2026-04-27**: Restructured after cross-referencing `mlx-lm/mlx_lm/models/deepseek_v4.py` (2153 lines).
 > Phase 8 now covers everything needed for "load + generate 1 correct token" with DeepSeek V4 Flash 4-bit.
 > Performance optimizations (gather_mm, CustomMetalKernel) remain in Phase 9.
+>
+> <!-- sub-doc: design-deepseek-v4.md -->
+> Detailed architecture design: [DeepSeek V4 Design](design-deepseek-v4.md)
 
 - [x] 36. Weight loading: sanitize parity with mlx-lm
   - [x] 36.1 Implement `dequant_fp4` for expert weights
@@ -776,6 +785,7 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
     - Output: `|` (degraded quality expected without routed experts)
   - [ ] 55.3 Generate 32 tokens — verify coherent output
     - **Blocked**: Decode too slow on 48GB Mac (~10min+ for 32 tokens). Attention dequantize + forward is the bottleneck.
+    <!-- NOTE: Performance bottleneck identified but not yet resolved in design. -->
   - [ ] 55.4 Memory usage: verify peak RSS < 40GB with smelt 0.25
     - **Note**: smelt 0.25 still OOMs. smelt 0.05 (shared-expert-only) fits in 48GB.
 
@@ -909,7 +919,10 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
     - (b) Implement custom safetensors reader with per-tensor random access (available in `src/io/safetensors_reader.zig`)
     - (c) Contribute lazy array support to mlx-c (upstream change)
   - [ ] 61.2 Test with smaller model (Qwen3-1.7B-4bit) to verify the full pipeline works
+    <!-- NOTE: End-to-end pipeline validation deferred. Must pass before
+         marking Phase 10 complete. -->
   - [ ] 61.3 Test with TinyLlama-1.1B-4bit to verify no regression
+    <!-- NOTE: Regression test deferred. Must pass before marking Phase 10 complete. -->
 
 ## Notes
 
@@ -922,3 +935,42 @@ Transform mlx-zig from a prototype into a production-grade LLM inference engine 
 - All code is Zig, targeting Apple Silicon via mlx-c bindings
 - Phase 8 (Tasks 36–42) revised 2026-04-27 after cross-referencing `mlx-lm/mlx_lm/models/deepseek_v4.py`. Key changes: MoE fused gather_mm moved from Phase 9 to Phase 8 (correctness prerequisite), DeepseekV4Cache/Compressor/Indexer now in Phase 8 (required for generate), sanitize FP4/FP8 dequant added, Attention rewritten to match mlx-lm dual-path architecture
 - Phase 9 (Tasks 43–48) is pure performance optimization — model must already produce correct output before starting
+
+### Doc-Code Sync Log (2026-04-29)
+
+Full pass across all sub-documents. Fixed 20+ discrepancies:
+
+**design-inference-engine.md:**
+- Added `repetition_penalty` to `GenerateConfig`
+- Fixed `generateStep` return type to `SampleResult`
+- Moved `ModelConfig`, `ModelVTable`, `ForwardWithHiddenResult` to §2.1 (correct source file)
+- Fixed `ModelLoader` signature (added `config_json`, `io`, `smelt`; return `ModelVTable`)
+- Removed non-existent `ModelInstance` references
+- Updated architecture list from 5 → 10 (added Qwen3, Glm4, Phi, Phi3, Llava)
+- Added `RegistryError`, `getLoader`, `supported_architectures` documentation
+- Added §2.1.4 (PLD) and §2.1.5 (EAGLE) speculative decoding docs
+
+**design-server.md:**
+- Marked `ChatCompletionRequest`, `SSEWriter`, `ModelState` as module-private
+- Added missing `ServerConfig` fields (`memory_config`, `max_kv_size`)
+- Added missing `ModelState` fields (`allocator`, `io`, `ctx`, `stream`, `tokenizer_backend`)
+- Fixed lifecycle pseudocode signatures (`start(allocator, io, config)`, `Scheduler.init(allocator, ..., max_prefill_tokens)`, `io.async(engineLoop, .{ io, &state })`)
+- Added `kv_quant` unused NOTE
+- Clarified `top_k`/`top_p` are server-level only
+- Added `AnthropicRequest` to Data Models
+- Marked `batch_builder` as "imported but not yet integrated"
+
+**design-batch-builder.md:**
+- Added `BatchResult.deinit()` and `isAttending()` to interface
+- Fixed decode position ID description
+- Documented empty-prompt and empty-decode edge cases
+
+**design-paged-kv-cache.md:**
+- Fixed `BlockManager.init(allocator, total_blocks)` signature
+- Added `registerBlockHash`, `freeCount`, `usedCount`, `deinit` to BlockManager API
+- Added missing PagedKVCache fields (`batch_size`, `num_kv_heads`, `head_dim`, `max_pages`, `dtype`, `group_size`, `el_per_int`, `seq_prev_hashes`)
+- Fixed VTable signatures (`updateAndFetch` takes `stream`; `filter` takes `allocator`; `deinit` takes `allocator`)
+- Fixed Step 6 cache purpose description
+- Added `Block`/`Page`/`PageTableEntry`/`SequenceState` type documentation
+- Added factory functions (`createPaged`, `createPagedQuantized`, etc.)
+- Fixed `filter`/`rollback`/`reset` descriptions to accurately reflect that pages are marked unused (not deinit'd)

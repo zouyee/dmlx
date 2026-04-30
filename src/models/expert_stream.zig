@@ -81,14 +81,17 @@ pub const ExpertStreamProvider = struct {
         const n_selected = expert_ids.len;
         const total_bytes = n_selected * row_bytes;
         const buf = try self.allocator.alloc(u8, total_bytes);
-        defer self.allocator.free(buf);
+        defer self.allocator.free(buf); // Safe to free after MLX copies the data
 
         // Read each expert's row via pread
         for (expert_ids, 0..) |eid, i| {
             const offset: i64 = @intCast(info.data_offset_start + @as(u64, eid) * @as(u64, row_bytes));
             const dest = buf[i * row_bytes .. (i + 1) * row_bytes];
             const r = unistd.pread(fd, dest.ptr, row_bytes, offset);
-            if (r < @as(isize, @intCast(row_bytes))) return error.IncompleteRead;
+            if (r < @as(isize, @intCast(row_bytes))) {
+                std.log.err("Failed to read expert {d} from {s}: read {d} bytes, expected {d}", .{eid, tensor_name, r, row_bytes});
+                return error.IncompleteRead;
+            }
         }
 
         // Build shape: [n_selected, rest_of_dims...]
@@ -100,8 +103,15 @@ pub const ExpertStreamProvider = struct {
         }
 
         const mlx_dtype = safetensors_reader.dtypeFromString(info.dtype_str) orelse return error.UnsupportedDtype;
-        const arr = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
-        return Array.fromHandle(arr);
+        
+        // Create array from data - MLX will copy the data internally
+        const arr_raw = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
+        const arr = Array.fromHandle(arr_raw);
+        
+        // Force evaluation to ensure data is copied before we free buf
+        try arr.eval();
+        
+        return arr;
     }
 
     /// Load the selected experts for a given layer and run the SwiGLU forward pass.
