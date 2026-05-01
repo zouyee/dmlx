@@ -34,6 +34,7 @@ const ChatCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
+    smelt_cache_mb: usize = 4096, // Expert cache size in MB (stream mode)
     distributed: bool = false,
 };
 
@@ -263,6 +264,7 @@ fn printUsage() void {
         \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
         \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
         \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
+        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
         \\    --distributed               Enable distributed tensor parallelism
         \\
         \\  mlx-zig benchmark [options]
@@ -442,6 +444,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
             cmd.smelt_strategy = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
+            cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
@@ -853,6 +857,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             4,    // 4-bit quantization
             "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
             ds_config.swiglu_limit,
+            cmd.smelt_cache_mb,
         );
         expert_sp = sp;
 

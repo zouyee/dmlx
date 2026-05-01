@@ -97,7 +97,6 @@ pub const ChatTemplate = struct {
             } else if (std.mem.eql(u8, msg.role, "user")) {
                 try result.appendSlice(self.allocator, "<｜User｜>");
                 try result.appendSlice(self.allocator, msg.content);
-                try result.appendSlice(self.allocator, "\n\n");
             } else if (std.mem.eql(u8, msg.role, "assistant")) {
                 try result.appendSlice(self.allocator, "<｜Assistant｜>");
                 try result.appendSlice(self.allocator, msg.content);
@@ -107,7 +106,7 @@ pub const ChatTemplate = struct {
         }
 
         if (add_generation_prompt) {
-            try result.appendSlice(self.allocator, "<｜Assistant｜>");
+            try result.appendSlice(self.allocator, "<｜Assistant｜></think>");
         }
     }
 

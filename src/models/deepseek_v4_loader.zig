@@ -909,7 +909,11 @@ fn loadShardedWeights(
     // Build smelt mask to determine which expert weights to skip
     var smelt_mask: ?[]bool = null;
     defer if (smelt_mask) |m| allocator.free(m);
-    if (smelt.enabled and smelt.load_fraction < 1.0) {
+    // In stream mode, skip ALL expert weights regardless of load_fraction
+    // (they'll be loaded on-demand via TensorIndex + ExpertStreamProvider).
+    // In preload mode, only skip unselected experts when load_fraction < 1.0.
+    const skip_all_experts = smelt.enabled and smelt.load_mode == .stream;
+    if (smelt.enabled and smelt.load_fraction < 1.0 and !skip_all_experts) {
         smelt_mask = try smelt.buildMask(allocator, 256); // V4 has 256 experts
     }
 
@@ -922,7 +926,11 @@ fn loadShardedWeights(
         const weight_name = entry.key_ptr.*;
         const shard_file = entry.value_ptr.*.string;
 
-        // Check if this weight should be skipped (unloaded expert)
+        // Check if this weight should be skipped (unloaded expert or stream mode)
+        if (skip_all_experts and isExpertWeight(weight_name)) {
+            // Stream mode: skip ALL expert weights (loaded on-demand from SSD)
+            continue;
+        }
         if (smelt_mask != null and isExpertWeight(weight_name)) {
             const eid = parseExpertIndexFromHF(weight_name);
             if (eid) |e| {
@@ -978,18 +986,23 @@ fn loadShardedWeights(
 
             // Skip expert weights in smelt mode (will be streamed from SSD on demand)
             if (smelt.enabled and isExpertWeight(hf_name)) {
-                const eid = parseExpertIndexFromHF(hf_name);
-                if (eid) |e| {
-                    // Individual expert format: skip based on mask
-                    if (smelt_mask) |mask| {
-                        if (e < mask.len and !mask[e]) {
-                            keep = false;
+                if (skip_all_experts) {
+                    // Stream mode: skip ALL expert weights
+                    keep = false;
+                } else {
+                    const eid = parseExpertIndexFromHF(hf_name);
+                    if (eid) |e| {
+                        // Individual expert format: skip based on mask
+                        if (smelt_mask) |mask| {
+                            if (e < mask.len and !mask[e]) {
+                                keep = false;
+                            }
                         }
                     }
-                }
-                // Fused switch_mlp weights: always skip in smelt mode (streamed from SSD)
-                if (eid == null and std.mem.indexOf(u8, hf_name, "switch_mlp") != null) {
-                    keep = false;
+                    // Fused switch_mlp weights: always skip in smelt mode (streamed from SSD)
+                    if (eid == null and std.mem.indexOf(u8, hf_name, "switch_mlp") != null) {
+                        keep = false;
+                    }
                 }
             }
 
@@ -1643,6 +1656,7 @@ pub fn buildDSV4Model(
                     if (weights.fetchRemove(gate_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(up_proj_name)) |kv| allocator.free(kv.key);
                     if (weights.fetchRemove(down_proj_name)) |kv| allocator.free(kv.key);
+                } else {
                     // Individual experts — stack into fused format
                     // This handles checkpoints with experts.{e}.w1.weight format
                     

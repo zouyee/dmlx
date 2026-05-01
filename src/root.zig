@@ -25,6 +25,7 @@ pub const model_loader = @import("models/llama_loader.zig");
 pub const deepseek_v4 = @import("models/deepseek_v4.zig");
 pub const deepseek_v4_loader = @import("models/deepseek_v4_loader.zig");
 pub const expert_stream = @import("models/expert_stream.zig");
+pub const layer_prefetcher = @import("models/layer_prefetcher.zig");
 pub const nemotron_h = @import("models/nemotron_h.zig");
 pub const nemotron_h_loader = @import("models/nemotron_h_loader.zig");
 pub const llava_loader = @import("models/llava_loader.zig");

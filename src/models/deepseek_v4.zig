@@ -840,6 +840,103 @@ pub const DSV4SwitchGLU = struct {
         }
     }
 
+    /// Forward pass WITHOUT score weighting — matches Python mlx-lm SwitchGLU.__call__.
+    /// Returns [N, topk, D] (not summed over topk). Caller applies scores and sums.
+    /// This is the correct behavior per Python reference:
+    ///   y = switch_mlp(x, inds)                    # this function
+    ///   y = (y * scores[..., None]).sum(axis=-2)    # caller does this
+    pub fn forwardNoScores(self: *DSV4SwitchGLU, x: Array, indices: Array, stream: c.c.mlx_stream) !Array {
+        _ = stream;
+        const route_shape = indices.shape();
+        const topk = @as(usize, @intCast(route_shape[route_shape.len - 1]));
+
+        // Expand x: [N, D] → [N, 1, 1, D]
+        const x_4d = try ops.expandDims(self.ctx, x, -2);
+        defer x_4d.deinit();
+        const x_exp = try ops.expandDims(self.ctx, x_4d, -2);
+        defer x_exp.deinit();
+
+        const total_indices = indices.size();
+        const do_sort = total_indices >= self.sort_threshold;
+
+        const gate_proj_t = try ops.transposeAxes(self.ctx, self.gate_proj, &[_]i32{ 0, 2, 1 });
+        defer gate_proj_t.deinit();
+        const up_proj_t = try ops.transposeAxes(self.ctx, self.up_proj, &[_]i32{ 0, 2, 1 });
+        defer up_proj_t.deinit();
+        const down_proj_t = try ops.transposeAxes(self.ctx, self.down_proj, &[_]i32{ 0, 2, 1 });
+        defer down_proj_t.deinit();
+
+        if (do_sort) {
+            const flat_indices = try ops.reshape(self.ctx, indices, &[_]i32{@intCast(total_indices)});
+            defer flat_indices.deinit();
+
+            var order_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&order_handle, flat_indices.inner, 0, self.ctx.stream.inner));
+            const order = Array.fromHandle(order_handle);
+            defer order.deinit();
+
+            var inv_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&inv_handle, order.inner, 0, self.ctx.stream.inner));
+            const inv_order = Array.fromHandle(inv_handle);
+            defer inv_order.deinit();
+
+            const x_flat = try shape_mod.flatten(self.ctx, x_exp, 0, @as(i32, @intCast(x_exp.ndim())) - 3);
+            defer x_flat.deinit();
+            const topk_scalar = try ops.scalarI32(self.ctx, @intCast(topk));
+            defer topk_scalar.deinit();
+            const order_i32 = try ops.astype(self.ctx, order, .int32);
+            defer order_i32.deinit();
+            const token_idx_f = try ops.divide(self.ctx, order_i32, topk_scalar);
+            defer token_idx_f.deinit();
+            const token_idx = try ops.astype(self.ctx, token_idx_f, .int32);
+            defer token_idx.deinit();
+            const sx = try shape_mod.takeAxis(self.ctx, x_flat, token_idx, 0);
+            defer sx.deinit();
+
+            const si_raw = try shape_mod.take(self.ctx, flat_indices, order);
+            defer si_raw.deinit();
+            const si = try ops.astype(self.ctx, si_raw, .uint32);
+            defer si.deinit();
+
+            const x_up = try self.dispatchGatherMm(sx, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, si, true);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(sx, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, si, true);
+            defer x_gate.deinit();
+
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Down projection WITHOUT score weighting
+            const x_down = try self.dispatchGatherMm(activated, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, si, true);
+            defer x_down.deinit();
+
+            // Unsort and unflatten to [N, topk, 1, D]
+            const unsorted = try shape_mod.takeAxis(self.ctx, x_down, inv_order, 0);
+            defer unsorted.deinit();
+            const unflat = try shape_mod.unflatten(self.ctx, unsorted, 0, indices.shape());
+            defer unflat.deinit();
+            // Squeeze only axis -2 (the singleton dim from gather_mm), not all singletons
+            // Python: return x.squeeze(-2)
+            return shape_mod.squeezeAxes(self.ctx, unflat, &[_]i32{-2});
+        } else {
+            const x_up = try self.dispatchGatherMm(x_exp, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, indices, false);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(x_exp, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, indices, false);
+            defer x_gate.deinit();
+
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Down projection WITHOUT score weighting
+            const x_down = try self.dispatchGatherMm(activated, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, indices, false);
+            defer x_down.deinit();
+
+            // Squeeze only axis -2 (the singleton dim from gather_mm)
+            // Python: return x.squeeze(-2)
+            return shape_mod.squeezeAxes(self.ctx, x_down, &[_]i32{-2});
+        }
+    }
+
     fn limitedSwiGLU(self: *DSV4SwitchGLU, gate: Array, up: Array) !Array {
         if (self.swiglu_limit > 0) {
             const limit_pos = try ops.scalarF32(self.ctx, self.swiglu_limit);
@@ -2694,6 +2791,10 @@ pub const DSV4Model = struct {
                 std.log.info("Top tokens: [{d}]={d:.2} [{d}]={d:.2} [{d}]={d:.2}", .{
                     top5[0].idx, top5[0].val, top5[1].idx, top5[1].val, top5[2].idx, top5[2].val,
                 });
+                // Check token 22 ("4") specifically for math correctness debugging
+                if (logits_data.len > 22) {
+                    std.log.info("Token 22 ('4') logit: {d:.4}", .{logits_data[22]});
+                }
             }
 
             const next_token = (try sampler_config.sample(f32_logits, allocator)).token;

@@ -54,6 +54,14 @@ pub const vision_preprocess_tests = @import("vision/preprocess.zig");
 pub const vision_vit_tests = @import("vision/vit.zig");
 pub const vision_llava_tests = @import("vision/llava.zig");
 
+pub const expert_remap_tests = @import("tests/expert_remap_test.zig");
+pub const expert_cache_tests = @import("models/expert_cache.zig");
+pub const layer_prefetcher_tests = @import("models/layer_prefetcher.zig");
+pub const numerical_equivalence_tests = @import("tests/numerical_equivalence_test.zig");
+pub const cache_integration_tests = @import("tests/cache_integration_test.zig");
+pub const safetensors_reader_tests = @import("io/safetensors_reader.zig");
+pub const expert_stream_tests = @import("models/expert_stream.zig");
+
 test "init mlx error handler" {
     c.initErrorHandler();
 }
@@ -109,4 +117,12 @@ test {
     _ = vision_preprocess_tests;
     _ = vision_vit_tests;
     _ = vision_llava_tests;
+    
+    _ = expert_remap_tests;
+    _ = expert_cache_tests;
+    _ = layer_prefetcher_tests;
+    _ = numerical_equivalence_tests;
+    _ = cache_integration_tests;
+    _ = safetensors_reader_tests;
+    _ = expert_stream_tests;
 }
