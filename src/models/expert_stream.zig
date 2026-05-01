@@ -580,6 +580,115 @@ pub const ExpertStreamProvider = struct {
             .sort_threshold = 8,
         };
         // Call forwardNoScores which does gate/up/SwiGLU/down without score weighting
+        if (layer_idx == 0) {
+            std.log.info("DIAG switch_glu params: quant={}, group_size={d}, bits={d}, mode={s}, swiglu_limit={d:.1}", .{
+                switch_glu.is_quantized, switch_glu.quant_group_size, switch_glu.quant_bits,
+                switch_glu.quant_mode, switch_glu.swiglu_limit,
+            });
+            // Print flat_x stats for Python comparison
+            try flat_x.eval();
+            const fx_f32 = try ops.astype(self.ctx, flat_x, .float32);
+            defer fx_f32.deinit();
+            try fx_f32.eval();
+            const fx_data = try fx_f32.dataSlice(f32);
+            std.log.info("DIAG flat_x shape: {any}, first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
+                flat_x.shape(),
+                fx_data[0], fx_data[1], fx_data[2], fx_data[3], fx_data[4],
+            });
+            // Print gate_w shape and first few u32 values
+            try gate_w.eval();
+            const gw_data = try gate_w.dataSlice(u32);
+            std.log.info("DIAG gate_w shape: {any}, first 4 u32: {d} {d} {d} {d}", .{
+                gate_w.shape(),
+                gw_data[0], gw_data[1], gw_data[2], gw_data[3],
+            });
+
+            // CORRECTNESS TEST: Run forwardNoScores with known input (all 0.1)
+            // and indices [0,1,2,3,4,5] using FULL 256-expert weights (not sliced).
+            // Compare output with Python reference:
+            //   mean=-0.000001, std=0.015521, max=0.059080, min=-0.075170
+            //   first 5: [0.011578, -0.001211, 0.001326, -0.000963, 0.006477]
+            correctness_test: {
+                // Load full gate/up/down weights (not sliced)
+                const full_gate = self.index.loadTensor(meta.gate_proj_name) catch break :correctness_test;
+                defer full_gate.deinit();
+                const full_up = self.index.loadTensor(meta.up_proj_name) catch break :correctness_test;
+                defer full_up.deinit();
+                const full_down = self.index.loadTensor(meta.down_proj_name) catch break :correctness_test;
+                defer full_down.deinit();
+                var full_gate_s: ?Array = null;
+                var full_up_s: ?Array = null;
+                var full_down_s: ?Array = null;
+                defer if (full_gate_s) |a| a.deinit();
+                defer if (full_up_s) |a| a.deinit();
+                defer if (full_down_s) |a| a.deinit();
+                if (meta.gate_scales_name) |n| { full_gate_s = self.index.loadTensor(n) catch null; }
+                if (meta.up_scales_name) |n| { full_up_s = self.index.loadTensor(n) catch null; }
+                if (meta.down_scales_name) |n| { full_down_s = self.index.loadTensor(n) catch null; }
+
+                // Create test input: all 0.1, shape [1, 4096]
+                var test_data: [4096]f32 = undefined;
+                @memset(&test_data, 0.1);
+                const test_x = try Array.fromData(self.allocator, f32, &test_data, &[_]i32{ 1, 4096 });
+                defer test_x.deinit();
+
+                // Create test indices: [0, 1, 2, 3, 4, 5], shape [1, 6]
+                const test_indices_data = [_]u32{ 0, 1, 2, 3, 4, 5 };
+                const test_indices = try Array.fromData(self.allocator, u32, &test_indices_data, &[_]i32{ 1, 6 });
+                defer test_indices.deinit();
+
+                // Build test SwitchGLU with full weights
+                const deepseek_v4_test = @import("deepseek_v4.zig");
+                var test_glu = deepseek_v4_test.DSV4SwitchGLU{
+                    .ctx = self.ctx,
+                    .gate_proj = full_gate,
+                    .up_proj = full_up,
+                    .down_proj = full_down,
+                    .gate_proj_scales = full_gate_s,
+                    .gate_proj_biases = null,
+                    .up_proj_scales = full_up_s,
+                    .up_proj_biases = null,
+                    .down_proj_scales = full_down_s,
+                    .down_proj_biases = null,
+                    .is_quantized = self.is_quantized,
+                    .quant_group_size = self.quant_group_size,
+                    .quant_bits = self.quant_bits,
+                    .quant_mode = self.quant_mode,
+                    .swiglu_limit = self.swiglu_limit,
+                    .sort_threshold = 8,
+                };
+
+                const test_out = test_glu.forwardNoScores(test_x, test_indices, self.ctx.stream.inner) catch break :correctness_test;
+                defer test_out.deinit();
+                try test_out.eval();
+
+                const test_f32 = try ops.astype(self.ctx, test_out, .float32);
+                defer test_f32.deinit();
+                try test_f32.eval();
+                const test_data_out = try test_f32.dataSlice(f32);
+
+                std.log.info("CORRECTNESS TEST (x=0.1, indices=[0..5]):", .{});
+                std.log.info("  shape: {any}", .{test_out.shape()});
+                std.log.info("  first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
+                    test_data_out[0], test_data_out[1], test_data_out[2], test_data_out[3], test_data_out[4],
+                });
+                // Python reference: [0.011578, -0.001211, 0.001326, -0.000963, 0.006477]
+                std.log.info("  Python ref: 0.011578 -0.001211 0.001326 -0.000963 0.006477", .{});
+
+                // Compute stats
+                var t_max: f32 = -std.math.inf(f32);
+                var t_min: f32 = std.math.inf(f32);
+                var t_sum: f64 = 0;
+                for (test_data_out[0..@min(test_data_out.len, 24576)]) |v| {
+                    if (v > t_max) t_max = v;
+                    if (v < t_min) t_min = v;
+                    t_sum += v;
+                }
+                const t_mean = t_sum / @as(f64, @floatFromInt(@min(test_data_out.len, 24576)));
+                std.log.info("  stats: mean={d:.6} max={d:.6} min={d:.6}", .{ t_mean, t_max, t_min });
+                std.log.info("  Python ref: mean=-0.000001 max=0.059080 min=-0.075170", .{});
+            }
+        }
         const expert_out = try switch_glu.forwardNoScores(flat_x, remapped_u32, self.ctx.stream.inner);
         defer expert_out.deinit();
 
