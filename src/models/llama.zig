@@ -240,15 +240,14 @@ pub const LlamaAttention = struct {
         defer scores.deinit();
 
         var scaled_scores = try ops.multiply(self.ctx, scores, try ops.scalar(self.ctx, scale, .float32));
-        defer scaled_scores.deinit();
 
         // 8. Apply causal mask
-        var masked_scores = scaled_scores;
-        if (mask) |m| {
+        var masked_scores = if (mask) |m| blk: {
             const masked = try ops.add(self.ctx, scaled_scores, m);
-            masked_scores.deinit();
-            masked_scores = masked;
-        }
+            scaled_scores.deinit();
+            break :blk masked;
+        } else scaled_scores;
+        defer masked_scores.deinit();
 
         // 9. Softmax
         var attn_weights = try ops.softmax(self.ctx, masked_scores, &[_]i32{-1});
@@ -545,9 +544,28 @@ pub const LlamaModel = struct {
         // input_ids: [batch, seq_len]
         var hidden = try arena.track(try self.embed_tokens.forward(input_ids));
 
+        // Create causal attention mask if not provided and seq_len > 1
+        // Shape: [seq_len, seq_len] with -inf for future positions, 0 for valid positions
+        const seq_len_val = @as(usize, @intCast(input_ids.shape()[1]));
+        var causal_mask: ?Array = mask;
+        if (mask == null and seq_len_val > 1) {
+            var mask_data = try self.allocator.alloc(f32, seq_len_val * seq_len_val);
+            defer self.allocator.free(mask_data);
+            for (0..seq_len_val) |row| {
+                for (0..seq_len_val) |col| {
+                    mask_data[row * seq_len_val + col] = if (col <= row) 0.0 else -1.0e9;
+                }
+            }
+            // Shape [1, 1, seq_len, seq_len] for broadcasting with [batch, heads, seq, seq]
+            const mask_arr = try Array.fromData(self.allocator, f32, mask_data, &[_]i32{
+                1, 1, @intCast(seq_len_val), @intCast(seq_len_val),
+            });
+            causal_mask = try arena.track(mask_arr);
+        }
+
         for (self.layers, 0..) |*layer, i| {
             const cache = if (caches) |cache_list| (if (i < cache_list.len) cache_list[i] else null) else null;
-            hidden = try arena.track(try layer.forward(hidden, mask, cache, self.lora));
+            hidden = try arena.track(try layer.forward(hidden, causal_mask, cache, self.lora));
         }
 
         const normed = try arena.track(try self.norm.forward(hidden));
