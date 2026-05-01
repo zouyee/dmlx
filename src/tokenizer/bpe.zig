@@ -647,11 +647,21 @@ fn parsePreTokenizer(allocator: std.mem.Allocator, val: std.json.Value) !pt.PreT
 
     if (std.mem.eql(u8, type_str, "Sequence")) {
         const arr = val.object.get("pretokenizers") orelse return error.InvalidPreTokenizer;
-        const items = try allocator.alloc(pt.PreTokenizer, arr.array.items.len);
-        errdefer allocator.free(items);
-        for (arr.array.items, 0..) |item, i| {
-            items[i] = try parsePreTokenizer(allocator, item);
+        // Parse each sub-pretokenizer, skipping unsupported ones (e.g., complex regex Split)
+        // This ensures ByteLevel is still applied even if Split pattern is unsupported.
+        var items_list = std.ArrayList(pt.PreTokenizer).empty;
+        defer items_list.deinit(allocator);
+        for (arr.array.items) |item| {
+            const parsed = parsePreTokenizer(allocator, item) catch |err| {
+                // Skip unsupported sub-pretokenizers (e.g., complex regex Split)
+                // but continue parsing the rest (ByteLevel is critical)
+                std.log.debug("Skipping unsupported pre_tokenizer in Sequence: {}", .{err});
+                continue;
+            };
+            try items_list.append(allocator, parsed);
         }
+        if (items_list.items.len == 0) return error.InvalidPreTokenizer;
+        const items = try items_list.toOwnedSlice(allocator);
         return .{ .sequence = .{ .pretokenizers = items } };
     } else if (std.mem.eql(u8, type_str, "Split")) {
         const pattern_val = val.object.get("pattern") orelse return error.InvalidPreTokenizer;

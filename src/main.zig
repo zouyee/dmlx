@@ -677,6 +677,13 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
 
+    std.log.info("Prompt text: '{s}'", .{prompt_text});
+    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    std.log.info("Config: vocab={d}, layers={d}, heads={d}, kv_heads={d}, hidden={d}, head_dim={d}", .{
+        config.vocab_size, config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.hidden_size, config.getHeadDim(),
+    });
+
     const prompt_arr = c.c.mlx_array_new_data(
         prompt_tokens.ptr,
         &[_]c_int{ 1, @intCast(prompt_tokens.len) },

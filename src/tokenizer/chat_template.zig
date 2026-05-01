@@ -116,7 +116,7 @@ pub const ChatTemplate = struct {
             try result.appendSlice(self.allocator, msg.role);
             try result.appendSlice(self.allocator, "\n");
             try result.appendSlice(self.allocator, msg.content);
-            try result.appendSlice(self.allocator, "\n<|im_end|>\n");
+            try result.appendSlice(self.allocator, "<|im_end|>\n");
         }
 
         if (add_generation_prompt) {
