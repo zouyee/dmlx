@@ -717,6 +717,20 @@ pub const ExpertStreamProvider = struct {
         }
 
         // Apply scores AFTER switch_mlp (matching Python: y = (y * scores[..., None]).sum(-2))
+        if (layer_idx == 0) {
+            try scores.eval();
+            const sc_f32 = try ops.astype(self.ctx, scores, .float32);
+            defer sc_f32.deinit();
+            try sc_f32.eval();
+            const sc_data = try sc_f32.dataSlice(f32);
+            std.log.info("DIAG scores (first 12): {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}", .{
+                sc_data[0], sc_data[1], sc_data[2], sc_data[3], sc_data[4], sc_data[5],
+                sc_data[6], sc_data[7], sc_data[8], sc_data[9], sc_data[10], sc_data[11],
+            });
+            var sc_sum: f64 = 0;
+            for (sc_data[0..6]) |v| sc_sum += v;
+            std.log.info("DIAG scores sum (first token's 6 experts): {d:.4}", .{sc_sum});
+        }
         const scores_expanded = try ops.expandDims(self.ctx, scores, -1);
         defer scores_expanded.deinit();
         const weighted_out = try ops.multiply(self.ctx, expert_out, scores_expanded);
