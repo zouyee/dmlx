@@ -493,14 +493,41 @@ pub fn loadWeightsSelective(
 
     std.log.info("Indexed {d} tensors across shards", .{index.entries.count()});
 
+    // Open all shard file descriptors once (avoids 2000+ open/close cycles)
+    var fd_pool = safetensors_reader.FdPool.init(allocator);
+    defer fd_pool.deinit();
+    try fd_pool.openAll(&index);
+
+    // mmap all shards for zero-syscall reads
+    var mmap_pool = safetensors_reader.MmapPool.init(allocator);
+    defer mmap_pool.deinit();
+    mmap_pool.mmapAll(&index) catch |err| {
+        std.log.warn("Failed to mmap shards: {}, falling back to pread", .{err});
+    };
+
     // Build smelt mask
     var smelt_mask: ?[]bool = null;
     defer if (smelt_mask) |m| allocator.free(m);
-    if (smelt.enabled and smelt.load_fraction < 1.0) {
+    const skip_all_experts = smelt.enabled and smelt.load_mode == .stream;
+    if (smelt.enabled and smelt.load_fraction < 1.0 and !skip_all_experts) {
         smelt_mask = try smelt.buildMask(allocator, 256);
     }
 
-    // Load each tensor individually
+    // Count how many tensors to load (for progress reporting)
+    var to_load: usize = 0;
+    var to_skip: usize = 0;
+    {
+        var count_it = index.entries.iterator();
+        while (count_it.next()) |entry| {
+            const hf_name = entry.key_ptr.*;
+            if (skip_all_experts and isExpertWeight(hf_name)) { to_skip += 1; continue; }
+            if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) { to_skip += 1; continue; }
+            to_load += 1;
+        }
+    }
+    std.log.info("Loading {d} backbone weights ({d} expert weights skipped)", .{ to_load, to_skip });
+
+    // Load each tensor using pre-opened file descriptors
     var weights = std.StringHashMap(Array).init(allocator);
     errdefer {
         var it = weights.iterator();
@@ -511,11 +538,19 @@ pub fn loadWeightsSelective(
         weights.deinit();
     }
 
+    const posix_c = @cImport(@cInclude("unistd.h"));
+
     var loaded_count: usize = 0;
     var skipped_count: usize = 0;
     var idx_it = index.entries.iterator();
     while (idx_it.next()) |entry| {
         const hf_name = entry.key_ptr.*;
+
+        // Stream mode: skip ALL expert weights (loaded on-demand via ExpertStreamProvider)
+        if (skip_all_experts and isExpertWeight(hf_name)) {
+            skipped_count += 1;
+            continue;
+        }
 
         // Skip expert weights for unloaded experts
         if (smelt_mask != null and isExpertWeight(hf_name)) {
@@ -531,11 +566,47 @@ pub fn loadWeightsSelective(
             continue;
         }
 
-        // Load tensor from file at offset
-        const tensor = index.loadTensor(hf_name) catch |err| {
-            std.log.warn("Failed to load tensor {s}: {}", .{ hf_name, err });
+        // Load tensor using mmap (zero-syscall) or pread fallback
+        const info = entry.value_ptr.*;
+        const data_len: usize = @intCast(info.data_offset_end - info.data_offset_start);
+
+        // Map dtype and build shape first (needed for both paths)
+        const mlx_dtype = safetensors_reader.dtypeFromString(info.dtype_str) orelse {
             skipped_count += 1;
             continue;
+        };
+        var shape_i32 = allocator.alloc(i32, info.shape.len) catch {
+            skipped_count += 1;
+            continue;
+        };
+        defer allocator.free(shape_i32);
+        for (info.shape, 0..) |s, si| {
+            shape_i32[si] = @intCast(s);
+        }
+
+        // Try mmap path first (zero-copy pointer into mapped region)
+        const tensor = if (mmap_pool.getSlice(info.shard_path, info.data_offset_start, data_len)) |slice| blk: {
+            // mlx_array_new_data copies the data, so mmap region stays valid
+            const arr = c.c.mlx_array_new_data(slice.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
+            break :blk Array.fromHandle(arr);
+        } else |_| blk: {
+            // Fallback to pread via FdPool
+            const fd = fd_pool.getFd(info.shard_path) catch {
+                skipped_count += 1;
+                continue;
+            };
+            const buf = allocator.alloc(u8, data_len) catch {
+                skipped_count += 1;
+                continue;
+            };
+            defer allocator.free(buf);
+            const read_len = posix_c.pread(fd, buf.ptr, data_len, @intCast(info.data_offset_start));
+            if (read_len < @as(isize, @intCast(data_len))) {
+                skipped_count += 1;
+                continue;
+            }
+            const arr = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
+            break :blk Array.fromHandle(arr);
         };
 
         // Apply name mapping
@@ -545,7 +616,7 @@ pub fn loadWeightsSelective(
 
         loaded_count += 1;
         if (loaded_count % 200 == 0) {
-            std.log.info("Loaded {d} tensors ({d} skipped)...", .{ loaded_count, skipped_count });
+            std.log.info("Loaded {d}/{d} tensors...", .{ loaded_count, to_load });
         }
     }
 

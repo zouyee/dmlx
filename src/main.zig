@@ -747,9 +747,18 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         .load_fraction = cmd.smelt_experts,
         .load_mode = smelt_strategy,
     };
-    // Use original eager loading with streaming shard cleanup
-    // mlx_load_safetensors returns lazy/memory-mapped arrays that don't consume RAM until evaluated
-    var weights = try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream, smelt_config);
+
+    // In stream mode, use selective loading via TensorIndex + mmap.
+    // Only reads shard headers (~few KB each), then loads backbone weights
+    // via mmap — skipping all expert weights entirely.
+    // This reduces disk I/O from ~141GB (all shards) to ~4.3GB (backbone only).
+    // ~3x faster than mlx_load_safetensors which reads entire shard files.
+    const use_selective = cmd.smelt and smelt_strategy == .stream;
+
+    var weights = if (use_selective)
+        try root.deepseek_v4_loader.loadWeightsSelective(allocator, cmd.model_path, smelt_config)
+    else
+        try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream, smelt_config);
     defer {
         var it = weights.iterator();
         while (it.next()) |entry| {
