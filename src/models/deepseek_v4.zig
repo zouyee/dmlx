@@ -439,6 +439,7 @@ pub const DSV4Expert = struct {
     w3_biases: ?Array = null,
     quant_group_size: i32 = 64,
     quant_bits: u8 = 4,
+    quant_mode: quantize_mod.QuantMode = .affine,
     swiglu_limit: f32,
 
     pub fn deinit(self: *DSV4Expert) void {
@@ -460,7 +461,7 @@ pub const DSV4Expert = struct {
                 .data = w,
                 .scales = s,
                 .biases = biases orelse Array.fromHandle(c.c.mlx_array_new()),
-                .config = .{ .group_size = self.quant_group_size, .bits = self.quant_bits },
+                .config = .{ .group_size = self.quant_group_size, .bits = self.quant_bits, .mode = self.quant_mode },
                 .original_shape = &[_]i32{},
             };
             return quantize_mod.quantizedMatmul(self.ctx, x, qw, true);
@@ -1580,6 +1581,7 @@ pub const DSV4Attention = struct {
     // Quantization config for attention weights
     attn_quant_group_size: i32,
     attn_quant_bits: u8,
+    attn_quant_mode: quantize_mod.QuantMode = .affine,
 
     // RoPE
     rope: DSV4YarnRoPE,
@@ -1643,7 +1645,7 @@ pub const DSV4Attention = struct {
         // === Q path ===
         // Use quantizedMatmul if weights are quantized, else plain matmul
         const q_a = if (self.wq_a_scales != null) blk: {
-            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_a, .scales = self.wq_a_scales.?, .biases = self.wq_a_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_a, .scales = self.wq_a_scales.?, .biases = self.wq_a_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
             break :blk try quantize_mod.quantizedMatmul(self.ctx, hidden_states, qw, true);
         } else blk: {
             const wq_a_t = try ops.transpose(self.ctx, self.wq_a);
@@ -1654,7 +1656,7 @@ pub const DSV4Attention = struct {
         const q_residual = try self.q_norm.forward(q_a);
         defer q_residual.deinit();
         const q_proj = if (self.wq_b_scales != null) blk: {
-            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_b, .scales = self.wq_b_scales.?, .biases = self.wq_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_b, .scales = self.wq_b_scales.?, .biases = self.wq_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
             break :blk try quantize_mod.quantizedMatmul(self.ctx, q_residual, qw, true);
         } else blk: {
             const wq_b_t = try ops.transpose(self.ctx, self.wq_b);
@@ -1673,7 +1675,7 @@ pub const DSV4Attention = struct {
 
         // === KV path ===
         const kv_raw = if (self.wkv_scales != null) blk: {
-            const qw = quantize_mod.QuantizedWeight{ .data = self.wkv, .scales = self.wkv_scales.?, .biases = self.wkv_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wkv, .scales = self.wkv_scales.?, .biases = self.wkv_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
             break :blk try quantize_mod.quantizedMatmul(self.ctx, hidden_states, qw, true);
         } else blk: {
             const wkv_t = try ops.transpose(self.ctx, self.wkv);
@@ -1758,7 +1760,7 @@ pub const DSV4Attention = struct {
             const rs = try ops.reshape(self.ctx, cat, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(n_groups * o_lora_rank) });
             defer rs.deinit();
             break :blk if (self.wo_b_scales != null) blk2: {
-                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };
+                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
                 break :blk2 try quantize_mod.quantizedMatmul(self.ctx, rs, qw, true);
             } else blk2: {
                 const wbt = try ops.transpose(self.ctx, self.wo_b);
@@ -1777,7 +1779,7 @@ pub const DSV4Attention = struct {
                     .data = self.wo_a,
                     .scales = self.wo_a_scales.?,
                     .biases = self.wo_a_biases orelse Array.fromHandle(c.c.mlx_array_new()),
-                    .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits },
+                    .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode },
                     .original_shape = &[_]i32{},
                 };
                 break :blk_qa try quantize_mod.quantizedMatmul(self.ctx, of, qw, true);
@@ -1788,7 +1790,7 @@ pub const DSV4Attention = struct {
             };
             defer oa.deinit();
             break :blk if (self.wo_b_scales != null) blk2: {
-                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits }, .original_shape = &[_]i32{} };
+                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
                 break :blk2 try quantize_mod.quantizedMatmul(self.ctx, oa, qw, true);
             } else blk2: {
                 const wbt = try ops.transpose(self.ctx, self.wo_b);
@@ -2735,10 +2737,12 @@ pub const DSV4Model = struct {
         // Pass through layers (eval after each to allow memory paging)
         for (self.layers, 0..) |*layer, i| {
             const cache = if (caches) |cache_arr| cache_arr[i] else null;
+            std.debug.print("Layer {d}/43 forward start\n", .{i});
             hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
             // Eval after each layer to materialize results and free lazy weight references
             // This allows MLX to page weights in/out of memory for large models
             try hidden.eval();
+            std.debug.print("Layer {d}/43 forward done\n", .{i});
         }
 
         // Compress from mHC format before final norm using HyperHead
@@ -2789,7 +2793,7 @@ pub const DSV4Model = struct {
             const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
-            // Diagnostic: show logits stats for first token
+            // Diagnostic: show logits stats
             {
                 const logits_data = try f32_logits.dataSlice(f32);
                 var max_val: f32 = -std.math.inf(f32);
@@ -2809,7 +2813,6 @@ pub const DSV4Model = struct {
                 std.log.info("Logits: len={d} max={d:.4} min={d:.4} mean={d:.4} argmax={d} nan={d} inf={d}", .{
                     logits_data.len, max_val, min_val, mean, max_idx, nan_count, inf_count,
                 });
-                // Show top-5 token IDs
                 var top5 = [_]struct { idx: usize, val: f32 }{ .{ .idx = 0, .val = -std.math.inf(f32) } } ** 5;
                 for (logits_data, 0..) |v, idx| {
                     if (std.math.isNan(v) or std.math.isInf(v)) continue;
@@ -2823,7 +2826,6 @@ pub const DSV4Model = struct {
                 std.log.info("Top tokens: [{d}]={d:.2} [{d}]={d:.2} [{d}]={d:.2}", .{
                     top5[0].idx, top5[0].val, top5[1].idx, top5[1].val, top5[2].idx, top5[2].val,
                 });
-                // Check token 22 ("4") specifically for math correctness debugging
                 if (logits_data.len > 22) {
                     std.log.info("Token 22 ('4') logit: {d:.4}", .{logits_data[22]});
                 }

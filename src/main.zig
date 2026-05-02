@@ -465,10 +465,10 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
 fn runChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand) !void {
     std.log.info("Loading model from {s}...", .{cmd.model_path});
 
-    const ctx = EagerContext.init(allocator);
+    // Use GPU stream for inference — gather_qmm with mxfp4 is ~20x faster on GPU
+    const stream = c.c.mlx_default_gpu_stream_new();
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
     defer ctx.deinit();
-    const stream = c.c.mlx_default_cpu_stream_new();
-    defer _ = c.c.mlx_stream_free(stream);
 
     // 1. Load config and detect model type
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "config.json" });
@@ -945,8 +945,9 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         allocator.free(caches);
     }
 
-    std.log.info("Starting generation...", .{});
+    std.debug.print("Starting generation...\n", .{});
     const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
+    std.log.info("DEBUG: model.generate returned {d} tokens", .{new_tokens.len});
     defer allocator.free(new_tokens);
 
     // Validate generated tokens

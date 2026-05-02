@@ -84,28 +84,30 @@ pub const ChatTemplate = struct {
     }
 
     fn applyDeepSeek(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
-        // DeepSeek-V4-Flash format (4-bit quantized model):
-        // <｜begin▁of▁sentence｜>{system}\n\n<｜User｜>{user}\n\n<｜Assistant｜>{assistant}<｜end▁of▁sentence｜>
-        // Special token IDs: BOS=0, EOS=1, User=128803, Assistant=128804
-        // Note: Uses full-width pipe ｜ (U+FF5C) and special space ▁ (U+2581)
+        // DeepSeek-V4-Flash chat template (from chat_template.jinja):
+        // Default mode='chat' (non-thinking). User msg: <｜User｜>{content}<｜Assistant｜></think>
+        // Assistant msg: </think>{content}<｜end▁of▁sentence｜>
+        // add_generation_prompt: <｜Assistant｜></think>
         try result.appendSlice(self.allocator, self.bos_token);
 
         for (messages) |msg| {
             if (std.mem.eql(u8, msg.role, "system")) {
                 try result.appendSlice(self.allocator, msg.content);
-                try result.appendSlice(self.allocator, "\n\n");
             } else if (std.mem.eql(u8, msg.role, "user")) {
                 try result.appendSlice(self.allocator, "<｜User｜>");
                 try result.appendSlice(self.allocator, msg.content);
-            } else if (std.mem.eql(u8, msg.role, "assistant")) {
                 try result.appendSlice(self.allocator, "<｜Assistant｜>");
+                try result.appendSlice(self.allocator, "</think>");
+            } else if (std.mem.eql(u8, msg.role, "assistant")) {
+                try result.appendSlice(self.allocator, "</think>");
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, self.eos_token);
-                try result.appendSlice(self.allocator, "\n\n");
             }
         }
 
-        if (add_generation_prompt) {
+        // add_generation_prompt only applies when last message is not user
+        // (user messages already include <｜Assistant｜></think> in the loop above)
+        if (add_generation_prompt and messages.len > 0 and !std.mem.eql(u8, messages[messages.len - 1].role, "user")) {
             try result.appendSlice(self.allocator, "<｜Assistant｜></think>");
         }
     }

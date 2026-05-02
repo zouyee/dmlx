@@ -112,14 +112,15 @@ fn dequantIfNeeded(
 
     const null_array: c.c.mlx_array = .{ .ctx = null };
     const biases_inner = if (biases) |b| b.inner else null_array;
-    const gs = config.quantize_default_group_size;
+    const is_mxfp4 = biases == null;
+    const gs = if (is_mxfp4) 32 else config.quantize_default_group_size;
     const bits_val: i32 = @intCast(if (config.quantize_default_bits > 0) config.quantize_default_bits else 4);
     const opt_group: c.c.mlx_optional_int = .{ .value = gs, .has_value = true };
     const opt_bits: c.c.mlx_optional_int = .{ .value = bits_val, .has_value = true };
     const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_BFLOAT16, .has_value = true };
 
     var res = c.c.mlx_array_new();
-    try c.check(c.c.mlx_dequantize(&res, weight.inner, scales.inner, biases_inner, opt_group, opt_bits, "affine", null_array, no_dtype, ctx.stream.inner));
+    try c.check(c.c.mlx_dequantize(&res, weight.inner, scales.inner, biases_inner, opt_group, opt_bits, if (is_mxfp4) "mxfp4" else "affine", null_array, no_dtype, ctx.stream.inner));
 
     if (weights.fetchRemove(scales_key)) |kv| allocator.free(kv.key);
     if (weights.fetchRemove(biases_key)) |kv| allocator.free(kv.key);
@@ -1139,11 +1140,12 @@ pub fn buildDSV4Model(
         const embed_biases = weights.get("embed.weight.biases");
         const null_array: c.c.mlx_array = .{ .ctx = null };
         const biases_inner = if (embed_biases) |b| b.inner else null_array;
-        const opt_group: c.c.mlx_optional_int = .{ .value = config.quantize_default_group_size, .has_value = true };
+        const embed_is_mxfp4 = embed_biases == null;
+        const opt_group: c.c.mlx_optional_int = .{ .value = if (embed_is_mxfp4) 32 else config.quantize_default_group_size, .has_value = true };
         const opt_bits: c.c.mlx_optional_int = .{ .value = @as(i32, @intCast(if (config.quantize_default_bits > 0) config.quantize_default_bits else 4)), .has_value = true };
         const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_BFLOAT16, .has_value = true };
         var deq_res = c.c.mlx_array_new();
-        try c.check(c.c.mlx_dequantize(&deq_res, embed_weight.inner, embed_scales.?.inner, biases_inner, opt_group, opt_bits, "affine", null_array, no_dtype, ctx.stream.inner));
+        try c.check(c.c.mlx_dequantize(&deq_res, embed_weight.inner, embed_scales.?.inner, biases_inner, opt_group, opt_bits, if (embed_is_mxfp4) "mxfp4" else "affine", null_array, no_dtype, ctx.stream.inner));
         embed_weight = Array.fromHandle(deq_res);
     }
     const embed = nn.Embedding{
@@ -1498,8 +1500,9 @@ pub fn buildDSV4Model(
             .wo_b = wo_b,
             .wo_b_scales = wo_b_scales,
             .wo_b_biases = wo_b_biases,
-            .attn_quant_group_size = qgs,
+            .attn_quant_group_size = if (wq_a_biases == null) 32 else qgs,
             .attn_quant_bits = qbits,
+            .attn_quant_mode = if (wq_a_biases == null) .mxfp4 else .affine,
             .rope = rope,
             .compress_ratio = compress_ratio,
             .compress_gate_weight = compress_gate_weight,
@@ -1650,8 +1653,9 @@ pub fn buildDSV4Model(
             .w2_biases = se_w2_biases,
             .w3_scales = se_w3_scales,
             .w3_biases = se_w3_biases,
-            .quant_group_size = config.quantize_default_group_size,
+            .quant_group_size = if (se_w1_biases == null) 32 else config.quantize_default_group_size,
             .quant_bits = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4,
+            .quant_mode = if (se_w1_biases == null) .mxfp4 else .affine,
             .swiglu_limit = 0,
         };
         // Consume any remaining shared expert quantized metadata
@@ -1837,11 +1841,11 @@ pub fn buildDSV4Model(
 
                 break :blk blk2: {
                     // Check if quantized scales exist for fused weights
-                    const gate_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.gate_proj.scales", .{idx_fmt});
+                    const gate_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.scales", .{idx_fmt});
                     defer allocator.free(gate_scales_name);
-                    const up_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.up_proj.scales", .{idx_fmt});
+                    const up_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.scales", .{idx_fmt});
                     defer allocator.free(up_scales_name);
-                    const down_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.down_proj.scales", .{idx_fmt});
+                    const down_scales_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.scales", .{idx_fmt});
                     defer allocator.free(down_scales_name);
 
                     const gate_scales = weights.get(gate_scales_name);
@@ -1859,11 +1863,11 @@ pub fn buildDSV4Model(
                         if (weights.fetchRemove(up_scales_name)) |kv| allocator.free(kv.key);
                         if (weights.fetchRemove(down_scales_name)) |kv| allocator.free(kv.key);
 
-                        const gate_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.gate_proj.biases", .{idx_fmt});
+                        const gate_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w1.biases", .{idx_fmt});
                         defer allocator.free(gate_biases_name);
-                        const up_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.up_proj.biases", .{idx_fmt});
+                        const up_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w3.biases", .{idx_fmt});
                         defer allocator.free(up_biases_name);
-                        const down_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.down_proj.biases", .{idx_fmt});
+                        const down_biases_name = try std.fmt.allocPrint(allocator, "{s}ffn.switch_mlp.w2.biases", .{idx_fmt});
                         defer allocator.free(down_biases_name);
 
                         gate_biases = weights.get(gate_biases_name);

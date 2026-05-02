@@ -210,6 +210,22 @@ pub const ExpertStreamProvider = struct {
                 try pool.openAll(index);
                 provider.fd_pool = pool;
 
+                // Initialize MmapPool for zero-copy memory-mapped access
+                const mmap = try allocator.create(safetensors_reader.MmapPool);
+                mmap.* = safetensors_reader.MmapPool.init(allocator);
+                try mmap.mmapAll(index);
+                provider.mmap_pool = mmap;
+
+                // Initialize PartialTensorReader for reading only selected expert rows
+                const reader = try allocator.create(safetensors_reader.PartialTensorReader);
+                reader.* = safetensors_reader.PartialTensorReader.init(allocator, index, pool);
+                provider.partial_reader = reader;
+
+                // Initialize ExpertCache for caching frequently-used expert slices
+                const cache = try allocator.create(expert_cache.ExpertCache);
+                cache.* = expert_cache.ExpertCache.init(allocator, cache_budget_mb * 1024 * 1024);
+                provider.cache = cache;
+
                 std.log.info("Expert streaming enabled: loading experts from SSD on demand (cache_budget={d}MB)", .{cache_budget_mb});
             },
         }
@@ -260,10 +276,22 @@ pub const ExpertStreamProvider = struct {
         row_bytes: usize,
     ) !Array {
         _ = row_bytes; // Not used in the new approach
+
+        // Use PartialTensorReader if available: read only selected expert rows
+        if (self.partial_reader) |reader| {
+            const arr = try reader.readExpertRows(tensor_name, expert_ids);
+            // DEBUG: Force copy to ensure contiguous strides. The partial-read path
+            // (mmap/pread + mlx_array_new_data) may create tensors with non-standard
+            // strides that gatherQmm cannot process correctly.
+            const copied = try ops.copy(self.ctx, arr);
+            arr.deinit();
+            try copied.eval();
+            return copied;
+        }
         
         const info = self.index.entries.get(tensor_name) orelse return error.TensorNotFound;
         
-        // Load the FULL tensor from disk (this is the key fix!)
+        // Fallback: load the FULL tensor from disk then slice
         const full_tensor = try self.index.loadTensor(tensor_name);
         defer full_tensor.deinit();
         
@@ -274,7 +302,6 @@ pub const ExpertStreamProvider = struct {
         }
         
         // Slice to get only the selected experts: full_tensor[expert_ids, ...]
-        // Convert expert_ids to an MLX array for indexing
         const indices_arr = try Array.fromData(self.allocator, u32, expert_ids, &[_]i32{@intCast(expert_ids.len)});
         defer indices_arr.deinit();
         
@@ -595,11 +622,11 @@ pub const ExpertStreamProvider = struct {
                 flat_x.shape(),
                 fx_data[0], fx_data[1], fx_data[2], fx_data[3], fx_data[4],
             });
-            // Print gate_w shape and first few u32 values
+            // Print gate_w shape, strides, dtype and first few u32 values
             try gate_w.eval();
             const gw_data = try gate_w.dataSlice(u32);
-            std.log.info("DIAG gate_w shape: {any}, first 4 u32: {d} {d} {d} {d}", .{
-                gate_w.shape(),
+            std.log.info("DIAG gate_w shape: {any} strides: {any} dtype: {d} first 4 u32: {d} {d} {d} {d}", .{
+                gate_w.shape(), gate_w.strides(), gate_w.dtype(),
                 gw_data[0], gw_data[1], gw_data[2], gw_data[3],
             });
 
@@ -687,6 +714,51 @@ pub const ExpertStreamProvider = struct {
                 const t_mean = t_sum / @as(f64, @floatFromInt(@min(test_data_out.len, 24576)));
                 std.log.info("  stats: mean={d:.6} max={d:.6} min={d:.6}", .{ t_mean, t_max, t_min });
                 std.log.info("  Python ref: mean=-0.000001 max=0.059080 min=-0.075170", .{});
+
+                // CORRECTNESS TEST 2: Use STREAM-LOADED sliced weights (gate_w/up_w/down_w)
+                // to detect if partial-read/takeAxis produces different results from full weights.
+                stream_test: {
+                    const deepseek_v4_test2 = @import("deepseek_v4.zig");
+                    var test_glu2 = deepseek_v4_test2.DSV4SwitchGLU{
+                        .ctx = self.ctx,
+                        .gate_proj = gate_w,
+                        .up_proj = up_w,
+                        .down_proj = down_w,
+                        .gate_proj_scales = gate_s,
+                        .gate_proj_biases = null,
+                        .up_proj_scales = up_s,
+                        .up_proj_biases = null,
+                        .down_proj_scales = down_s,
+                        .down_proj_biases = null,
+                        .is_quantized = self.is_quantized,
+                        .quant_group_size = self.quant_group_size,
+                        .quant_bits = self.quant_bits,
+                        .quant_mode = self.quant_mode,
+                        .swiglu_limit = self.swiglu_limit,
+                        .sort_threshold = 8,
+                    };
+                    const test_out2 = test_glu2.forwardNoScores(test_x, test_indices, self.ctx.stream.inner) catch break :stream_test;
+                    defer test_out2.deinit();
+                    try test_out2.eval();
+                    const test_f32_2 = try ops.astype(self.ctx, test_out2, .float32);
+                    defer test_f32_2.deinit();
+                    try test_f32_2.eval();
+                    const test_data_out2 = try test_f32_2.dataSlice(f32);
+                    std.log.info("STREAM WEIGHTS TEST (x=0.1, indices=[0..5]):", .{});
+                    std.log.info("  first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
+                        test_data_out2[0], test_data_out2[1], test_data_out2[2], test_data_out2[3], test_data_out2[4],
+                    });
+                    var t2_max: f32 = -std.math.inf(f32);
+                    var t2_min: f32 = std.math.inf(f32);
+                    var t2_sum: f64 = 0;
+                    for (test_data_out2[0..@min(test_data_out2.len, 24576)]) |v| {
+                        if (v > t2_max) t2_max = v;
+                        if (v < t2_min) t2_min = v;
+                        t2_sum += v;
+                    }
+                    const t2_mean = t2_sum / @as(f64, @floatFromInt(@min(test_data_out2.len, 24576)));
+                    std.log.info("  stats: mean={d:.6} max={d:.6} min={d:.6}", .{ t2_mean, t2_max, t2_min });
+                }
             }
         }
         const expert_out = try switch_glu.forwardNoScores(flat_x, remapped_u32, self.ctx.stream.inner);
@@ -723,9 +795,8 @@ pub const ExpertStreamProvider = struct {
             defer sc_f32.deinit();
             try sc_f32.eval();
             const sc_data = try sc_f32.dataSlice(f32);
-            std.log.info("DIAG scores (first 12): {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}", .{
-                sc_data[0], sc_data[1], sc_data[2], sc_data[3], sc_data[4], sc_data[5],
-                sc_data[6], sc_data[7], sc_data[8], sc_data[9], sc_data[10], sc_data[11],
+            std.log.info("DIAG scores (len={d}): {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}", .{
+                sc_data.len, sc_data[0], sc_data[1], sc_data[2], sc_data[3], sc_data[4], sc_data[5],
             });
             var sc_sum: f64 = 0;
             for (sc_data[0..6]) |v| sc_sum += v;
