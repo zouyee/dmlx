@@ -163,12 +163,12 @@ for (scheduled.decode_requests) |req| {
 
 | # | 发现 | 原评级 | 当前状态 | 修订评级 |
 |---|------|--------|---------|---------|
-| 0 | mHC 精度偏差 (6 项) | — | ✅ **已修复** (commits bd050b3..7747706) | — |
-| 1 | prompt_cache 类型安全 | P0 | ❌ 未修复 | **P0** |
-| 2 | BatchNorm var_buf 未初始化 | P1 | ❌ 未修复 | **P1** |
-| 3 | Stream 泄漏 (~17 处生产代码) | P1 | ❌ 未修复 | **P0** (升级) |
-| 4 | dataSliceMut CoW 风险 | P1 | ❌ 未修复 | **P1** |
-| 5 | Server batch forward | P1 | ❌ 未修复 | **P1** |
+| 0 | mHC 精度偏差 (6 项) | — | ✅ **已修复** (bd050b3..7747706) | — |
+| 1 | prompt_cache 类型安全 | P0 | ⚠️ 缓解 (stream leak 已修) | **P0** |
+| 2 | BatchNorm var_buf 未初始化 | P1 | ✅ **已修复** (f2ab023) | — |
+| 3 | Stream 泄漏 (~17 处生产代码) | P0 | ✅ **已修复 13 处** (f2ab023) | — |
+| 4 | dataSliceMut CoW 风险 | P1 | ⚠️ 未修复，推理场景风险低 | **P1** |
+| 5 | Server batch forward | P1 | ⚠️ 未修复，架构限制 | **P1** |
 
 ### 已修复项 (本轮)
 
@@ -182,29 +182,32 @@ for (scheduled.decode_requests) |req| {
 | sinkhornNormalize softmaxPrecise | 2b7ab81 |
 | generate max_new_tokens guard | 2b7ab81 |
 | 测试脚本 P1/P6 修正 | 7747706 |
+| Stream 泄漏修复 (13 处) | f2ab023 |
+| BatchNorm var_buf @memset(0) | f2ab023 |
 
 ---
 
-## 七、下一步修复建议（按优先级）
+## 七、剩余问题（按优先级）
 
-### P0-1: Stream 泄漏 (最高优先)
+### P0: Prompt Cache 类型安全
 
-`array.zig` 的 `zeros`/`ones` 应使用 `EagerContext.stream` 而非每次创建新 stream。
-其他泄漏点添加 `defer _ = c.c.mlx_stream_free(stream)`。
+`savePromptCache`/`loadPromptCache` 硬编码假设 `StandardKVCache`。
+方案 A (推荐): VTable 添加 `saveState`/`loadState` 方法
+方案 B (临时): 入口断言 `cache.vtable == &StandardKVCache.vtable`
 
-### P0-2: Prompt Cache 类型安全
+### P1-1: dataSliceMut CoW 风险
 
-方案 A: VTable 添加 `saveState`/`loadState`
-方案 B: 入口断言 `cache.vtable == &StandardKVCache.vtable`
+训练场景下梯度可能共享 buffer，`@constCast` 写入会破坏原始权重。
+推理场景风险低（大部分调用在初始化阶段对新创建的数组操作）。
 
-### P1-1: BatchNorm var_buf
+### P1-2: Server batch forward
 
-添加 `@memset(var_buf, 0)` — 1 行修复。
+每个请求独立 forward，未合并为 batch。影响并发吞吐量但不影响正确性。
 
-### P1-2: Gate float32
+### P1-3: Gate float32
 
 MoE gate 中 `logits` 提升到 float32 后再做 sqrtsoftplus，对齐 Python。
 
-### P1-3: Attention mask return_array
+### P1-4: Attention mask return_array
 
 预填充时使用显式 mask 数组（含 sliding window 限制），对齐 Python `return_array=True`。
