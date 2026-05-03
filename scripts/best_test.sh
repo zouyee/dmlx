@@ -79,8 +79,8 @@ run_test() {
 # ==================================================================
 
 # --- Prompt 1: Math ---
-run_test "P1: 3+3=" \
-    "3+3=" 30 "6"
+run_test "P1: 2+2=" \
+    "2+2=" 30 "4"
 
 # --- Prompt 2: Geography completion ---
 run_test "P2: Capital of France (completion)" \
@@ -99,8 +99,8 @@ run_test "P5: 3*3=" \
     "3*3=" 30 "9"
 
 # --- Prompt 6: Math ---
-run_test "P6: 10-6=" \
-    "10-5=" 30 "4"
+run_test "P6: 10-5=" \
+    "10-5=" 30 "5"
 
 # --- Prompt 7: Geography question ---
 run_test "P7: Capital of France (question)" \
