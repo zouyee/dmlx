@@ -103,10 +103,22 @@ pub const LlamaAttention = struct {
     pub fn deinit(self: *LlamaAttention, allocator: std.mem.Allocator) void {
         // Free quantized weights (owns data + scales + biases + original_shape).
         // When quantized, wq/wk/wv/wo point to qw.data — don't double-free.
-        if (self.wq_quant) |qw| { var m = qw; m.deinit(allocator); } else self.wq.deinit();
-        if (self.wk_quant) |qw| { var m = qw; m.deinit(allocator); } else self.wk.deinit();
-        if (self.wv_quant) |qw| { var m = qw; m.deinit(allocator); } else self.wv.deinit();
-        if (self.wo_quant) |qw| { var m = qw; m.deinit(allocator); } else self.wo.deinit();
+        if (self.wq_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.wq.deinit();
+        if (self.wk_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.wk.deinit();
+        if (self.wv_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.wv.deinit();
+        if (self.wo_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.wo.deinit();
     }
 
     /// Perform linear projection: x @ W^T + bias, using quantized matmul if available.
@@ -335,9 +347,18 @@ pub const LlamaMLP = struct {
     }
 
     pub fn deinit(self: *LlamaMLP, allocator: std.mem.Allocator) void {
-        if (self.gate_proj_quant) |qw| { var m = qw; m.deinit(allocator); } else self.gate_proj.deinit();
-        if (self.up_proj_quant) |qw| { var m = qw; m.deinit(allocator); } else self.up_proj.deinit();
-        if (self.down_proj_quant) |qw| { var m = qw; m.deinit(allocator); } else self.down_proj.deinit();
+        if (self.gate_proj_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.gate_proj.deinit();
+        if (self.up_proj_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.up_proj.deinit();
+        if (self.down_proj_quant) |qw| {
+            var m = qw;
+            m.deinit(allocator);
+        } else self.down_proj.deinit();
     }
 
     /// Perform linear projection: x @ W^T, using quantized matmul if available.
@@ -688,36 +709,6 @@ pub const LlamaModel = struct {
 
             // Convert to float32 for CPU sampling
             const logits_f32 = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
-
-            // DIAGNOSTIC: Print first token's top logits for comparison with Python
-            if (!prefill_done) {
-                try logits_f32.eval();
-                const ldata = try logits_f32.dataSlice(f32);
-                var max1_idx: usize = 0;
-                var max1_val: f32 = -std.math.inf(f32);
-                var max2_idx: usize = 0;
-                var max2_val: f32 = -std.math.inf(f32);
-                for (ldata, 0..) |v, idx| {
-                    if (v > max1_val) {
-                        max2_val = max1_val;
-                        max2_idx = max1_idx;
-                        max1_val = v;
-                        max1_idx = idx;
-                    } else if (v > max2_val) {
-                        max2_val = v;
-                        max2_idx = idx;
-                    }
-                }
-                std.log.info("LLAMA DIAG first token: argmax=[{d}]={d:.4}, 2nd=[{d}]={d:.4}", .{
-                    max1_idx, max1_val, max2_idx, max2_val,
-                });
-                // Python ref: token 10234=20.375, 39814=20.0
-                std.log.info("LLAMA DIAG Python ref: [10234]=20.375 [39814]=20.0", .{});
-                // Also check token 10234 specifically
-                if (ldata.len > 10234) {
-                    std.log.info("LLAMA DIAG token 10234 ('Why') logit: {d:.4}", .{ldata[10234]});
-                }
-            }
 
             // Sample (update context for repetition penalty)
             sampler_config.context_tokens = tokens;

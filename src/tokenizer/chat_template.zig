@@ -30,6 +30,8 @@ pub const ChatTemplate = struct {
     template_type: ChatTemplateType,
     bos_token: []const u8,
     eos_token: []const u8,
+    /// DeepSeek: 'chat' (non-thinking) or 'thinking' (model reasons before answering)
+    thinking_mode: []const u8 = "chat",
 
     pub fn init(allocator: std.mem.Allocator, template_type: ChatTemplateType) ChatTemplate {
         return .{
@@ -46,6 +48,7 @@ pub const ChatTemplate = struct {
             .template_type = .deepseek,
             .bos_token = "<｜begin▁of▁sentence｜>",
             .eos_token = "<｜end▁of▁sentence｜>",
+            .thinking_mode = "chat",
         };
     }
 
@@ -84,29 +87,40 @@ pub const ChatTemplate = struct {
     }
 
     fn applyDeepSeek(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
-        // DeepSeek-V4-Flash chat template (from chat_template.jinja):
-        // Default mode='chat' (non-thinking). User msg: <｜User｜>{content}<｜Assistant｜></think>
-        // Assistant msg: </think>{content}<｜end▁of▁sentence｜>
-        // add_generation_prompt: <｜Assistant｜></think>
+        // Matches official chat_template.jinja from DeepSeek-V4-Flash-4bit:
+        // {%- set mode = thinking_mode|default('chat') -%}
+        // User msg: <｜User｜>content<｜Assistant｜>
+        //   - last+thinking: <think>
+        //   - else: </think>
+        // Assistant msg: reasoning(if thinking) + </think> + content + <eos>
+        // add_generation_prompt: only when messages[-1].role != 'user' → <Assistant|></think>
+        const is_thinking = std.mem.eql(u8, self.thinking_mode, "thinking");
+
         try result.appendSlice(self.allocator, self.bos_token);
 
-        for (messages) |msg| {
+        for (messages, 0..) |msg, idx| {
+            const is_last = idx == messages.len - 1;
+
             if (std.mem.eql(u8, msg.role, "system")) {
                 try result.appendSlice(self.allocator, msg.content);
             } else if (std.mem.eql(u8, msg.role, "user")) {
                 try result.appendSlice(self.allocator, "<｜User｜>");
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, "<｜Assistant｜>");
-                try result.appendSlice(self.allocator, "</think>");
+                // Add thinking or non-thinking marker
+                if (is_last and is_thinking) {
+                    try result.appendSlice(self.allocator, "<think>");
+                } else {
+                    try result.appendSlice(self.allocator, "</think>");
+                }
             } else if (std.mem.eql(u8, msg.role, "assistant")) {
-                try result.appendSlice(self.allocator, "</think>");
+                // Assistant: content may include thinking; we just append content + eos
                 try result.appendSlice(self.allocator, msg.content);
                 try result.appendSlice(self.allocator, self.eos_token);
             }
         }
 
-        // add_generation_prompt only applies when last message is not user
-        // (user messages already include <｜Assistant｜></think> in the loop above)
+        // add_generation_prompt: only when last message is NOT user
         if (add_generation_prompt and messages.len > 0 and !std.mem.eql(u8, messages[messages.len - 1].role, "user")) {
             try result.appendSlice(self.allocator, "<｜Assistant｜></think>");
         }

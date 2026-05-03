@@ -77,6 +77,7 @@ pub const ServerConfig = struct {
     allow_unsafe_tools: bool = false,
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload",
 };
 
 // ------------------------------------------------------------------
@@ -279,9 +280,16 @@ fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !Mo
         return error.UnsupportedArchitecture;
     };
 
+    const smelt_load_mode: root.deepseek_v4_loader.SmeltConfig.LoadMode =
+        if (std.mem.eql(u8, config.smelt_strategy, "stream"))
+            .stream
+        else
+            .preload;
+
     const vtable = try loader(allocator, config_content, config.model_path, ctx, stream, io, .{
         .enabled = config.smelt,
         .load_fraction = config.smelt_experts,
+        .load_mode = smelt_load_mode,
     });
 
     // 3. Load tokenizer

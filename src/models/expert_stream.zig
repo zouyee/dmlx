@@ -45,8 +45,8 @@ pub const TokenStepMetrics = struct {
 
 /// Expert loading strategy.
 pub const ExpertLoadStrategy = enum {
-    preload,  // Option 1: Preload subset at init (matches Python vmlx)
-    stream,   // Option 2: Stream on-demand from disk (experimental)
+    preload, // Option 1: Preload subset at init (matches Python vmlx)
+    stream, // Option 2: Stream on-demand from disk (experimental)
 };
 
 /// Per-layer expert weight metadata for streaming.
@@ -70,17 +70,17 @@ pub const ExpertStreamProvider = struct {
     index: *TensorIndex,
     ctx: EagerContext,
     strategy: ExpertLoadStrategy,
-    
+
     // Common fields
     is_quantized: bool,
     quant_group_size: i32,
     quant_bits: u8,
     quant_mode: []const u8,
     swiglu_limit: f32,
-    
+
     // Strategy-specific implementations
     preload_provider: ?*expert_preload.ExpertPreloadProvider = null,
-    
+
     // Stream-specific fields (Option 2)
     layer_meta: []LayerExpertMeta,
 
@@ -104,7 +104,7 @@ pub const ExpertStreamProvider = struct {
             provider.deinit();
             self.allocator.destroy(provider);
         }
-        
+
         // Clean up performance optimization components
         if (self.prefetcher) |pf| {
             pf.deinit();
@@ -125,7 +125,7 @@ pub const ExpertStreamProvider = struct {
             p.deinit();
             self.allocator.destroy(p);
         }
-        
+
         // Clean up stream-specific metadata
         for (self.layer_meta) |meta| {
             self.allocator.free(meta.gate_proj_name);
@@ -137,7 +137,7 @@ pub const ExpertStreamProvider = struct {
         }
         self.allocator.free(self.layer_meta);
     }
-    
+
     /// Initialize provider with specified strategy.
     pub fn initWithStrategy(
         allocator: std.mem.Allocator,
@@ -165,15 +165,15 @@ pub const ExpertStreamProvider = struct {
             .swiglu_limit = swiglu_limit,
             .layer_meta = layer_meta,
         };
-        
+
         switch (strategy) {
             .preload => {
                 std.log.info("Initializing expert provider with PRELOAD strategy", .{});
-                
+
                 // Convert LayerExpertMeta to expert_preload.LayerMeta
                 var preload_meta = try allocator.alloc(expert_preload.LayerMeta, layer_meta.len);
                 defer allocator.free(preload_meta);
-                
+
                 for (layer_meta, 0..) |meta, i| {
                     preload_meta[i] = expert_preload.LayerMeta{
                         .gate_proj_name = meta.gate_proj_name,
@@ -185,7 +185,7 @@ pub const ExpertStreamProvider = struct {
                         .n_experts = meta.n_experts,
                     };
                 }
-                
+
                 // Initialize preload provider
                 const preload_impl = try allocator.create(expert_preload.ExpertPreloadProvider);
                 preload_impl.* = try expert_preload.ExpertPreloadProvider.init(
@@ -229,10 +229,10 @@ pub const ExpertStreamProvider = struct {
                 std.log.info("Expert streaming enabled: loading experts from SSD on demand (cache_budget={d}MB)", .{cache_budget_mb});
             },
         }
-        
+
         return provider;
     }
-    
+
     /// Forward pass - dispatches to appropriate strategy implementation.
     pub fn streamForward(
         self: *ExpertStreamProvider,
@@ -251,7 +251,7 @@ pub const ExpertStreamProvider = struct {
             .stream => self.streamingForward(layer_idx, flat_x, indices, scores),
         };
     }
-    
+
     /// Get cache bias for router (only for preload strategy).
     pub fn getCacheBias(self: *ExpertStreamProvider, layer_idx: usize) ?Array {
         if (self.strategy == .preload) {
@@ -265,7 +265,7 @@ pub const ExpertStreamProvider = struct {
     /// Load a subset of experts from a fused tensor on disk.
     /// Returns a mini fused tensor [n_selected, ...] containing only the requested expert rows.
     /// `expert_ids` is a sorted, deduplicated list of expert indices to load.
-    /// 
+    ///
     /// CRITICAL: For quantized mxfp4 format, we MUST load the full tensor first, then slice it.
     /// Creating a new tensor from concatenated expert rows breaks the packing format.
     /// This matches the Python vmlx implementation (_load_expert_subset).
@@ -288,43 +288,41 @@ pub const ExpertStreamProvider = struct {
             try copied.eval();
             return copied;
         }
-        
+
         const info = self.index.entries.get(tensor_name) orelse return error.TensorNotFound;
-        
+
         // Fallback: load the FULL tensor from disk then slice
         const full_tensor = try self.index.loadTensor(tensor_name);
         defer full_tensor.deinit();
-        
+
         // If all experts are selected, return the full tensor
         const n_experts = @as(usize, @intCast(info.shape[0]));
         if (expert_ids.len >= n_experts) {
             return ops.copy(self.ctx, full_tensor);
         }
-        
+
         // Slice to get only the selected experts: full_tensor[expert_ids, ...]
         const indices_arr = try Array.fromData(self.allocator, u32, expert_ids, &[_]i32{@intCast(expert_ids.len)});
         defer indices_arr.deinit();
-        
+
         // Use take_axis to slice along axis 0 (expert dimension)
         const indices_i32 = try ops.astype(self.ctx, indices_arr, .int32);
         defer indices_i32.deinit();
-        
+
         const sliced = try shape_mod.takeAxis(self.ctx, full_tensor, indices_i32, 0);
-        
+
         // Force evaluation to materialize the sliced data
         try sliced.eval();
-        
+
         return sliced;
     }
 
     /// Load expert slices with cache-first strategy using partial reads.
     ///
-    /// For each required projection tensor:
-    /// 1. Build a cache key from (layer_idx, tensor_name, expert_ids)
-    /// 2. On cache hit, return the cached mini-fused tensor
-    /// 3. On cache miss, use PartialTensorReader to load only needed expert rows
-    /// 4. Insert the assembled mini-fused tensor into the cache
-    /// 5. Falls back to full tensor loading if cache or partial_reader is null
+    /// Strategy:
+    /// 1. Try to assemble ALL experts from cache (fast path for repeated selections)
+    /// 2. On partial or full miss, load via PartialTensorReader (already active in loadExpertSlices)
+    /// 3. Cache each newly-loaded expert row for future tokens
     fn loadExpertSlicesCached(
         self: *ExpertStreamProvider,
         tensor_name: []const u8,
@@ -332,14 +330,61 @@ pub const ExpertStreamProvider = struct {
         layer_idx: usize,
         row_bytes: usize,
     ) !Array {
-        // Always use full tensor loading (load full tensor + takeAxis slice).
-        // This produces GPU-friendly tensors that gatherQmm processes efficiently.
-        // The partial-read path (mmap/pread) creates tensors from raw bytes that
-        // are numerically correct but may not be optimally laid out for GPU computation.
-        // Cache and partial reads are available but bypassed until the GPU layout
-        // issue is resolved.
-        _ = layer_idx;
-        return self.loadExpertSlices(tensor_name, expert_ids, row_bytes);
+        // If cache unavailable, fall through to direct load (PartialTensorReader already active there)
+        if (self.cache == null) {
+            return self.loadExpertSlices(tensor_name, expert_ids, row_bytes);
+        }
+
+        const cache_inst = self.cache.?;
+        const tensor_name_hash = std.hash.Wyhash.hash(0, tensor_name);
+        const lx: u32 = @intCast(layer_idx);
+
+        // Try to assemble ALL from cache (fast path)
+        var all_cached = true;
+        for (expert_ids) |eid| {
+            const key = expert_cache.CacheKey{ .layer_idx = lx, .tensor_name_hash = tensor_name_hash, .expert_id = eid };
+            if (cache_inst.get(key) == null) {
+                all_cached = false;
+                break;
+            }
+        }
+
+        if (all_cached) {
+            // Fast path: assemble mini-fused tensor from cached rows
+            var cached_rows = try self.allocator.alloc(Array, expert_ids.len);
+            defer self.allocator.free(cached_rows);
+            for (expert_ids, 0..) |eid, i| {
+                const key = expert_cache.CacheKey{ .layer_idx = lx, .tensor_name_hash = tensor_name_hash, .expert_id = eid };
+                const cached_row = cache_inst.get(key).?;
+                cached_rows[i] = try ops.copy(self.ctx, cached_row);
+            }
+            return try shape_mod.concatenateAxis(self.ctx, cached_rows, 0);
+        }
+
+        // Partial/full miss: load via existing path (uses PartialTensorReader)
+        const result = try self.loadExpertSlices(tensor_name, expert_ids, row_bytes);
+
+        // Cache individual expert rows lazily for future token reuse
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const aa = arena.allocator();
+
+        for (expert_ids, 0..) |eid, i| {
+            const key = expert_cache.CacheKey{ .layer_idx = lx, .tensor_name_hash = tensor_name_hash, .expert_id = eid };
+            if (cache_inst.get(key) != null) continue;
+
+            const idx_arr = try Array.fromData(aa, i32, &[_]i32{@intCast(i)}, &[_]i32{1});
+            const row = try shape_mod.takeAxis(self.ctx, result, idx_arr, 0);
+            const row_copy = try ops.copy(self.ctx, row);
+            row.deinit();
+            idx_arr.deinit();
+            try row_copy.eval();
+
+            const sz = row_copy.nbytes();
+            cache_inst.put(key, row_copy, sz);
+        }
+
+        return result;
     }
 
     /// Streaming forward (Option 2): Load experts on-demand from disk.
@@ -389,14 +434,8 @@ pub const ExpertStreamProvider = struct {
         defer indices_u32.deinit();
         try indices_u32.eval();
 
-        // DIAGNOSTIC: Log strides to verify contiguity fix
-        if (layer_idx == 0) {
-            std.log.info("indices original: shape={any} strides={any} ndim={d}", .{ indices.shape(), indices.strides(), indices.ndim() });
-            std.log.info("indices_u32 (after copy+astype): shape={any} strides={any} ndim={d}", .{ indices_u32.shape(), indices_u32.strides(), indices_u32.ndim() });
-        }
-
         const indices_data = try indices_u32.dataSlice(u32);
-        
+
         var unique_set = std.AutoHashMap(u32, void).init(self.allocator);
         defer unique_set.deinit();
         for (indices_data) |eid| {
@@ -418,112 +457,12 @@ pub const ExpertStreamProvider = struct {
         // 2. Load expert weight slices using cache-first strategy with partial reads
         const gate_w = try self.loadExpertSlicesCached(meta.gate_proj_name, unique_ids, layer_idx, 0);
         defer gate_w.deinit();
-        
+
         const up_w = try self.loadExpertSlicesCached(meta.up_proj_name, unique_ids, layer_idx, 0);
         defer up_w.deinit();
-        
+
         const down_w = try self.loadExpertSlicesCached(meta.down_proj_name, unique_ids, layer_idx, 0);
         defer down_w.deinit();
-
-        // DIAGNOSTIC: Compare stream-loaded tensor (TensorIndex.loadTensor) with
-        // mlx_load_safetensors-loaded tensor for the SAME tensor name.
-        // This verifies that both loading methods produce identical tensor data.
-        if (layer_idx == 0) diag: {
-            const mlx_io = @import("../io/mlx_io.zig");
-            const info = self.index.entries.get(meta.gate_proj_name) orelse break :diag;
-
-            // Load the full tensor via TensorIndex.loadTensor (the stream path)
-            const stream_tensor = self.index.loadTensor(meta.gate_proj_name) catch |err| {
-                std.log.err("DIAG: TensorIndex.loadTensor failed: {}", .{err});
-                break :diag;
-            };
-            defer stream_tensor.deinit();
-
-            // Load the same shard via mlx_load_safetensors (the preload path)
-            var mlx_result = mlx_io.loadSafetensors(self.allocator, info.shard_path) catch |err| {
-                std.log.err("DIAG: mlx_load_safetensors failed: {}", .{err});
-                break :diag;
-            };
-            defer mlx_result.deinit(self.allocator);
-
-            std.log.info("DIAG: gate_proj tensor name = '{s}'", .{meta.gate_proj_name});
-            std.log.info("DIAG: shard_path = '{s}'", .{info.shard_path});
-
-            if (mlx_result.weights.get(meta.gate_proj_name)) |mlx_tensor| {
-                // Compare shapes
-                const stream_shape = stream_tensor.shape();
-                const mlx_shape = mlx_tensor.shape();
-                std.log.info("DIAG COMPARE shapes: stream={any} mlx={any}", .{ stream_shape, mlx_shape });
-
-                // Evaluate both tensors to materialize data
-                stream_tensor.eval() catch |err| {
-                    std.log.err("DIAG: stream_tensor.eval() failed: {}", .{err});
-                    break :diag;
-                };
-                mlx_tensor.eval() catch |err| {
-                    std.log.err("DIAG: mlx_tensor.eval() failed: {}", .{err});
-                    break :diag;
-                };
-
-                // Compare raw data as u32 (mxfp4 weights are stored as U32)
-                const stream_data = stream_tensor.dataSlice(u32) catch |err| {
-                    std.log.err("DIAG: stream_tensor.dataSlice(u32) failed: {}", .{err});
-                    break :diag;
-                };
-                const mlx_data = mlx_tensor.dataSlice(u32) catch |err| {
-                    std.log.err("DIAG: mlx_tensor.dataSlice(u32) failed: {}", .{err});
-                    break :diag;
-                };
-
-                std.log.info("DIAG COMPARE element counts: stream={d} mlx={d}", .{ stream_data.len, mlx_data.len });
-
-                // Compare first N elements
-                var mismatch_count: usize = 0;
-                const check_len = @min(stream_data.len, @min(mlx_data.len, 64));
-                for (0..check_len) |i| {
-                    if (stream_data[i] != mlx_data[i]) mismatch_count += 1;
-                }
-                std.log.info("DIAG COMPARE first {d} u32 elements: {d} mismatches", .{ check_len, mismatch_count });
-
-                if (mismatch_count > 0) {
-                    std.log.info("DIAG stream[0..4]: {any}", .{stream_data[0..@min(4, stream_data.len)]});
-                    std.log.info("DIAG mlx[0..4]:    {any}", .{mlx_data[0..@min(4, mlx_data.len)]});
-                } else {
-                    // Quick full comparison
-                    if (stream_data.len == mlx_data.len) {
-                        var total_mismatches: usize = 0;
-                        for (0..stream_data.len) |i| {
-                            if (stream_data[i] != mlx_data[i]) total_mismatches += 1;
-                        }
-                        std.log.info("DIAG COMPARE ALL {d} u32 elements: {d} mismatches", .{ stream_data.len, total_mismatches });
-                    }
-                }
-            } else {
-                // Tensor name not found in mlx_load result - log available keys for debugging
-                std.log.info("DIAG: gate_proj '{s}' NOT FOUND in mlx_load_safetensors result", .{meta.gate_proj_name});
-                var wit = mlx_result.weights.iterator();
-                var found_count: usize = 0;
-                while (wit.next()) |entry| {
-                    if (std.mem.indexOf(u8, entry.key_ptr.*, "gate_proj") != null or
-                        std.mem.indexOf(u8, entry.key_ptr.*, "w1.weight") != null)
-                    {
-                        std.log.info("DIAG: found similar key: '{s}'", .{entry.key_ptr.*});
-                        found_count += 1;
-                        if (found_count >= 5) break;
-                    }
-                }
-                if (found_count == 0) {
-                    // Log first few keys to understand the naming scheme
-                    var kit = mlx_result.weights.iterator();
-                    var key_count: usize = 0;
-                    while (kit.next()) |entry| {
-                        std.log.info("DIAG: mlx_load key[{d}]: '{s}'", .{ key_count, entry.key_ptr.* });
-                        key_count += 1;
-                        if (key_count >= 5) break;
-                    }
-                }
-            }
-        }
 
         // Load scales if quantized
         var gate_s: ?Array = null;
@@ -533,9 +472,15 @@ pub const ExpertStreamProvider = struct {
         defer if (up_s) |a| a.deinit();
         defer if (down_s) |a| a.deinit();
         if (self.is_quantized) {
-            if (meta.gate_scales_name) |n| { gate_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0); }
-            if (meta.up_scales_name) |n| { up_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0); }
-            if (meta.down_scales_name) |n| { down_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0); }
+            if (meta.gate_scales_name) |n| {
+                gate_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0);
+            }
+            if (meta.up_scales_name) |n| {
+                up_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0);
+            }
+            if (meta.down_scales_name) |n| {
+                down_s = try self.loadExpertSlicesCached(n, unique_ids, layer_idx, 0);
+            }
         }
 
         // 3. Build remap: original_expert_id → mini_fused_row_index
@@ -552,7 +497,7 @@ pub const ExpertStreamProvider = struct {
         // Use manual remap to avoid mlx_take 2D layout issues
         // (see .kiro/specs/stream-mode-correctness/design.md - H1)
         const remap_readback = try remap_arr.dataSlice(i32);
-        
+
         // Build remapped indices preserving original 2D shape [N, topk]
         var remapped_data = try self.allocator.alloc(u32, indices_data.len);
         defer self.allocator.free(remapped_data);
@@ -560,13 +505,6 @@ pub const ExpertStreamProvider = struct {
             remapped_data[i] = @intCast(remap_readback[idx]);
         }
 
-        // DIAGNOSTIC: Log first few indices and remap results
-        if (layer_idx == 0) {
-            std.log.info("indices_data (first 12): {any}", .{indices_data[0..@min(12, indices_data.len)]});
-            std.log.info("unique_ids: {any}", .{unique_ids[0..@min(10, unique_ids.len)]});
-            std.log.info("remapped (first 12): {any}", .{remapped_data[0..@min(12, remapped_data.len)]});
-        }
-        
         const idx_shape = indices_u32.shape();
         var shape_buf: [8]i32 = undefined;
         for (idx_shape, 0..) |d, i| {
@@ -607,201 +545,10 @@ pub const ExpertStreamProvider = struct {
             .sort_threshold = 8,
         };
         // Call forwardNoScores which does gate/up/SwiGLU/down without score weighting
-        if (layer_idx == 0) {
-            std.log.info("DIAG switch_glu params: quant={}, group_size={d}, bits={d}, mode={s}, swiglu_limit={d:.1}", .{
-                switch_glu.is_quantized, switch_glu.quant_group_size, switch_glu.quant_bits,
-                switch_glu.quant_mode, switch_glu.swiglu_limit,
-            });
-            // Print flat_x stats for Python comparison
-            try flat_x.eval();
-            const fx_f32 = try ops.astype(self.ctx, flat_x, .float32);
-            defer fx_f32.deinit();
-            try fx_f32.eval();
-            const fx_data = try fx_f32.dataSlice(f32);
-            std.log.info("DIAG flat_x shape: {any}, first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
-                flat_x.shape(),
-                fx_data[0], fx_data[1], fx_data[2], fx_data[3], fx_data[4],
-            });
-            // Print gate_w shape, strides, dtype and first few u32 values
-            try gate_w.eval();
-            const gw_data = try gate_w.dataSlice(u32);
-            std.log.info("DIAG gate_w shape: {any} strides: {any} dtype: {d} first 4 u32: {d} {d} {d} {d}", .{
-                gate_w.shape(), gate_w.strides(), gate_w.dtype(),
-                gw_data[0], gw_data[1], gw_data[2], gw_data[3],
-            });
-
-            // CORRECTNESS TEST: Run forwardNoScores with known input (all 0.1)
-            // and indices [0,1,2,3,4,5] using FULL 256-expert weights (not sliced).
-            // Compare output with Python reference:
-            //   mean=-0.000001, std=0.015521, max=0.059080, min=-0.075170
-            //   first 5: [0.011578, -0.001211, 0.001326, -0.000963, 0.006477]
-            correctness_test: {
-                // Load full gate/up/down weights (not sliced)
-                const full_gate = self.index.loadTensor(meta.gate_proj_name) catch break :correctness_test;
-                defer full_gate.deinit();
-                const full_up = self.index.loadTensor(meta.up_proj_name) catch break :correctness_test;
-                defer full_up.deinit();
-                const full_down = self.index.loadTensor(meta.down_proj_name) catch break :correctness_test;
-                defer full_down.deinit();
-                var full_gate_s: ?Array = null;
-                var full_up_s: ?Array = null;
-                var full_down_s: ?Array = null;
-                defer if (full_gate_s) |a| a.deinit();
-                defer if (full_up_s) |a| a.deinit();
-                defer if (full_down_s) |a| a.deinit();
-                if (meta.gate_scales_name) |n| { full_gate_s = self.index.loadTensor(n) catch null; }
-                if (meta.up_scales_name) |n| { full_up_s = self.index.loadTensor(n) catch null; }
-                if (meta.down_scales_name) |n| { full_down_s = self.index.loadTensor(n) catch null; }
-
-                // Create test input: all 0.1, shape [1, 4096]
-                var test_data: [4096]f32 = undefined;
-                @memset(&test_data, 0.1);
-                const test_x = try Array.fromData(self.allocator, f32, &test_data, &[_]i32{ 1, 4096 });
-                defer test_x.deinit();
-
-                // Create test indices: [0, 1, 2, 3, 4, 5], shape [1, 6]
-                const test_indices_data = [_]u32{ 0, 1, 2, 3, 4, 5 };
-                const test_indices = try Array.fromData(self.allocator, u32, &test_indices_data, &[_]i32{ 1, 6 });
-                defer test_indices.deinit();
-
-                // Build test SwitchGLU with full weights
-                const deepseek_v4_test = @import("deepseek_v4.zig");
-                var test_glu = deepseek_v4_test.DSV4SwitchGLU{
-                    .ctx = self.ctx,
-                    .gate_proj = full_gate,
-                    .up_proj = full_up,
-                    .down_proj = full_down,
-                    .gate_proj_scales = full_gate_s,
-                    .gate_proj_biases = null,
-                    .up_proj_scales = full_up_s,
-                    .up_proj_biases = null,
-                    .down_proj_scales = full_down_s,
-                    .down_proj_biases = null,
-                    .is_quantized = self.is_quantized,
-                    .quant_group_size = self.quant_group_size,
-                    .quant_bits = self.quant_bits,
-                    .quant_mode = self.quant_mode,
-                    .swiglu_limit = self.swiglu_limit,
-                    .sort_threshold = 8,
-                };
-
-                const test_out = test_glu.forwardNoScores(test_x, test_indices, self.ctx.stream.inner) catch break :correctness_test;
-                defer test_out.deinit();
-                try test_out.eval();
-
-                const test_f32 = try ops.astype(self.ctx, test_out, .float32);
-                defer test_f32.deinit();
-                try test_f32.eval();
-                const test_data_out = try test_f32.dataSlice(f32);
-
-                std.log.info("CORRECTNESS TEST (x=0.1, indices=[0..5]):", .{});
-                std.log.info("  shape: {any}", .{test_out.shape()});
-                std.log.info("  first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
-                    test_data_out[0], test_data_out[1], test_data_out[2], test_data_out[3], test_data_out[4],
-                });
-                // Python reference: [0.011578, -0.001211, 0.001326, -0.000963, 0.006477]
-                std.log.info("  Python ref: 0.011578 -0.001211 0.001326 -0.000963 0.006477", .{});
-
-                // Compute stats
-                var t_max: f32 = -std.math.inf(f32);
-                var t_min: f32 = std.math.inf(f32);
-                var t_sum: f64 = 0;
-                for (test_data_out[0..@min(test_data_out.len, 24576)]) |v| {
-                    if (v > t_max) t_max = v;
-                    if (v < t_min) t_min = v;
-                    t_sum += v;
-                }
-                const t_mean = t_sum / @as(f64, @floatFromInt(@min(test_data_out.len, 24576)));
-                std.log.info("  stats: mean={d:.6} max={d:.6} min={d:.6}", .{ t_mean, t_max, t_min });
-                std.log.info("  Python ref: mean=-0.000001 max=0.059080 min=-0.075170", .{});
-
-                // CORRECTNESS TEST 2: Use STREAM-LOADED sliced weights (gate_w/up_w/down_w)
-                // to detect if partial-read/takeAxis produces different results from full weights.
-                stream_test: {
-                    const deepseek_v4_test2 = @import("deepseek_v4.zig");
-                    var test_glu2 = deepseek_v4_test2.DSV4SwitchGLU{
-                        .ctx = self.ctx,
-                        .gate_proj = gate_w,
-                        .up_proj = up_w,
-                        .down_proj = down_w,
-                        .gate_proj_scales = gate_s,
-                        .gate_proj_biases = null,
-                        .up_proj_scales = up_s,
-                        .up_proj_biases = null,
-                        .down_proj_scales = down_s,
-                        .down_proj_biases = null,
-                        .is_quantized = self.is_quantized,
-                        .quant_group_size = self.quant_group_size,
-                        .quant_bits = self.quant_bits,
-                        .quant_mode = self.quant_mode,
-                        .swiglu_limit = self.swiglu_limit,
-                        .sort_threshold = 8,
-                    };
-                    const test_out2 = test_glu2.forwardNoScores(test_x, test_indices, self.ctx.stream.inner) catch break :stream_test;
-                    defer test_out2.deinit();
-                    try test_out2.eval();
-                    const test_f32_2 = try ops.astype(self.ctx, test_out2, .float32);
-                    defer test_f32_2.deinit();
-                    try test_f32_2.eval();
-                    const test_data_out2 = try test_f32_2.dataSlice(f32);
-                    std.log.info("STREAM WEIGHTS TEST (x=0.1, indices=[0..5]):", .{});
-                    std.log.info("  first 5: {d:.6} {d:.6} {d:.6} {d:.6} {d:.6}", .{
-                        test_data_out2[0], test_data_out2[1], test_data_out2[2], test_data_out2[3], test_data_out2[4],
-                    });
-                    var t2_max: f32 = -std.math.inf(f32);
-                    var t2_min: f32 = std.math.inf(f32);
-                    var t2_sum: f64 = 0;
-                    for (test_data_out2[0..@min(test_data_out2.len, 24576)]) |v| {
-                        if (v > t2_max) t2_max = v;
-                        if (v < t2_min) t2_min = v;
-                        t2_sum += v;
-                    }
-                    const t2_mean = t2_sum / @as(f64, @floatFromInt(@min(test_data_out2.len, 24576)));
-                    std.log.info("  stats: mean={d:.6} max={d:.6} min={d:.6}", .{ t2_mean, t2_max, t2_min });
-                }
-            }
-        }
         const expert_out = try switch_glu.forwardNoScores(flat_x, remapped_u32, self.ctx.stream.inner);
         defer expert_out.deinit();
 
-        // DIAGNOSTIC: Check expert_out shape and magnitude
-        if (layer_idx == 0) {
-            std.log.info("DIAG expert_out shape: {any}, scores shape: {any}", .{expert_out.shape(), scores.shape()});
-            // Check if expert_out has meaningful values
-            try expert_out.eval();
-            const eo_f32 = try ops.astype(self.ctx, expert_out, .float32);
-            defer eo_f32.deinit();
-            try eo_f32.eval();
-            const eo_data = try eo_f32.dataSlice(f32);
-            var eo_max: f32 = -std.math.inf(f32);
-            var eo_min: f32 = std.math.inf(f32);
-            var eo_sum: f64 = 0;
-            var eo_nonzero: usize = 0;
-            for (eo_data[0..@min(1000, eo_data.len)]) |v| {
-                if (v > eo_max) eo_max = v;
-                if (v < eo_min) eo_min = v;
-                eo_sum += v;
-                if (v != 0) eo_nonzero += 1;
-            }
-            std.log.info("DIAG expert_out stats (first 1000): max={d:.4} min={d:.4} mean={d:.4} nonzero={d}/1000", .{
-                eo_max, eo_min, eo_sum / 1000.0, eo_nonzero,
-            });
-        }
-
         // Apply scores AFTER switch_mlp (matching Python: y = (y * scores[..., None]).sum(-2))
-        if (layer_idx == 0) {
-            try scores.eval();
-            const sc_f32 = try ops.astype(self.ctx, scores, .float32);
-            defer sc_f32.deinit();
-            try sc_f32.eval();
-            const sc_data = try sc_f32.dataSlice(f32);
-            std.log.info("DIAG scores (len={d}): {d:.4} {d:.4} {d:.4} {d:.4} {d:.4} {d:.4}", .{
-                sc_data.len, sc_data[0], sc_data[1], sc_data[2], sc_data[3], sc_data[4], sc_data[5],
-            });
-            var sc_sum: f64 = 0;
-            for (sc_data[0..6]) |v| sc_sum += v;
-            std.log.info("DIAG scores sum (first token's 6 experts): {d:.4}", .{sc_sum});
-        }
         const scores_expanded = try ops.expandDims(self.ctx, scores, -1);
         defer scores_expanded.deinit();
         const weighted_out = try ops.multiply(self.ctx, expert_out, scores_expanded);

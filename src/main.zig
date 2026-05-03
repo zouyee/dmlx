@@ -36,6 +36,7 @@ const ChatCommand = struct {
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     smelt_cache_mb: usize = 4096, // Expert cache size in MB (stream mode)
     distributed: bool = false,
+    raw: bool = false, // Skip chat template, use raw prompt completion
 };
 
 const ServerCommand = struct {
@@ -187,6 +188,7 @@ pub fn main(init: std.process.Init) !void {
             .speculative_ngram = cmd.speculative_ngram,
             .smelt = cmd.smelt,
             .smelt_experts = cmd.smelt_experts,
+            .smelt_strategy = cmd.smelt_strategy,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -449,6 +451,9 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
+        } else if (std.mem.eql(u8, flag, "--raw")) {
+            cmd.raw = true;
+            i -= 1;
         }
     }
 
@@ -680,8 +685,8 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     std.log.info("Prompt text: '{s}'", .{prompt_text});
     std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
     std.log.info("Config: vocab={d}, layers={d}, heads={d}, kv_heads={d}, hidden={d}, head_dim={d}", .{
-        config.vocab_size, config.num_hidden_layers, config.num_attention_heads,
-        config.num_key_value_heads, config.hidden_size, config.getHeadDim(),
+        config.vocab_size,          config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.hidden_size,       config.getHeadDim(),
     });
 
     const prompt_arr = c.c.mlx_array_new_data(
@@ -748,7 +753,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         .stream
     else
         .preload;
-    
+
     const smelt_config = root.deepseek_v4_loader.SmeltConfig{
         .enabled = cmd.smelt,
         .load_fraction = cmd.smelt_experts,
@@ -778,12 +783,18 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     // 4. Build model
     var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
     // Don't defer model cleanup - we'll do it manually to control order
-    
+
     // 4b. Wire expert streaming when smelt is enabled (loads experts from SSD on demand)
     var expert_sp: ?*root.expert_stream.ExpertStreamProvider = null;
     var tensor_index: ?*safetensors_reader.TensorIndex = null;
-    defer if (expert_sp) |sp| { sp.deinit(); allocator.destroy(sp); };
-    defer if (tensor_index) |idx| { idx.deinit(); allocator.destroy(idx); };
+    defer if (expert_sp) |sp| {
+        sp.deinit();
+        allocator.destroy(sp);
+    };
+    defer if (tensor_index) |idx| {
+        idx.deinit();
+        allocator.destroy(idx);
+    };
 
     if (cmd.smelt and !model.hasExpertsLoaded()) {
         // Build tensor index for random-access reading
@@ -829,9 +840,18 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
                 .gate_proj_name = hf_gate,
                 .up_proj_name = hf_up,
                 .down_proj_name = hf_down,
-                .gate_scales_name = if (idx.entries.contains(hf_gate_s)) hf_gate_s else blk: { allocator.free(hf_gate_s); break :blk null; },
-                .up_scales_name = if (idx.entries.contains(hf_up_s)) hf_up_s else blk: { allocator.free(hf_up_s); break :blk null; },
-                .down_scales_name = if (idx.entries.contains(hf_down_s)) hf_down_s else blk: { allocator.free(hf_down_s); break :blk null; },
+                .gate_scales_name = if (idx.entries.contains(hf_gate_s)) hf_gate_s else blk: {
+                    allocator.free(hf_gate_s);
+                    break :blk null;
+                },
+                .up_scales_name = if (idx.entries.contains(hf_up_s)) hf_up_s else blk: {
+                    allocator.free(hf_up_s);
+                    break :blk null;
+                },
+                .down_scales_name = if (idx.entries.contains(hf_down_s)) hf_down_s else blk: {
+                    allocator.free(hf_down_s);
+                    break :blk null;
+                },
                 .expert_row_bytes = row_bytes,
                 .expert_scale_row_bytes = scale_row_bytes,
                 .n_experts = ds_config.n_routed_experts,
@@ -839,13 +859,13 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         }
 
         const sp = try allocator.create(root.expert_stream.ExpertStreamProvider);
-        
+
         // Determine strategy
         const strategy: root.expert_stream.ExpertLoadStrategy = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
             .stream
         else
             .preload;
-        
+
         // Calculate number of experts to load (for preload mode)
         const n_experts_to_load = @as(usize, @intFromFloat(@as(f32, @floatFromInt(ds_config.n_routed_experts)) * cmd.smelt_experts));
         var expert_ids = try allocator.alloc(u32, n_experts_to_load);
@@ -853,14 +873,14 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         for (0..n_experts_to_load) |i| {
             expert_ids[i] = @intCast(i);
         }
-        
+
         std.log.info("Expert strategy: {s}, loading {d}/{d} experts ({d:.1}%)", .{
             @tagName(strategy),
             n_experts_to_load,
             ds_config.n_routed_experts,
             cmd.smelt_experts * 100.0,
         });
-        
+
         sp.* = try root.expert_stream.ExpertStreamProvider.initWithStrategy(
             allocator,
             ctx,
@@ -869,8 +889,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             expert_ids,
             layer_meta,
             true, // switch_mlp is always quantized in 4-bit models
-            32,   // mxfp4 uses group_size=32
-            4,    // 4-bit quantization
+            32, // mxfp4 uses group_size=32
+            4, // 4-bit quantization
             "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
             ds_config.swiglu_limit,
             cmd.smelt_cache_mb,
@@ -882,22 +902,30 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         std.log.info("Expert streaming enabled: loading experts from SSD on demand", .{});
     }
 
-    // 5. Format prompt with chat template
+    // 5. Format prompt with chat template (or raw mode)
     var chat_template = root.tokenizer.ChatTemplate.initDeepSeek(allocator);
 
-    var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
-    defer messages.deinit(allocator);
+    var prompt_tokens: []u32 = undefined;
 
-    if (cmd.system_prompt.len > 0) {
-        try messages.append(allocator, .{ .role = "system", .content = cmd.system_prompt });
+    if (cmd.raw) {
+        // Raw mode: tokenize prompt directly without chat template
+        // Add BOS token (0 for DeepSeek V4 Flash) at the start
+        const raw_tokens = try tokenizer.encode(cmd.prompt, true, allocator);
+        // raw_tokens already includes BOS from add_special_tokens=true
+        prompt_tokens = raw_tokens;
+    } else {
+        var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
+        defer messages.deinit(allocator);
+
+        if (cmd.system_prompt.len > 0) {
+            try messages.append(allocator, .{ .role = "system", .content = cmd.system_prompt });
+        }
+        try messages.append(allocator, .{ .role = "user", .content = cmd.prompt });
+
+        const prompt_text = try chat_template.apply(messages.items, true);
+        defer allocator.free(prompt_text);
+        prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     }
-    try messages.append(allocator, .{ .role = "user", .content = cmd.prompt });
-
-    const prompt_text = try chat_template.apply(messages.items, true);
-    defer allocator.free(prompt_text);
-
-    // 6. Encode (no special tokens added by tokenizer, template handles them)
-    const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
 
     // Validate prompt format: first token should be BOS (0 for DeepSeek-V4-Flash)
@@ -905,20 +933,23 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         std.log.err("Empty prompt after tokenization", .{});
         return error.InvalidPromptFormat;
     }
-    
+
     const expected_bos: u32 = 0; // <｜begin▁of▁sentence｜> token ID
     if (prompt_tokens[0] != expected_bos) {
         std.log.err("❌ BOS token mismatch! Expected {d}, got {d}", .{ expected_bos, prompt_tokens[0] });
-        std.log.err("Prompt text: '{s}'", .{prompt_text});
         std.log.err("First 10 tokens: {any}", .{prompt_tokens[0..@min(prompt_tokens.len, 10)]});
         std.log.err("This indicates the chat template format doesn't match the tokenizer.", .{});
         std.log.err("DeepSeek V4 Flash uses: <｜begin▁of▁sentence｜> (token ID 0)", .{});
         return error.InvalidPromptFormat;
     }
 
-    std.log.info("✅ Prompt correctly formatted with BOS token {d}", .{expected_bos});
-    std.log.info("Prompt text: '{s}'", .{prompt_text});
-    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    if (cmd.raw) {
+        std.log.info("✅ Raw mode: prompt starts with BOS token {d}", .{expected_bos});
+        std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    } else {
+        std.log.info("✅ Prompt correctly formatted with BOS token {d}", .{expected_bos});
+        std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    }
 
     const prompt_arr = c.c.mlx_array_new_data(
         prompt_tokens.ptr,
@@ -963,7 +994,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     defer allocator.free(output_text);
 
     std.debug.print("\n{s}\n", .{output_text});
-    
+
     // Manual cleanup to control order
     model.deinit();
 }
@@ -1394,9 +1425,9 @@ fn runConvert(allocator: std.mem.Allocator, io: std.Io, cmd: ConvertCommand) !vo
     // Delegate to mlx_lm.convert for HuggingFace model conversion
     const result = std.process.run(allocator, io, .{
         .argv = &.{
-            "python3", "-m", "mlx_lm.convert",
-            "--hf-path", cmd.input_path,
-            "--mlx-path", cmd.output_path,
+            "python3",       "-m",           "mlx_lm.convert",
+            "--hf-path",     cmd.input_path, "--mlx-path",
+            cmd.output_path,
         },
     }) catch |err| {
         std.log.err("Failed to run mlx_lm.convert: {s}. Ensure mlx-lm is installed (`pip install mlx-lm`).", .{@errorName(err)});
