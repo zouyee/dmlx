@@ -2408,7 +2408,8 @@ pub fn sinkhornNormalize(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
-    const softmaxed = try ops.softmax(ctx, x, &[_]i32{-1});
+    // Use softmaxPrecise to match Python's precise=True behavior
+    const softmaxed = try ops.softmaxPrecise(ctx, x, &[_]i32{-1});
     defer softmaxed.deinit();
 
     const eps_arr = try Array.fromData(ctx.allocator, f32, &[_]f32{eps}, &[_]i32{1});
@@ -2800,6 +2801,12 @@ pub const DSV4Model = struct {
         stream: c.c.mlx_stream,
     ) ![]u32 {
         const allocator = self.allocator;
+
+        // Guard against max_new_tokens=0 underflow (usize 0-1 wraps to maxInt)
+        if (max_new_tokens == 0) {
+            return try allocator.alloc(u32, 0);
+        }
+
         var tokens = try allocator.alloc(u32, prompt_tokens.len + max_new_tokens);
         defer allocator.free(tokens);
         @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
