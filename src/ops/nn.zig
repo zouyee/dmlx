@@ -134,6 +134,7 @@ pub const BatchNorm = struct {
             // Compute batch variance
             var var_buf = try self.ctx.allocator.alloc(f32, num_features);
             defer self.ctx.allocator.free(var_buf);
+            @memset(var_buf, 0);
 
             for (0..batch) |n| {
                 for (0..num_features) |f| {
@@ -212,8 +213,8 @@ pub const Dropout = struct {
         const scale: f32 = 1.0 / (1.0 - self.p);
 
         for (0..size) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             dst[i] = if (rng.random().float(f32) < self.p) 0 else src[i] * scale;
         }
 
@@ -255,13 +256,13 @@ pub const LSTM = struct {
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 
@@ -424,13 +425,13 @@ pub const GRU = struct {
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 
@@ -776,13 +777,13 @@ pub const RNN = struct {
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-        var prng = std.Random.DefaultPrng.init(42);
-        const rng = prng.random();
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
             w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 

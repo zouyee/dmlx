@@ -71,6 +71,7 @@ pub fn savePromptCache(
     for (caches, 0..) |cache, i| {
         // Get the current cached state by doing a zero-length update
         // We access the underlying StandardKVCache to read keys/values directly
+        // SAFETY: prompt cache only supports StandardKVCache.
         const std_cache: *StandardKVCache = @ptrCast(@alignCast(cache.ptr));
 
         const current_len = std_cache.offset;
@@ -78,6 +79,7 @@ pub fn savePromptCache(
 
         // Slice the valid portion of keys and values
         const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
         const keys = try sliceCache(std_cache.keys, current_len, stream);
         const values = try sliceCache(std_cache.values, current_len, stream);
 
@@ -175,6 +177,7 @@ pub fn loadPromptCache(
 
     // Reconstruct KV caches
     const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
     var caches = try allocator.alloc(KVCacheStrategy, num_layers);
     errdefer {
         for (caches) |*cache_strategy| {
@@ -402,8 +405,7 @@ test "Property 5: Prompt Cache Round-Trip — save/load equality and mismatch er
         const seq_len = rand.intRangeAtMost(usize, 1, 16);
 
         const stream = c.c.mlx_default_cpu_stream_new();
-
-        // --- Create caches with random data ---
+        defer _ = c.c.mlx_stream_free(stream);
         var caches = try allocator.alloc(KVCacheStrategy, num_layers);
         defer {
             for (caches) |cache_strat| {

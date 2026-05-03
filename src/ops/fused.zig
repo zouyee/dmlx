@@ -45,6 +45,7 @@ pub fn swigluForward(inputs: []const Array, allocator: std.mem.Allocator) error{
 
     const stream = c.c.mlx_default_cpu_stream_new();
     const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
+    defer ctx.deinit();
 
     // gate = x @ gate_weight^T
     const gate_weight_t = ops_mod.transpose(ctx, gate_weight) catch return error.MlxError;
@@ -151,6 +152,7 @@ pub fn adamwStepForward(inputs: []const Array, allocator: std.mem.Allocator) err
 
     const stream = c.c.mlx_default_cpu_stream_new();
     const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
+    defer ctx.deinit();
 
     // one_minus_beta1 = 1 - beta1
     const one = ops_mod.scalarF32(ctx, 1.0) catch return error.MlxError;

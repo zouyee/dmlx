@@ -50,7 +50,9 @@ pub const Array = struct {
     pub fn zeros(allocator: std.mem.Allocator, shape_: []const ShapeElem, dt: Dtype) !Array {
         _ = allocator;
         var arr = c.c.mlx_array_new();
-        try c.check(c.c.mlx_zeros(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), c.c.mlx_default_cpu_stream_new()));
+        const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
+        try c.check(c.c.mlx_zeros(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), stream));
         return fromHandle(arr);
     }
 
@@ -58,7 +60,9 @@ pub const Array = struct {
     pub fn ones(allocator: std.mem.Allocator, shape_: []const ShapeElem, dt: Dtype) !Array {
         _ = allocator;
         var arr = c.c.mlx_array_new();
-        try c.check(c.c.mlx_ones(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), c.c.mlx_default_cpu_stream_new()));
+        const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
+        try c.check(c.c.mlx_ones(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), stream));
         return fromHandle(arr);
     }
 

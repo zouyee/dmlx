@@ -187,8 +187,10 @@ pub const StandardKVCache = struct {
         // take along batch axis (axis 0)
         var new_keys = c.c.mlx_array_new();
         var new_values = c.c.mlx_array_new();
-        try c.check(c.c.mlx_take_axis(&new_keys, self.keys.inner, idx_arr, 0, c.c.mlx_default_cpu_stream_new()));
-        try c.check(c.c.mlx_take_axis(&new_values, self.values.inner, idx_arr, 0, c.c.mlx_default_cpu_stream_new()));
+        const trim_stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(trim_stream);
+        try c.check(c.c.mlx_take_axis(&new_keys, self.keys.inner, idx_arr, 0, trim_stream));
+        try c.check(c.c.mlx_take_axis(&new_values, self.values.inner, idx_arr, 0, trim_stream));
 
         self.keys.deinit();
         self.values.deinit();

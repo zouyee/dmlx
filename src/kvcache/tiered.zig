@@ -183,6 +183,7 @@ pub const TieredKVCache = struct {
             @intCast(self.hot.head_dim),
         };
         const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
         var empty_k = c.c.mlx_array_new();
         var empty_v = c.c.mlx_array_new();
         try c.check(c.c.mlx_zeros(&empty_k, shape.ptr, shape.len, @intCast(@intFromEnum(self.hot.dtype)), stream));
