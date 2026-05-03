@@ -139,6 +139,18 @@ pub fn softmax(ctx: EagerContext, a: Array, axes: []const i32) !Array {
     return Array.fromHandle(res);
 }
 
+pub fn softmaxPrecise(ctx: EagerContext, a: Array, axes: []const i32) !Array {
+    var res = c.c.mlx_array_new();
+    if (axes.len == 0) {
+        try c.check(c.c.mlx_softmax(&res, a.inner, true, ctx.stream.inner));
+    } else if (axes.len == 1) {
+        try c.check(c.c.mlx_softmax_axis(&res, a.inner, axes[0], true, ctx.stream.inner));
+    } else {
+        try c.check(c.c.mlx_softmax_axes(&res, a.inner, axes.ptr, axes.len, true, ctx.stream.inner));
+    }
+    return Array.fromHandle(res);
+}
+
 pub fn negative(ctx: EagerContext, a: Array) !Array {
     var res = c.c.mlx_array_new();
     try c.check(c.c.mlx_negative(&res, a.inner, ctx.stream.inner));

@@ -98,8 +98,8 @@ pub const DSV4Config = struct {
 pub const HyperHead = struct {
     ctx: EagerContext,
     fn_weight: Array, // [mix, mult*hidden_size] where mix = (2+mult)*mult
-    base: Array,      // [mix]
-    scale: Array,     // [3]
+    base: Array, // [mix]
+    scale: Array, // [3]
     hc_mult: usize,
     norm_eps: f32,
 
@@ -1068,7 +1068,7 @@ pub const DSV4MoE = struct {
             }
             std.log.info("MOE DIAG layer 0: y shape={any} shared shape={any}", .{ y.shape(), shared_out.shape() });
             std.log.info("MOE DIAG layer 0: y mean={d:.6} max={d:.6}, shared mean={d:.6} max={d:.6}", .{
-                y_sum / @as(f64, @floatFromInt(n)), y_max,
+                y_sum / @as(f64, @floatFromInt(n)),                      y_max,
                 s_sum / @as(f64, @floatFromInt(@min(s_data.len, 1000))), s_max,
             });
         }
@@ -1274,7 +1274,7 @@ pub const LightningIndexer = struct {
 
         // Reshape to multi-head: [B, S, n_heads, head_dim] -> [B, n_heads, S, head_dim]
         const q_mh = try ops.reshape(ctx, q_fp4, &[_]i32{
-            @intCast(batch),     @intCast(seq_len),
+            @intCast(batch),              @intCast(seq_len),
             @intCast(self.index_n_heads), @intCast(self.index_head_dim),
         });
         defer q_mh.deinit();
@@ -1282,7 +1282,7 @@ pub const LightningIndexer = struct {
         defer q_mh_t.deinit();
 
         const k_mh = try ops.reshape(ctx, k_fp4, &[_]i32{
-            @intCast(batch),     @intCast(n_blocks),
+            @intCast(batch),              @intCast(n_blocks),
             @intCast(self.index_n_heads), @intCast(self.index_head_dim),
         });
         defer k_mh.deinit();
@@ -1697,7 +1697,10 @@ pub const DSV4Attention = struct {
             kv_slice = try cs.updateAndFetch(kv_roped, kv_roped, stream);
             full_kv = kv_slice.?.keys;
         }
-        defer if (kv_slice) |sl| { sl.keys.deinit(); sl.values.deinit(); };
+        defer if (kv_slice) |sl| {
+            sl.keys.deinit();
+            sl.values.deinit();
+        };
 
         // === Attention (simplified: concat pooled to local KV for dense SDPA) ===
         var attn_out: Array = undefined;
@@ -2249,7 +2252,7 @@ pub fn mhcPreNormFn(
     const sqrsum = try reduce_mod.sumAxis(ctx, res_sq, 1, false);
     defer sqrsum.deinit();
 
-    const group_size_f = try Array.fromData(ctx.allocator, f32, &[_]f32{ @floatFromInt(mhc_hidden_size) }, &[_]i32{1});
+    const group_size_f = try Array.fromData(ctx.allocator, f32, &[_]f32{@floatFromInt(mhc_hidden_size)}, &[_]i32{1});
     defer group_size_f.deinit();
     const sqrsum_div = try ops.divide(ctx, sqrsum, group_size_f);
     defer sqrsum_div.deinit();
@@ -2405,7 +2408,7 @@ pub fn sinkhornNormalize(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
-    const softmaxed = try ops.softmax(ctx, x, &[_]i32{ -1 });
+    const softmaxed = try ops.softmax(ctx, x, &[_]i32{-1});
     defer softmaxed.deinit();
 
     const eps_arr = try Array.fromData(ctx.allocator, f32, &[_]f32{eps}, &[_]i32{1});
@@ -2444,6 +2447,7 @@ pub fn sinkhornNormalize(
 }
 
 /// Apply pre-layer mix to residual.
+/// Matches Python: (pre[..., None] * y).sum(axis=2).astype(x.dtype) where y = x.astype(f32)
 pub fn mhcPreApplyMix(
     ctx: EagerContext,
     residual: Array,
@@ -2451,14 +2455,22 @@ pub fn mhcPreApplyMix(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
-    const weighted = try ops.multiply(ctx, residual, mix);
+    const orig_dtype = residual.dtype();
+    // Promote to float32 for precision (matching Python .astype(mx.float32))
+    const res_f32 = try ops.astype(ctx, residual, .float32);
+    defer res_f32.deinit();
+    const mix_f32 = try ops.astype(ctx, mix, .float32);
+    defer mix_f32.deinit();
+    const weighted = try ops.multiply(ctx, res_f32, mix_f32);
     defer weighted.deinit();
-    const result = try reduce_mod.sumAxis(ctx, weighted, 2, false);
-
-    return result;
+    const summed = try reduce_mod.sumAxis(ctx, weighted, 2, false);
+    defer summed.deinit();
+    // Cast back to original dtype
+    return ops.astype(ctx, summed, orig_dtype);
 }
 
 /// MHC post: combine sublayer output with residual using post_mix and comb_mix.
+/// Matches Python: all intermediate computation in float32, comb is transposed.
 pub fn mhcPost(
     ctx: EagerContext,
     x: Array,
@@ -2468,6 +2480,7 @@ pub fn mhcPost(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
+    const orig_dtype = x.dtype();
     const shape = x.shape();
     const batch = @as(usize, @intCast(shape[0]));
     const seq_len = @as(usize, @intCast(shape[1]));
@@ -2475,24 +2488,38 @@ pub fn mhcPost(
     const res_shape = residual.shape();
     const mhc_mult = @as(usize, @intCast(res_shape[2]));
 
-    const x_expanded = try ops.expandDims(ctx, x, 2);
+    // Promote to float32 for precision (matching Python .astype(mx.float32))
+    const x_f32 = try ops.astype(ctx, x, .float32);
+    defer x_f32.deinit();
+    const res_f32 = try ops.astype(ctx, residual, .float32);
+    defer res_f32.deinit();
+    const post_mix_f32 = try ops.astype(ctx, post_mix, .float32);
+    defer post_mix_f32.deinit();
+
+    const x_expanded = try ops.expandDims(ctx, x_f32, 2);
     defer x_expanded.deinit();
-    const term1 = try ops.multiply(ctx, x_expanded, post_mix);
+    const term1 = try ops.multiply(ctx, x_expanded, post_mix_f32);
     defer term1.deinit();
 
     const bs = batch * seq_len;
+    // Python: mx.matmul(comb.swapaxes(-1, -2), residual) — comb is transposed
     const comb_2d = try ops.reshape(ctx, comb_mix, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(mhc_mult) });
     defer comb_2d.deinit();
-    const res_2d = try ops.reshape(ctx, residual, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(h) });
+    const comb_2d_f32 = try ops.astype(ctx, comb_2d, .float32);
+    defer comb_2d_f32.deinit();
+    const comb_2d_t = try ops.transposeAxes(ctx, comb_2d_f32, &[_]i32{ 0, 2, 1 });
+    defer comb_2d_t.deinit();
+    const res_2d = try ops.reshape(ctx, res_f32, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(h) });
     defer res_2d.deinit();
-    const term2_2d = try ops.matmul(ctx, comb_2d, res_2d);
+    const term2_2d = try ops.matmul(ctx, comb_2d_t, res_2d);
     defer term2_2d.deinit();
     const term2 = try ops.reshape(ctx, term2_2d, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(mhc_mult), @intCast(h) });
     defer term2.deinit();
 
-    const result = try ops.add(ctx, term1, term2);
-
-    return result;
+    const result_f32 = try ops.add(ctx, term1, term2);
+    defer result_f32.deinit();
+    // Cast back to original dtype
+    return ops.astype(ctx, result_f32, orig_dtype);
 }
 
 /// MHC head compression: compress residual from [B,S,mhc_mult,H] to [B,S,H] for lm_head.
@@ -2568,7 +2595,7 @@ pub const DSV4HyperConn = struct {
         }
         const mixes = try mhcPreNormFn(ctx, x, self.hc_fn, null, self.hc_eps, stream);
         defer mixes.deinit();
-        const pre_mix, const post_mix, const comb_mix = try mhcPreSplitMixes(ctx, mixes, self.hc_scale, self.hc_base, self.hc_mult, 1.0, self.hc_eps, stream);
+        const pre_mix, const post_mix, const comb_mix = try mhcPreSplitMixes(ctx, mixes, self.hc_scale, self.hc_base, self.hc_mult, 2.0, self.hc_eps, stream);
         defer pre_mix.deinit();
 
         const comb_mix_norm = try sinkhornNormalize(ctx, comb_mix, self.hc_sinkhorn_iters, self.hc_eps, stream);
@@ -2785,7 +2812,7 @@ pub const DSV4Model = struct {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
-            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{1, @intCast(prompt_tokens.len)}));
+            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
             const logits = try self.forward(prompt_arr, null, caches, start_pos, stream);
 
             // Get last token logits
@@ -2803,17 +2830,28 @@ pub const DSV4Model = struct {
                 var nan_count: usize = 0;
                 var inf_count: usize = 0;
                 for (logits_data, 0..) |v, idx| {
-                    if (std.math.isNan(v)) { nan_count += 1; continue; }
-                    if (std.math.isInf(v)) { inf_count += 1; continue; }
+                    if (std.math.isNan(v)) {
+                        nan_count += 1;
+                        continue;
+                    }
+                    if (std.math.isInf(v)) {
+                        inf_count += 1;
+                        continue;
+                    }
                     sum += v;
-                    if (v > max_val) { max_val = v; max_idx = idx; }
-                    if (v < min_val) { min_val = v; }
+                    if (v > max_val) {
+                        max_val = v;
+                        max_idx = idx;
+                    }
+                    if (v < min_val) {
+                        min_val = v;
+                    }
                 }
                 const mean = sum / @as(f64, @floatFromInt(logits_data.len));
                 std.log.info("Logits: len={d} max={d:.4} min={d:.4} mean={d:.4} argmax={d} nan={d} inf={d}", .{
                     logits_data.len, max_val, min_val, mean, max_idx, nan_count, inf_count,
                 });
-                var top5 = [_]struct { idx: usize, val: f32 }{ .{ .idx = 0, .val = -std.math.inf(f32) } } ** 5;
+                var top5 = [_]struct { idx: usize, val: f32 }{.{ .idx = 0, .val = -std.math.inf(f32) }} ** 5;
                 for (logits_data, 0..) |v, idx| {
                     if (std.math.isNan(v) or std.math.isInf(v)) continue;
                     for (&top5) |*t| {
@@ -2844,17 +2882,17 @@ pub const DSV4Model = struct {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
-            const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tokens[current_len - 1]}, &[_]i32{1, 1}));
+            const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tokens[current_len - 1]}, &[_]i32{ 1, 1 }));
             const logits = try self.forward(input_arr, null, caches, start_pos, stream);
 
-            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, logits, &[_]i32{0, 1}));
+            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, logits, &[_]i32{ 0, 1 }));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
             const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
-            
+
             // Check for EOS token (ID 1 for DeepSeek V4)
             if (next_token == 1) {
                 std.log.info("EOS token generated, stopping", .{});
