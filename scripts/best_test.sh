@@ -100,7 +100,7 @@ run_test "P5: 3*3=" \
 
 # --- Prompt 6: Math ---
 run_test "P6: 10-5=" \
-    "10-5=" 30 "5"
+    "10-5=" 50 "answer is 5"
 
 # --- Prompt 7: Geography question ---
 run_test "P7: Capital of France (question)" \
