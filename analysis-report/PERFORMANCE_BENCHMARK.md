@@ -90,7 +90,9 @@ zig build test → exit code 0
 
 | 指标 | 修复前 (a024bee) | 修复后 (14da587) | 变化 |
 |------|-----------------|-----------------|------|
-| Prefill 延迟 | ~716ms | ~170ms | **-76%** |
+| TTFT (模型加载→首 token) | ~140s | ~138s | — |
+| 其中: 模型加载+权重索引 | ~137s | ~137s | — |
+| 其中: Prefill | ~716ms | ~170ms | **-76%** |
 | 稳态 token 延迟 | ~125ms | ~41ms | **-67%** |
 | 稳态吞吐量 | ~8 tok/s | ~23 tok/s | **+188%** |
 | 7-Prompt 通过率 | 1/7 | 7/7 | **+600%** |
@@ -98,3 +100,6 @@ zig build test → exit code 0
 | ExpertCache 稳态命中率 | ~40% | ~40% | — |
 | 模型加载 | smelt stream | smelt stream | — |
 | 内存占用 | <48GB | <48GB | — |
+
+注: TTFT 主要瓶颈是模型加载（33 个 safetensors 分片索引 × 2 次 = ~137s），
+prefill 本身仅 170ms。模型加载是一次性开销，server 模式下后续请求不受影响。

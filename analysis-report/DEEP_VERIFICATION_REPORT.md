@@ -187,27 +187,21 @@ for (scheduled.decode_requests) |req| {
 
 ---
 
-## 七、剩余问题（按优先级）
+## 七、剩余问题
 
-### P0: Prompt Cache 类型安全
+### 已全部修复
 
-`savePromptCache`/`loadPromptCache` 硬编码假设 `StandardKVCache`。
-方案 A (推荐): VTable 添加 `saveState`/`loadState` 方法
-方案 B (临时): 入口断言 `cache.vtable == &StandardKVCache.vtable`
+| 问题 | 修复 commit |
+|------|-----------|
+| P0: Prompt Cache 类型安全 | fad4ecb — VTable getState 方法 |
+| P0: Stream 泄漏 (13 处) | f2ab023 |
+| P1: BatchNorm var_buf | f2ab023 |
+| P1: Gate float32 | 13a6e6b |
+| P1: Attention mask | 13a6e6b |
+| P1: dataSliceMut CoW | 13a6e6b — 安全文档 |
 
-### P1-1: dataSliceMut CoW 风险
+### 架构限制（不在修复范围）
 
-训练场景下梯度可能共享 buffer，`@constCast` 写入会破坏原始权重。
-推理场景风险低（大部分调用在初始化阶段对新创建的数组操作）。
-
-### P1-2: Server batch forward
-
-每个请求独立 forward，未合并为 batch。影响并发吞吐量但不影响正确性。
-
-### P1-3: Gate float32
-
-MoE gate 中 `logits` 提升到 float32 后再做 sqrtsoftplus，对齐 Python。
-
-### P1-4: Attention mask return_array
-
-预填充时使用显式 mask 数组（含 sliding window 限制），对齐 Python `return_array=True`。
+**Server batch forward**: engine loop 是 stub，decode 循环无实际 forward 调用。
+实现真正的 continuous batching 需要：batch tensor 拼接、per-request KV cache 管理、
+输出拆分、流式返回。这是架构级重构，不影响当前 CLI 推理的正确性和性能。
