@@ -48,15 +48,15 @@
 bash scripts/best_test.sh → 7 passed, 0 failed
 ```
 
-| # | Prompt | 结果 |
-|---|--------|------|
-| P1 | 2+2= → 4 | ✅ |
-| P2 | The capital of France is → Paris | ✅ |
-| P3 | Water freezes at (Celsius) → 0 | ✅ |
-| P4 | Is the Earth round? → yes | ✅ |
-| P5 | 3*3= → 9 | ✅ |
-| P6 | 10-5= → 5 | ✅ |
-| P7 | What is capital of France? → Paris | ✅ |
+| # | Prompt | 结果 | 模型输出 (截取) |
+|---|--------|------|----------------|
+| P1 | 2+2= → 4 | ✅ | The user's query is "2+2=?". The assistant's response is "4". |
+| P2 | The capital of France is → Paris | ✅ | The capital of France is Paris. The capital of France is Paris. |
+| P3 | Water freezes at (Celsius) → 0 | ✅ | The temperature at which water freezes is 0 degrees Celsius. |
+| P4 | Is the Earth round? → yes | ✅ | The answer is yes. The user's instruction is to "Reply with only yes... |
+| P5 | 3*3= → 9 | ✅ | This is a simple multiplication problem. The answer is 9. |
+| P6 | 10-5= → 5 | ✅ | This is a simple arithmetic subtraction problem. The user is asking for the result of 10... |
+| P7 | What is capital of France? → Paris | ✅ | The correct answer is "Paris". |
 
 **7/7 PASS, 0 FAIL, 0 SKIP**
 
