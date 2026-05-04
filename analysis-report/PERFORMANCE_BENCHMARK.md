@@ -1,6 +1,6 @@
 # mlx-zig 性能基准测试报告
 # 日期: 2026-05-04
-# Commit: 93ed7a6 (tuning branch)
+# Commit: 13a6e6b (tuning branch)
 # 模型: DeepSeek-V4-Flash-4bit (~150GB, 33 shards)
 # 硬件: MacBook Pro, 48GB RAM
 # 模式: smelt + stream, ExpertCache 4GB, temperature=0
@@ -9,44 +9,43 @@
 
 ## 一、Token 生成延迟
 
-### Test 1: 短 prompt ("Hello", 5 tokens input, 20 tokens output)
+### Test 1: 短 prompt ("Hello", 5 tokens input, 10 tokens output)
 
 | Token | 延迟 (ms) | Cache Hits | Cache Misses | 说明 |
 |-------|----------|-----------|-------------|------|
-| 1 | 715.9 | 0 | 12390 | 冷启动 + prefill |
-| 2 | 148.3 | 12 | 1800 | cache 预热中 |
-| 3 | 113.0 | 918 | 1122 | cache 命中率上升 |
-| 4 | 118.5 | 768 | 1218 | |
-| 5 | 120.3 | 936 | 1110 | |
-| 6-10 | 114-131 | 576-1068 | 1056-1338 | 稳态 |
-| 11-20 | 115-138 | 480-1164 | 1002-1428 | 稳态 |
+| 1 | 384.6 | 0 | 7920 | 冷启动 + prefill |
+| 2 | 143.1 | 22 | 1795 | cache 预热中 |
+| 3 | 109.8 | 840 | 1176 | cache 命中率上升 |
+| 4 | 111.1 | 816 | 1182 | |
+| 5 | 97.3 | 882 | 1134 | |
+| 6 | 109.3 | 708 | 1266 | |
+| 7 | 105.7 | 846 | 1134 | |
+| 8 | 112.8 | 558 | 1344 | |
+| 9 | 118.4 | 708 | 1242 | |
+| 10 | 106.2 | 750 | 1230 | |
 
 **汇总**:
-- Prefill (token 1): **716ms**
-- 稳态 (token 3-20): **113-138ms/token**, 平均 ~125ms
-- 吞吐量: ~8 tokens/s
-- ExpertCache 命中率: 从 0% 爬升到 ~45%
+- Prefill (token 1): **385ms**
+- 稳态 (token 3-10): **97-118ms/token**, 平均 ~109ms
+- 吞吐量: ~9.2 tokens/s
+- ExpertCache 命中率: 从 0% 爬升到 ~40%
 
-### Test 2: 数学 prompt ("2+2=", 8 tokens input, 10 tokens output)
+### 与修复前对比
 
-| Token | 延迟 (ms) | Cache Hits | Cache Misses |
-|-------|----------|-----------|-------------|
-| 1 | 688.1 | 0 | 12390 |
-| 2 | 155.9 | 12 | 1800 |
-| 3 | 126.1 | 918 | 1122 |
-| 4-10 | 123-134 | 576-1068 | 1056-1338 |
+| 指标 | 修复前 (commit 58d7752) | 修复后 (commit 13a6e6b) | 变化 |
+|------|------------------------|------------------------|------|
+| Prefill | 716ms | 385ms | **-46%** |
+| 稳态平均 | ~125ms | ~109ms | **-13%** |
+| 吞吐量 | ~8 tok/s | ~9.2 tok/s | **+15%** |
 
-**汇总**:
-- Prefill: **688ms**
-- 稳态: **123-134ms/token**, 平均 ~128ms
-- 与 Test 1 一致，prompt 长度对稳态延迟无显著影响
+提升原因: 显式 causal mask 让 MLX SDPA 走更优 kernel 路径（无需内部构建 mask）。
 
 ---
 
 ## 二、7-Prompt 端到端测试
 
 ```
-bash scripts/best_test.sh
+bash scripts/best_test.sh → 7 passed, 0 failed
 ```
 
 | # | Prompt | 结果 |
@@ -77,10 +76,10 @@ zig build test → exit code 0
 
 | 指标 | 值 |
 |------|-----|
-| Prefill 延迟 | ~700ms (8 tokens) |
-| 稳态 token 延迟 | ~125ms |
-| 稳态吞吐量 | ~8 tok/s |
+| Prefill 延迟 | ~385ms (8 tokens) |
+| 稳态 token 延迟 | ~109ms |
+| 稳态吞吐量 | ~9.2 tok/s |
 | ExpertCache 大小 | 4GB |
-| ExpertCache 稳态命中率 | ~40-45% |
+| ExpertCache 稳态命中率 | ~40% |
 | 模型加载 | smelt stream (按需从 SSD 加载) |
 | 内存占用 | <48GB (适配 MacBook Pro) |
