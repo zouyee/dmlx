@@ -149,6 +149,12 @@ pub const Array = struct {
     }
 
     /// Get mutable typed slice. Array must be evaluated.
+    ///
+    /// SAFETY: This bypasses MLX's copy-on-write semantics via @constCast.
+    /// Only safe when the array has a unique reference (ref_count == 1),
+    /// e.g. immediately after creation via zeros/ones/fromData.
+    /// Using this on shared arrays (slices, reshapes, broadcasts) will
+    /// silently corrupt the shared buffer. Prefer MLX ops for mutations.
     pub fn dataSliceMut(self: Array, comptime T: type) ![]T {
         const ptr = try self.dataPtr(T);
         return @constCast(ptr)[0..self.size()];

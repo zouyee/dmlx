@@ -31,6 +31,7 @@ pub const PromptCacheError = error{
     MissingMetadata,
     InvalidMetadata,
     MissingCacheData,
+    UnsupportedCacheType,
 };
 
 /// Save KV cache state to a safetensors file.
@@ -69,9 +70,12 @@ pub fn savePromptCache(
     var cache_dtype: Dtype = .float32;
 
     for (caches, 0..) |cache, i| {
-        // Get the current cached state by doing a zero-length update
-        // We access the underlying StandardKVCache to read keys/values directly
         // SAFETY: prompt cache only supports StandardKVCache.
+        // Reject other cache types at runtime to prevent undefined behavior.
+        if (cache.vtable != &StandardKVCache.vtable) {
+            std.log.err("savePromptCache: layer {d} uses unsupported cache type (not StandardKVCache)", .{i});
+            return error.UnsupportedCacheType;
+        }
         const std_cache: *StandardKVCache = @ptrCast(@alignCast(cache.ptr));
 
         const current_len = std_cache.offset;

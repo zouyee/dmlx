@@ -544,29 +544,21 @@ pub const DSV4Gate = struct {
         const logits = try ops.matmul(self.ctx, flat, weight_t);
         defer logits.deinit();
 
+        // Promote to float32 for numerical stability (matching Python: logits.astype(mx.float32))
+        const logits_f32 = try ops.astype(self.ctx, logits, .float32);
+        defer logits_f32.deinit();
+
         // Apply scoring function
         var scores: Array = undefined;
         switch (self.scoring_func) {
             .softmax => {
-                scores = try ops.softmax(self.ctx, logits, &[_]i32{-1});
+                scores = try ops.softmax(self.ctx, logits_f32, &[_]i32{-1});
             },
             .sigmoid => {
-                // sigmoid(x) = 1 / (1 + exp(-x))
-                const neg = try ops.negative(self.ctx, logits);
-                defer neg.deinit();
-                const exp_neg = try ops.exp(self.ctx, neg);
-                defer exp_neg.deinit();
-                const one = try ops.scalarF32(self.ctx, 1.0);
-                defer one.deinit();
-                const denom = try ops.add(self.ctx, one, exp_neg);
-                defer denom.deinit();
-                scores = try ops.divide(self.ctx, one, denom);
+                scores = try ops.sigmoid(self.ctx, logits_f32);
             },
             .sqrtsoftplus => {
-                // softplus(x) = log(1 + exp(x))
-                // For numerical stability: softplus(x) = max(0, x) + log(1 + exp(-|x|))
-                // Simplified: log(1 + exp(x))
-                const exp_logits = try ops.exp(self.ctx, logits);
+                const exp_logits = try ops.exp(self.ctx, logits_f32);
                 defer exp_logits.deinit();
                 const one = try ops.scalarF32(self.ctx, 1.0);
                 defer one.deinit();
@@ -1714,14 +1706,15 @@ pub const DSV4Attention = struct {
                 defer pooled_4d.deinit();
                 const combined = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ full_kv, pooled_4d }, 2);
                 defer combined.deinit();
-                const mm: []const u8 = if (start_pos == 0 and seq_len > 1) "causal" else "";
+                // When explicit mask is provided, don't use "causal" string (they conflict in MLX)
+                const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
                 attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, combined, combined, scale, mm, mask, self.sink_logits);
             } else {
-                const mm: []const u8 = if (start_pos == 0 and seq_len > 1) "causal" else "";
+                const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
                 attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, full_kv, full_kv, scale, mm, mask, self.sink_logits);
             }
         } else {
-            const mm: []const u8 = if (start_pos == 0 and seq_len > 1) "causal" else "";
+            const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
             attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, full_kv, full_kv, scale, mm, mask, self.sink_logits);
         }
         defer attn_out.deinit();
@@ -2820,7 +2813,31 @@ pub const DSV4Model = struct {
             defer arena.deinit();
 
             const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
-            const logits = try self.forward(prompt_arr, null, caches, start_pos, stream);
+
+            // Create explicit causal mask with sliding window for prefill
+            // Matches Python: create_attention_mask(return_array=True, window_size=sliding_window)
+            const prefill_mask = if (prompt_tokens.len > 1) blk: {
+                const sl = prompt_tokens.len;
+                const ws = self.config.sliding_window;
+                var mask_data = try allocator.alloc(f32, sl * sl);
+                defer allocator.free(mask_data);
+                @memset(mask_data, 0);
+                const neg_inf = -std.math.inf(f32);
+                for (0..sl) |i| {
+                    for (0..sl) |j| {
+                        const causal = j > i;
+                        const outside_window = ws > 0 and i >= ws and j < i + 1 - ws;
+                        if (causal or outside_window) {
+                            mask_data[i * sl + j] = neg_inf;
+                        }
+                    }
+                }
+                const mask_arr = try Array.fromData(allocator, f32, mask_data, &[_]i32{ 1, 1, @intCast(sl), @intCast(sl) });
+                break :blk mask_arr;
+            } else null;
+            defer if (prefill_mask) |m| m.deinit();
+
+            const logits = try self.forward(prompt_arr, prefill_mask, caches, start_pos, stream);
 
             // Get last token logits
             const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
