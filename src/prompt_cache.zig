@@ -31,7 +31,6 @@ pub const PromptCacheError = error{
     MissingMetadata,
     InvalidMetadata,
     MissingCacheData,
-    UnsupportedCacheType,
 };
 
 /// Save KV cache state to a safetensors file.
@@ -70,22 +69,20 @@ pub fn savePromptCache(
     var cache_dtype: Dtype = .float32;
 
     for (caches, 0..) |cache, i| {
-        // SAFETY: prompt cache only supports StandardKVCache.
-        // Reject other cache types at runtime to prevent undefined behavior.
-        if (cache.vtable != &StandardKVCache.vtable) {
-            std.log.err("savePromptCache: layer {d} uses unsupported cache type (not StandardKVCache)", .{i});
-            return error.UnsupportedCacheType;
-        }
-        const std_cache: *StandardKVCache = @ptrCast(@alignCast(cache.ptr));
+        // Use VTable getState to safely access cache internals
+        const state = cache.getState() orelse {
+            std.log.warn("savePromptCache: layer {d} cache type does not support getState, skipping", .{i});
+            continue;
+        };
 
-        const current_len = std_cache.offset;
+        const current_len = state.offset;
         if (current_len == 0) continue;
 
         // Slice the valid portion of keys and values
         const stream = c.c.mlx_default_cpu_stream_new();
         defer _ = c.c.mlx_stream_free(stream);
-        const keys = try sliceCache(std_cache.keys, current_len, stream);
-        const values = try sliceCache(std_cache.values, current_len, stream);
+        const keys = try sliceCache(state.keys, current_len, stream);
+        const values = try sliceCache(state.values, current_len, stream);
 
         // Store shape info from first non-empty layer
         if (seq_len == 0) {

@@ -40,6 +40,7 @@ pub const StandardKVCache = struct {
         .reset = resetImpl,
         .filter = filterImpl,
         .rollback = rollbackImpl,
+        .getState = getStateImpl,
         .deinit = deinitImpl,
     };
 
@@ -197,6 +198,11 @@ pub const StandardKVCache = struct {
         self.keys = Array.fromHandle(new_keys);
         self.values = Array.fromHandle(new_values);
         self.batch_size = indices.len;
+    }
+
+    fn getStateImpl(ctx: *anyopaque) ?iface.CacheState {
+        const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
+        return .{ .keys = self.keys, .values = self.values, .offset = self.offset };
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {
