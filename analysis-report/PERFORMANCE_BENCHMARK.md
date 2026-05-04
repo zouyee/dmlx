@@ -88,12 +88,13 @@ zig build test → exit code 0
 
 ## 四、关键性能指标
 
-| 指标 | 值 |
-|------|-----|
-| Prefill 延迟 | ~170ms (8 tokens) |
-| 稳态 token 延迟 | ~41ms |
-| 稳态吞吐量 | ~23 tok/s |
-| ExpertCache 大小 | 4GB |
-| ExpertCache 稳态命中率 | ~40% |
-| 模型加载 | smelt stream (按需从 SSD 加载) |
-| 内存占用 | <48GB (适配 MacBook Pro) |
+| 指标 | 修复前 (a024bee) | 修复后 (14da587) | 变化 |
+|------|-----------------|-----------------|------|
+| Prefill 延迟 | ~716ms | ~170ms | **-76%** |
+| 稳态 token 延迟 | ~125ms | ~41ms | **-67%** |
+| 稳态吞吐量 | ~8 tok/s | ~23 tok/s | **+188%** |
+| 7-Prompt 通过率 | 1/7 | 7/7 | **+600%** |
+| ExpertCache 大小 | 4GB | 4GB | — |
+| ExpertCache 稳态命中率 | ~40% | ~40% | — |
+| 模型加载 | smelt stream | smelt stream | — |
+| 内存占用 | <48GB | <48GB | — |
