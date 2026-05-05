@@ -5,10 +5,6 @@ const array_mod = @import("../array.zig");
 
 const Array = array_mod.Array;
 
-inline fn defaultStream() c.c.mlx_stream {
-    return c.c.mlx_default_cpu_stream_new();
-}
-
 pub const SafetensorsResult = struct {
     weights: std.StringHashMap(Array),
     metadata: std.StringHashMap([]const u8),
@@ -39,7 +35,12 @@ pub fn loadSafetensors(allocator: std.mem.Allocator, path: []const u8) !Safetens
     var metadata_map = c.c.mlx_map_string_to_string_new();
     defer _ = c.c.mlx_map_string_to_string_free(metadata_map);
 
-    try c.check(c.c.mlx_load_safetensors(&weights_map, &metadata_map, file_z.ptr, defaultStream()));
+    const stream = c.c.mlx_default_cpu_stream_new();
+    // NOTE: stream is intentionally NOT freed here. MLX load operations are lazy —
+    // the returned arrays reference this stream for deferred evaluation. Freeing
+    // the stream before eval would cause data load failures. The stream will be
+    // freed when the process exits or when MLX's internal refcount drops to zero.
+    try c.check(c.c.mlx_load_safetensors(&weights_map, &metadata_map, file_z.ptr, stream));
 
     var weights = std.StringHashMap(Array).init(allocator);
     var metadata = std.StringHashMap([]const u8).init(allocator);
@@ -113,7 +114,9 @@ pub fn load(allocator: std.mem.Allocator, path: []const u8) !Array {
     const file_z = try allocator.dupeZ(u8, path);
     defer allocator.free(file_z);
     var res = c.c.mlx_array_new();
-    try c.check(c.c.mlx_load(&res, file_z.ptr, defaultStream()));
+    const stream = c.c.mlx_default_cpu_stream_new();
+    // NOTE: stream intentionally not freed — MLX load is lazy, array references stream.
+    try c.check(c.c.mlx_load(&res, file_z.ptr, stream));
     return Array.fromHandle(res);
 }
 

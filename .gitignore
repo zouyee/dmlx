@@ -41,3 +41,21 @@ out.txt
 .sisyphus/
 *.bak
 test_random
+
+# Benchmark worktree (local only)
+.benchmark-worktree/
+
+# Compiled test/debug binaries
+check_types
+main
+test_arr
+test_fs
+test_fs2
+test_mlx_c
+test_try
+test_remap_standalone
+test_mlx_take_zero
+
+# Python cache
+__pycache__/
+*.pyc

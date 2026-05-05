@@ -155,7 +155,9 @@ test "LlavaModel init and deinit" {
     try weights.put(try allocator.dupe(u8, "layers.0.mlp.up_proj"), try array_mod.zeros(allocator, &[_]i32{ 256, 128 }, .float32));
     try weights.put(try allocator.dupe(u8, "layers.0.mlp.down_proj"), try array_mod.zeros(allocator, &[_]i32{ 128, 256 }, .float32));
 
-    const lm_model = try @import("../models/llama_loader.zig").buildModel(allocator, &config, &weights, ctx, c.c.mlx_default_cpu_stream_new(), null);
+    const lm_stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(lm_stream);
+    const lm_model = try @import("../models/llama_loader.zig").buildModel(allocator, &config, &weights, ctx, lm_stream, null);
 
     var model = LlavaModel{
         .allocator = allocator,
