@@ -45,6 +45,9 @@ run_test() {
     echo "   Max tokens: ${max_tokens}"
     echo "   Expected: contains '${expected}'"
 
+    local start_time end_time elapsed
+    start_time=$(python3 -c "import time; print(time.time())")
+
     local output
     output=$("${CLI}" chat \
         --model "${MODEL_PATH}" \
@@ -52,20 +55,25 @@ run_test() {
         --max-tokens "${max_tokens}" \
         --temperature 0 \
         "${SMELT_FLAGS[@]}" 2>&1) || {
-        echo -e "${RED}   ❌ CRASHED${NC}"
+        end_time=$(python3 -c "import time; print(time.time())")
+        elapsed=$(python3 -c "print(f'{${end_time} - ${start_time}:.1f}')")
+        echo -e "${RED}   ❌ CRASHED (${elapsed}s)${NC}"
         FAILED=$((FAILED + 1))
         return
     }
+
+    end_time=$(python3 -c "import time; print(time.time())")
+    elapsed=$(python3 -c "print(f'{${end_time} - ${start_time}:.1f}')")
 
     local generated
     generated=$(echo "${output}" | grep -v '^info:' | grep -v '^debug:' | grep -v '^Starting generation' | grep -v '^Layer ' | tail -1 | tr -d '\r')
 
     if echo "${generated}" | grep -qi "${expected}"; then
-        echo -e "${GREEN}   ✅ PASSED${NC}"
+        echo -e "${GREEN}   ✅ PASSED (${elapsed}s)${NC}"
         echo "   Generated: ${generated:0:120}"
         PASSED=$((PASSED + 1))
     else
-        echo -e "${RED}   ❌ FAILED${NC}"
+        echo -e "${RED}   ❌ FAILED (${elapsed}s)${NC}"
         echo "   Generated: ${generated:0:120}"
         FAILED=$((FAILED + 1))
     fi

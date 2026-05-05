@@ -30,8 +30,11 @@ machine learning framework, built on top of the official `mlx-c` C library.
   and guided decoding (JSON schema / regex).
   
   > **Note:** DeepSeek V4 chat template was fixed in commit `a18bc24` to use correct ASCII
-  > special tokens. If you experience garbled output, see [`docs/QUICKFIX-DEEPSEEK-V4.md`](docs/QUICKFIX-DEEPSEEK-V4.md)
-  > for verification steps.
+  > special tokens. If you experience garbled output, see [Quick Fix Guide](docs/en/user-guide/deepseek-v4-quickfix.md)
+  > for verification steps. [中文版](docs/zh/user-guide/deepseek-v4-quickfix.md)
+  > 
+  > **DeepSeek MoE Deep Dive**: How mlx-zig runs a 671B model on a 48GB Mac —
+  > [Technical Architecture](docs/en/deepseek-moe/README.md) | [技术架构](docs/zh/deepseek-moe/README.md)
 
 - **KV cache**: 6 strategies (Standard, Rotating, Quantized 4/8-bit, Paged with CoW,
   Paged+Quantized, Tiered RAM+SSD) with prefix caching and on-disk shared-prefix reuse.
@@ -217,13 +220,25 @@ const weight = st.weights.get("layer1.weight").?;
 try mlx.io.saveSafetensors(allocator, "out.safetensors", weights, metadata);
 ```
 
+## Documentation
+
+Comprehensive documentation is available in [docs/](docs/index.md) (bilingual EN/ZH):
+
+| Section | Description |
+|---------|-------------|
+| [User Guide](docs/en/user-guide/) | Quick fixes and troubleshooting |
+| [Developer Guide](CONTRIBUTING.md) | Contributing and architecture |
+| [DeepSeek V4](docs/en/deepseek-v4/) | Technical deep dives and fixes |
+| [Technical Docs](docs/en/technical/) | Benchmarks, TTFT, SMELT, roadmap |
+| [Analysis Reports](docs/en/analysis/) | Comprehensive project analysis |
+
+→ [Documentation Index (中英双语)](docs/index.md)
+
 ## Platform Support
 
 | Platform | Status | Backend |
 |----------|--------|---------|
 | macOS Apple Silicon | ✅ Primary | Metal + CPU (Accelerate) |
-| macOS Intel | ⚠️ Experimental | CPU only |
-| Linux | ⚠️ Experimental | CPU + CUDA (if available) |
 
 ## Contributing
 

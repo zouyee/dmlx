@@ -18,11 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   official DeepSeek V4 format specification.
 
 ### Added
-- Comprehensive troubleshooting guide for DeepSeek V4 (`docs/deepseek-v4-troubleshooting.md`)
+- Comprehensive troubleshooting guide for DeepSeek V4 (`docs/en/deepseek-v4/troubleshooting.md`)
 - Chat template unit tests to validate special token formatting
 - Automatic prompt validation with detailed error messages for debugging
 
-## [0.3.0] - 2026-04-21
+## [0.0.3] - 2026-04-21
 
 ### Breaking
 - Architecture rebuilt from a pure-Zig MLX rewrite (~30K lines) to Zig-native
@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed `nn.zig` LSTM/GRU scope bugs caused by Zig 0.16 shadowing rules
 - Fixed segfault from uninitialized `mlx_device` before `mlx_get_default_stream`
 
-## [0.2.0] - 2026-04-17
+## [0.0.2] - 2026-04-17
 
 ### Added
 - 100% MLX C++ core API parity (all operations migrated)
@@ -72,7 +72,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PCG random number generator invalid bit shift (>> 75 on u64)
 - `randpermutation` comptime array size issue
 
-## [0.1.0] - 2025-01-01
+## [0.0.1] - 2025-01-01
 
 ### Added
 - Phase 1: Core data structures (Array, Dtype, Device, Stream)
