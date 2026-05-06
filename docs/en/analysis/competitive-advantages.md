@@ -20,7 +20,7 @@ horses Adhtml Is
 - ✅ `quantizedMatmul` fused kernel used for all linear layers
 - ✅ 430+ unit tests all passing
 
-### DeepSeek V4 (671B MoE on M4 Pro 48GB)
+### DeepSeek V4 (284B MoE on M4 Pro 48GB)
 
 ```bash
 $ bash scripts/run_benchmark.sh  # smelt + stream mode, ExpertCache 4GB, temperature=0
@@ -58,7 +58,7 @@ memory budget, leak's relative impact below OOM threshold). Fix in progress.
 
 ## I. The Small-Mac Advantage (Killer Feature)
 
-On **48GB Apple Silicon Macs**, dmlx is the only platform that can run DeepSeek V4 (671B MoE).
+On **48GB Apple Silicon Macs**, dmlx is the only platform that can run DeepSeek V4 (284B MoE).
 This is not a speed advantage — it's an **"it runs at all"** advantage.
 
 | Scenario | dmlx | mlx-lm | llama.cpp | LM Studio |

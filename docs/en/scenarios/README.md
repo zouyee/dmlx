@@ -1,6 +1,6 @@
 # Application Scenarios — DeepSeek V4 on Small Macs
 
-> **Core Value**: Run a 671B-parameter MoE model on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.
+> **Core Value**: Run a 284B-parameter MoE model on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.
 
 ---
 

@@ -20,7 +20,7 @@ horses Adhtml Is
 - ✅ `quantizedMatmul` 融合 kernel 用于所有线性层
 - ✅ 430+ 单元测试全部通过
 
-### DeepSeek V4 (671B MoE, M4 Pro 48GB)
+### DeepSeek V4 (284B MoE, M4 Pro 48GB)
 
 ```bash
 $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, temperature=0
@@ -57,7 +57,7 @@ $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, tempe
 
 ## 一、小规格 Mac 优势（杀手级特性）
 
-在 **48GB Apple Silicon Mac** 上，dmlx 是唯一能运行 DeepSeek V4 (671B MoE) 的平台。
+在 **48GB Apple Silicon Mac** 上，dmlx 是唯一能运行 DeepSeek V4 (284B MoE) 的平台。
 这不是速度优势 — 这是 **「能跑 vs 不能跑」的质变**。
 
 | 场景 | dmlx | mlx-lm | llama.cpp | LM Studio |

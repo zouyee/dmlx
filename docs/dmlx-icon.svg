@@ -1,0 +1,113 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Background gradient: deep space dark -->
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1117"/>
+      <stop offset="100%" style="stop-color:#161b22"/>
+    </linearGradient>
+    <!-- Purple accent gradient (Zig/performance) -->
+    <linearGradient id="purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#a78bfa"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+    <!-- Green accent gradient (Apple/Metal) -->
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4ade80"/>
+      <stop offset="100%" style="stop-color:#16a34a"/>
+    </linearGradient>
+    <!-- Glow effect -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-strong">
+      <feGaussianBlur stdDeviation="8" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="256" fill="url(#bg)"/>
+  
+  <!-- Outer ring: represents the 256 experts (subtle dots around the edge) -->
+  <g opacity="0.3">
+    <!-- 24 dots representing MoE experts around the perimeter -->
+    <circle cx="256" cy="52" r="3" fill="#a78bfa"/>
+    <circle cx="309" cy="57" r="3" fill="#a78bfa"/>
+    <circle cx="357" cy="75" r="3" fill="#a78bfa"/>
+    <circle cx="397" cy="105" r="3" fill="#a78bfa"/>
+    <circle cx="427" cy="145" r="3" fill="#a78bfa"/>
+    <circle cx="445" cy="193" r="3" fill="#a78bfa"/>
+    <circle cx="450" cy="246" r="3" fill="#a78bfa"/>
+    <circle cx="442" cy="299" r="3" fill="#a78bfa"/>
+    <circle cx="422" cy="347" r="3" fill="#a78bfa"/>
+    <circle cx="392" cy="387" r="3" fill="#a78bfa"/>
+    <circle cx="354" cy="417" r="3" fill="#a78bfa"/>
+    <circle cx="309" cy="435" r="3" fill="#a78bfa"/>
+    <circle cx="256" cy="440" r="3" fill="#a78bfa"/>
+    <circle cx="203" cy="435" r="3" fill="#a78bfa"/>
+    <circle cx="158" cy="417" r="3" fill="#a78bfa"/>
+    <circle cx="120" cy="387" r="3" fill="#a78bfa"/>
+    <circle cx="90" cy="347" r="3" fill="#a78bfa"/>
+    <circle cx="70" cy="299" r="3" fill="#a78bfa"/>
+    <circle cx="62" cy="246" r="3" fill="#a78bfa"/>
+    <circle cx="67" cy="193" r="3" fill="#a78bfa"/>
+    <circle cx="85" cy="145" r="3" fill="#a78bfa"/>
+    <circle cx="115" cy="105" r="3" fill="#a78bfa"/>
+    <circle cx="155" cy="75" r="3" fill="#a78bfa"/>
+    <circle cx="203" cy="57" r="3" fill="#a78bfa"/>
+  </g>
+
+  <!-- 6 active expert connections (bright lines from center to edge) -->
+  <g filter="url(#glow)" opacity="0.6">
+    <line x1="256" y1="256" x2="256" y2="52" stroke="#4ade80" stroke-width="1.5"/>
+    <line x1="256" y1="256" x2="397" y2="105" stroke="#4ade80" stroke-width="1.5"/>
+    <line x1="256" y1="256" x2="450" y2="246" stroke="#4ade80" stroke-width="1.5"/>
+    <line x1="256" y1="256" x2="354" y2="417" stroke="#4ade80" stroke-width="1.5"/>
+    <line x1="256" y1="256" x2="158" y2="417" stroke="#4ade80" stroke-width="1.5"/>
+    <line x1="256" y1="256" x2="67" y2="193" stroke="#4ade80" stroke-width="1.5"/>
+  </g>
+
+  <!-- 6 active expert dots (highlighted) -->
+  <g filter="url(#glow)">
+    <circle cx="256" cy="52" r="6" fill="#4ade80"/>
+    <circle cx="397" cy="105" r="6" fill="#4ade80"/>
+    <circle cx="450" cy="246" r="6" fill="#4ade80"/>
+    <circle cx="354" cy="417" r="6" fill="#4ade80"/>
+    <circle cx="158" cy="417" r="6" fill="#4ade80"/>
+    <circle cx="67" cy="193" r="6" fill="#4ade80"/>
+  </g>
+
+  <!-- Central hexagonal chip shape (represents Apple Silicon) -->
+  <g filter="url(#glow-strong)">
+    <polygon points="256,160 320,192 320,288 256,320 192,288 192,192" 
+             fill="none" stroke="url(#purple)" stroke-width="3" opacity="0.8"/>
+  </g>
+
+  <!-- Inner diamond: the "d" letterform abstracted as a lightning bolt / data flow -->
+  <g filter="url(#glow)">
+    <!-- Lightning bolt "d" shape -->
+    <path d="M 240 185 L 260 185 L 248 235 L 272 235 L 244 300 L 252 255 L 232 255 Z" 
+          fill="url(#green)" opacity="0.95"/>
+  </g>
+
+  <!-- "dmlx" text below the icon -->
+  <text x="256" y="385" text-anchor="middle" 
+        font-family="SF Pro Display, -apple-system, sans-serif" 
+        font-size="52" font-weight="700" fill="#ffffff" letter-spacing="-1">
+    dmlx
+  </text>
+  
+  <!-- Subtle tagline -->
+  <text x="256" y="415" text-anchor="middle" 
+        font-family="SF Pro Display, -apple-system, sans-serif" 
+        font-size="14" fill="#8b949e" letter-spacing="2">
+    APPLE SILICON · ZIG · MLX
+  </text>
+</svg>

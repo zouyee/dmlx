@@ -1,0 +1,95 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#0d1117"/>
+      <stop offset="100%" style="stop-color:#161b22"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#a78bfa"/>
+      <stop offset="100%" style="stop-color:#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#4ade80"/>
+      <stop offset="100%" style="stop-color:#16a34a"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="4" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <filter id="glow-strong">
+      <feGaussianBlur stdDeviation="6" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background rounded square -->
+  <rect x="0" y="0" width="512" height="512" rx="96" fill="url(#bg)"/>
+  
+  <!-- Outer ring of expert dots (256 experts, showing ~24 representative) -->
+  <g opacity="0.25">
+    <circle cx="256" cy="48" r="4" fill="#a78bfa"/>
+    <circle cx="316" cy="55" r="4" fill="#a78bfa"/>
+    <circle cx="370" cy="76" r="4" fill="#a78bfa"/>
+    <circle cx="414" cy="110" r="4" fill="#a78bfa"/>
+    <circle cx="445" cy="155" r="4" fill="#a78bfa"/>
+    <circle cx="461" cy="208" r="4" fill="#a78bfa"/>
+    <circle cx="462" cy="264" r="4" fill="#a78bfa"/>
+    <circle cx="448" cy="318" r="4" fill="#a78bfa"/>
+    <circle cx="420" cy="365" r="4" fill="#a78bfa"/>
+    <circle cx="381" cy="402" r="4" fill="#a78bfa"/>
+    <circle cx="333" cy="427" r="4" fill="#a78bfa"/>
+    <circle cx="280" cy="438" r="4" fill="#a78bfa"/>
+    <circle cx="226" cy="436" r="4" fill="#a78bfa"/>
+    <circle cx="176" cy="420" r="4" fill="#a78bfa"/>
+    <circle cx="133" cy="393" r="4" fill="#a78bfa"/>
+    <circle cx="100" cy="355" r="4" fill="#a78bfa"/>
+    <circle cx="78" cy="308" r="4" fill="#a78bfa"/>
+    <circle cx="68" cy="256" r="4" fill="#a78bfa"/>
+    <circle cx="72" cy="202" r="4" fill="#a78bfa"/>
+    <circle cx="90" cy="152" r="4" fill="#a78bfa"/>
+    <circle cx="120" cy="108" r="4" fill="#a78bfa"/>
+    <circle cx="160" cy="74" r="4" fill="#a78bfa"/>
+    <circle cx="206" cy="53" r="4" fill="#a78bfa"/>
+  </g>
+
+  <!-- 6 active expert rays (top-6 routing) -->
+  <g filter="url(#glow)" opacity="0.5">
+    <line x1="256" y1="256" x2="256" y2="48" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+    <line x1="256" y1="256" x2="414" y2="110" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+    <line x1="256" y1="256" x2="462" y2="264" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+    <line x1="256" y1="256" x2="333" y2="427" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+    <line x1="256" y1="256" x2="133" y2="393" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+    <line x1="256" y1="256" x2="72" y2="202" stroke="#4ade80" stroke-width="2" stroke-linecap="round"/>
+  </g>
+
+  <!-- Active expert endpoints -->
+  <g filter="url(#glow)">
+    <circle cx="256" cy="48" r="8" fill="#4ade80"/>
+    <circle cx="414" cy="110" r="8" fill="#4ade80"/>
+    <circle cx="462" cy="264" r="8" fill="#4ade80"/>
+    <circle cx="333" cy="427" r="8" fill="#4ade80"/>
+    <circle cx="133" cy="393" r="8" fill="#4ade80"/>
+    <circle cx="72" cy="202" r="8" fill="#4ade80"/>
+  </g>
+
+  <!-- Central hexagon (Apple Silicon chip) -->
+  <g filter="url(#glow-strong)">
+    <polygon points="256,148 336,188 336,324 256,364 176,324 176,188" 
+             fill="rgba(139,92,246,0.08)" stroke="url(#purple)" stroke-width="3.5"/>
+  </g>
+
+  <!-- Lightning bolt "d" — the core symbol -->
+  <g filter="url(#glow-strong)">
+    <path d="M 236 175 L 272 175 L 252 245 L 285 245 L 235 340 L 248 265 L 220 265 Z" 
+          fill="url(#green)"/>
+  </g>
+
+  <!-- Central core dot -->
+  <circle cx="256" cy="256" r="5" fill="#ffffff" opacity="0.9"/>
+</svg>
