@@ -1,4 +1,4 @@
-# MLX-Zig 源码深入验证报告
+# dmlx 源码深入验证报告
 
 > 验证方法：逐行审计关键文件，静态分析 + 运行时交叉验证
 > 初始日期：2026-05-03 | 修订日期：2026-05-03
@@ -44,7 +44,7 @@ const std_cache: *StandardKVCache = @ptrCast(@alignCast(cache.ptr));
 ### 1.3 触发条件
 
 ```bash
-mlx-zig serve --model <path> --kv-strategy paged --prompt-cache-file /tmp/cache.bin
+dmlx serve --model <path> --kv-strategy paged --prompt-cache-file /tmp/cache.bin
 ```
 
 **结论**: P0 评级正确。**未修复**。

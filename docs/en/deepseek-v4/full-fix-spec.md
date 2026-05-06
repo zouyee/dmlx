@@ -1,4 +1,4 @@
-# mlx-zig DeepSeek V4 Flash — 全面修复规格文档
+# dmlx DeepSeek V4 Flash — 全面修复规格文档
 # 日期: 2026-05-03
 # 目标: 7 Prompt 测试全部通过（无 SKIP），单元测试全部通过
 

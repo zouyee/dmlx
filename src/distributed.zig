@@ -32,7 +32,7 @@
 ///
 /// - mlx-c with distributed support compiled in (requires MPI backend)
 /// - Multiple Macs on the same network
-/// - Launch via `mpirun -np <N> mlx-zig serve --model <path>`
+/// - Launch via `mpirun -np <N> dmlx serve --model <path>`
 ///
 /// ## Tensor Parallelism Strategy
 ///

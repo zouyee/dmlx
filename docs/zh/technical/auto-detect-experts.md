@@ -12,12 +12,12 @@
 
 ```bash
 # ❌ 不使用 --smelt 会失败
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 error: MissingWeight
 src/models/deepseek_v4_loader.zig:1615:69: gate_list[e] = weights.get(ew1_name) orelse return LoadError.MissingWeight;
 
 # ✅ 必须手动指定 --smelt
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
 Success!
 ```
 
@@ -25,13 +25,13 @@ Success!
 
 ```bash
 # ✅ 自动检测部分专家，无需 --smelt
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 ⚠️  Layer 0: Partial expert model detected: 38/256 experts available
 Auto-enabling smelt mode for this layer.
 Success!
 
 # ✅ 显式指定 --smelt 仍然有效（用于控制加载比例）
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --smelt-experts 0.15 --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --smelt-experts 0.15 --prompt "Hello"
 Success!
 ```
 
@@ -89,7 +89,7 @@ if (smelt.enabled) {
 
 ```bash
 # 模型文件只包含 38/256 个专家
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 
 # 输出：
 ⚠️  Layer 0: Partial expert model detected: 38/256 experts available
@@ -105,7 +105,7 @@ Generated: Hello! How can I assist you today?
 
 ```bash
 # 模型文件包含所有 256 个专家
-$ mlx-zig chat --model ~/models/deepseek-v4-fp16 --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-fp16 --prompt "Hello"
 
 # 输出：
 ✅ Prompt correctly formatted with BOS token 100000
@@ -116,7 +116,7 @@ Generated: Hello! How can I assist you today?
 
 ```bash
 # 即使模型包含所有专家，也只加载 15%
-$ mlx-zig chat --model ~/models/deepseek-v4-fp16 \
+$ dmlx chat --model ~/models/deepseek-v4-fp16 \
   --smelt --smelt-experts 0.15 \
   --prompt "Hello"
 
@@ -214,10 +214,10 @@ if (n_available < n_routed_experts and n_available > 0) {
 
 ```bash
 # 之前：必须记住使用 --smelt
-mlx-zig chat --model <4bit-model> --smelt --prompt "Hello"
+dmlx chat --model <4bit-model> --smelt --prompt "Hello"
 
 # 现在：直接使用，自动检测
-mlx-zig chat --model <4bit-model> --prompt "Hello"
+dmlx chat --model <4bit-model> --prompt "Hello"
 ```
 
 **设计哲学**：

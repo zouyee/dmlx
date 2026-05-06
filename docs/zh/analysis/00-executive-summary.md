@@ -10,7 +10,7 @@
 
 ## 项目定位
 
-MLX-Zig 是基于 Apple MLX C 绑定（`mlx-c`）的全栈 LLM 推理与训练系统，以 Zig 语言编写，目标平台为 macOS Apple Silicon。项目经历了从原型到生产级的显著跃迁，当前具备与 Python vLLM/mlx-lm 对标的功能深度。
+dmlx 是基于 Apple MLX C 绑定（`mlx-c`）的全栈 LLM 推理与训练系统，以 Zig 语言编写，目标平台为 macOS Apple Silicon。项目经历了从原型到生产级的显著跃迁，当前具备与 Python vLLM/mlx-lm 对标的功能深度。
 
 ## 核心结论
 

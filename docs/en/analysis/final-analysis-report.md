@@ -1,4 +1,4 @@
-# MLX-Zig Deep Technical Analysis Final Report
+# dmlx Deep Technical Analysis Final Report
 
 > **Version**: Based on codebase HEAD (v0.3.0-mlx-c)
 > **Analysis Rounds**: Three progressive rounds of deep analysis
@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-MLX-Zig is a full-stack LLM inference and training system built on Apple MLX C bindings (`mlx-c`), written in Zig, targeting macOS Apple Silicon. The project has made a significant leap from prototype to production-grade, currently matching the functional depth of Python vLLM/mlx-lm, including complete DeepSeek V4 support, six-tier KV Cache strategies, dual-track speculative decoding, guided decoding FSM, tiered caching (RAM+SSD), and multi-Mac distributed inference.
+dmlx is a full-stack LLM inference and training system built on Apple MLX C bindings (`mlx-c`), written in Zig, targeting macOS Apple Silicon. The project has made a significant leap from prototype to production-grade, currently matching the functional depth of Python vLLM/mlx-lm, including complete DeepSeek V4 support, six-tier KV Cache strategies, dual-track speculative decoding, guided decoding FSM, tiered caching (RAM+SSD), and multi-Mac distributed inference.
 
 **Core Conclusions**:
 
@@ -63,7 +63,7 @@ MLX-Zig is a full-stack LLM inference and training system built on Apple MLX C b
 
 ### 1.3 Architecture Overview
 
-MLX-Zig adopts a six-layer architecture (from `.kiro/specs/production-deployment/design.md`):
+dmlx adopts a six-layer architecture (from `.kiro/specs/production-deployment/design.md`):
 
 1. **Foundation Layer**: `c.zig` (C bindings), `array.zig` (type wrappers), `ops.zig` + `ops/` (200+ operators), `fast.zig` (fused kernels)
 2. **Inference Engine**: `generation.zig` (three-layer generation API), `model_registry.zig` (9 architecture registry), `speculative.zig` (speculative decoding), `guided.zig` (guided decoding)
@@ -597,8 +597,8 @@ High Impact ↑
 - `zig_regex`: Regular expression library (Zig package, fixed hash)
 
 **Build Artifacts**:
-- `libmlx-zig.a`: Static library
-- `mlx-zig`: CLI tool (chat/serve/benchmark/quantize/lora-train/convert/evaluate)
+- `libdmlx.a`: Static library
+- `dmlx`: CLI tool (chat/serve/benchmark/quantize/lora-train/convert/evaluate)
 - `example`: Example program
 - `test`: Test runner (50+ modules, 350 tests)
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# End-to-end correctness tests using mlx-zig server mode.
+# End-to-end correctness tests using dmlx server mode.
 #
 # This avoids reloading the 141GB model for every test by starting the
 # server once and sending requests via HTTP API.
@@ -21,7 +21,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-CLI="${PROJECT_DIR}/zig-out/bin/mlx-zig"
+CLI="${PROJECT_DIR}/zig-out/bin/dmlx"
 PORT=18080
 SERVER_URL="http://localhost:${PORT}"
 
@@ -229,7 +229,7 @@ if [ ! -d "${MODEL_PATH}" ]; then
 fi
 
 if [ ! -f "${CLI}" ]; then
-    echo "📦 Building mlx-zig..."
+    echo "📦 Building dmlx..."
     (cd "${PROJECT_DIR}" && zig build -Doptimize=ReleaseFast) || {
         echo -e "${RED}❌ Build failed${NC}"
         exit 1

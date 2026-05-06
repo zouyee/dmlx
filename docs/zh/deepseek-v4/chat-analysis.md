@@ -3,7 +3,7 @@
 **分析日期:** 2026-05-01  
 **命令:**
 ```bash
-gtimeout 300 ./zig-out/bin/mlx-zig chat \
+gtimeout 300 ./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 30 \
@@ -493,7 +493,7 @@ print(response)  # 预期: "4" 或相关答案
 
 ### 结论
 
-**`../autoresearch-mlx` 不能直接协助解决 DeepSeek V4 的推理问题。** 它是一个训练工具，与 mlx-zig 的推理引擎属于不同领域。
+**`../autoresearch-mlx` 不能直接协助解决 DeepSeek V4 的推理问题。** 它是一个训练工具，与 dmlx 的推理引擎属于不同领域。
 
 如果需要一个**独立的 Python 参考实现**来对比验证，建议直接使用 `mlx-lm`（`pip install mlx-lm`），而非 autoresearch-mlx。
 
@@ -527,4 +527,4 @@ print(response)  # 预期: "4" 或相关答案
 
 ---
 
-*本分析基于对 mlx-zig `tuning` 分支（commit 5c1cec2）的完整源码审查。所有代码引用均经实际文件验证。*
+*本分析基于对 dmlx `tuning` 分支（commit 5c1cec2）的完整源码审查。所有代码引用均经实际文件验证。*

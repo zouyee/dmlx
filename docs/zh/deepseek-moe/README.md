@@ -1,18 +1,18 @@
 # DeepSeek V4 MoE 在小内存 Mac 上的技术深度解析
 
-> **mlx-zig 如何在 48GB MacBook Pro 上运行 ~150GB 的 MoE 模型**
+> **dmlx 如何在 48GB MacBook Pro 上运行 ~150GB 的 MoE 模型**
 
 ---
 
 ## 问题所在
 
-DeepSeek V4 是一个 671B 参数的 Mixture-of-Experts 模型。即使在 4-bit 量化下，完整模型仍重约 40GB。在 FP16 下，仅权重就超过 150GB。在一台只有 48GB 统一内存的消费级 MacBook Pro 上运行它看似不可能——但 mlx-zig 做到了。
+DeepSeek V4 是一个 671B 参数的 Mixture-of-Experts 模型。即使在 4-bit 量化下，完整模型仍重约 40GB。在 FP16 下，仅权重就超过 150GB。在一台只有 48GB 统一内存的消费级 MacBook Pro 上运行它看似不可能——但 dmlx 做到了。
 
 ## 解决方案：五层内存优化
 
 ### 第一层：MoE Expert Streaming（138GB → 10GB）
 
-DeepSeek V4 使用 256 个路由专家 + 共享专家，采用 top-k 路由。每个 token 仅激活一小部分专家（通常 top-8）。mlx-zig 的 `expert_stream.zig`（649 行）利用了这种稀疏性：
+DeepSeek V4 使用 256 个路由专家 + 共享专家，采用 top-k 路由。每个 token 仅激活一小部分专家（通常 top-8）。dmlx 的 `expert_stream.zig`（649 行）利用了这种稀疏性：
 
 - **按需加载**：仅通过 `PartialTensorReader`（基于 pread 的部分张量读取）将活跃专家加载到内存中
 - **LRU 专家缓存**：常用专家常驻内存；冷门专家被淘汰
@@ -26,7 +26,7 @@ Source: src/models/expert_stream.zig (649 lines)
 
 ### 第二层：4-bit 量化（40GB → 6-12GB，借助 SMELT）
 
-mlx-zig 支持六种量化格式，SMELT 系统实现了部分专家加载：
+dmlx 支持六种量化格式，SMELT 系统实现了部分专家加载：
 
 | 模式 | 专家加载数 | 内存 | 延迟影响 |
 |------|---------------|--------|----------------|
@@ -95,7 +95,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    mlx-zig Inference Engine               │
+│                    dmlx Inference Engine               │
 ├─────────────────────────────────────────────────────────┤
 │  Model (DeepSeek V4, 3,091 lines)                        │
 │  ├── MLA (Multi-head Latent Attention)                   │
@@ -126,7 +126,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 ## 为什么选择 Zig？
 
-| 方面 | Python (mlx-lm) | Zig (mlx-zig) |
+| 方面 | Python (mlx-lm) | Zig (dmlx) |
 |--------|----------------|---------------|
 | **内存控制** | GC + 隐式 | 显式，编译期检查 |
 | **并发** | GIL 受限 | 真正的并行，无 GIL |
@@ -156,7 +156,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 → 详细用例请参见 [应用场景](../scenarios/README.md)。
 
-| 场景 | mlx-zig 的优势 |
+| 场景 | dmlx 的优势 |
 |----------|-------------|
 | **本地 LLM 推理** | 在笔记本上运行 671B 模型——无需云端 |
 | **隐私优先应用** | 所有数据保留在设备上，零网络出站 |

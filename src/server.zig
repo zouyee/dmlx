@@ -1,4 +1,4 @@
-/// Minimal OpenAI-compatible HTTP server for MLX-Zig inference.
+/// Minimal OpenAI-compatible HTTP server for DMLX inference.
 ///
 /// Endpoints:
 ///   POST /v1/chat/completions  — Chat completion (streaming & non-streaming)
@@ -153,7 +153,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !vo
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.log.info("MLX-Zig server listening on http://0.0.0.0:{d}", .{config.port});
+    std.log.info("DMLX server listening on http://0.0.0.0:{d}", .{config.port});
 
     while (true) {
         const connection = try listener.accept(io);

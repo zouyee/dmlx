@@ -209,18 +209,18 @@ Top tokens: [18639]=18.70 [84202]=17.35 [46552]=17.02
 - `3ac642f` - 修复 stream 模式以匹配预加载模式行为
 
 ### 修改的文件
-- `mlx-zig/src/models/expert_stream.zig` - Stream 模式实现（手动重映射修复 + 性能优化）
-- `mlx-zig/src/models/expert_preload.zig` - 预加载模式参考
-- `mlx-zig/src/models/expert_cache.zig` - LRU 专家权重缓存
-- `mlx-zig/src/models/layer_prefetcher.zig` - 异步层预取
-- `mlx-zig/src/io/safetensors_reader.zig` - 部分张量读取 + FdPool
-- `mlx-zig/src/tests/expert_remap_test.zig` - 重映射正确性单元测试
-- `mlx-zig/tests/test_mlx_take.py` - Python MLX 参考测试
+- `dmlx/src/models/expert_stream.zig` - Stream 模式实现（手动重映射修复 + 性能优化）
+- `dmlx/src/models/expert_preload.zig` - 预加载模式参考
+- `dmlx/src/models/expert_cache.zig` - LRU 专家权重缓存
+- `dmlx/src/models/layer_prefetcher.zig` - 异步层预取
+- `dmlx/src/io/safetensors_reader.zig` - 部分张量读取 + FdPool
+- `dmlx/src/tests/expert_remap_test.zig` - 重映射正确性单元测试
+- `dmlx/tests/test_mlx_take.py` - Python MLX 参考测试
 
 ### 测试命令
 ```bash
 # 测试 stream 模式（慢但能运行）
-./zig-out/bin/mlx-zig chat \
+./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 5 \
@@ -228,7 +228,7 @@ Top tokens: [18639]=18.70 [84202]=17.35 [46552]=17.02
   --smelt-strategy stream
 
 # 测试预加载模式（快但会 OOM）
-./zig-out/bin/mlx-zig chat \
+./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 5 \

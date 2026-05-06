@@ -107,7 +107,7 @@ pub const EagleDrafter = struct {
             try arena.track(try ops.reshape(ctx, hidden_state, &[_]i32{ 1, @intCast(self.hidden_dim) }))
         else if (hidden_state.ndim() == 3)
             // [1, 1, hidden_dim] -> squeeze to [1, hidden_dim]
-            try arena.track(try shape_mod.squeezeAxes(ctx, hidden_state, &[_]i32{ 1 }))
+            try arena.track(try shape_mod.squeezeAxes(ctx, hidden_state, &[_]i32{1}))
         else
             hidden_state;
 
@@ -1149,7 +1149,6 @@ test "Property 15: Speculative Decoding — high-probability drafts are mostly a
     try std.testing.expect(acceptance_rate > 0.90);
 }
 
-
 // ============================================================
 // EagleDrafter Unit Tests
 // ============================================================
@@ -1171,7 +1170,7 @@ test "EagleDrafter: propose returns null without weights" {
     c_test.initErrorHandler();
     const ctx = EagerContext.init(std.testing.allocator);
     const drafter = EagleDrafter.init(4096, 32000);
-    const hidden = try Array.zeros(std.testing.allocator, &[_]i32{1, 4096}, .float32);
+    const hidden = try Array.zeros(std.testing.allocator, &[_]i32{ 1, 4096 }, .float32);
     defer hidden.deinit();
     const result = try drafter.propose(hidden, 3, ctx, std.testing.allocator);
     try std.testing.expect(result == null);

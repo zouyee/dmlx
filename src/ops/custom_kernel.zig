@@ -1,4 +1,4 @@
-/// Custom Metal kernel registration for MLX-Zig.
+/// Custom Metal kernel registration for DMLX.
 ///
 /// Provides Zig wrappers around the mlx-c custom Metal kernel API
 /// (`mlx_fast_metal_kernel`), enabling users to register and execute

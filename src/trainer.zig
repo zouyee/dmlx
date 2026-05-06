@@ -411,8 +411,6 @@ pub const SFTTrainer = struct {
             try tree_mod.treeToArrays(self.allocator, self.model.*);
         defer self.allocator.free(model_params);
 
-
-
         var inputs = try self.allocator.alloc(Array, 2 + model_params.len);
         defer {
             for (inputs) |arr| arr.deinit();
@@ -464,7 +462,6 @@ pub const SFTTrainer = struct {
                 }
             }
         }
-
 
         try self.optimizer.step(result.grad, self.stream);
 

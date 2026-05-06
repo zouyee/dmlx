@@ -1,4 +1,4 @@
-# MLX-Zig Source Code Deep Verification Report
+# dmlx Source Code Deep Verification Report
 
 > Methodology: Line-by-line audit of key files, static analysis + runtime cross-validation
 > Initial Date: 2026-05-03 | Revised Date: 2026-05-03
@@ -44,7 +44,7 @@ When the KV cache strategy is `PagedKVCache`, `RotatingKVCache`, `QuantizedKVCac
 ### 1.3 Trigger Condition
 
 ```bash
-mlx-zig serve --model <path> --kv-strategy paged --prompt-cache-file /tmp/cache.bin
+dmlx serve --model <path> --kv-strategy paged --prompt-cache-file /tmp/cache.bin
 ```
 
 **Conclusion**: P0 rating is correct. **Not fixed**.

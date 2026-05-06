@@ -283,7 +283,7 @@ pub const BpeTokenizer = struct {
             while (it.next()) |entry| {
                 const token_str = entry.key_ptr.*;
                 const token_id = entry.value_ptr.*;
-                if (pos + token_str.len <= text.len and std.mem.eql(u8, text[pos..pos + token_str.len], token_str)) {
+                if (pos + token_str.len <= text.len and std.mem.eql(u8, text[pos .. pos + token_str.len], token_str)) {
                     // Found a special token
                     try segments.append(self.allocator, .{
                         .text = token_str,

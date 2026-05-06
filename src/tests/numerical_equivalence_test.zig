@@ -102,7 +102,7 @@ test "Feature: stream-mode-performance, Property 8: Numerical equivalence with u
     var iteration_rng = std.Random.DefaultPrng.init(0xDEAD_BEEF_CAFE_1234);
     const iter_random = iteration_rng.random();
 
-    const tmp_path = "/tmp/mlx_zig_numerical_equiv_test.safetensors";
+    const tmp_path = "/tmp/dmlx_numerical_equiv_test.safetensors";
 
     // Run 100 iterations with random configurations
     for (0..100) |iteration| {
@@ -198,11 +198,11 @@ test "Feature: stream-mode-performance, Property 8: Numerical equivalence with u
                         "  n_experts={d}, dim1={d}, dim2={d}, n_selected={d}\n" ++
                         "  expert_ids={any}\n",
                     .{
-                        iteration,    elem_idx,
-                        old_val,      old_bits,
-                        new_val,      new_bits,
-                        n_experts,    dim1,
-                        dim2,         expert_ids.len,
+                        iteration,  elem_idx,
+                        old_val,    old_bits,
+                        new_val,    new_bits,
+                        n_experts,  dim1,
+                        dim2,       expert_ids.len,
                         expert_ids,
                     },
                 );

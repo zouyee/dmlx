@@ -623,7 +623,7 @@ std.log.info("TTFT breakdown: index={d}ms fd={d}ms mmap={d}ms load={d}ms total={
 **P3 顺序加载验证**: 对比优化前后的 page fault 数量：
 ```bash
 # macOS: 用 /usr/bin/time -l 查看 page faults
-/usr/bin/time -l ./zig-out/bin/mlx-zig --model ... 2>&1 | grep "page faults"
+/usr/bin/time -l ./zig-out/bin/dmlx --model ... 2>&1 | grep "page faults"
 ```
 
 **回归测试**: 每次优化后运行 `bash scripts/best_test.sh`，确保 7/7 prompt 全部通过。

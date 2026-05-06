@@ -98,7 +98,7 @@ if (prompt_tokens[0] != 100000) {
 ./scripts/verify-deepseek-v4-fix.sh ~/models/deepseek-v4-flash-4bit
 
 # 手动检查
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 ### 验证（开发者）

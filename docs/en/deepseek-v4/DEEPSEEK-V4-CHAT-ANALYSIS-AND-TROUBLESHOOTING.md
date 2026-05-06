@@ -24,7 +24,7 @@ The `chat` command with DeepSeek V4 Flash 4-bit was completely non-functional du
 **Analysis Date:** 2026-05-01  
 **Command:**
 ```bash
-gtimeout 300 ./zig-out/bin/mlx-zig chat \
+gtimeout 300 ./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 30 \
@@ -426,7 +426,7 @@ response = generate(model, tokenizer, prompt, max_tokens=30, temp=0.0)
 print(response)  # Expected: "4" or related answer
 ```
 
-**`../autoresearch-mlx` cannot directly assist with DeepSeek V4 inference issues.** It's a training tool, separate domain from mlx-zig inference engine.
+**`../autoresearch-mlx` cannot directly assist with DeepSeek V4 inference issues.** It's a training tool, separate domain from dmlx inference engine.
 
 ### 8. Summary & Recommended Fix Order
 
@@ -440,7 +440,7 @@ print(response)  # Expected: "4" or related answer
 | P2 | Fix CSA/HCA compression path | **Long context accuracy** |
 | P2 | Unify chat template | **Cross-variant compatibility** |
 
-*This analysis is based on full source code review of mlx-zig `tuning` branch (commit 5c1cec2). All code references verified against actual files.*
+*This analysis is based on full source code review of dmlx `tuning` branch (commit 5c1cec2). All code references verified against actual files.*
 
 ---
 
@@ -459,7 +459,7 @@ print(response)  # Expected: "4" or related answer
 
 **Diagnosis:**
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello"
 ```
 
 Look for prompt token validation:
@@ -522,21 +522,21 @@ MLX memory: wired_limit=40960MB cache_limit=38400MB (system=48000MB)
 
 1. **Enable Smelt Mode** (partial expert loading):
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --smelt --smelt-experts 0.15 \
   --prompt "Hello"
 ```
 
 2. **Use Quantized KV Cache:**
 ```bash
-mlx-zig serve --model ~/models/deepseek-v4 \
+dmlx serve --model ~/models/deepseek-v4 \
   --kv-strategy paged_quantized \
   --kv-bits 4
 ```
 
 3. **Reduce Context Length:**
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --max-kv-size 4096 \
   --prompt "Hello"
 ```
@@ -560,7 +560,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 
 3. **Enable speculative decoding** (future optimization):
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --speculative-ngram 4 \
   --prompt "Hello"
 ```
@@ -585,7 +585,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 **Enable Verbose Logging:**
 ```bash
 export RUST_LOG=debug
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Test"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Test"
 ```
 
 **Inspect Logits:**
@@ -599,19 +599,19 @@ Check for: NaN/Inf (numerical instability), extreme values (scaling issues), uni
 **Test with Simple Prompts:**
 ```bash
 # Test 1: Single token
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
 
 # Test 2: English only
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 
 # Test 3: Chinese (if supported)
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
 ```
 
 ### Performance Benchmarking
 
 ```bash
-mlx-zig benchmark --model ~/models/deepseek-v4-flash-4bit \
+dmlx benchmark --model ~/models/deepseek-v4-flash-4bit \
   --input-tokens 32 \
   --output-tokens 128 \
   --num-runs 3

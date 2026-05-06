@@ -56,7 +56,7 @@ pub fn treeFlatten(
                 }
             }
         },
-        .@"pointer" => |ptr| {
+        .pointer => |ptr| {
             if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct") {
                 try treeFlatten(allocator, prefix, value.*, entries);
             }
@@ -164,7 +164,7 @@ pub fn treeSetArrays(tree: anytype, arrays: []const Array, idx: *usize) void {
                     idx.* += 1;
                 } else if (@typeInfo(FieldType) == .@"struct") {
                     treeSetArrays(field_ptr, arrays, idx);
-                } else if (@typeInfo(FieldType) == .@"pointer") {
+                } else if (@typeInfo(FieldType) == .pointer) {
                     const ptr = @typeInfo(FieldType).pointer;
                     if (ptr.size == .slice and @typeInfo(ptr.child) == .@"struct") {
                         for (field_ptr.*) |*item| {
@@ -176,7 +176,7 @@ pub fn treeSetArrays(tree: anytype, arrays: []const Array, idx: *usize) void {
                 }
             }
         },
-        .@"pointer" => |ptr| {
+        .pointer => |ptr| {
             if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct") {
                 const S = @typeInfo(ptr.child).@"struct";
                 inline for (S.fields) |field| {
@@ -191,7 +191,7 @@ pub fn treeSetArrays(tree: anytype, arrays: []const Array, idx: *usize) void {
                         idx.* += 1;
                     } else if (@typeInfo(FieldType) == .@"struct") {
                         treeSetArrays(field_ptr, arrays, idx);
-                    } else if (@typeInfo(FieldType) == .@"pointer") {
+                    } else if (@typeInfo(FieldType) == .pointer) {
                         const fptr = @typeInfo(FieldType).pointer;
                         if (fptr.size == .one and @typeInfo(fptr.child) == .@"struct") {
                             treeSetArrays(field_ptr.*, arrays, idx);
@@ -260,7 +260,7 @@ pub fn treeToArrays(
                     const nested = try treeToArrays(allocator, field_value);
                     defer allocator.free(nested);
                     try arrays.appendSlice(allocator, nested);
-                } else if (@typeInfo(FieldType) == .@"pointer") {
+                } else if (@typeInfo(FieldType) == .pointer) {
                     const ptr = @typeInfo(FieldType).pointer;
                     if (ptr.size == .slice and @typeInfo(ptr.child) == .@"struct") {
                         for (field_value) |item| {
@@ -306,7 +306,7 @@ pub fn treeToArrayPtrs(
                 }
             }
         },
-        .@"pointer" => |ptr| {
+        .pointer => |ptr| {
             if (ptr.size == .one and @typeInfo(ptr.child) == .@"struct") {
                 const S = @typeInfo(ptr.child).@"struct";
                 inline for (S.fields) |field| {
@@ -317,7 +317,7 @@ pub fn treeToArrayPtrs(
                         try arrays.append(allocator, @constCast(field_ptr));
                     } else if (@typeInfo(FieldType) == .@"struct") {
                         try treeToArrayPtrs(allocator, field_ptr, arrays);
-                    } else if (@typeInfo(FieldType) == .@"pointer") {
+                    } else if (@typeInfo(FieldType) == .pointer) {
                         const fptr = @typeInfo(FieldType).pointer;
                         if (fptr.size == .one and @typeInfo(fptr.child) == .@"struct") {
                             try treeToArrayPtrs(allocator, field_ptr.*, arrays);

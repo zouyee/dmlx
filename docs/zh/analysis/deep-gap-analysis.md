@@ -1,4 +1,4 @@
-# mlx-zig 深度差距分析：对比 mlx/mlx-c/mlx-lm/oMLX/TileKernels/vLLM
+# dmlx 深度差距分析：对比 mlx/mlx-c/mlx-lm/oMLX/TileKernels/vLLM
 
 > 基于 2026-04-26 代码审计（37K+ 行 Zig、100+ 文件、350 测试），
 > 对比 6 个参考项目，识别可借鉴的强化方向。
@@ -6,7 +6,7 @@
 
 ---
 
-## I. mlx-zig 真实状态（诚实评估）
+## I. dmlx 真实状态（诚实评估）
 
 ### 已验证可运行
 - ✅ TinyLlama-1.1B-Chat-v1.0-4bit：加载 + 量化推理 + token 生成
@@ -45,7 +45,7 @@
 
 ### 1. 对比 mlx (Apple 官方框架)
 
-| 能力 | mlx | mlx-zig | 差距 | 借鉴价值 |
+| 能力 | mlx | dmlx | 差距 | 借鉴价值 |
 |------------|-----|---------|-----|---------------|
 | 惰性求值 | ✅ 核心 | ✅ 通过 mlx-c | 无 | — |
 | Metal kernel | ✅ 自动 | ✅ 通过 mlx-c | 无 | — |
@@ -58,7 +58,7 @@
 
 ### 2. 对比 mlx-c (C API 层)
 
-| 能力 | mlx-c | mlx-zig 绑定 | 差距 |
+| 能力 | mlx-c | dmlx 绑定 | 差距 |
 |------------|-------|-----------------|-----|
 | 全部算子 | ~200 | ~200 | 无 |
 | quantize/dequantize | ✅ 4 模式 | ✅ 4 模式 | 无 |
@@ -71,7 +71,7 @@
 
 ### 3. 对比 mlx-lm (Python 参考实现)
 
-| 能力 | mlx-lm | mlx-zig | 差距 | 优先级 |
+| 能力 | mlx-lm | dmlx | 差距 | 优先级 |
 |------------|--------|---------|-----|----------|
 | 模型架构数 | 50+ | 5 | **高** | P1 |
 | 流式 token 输出 | ✅ yield | ❌ 批量输出 | **高** | P0 |
@@ -85,13 +85,13 @@
 | GGUF 导出 | ✅ | ❌ | 低 | P3 |
 
 **最高优先级借鉴**：
-1. **流式 token 输出** — mlx-lm 的 `generate_step` 是 yield 模式，每个 token 生成即输出。mlx-zig 的 generate 等待全部完成。
-2. **EOS 停止** — mlx-lm 检查 `eos_token_id` 并提前终止。mlx-zig 始终生成 max_tokens。
-3. **Chat template** — mlx-lm 用 Jinja2 渲染 chat template。mlx-zig 仅在 V4 路径有 chat template，LLaMA 路径传递原始 prompt。
+1. **流式 token 输出** — mlx-lm 的 `generate_step` 是 yield 模式，每个 token 生成即输出。dmlx 的 generate 等待全部完成。
+2. **EOS 停止** — mlx-lm 检查 `eos_token_id` 并提前终止。dmlx 始终生成 max_tokens。
+3. **Chat template** — mlx-lm 用 Jinja2 渲染 chat template。dmlx 仅在 V4 路径有 chat template，LLaMA 路径传递原始 prompt。
 
 ### 4. 对比 oMLX (生产级服务器)
 
-| 能力 | oMLX | mlx-zig | 差距 | 优先级 |
+| 能力 | oMLX | dmlx | 差距 | 优先级 |
 |------------|------|---------|-----|----------|
 | Continuous Batching | ✅ 真实 | ⚠️ 框架存在但无真实批量前向 | **高** | P1 |
 | SSE keep-alive | ✅ | ❌ | 中 | P2 |
@@ -104,7 +104,7 @@
 
 ### 5. 对比 TileKernels (DeepSeek GPU Kernel 库)
 
-| 能力 | TileKernels | mlx-zig | 差距 |
+| 能力 | TileKernels | dmlx | 差距 |
 |------------|-------------|---------|-----|
 | 数值验证框架 | ✅ cosine sim + bias check | ✅ golden test | 无 |
 | Per-token/per-block 量化 | ✅ | ✅ | 无 |
@@ -113,11 +113,11 @@
 | 自定义 CUDA kernel | ✅ | N/A (Metal) | — |
 | FP8/FP4 训练 kernel | ✅ | ❌ | 低 (推理优先) |
 
-**借鉴方向**：无明显差距。TileKernels 的核心价值（MoE 路由、量化 kernel、数值验证）已在 mlx-zig 中实现。
+**借鉴方向**：无明显差距。TileKernels 的核心价值（MoE 路由、量化 kernel、数值验证）已在 dmlx 中实现。
 
 ### 6. 对比 vLLM (工业级推理引擎)
 
-| 能力 | vLLM | mlx-zig | 差距 | 优先级 |
+| 能力 | vLLM | dmlx | 差距 | 优先级 |
 |------------|------|---------|-----|----------|
 | PagedAttention | ✅ | ✅ | 无 | — |
 | Prefix Caching | ✅ 真实 | ⚠️ Hash 已注册但查找未使用 | 中 | P2 |
@@ -129,7 +129,7 @@
 | OpenAI API 完整性 | ✅ | ⚠️ 基础 | 中 | P2 |
 
 **借鉴方向**：
-1. **OpenAI API 完整性** — vLLM 支持完整 `/v1/chat/completions`，包括 `stream`、`stop`、`temperature`、`top_p`、`max_tokens`、`logprobs`、`tool_calls`。mlx-zig 的服务器仅支持基础字段。
+1. **OpenAI API 完整性** — vLLM 支持完整 `/v1/chat/completions`，包括 `stream`、`stop`、`temperature`、`top_p`、`max_tokens`、`logprobs`、`tool_calls`。dmlx 的服务器仅支持基础字段。
 2. **EAGLE 投机解码** — 比 n-gram 更高效，但需要额外的 draft model head。
 
 ---

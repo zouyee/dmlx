@@ -8,9 +8,9 @@
 
 **问题**：你需要 GPT-4 级别的智能，但不能将敏感数据发送到云端 API。
 
-**解决方案**：mlx-zig 完全在设备上运行 DeepSeek V4。所有计算在你的 Mac 的 Metal GPU 上通过 Apple 的统一内存架构完成。
+**解决方案**：dmlx 完全在设备上运行 DeepSeek V4。所有计算在你的 Mac 的 Metal GPU 上通过 Apple 的统一内存架构完成。
 
-| 方面 | 云端 API (OpenAI/Claude) | mlx-zig 本地 |
+| 方面 | 云端 API (OpenAI/Claude) | dmlx 本地 |
 |--------|--------------------------|---------------|
 | 数据隐私 | ❌ 数据离开设备 | ✅ 零网络出站 |
 | 延迟 | ~500ms-2s（网络） | 200-500ms TTFT, 250-500ms/tok |
@@ -26,7 +26,7 @@
 
 **问题**：医疗、法律、金融或企业数据不能离开设备。
 
-**解决方案**：mlx-zig 的单二进制部署 + 零网络依赖意味着：
+**解决方案**：dmlx 的单二进制部署 + 零网络依赖意味着：
 
 - **HIPAA/GDPR 合规**：无数据传输，无第三方处理器
 - **物理隔离部署**：在无互联网连接的机器上运行
@@ -37,7 +37,7 @@
 ┌─────────────────────────────────────┐
 │           Your Mac                   │
 │  ┌─────────────────────────────┐    │
-│  │     mlx-zig binary           │    │
+│  │     dmlx binary           │    │
 │  │  ┌───────────────────────┐  │    │
 │  │  │  DeepSeek V4 Model    │  │    │
 │  │  │  + KV Cache (local)   │  │    │
@@ -57,7 +57,7 @@
 
 ```bash
 # Start the OpenAI-compatible server
-mlx-zig server --model ~/models/deepseek-v4-flash-4bit \
+dmlx server --model ~/models/deepseek-v4-flash-4bit \
   --port 8080 --kv-strategy paged
 
 # Team members connect via standard OpenAI client
@@ -81,7 +81,7 @@ curl http://mac-mini:8080/v1/chat/completions \
 
 **问题**：云端 LLM API 在某些地区被屏蔽、审查或不可用。
 
-**解决方案**：mlx-zig 的单二进制 + 内置模型权重意味着：
+**解决方案**：dmlx 的单二进制 + 内置模型权重意味着：
 
 1. 一次性下载模型（通过任何可用渠道）
 2. 完全离线运行——无需 API key，无需网络调用
@@ -91,11 +91,11 @@ curl http://mac-mini:8080/v1/chat/completions \
 ```bash
 # One-time setup
 brew install mlx-c
-git clone https://github.com/zouyee/mlx-zig.git
-cd mlx-zig && zig build
+git clone https://github.com/zouyee/dmlx.git
+cd dmlx && zig build
 
 # Run anywhere, anytime — no internet needed
-./zig-out/bin/mlx-zig chat --model /path/to/model --prompt "Hello"
+./zig-out/bin/dmlx chat --model /path/to/model --prompt "Hello"
 ```
 
 ---
@@ -106,7 +106,7 @@ cd mlx-zig && zig build
 
 **解决方案**：在你的 Mac 上本地开发与测试：
 
-| 任务 | 云端 GPU | mlx-zig 本地 |
+| 任务 | 云端 GPU | dmlx 本地 |
 |------|-----------|---------------|
 | Prompt 工程 | 部署 → 测试 → 重新部署 | 即时迭代 |
 | 模型评估 | 预留 A100 ($3+/hr) | 你的 Mac（免费） |
@@ -121,7 +121,7 @@ cd mlx-zig && zig build
 
 **问题**：研究人员需要实验 MoE 路由、KV Cache 策略和量化，但不能有云端开销。
 
-**解决方案**：mlx-zig 暴露完整技术栈用于实验：
+**解决方案**：dmlx 暴露完整技术栈用于实验：
 
 - **MoE 路由**：在 `moe_router.zig` 中修改 top-k、路由偏置、专家选择
 - **KV Cache 策略**：通过 VTable 多态在运行时切换 6 种策略
@@ -141,9 +141,9 @@ const strategy = switch (config.mode) {
 
 ---
 
-## 为何这些场景选择 mlx-zig
+## 为何这些场景选择 dmlx
 
-| 需求 | mlx-zig 如何满足 |
+| 需求 | dmlx 如何满足 |
 |-------------|---------------------|
 | **小内存** | 五层优化：streaming + SMELT + MLA + 量化 + 分层 KV |
 | **无需云端** | 单个静态二进制，零网络依赖 |
@@ -157,7 +157,7 @@ const strategy = switch (config.mode) {
 
 ## 入门指南
 
-1. [安装](../user-guide/) — 在你的 Mac 上设置 mlx-zig
+1. [安装](../user-guide/) — 在你的 Mac 上设置 dmlx
 2. [DeepSeek V4 快速修复](../user-guide/deepseek-v4-quickfix.md) — 修复乱码输出
 3. [DeepSeek MoE 深度解析](../deepseek-moe/README.md) — 技术原理
 4. [性能基准](../technical/benchmarks.md) — 性能数据

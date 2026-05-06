@@ -1,4 +1,4 @@
-# mlx-zig 完整代码审查报告
+# dmlx 完整代码审查报告
 
 **审查日期:** 2026-05-01  
 **审查范围:** `src/` 下 130+ 个 Zig 文件（~52,572 行），`build.zig`，`tests/`，`docs/`  
@@ -12,7 +12,7 @@
 ## 执行摘要
 
 ### 项目定位
-`mlx-zig` 是 Apple `mlx-c` C 库的 Zig 语言绑定，提供 LLM 推理引擎。支持多种架构（LLaMA、DeepSeek V4、MiniMax、Nemotron-H 等）、多种 KV 缓存策略、量化、连续批处理、服务器模式。
+`dmlx` 是 Apple `mlx-c` C 库的 Zig 语言绑定，提供 LLM 推理引擎。支持多种架构（LLaMA、DeepSeek V4、MiniMax、Nemotron-H 等）、多种 KV 缓存策略、量化、连续批处理、服务器模式。
 
 ### 总体评分
 
@@ -448,4 +448,4 @@ return .{ .inner = c.c.mlx_fast_metal_kernel_new(name_z.ptr, ...) };
 
 ---
 
-*本报告基于对 mlx-zig 代码库的六次独立维度审视，所有声明均经源码交叉验证。报告生成日期：2026-05-01。*
+*本报告基于对 dmlx 代码库的六次独立维度审视，所有声明均经源码交叉验证。报告生成日期：2026-05-01。*

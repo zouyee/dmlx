@@ -1,24 +1,24 @@
-# MLX-Zig — Run Frontier LLMs on Your Mac
+# dmlx — Run Frontier LLMs on Your Mac
 
 [**How It Works**](#how-it-works-5-layer-memory-optimization) | [**Performance**](#real-world-performance) | [**Scenarios**](#application-scenarios) | [**Quick Start**](#quick-start) | [**Installation**](#installation) | [**Architecture**](#architecture)
 
 > **Run a 671B-parameter MoE model on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
 >
-> MLX-Zig combines Apple's MLX Metal backend with five layers of memory optimization to make the
+> dmlx combines Apple's MLX Metal backend with five layers of memory optimization to make the
 > impossible possible — and wraps it in a single static Zig binary with an OpenAI-compatible API.
 
 ---
 
-## Why MLX-Zig?
+## Why dmlx?
 
 The DeepSeek V4 model is **671 billion parameters** across 256 routed experts. At full precision,
 its weights exceed **150 GB** — more than 3× the memory of a 48GB MacBook Pro. Even at 4-bit
 quantization (~40 GB), it won't fit without aggressive memory management.
 
-MLX-Zig solves this through **five complementary layers of memory optimization**, plus a production-grade
+dmlx solves this through **five complementary layers of memory optimization**, plus a production-grade
 inference stack that makes frontier LLMs practical on consumer hardware.
 
-| Capability | mlx-lm (Python) | MLX-Zig (Zig) |
+| Capability | mlx-lm (Python) | dmlx (Zig) |
 |-----------|-----------------|-----------------|
 | DeepSeek V4 on 48GB Mac | ❌ OOM (~40GB weights needed) | ✅ ~6GB via SMELT 15% |
 | DeepSeek V4 on 96GB+ Mac | ✅ (if RAM sufficient) | ✅ |
@@ -35,7 +35,7 @@ inference stack that makes frontier LLMs practical on consumer hardware.
 
 ### Layer 1: MoE Expert Streaming → 138 GB → 10 GB
 
-DeepSeek V4 activates only **top-8 of 256 experts** per token. MLX-Zig exploits this sparsity
+DeepSeek V4 activates only **top-8 of 256 experts** per token. dmlx exploits this sparsity
 via `expert_stream.zig` (649 lines):
 
 - **On-demand loading**: Only active expert weights are loaded via `PartialTensorReader`
@@ -136,11 +136,11 @@ Source: docs/en/technical/ttft-optimization.md
 | Throughput | ~8 tok/s | **~12.2 tok/s** | **+52%** |
 
 > **Why this matters**: mlx-lm cannot run DeepSeek V4 on 48GB Macs at all — it requires loading
-> all ~40GB of 4-bit weights simultaneously, causing OOM. MLX-Zig's SMELT system runs the same
+> all ~40GB of 4-bit weights simultaneously, causing OOM. dmlx's SMELT system runs the same
 > model with ~6GB of weights. Raw Metal compute is similar (same `mlx-c` backend), so on larger
 > Macs (96GB+) where mlx-lm can fit, performance is comparable.
 >
-> **MLX-Zig's advantage is not raw speed — it's that the model runs at all on small Macs.**
+> **dmlx's advantage is not raw speed — it's that the model runs at all on small Macs.**
 
 [→ Performance Dashboard](https://dmlx.ai/) | [→ Benchmarking Guide](docs/en/technical/benchmarks.md) | [→ Competitive Analysis](docs/en/analysis/competitive-advantages.md)
 
@@ -163,7 +163,7 @@ Your models, your data, your hardware — no third-party processors.
 Deploy a Mac mini as a private team inference server with OpenAI-compatible API:
 
 ```bash
-mlx-zig server --model ~/models/deepseek-v4-flash-4bit \
+dmlx server --model ~/models/deepseek-v4-flash-4bit \
   --port 8080 --kv-strategy paged
 
 # Any OpenAI client works as a drop-in replacement
@@ -224,7 +224,7 @@ strategies (PLD vs EAGLE).
 
 ```bash
 # Start chatting with DeepSeek V4 on your Mac
-mlx-zig chat --model ~/models/DeepSeek-V4-Flash-4bit \
+dmlx chat --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "Explain quantum computing in one sentence" \
   --smelt --smelt-experts 0.15
 ```
@@ -233,7 +233,7 @@ mlx-zig chat --model ~/models/DeepSeek-V4-Flash-4bit \
 
 ```zig
 const std = @import("std");
-const mlx = @import("mlx-zig");
+const mlx = @import("dmlx");
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -280,8 +280,8 @@ Add to your `build.zig.zon`:
 
 ```zig
 .dependencies = .{
-    .mlx_zig = .{
-        .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.3.0.tar.gz",
+    .dmlx = .{
+        .url = "https://github.com/zouyee/dmlx/archive/refs/tags/v0.3.0.tar.gz",
         .hash = "...",
     },
 },
@@ -290,8 +290,8 @@ Add to your `build.zig.zon`:
 ### Build from Source
 
 ```bash
-git clone https://github.com/zouyee/mlx-zig.git
-cd mlx-zig
+git clone https://github.com/zouyee/dmlx.git
+cd dmlx
 zig build          # Build library + example
 zig build test     # Run tests
 zig build run      # Run demo
@@ -302,7 +302,7 @@ zig build run      # Run demo
 ## Architecture
 
 ```
-mlx-zig/
+dmlx/
 ├── build.zig              # Build configuration (links mlx-c + Metal/Accelerate)
 ├── build.zig.zon          # Package manifest
 ├── src/
@@ -370,7 +370,7 @@ Comprehensive documentation is available in [docs/](docs/index.md) (bilingual EN
 |---------|-------------|
 | [DeepSeek MoE Deep Dive](docs/en/deepseek-moe/README.md) | How 671B runs on 48GB — 5-layer optimization |
 | [Application Scenarios](docs/en/scenarios/README.md) | 6 real-world use cases |
-| [Competitive Analysis](docs/en/analysis/competitive-advantages.md) | mlx-zig vs mlx-lm, llama.cpp, LM Studio — verified benchmarks |
+| [Competitive Analysis](docs/en/analysis/competitive-advantages.md) | dmlx vs mlx-lm, llama.cpp, LM Studio — verified benchmarks |
 | [User Guide](docs/en/user-guide/) | Quick fixes and troubleshooting |
 | [Technical Docs](docs/en/technical/) | Benchmarks, TTFT, SMELT, roadmap |
 | [Analysis Reports](analysis-report/) | Comprehensive project analysis (52K+ lines) |
@@ -396,7 +396,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
 ## Acknowledgments
 
-MLX-Zig is inspired by and built on [Apple's MLX](https://github.com/ml-explore/mlx)
+dmlx is inspired by and built on [Apple's MLX](https://github.com/ml-explore/mlx)
 and the official `mlx-c` C bindings. Custom Metal kernels reproduce optimizations from
 [DeepSeek's TileKernels](https://github.com/deepseek-ai/tilekernels), adapted from
 CUDA to Apple Silicon.
@@ -407,4 +407,4 @@ See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for details.
 
 ## License
 
-MLX-Zig is released under the [MIT License](LICENSE).
+dmlx is released under the [MIT License](LICENSE).

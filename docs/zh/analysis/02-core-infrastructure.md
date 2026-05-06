@@ -97,8 +97,8 @@ const mlx_prefix = blk: {
 
 ### 构建产物
 
-- `libmlx-zig.a`：静态库
-- `mlx-zig`：CLI 工具
+- `libdmlx.a`：静态库
+- `dmlx`：CLI 工具
 - `example`：示例程序
 - `test`：测试 runner
 

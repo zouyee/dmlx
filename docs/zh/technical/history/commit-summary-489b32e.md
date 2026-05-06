@@ -20,7 +20,7 @@
 ### 错误示例（修复前）
 
 ```bash
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 error: MissingWeight
 src/models/deepseek_v4_loader.zig:1615:69: gate_list[e] = weights.get(ew1_name) orelse return LoadError.MissingWeight;
 ```
@@ -86,11 +86,11 @@ if (smelt.enabled) {
 
 ```bash
 # ❌ 不使用 --smelt 会失败
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 error: MissingWeight
 
 # ✅ 使用 --smelt 才能运行
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
 Generated: Hello! How can I assist you today?
 ```
 
@@ -98,7 +98,7 @@ Generated: Hello! How can I assist you today?
 
 ```bash
 # ✅ 无需标志，自动运行
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 ⚠️  Layer 0: Partial expert model detected: 38/256 experts available
 Auto-enabling smelt mode for this layer.
 ⚠️  Layer 1: Partial expert model detected: 38/256 experts available
@@ -107,7 +107,7 @@ Auto-enabling smelt mode for this layer.
 Generated: Hello! How can I assist you today?
 
 # ✅ 显式 --smelt 仍然有效
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --smelt-experts 0.15 --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --smelt-experts 0.15 --prompt "Hello"
 Generated: Hello! How can I assist you today?
 ```
 
@@ -206,19 +206,19 @@ if (n_available < n_routed_experts and n_available > 0) {
 
 ```bash
 # 测试 1：4-bit 部分专家模型
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 ✅ 自动运行并显示警告
 
 # 测试 2：完整 FP16 模型
-$ mlx-zig chat --model ~/models/deepseek-v4-fp16 --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-fp16 --prompt "Hello"
 ✅ 正常运行，无警告
 
 # 测试 3：完整模型 + 显式 --smelt
-$ mlx-zig chat --model ~/models/deepseek-v4-fp16 --smelt --smelt-experts 0.15 --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-fp16 --smelt --smelt-experts 0.15 --prompt "Hello"
 ✅ 正常运行，仅加载 15% 专家
 
 # 测试 4：部分模型 + 显式 --smelt
-$ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
+$ dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
 ✅ 正常运行，无重复警告
 ```
 
@@ -330,6 +330,6 @@ $ zig build
 ---
 
 **提交：** `489b32e`  
-**作者：** mlx-zig 团队  
+**作者：** dmlx 团队  
 **日期：** 2026-04-29  
 **状态：** ✅ 已提交至 tuning 分支

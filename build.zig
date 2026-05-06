@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
 
     // --- Library ---
     const lib = b.addLibrary(.{
-        .name = "mlx-zig",
+        .name = "dmlx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,
@@ -106,7 +106,7 @@ pub fn build(b: *std.Build) void {
 
     // --- CLI ---
     const cli = b.addExecutable(.{
-        .name = "mlx-zig",
+        .name = "dmlx",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

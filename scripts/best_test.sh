@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================
-# mlx-zig Best Test Plan — 7-Prompt Correctness Verification
+# dmlx Best Test Plan — 7-Prompt Correctness Verification
 # ============================================================
 # Mode: chat (thinking OFF, </think> in prompt)
 # Strategy: smelt + stream
@@ -13,7 +13,7 @@
 set -euo pipefail
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-CLI="${2:-${PWD}/zig-out/bin/mlx-zig}"
+CLI="${2:-${PWD}/zig-out/bin/dmlx}"
 SMELT_FLAGS=(--smelt --smelt-strategy stream --smelt-experts 0.1)
 
 RED='\033[0;31m'
@@ -24,7 +24,7 @@ PASSED=0
 FAILED=0
 
 echo "═══════════════════════════════════════════════════════"
-echo "🔍 mlx-zig 7-Prompt Test Plan (smelt + stream, chat mode)"
+echo "🔍 dmlx 7-Prompt Test Plan (smelt + stream, chat mode)"
 echo "═══════════════════════════════════════════════════════"
 echo "Model:  $MODEL_PATH"
 echo "Mode:   chat (thinking OFF — \`</think>\` in prompt)"

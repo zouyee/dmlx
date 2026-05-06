@@ -2,7 +2,7 @@
 
 ## 1.1 Six-Layer Architecture
 
-MLX-Zig adopts a six-layer architecture (from `.kiro/specs/production-deployment/design.md`):
+dmlx adopts a six-layer architecture (from `.kiro/specs/production-deployment/design.md`):
 
 ```
 ┌─────────────────────────────────────────┐

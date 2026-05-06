@@ -1,12 +1,12 @@
-# MLX 生态项目深度分析与 mlx-zig 借鉴方向
+# MLX 生态项目深度分析与 dmlx 借鉴方向
 
 > 基于 mlx-lm（Apple 官方 Python LLM 库）、oMLX（生产级推理服务器）、
 > TileKernels（DeepSeek GPU kernel 库）、mlx-rs（Rust 绑定）四个项目的深度分析，
-> 结合 mlx-zig 当前代码库审计，提炼可借鉴的架构模式和工程实践。
+> 结合 dmlx 当前代码库审计，提炼可借鉴的架构模式和工程实践。
 
 ---
 
-## 第一部分：mlx-zig 当前状态深度审计（更新）
+## 第一部分：dmlx 当前状态深度审计（更新）
 
 ### 新增发现：server.zig
 
@@ -75,7 +75,7 @@ mlx_lm/
 └── gguf.py           # GGUF 导出
 ```
 
-### mlx-zig 可借鉴的关键模式
+### dmlx 可借鉴的关键模式
 
 #### 1. 模型架构注册表模式
 
@@ -92,7 +92,7 @@ MODEL_REGISTRY = {
 }
 ```
 
-**mlx-zig 当前问题**：`root.zig` 硬编码了 `models = llama`、`deepseek_v4`，
+**dmlx 当前问题**：`root.zig` 硬编码了 `models = llama`、`deepseek_v4`，
 `main.zig` 通过字符串匹配 `detectModelType` 选择模型。
 
 **借鉴方案**：实现编译时模型注册表：
@@ -113,7 +113,7 @@ cat prompt.txt | mlx_lm.cache_prompt --prompt - --prompt-cache-file cache.safete
 mlx_lm.generate --prompt-cache-file cache.safetensors --prompt "Summarize"
 ```
 
-**mlx-zig 当前状态**：KV cache 只在内存中，进程退出即丢失。
+**dmlx 当前状态**：KV cache 只在内存中，进程退出即丢失。
 
 **借鉴方案**：利用已有的 safetensors I/O 实现 KV cache 序列化/反序列化。
 
@@ -126,7 +126,7 @@ mlx-lm 的 `quant/` 目录实现了三种量化方案：
 
 每种方案都有独立的量化器和反量化 kernel。
 
-**mlx-zig 当前状态**：QLoRA 已实现（`qlora.zig`），量化基础设施完整（affine/MXFP4/FP8）。
+**dmlx 当前状态**：QLoRA 已实现（`qlora.zig`），量化基础设施完整（affine/MXFP4/FP8）。
 
 **借鉴方案**：优先实现 GPTQ（最成熟），利用 mlx-c 的 `mlx_quantize`。
 
@@ -142,7 +142,7 @@ mlx-lm 将生成逻辑分为三层：
 def generate(model, tokenizer, prompt, sampler=None, logits_processors=None):
 ```
 
-**mlx-zig 当前状态**：`sampling.zig` 的采样器是独立函数，
+**dmlx 当前状态**：`sampling.zig` 的采样器是独立函数，
 但 `LlamaModel.generate` 硬编码了采样逻辑。
 
 **借鉴方案**：将 `generate` 拆分为 `generateStep` + `streamGenerate` + `generate` 三层。
@@ -157,13 +157,13 @@ mlx_lm convert --model <hf_id> -q  # 转换+量化
 mlx_lm share --model <path>   # 上传到 HuggingFace
 ```
 
-**mlx-zig 当前状态**：`convert` 命令是 TODO stub。
+**dmlx 当前状态**：`convert` 命令是 TODO stub。
 
 #### 6. Perplexity 评估
 
 mlx-lm 提供 `evaluate.py` 计算模型 perplexity，用于量化质量验证。
 
-**mlx-zig 当前状态**：无评估工具。
+**dmlx 当前状态**：无评估工具。
 
 ---
 
@@ -197,7 +197,7 @@ FastAPI Server (OpenAI / Anthropic API)
         └── PagedSSDCacheManager (SSD 冷层, safetensors 格式)
 ```
 
-### mlx-zig 可借鉴的关键模式
+### dmlx 可借鉴的关键模式
 
 #### 1. 分层 KV Cache（Hot + Cold）
 
@@ -208,8 +208,8 @@ oMLX 最核心的创新是分层 KV cache：
 - **Prefix sharing**：相同前缀的请求共享 KV cache block
 - **Copy-on-Write**：修改时才复制 block
 
-**mlx-zig 当前状态**：`kvcache.zig` 有 5 种策略（Standard/Rotating/Quantized/Paged/Radix），
-**mlx-zig 当前状态**：`kvcache.zig` 有 6 种策略（Standard/Rotating/Quantized/Paged/PagedQuantized/Tiered），
+**dmlx 当前状态**：`kvcache.zig` 有 5 种策略（Standard/Rotating/Quantized/Paged/Radix），
+**dmlx 当前状态**：`kvcache.zig` 有 6 种策略（Standard/Rotating/Quantized/Paged/PagedQuantized/Tiered），
 Paged 完整实现（block alloc/free/CoW/prefix hash），Tiered 实现 Hot RAM + Cold SSD offload。
 
 **借鉴方案**（已实现）：
@@ -226,7 +226,7 @@ oMLX 的 EnginePool 实现了：
 - **Per-model TTL**：空闲超时自动卸载
 - **进程内存限制**：`--max-process-memory 80%`
 
-**mlx-zig 当前状态**：`server.zig` 只加载一个模型，无内存管理。
+**dmlx 当前状态**：`server.zig` 只加载一个模型，无内存管理。
 
 **借鉴方案**：实现 `ModelPool` 结构体，支持多模型加载/卸载/LRU。
 
@@ -235,7 +235,7 @@ oMLX 的 EnginePool 实现了：
 oMLX 通过 mlx-lm 的 `BatchGenerator` 实现 continuous batching：
 多个请求的 prefill 和 decode 步骤交错执行，最大化 GPU 利用率。
 
-**mlx-zig 当前状态**：`server.zig` 串行处理请求。
+**dmlx 当前状态**：`server.zig` 串行处理请求。
 
 **借鉴方案**：这是 v1.0 的目标，需要实现请求队列 + batch scheduler。
 
@@ -243,7 +243,7 @@ oMLX 通过 mlx-lm 的 `BatchGenerator` 实现 continuous batching：
 
 oMLX 支持 Server-Sent Events 流式输出，这是 LLM 服务的标配。
 
-**mlx-zig 当前状态**：`server.zig` 返回 `streaming_not_supported`。
+**dmlx 当前状态**：`server.zig` 返回 `streaming_not_supported`。
 
 **借鉴方案**：实现 SSE 响应格式，每生成一个 token 就发送一个 event。
 
@@ -253,7 +253,7 @@ oMLX 针对 Claude Code 场景做了专门优化：
 - **Context scaling**：缩放报告的 token 数，让 auto-compact 在正确时机触发
 - **SSE keep-alive**：长 prefill 期间发送心跳，防止读超时
 
-**mlx-zig 借鉴价值**：如果 mlx-zig 要作为 Claude Code 的本地后端，
+**dmlx 借鉴价值**：如果 dmlx 要作为 Claude Code 的本地后端，
 这些优化是必需的。
 
 ---
@@ -266,13 +266,13 @@ oMLX 针对 Claude Code 场景做了专门优化：
 
 TileKernels 的 MoE 路由管线（topk_gate → expand → reduce）
 对应 mlx-lm 中 DeepSeek V3 模型的路由实现。
-mlx-zig 的 `deepseek_v4.zig` 应该参照两者实现完整的 MoE 路由。
+dmlx 的 `deepseek_v4.zig` 应该参照两者实现完整的 MoE 路由。
 
 ### 与 oMLX 的交叉
 
 TileKernels 的量化 kernel（per-token/per-block FP8/FP4）
 对应 oMLX 中量化模型的推理路径。
-mlx-zig 的量化基础设施应该同时支持训练（TileKernels 模式）和推理（oMLX 模式）。
+dmlx 的量化基础设施应该同时支持训练（TileKernels 模式）和推理（oMLX 模式）。
 
 ---
 
@@ -280,14 +280,14 @@ mlx-zig 的量化基础设施应该同时支持训练（TileKernels 模式）和
 
 ### 项目概况
 
-mlx-rs 是 MLX 的非官方 Rust 绑定，与 mlx-zig 定位最接近。
+mlx-rs 是 MLX 的非官方 Rust 绑定，与 dmlx 定位最接近。
 v0.21.0，活跃开发中。
 
-### mlx-zig 可借鉴的关键模式
+### dmlx 可借鉴的关键模式
 
 #### 1. 自动微分的显式输入模式
 
-mlx-rs 发现了与 mlx-zig 相同的问题：闭包捕获外部变量时，
+mlx-rs 发现了与 dmlx 相同的问题：闭包捕获外部变量时，
 自动微分无法正确追踪计算图。mlx-rs 的解决方案是要求所有输入显式传递：
 
 ```rust
@@ -301,7 +301,7 @@ let loss_fn = |inputs: &[Array]| {
 };
 ```
 
-**mlx-zig 当前状态**：`closure.zig` 的 `Closure.init` 接受
+**dmlx 当前状态**：`closure.zig` 的 `Closure.init` 接受
 `fn(inputs: []const Array, allocator) ![]Array`，已经是显式输入模式。
 但文档中没有说明这个限制。
 
@@ -316,7 +316,7 @@ metal = []
 accelerate = []
 ```
 
-**mlx-zig 当前状态**：`build.zig` 通过 `is_macos` 条件编译，
+**dmlx 当前状态**：`build.zig` 通过 `is_macos` 条件编译，
 但没有暴露用户可控的 feature flag。
 
 **借鉴方案**：添加 `-Denable_metal=true/false` 构建选项。
@@ -373,7 +373,7 @@ accelerate = []
 
 ## 附录 A：项目对比矩阵
 
-| 特性 | mlx-zig | mlx-lm | oMLX | TileKernels | mlx-rs |
+| 特性 | dmlx | mlx-lm | oMLX | TileKernels | mlx-rs |
 |------|---------|--------|------|-------------|--------|
 | 语言 | Zig | Python | Python | Python+TileLang | Rust |
 | 后端 | mlx-c | MLX Python | mlx-lm | CUDA | mlx-c |
@@ -389,7 +389,7 @@ accelerate = []
 | 测试覆盖 | 337 tests | 高 | 中 | 高 | 中 |
 | HTTP 服务器 | ✅ OpenAI 兼容 | ✅ | ✅ 生产级 | — | ❌ |
 
-## 附录 B：mlx-lm 模型架构列表（mlx-zig 可参考的优先级）
+## 附录 B：mlx-lm 模型架构列表（dmlx 可参考的优先级）
 
 **高优先级**（使用最广泛）：
 - LLaMA / LLaMA-2 / LLaMA-3 ✅ 已支持

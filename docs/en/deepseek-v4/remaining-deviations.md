@@ -1,4 +1,4 @@
-# mlx-zig DeepSeek V4 — 未修复偏差清单
+# dmlx DeepSeek V4 — 未修复偏差清单
 # 2026-05-03 | 对照源: mlx-lm / Rapid-MLX
 
 ## 状态: 7/7 测试已通过，以下为精度优化项（非阻塞）

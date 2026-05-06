@@ -17,7 +17,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-CLI="${PROJECT_DIR}/zig-out/bin/mlx-zig"
+CLI="${PROJECT_DIR}/zig-out/bin/dmlx"
 
 # Smelt configuration (required for 48GB Mac)
 SMELT_FLAGS=(--smelt --smelt-strategy stream --smelt-experts 0.1)
@@ -96,7 +96,7 @@ if [ ! -d "${MODEL_PATH}" ]; then
 fi
 
 if [ ! -f "${CLI}" ]; then
-    echo "📦 Building mlx-zig..."
+    echo "📦 Building dmlx..."
     (cd "${PROJECT_DIR}" && zig build -Doptimize=ReleaseFast) || {
         echo -e "${RED}❌ Build failed${NC}"
         exit 1

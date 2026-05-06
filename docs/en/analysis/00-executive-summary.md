@@ -10,7 +10,7 @@
 
 ## Project Positioning
 
-MLX-Zig is a full-stack LLM inference and training system built on Apple MLX C bindings (`mlx-c`), written in Zig and targeting macOS Apple Silicon. The project has undergone a significant transition from prototype to production-grade, currently reaching feature depth comparable to Python vLLM/mlx-lm.
+dmlx is a full-stack LLM inference and training system built on Apple MLX C bindings (`mlx-c`), written in Zig and targeting macOS Apple Silicon. The project has undergone a significant transition from prototype to production-grade, currently reaching feature depth comparable to Python vLLM/mlx-lm.
 
 ## Core Conclusions
 

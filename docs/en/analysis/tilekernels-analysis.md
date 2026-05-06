@@ -1,7 +1,7 @@
-# TileKernels Deep Analysis and mlx-zig Reference Directions
+# TileKernels Deep Analysis and dmlx Reference Directions
 
 > Based on per-module audit of the DeepSeek TileKernels codebase, extracting its design philosophy and engineering practices,
-> identifying key patterns mlx-zig can adopt to fully leverage MLX's advantages on Apple Silicon.
+> identifying key patterns dmlx can adopt to fully leverage MLX's advantages on Apple Silicon.
 
 ---
 
@@ -115,13 +115,13 @@ model layer (directly replaces PyTorch standard layers)
 
 ---
 
-## Part 2: Key Patterns mlx-zig Can Adopt
+## Part 2: Key Patterns dmlx Can Adopt
 
-### Adoption 1: Operator Fusion — Solving mlx-zig's Biggest Performance Problem
+### Adoption 1: Operator Fusion — Solving dmlx's Biggest Performance Problem
 
 **TileKernels approach:** Fuse SwiGLU + quantization, RMSNorm + gating + residual etc. into single kernels.
 
-**mlx-zig current problem:** `nn.zig` layer implementations completely bypass MLX computation graph, using CPU scalar loops.
+**dmlx current problem:** `nn.zig` layer implementations completely bypass MLX computation graph, using CPU scalar loops.
 
 **Adoption plan:**
 
@@ -131,7 +131,7 @@ mlx-c already provides fused kernel entry points:
 - `mlx_fast_rope` — Fused RoPE
 - `mlx_fast_scaled_dot_product_attention` — Fused SDPA
 
-mlx-zig's `fast.zig` has already bound these functions, but `nn.zig` doesn't call them at all.
+dmlx's `fast.zig` has already bound these functions, but `nn.zig` doesn't call them at all.
 
 **Specific actions:**
 
@@ -150,7 +150,7 @@ pub fn forward(self: *RMSNorm, input: Array) !Array {
 Similarly, LLaMA Attention should call `fast.scaledDotProductAttention`,
 RoPE should call `fast.rope`.
 
-**Going further:** Referencing TileKernels' SwiGLU+quantization fusion pattern, mlx-zig can use
+**Going further:** Referencing TileKernels' SwiGLU+quantization fusion pattern, dmlx can use
 `mlx_compile` to compile multiple mlx-c operators into fused graphs:
 
 ```zig
@@ -159,7 +159,7 @@ const swiglu_closure = try Closure.init(swiGluForward, allocator);
 const compiled_swiglu = try compile.compile(swiglu_closure, false);
 ```
 
-### Adoption 2: Quantization Infrastructure — mlx-zig's QLoRA Roadmap
+### Adoption 2: Quantization Infrastructure — dmlx's QLoRA Roadmap
 
 **TileKernels approach:**
 
@@ -179,7 +179,7 @@ class CastOutputConfig:
     use_packed_ue8m0: bool           # Whether to use packed format
 ```
 
-**mlx-zig current state:** Quantization infrastructure fully implemented (affine/MXFP4/FP8), QLoRA implemented.
+**dmlx current state:** Quantization infrastructure fully implemented (affine/MXFP4/FP8), QLoRA implemented.
 
 **Adoption plan:**
 
@@ -213,7 +213,7 @@ Each stage has optimized kernels:
 - `normalize_weight`: Routing weight normalization
 - `aux_fi`: Load balancing auxiliary loss
 
-**mlx-zig current state:** `models/deepseek_v4.zig` + `moe_router.zig` fully implement MoE routing pipeline.
+**dmlx current state:** `models/deepseek_v4.zig` + `moe_router.zig` fully implement MoE routing pipeline.
 
 **Adoption plan:**
 
@@ -247,12 +247,12 @@ Each optimized implementation has:
 3. Bias statistical checks (`check_bias`)
 4. Benchmark tools
 
-**mlx-zig current problem:** Zero test coverage for NN layers and Autograd.
+**dmlx current problem:** Zero test coverage for NN layers and Autograd.
 
 **Adoption plan:**
 
 1. Create Python MLX reference implementations for each NN layer, generate golden test data
-2. Zig tests load golden data, compare with mlx-zig output
+2. Zig tests load golden data, compare with dmlx output
 3. Reference TileKernels' `calc_diff` to implement numerical similarity checks:
 
 ```zig
@@ -279,9 +279,9 @@ fn calcDiff(x: []const f32, y: []const f32) f64 {
 used for attention weight matrix bistochastic normalization in Manifold HyperConnection.
 Includes complete forward and backward propagation implementations.
 
-**mlx-zig adoption value:**
+**dmlx adoption value:**
 
-This is a key component of the DeepSeek V4 architecture. If mlx-zig is to fully support DeepSeek V4,
+This is a key component of the DeepSeek V4 architecture. If dmlx is to fully support DeepSeek V4,
 Sinkhorn normalization needs to be implemented. Can use mlx-c operator combinations:
 
 ```zig
@@ -318,9 +318,9 @@ class EngramGateFn(torch.autograd.Function):
         # Call bwd kernel
 ```
 
-**mlx-zig adoption:**
+**dmlx adoption:**
 
-mlx-zig's `closure.zig` + `grad.zig` already provide similar mechanisms,
+dmlx's `closure.zig` + `grad.zig` already provide similar mechanisms,
 but current NN layers (Linear, LSTM, etc.) don't leverage them.
 
 Should implement closure-based forward for every layer that needs gradients,
@@ -364,20 +364,20 @@ MLX's compiler will automatically:
 TileKernels needs explicit CPU↔GPU data transfer management,
 while MLX's unified memory architecture naturally avoids this problem.
 
-mlx-zig should **stop** manipulating data on the CPU side via `dataSliceMut`,
+dmlx should **stop** manipulating data on the CPU side via `dataSliceMut`,
 letting all computation stay within MLX's lazy evaluation graph, with MLX deciding the optimal execution location.
 
 ### Metal Tile Groups
 
 MLX's Steel GEMM and Metal shader are already optimized for Apple Silicon's
 GPU architecture (TBDR, tile memory, SIMD groups).
-mlx-zig calling these optimized implementations via mlx-c is more reliable than hand-writing Metal shaders.
+dmlx calling these optimized implementations via mlx-c is more reliable than hand-writing Metal shaders.
 
 ---
 
 ## Part 4: Specific Action Items
 
-| Priority | Action | Reference TileKernels | mlx-zig Implementation |
+| Priority | Action | Reference TileKernels | dmlx Implementation |
 |--------|------|-----------------|-----------------|
 | P0 | NN layers switch to mlx-c operators | All kernels go through GPU | Call `fast.zig` bindings |
 | P0 | Enable `mlx_compile` fusion | SwiGLU+cast fusion | `compile.compile(closure)` |

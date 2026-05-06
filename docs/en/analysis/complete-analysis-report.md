@@ -1,4 +1,4 @@
-# mlx-zig DeepSeek V4 Flash — Complete Analysis Report
+# dmlx DeepSeek V4 Flash — Complete Analysis Report
 # Date: 2026-05-03 (Revised)
 # Baseline: mlx-lm `hyper_connection.py` + `deepseek_v4.py`
 

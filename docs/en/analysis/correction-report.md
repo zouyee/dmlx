@@ -1,4 +1,4 @@
-# MLX-Zig Analysis Report Corrections and Verification
+# dmlx Analysis Report Corrections and Verification
 
 > Verification Date: 2026-05-03  
 > Verification Method: Line-by-line source code review, re-counting key metrics
@@ -202,23 +202,23 @@ Update the following files in `analysis-report/`:
 
 ### 6.1 Problem Description
 
-When using the `mlx-zig` CLI to run models of **0.6B parameters or larger**, the system terminates the process due to out-of-memory (OOM):
+When using the `dmlx` CLI to run models of **0.6B parameters or larger**, the system terminates the process due to out-of-memory (OOM):
 
 ```bash
-$ mlx-zig chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
+$ dmlx chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
 ...
 Killed: 9  # SIGKILL, system OOM termination
 ```
 
 ### 6.2 Verification Matrix
 
-| Model | Size | mlx-zig CLI | Python mlx-lm | Conclusion |
+| Model | Size | dmlx CLI | Python mlx-lm | Conclusion |
 |------|------|-------------|---------------|------|
 | Qwen2.5-0.5B-Instruct | 0.5B | ✅ Runs fine | ✅ Runs fine | Baseline |
-| Qwen3-0.6B-4bit | 0.6B | ❌ **Killed: 9** | ✅ Runs fine | **mlx-zig-only defect** |
+| Qwen3-0.6B-4bit | 0.6B | ❌ **Killed: 9** | ✅ Runs fine | **dmlx-only defect** |
 | Qwen3-1.7B-4bit | 1.7B | ❌ **Killed: 9** | Not tested | Same as above |
 
-**Key Comparison**: Same machine, same model, Python `mlx-lm` runs fine while `mlx-zig` is killed by OOM.
+**Key Comparison**: Same machine, same model, Python `mlx-lm` runs fine while `dmlx` is killed by OOM.
 
 ### 6.3 Root Cause Analysis
 
@@ -254,6 +254,6 @@ Original Report: "mlx_default_cpu_stream_new() 60+ creates without freeing"
 
 **Verification Method**: After fixing, re-run:
 ```bash
-mlx-zig chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
+dmlx chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
 # Expected: normal output "9", no more Killed: 9
 ```

@@ -703,7 +703,7 @@ test "checkSimilarity with int4 precision allows larger deviations" {
 // End-to-end TinyLlama golden test (conditional — skipped if golden data absent)
 //
 // This test loads pre-generated TinyLlama output tokens from the golden
-// directory and compares them against mlx-zig inference output. Since
+// directory and compares them against dmlx inference output. Since
 // TinyLlama model weights are large and may not be available in CI,
 // the test is skipped when golden data files are not present.
 //

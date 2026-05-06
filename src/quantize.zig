@@ -740,7 +740,6 @@ test "quantizedMatmul produces correct output shape" {
     try std.testing.expectEqual(@as(i32, 64), result_shape[1]);
 }
 
-
 test "gatherQmm with mxfp4 mode" {
     c.initErrorHandler();
     const allocator = std.testing.allocator;

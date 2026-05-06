@@ -1,6 +1,6 @@
-# MLX-Zig Project Roadmap
+# DMLX Project Roadmap
 
-> Based on deep audit of the mlx-zig codebase and systematic analysis of five projects: vLLM,
+> Based on deep audit of the dmlx codebase and systematic analysis of five projects: vLLM,
 > mlx-lm, oMLX, TileKernels, and mlx-rs. Defines the complete path from current state to
 > production-grade deployment.
 
@@ -34,7 +34,7 @@
 
 ---
 
-## 1. MLX-Zig Current State Overview (Updated 2026-04-26)
+## 1. DMLX Current State Overview (Updated 2026-04-26)
 
 ### Existing Capabilities
 
@@ -71,14 +71,14 @@
 
 ## 2. Key Architecture Lessons from External Projects
 
-> **Note**: The "mlx-zig counterpart" descriptions below describe the original state before
+> **Note**: The "dmlx counterpart" descriptions below describe the original state before
 > implementation. All mentioned missing features have been implemented in Phase 0-5 + Task 13-22.
 > Current state is reflected in the progress tracking table above.
 
 ### vLLM — The Gold Standard for Industrial Inference Engines
 
 vLLM is the most mature LLM inference engine. Its architecture defines the standard for production-grade inference.
-Below are the core mechanisms mlx-zig must understand and leverage:
+Below are the core mechanisms dmlx must understand and leverage:
 
 #### PagedAttention
 
@@ -93,7 +93,7 @@ block_size = 2 * block_size_tokens * num_kv_heads * head_size * dtype_bytes
 - Supports Copy-on-Write (multiple requests share blocks during prefix sharing)
 - Blocks can be reclaimed and reused by new requests
 
-**mlx-zig counterpart**: `kvcache/paged.zig` is the skeleton; full block alloc/free/CoW needed.
+**dmlx counterpart**: `kvcache/paged.zig` is the skeleton; full block alloc/free/CoW needed.
 
 #### Continuous Batching
 
@@ -105,7 +105,7 @@ ensuring each sequence only attends to its own tokens. New requests can join at 
  ← 3 sequences of different lengths concatenated →
 ```
 
-**mlx-zig counterpart**: `server.zig` processes requests serially; needs a batch scheduler.
+**dmlx counterpart**: `server.zig` processes requests serially; needs a batch scheduler.
 
 #### Scheduler Three-Phase Loop
 
@@ -114,14 +114,14 @@ Each engine step:
 2. **Forward** — Execute model forward propagation + sampling
 3. **Postprocess** — Append tokens, check stop conditions, release blocks for completed requests
 
-**mlx-zig counterpart**: Current `generate` is a single-request loop; needs refactoring to scheduler-driven.
+**dmlx counterpart**: Current `generate` is a single-request loop; needs refactoring to scheduler-driven.
 
 #### Chunked Prefill
 
 Long prompt prefill split into multiple chunks (e.g., 8 tokens each),
 preventing a single long request from monopolizing engine steps and reducing latency for other requests.
 
-**mlx-zig counterpart**: No equivalent mechanism currently.
+**dmlx counterpart**: No equivalent mechanism currently.
 
 #### Prefix Caching
 
@@ -132,7 +132,7 @@ Requests with matching prefixes can reuse already-computed KV cache blocks, skip
 hash(block) = hash(prev_block_hash, token_ids, metadata)
 ```
 
-**mlx-zig counterpart**: `kvcache/radix.zig` has skeleton; hash-based lookup not yet implemented.
+**dmlx counterpart**: `kvcache/radix.zig` has skeleton; hash-based lookup not yet implemented.
 
 #### Speculative Decoding
 
@@ -141,18 +141,18 @@ Accept/reject guarantees statistical equivalence to token-by-token sampling.
 
 vLLM V1 supports: n-gram, EAGLE, Medusa — three draft methods.
 
-**mlx-zig counterpart**: Completely missing.
+**dmlx counterpart**: Completely missing.
 
 #### Guided Decoding
 
 Use FSM (Finite State Machine) to mask logits at each step,
 ensuring output conforms to specified grammar (JSON schema, regex, etc.).
 
-**mlx-zig counterpart**: Completely missing.
+**dmlx counterpart**: Completely missing.
 
 ### mlx-lm — The MLX Ecosystem Reference Implementation
 
-- **50+ model architecture** registry vs mlx-zig's 2
+- **50+ model architecture** registry vs dmlx's 2
 - **Three-tier generation architecture**: `generate_step` → `stream_generate` → `generate`
 - **Prompt cache persistence** to safetensors
 - **Quantization suite**: GPTQ / AWQ / DWQ
@@ -502,7 +502,7 @@ CLI exposed as `--max-kv-size auto` (default) or `--max-kv-size 32768` (manual).
 #### 5.4 Benchmark Tool (Based on vLLM + mlx-lm)
 
 ```bash
-mlx-zig benchmark --model <path> --input-tokens 32 --output-tokens 128
+dmlx benchmark --model <path> --input-tokens 32 --output-tokens 128
 # Output: TTFT, ITL, throughput, memory usage
 ```
 
@@ -526,7 +526,7 @@ fn checkBias(x: []const f32, ref: []const f32) !void {
 ### Golden Tests
 
 1. Python MLX generates reference outputs (each NN layer, each activation, each loss)
-2. Zig tests load reference data, compare against mlx-zig output
+2. Zig tests load reference data, compare against dmlx output
 3. CI runs automatically
 
 ### End-to-End Verification
@@ -624,7 +624,7 @@ fn checkBias(x: []const f32, ref: []const f32) !void {
 ## 8. KV Cache Architecture Overview (Apple Silicon Deep Optimization)
 
 > Based on Apple Silicon UMA characteristics, mlx-lm best practices, DeepSeek V4 technical report,
-> TurboQuant paper (arXiv:2504.19874), defining mlx-zig's final KV Cache architecture.
+> TurboQuant paper (arXiv:2504.19874), defining dmlx's final KV Cache architecture.
 
 ### 8.1 Final Architecture Diagram
 

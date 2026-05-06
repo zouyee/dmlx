@@ -117,7 +117,7 @@ if (prompt_tokens[0] != 100000) {
 
 **手动检查：**
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 查找如下输出：
@@ -243,8 +243,8 @@ git log --oneline -2
 - `e11c3b9` - 文档
 
 **日期：** 2026-04-29  
-**报告人：** mlx-zig 团队  
-**负责人：** mlx-zig 团队  
+**报告人：** dmlx 团队  
+**负责人：** dmlx 团队  
 **优先级：** 紧急  
 **解决方案：** 已修复
 

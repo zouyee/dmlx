@@ -8,7 +8,7 @@
 
 ## 1. Architecture Overview
 
-MLX-Zig's continuous batching architecture follows a **three-phase Engine Step loop**:
+dmlx's continuous batching architecture follows a **three-phase Engine Step loop**:
 
 ```
                    ┌──────────────────────────────────────────┐
@@ -462,7 +462,7 @@ engineLoop (async fiber):
 
 ## 11. Comparison with oMLX
 
-| Dimension | oMLX | mlx-zig (current) | mlx-zig (target) |
+| Dimension | oMLX | dmlx (current) | dmlx (target) |
 |-----------|------|-------------------|------------------|
 | **Language** | Python | Zig | Zig |
 | **Batch engine** | mlx-lm `BatchGenerator` | Custom `BatchBuilder` | Same |

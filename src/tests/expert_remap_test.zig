@@ -9,12 +9,12 @@ const EagerContext = ops.EagerContext;
 test "mlx_take remap with 2D indices - exact scenario from logs" {
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
-    
+
     // Simulate the exact scenario from debug logs:
     // Router selected: [87, 0, 31, 0, 22, 0]
     // Unique experts (sorted): [0, 22, 31, 87]
     // Remap: remap[0]=0, remap[22]=1, remap[31]=2, remap[87]=3
-    
+
     // Build remap array (256 elements, most are 0 as fallback)
     var remap_data = try allocator.alloc(i32, 256);
     defer allocator.free(remap_data);
@@ -23,45 +23,44 @@ test "mlx_take remap with 2D indices - exact scenario from logs" {
     remap_data[22] = 1;
     remap_data[31] = 2;
     remap_data[87] = 3;
-    
+
     const remap = try Array.fromData(allocator, i32, remap_data, &[_]i32{256});
     defer remap.deinit();
-    
+
     // Indices as 2D array [1, 6] - matching the actual shape from logs
     const indices_data = [_]u32{ 87, 0, 31, 0, 22, 0 };
-    const indices = try Array.fromData(allocator, u32, &indices_data, &[_]i32{1, 6});
+    const indices = try Array.fromData(allocator, u32, &indices_data, &[_]i32{ 1, 6 });
     defer indices.deinit();
-    
+
     // Perform mlx_take (same as in streamingForward)
     var remapped_raw = c.c.mlx_array_new();
     try c.check(c.c.mlx_take(&remapped_raw, remap.inner, indices.inner, ctx.stream.inner));
     const remapped = Array.fromHandle(remapped_raw);
     defer remapped.deinit();
     try remapped.eval();
-    
+
     // Convert to u32 for easier comparison (same as in streamingForward)
     const remapped_u32 = try ops.astype(ctx, remapped, .uint32);
     defer remapped_u32.deinit();
     try remapped_u32.eval();
-    
+
     // Check results using dataSlice (same method as in streamingForward)
     const result = try remapped_u32.dataSlice(u32);
-    
+
     std.debug.print("\nTest results:\n", .{});
     std.debug.print("indices:  {any}\n", .{indices_data});
     std.debug.print("remapped: {any}\n", .{result[0..6]});
     std.debug.print("expected: [3, 0, 2, 0, 1, 0]\n", .{});
-    
+
     // Verify each element
     std.debug.print("\nPer-element verification:\n", .{});
     for (indices_data, 0..) |idx, i| {
         const expected = remap_data[idx];
         const actual = @as(i32, @intCast(result[i]));
         const match = if (expected == actual) "✓" else "✗";
-        std.debug.print("  [{d}]: indices={d} → remap[{d}]={d}, got {d} {s}\n", 
-            .{ i, idx, idx, expected, actual, match });
+        std.debug.print("  [{d}]: indices={d} → remap[{d}]={d}, got {d} {s}\n", .{ i, idx, idx, expected, actual, match });
     }
-    
+
     // Assert expected values
     try std.testing.expectEqual(@as(u32, 3), result[0]); // remap[87] = 3
     try std.testing.expectEqual(@as(u32, 0), result[1]); // remap[0] = 0
@@ -74,7 +73,7 @@ test "mlx_take remap with 2D indices - exact scenario from logs" {
 test "mlx_take remap with 1D indices - control test" {
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
-    
+
     // Same remap as above
     var remap_data = try allocator.alloc(i32, 256);
     defer allocator.free(remap_data);
@@ -83,32 +82,32 @@ test "mlx_take remap with 1D indices - control test" {
     remap_data[22] = 1;
     remap_data[31] = 2;
     remap_data[87] = 3;
-    
+
     const remap = try Array.fromData(allocator, i32, remap_data, &[_]i32{256});
     defer remap.deinit();
-    
+
     // Indices as 1D array [6] - flattened version
     const indices_data = [_]u32{ 87, 0, 31, 0, 22, 0 };
     const indices = try Array.fromData(allocator, u32, &indices_data, &[_]i32{6});
     defer indices.deinit();
-    
+
     // Perform mlx_take
     var remapped_raw = c.c.mlx_array_new();
     try c.check(c.c.mlx_take(&remapped_raw, remap.inner, indices.inner, ctx.stream.inner));
     const remapped = Array.fromHandle(remapped_raw);
     defer remapped.deinit();
     try remapped.eval();
-    
+
     const remapped_u32 = try ops.astype(ctx, remapped, .uint32);
     defer remapped_u32.deinit();
     try remapped_u32.eval();
-    
+
     const result = try remapped_u32.dataSlice(u32);
-    
+
     std.debug.print("\n1D Control test results:\n", .{});
     std.debug.print("indices:  {any}\n", .{indices_data});
     std.debug.print("remapped: {any}\n", .{result[0..6]});
-    
+
     // Assert expected values
     try std.testing.expectEqual(@as(u32, 3), result[0]);
     try std.testing.expectEqual(@as(u32, 0), result[1]);

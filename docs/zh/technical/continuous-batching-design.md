@@ -8,7 +8,7 @@
 
 ## 1. 架构总览
 
-MLX-Zig 的 continuous batching 架构基于 **三阶段 Engine Step 循环**：
+dmlx 的 continuous batching 架构基于 **三阶段 Engine Step 循环**：
 
 ```
                    ┌──────────────────────────────────────────┐
@@ -462,7 +462,7 @@ engineLoop (异步 fiber):
 
 ## 11. 与 oMLX 对比
 
-| 维度 | oMLX | mlx-zig（当前） | mlx-zig（目标） |
+| 维度 | oMLX | dmlx（当前） | dmlx（目标） |
 |-----------|------|-------------------|---------------------|
 | **语言** | Python | Zig | Zig |
 | **批引擎** | mlx-lm `BatchGenerator` | 自定义 `BatchBuilder` | 同当前 |

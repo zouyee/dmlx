@@ -2,7 +2,7 @@
 
 ## 1.1 六层架构
 
-MLX-Zig 采用六层架构（引自 `.kiro/specs/production-deployment/design.md`）：
+dmlx 采用六层架构（引自 `.kiro/specs/production-deployment/design.md`）：
 
 ```
 ┌─────────────────────────────────────────┐

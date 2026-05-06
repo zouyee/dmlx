@@ -1,4 +1,4 @@
-# mlx-zig 竞争优势分析
+# dmlx 竞争优势分析
 
 > 相较于 mlx-lm (Python)、oMLX (Python)、llama.cpp (C++)、LM Studio (Electron) 的核心差异化优势。
 > 更新于 2026-05-05 — 包含 DeepSeek V4 benchmark (commit `7e72a07`) 和修正发现。
@@ -10,7 +10,7 @@
 ### 小模型 (TinyLlama / Qwen2.5)
 
 ```bash
-$ ./mlx-zig chat --model ~/models/TinyLlama-1.1B-Chat-v1.0-4bit --prompt "Hi" --max-tokens 4
+$ ./dmlx chat --model ~/models/TinyLlama-1.1B-Chat-v1.0-4bit --prompt "Hi" --max-tokens 4
 info: Loading model from /Users/zouyee/models/TinyLlama-1.1B-Chat-v1.0-4bit...
 horses Adhtml Is
 ```
@@ -38,14 +38,14 @@ $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, tempe
 | 7-prompt 正确率 | **7/7 PASS** |
 
 > **核心结论**：这是唯一能在 48GB Mac 上运行 DeepSeek V4 的平台。
-> mlx-lm 需要加载全部 ~40GB 4-bit 权重 → 48GB 机器 OOM。mlx-zig 的 SMELT 系统
+> mlx-lm 需要加载全部 ~40GB 4-bit 权重 → 48GB 机器 OOM。dmlx 的 SMELT 系统
 > 将同一模型的权重降至 ~6GB + KV cache。
 
 ### 已知问题：小模型上的 Stream 泄漏
 
 来自 [CORRECTION_REPORT.md](../correction-report.md) (2026-05-03):
 
-| 模型 | 大小 | mlx-zig CLI | Python mlx-lm |
+| 模型 | 大小 | dmlx CLI | Python mlx-lm |
 |------|------|-------------|---------------|
 | Qwen2.5-0.5B-Instruct | 0.5B | ✅ 正常运行 | ✅ 正常运行 |
 | Qwen3-0.6B-4bit | 0.6B | ❌ Killed: 9 (OOM) | ✅ 正常运行 |
@@ -57,10 +57,10 @@ $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, tempe
 
 ## 一、小规格 Mac 优势（杀手级特性）
 
-在 **48GB Apple Silicon Mac** 上，mlx-zig 是唯一能运行 DeepSeek V4 (671B MoE) 的平台。
+在 **48GB Apple Silicon Mac** 上，dmlx 是唯一能运行 DeepSeek V4 (671B MoE) 的平台。
 这不是速度优势 — 这是 **「能跑 vs 不能跑」的质变**。
 
-| 场景 | mlx-zig | mlx-lm | llama.cpp | LM Studio |
+| 场景 | dmlx | mlx-lm | llama.cpp | LM Studio |
 |------|---------|--------|-----------|-----------|
 | DeepSeek V4 on 48GB | ✅ ~6GB (SMELT 15%) | ❌ OOM (~40GB needed) | ❌ MoE/Metal 支持有限 | ❌ 不支持 |
 | DeepSeek V4 on 96GB+ | ✅ | ✅ (内存足够时) | ⚠️ 有限 | ❌ |
@@ -78,7 +78,7 @@ $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, tempe
 
 | 方案 | 语言 | GC | 推理延迟抖动 |
 |------|------|-----|-------------|
-| mlx-zig | Zig | 无 GC | 亚毫秒级确定性 |
+| dmlx | Zig | 无 GC | 亚毫秒级确定性 |
 | mlx-lm | Python | Python GC | 10-100ms 随机停顿 |
 | oMLX | Python | Python GC | 同上 |
 | llama.cpp | C++ | 无 GC | 确定性（但无 MLX 加速）|
@@ -96,8 +96,8 @@ $ bash scripts/run_benchmark.sh  # smelt + stream 模式, ExpertCache 4GB, tempe
 ### 3. 单二进制部署
 
 ```bash
-# mlx-zig：一个二进制文件，零依赖
-./mlx-zig serve --model ./model --port 8080
+# dmlx：一个二进制文件，零依赖
+./dmlx serve --model ./model --port 8080
 
 # mlx-lm：需要 Python 环境 + pip 依赖
 pip install mlx-lm
@@ -121,7 +121,7 @@ omlx serve --model ./model
 
 ### 对比 mlx-lm
 
-| 特性 | mlx-zig | mlx-lm |
+| 特性 | dmlx | mlx-lm |
 |------|---------|--------|
 | KV 量化 | ✅ 4/8-bit + MXFP4 + FP8 + **TurboQuant** | ✅ 4/8-bit |
 | Paged Attention | ✅ block alloc/free/CoW/prefix hash | ❌ 连续内存 |
@@ -133,7 +133,7 @@ omlx serve --model ./model
 
 ### 对比 llama.cpp
 
-| 特性 | mlx-zig | llama.cpp |
+| 特性 | dmlx | llama.cpp |
 |------|---------|-----------|
 | 后端 | Metal (MLX 原生) | Metal (自实现 kernel) |
 | KV 量化 | ✅ mlx_quantize 原生 | ✅ 自实现 |
@@ -146,7 +146,7 @@ omlx serve --model ./model
 
 ## 四、DeepSeek V4 支持深度
 
-| V4 特性 | mlx-zig | mlx-lm | llama.cpp |
+| V4 特性 | dmlx | mlx-lm | llama.cpp |
 |----------|---------|--------|-----------|
 | CSA 4x 压缩 | ✅ learned softmax-gated pooling | ✅ | ❌ |
 | HCA 128x 压缩 | ✅ | ✅ | ❌ |
@@ -165,7 +165,7 @@ omlx serve --model ./model
 
 ## 五、量化栈深度
 
-| 量化方案 | mlx-zig | mlx-lm | llama.cpp |
+| 量化方案 | dmlx | mlx-lm | llama.cpp |
 |----------|---------|--------|-----------|
 | Affine INT4/INT8 | ✅ | ✅ | ✅ (Q4_K_M) |
 | MXFP4 (E2M1) | ✅ | ✅ (v0.29+) | ❌ |
@@ -176,14 +176,14 @@ omlx serve --model ./model
 | gatherQmm (indexed) | ✅ | ✅ | ❌ |
 | mlx-lm 量化模型直接加载 | ✅ | ✅ | ❌ |
 
-TurboQuant 是 mlx-zig 独有 — 基于 arXiv:2504.19874 论文，提供理论最优的 KV cache 量化
+TurboQuant 是 dmlx 独有 — 基于 arXiv:2504.19874 论文，提供理论最优的 KV cache 量化
 （3.5-bit 无损，无偏内积估计）。
 
 ---
 
 ## 六、并发模型
 
-mlx-zig 使用 Zig 0.16.0 `std.Io.async`：
+dmlx 使用 Zig 0.16.0 `std.Io.async`：
 - 底层：macOS GCD (Grand Central Dispatch)
 - 每个 HTTP 连接在独立 async fiber 中处理
 - Engine loop 作为后台 fiber 驱动 Scheduler
@@ -228,18 +228,18 @@ mlx-zig 使用 Zig 0.16.0 `std.Io.async`：
 
 ## 九、定位总结
 
-mlx-zig 不是 mlx-lm 的替代品，而是面向不同场景的互补方案：
+dmlx 不是 mlx-lm 的替代品，而是面向不同场景的互补方案：
 
 | 场景 | 最佳方案 | 原因 |
 |------|---------|------|
 | 快速原型/实验 | mlx-lm (Python) | 生态丰富，50+ 架构 |
-| **DeepSeek V4 on 48GB Mac** | **mlx-zig** | **唯一能跑的平台** |
-| 生产级 Mac 服务 | mlx-zig | 零 GC、单二进制、确定性延迟 |
-| iOS/macOS App 嵌入 | mlx-zig | C ABI、无 Python 运行时 |
-| 长上下文 Agent (128K+) | mlx-zig | Tiered KV Cache (RAM+SSD) |
+| **DeepSeek V4 on 48GB Mac** | **dmlx** | **唯一能跑的平台** |
+| 生产级 Mac 服务 | dmlx | 零 GC、单二进制、确定性延迟 |
+| iOS/macOS App 嵌入 | dmlx | C ABI、无 Python 运行时 |
+| 长上下文 Agent (128K+) | dmlx | Tiered KV Cache (RAM+SSD) |
 | 跨平台部署 | llama.cpp | Linux/Windows/Android |
 | 桌面 GUI 使用 | LM Studio | 开箱即用 |
 
-**一句话定位**：mlx-zig 是 Apple Silicon 上的 **边缘原生 LLM 引擎** — 
+**一句话定位**：dmlx 是 Apple Silicon 上的 **边缘原生 LLM 引擎** — 
 为部署而优化，而非仅为原型设计。其杀手级特性是通过内存优化，
 让前沿模型在消费级硬件上实用化 — 这是其他 MLX 平台无法提供的。

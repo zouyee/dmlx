@@ -1,4 +1,4 @@
-# MLX-Zig 分析报告修正与验证
+# dmlx 分析报告修正与验证
 
 > 验证日期：2026-05-03  
 > 验证方法：逐条核对源码，重新统计关键指标
@@ -202,23 +202,23 @@ const stream = c.c.mlx_default_cpu_stream_new();  // 行 80, 177, 404
 
 ### 6.1 问题描述
 
-使用 `mlx-zig` CLI 运行 **0.6B 及以上**模型时，系统因内存不足（OOM）终止进程：
+使用 `dmlx` CLI 运行 **0.6B 及以上**模型时，系统因内存不足（OOM）终止进程：
 
 ```bash
-$ mlx-zig chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
+$ dmlx chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
 ...
 Killed: 9  # SIGKILL，系统 OOM 终止
 ```
 
 ### 6.2 验证矩阵
 
-| 模型 | 大小 | mlx-zig CLI | Python mlx-lm | 结论 |
+| 模型 | 大小 | dmlx CLI | Python mlx-lm | 结论 |
 |------|------|-------------|---------------|------|
 | Qwen2.5-0.5B-Instruct | 0.5B | ✅ 正常运行 | ✅ 正常运行 | 基准 |
-| Qwen3-0.6B-4bit | 0.6B | ❌ **Killed: 9** | ✅ 正常运行 | **mlx-zig 独有缺陷** |
+| Qwen3-0.6B-4bit | 0.6B | ❌ **Killed: 9** | ✅ 正常运行 | **dmlx 独有缺陷** |
 | Qwen3-1.7B-4bit | 1.7B | ❌ **Killed: 9** | 未测试 | 同上 |
 
-**关键对比**：同一台机器、同一模型，Python `mlx-lm` 能正常运行，而 `mlx-zig` 被 OOM 杀死。
+**关键对比**：同一台机器、同一模型，Python `mlx-lm` 能正常运行，而 `dmlx` 被 OOM 杀死。
 
 ### 6.3 根因分析
 
@@ -254,6 +254,6 @@ Killed: 9  # SIGKILL，系统 OOM 终止
 
 **验证方法**：修复后重新运行：
 ```bash
-mlx-zig chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
+dmlx chat --model ~/models/Qwen3-0.6B-4bit --prompt "3*3=" --max-tokens 50
 # 预期：正常输出 "9"，不再 Killed: 9
 ```

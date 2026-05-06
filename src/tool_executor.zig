@@ -96,7 +96,7 @@ fn executeFileRead(allocator: std.mem.Allocator, config: ExecutorConfig, args_js
     const resolved = if (config.work_dir) |wd|
         try std.fs.path.resolve(allocator, &[_][]const u8{ wd, path })
     else
-        try std.fs.path.resolve(allocator, &[_][]const u8{ path });
+        try std.fs.path.resolve(allocator, &[_][]const u8{path});
     defer allocator.free(resolved);
 
     const dir = std.Io.Dir.cwd();
@@ -135,7 +135,7 @@ fn executeFileWrite(allocator: std.mem.Allocator, config: ExecutorConfig, args_j
     const resolved = if (config.work_dir) |wd|
         try std.fs.path.resolve(allocator, &[_][]const u8{ wd, path })
     else
-        try std.fs.path.resolve(allocator, &[_][]const u8{ path });
+        try std.fs.path.resolve(allocator, &[_][]const u8{path});
     defer allocator.free(resolved);
 
     // Ensure parent directory exists
@@ -166,9 +166,9 @@ fn executeFileWrite(allocator: std.mem.Allocator, config: ExecutorConfig, args_j
 // ============================================================
 
 const SHELL_WHITELIST = [_][]const u8{
-    "ls", "cat", "head", "tail", "grep", "find", "wc", "echo", "pwd", "mkdir",
-    "touch", "rm", "cp", "mv", "diff", "sort", "uniq", "date", "whoami",
-    "python3", "python", "zig", "git", "curl", "wget",
+    "ls",     "cat", "head", "tail", "grep", "find", "wc",   "echo", "pwd",    "mkdir",
+    "touch",  "rm",  "cp",   "mv",   "diff", "sort", "uniq", "date", "whoami", "python3",
+    "python", "zig", "git",  "curl", "wget",
 };
 
 fn executeShellExec(allocator: std.mem.Allocator, config: ExecutorConfig, args_json: []const u8) !ToolResult {
@@ -249,7 +249,7 @@ fn executeWebFetch(allocator: std.mem.Allocator, config: ExecutorConfig, args_js
     defer allocator.free(timeout_str);
 
     const run_result = std.process.run(allocator, io, .{
-        .argv = &[_][]const u8{ "curl", "-sL", "--max-time", timeout_str, "-A", "mlx-zig-tool/1.0", url },
+        .argv = &[_][]const u8{ "curl", "-sL", "--max-time", timeout_str, "-A", "dmlx-tool/1.0", url },
         .stdout_limit = .limited(10 * 1024 * 1024),
         .stderr_limit = .limited(1024 * 1024),
     }) catch |err| {
@@ -435,7 +435,7 @@ fn extractStringField(allocator: std.mem.Allocator, json: []const u8, key: []con
     defer allocator.free(pattern);
 
     const idx = std.mem.indexOf(u8, json, pattern) orelse return null;
-    const after = json[idx + pattern.len..];
+    const after = json[idx + pattern.len ..];
 
     var pos: usize = 0;
     while (pos < after.len and (after[pos] == ' ' or after[pos] == '\t' or after[pos] == '\n' or after[pos] == '\r' or after[pos] == ':')) {

@@ -1,4 +1,4 @@
-# mlx-zig 性能基准测试报告
+# dmlx 性能基准测试报告
 # 日期: 2026-05-06
 # Commit: 8ced50c (tuning)
 # 模型: DeepSeek-V4-Flash-4bit (~150GB, 33 shards)

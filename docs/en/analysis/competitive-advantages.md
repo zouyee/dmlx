@@ -1,4 +1,4 @@
-# mlx-zig Competitive Advantage Analysis
+# dmlx Competitive Advantage Analysis
 
 > Core differentiating advantages vs mlx-lm (Python), oMLX (Python), llama.cpp (C++), LM Studio (Electron).
 > Updated 2026-05-05 — includes DeepSeek V4 benchmark (commit `7e72a07`) and correction findings.
@@ -10,7 +10,7 @@
 ### Small Models (TinyLlama / Qwen2.5)
 
 ```bash
-$ ./mlx-zig chat --model ~/models/TinyLlama-1.1B-Chat-v1.0-4bit --prompt "Hi" --max-tokens 4
+$ ./dmlx chat --model ~/models/TinyLlama-1.1B-Chat-v1.0-4bit --prompt "Hi" --max-tokens 4
 info: Loading model from /Users/zouyee/models/TinyLlama-1.1B-Chat-v1.0-4bit...
 horses Adhtml Is
 ```
@@ -38,14 +38,14 @@ $ bash scripts/run_benchmark.sh  # smelt + stream mode, ExpertCache 4GB, tempera
 | 7-prompt correctness | **7/7 PASS** |
 
 > **Key takeaway**: This is the only platform that can run DeepSeek V4 on 48GB Macs at all.
-> mlx-lm requires loading all ~40GB of 4-bit weights → OOM on 48GB. mlx-zig's SMELT system
+> mlx-lm requires loading all ~40GB of 4-bit weights → OOM on 48GB. dmlx's SMELT system
 > runs the same model with ~6GB of weights + KV cache.
 
 ### Known Issue: Stream Leak on Smaller Models
 
 From [CORRECTION_REPORT.md](correction-report.md) (2026-05-03):
 
-| Model | Size | mlx-zig CLI | Python mlx-lm |
+| Model | Size | dmlx CLI | Python mlx-lm |
 |-------|------|-------------|---------------|
 | Qwen2.5-0.5B-Instruct | 0.5B | ✅ Runs fine | ✅ Runs fine |
 | Qwen3-0.6B-4bit | 0.6B | ❌ Killed: 9 (OOM) | ✅ Runs fine |
@@ -58,10 +58,10 @@ memory budget, leak's relative impact below OOM threshold). Fix in progress.
 
 ## I. The Small-Mac Advantage (Killer Feature)
 
-On **48GB Apple Silicon Macs**, mlx-zig is the only platform that can run DeepSeek V4 (671B MoE).
+On **48GB Apple Silicon Macs**, dmlx is the only platform that can run DeepSeek V4 (671B MoE).
 This is not a speed advantage — it's an **"it runs at all"** advantage.
 
-| Scenario | mlx-zig | mlx-lm | llama.cpp | LM Studio |
+| Scenario | dmlx | mlx-lm | llama.cpp | LM Studio |
 |----------|---------|--------|-----------|-----------|
 | DeepSeek V4 on 48GB | ✅ ~6GB (SMELT 15%) | ❌ OOM (~40GB needed) | ❌ MoE/Metal support limited | ❌ Not supported |
 | DeepSeek V4 on 96GB+ | ✅ | ✅ (if RAM sufficient) | ⚠️ Limited | ❌ |
@@ -79,7 +79,7 @@ is the difference between "OOM killed" and "7/7 benchmarks passing at 12.2 tok/s
 
 | Solution | Language | GC | Inference Latency Jitter |
 |----------|----------|------|-------------------------|
-| mlx-zig | Zig | No GC | Sub-millisecond deterministic |
+| dmlx | Zig | No GC | Sub-millisecond deterministic |
 | mlx-lm | Python | Python GC | 10-100ms random pauses |
 | oMLX | Python | Python GC | Same as above |
 | llama.cpp | C++ | No GC | Deterministic (but no MLX acceleration) |
@@ -97,8 +97,8 @@ For real-time Agent scenarios, per-token latency is predictable — no GC pause 
 ### 3. Single Binary Deployment
 
 ```bash
-# mlx-zig: one binary, zero dependencies
-./mlx-zig serve --model ./model --port 8080
+# dmlx: one binary, zero dependencies
+./dmlx serve --model ./model --port 8080
 
 # mlx-lm: requires Python environment + pip dependencies
 pip install mlx-lm
@@ -123,7 +123,7 @@ Enables embedding in Swift/ObjC Apps, XPC Service, macOS Framework packaging.
 
 ### vs mlx-lm
 
-| Feature | mlx-zig | mlx-lm |
+| Feature | dmlx | mlx-lm |
 |---------|---------|--------|
 | KV quantization | ✅ 4/8-bit + MXFP4 + FP8 + **TurboQuant** | ✅ 4/8-bit |
 | Paged Attention | ✅ block alloc/free/CoW/prefix hash | ❌ contiguous memory |
@@ -135,7 +135,7 @@ Enables embedding in Swift/ObjC Apps, XPC Service, macOS Framework packaging.
 
 ### vs llama.cpp
 
-| Feature | mlx-zig | llama.cpp |
+| Feature | dmlx | llama.cpp |
 |---------|---------|-----------|
 | Backend | Metal (MLX native) | Metal (self-implemented kernels) |
 | KV quantization | ✅ mlx_quantize native | ✅ self-implemented |
@@ -148,7 +148,7 @@ Enables embedding in Swift/ObjC Apps, XPC Service, macOS Framework packaging.
 
 ## IV. DeepSeek V4 Support Depth
 
-| V4 Feature | mlx-zig | mlx-lm | llama.cpp |
+| V4 Feature | dmlx | mlx-lm | llama.cpp |
 |------------|---------|--------|-----------|
 | CSA 4x compression | ✅ learned softmax-gated pooling | ✅ | ❌ |
 | HCA 128x compression | ✅ | ✅ | ❌ |
@@ -167,7 +167,7 @@ Enables embedding in Swift/ObjC Apps, XPC Service, macOS Framework packaging.
 
 ## V. Quantization Stack
 
-| Scheme | mlx-zig | mlx-lm | llama.cpp |
+| Scheme | dmlx | mlx-lm | llama.cpp |
 |--------|---------|--------|-----------|
 | Affine INT4/INT8 | ✅ | ✅ | ✅ (Q4_K_M) |
 | MXFP4 (E2M1) | ✅ | ✅ (v0.29+) | ❌ |
@@ -178,14 +178,14 @@ Enables embedding in Swift/ObjC Apps, XPC Service, macOS Framework packaging.
 | gatherQmm (indexed) | ✅ | ✅ | ❌ |
 | mlx-lm quant model direct load | ✅ | ✅ | ❌ |
 
-TurboQuant is mlx-zig unique — arXiv:2504.19874, theoretically optimal KV cache quantization
+TurboQuant is dmlx unique — arXiv:2504.19874, theoretically optimal KV cache quantization
 (3.5-bit lossless, unbiased inner product estimation).
 
 ---
 
 ## VI. Concurrency Model
 
-mlx-zig uses Zig 0.16.0 `std.Io.async`:
+dmlx uses Zig 0.16.0 `std.Io.async`:
 - Underlying: GCD (Grand Central Dispatch) on macOS
 - Each HTTP connection in independent async fiber
 - Engine loop drives Scheduler as background fiber
@@ -230,18 +230,18 @@ Priority expansion: Qwen3 (non-VL), GLM-4 MoE, GPT-OSS — covers most LM Studio
 
 ## IX. Positioning Summary
 
-mlx-zig is not a replacement for mlx-lm — it's a complementary solution for different scenarios:
+dmlx is not a replacement for mlx-lm — it's a complementary solution for different scenarios:
 
 | Scenario | Best Tool | Why |
 |----------|-----------|-----|
 | Quick prototyping | mlx-lm (Python) | Rich ecosystem, 50+ architectures |
-| **DeepSeek V4 on 48GB Mac** | **mlx-zig** | **Only platform that fits** |
-| Production Mac server | mlx-zig | Zero GC, single binary, deterministic latency |
-| iOS/macOS App embedding | mlx-zig | C ABI, no Python runtime |
-| Long-context Agent (128K+) | mlx-zig | Tiered KV Cache (RAM+SSD) |
+| **DeepSeek V4 on 48GB Mac** | **dmlx** | **Only platform that fits** |
+| Production Mac server | dmlx | Zero GC, single binary, deterministic latency |
+| iOS/macOS App embedding | dmlx | C ABI, no Python runtime |
+| Long-context Agent (128K+) | dmlx | Tiered KV Cache (RAM+SSD) |
 | Cross-platform deployment | llama.cpp | Linux/Windows/Android |
 | Desktop GUI | LM Studio | Ready to use |
 
-**One-line positioning**: mlx-zig is the **edge-native LLM engine** for Apple Silicon — 
+**One-line positioning**: dmlx is the **edge-native LLM engine** for Apple Silicon — 
 optimized for deployment, not just prototyping. Its killer feature is making frontier models
 practical on consumer hardware through memory optimization that no other MLX platform provides.

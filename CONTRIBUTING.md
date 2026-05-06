@@ -1,4 +1,4 @@
-# Contributing to MLX-Zig
+# Contributing to DMLX
 
 We want to make contributing to this project as easy and transparent as
 possible.
@@ -15,8 +15,8 @@ possible.
 
 ```bash
 # Clone
-git clone https://github.com/zouyee/mlx-zig.git
-cd mlx-zig
+git clone https://github.com/zouyee/dmlx.git
+cd dmlx
 
 # Build
 zig build
@@ -78,5 +78,5 @@ Use GitHub issues to report bugs. Please include:
 
 ## License
 
-By contributing to MLX-Zig, you agree that your contributions will be licensed
+By contributing to DMLX, you agree that your contributions will be licensed
 under the MIT License in the root directory of this source tree.

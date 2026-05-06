@@ -8,7 +8,7 @@
 
 ## Executive Summary
 
-Based on deep audit of Apple's official `mlx-lm/mlx_lm/models/deepseek_v4.py` (2153 lines) and mlx-zig's current capabilities (including `CustomMetalKernel` support), this document provides a 5-week executable optimization roadmap. Three key architectural differences between mlx-zig and mlx-lm drive the optimization strategy: (1) MoE weight format (fused vs split), (2) KV compression subsystem (stateful vs pure function), and (3) Indexer design (Apple redesign vs paper-original).
+Based on deep audit of Apple's official `mlx-lm/mlx_lm/models/deepseek_v4.py` (2153 lines) and dmlx's current capabilities (including `CustomMetalKernel` support), this document provides a 5-week executable optimization roadmap. Three key architectural differences between dmlx and mlx-lm drive the optimization strategy: (1) MoE weight format (fused vs split), (2) KV compression subsystem (stateful vs pure function), and (3) Indexer design (Apple redesign vs paper-original).
 
 Additionally, TurboQuant analysis identifies concrete steps for upgrading FP8 KV storage (now possible with new `mlx-c` 0.6.0 bindings) and a path toward optimal KV cache quantization.
 
@@ -31,34 +31,34 @@ v2 corrected 8 issues from v1; v3 corrected 3 factual errors (gatherMm already b
 
 #### 2.1 MoE Weight Format: Fused vs Split
 
-| Dimension | mlx-lm | mlx-zig |
+| Dimension | mlx-lm | dmlx |
 |-----------|--------|---------|
 | **Storage** | `switch_mlp.{gate,up,down}_proj.weight` as `[n_experts, out, in]` (fused) | Loader splits fused tensor into 256 independent experts (`ffn.experts.{e}.{w1,w2,w3}`) |
 | **Dispatch** | `mx.gather_mm` / `mx.gather_qmm` loads selected experts at once | Iterates 256 `DSV4Expert`, mask shorts experts with no tokens |
 | **Quantized state** | `QuantizedSwitchLinear` keeps MXFP4/affine packed, dequant inside kernel | Loader `mlx_dequantize` dequantizes to float16/float32 |
 
-**Conclusion:** mlx-zig MoE is `fused → split → dequantize → per-expert loop` path, opposite of mlx-lm's `fused → gather_mm`. Optimization requires **reverse refactoring**.
+**Conclusion:** dmlx MoE is `fused → split → dequantize → per-expert loop` path, opposite of mlx-lm's `fused → gather_mm`. Optimization requires **reverse refactoring**.
 
 #### 2.2 KV Compression Subsystem: Module State vs Pure Function
 
-| Dimension | mlx-lm | mlx-zig |
+| Dimension | mlx-lm | dmlx |
 |-----------|--------|---------|
 | **Structure** | `Compressor` is stateful `nn.Module` with `wkv`, `wgate`, `ape`, `norm` | `compressKV()` is pure function, weights from caller |
 | **Cache integration** | `Compressor.__call__` internally calls `cache.accumulate_windows` | `compressKV()` completely unaware of cache |
 | **Overlap** | `_overlap_transform` is member method, accesses `self.head_dim`, `self.overlap` | No overlap logic |
 
-**Conclusion:** mlx-zig lacks `Compressor` module and `DeepseekV4Cache` state machine. Not a simple `compressKV` function fix.
+**Conclusion:** dmlx lacks `Compressor` module and `DeepseekV4Cache` state machine. Not a simple `compressKV` function fix.
 
 #### 2.3 Indexer: Two Different Architectures
 
-| Dimension | mlx-lm `Indexer` | mlx-zig `LightningIndexer` |
+| Dimension | mlx-lm `Indexer` | dmlx `LightningIndexer` |
 |-----------|-------------------|---------------------------|
 | **Q projection** | `wq_b: Linear(q_lora_rank → n_heads * head_dim)` | `wq_index: [index_n_heads * index_head_dim, head_dim]` |
 | **K source** | **Internally nests `Compressor`** generating pooled | Directly receives external `k_compressed` |
 | **Scoring** | `q @ pooled^T`, `max(0, score)`, weighted by `weights_proj` | `q_index @ k_index^T`, scaled, mean over heads |
 | **FP4** | ❌ All bfloat16/float32 | ⚠️ Has `quantize4bit` simulation (should be removed) |
 
-**Conclusion:** Two Indexers have completely different weight shapes, input sources, and scoring logic. mlx-zig's `LightningIndexer` is closer to DeepSeek V3 paper design, while mlx-lm's is Apple's redesign.
+**Conclusion:** Two Indexers have completely different weight shapes, input sources, and scoring logic. dmlx's `LightningIndexer` is closer to DeepSeek V3 paper design, while mlx-lm's is Apple's redesign.
 
 ### 3. Priority Overview
 
@@ -83,7 +83,7 @@ v2 corrected 8 issues from v1; v3 corrected 3 factual errors (gatherMm already b
 | **mlx-lm reference** | `DeepseekV4SwitchGLU` (`deepseek_v4.py:125-155`), inherits `SwitchGLU` (`switch_layers.py:160-199`) |
 | **Key mechanism** | 1. `_gather_sort`: sort tokens by expert ID (`sort_threshold=8`, covers nearly all V4 cases)<br>2. `mx.gather_mm` / `mx.gather_qmm`: only load selected expert weights (fused `[n_experts, out, in]`)<br>3. `scores` multiplied **before** `down_proj`, reduces one reduce<br>4. `_scatter_unsort` restores original token order |
 | **Prerequisite** | ~~`mlx_gather_mm` Zig binding missing~~ — **v3 correction: `ops.zig:318` already has complete `pub fn gatherMm` binding** |
-| **mlx-zig actions** | 1. ~~Bind `mlx_gather_mm`~~ (done)<br>2. **Stop splitFusedExperts**: loader keeps `switch_mlp.weight` as `[n_experts, out, in]` fused<br>3. **Refactor DSV4MoE**: remove `DSV4Expert` array, use fused weights + `gatherMm`/`gatherQmm`<br>4. **Integrate sort**: `argsort` tokens by expert ID after routing, call gather with `sorted_indices=true`<br>5. **Pre-fuse scores**: multiply before down-proj |
+| **dmlx actions** | 1. ~~Bind `mlx_gather_mm`~~ (done)<br>2. **Stop splitFusedExperts**: loader keeps `switch_mlp.weight` as `[n_experts, out, in]` fused<br>3. **Refactor DSV4MoE**: remove `DSV4Expert` array, use fused weights + `gatherMm`/`gatherQmm`<br>4. **Integrate sort**: `argsort` tokens by expert ID after routing, call gather with `sorted_indices=true`<br>5. **Pre-fuse scores**: multiply before down-proj |
 | **Expected benefit** | **10-100x** expert computation speedup, eliminate redundant kernel launches, reduce VRAM fragmentation |
 | **Related files** | `src/models/deepseek_v4.zig:638-777`, `src/models/deepseek_v4_loader.zig:495-536`, `src/quantize.zig:323-358`, `src/ops.zig` |
 
@@ -94,7 +94,7 @@ v2 corrected 8 issues from v1; v3 corrected 3 factual errors (gatherMm already b
 | **Problem** | `compressKV` is pure function, no state management, two problems:<br>1. **No `_overlap_transform`**: CSA (ratio=4) layers lose block overlap, compressed blocks only aggregate `m` tokens not `2m`<br>2. **No `accumulate_windows`**: tail tokens directly discarded (`num_groups = prefix_len / compress_ratio`, remainder not buffered), generate phase L=1 can't accumulate |
 | **mlx-lm reference** | `Compressor` module (`deepseek_v4.py:1481-1551`), `DeepseekV4Cache.accumulate_windows` (`deepseek_v4.py:1028-1126`) |
 | **Key mechanism** | 1. `Compressor` as stateful module, internally calls `cache.accumulate_windows(kv, gate, state_key, ratio, start_pos)`<br>2. `_overlap_transform`: CSA concats `[prev_first, second_half]`, gate fills with `-inf`<br>3. `accumulate_windows`: maintains `buffer_kv`/`buffer_gate`, tail < `compress_ratio` preserved for next forward; supports variable-length batch (`lengths` + `right_padding`) |
-| **mlx-zig actions** | 1. **Introduce `Compressor` struct**: encapsulate `wkv`, `wgate`, `ape`, `norm`, `overlap` flag<br>2. **Introduce `DeepseekV4Cache`**: extend or add cache type, manage `local` + `compressor_state` + `indexer_state`<br>3. **Implement `_overlap_transform`**: add overlap branch in `Compressor` (only `compress_ratio == 4`)<br>4. **Implement `accumulate_windows`**: maintain buffer state in `DeepseekV4Cache` |
+| **dmlx actions** | 1. **Introduce `Compressor` struct**: encapsulate `wkv`, `wgate`, `ape`, `norm`, `overlap` flag<br>2. **Introduce `DeepseekV4Cache`**: extend or add cache type, manage `local` + `compressor_state` + `indexer_state`<br>3. **Implement `_overlap_transform`**: add overlap branch in `Compressor` (only `compress_ratio == 4`)<br>4. **Implement `accumulate_windows`**: maintain buffer state in `DeepseekV4Cache` |
 | **Expected benefit** | **CSA layer correctness fix** (otherwise attention loses half context), support arbitrary length input and correct generate phase accumulation |
 | **Related files** | `src/models/deepseek_v4.zig:1367-1441` (compressKV), `src/kvcache.zig`, `src/models/deepseek_v4.zig:1117-1234` (Attention forward) |
 
@@ -106,10 +106,10 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | mlx-zig uniformly uses `gatherBlocks → concat → dense SDPA` for all CSA layers, doesn't distinguish generate (L=1) and prefill (L>1). **Correctness issue**: generate phase L=1, compressed blocks gather semantics differ (applies last prefill's index result) |
+| **Problem** | dmlx uniformly uses `gatherBlocks → concat → dense SDPA` for all CSA layers, doesn't distinguish generate (L=1) and prefill (L>1). **Correctness issue**: generate phase L=1, compressed blocks gather semantics differ (applies last prefill's index result) |
 | **mlx-lm reference** | `V4Attention.__call__` (`deepseek_v4.py:1769-1794`) |
 | **Key mechanism** | - **L==1** (generate): `take_along_axis` gather selected pooled blocks, concat, standard `scaled_dot_product_attention`<br>- **L>1** (prefill): use `_sparse_pooled_attention` (`deepseek_v4.py:295-333`) |
-| **mlx-zig actions** | 1. Add `if (seq_len == 1)` gather + dense SDPA branch in `DSV4Attention.forward`<br>2. Implement `seq_len > 1` `_sparse_pooled_attention` equivalent path |
+| **dmlx actions** | 1. Add `if (seq_len == 1)` gather + dense SDPA branch in `DSV4Attention.forward`<br>2. Implement `seq_len > 1` `_sparse_pooled_attention` equivalent path |
 | **Expected benefit** | Decode phase correctness fix + latency reduction, prefill phase pooled computation reduction |
 | **Related files** | `src/models/deepseek_v4.zig:1113-1361` |
 
@@ -121,8 +121,8 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | `LightningIndexer.quantize4bit()` (`deepseek_v4.zig:905-986`) does `quantize(mxfp4) → dequantize → float32 matmul`, no speed or precision benefit. More importantly: mlx-zig `LightningIndexer` vs mlx-lm `Indexer` architectures are **completely different** (§2.3) |
-| **mlx-zig actions** | **Plan A (recommended)**: Align with mlx-lm Indexer — delete `LightningIndexer`, create `Indexer` struct (nest `Compressor`, `wq_b` projection, `weights_proj`); remove `quantize4bit`<br>**Plan B**: Keep paper-original Lightning Indexer, just remove `quantize4bit`, use bfloat16 matmul |
+| **Problem** | `LightningIndexer.quantize4bit()` (`deepseek_v4.zig:905-986`) does `quantize(mxfp4) → dequantize → float32 matmul`, no speed or precision benefit. More importantly: dmlx `LightningIndexer` vs mlx-lm `Indexer` architectures are **completely different** (§2.3) |
+| **dmlx actions** | **Plan A (recommended)**: Align with mlx-lm Indexer — delete `LightningIndexer`, create `Indexer` struct (nest `Compressor`, `wq_b` projection, `weights_proj`); remove `quantize4bit`<br>**Plan B**: Keep paper-original Lightning Indexer, just remove `quantize4bit`, use bfloat16 matmul |
 | **Expected benefit** | Code simplification, precision improvement, reference implementation alignment |
 | **Related files** | `src/models/deepseek_v4.zig:794-1056` |
 
@@ -136,7 +136,7 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 | **mlx-lm reference** | `_make_hc_sinkhorn_collapse_kernel` (`deepseek_v4.py:486-633`) and `_make_hc_split_sinkhorn_kernel` (`deepseek_v4.py:365-448`) |
 | **Key mechanism** | Single Metal dispatch, `simd_sum` column normalization, `bfloat4` vectorized load, FMA chain, branchless lanes |
 | **Prerequisite** | Metal 3.1+ (supports `bfloat16_t` and `vec<bfloat16_t, 4>`) |
-| **mlx-zig actions** | 1. Translate mlx-lm Metal source strings to Zig strings<br>2. Register `CustomMetalKernel` via `src/ops/custom_kernel.zig`<br>3. Trigger: `!training && hc_mult==4 && dtype==bfloat16 && gpu`<br>4. Static init kernel at module load (like mlx-lm's `_hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()`)<br>5. Fallback to existing ops path |
+| **dmlx actions** | 1. Translate mlx-lm Metal source strings to Zig strings<br>2. Register `CustomMetalKernel` via `src/ops/custom_kernel.zig`<br>3. Trigger: `!training && hc_mult==4 && dtype==bfloat16 && gpu`<br>4. Static init kernel at module load (like mlx-lm's `_hc_sinkhorn_collapse_kernel = _make_hc_sinkhorn_collapse_kernel()`)<br>5. Fallback to existing ops path |
 | **Expected benefit** | mHC forward pass reduces 80%+ kernel launch overhead, 43-layer cumulative effect significant |
 | **Related files** | `src/models/deepseek_v4.zig:1861-1899`, `src/ops/custom_kernel.zig` |
 
@@ -147,7 +147,7 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 | **Problem** | `compressKV` uses uniform gated pooling for all `compress_ratio > 1`, doesn't distinguish CSA (4x) and HCA (128x) |
 | **mlx-lm reference** | `Compressor.__init__` (`deepseek_v4.py:1483-1493`): `self.overlap = compress_ratio == 4`, `self.out_dim = head_dim * (2 if overlap else 1)` |
 | **Key mechanism** | CSA (4x): gated pool + overlap + Indexer, output `head_dim * 2`<br>HCA (128x): gated pool, no overlap, no Indexer, output `head_dim` |
-| **mlx-zig actions** | Select strategy by `compress_ratio` in `Compressor`: 128x layers simplified (no overlap, out_dim = head_dim) |
+| **dmlx actions** | Select strategy by `compress_ratio` in `Compressor`: 128x layers simplified (no overlap, out_dim = head_dim) |
 | **Expected benefit** | HCA layers avoid wasted computation, strict paper architecture alignment |
 | **Related files** | `src/models/deepseek_v4.zig` (refactored Compressor) |
 
@@ -155,8 +155,8 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | mlx-zig `sink_logits` **already aligned** with mlx-lm dense SDPA path (both pass to `fast_scaled_dot_product_attention` `sinks` param). Real difference in `_sparse_pooled_attention` path: mlx-lm manually concats sink to scores front (`deepseek_v4.py:319-324`), mlx-zig lacks sparse_pooled path |
-| **mlx-zig actions** | When implementing `_sparse_pooled_attention` equivalent path, explicitly concat sink as prefix to scores (`scores = concat([sink_scores, local_scores, pooled_scores])`) |
+| **Problem** | dmlx `sink_logits` **already aligned** with mlx-lm dense SDPA path (both pass to `fast_scaled_dot_product_attention` `sinks` param). Real difference in `_sparse_pooled_attention` path: mlx-lm manually concats sink to scores front (`deepseek_v4.py:319-324`), dmlx lacks sparse_pooled path |
+| **dmlx actions** | When implementing `_sparse_pooled_attention` equivalent path, explicitly concat sink as prefix to scores (`scores = concat([sink_scores, local_scores, pooled_scores])`) |
 | **Expected benefit** | sparse_pooled path behavior consistent with mlx-lm |
 | **Related files** | `src/models/deepseek_v4.zig:1089-1091`, `src/ops/fast.zig:39-47` |
 
@@ -164,9 +164,9 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | mlx-zig `DSV4YarnRoPE` may have separate `apply` and `applyInverse` methods, code duplication |
+| **Problem** | dmlx `DSV4YarnRoPE` may have separate `apply` and `applyInverse` methods, code duplication |
 | **mlx-lm reference** | `_apply_partial_rope(..., inverse=True)` (`deepseek_v4.py:266-284`) reuses same function |
-| **mlx-zig actions** | Merge `applyInverse` into `apply`, add `inverse: bool = false` param |
+| **dmlx actions** | Merge `applyInverse` into `apply`, add `inverse: bool = false` param |
 | **Expected benefit** | Reduce code duplication, lower maintenance cost |
 | **Related files** | `src/models/deepseek_v4.zig` (RoPE related) |
 
@@ -180,7 +180,7 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 |-----------|---------|
 | **Problem** | `loader.zig` (line 539-653) dequantizes all quantized weights (incl. experts) via `mlx_dequantize` to float16/float32. Expert weights are full precision at inference |
 | **mlx-lm reference** | `QuantizedSwitchLinear` (`switch_layers.py:27-90`): weights stay MXFP4/affine packed, dequant inside kernel via `mx.gather_qmm` |
-| **mlx-zig actions** | 1. Keep packed weight + scales at load (don't dequantize)<br>2. Use `gatherQmm` for expert matmul (`quantize.zig:324-358`)<br>3. Note: requires P0.1 fused format refactoring first (no split) |
+| **dmlx actions** | 1. Keep packed weight + scales at load (don't dequantize)<br>2. Use `gatherQmm` for expert matmul (`quantize.zig:324-358`)<br>3. Note: requires P0.1 fused format refactoring first (no split) |
 | **Expected benefit** | MoE expert weight memory to 1/4-1/8, relieve VRAM pressure |
 | **Related files** | `src/models/deepseek_v4_loader.zig:539-653`, `src/quantize.zig:324-358` |
 
@@ -188,9 +188,9 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | mlx-zig O-LoRA manually implements grouped matmul (`deepseek_v4.zig:1305-1358`), only float32/float16 path, **no quantized matmul** |
+| **Problem** | dmlx O-LoRA manually implements grouped matmul (`deepseek_v4.zig:1305-1358`), only float32/float16 path, **no quantized matmul** |
 | **mlx-lm reference** | `V4Attention._grouped_output_projection` (`deepseek_v4.py:1680-1709`): when `wo_a` is `QuantizedLinear`, uses `mx.quantized_matmul` |
-| **mlx-zig actions** | In grouped projection, detect if `wo_a` is quantized, if so call `quantizedMatmul` (`quantize.zig:259-285`) |
+| **dmlx actions** | In grouped projection, detect if `wo_a` is quantized, if so call `quantizedMatmul` (`quantize.zig:259-285`) |
 | **Expected benefit** | Quantized model end-to-end inference performance improvement |
 | **Related files** | `src/models/deepseek_v4.zig:1305-1358` |
 
@@ -206,8 +206,8 @@ Already fixed. `deepseek_v4_loader.zig:935` condition is `compress_ratio == 4`, 
 
 | Attribute | Content |
 |-----------|---------|
-| **Problem** | mlx-lm `sanitize` (`deepseek_v4.py:1992-2127`) handles FP4/FP8 custom dequant (`dequant_fp4`, `dequant_fp8`), naming remap (`w1→gate_proj`), and **independent expert → fused `switch_mlp` stack**. mlx-zig direction is opposite (fused → split) |
-| **mlx-zig actions** | 1. Confirm mlx-lm quant format (packed uint8 + scales specific layout) compatible with `mlx_dequantize`<br>2. With P0.1 refactoring, loader ultimately **stops split**, keeps fused (same direction as mlx-lm) |
+| **Problem** | mlx-lm `sanitize` (`deepseek_v4.py:1992-2127`) handles FP4/FP8 custom dequant (`dequant_fp4`, `dequant_fp8`), naming remap (`w1→gate_proj`), and **independent expert → fused `switch_mlp` stack**. dmlx direction is opposite (fused → split) |
+| **dmlx actions** | 1. Confirm mlx-lm quant format (packed uint8 + scales specific layout) compatible with `mlx_dequantize`<br>2. With P0.1 refactoring, loader ultimately **stops split**, keeps fused (same direction as mlx-lm) |
 | **Expected benefit** | 1:1 weight format compatibility with mlx-lm, reduce conversion overhead |
 | **Related files** | `src/models/deepseek_v4_loader.zig:471-661` |
 
@@ -244,16 +244,16 @@ Week 6 (P3) — Detail Polish
 | `deepseek_v4.py` | `mlx-lm/mlx_lm/models/deepseek_v4.py` | Official complete implementation (2153 lines) |
 | `switch_layers.py` | `mlx-lm/mlx_lm/models/switch_layers.py` | MoE SwitchGLU / gather_mm / gather_qmm |
 | `base.py` | `mlx-lm/mlx_lm/models/base.py` | `scaled_dot_product_attention` (sinks param) |
-| `custom_kernel.zig` | `mlx-zig/src/ops/custom_kernel.zig` | mlx-zig CustomMetalKernel (full API) |
-| `deepseek_v4.zig` | `mlx-zig/src/models/deepseek_v4.zig` | mlx-zig V4 implementation |
-| `deepseek_v4_loader.zig` | `mlx-zig/src/models/deepseek_v4_loader.zig` | Weight loading |
-| `moe_router.zig` | `mlx-zig/src/moe_router.zig` | MoE routing module (not integrated into DSV4MoE) |
-| `quantize.zig` | `mlx-zig/src/quantize.zig` | Quantization / gather_qmm |
+| `custom_kernel.zig` | `dmlx/src/ops/custom_kernel.zig` | dmlx CustomMetalKernel (full API) |
+| `deepseek_v4.zig` | `dmlx/src/models/deepseek_v4.zig` | dmlx V4 implementation |
+| `deepseek_v4_loader.zig` | `dmlx/src/models/deepseek_v4_loader.zig` | Weight loading |
+| `moe_router.zig` | `dmlx/src/moe_router.zig` | MoE routing module (not integrated into DSV4MoE) |
+| `quantize.zig` | `dmlx/src/quantize.zig` | Quantization / gather_qmm |
 | `ops.h` | `mlx-c/mlx/c/ops.h` | `mlx_gather_mm` / `mlx_gather_qmm` C API |
 
-### 10. Appendix: mlx-lm vs mlx-zig Capability Matrix
+### 10. Appendix: mlx-lm vs dmlx Capability Matrix
 
-| Feature | mlx-lm (Python) | mlx-zig | Gap | Notes |
+| Feature | mlx-lm (Python) | dmlx | Gap | Notes |
 |---------|-----------------|---------|-----|-------|
 | MoE gather_mm dispatch | ✅ `SwitchLinear` + `gather_mm` | ❌ split + per-expert loop | **High** | Need reverse refactoring |
 | CSA overlap transform | ✅ `Compressor._overlap_transform` | ❌ pure fn compressKV | **High** | Need Compressor module |
@@ -280,7 +280,7 @@ Week 6 (P3) — Detail Polish
 | P1 4.2 | Only mentioned "separate local/pooled" | Added L==1 branch; distinguished generate vs prefill |
 | P1 4.3 | Only mentioned "accumulate_windows" | Merged into P0 3.2 (Compressor + Cache refactoring) |
 | P3 6.1 | Misleading "sink_logits needs refactoring" | Noted dense path aligned; corrected to sparse_pooled sink concat |
-| P2 5.2 | Suggested "sanitize align + stack" | Noted mlx-zig direction opposite; changed to "stop split, keep fused" |
+| P2 5.2 | Suggested "sanitize align + stack" | Noted dmlx direction opposite; changed to "stop split, keep fused" |
 | New | — | §2 Key architectural differences (fused vs split, Compressor state, Indexer designs) |
 | New | — | P2.2 O-LoRA quantized path |
 | New | — | P2.3 Bind `mlx_gather_mm` |
@@ -289,7 +289,7 @@ Week 6 (P3) — Detail Polish
 
 ## Part 2: TurboQuant & FP8 Analysis (from turboquant-analysis.md)
 
-> Based on DeepSeek V4 technical report (2026-04-24) and TurboQuant paper (arXiv:2504.19874), combined with mlx-zig code audit (2026-04-26) and newly completed MXFP4/FP8 bindings.
+> Based on DeepSeek V4 technical report (2026-04-24) and TurboQuant paper (arXiv:2504.19874), combined with dmlx code audit (2026-04-26) and newly completed MXFP4/FP8 bindings.
 
 ### 1. Current Implementation Status Audit
 

@@ -14,7 +14,7 @@ pub const VAEConfig = struct {
     in_channels: usize = 3,
     out_channels: usize = 3,
     latent_channels: usize = 16,
-    block_out_channels: []const usize = &.{128, 256, 512},
+    block_out_channels: []const usize = &.{ 128, 256, 512 },
 };
 
 /// Minimal decoder: conv_in -> mid -> upsample -> conv_out.
@@ -155,7 +155,7 @@ test "VAEDecoder init and deinit" {
         .in_channels = 3,
         .out_channels = 3,
         .latent_channels = 16,
-        .block_out_channels = &.{128, 256, 512},
+        .block_out_channels = &.{ 128, 256, 512 },
     };
 
     var decoder = try VAEDecoder.init(allocator, config, ctx);
@@ -172,7 +172,7 @@ test "VAEDecoder decode shape" {
         .in_channels = 3,
         .out_channels = 3,
         .latent_channels = 16,
-        .block_out_channels = &.{128, 256, 512},
+        .block_out_channels = &.{ 128, 256, 512 },
     };
 
     var decoder = try VAEDecoder.init(allocator, config, ctx);

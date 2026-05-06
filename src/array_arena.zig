@@ -29,8 +29,6 @@ pub const ScopedArrayArena = struct {
         self.arrays.deinit(self.allocator);
     }
 
-
-
     /// Track an Array for later bulk release. Returns the same Array for chaining.
     pub fn track(self: *ScopedArrayArena, array: Array) !Array {
         try self.arrays.append(self.allocator, array);

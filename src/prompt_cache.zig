@@ -463,7 +463,7 @@ test "Property 5: Prompt Cache Round-Trip — save/load equality and mismatch er
         }
 
         // --- Save to temp file ---
-        const tmp_path = "/tmp/mlx_zig_pbt_prompt_cache.safetensors";
+        const tmp_path = "/tmp/dmlx_pbt_prompt_cache.safetensors";
         try savePromptCache(allocator, caches, tmp_path);
 
         // --- Load with matching config → verify element-wise equality ---

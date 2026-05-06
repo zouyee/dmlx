@@ -1,4 +1,4 @@
-/// MLX-Zig: Apple MLX bindings via mlx-c.
+/// DMLX: Apple MLX bindings via mlx-c.
 const std = @import("std");
 
 pub const dtype = @import("dtype.zig");

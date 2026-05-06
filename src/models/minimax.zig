@@ -440,7 +440,7 @@ pub const MiniMaxMoE = struct {
             for (0..self.topk) |k| {
                 const k_slice = try ops.slice(self.ctx, mask, &[_]i32{ 0, @intCast(k), 0 }, &[_]i32{ @intCast(batch * seq_len), @intCast(k + 1), 1 }, &[_]i32{});
                 defer k_slice.deinit();
-                const k_mask = try ops.reshape(self.ctx, k_slice, &[_]i32{ @intCast(batch * seq_len) });
+                const k_mask = try ops.reshape(self.ctx, k_slice, &[_]i32{@intCast(batch * seq_len)});
                 defer k_mask.deinit();
 
                 const mask_f32 = try ops.astype(self.ctx, k_mask, .float32);
@@ -456,7 +456,7 @@ pub const MiniMaxMoE = struct {
 
                 const k_weight = try ops.slice(self.ctx, weights, &[_]i32{ 0, @intCast(k) }, &[_]i32{ @intCast(batch * seq_len), @intCast(k + 1) }, &[_]i32{});
                 defer k_weight.deinit();
-                const k_weight_flat = try ops.reshape(self.ctx, k_weight, &[_]i32{ @intCast(batch * seq_len) });
+                const k_weight_flat = try ops.reshape(self.ctx, k_weight, &[_]i32{@intCast(batch * seq_len)});
                 defer k_weight_flat.deinit();
                 const k_weight_exp = try ops.expandDims(self.ctx, k_weight_flat, 1);
                 defer k_weight_exp.deinit();

@@ -1,4 +1,4 @@
-# MLX-Zig 文档导航 / Documentation
+# dmlx 文档导航 / Documentation
 
 > **核心叙事：小规格 Mac 运行大模型** — 48GB MacBook Pro 运行 671B DeepSeek V4 MoE
 > 

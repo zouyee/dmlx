@@ -1,12 +1,12 @@
-# MLX-Zig Differentiation Overview
+# dmlx Differentiation Overview
 
-> Competitive Analysis: mlx-zig's positioning in the macOS Apple Silicon LLM/VLM ecosystem
+> Competitive Analysis: dmlx's positioning in the macOS Apple Silicon LLM/VLM ecosystem
 
 ---
 
 ## Competitive Matrix
 
-| Dimension | mlx-zig (us) | Python MLX | mlx-vlm | llama.cpp | LM Studio | Ollama | vLLM | SGLang |
+| Dimension | dmlx (us) | Python MLX | mlx-vlm | llama.cpp | LM Studio | Ollama | vLLM | SGLang |
 |-----------|-------------|------------|---------|-----------|-----------|--------|------|--------|
 | **Form Factor** | Library + CLI | Python library | Python library | C++ library + CLI | GUI app | Container service | Python service | Python service |
 | **Target Platform** | macOS Apple Silicon | macOS Apple Silicon | macOS Apple Silicon | Cross-platform | macOS/Win/Linux | Cross-platform | NVIDIA CUDA | NVIDIA CUDA |
@@ -32,7 +32,7 @@
 
 LM Studio is the most popular local LLM GUI tool on macOS, based on llama.cpp, supporting GGUF models.
 
-| Scenario | LM Studio | mlx-zig |
+| Scenario | LM Studio | dmlx |
 |----------|-----------|---------|
 | **Usage** | Desktop GUI, click to run | Library/SDK, code integration |
 | **Target Users** | End users, non-developers | Developers, embedded engineers |
@@ -47,13 +47,13 @@ LM Studio is the most popular local LLM GUI tool on macOS, based on llama.cpp, s
 | **Vision Models** | ✅ Supported | Target: replicate mlx-vlm full capability |
 | **Model Format** | GGUF | Safetensors (MLX native) |
 
-**One-line positioning**: LM Studio is the "local ChatGPT client" on macOS, mlx-zig is the "programmable AI engine" on macOS.
+**One-line positioning**: LM Studio is the "local ChatGPT client" on macOS, dmlx is the "programmable AI engine" on macOS.
 
 ---
 
 ## Special Comparison with Python MLX Ecosystem
 
-| Scenario | Python MLX / mlx-vlm | mlx-zig |
+| Scenario | Python MLX / mlx-vlm | dmlx |
 |----------|---------------------|---------|
 | **Dev Experience** | Python dynamic types, fast iteration | Zig compile-time checks, zero runtime errors |
 | **Deployment** | venv + pip install + download weights | Single binary, AOT weight bundling |
@@ -70,7 +70,7 @@ LM Studio is the most popular local LLM GUI tool on macOS, based on llama.cpp, s
 
 llama.cpp is the de facto standard for local inference, but has fundamental limitations on Apple Silicon:
 
-| Scenario | llama.cpp | mlx-zig |
+| Scenario | llama.cpp | dmlx |
 |----------|-----------|---------|
 | **Apple Silicon Optimization** | Generic CPU/GPU backend | Native Metal Performance Shaders |
 | **Memory Architecture** | CPU RAM ↔ GPU VRAM copy | UMA zero-copy (CPU/GPU same memory) |
@@ -81,7 +81,7 @@ llama.cpp is the de facto standard for local inference, but has fundamental limi
 | **Code Maintainability** | C++ template metaprogramming complex | Zig comptime clear and controllable |
 | **Cross-platform** | ✅ All platforms | ❌ macOS Apple Silicon only |
 
-**Key difference**: llama.cpp is designed to "run anywhere", mlx-zig is designed to "run best on Apple Silicon".
+**Key difference**: llama.cpp is designed to "run anywhere", dmlx is designed to "run best on Apple Silicon".
 
 ---
 
@@ -132,7 +132,7 @@ const weights = @embedFile("llama-3-8b-q4.safetensors");
               ┌─────────┴─────────┐     ┌─────────┴─────────┐
               │  Embedded/Edge    │     │    Desktop GUI     │
               │                   │     │                    │
-         mlx-zig ◄──────┬──────► llama.cpp  LM Studio   Ollama
+         dmlx ◄──────┬──────► llama.cpp  LM Studio   Ollama
               │         │       │     ↑           ↑
               │   Server Inf   │     │           │
               │         │       │     │           │
@@ -140,7 +140,7 @@ const weights = @embedFile("llama-3-8b-q4.safetensors");
                 (NVIDIA CUDA only)
 ```
 
-**mlx-zig exclusive quadrant**: **Developer-first, Embedded-first, Training+Inference unified** on macOS Apple Silicon
+**dmlx exclusive quadrant**: **Developer-first, Embedded-first, Training+Inference unified** on macOS Apple Silicon
 
 ---
 
@@ -152,10 +152,10 @@ Need to run LLM/VLM locally?
 ├── Developer, need NVIDIA GPU → vLLM / SGLang
 ├── Developer, need cross-platform → llama.cpp
 └── Developer, want optimal Apple Silicon
-    ├── Need to train/fine-tune models → mlx-zig ✅
-    ├── Need to embed in iOS/macOS App → mlx-zig ✅
-    ├── Need deterministic real-time latency → mlx-zig ✅
-    ├── Need single binary deployment → mlx-zig ✅
+    ├── Need to train/fine-tune models → dmlx ✅
+    ├── Need to embed in iOS/macOS App → dmlx ✅
+    ├── Need deterministic real-time latency → dmlx ✅
+    ├── Need single binary deployment → dmlx ✅
     └── Quick prototype validation → Python MLX / mlx-vlm
-        (Validate then migrate to mlx-zig production deployment)
+        (Validate then migrate to dmlx production deployment)
 ```

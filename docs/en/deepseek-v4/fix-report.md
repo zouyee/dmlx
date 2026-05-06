@@ -117,7 +117,7 @@ if (prompt_tokens[0] != 100000) {
 
 **Manual Check:**
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 Look for:
@@ -243,8 +243,8 @@ git log --oneline -2
 - `e11c3b9` - Documentation
 
 **Date:** 2026-04-29  
-**Reporter:** mlx-zig team  
-**Assignee:** mlx-zig team  
+**Reporter:** dmlx team  
+**Assignee:** dmlx team  
 **Priority:** Critical  
 **Resolution:** Fixed
 

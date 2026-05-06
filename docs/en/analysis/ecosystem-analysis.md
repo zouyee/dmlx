@@ -1,12 +1,12 @@
-# MLX Ecosystem Deep Analysis and mlx-zig Reference Directions
+# MLX Ecosystem Deep Analysis and dmlx Reference Directions
 
 > Based on deep analysis of four projects: mlx-lm (Apple's official Python LLM library), oMLX (production inference server),
 > TileKernels (DeepSeek GPU kernel library), and mlx-rs (Rust bindings),
-> combined with mlx-zig current codebase audit, extracting adoptable architecture patterns and engineering practices.
+> combined with dmlx current codebase audit, extracting adoptable architecture patterns and engineering practices.
 
 ---
 
-## Part 1: mlx-zig Current State Deep Audit (Updated)
+## Part 1: dmlx Current State Deep Audit (Updated)
 
 ### New Discovery: server.zig
 
@@ -75,7 +75,7 @@ mlx_lm/
 └── gguf.py           # GGUF export
 ```
 
-### Key Patterns Adoptable by mlx-zig
+### Key Patterns Adoptable by dmlx
 
 #### 1. Model Architecture Registry Pattern
 
@@ -92,7 +92,7 @@ MODEL_REGISTRY = {
 }
 ```
 
-**mlx-zig current issue**: `root.zig` hardcodes `models = llama`, `deepseek_v4`;
+**dmlx current issue**: `root.zig` hardcodes `models = llama`, `deepseek_v4`;
 `main.zig` selects models via string matching `detectModelType`.
 
 **Adoption plan**: Implement a compile-time model registry:
@@ -113,7 +113,7 @@ cat prompt.txt | mlx_lm.cache_prompt --prompt - --prompt-cache-file cache.safete
 mlx_lm.generate --prompt-cache-file cache.safetensors --prompt "Summarize"
 ```
 
-**mlx-zig current state**: KV cache is in-memory only, lost on process exit.
+**dmlx current state**: KV cache is in-memory only, lost on process exit.
 
 **Adoption plan**: Leverage existing safetensors I/O to implement KV cache serialization/deserialization.
 
@@ -126,7 +126,7 @@ mlx-lm's `quant/` directory implements three quantization schemes:
 
 Each scheme has independent quantizer and dequantization kernels.
 
-**mlx-zig current state**: QLoRA is implemented (`qlora.zig`), quantization infrastructure is complete (affine/MXFP4/FP8).
+**dmlx current state**: QLoRA is implemented (`qlora.zig`), quantization infrastructure is complete (affine/MXFP4/FP8).
 
 **Adoption plan**: Prioritize GPTQ implementation (most mature), utilizing mlx-c's `mlx_quantize`.
 
@@ -142,7 +142,7 @@ Samplers are injected via callable interface, supporting customization:
 def generate(model, tokenizer, prompt, sampler=None, logits_processors=None):
 ```
 
-**mlx-zig current state**: `sampling.zig` samplers are standalone functions,
+**dmlx current state**: `sampling.zig` samplers are standalone functions,
 but `LlamaModel.generate` hardcodes sampling logic.
 
 **Adoption plan**: Split `generate` into `generateStep` + `streamGenerate` + `generate` three layers.
@@ -157,13 +157,13 @@ mlx_lm convert --model <hf_id> -q  # Convert + quantize
 mlx_lm share --model <path>   # Upload to HuggingFace
 ```
 
-**mlx-zig current state**: `convert` command is a TODO stub.
+**dmlx current state**: `convert` command is a TODO stub.
 
 #### 6. Perplexity Evaluation
 
 mlx-lm provides `evaluate.py` for computing model perplexity, used for quantization quality verification.
 
-**mlx-zig current state**: No evaluation tools.
+**dmlx current state**: No evaluation tools.
 
 ---
 
@@ -197,7 +197,7 @@ FastAPI Server (OpenAI / Anthropic API)
         └── PagedSSDCacheManager (SSD cold layer, safetensors format)
 ```
 
-### Key Patterns Adoptable by mlx-zig
+### Key Patterns Adoptable by dmlx
 
 #### 1. Tiered KV Cache (Hot + Cold)
 
@@ -208,7 +208,7 @@ oMLX's core innovation is tiered KV cache:
 - **Prefix sharing**: Requests sharing the same prefix share KV cache blocks
 - **Copy-on-Write**: Blocks are only copied on modification
 
-**mlx-zig current state**: `kvcache.zig` has 6 strategies (Standard/Rotating/Quantized/Paged/PagedQuantized/Tiered),
+**dmlx current state**: `kvcache.zig` has 6 strategies (Standard/Rotating/Quantized/Paged/PagedQuantized/Tiered),
 Paged fully implemented (block alloc/free/CoW/prefix hash), Tiered implements Hot RAM + Cold SSD offload.
 
 **Adoption plan** (already implemented):
@@ -225,7 +225,7 @@ oMLX's EnginePool implements:
 - **Per-model TTL**: Auto-unload on idle timeout
 - **Process memory limit**: `--max-process-memory 80%`
 
-**mlx-zig current state**: `server.zig` loads only one model, no memory management.
+**dmlx current state**: `server.zig` loads only one model, no memory management.
 
 **Adoption plan**: Implement `ModelPool` struct, supporting multi-model load/unload/LRU.
 
@@ -234,7 +234,7 @@ oMLX's EnginePool implements:
 oMLX implements continuous batching via mlx-lm's `BatchGenerator`:
 Prefill and decode steps of multiple requests interleave, maximizing GPU utilization.
 
-**mlx-zig current state**: `server.zig` processes requests serially.
+**dmlx current state**: `server.zig` processes requests serially.
 
 **Adoption plan**: This is a v1.0 goal, requiring request queue + batch scheduler.
 
@@ -242,7 +242,7 @@ Prefill and decode steps of multiple requests interleave, maximizing GPU utiliza
 
 oMLX supports Server-Sent Events streaming output, a standard feature for LLM services.
 
-**mlx-zig current state**: `server.zig` returns `streaming_not_supported`.
+**dmlx current state**: `server.zig` returns `streaming_not_supported`.
 
 **Adoption plan**: Implement SSE response format, sending one event per generated token.
 
@@ -252,7 +252,7 @@ oMLX provides specific optimizations for the Claude Code use case:
 - **Context scaling**: Scales reported token count so auto-compact triggers at the right time
 - **SSE keep-alive**: Sends heartbeats during long prefills to prevent read timeouts
 
-**mlx-zig adoption value**: If mlx-zig is to serve as a local backend for Claude Code,
+**dmlx adoption value**: If dmlx is to serve as a local backend for Claude Code,
 these optimizations are essential.
 
 ---
@@ -265,13 +265,13 @@ these optimizations are essential.
 
 TileKernels' MoE routing pipeline (topk_gate → expand → reduce)
 corresponds to the routing implementation of DeepSeek V3 models in mlx-lm.
-mlx-zig's `deepseek_v4.zig` should reference both to implement a complete MoE routing.
+dmlx's `deepseek_v4.zig` should reference both to implement a complete MoE routing.
 
 ### Intersection with oMLX
 
 TileKernels' quantization kernels (per-token/per-block FP8/FP4)
 correspond to quantized model inference paths in oMLX.
-mlx-zig's quantization infrastructure should support both training (TileKernels mode) and inference (oMLX mode).
+dmlx's quantization infrastructure should support both training (TileKernels mode) and inference (oMLX mode).
 
 ---
 
@@ -279,14 +279,14 @@ mlx-zig's quantization infrastructure should support both training (TileKernels 
 
 ### Project Overview
 
-mlx-rs is an unofficial Rust binding for MLX, closest in positioning to mlx-zig.
+mlx-rs is an unofficial Rust binding for MLX, closest in positioning to dmlx.
 v0.21.0, under active development.
 
-### Key Patterns Adoptable by mlx-zig
+### Key Patterns Adoptable by dmlx
 
 #### 1. Explicit Input Pattern for Autograd
 
-mlx-rs discovered the same issue as mlx-zig: when closures capture external variables,
+mlx-rs discovered the same issue as dmlx: when closures capture external variables,
 autograd cannot correctly trace the computation graph. mlx-rs' solution is requiring all inputs to be explicitly passed:
 
 ```rust
@@ -300,7 +300,7 @@ let loss_fn = |inputs: &[Array]| {
 };
 ```
 
-**mlx-zig current state**: `closure.zig`'s `Closure.init` accepts
+**dmlx current state**: `closure.zig`'s `Closure.init` accepts
 `fn(inputs: []const Array, allocator) ![]Array`, already using the explicit input pattern.
 But this limitation is not documented.
 
@@ -315,7 +315,7 @@ metal = []
 accelerate = []
 ```
 
-**mlx-zig current state**: `build.zig` uses `is_macos` conditional compilation,
+**dmlx current state**: `build.zig` uses `is_macos` conditional compilation,
 but does not expose user-controllable feature flags.
 
 **Adoption plan**: Add `-Denable_metal=true/false` build options.
@@ -372,7 +372,7 @@ but does not expose user-controllable feature flags.
 
 ## Appendix A: Project Comparison Matrix
 
-| Feature | mlx-zig | mlx-lm | oMLX | TileKernels | mlx-rs |
+| Feature | dmlx | mlx-lm | oMLX | TileKernels | mlx-rs |
 |------|---------|--------|------|-------------|--------|
 | Language | Zig | Python | Python | Python+TileLang | Rust |
 | Backend | mlx-c | MLX Python | mlx-lm | CUDA | mlx-c |
@@ -388,7 +388,7 @@ but does not expose user-controllable feature flags.
 | Test Coverage | 337 tests | High | Medium | High | Medium |
 | HTTP Server | ✅ OpenAI-compatible | ✅ | ✅ Production-grade | — | ❌ |
 
-## Appendix B: mlx-lm Model Architecture List (mlx-zig Reference Priority)
+## Appendix B: mlx-lm Model Architecture List (dmlx Reference Priority)
 
 **High priority** (most widely used):
 - LLaMA / LLaMA-2 / LLaMA-3 ✅ Supported

@@ -1,4 +1,4 @@
-# mlx-zig Makefile — Aggregates build, test, and verification commands.
+# dmlx Makefile — Aggregates build, test, and verification commands.
 #
 # Usage:
 #   make              — Build the CLI binary
@@ -22,7 +22,7 @@ all: build
 # Paths
 PROJECT_DIR := $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
 MODEL_PATH  ?= $(HOME)/models/DeepSeek-V4-Flash-4bit
-CLI         := $(PROJECT_DIR)/zig-out/bin/mlx-zig
+CLI         := $(PROJECT_DIR)/zig-out/bin/dmlx
 
 # Build options
 ZIG_BUILD_OPTS := -Doptimize=ReleaseFast
@@ -37,7 +37,7 @@ endif
 # Build
 # ------------------------------------------------------------------
 build:
-	@echo "📦 Building mlx-zig..."
+	@echo "📦 Building dmlx..."
 	cd "$(PROJECT_DIR)" && zig build $(ZIG_BUILD_OPTS)
 	@echo "✅ Build complete: $(CLI)"
 

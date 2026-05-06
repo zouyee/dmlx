@@ -2,7 +2,7 @@
 set -uo pipefail
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-CLI="${PWD}/zig-out/bin/mlx-zig"
+CLI="${PWD}/zig-out/bin/dmlx"
 REPORT="docs/en/analysis/performance-benchmark.md"
 DIR="$(cd "$(dirname "$0")" && pwd)"
 

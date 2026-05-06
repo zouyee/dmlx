@@ -11,7 +11,7 @@
 
 ## Problem Statement
 
-DeepSeek V4 models were generating garbled, nonsensical output when used with mlx-zig. The generated text contained random characters and symbols instead of coherent responses.
+DeepSeek V4 models were generating garbled, nonsensical output when used with dmlx. The generated text contained random characters and symbols instead of coherent responses.
 
 ### Root Cause Analysis
 
@@ -152,7 +152,7 @@ Expected output:
 ### Manual Verification
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 Look for:
@@ -272,6 +272,6 @@ Special thanks to the MLX community for the reference implementations.
 ---
 
 **Commit:** `a18bc24`  
-**Author:** mlx-zig team  
+**Author:** dmlx team  
 **Date:** 2026-04-29  
 **Status:** ✅ Merged to main

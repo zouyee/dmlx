@@ -51,7 +51,7 @@
 
 ### 方法 2：手动测试
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 在日志中查找以下内容：
@@ -170,10 +170,10 @@ Prompt tokens (5): [100000, 100003, 1234, 5678, 100006]
    - 验证脚本的输出
    - 模型路径和变体
    - 系统信息（macOS 版本、芯片、RAM）
-   - `mlx-zig chat` 命令的完整日志输出
+   - `dmlx chat` 命令的完整日志输出
 
 ---
 
 **提交：** `a18bc24`
 **日期：** 2026-04-29
-**作者：** mlx-zig 团队
+**作者：** dmlx 团队

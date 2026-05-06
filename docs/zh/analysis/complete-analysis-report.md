@@ -1,4 +1,4 @@
-# mlx-zig DeepSeek V4 Flash — 完整分析报告
+# dmlx DeepSeek V4 Flash — 完整分析报告
 # 日期：2026-05-03（修订）
 # 基线：mlx-lm `hyper_connection.py` + `deepseek_v4.py`
 

@@ -2,7 +2,7 @@
 
 ## 概述
 
-本文档提供 mlx-zig 中 DeepSeek V4 模型推理问题的故障排查指导。
+本文档提供 dmlx 中 DeepSeek V4 模型推理问题的故障排查指导。
 
 ## 常见问题
 
@@ -20,7 +20,7 @@
 检查推理运行时的日志输出：
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello"
 ```
 
 查看 prompt token 验证信息：
@@ -102,21 +102,21 @@ MLX memory: wired_limit=40960MB cache_limit=38400MB (system=48000MB)
 
 1. **启用 Smelt 模式**（部分专家加载）：
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --smelt --smelt-experts 0.15 \
   --prompt "Hello"
 ```
 
 2. **使用量化 KV Cache**：
 ```bash
-mlx-zig serve --model ~/models/deepseek-v4 \
+dmlx serve --model ~/models/deepseek-v4 \
   --kv-strategy paged_quantized \
   --kv-bits 4
 ```
 
 3. **减少上下文长度**：
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --max-kv-size 4096 \
   --prompt "Hello"
 ```
@@ -146,7 +146,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 
 3. **启用推测解码**（后续优化）：
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --speculative-ngram 4 \
   --prompt "Hello"
 ```
@@ -194,7 +194,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 将日志级别设为 debug：
 ```bash
 export RUST_LOG=debug  # 如果使用 Rust 组件
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Test"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Test"
 ```
 
 ### 检查 Logits
@@ -215,13 +215,13 @@ Top tokens: [1234]=12.35 [5678]=11.23 [9012]=10.45
 从最简 prompt 开始，隔离问题：
 ```bash
 # 测试 1：单个 token
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
 
 # 测试 2：仅英文
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 
 # 测试 3：中文（如果模型支持）
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
 ```
 
 ---
@@ -231,7 +231,7 @@ mlx-zig chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
 运行基准测试工具来测量性能：
 
 ```bash
-mlx-zig benchmark --model ~/models/deepseek-v4-flash-4bit \
+dmlx benchmark --model ~/models/deepseek-v4-flash-4bit \
   --input-tokens 32 \
   --output-tokens 128 \
   --num-runs 3
@@ -284,7 +284,7 @@ mlx-zig benchmark --model ~/models/deepseek-v4-flash-4bit \
 
 3. **使用的命令：**
    ```bash
-   mlx-zig chat --model <path> --prompt "<prompt>" --max-tokens <n>
+   dmlx chat --model <path> --prompt "<prompt>" --max-tokens <n>
    ```
 
 4. **日志输出：**

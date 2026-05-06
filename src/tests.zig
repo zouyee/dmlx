@@ -49,7 +49,6 @@ pub const tool_executor_tests = @import("tool_executor.zig");
 pub const jang_loader_tests = @import("io/jang_loader.zig");
 pub const jang_quantizer_tests = @import("jang_quantizer.zig");
 
-
 pub const vision_preprocess_tests = @import("vision/preprocess.zig");
 pub const vision_vit_tests = @import("vision/vit.zig");
 pub const vision_llava_tests = @import("vision/llava.zig");
@@ -117,7 +116,7 @@ test {
     _ = vision_preprocess_tests;
     _ = vision_vit_tests;
     _ = vision_llava_tests;
-    
+
     _ = expert_remap_tests;
     _ = expert_cache_tests;
     _ = layer_prefetcher_tests;

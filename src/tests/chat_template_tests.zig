@@ -34,7 +34,7 @@ test "DeepSeek chat template formats single user message correctly" {
     const result = try template.apply(&messages, true);
     defer allocator.free(result);
 
-    // Expected format: <|begin_of_sentence|><|User|>: Hello\n\n<|Assistant|>: 
+    // Expected format: <|begin_of_sentence|><|User|>: Hello\n\n<|Assistant|>:
     const expected = "<|begin_of_sentence|><|User|>: Hello\n\n<|Assistant|>: ";
     try std.testing.expectEqualStrings(expected, result);
 }
@@ -51,7 +51,7 @@ test "DeepSeek chat template formats system + user message correctly" {
     const result = try template.apply(&messages, true);
     defer allocator.free(result);
 
-    // Expected format: <|begin_of_sentence|>You are a helpful assistant.\n\n<|User|>: Hello\n\n<|Assistant|>: 
+    // Expected format: <|begin_of_sentence|>You are a helpful assistant.\n\n<|User|>: Hello\n\n<|Assistant|>:
     const expected = "<|begin_of_sentence|>You are a helpful assistant.\n\n<|User|>: Hello\n\n<|Assistant|>: ";
     try std.testing.expectEqualStrings(expected, result);
 }
@@ -85,7 +85,7 @@ test "DeepSeek chat template without generation prompt" {
     const result = try template.apply(&messages, false);
     defer allocator.free(result);
 
-    // Should not include trailing <|Assistant|>: 
+    // Should not include trailing <|Assistant|>:
     const expected = "<|begin_of_sentence|><|User|>: Hello\n\n";
     try std.testing.expectEqualStrings(expected, result);
 }

@@ -11,7 +11,7 @@
 
 ## 问题陈述
 
-使用 mlx-zig 时，DeepSeek V4 模型会生成乱码、无意义的输出。生成的文本包含随机字符和符号，而非连贯的回复。
+使用 dmlx 时，DeepSeek V4 模型会生成乱码、无意义的输出。生成的文本包含随机字符和符号，而非连贯的回复。
 
 ### 根因分析
 
@@ -152,7 +152,7 @@ std.log.info("✅ Prompt correctly formatted with BOS token {d}", .{expected_bos
 ### 手动验证
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 查看：
@@ -272,6 +272,6 @@ zig build test --summary all
 ---
 
 **提交：** `a18bc24`  
-**作者：** mlx-zig 团队  
+**作者：** dmlx 团队  
 **日期：** 2026-04-29  
 **状态：** ✅ 已合并至 main 分支

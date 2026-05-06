@@ -1,4 +1,4 @@
-# MLX-Zig Deep Analysis: Gaps and Optimization Directions
+# dmlx Deep Analysis: Gaps and Optimization Directions
 
 > Based on per-module audit of the v0.3.0 codebase, identifying architectural defects, security vulnerabilities, performance bottlenecks, and feature gaps.
 

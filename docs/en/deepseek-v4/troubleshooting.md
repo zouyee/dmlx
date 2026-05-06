@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document provides troubleshooting guidance for DeepSeek V4 model inference issues in mlx-zig.
+This document provides troubleshooting guidance for DeepSeek V4 model inference issues in dmlx.
 
 ## Common Issues
 
@@ -20,7 +20,7 @@ Incorrect chat template formatting causing the tokenizer to split special tokens
 Check the log output when running inference:
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello"
 ```
 
 Look for the prompt token validation:
@@ -102,21 +102,21 @@ MLX memory: wired_limit=40960MB cache_limit=38400MB (system=48000MB)
 
 1. **Enable Smelt Mode** (partial expert loading):
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --smelt --smelt-experts 0.15 \
   --prompt "Hello"
 ```
 
 2. **Use Quantized KV Cache**:
 ```bash
-mlx-zig serve --model ~/models/deepseek-v4 \
+dmlx serve --model ~/models/deepseek-v4 \
   --kv-strategy paged_quantized \
   --kv-bits 4
 ```
 
 3. **Reduce Context Length**:
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --max-kv-size 4096 \
   --prompt "Hello"
 ```
@@ -146,7 +146,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 
 3. **Enable speculative decoding** (future optimization):
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 \
+dmlx chat --model ~/models/deepseek-v4 \
   --speculative-ngram 4 \
   --prompt "Hello"
 ```
@@ -194,7 +194,7 @@ ls -lh ~/models/deepseek-v4-flash-4bit/
 Set log level to debug:
 ```bash
 export RUST_LOG=debug  # If using Rust components
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Test"
+dmlx chat --model ~/models/deepseek-v4 --prompt "Test"
 ```
 
 ### Inspect Logits
@@ -215,13 +215,13 @@ Check for:
 Start with minimal prompts to isolate issues:
 ```bash
 # Test 1: Single token
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hi" --max-tokens 5
 
 # Test 2: English only
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 
 # Test 3: Chinese (if model supports)
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
 ```
 
 ---
@@ -231,7 +231,7 @@ mlx-zig chat --model ~/models/deepseek-v4 --prompt "你好" --max-tokens 10
 Run the benchmark tool to measure performance:
 
 ```bash
-mlx-zig benchmark --model ~/models/deepseek-v4-flash-4bit \
+dmlx benchmark --model ~/models/deepseek-v4-flash-4bit \
   --input-tokens 32 \
   --output-tokens 128 \
   --num-runs 3
@@ -284,7 +284,7 @@ When reporting issues, please include:
 
 3. **Command used:**
    ```bash
-   mlx-zig chat --model <path> --prompt "<prompt>" --max-tokens <n>
+   dmlx chat --model <path> --prompt "<prompt>" --max-tokens <n>
    ```
 
 4. **Log output:**

@@ -1,4 +1,4 @@
-# MLX-Zig Project Deep Technical Analysis Report
+# dmlx Project Deep Technical Analysis Report
 
 > Analysis Scope: Core source (~28,000 lines of Zig), test suite (~50 test modules), build system, and documentation
 > Analysis Date: 2026-05-03
@@ -7,7 +7,7 @@
 
 ## 1. Executive Summary
 
-**MLX-Zig** is a Zig-native binding and extension layer for Apple's MLX framework. Its core value lies in: **leveraging Zig's compile-time safety and explicit memory management advantages to wrap the official `mlx-c` C library**, building a full-stack machine learning system covering everything from low-level operators to a production-grade LLM inference server.
+**dmlx** is a Zig-native binding and extension layer for Apple's MLX framework. Its core value lies in: **leveraging Zig's compile-time safety and explicit memory management advantages to wrap the official `mlx-c` C library**, building a full-stack machine learning system covering everything from low-level operators to a production-grade LLM inference server.
 
 The project goes far beyond a simple FFI wrapper, implementing:
 - **200+ operators** with a Zig-native API (`ops.zig` + 18 sub-modules)
@@ -34,7 +34,7 @@ The project goes far beyond a simple FFI wrapper, implementing:
 ### 2.2 Top-Level Module Architecture
 
 ```
-mlx-zig/
+dmlx/
 ├── C binding layer (c.zig)          ──→ Thin wrapper around mlx-c + error handling + type re-exports
 ├── Core type layer                  ──→ array.zig, dtype.zig, device.zig
 ├── Operation layer (ops/ 18 modules)──→ 200+ operators, EagerContext execution mode
@@ -597,7 +597,7 @@ mlx-c itself does not provide KV Cache management; the project fully built 6 str
 
 ## 11. Conclusion
 
-MLX-Zig is a project of **exceptionally high engineering maturity and carefully considered architecture**. It successfully combines Zig's systems programming advantages with Apple MLX's high-performance ML backend, building a functionally complete LLM inference and fine-tuning stack.
+dmlx is a project of **exceptionally high engineering maturity and carefully considered architecture**. It successfully combines Zig's systems programming advantages with Apple MLX's high-performance ML backend, building a functionally complete LLM inference and fine-tuning stack.
 
 ### Core Advantages
 
@@ -608,7 +608,7 @@ MLX-Zig is a project of **exceptionally high engineering maturity and carefully 
 
 ### Comparison with Python Ecosystem
 
-| Dimension | MLX-Zig | Python (mlx-lm / vLLM) |
+| Dimension | dmlx | Python (mlx-lm / vLLM) |
 |-----------|---------|------------------------|
 | Deployment size | Single static binary | Python environment + dependencies |
 | Startup latency | Milliseconds | Seconds (importing large libraries) |
@@ -616,7 +616,7 @@ MLX-Zig is a project of **exceptionally high engineering maturity and carefully 
 | Ecosystem/toolchain | Weak (smaller Zig ecosystem) | Strong (HuggingFace, visualization) |
 | Development speed | Slow (compilation required, strict types) | Fast (dynamic typing, REPL) |
 
-MLX-Zig's positioning is very clear: **targeted at scenarios requiring high-performance, low-latency, memory-controllable LLM inference serving on Apple Silicon**. For teams pursuing ultimate deployment efficiency who cannot accept Python runtime overhead, this is an extremely competitive choice.
+dmlx's positioning is very clear: **targeted at scenarios requiring high-performance, low-latency, memory-controllable LLM inference serving on Apple Silicon**. For teams pursuing ultimate deployment efficiency who cannot accept Python runtime overhead, this is an extremely competitive choice.
 
 ### Final Rating
 

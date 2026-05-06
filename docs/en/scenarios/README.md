@@ -8,9 +8,9 @@
 
 **Problem**: You need GPT-4-class intelligence but can't send sensitive data to cloud APIs.
 
-**Solution**: mlx-zig runs DeepSeek V4 entirely on-device. All computation happens on your Mac's Metal GPU via Apple's unified memory architecture.
+**Solution**: dmlx runs DeepSeek V4 entirely on-device. All computation happens on your Mac's Metal GPU via Apple's unified memory architecture.
 
-| Aspect | Cloud API (OpenAI/Claude) | mlx-zig Local |
+| Aspect | Cloud API (OpenAI/Claude) | dmlx Local |
 |--------|--------------------------|---------------|
 | Data privacy | ❌ Data leaves device | ✅ Zero network egress |
 | Latency | ~500ms-2s (network) | 200-500ms TTFT, 250-500ms/tok |
@@ -26,7 +26,7 @@
 
 **Problem**: Healthcare, legal, financial, or enterprise data cannot leave the device.
 
-**Solution**: mlx-zig's single-binary deployment + zero network dependency means:
+**Solution**: dmlx's single-binary deployment + zero network dependency means:
 
 - **HIPAA/GDPR compliance**: No data transmission, no third-party processors
 - **Air-gapped deployment**: Run on machines with no internet connection
@@ -37,7 +37,7 @@
 ┌─────────────────────────────────────┐
 │           Your Mac                   │
 │  ┌─────────────────────────────┐    │
-│  │     mlx-zig binary           │    │
+│  │     dmlx binary           │    │
 │  │  ┌───────────────────────┐  │    │
 │  │  │  DeepSeek V4 Model    │  │    │
 │  │  │  + KV Cache (local)   │  │    │
@@ -57,7 +57,7 @@
 
 ```bash
 # Start the OpenAI-compatible server
-mlx-zig server --model ~/models/deepseek-v4-flash-4bit \
+dmlx server --model ~/models/deepseek-v4-flash-4bit \
   --port 8080 --kv-strategy paged
 
 # Team members connect via standard OpenAI client
@@ -81,7 +81,7 @@ curl http://mac-mini:8080/v1/chat/completions \
 
 **Problem**: Cloud LLM APIs are blocked, censored, or unavailable in certain regions.
 
-**Solution**: mlx-zig's single binary + bundled model weights means:
+**Solution**: dmlx's single binary + bundled model weights means:
 
 1. Download model once (via any available channel)
 2. Run entirely offline — no API key, no network call
@@ -91,11 +91,11 @@ curl http://mac-mini:8080/v1/chat/completions \
 ```bash
 # One-time setup
 brew install mlx-c
-git clone https://github.com/zouyee/mlx-zig.git
-cd mlx-zig && zig build
+git clone https://github.com/zouyee/dmlx.git
+cd dmlx && zig build
 
 # Run anywhere, anytime — no internet needed
-./zig-out/bin/mlx-zig chat --model /path/to/model --prompt "Hello"
+./zig-out/bin/dmlx chat --model /path/to/model --prompt "Hello"
 ```
 
 ---
@@ -106,7 +106,7 @@ cd mlx-zig && zig build
 
 **Solution**: Develop and test locally on your Mac:
 
-| Task | Cloud GPU | mlx-zig Local |
+| Task | Cloud GPU | dmlx Local |
 |------|-----------|---------------|
 | Prompt engineering | Deploy → test → redeploy | Instant iteration |
 | Model evaluation | Reserve A100 ($3+/hr) | Your Mac (free) |
@@ -121,7 +121,7 @@ cd mlx-zig && zig build
 
 **Problem**: Researchers need to experiment with MoE routing, KV cache strategies, and quantization without cloud overhead.
 
-**Solution**: mlx-zig exposes the full stack for experimentation:
+**Solution**: dmlx exposes the full stack for experimentation:
 
 - **MoE routing**: Modify top-k, routing bias, expert selection in `moe_router.zig`
 - **KV cache strategies**: Swap between 6 strategies at runtime via VTable polymorphism
@@ -141,9 +141,9 @@ const strategy = switch (config.mode) {
 
 ---
 
-## Why mlx-zig for These Scenarios
+## Why dmlx for These Scenarios
 
-| Requirement | How mlx-zig Delivers |
+| Requirement | How dmlx Delivers |
 |-------------|---------------------|
 | **Small memory** | 5-layer optimization: streaming + SMELT + MLA + quantization + tiered KV |
 | **No cloud** | Single static binary, zero network dependency |
@@ -157,7 +157,7 @@ const strategy = switch (config.mode) {
 
 ## Getting Started
 
-1. [Installation](../user-guide/) — Set up mlx-zig on your Mac
+1. [Installation](../user-guide/) — Set up dmlx on your Mac
 2. [DeepSeek V4 Quick Fix](../user-guide/deepseek-v4-quickfix.md) — Fix garbled output
 3. [DeepSeek MoE Deep Dive](../deepseek-moe/README.md) — How it works technically
 4. [Benchmarks](../technical/benchmarks.md) — Performance data

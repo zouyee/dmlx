@@ -45,7 +45,7 @@ pub const Codebook = struct {
     /// 4-bit (16 centroids)
     pub const b4 = [_]f32{
         -2.733, -2.069, -1.618, -1.256, -0.9424, -0.6568, -0.3881, -0.1284,
-        0.1284,  0.3881,  0.6568,  0.9424,  1.256,  1.618,  2.069,  2.733,
+        0.1284, 0.3881, 0.6568, 0.9424, 1.256,   1.618,   2.069,   2.733,
     };
 
     /// Get codebook for given bit-width.
@@ -101,8 +101,14 @@ pub const TurboQuantState = struct {
 
         var rand_mat = c.c.mlx_array_new();
         try c.check(c.c.mlx_random_normal(
-            &rand_mat, shape.ptr, shape.len, c.c.MLX_FLOAT32,
-            0.0, 1.0, .{ .ctx = null }, stream,
+            &rand_mat,
+            shape.ptr,
+            shape.len,
+            c.c.MLX_FLOAT32,
+            0.0,
+            1.0,
+            .{ .ctx = null },
+            stream,
         ));
         defer _ = c.c.mlx_array_free(rand_mat);
 
@@ -122,7 +128,8 @@ pub const TurboQuantState = struct {
         for (cb, 0..) |v, i| scaled_data[i] = v * scale_factor;
 
         const scaled_cb = try Array.fromData(
-            ctx.allocator, f32,
+            ctx.allocator,
+            f32,
             scaled_data[0..cb.len],
             &[_]i32{@intCast(cb.len)},
         );
@@ -133,8 +140,14 @@ pub const TurboQuantState = struct {
         if (config.use_qjl) {
             var s_raw = c.c.mlx_array_new();
             try c.check(c.c.mlx_random_normal(
-                &s_raw, shape.ptr, shape.len, c.c.MLX_FLOAT32,
-                0.0, 1.0, .{ .ctx = null }, stream,
+                &s_raw,
+                shape.ptr,
+                shape.len,
+                c.c.MLX_FLOAT32,
+                0.0,
+                1.0,
+                .{ .ctx = null },
+                stream,
             ));
             qjl_mat = Array.fromHandle(s_raw);
             qjl_mat_t = try ops_mod.transpose(ctx, qjl_mat.?);
@@ -468,8 +481,14 @@ test "TurboQuantState: quantize and dequantize round-trip preserves shape" {
     const shape = &[_]i32{ 4, 8 };
     var x_raw = c.c.mlx_array_new();
     try c.check(c.c.mlx_random_normal(
-        &x_raw, shape.ptr, shape.len, c.c.MLX_FLOAT32,
-        0.0, 1.0, .{ .ctx = null }, stream,
+        &x_raw,
+        shape.ptr,
+        shape.len,
+        c.c.MLX_FLOAT32,
+        0.0,
+        1.0,
+        .{ .ctx = null },
+        stream,
     ));
     const x = Array.fromHandle(x_raw);
     defer x.deinit();

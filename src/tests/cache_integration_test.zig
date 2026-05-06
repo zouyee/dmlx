@@ -116,8 +116,9 @@ fn writeMockSafetensorsMulti(
         "{{\"{s}\": {{\"dtype\": \"F32\", \"shape\": [{d}, {d}, {d}], \"data_offsets\": [0, {d}]}}, " ++
             "\"{s}\": {{\"dtype\": \"F32\", \"shape\": [{d}, {d}, {d}], \"data_offsets\": [{d}, {d}]}}}}",
         .{
-            tensor_name_1, n_experts, dim1, dim2, tensor_data_bytes,
-            tensor_name_2, n_experts, dim1, dim2, tensor_data_bytes, total_data_bytes,
+            tensor_name_1,    n_experts, dim1, dim2, tensor_data_bytes,
+            tensor_name_2,    n_experts, dim1, dim2, tensor_data_bytes,
+            total_data_bytes,
         },
     );
     defer allocator.free(header_json);
@@ -207,7 +208,7 @@ test "cache integration: cache hit path — no disk I/O on second call" {
     // Validates: Requirement 5.2 (cache miss triggers partial read + insert)
     const allocator = std.testing.allocator;
 
-    const tmp_path = "/tmp/mlx_zig_cache_hit_test.safetensors";
+    const tmp_path = "/tmp/dmlx_cache_hit_test.safetensors";
     const tensor_name = "layer0.gate_proj.weight";
     const n_experts: u32 = 8;
     const dim1: u32 = 4;
@@ -274,7 +275,7 @@ test "cache integration: cache miss path — partial reads used for new experts"
     // Validates: Requirement 5.2 (cache miss loads via partial read + FdPool)
     const allocator = std.testing.allocator;
 
-    const tmp_path = "/tmp/mlx_zig_cache_miss_test.safetensors";
+    const tmp_path = "/tmp/dmlx_cache_miss_test.safetensors";
     const tensor_name = "layer0.gate_proj.weight";
     const n_experts: u32 = 8;
     const dim1: u32 = 4;
@@ -336,7 +337,7 @@ test "cache integration: mixed hit/miss — some experts cached, some not" {
     // others are new.
     const allocator = std.testing.allocator;
 
-    const tmp_path = "/tmp/mlx_zig_cache_mixed_test.safetensors";
+    const tmp_path = "/tmp/dmlx_cache_mixed_test.safetensors";
     const gate_name = "layer0.gate_proj.weight";
     const up_name = "layer0.up_proj.weight";
     const n_experts: u32 = 8;
@@ -417,7 +418,7 @@ test "cache integration: cross-layer caching — different layers use separate c
     // Validates: Requirement 5.1 (cache keyed by layer index)
     const allocator = std.testing.allocator;
 
-    const tmp_path = "/tmp/mlx_zig_cache_crosslayer_test.safetensors";
+    const tmp_path = "/tmp/dmlx_cache_crosslayer_test.safetensors";
     const tensor_name = "gate_proj.weight";
     const n_experts: u32 = 8;
     const dim1: u32 = 4;

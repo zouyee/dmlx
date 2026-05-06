@@ -51,8 +51,8 @@
 
 ### Build Artifacts
 
-- `libmlx-zig.a`: Static library
-- `mlx-zig`: CLI tool
+- `libdmlx.a`: Static library
+- `dmlx`: CLI tool
   - `chat`: Interactive chat
   - `serve`/`server`: HTTP service
   - `benchmark`: Performance benchmark

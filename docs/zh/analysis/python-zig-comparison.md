@@ -1,4 +1,4 @@
-# Python mlx-lm 与 Zig mlx-zig 逐项对比
+# Python mlx-lm 与 Zig dmlx 逐项对比
 # 日期：2026-05-03
 
 ---

@@ -1,18 +1,18 @@
 # DeepSeek V4 MoE on Small Macs — Technical Deep Dive
 
-> **How mlx-zig runs a ~150GB MoE model on a 48GB MacBook Pro**
+> **How dmlx runs a ~150GB MoE model on a 48GB MacBook Pro**
 
 ---
 
 ## The Problem
 
-DeepSeek V4 is a 671B-parameter Mixture-of-Experts model. Even at 4-bit quantization, the full model weighs ~40GB. In FP16, the weights alone exceed 150GB. Running this on a consumer MacBook Pro with 48GB unified memory seems impossible — yet mlx-zig does it.
+DeepSeek V4 is a 671B-parameter Mixture-of-Experts model. Even at 4-bit quantization, the full model weighs ~40GB. In FP16, the weights alone exceed 150GB. Running this on a consumer MacBook Pro with 48GB unified memory seems impossible — yet dmlx does it.
 
 ## The Solution: Five Layers of Memory Optimization
 
 ### Layer 1: MoE Expert Streaming (138GB → 10GB)
 
-DeepSeek V4 uses 256 routed experts + shared experts with top-k routing. Per token, only a small subset (typically top-8) of experts are activated. mlx-zig's `expert_stream.zig` (649 lines) exploits this sparsity:
+DeepSeek V4 uses 256 routed experts + shared experts with top-k routing. Per token, only a small subset (typically top-8) of experts are activated. dmlx's `expert_stream.zig` (649 lines) exploits this sparsity:
 
 - **On-demand loading**: Only active experts are loaded into memory via `PartialTensorReader` (pread-based partial tensor reads)
 - **LRU expert cache**: Frequently used experts stay resident; cold experts are evicted
@@ -26,7 +26,7 @@ Source: src/models/expert_stream.zig (649 lines)
 
 ### Layer 2: 4-bit Quantization (40GB → 6-12GB with SMELT)
 
-mlx-zig supports six quantization formats, with the SMELT system enabling partial expert loading:
+dmlx supports six quantization formats, with the SMELT system enabling partial expert loading:
 
 | Mode | Experts Loaded | Memory | Latency Impact |
 |------|---------------|--------|----------------|
@@ -95,7 +95,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    mlx-zig Inference Engine               │
+│                    dmlx Inference Engine               │
 ├─────────────────────────────────────────────────────────┤
 │  Model (DeepSeek V4, 3,091 lines)                        │
 │  ├── MLA (Multi-head Latent Attention)                   │
@@ -126,7 +126,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 ## Why Zig?
 
-| Aspect | Python (mlx-lm) | Zig (mlx-zig) |
+| Aspect | Python (mlx-lm) | Zig (dmlx) |
 |--------|----------------|---------------|
 | **Memory control** | GC + implicit | Explicit, compile-time checked |
 | **Concurrency** | GIL-limited | True parallelism, no GIL |
@@ -154,7 +154,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 ## TileKernels Reproduction — Custom Metal Kernels
 
-mlx-zig doesn't just call MLX ops — it reproduces key optimizations from [DeepSeek's TileKernels](https://github.com/deepseek-ai/tilekernels), the production-grade GPU kernel library powering DeepSeek's training and inference.
+dmlx doesn't just call MLX ops — it reproduces key optimizations from [DeepSeek's TileKernels](https://github.com/deepseek-ai/tilekernels), the production-grade GPU kernel library powering DeepSeek's training and inference.
 
 ### Fused hc_split_sinkhorn Metal Kernel
 
@@ -216,7 +216,7 @@ Source: src/models/deepseek_v4.zig:2395-2441
 
 ### What Makes This Impressive
 
-| Aspect | Challenge | mlx-zig Solution |
+| Aspect | Challenge | dmlx Solution |
 |--------|-----------|-----------------|
 | **Platform** | TileKernels targets NVIDIA CUDA (H100/B200) | Adapted to Apple Metal GPU |
 | **Language** | TileKernels uses Python/TileLang | Hand-written Zig + Metal Shading Language |
@@ -230,7 +230,7 @@ Source: src/models/deepseek_v4.zig:2395-2441
 
 → See [Application Scenarios](../scenarios/README.md) for detailed use cases.
 
-| Scenario | Why mlx-zig |
+| Scenario | Why dmlx |
 |----------|-------------|
 | **Local LLM inference** | Run 671B model on a laptop — no cloud needed |
 | **Privacy-first applications** | All data stays on-device, zero network egress |

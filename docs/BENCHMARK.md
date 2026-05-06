@@ -1,6 +1,6 @@
 # Performance Benchmarking & Dashboard
 
-This document describes the performance benchmarking infrastructure for mlx-zig.
+This document describes the performance benchmarking infrastructure for dmlx.
 
 ## Overview
 
@@ -21,7 +21,7 @@ This document describes the performance benchmarking infrastructure for mlx-zig.
 ### 1. Run benchmark locally
 
 ```bash
-cd /Users/zouyee/work/code/mlx-zig
+cd /Users/zouyee/work/code/dmlx
 make benchmark
 ```
 

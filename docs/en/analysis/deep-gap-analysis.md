@@ -1,4 +1,4 @@
-# mlx-zig Deep Gap Analysis: vs mlx/mlx-c/mlx-lm/oMLX/TileKernels/vLLM
+# dmlx Deep Gap Analysis: vs mlx/mlx-c/mlx-lm/oMLX/TileKernels/vLLM
 
 > Based on 2026-04-26 code audit (37K+ lines Zig, 100+ files, 350 tests),
 > compared against 6 reference projects, identifying leverageable strengthening directions.
@@ -6,7 +6,7 @@
 
 ---
 
-## I. mlx-zig True State (Honest Assessment)
+## I. dmlx True State (Honest Assessment)
 
 ### Verified Working
 - ✅ TinyLlama-1.1B-Chat-v1.0-4bit: loading + quantized inference + token generation
@@ -45,7 +45,7 @@
 
 ### 1. vs mlx (Apple Official Framework)
 
-| Capability | mlx | mlx-zig | Gap | Leverage Value |
+| Capability | mlx | dmlx | Gap | Leverage Value |
 |------------|-----|---------|-----|---------------|
 | Lazy evaluation | ✅ Core | ✅ via mlx-c | None | — |
 | Metal kernel | ✅ Auto | ✅ via mlx-c | None | — |
@@ -58,7 +58,7 @@
 
 ### 2. vs mlx-c (C API Layer)
 
-| Capability | mlx-c | mlx-zig Binding | Gap |
+| Capability | mlx-c | dmlx Binding | Gap |
 |------------|-------|-----------------|-----|
 | All ops | ~200 | ~200 | None |
 | quantize/dequantize | ✅ 4 mode | ✅ 4 mode | None |
@@ -71,7 +71,7 @@
 
 ### 3. vs mlx-lm (Python Reference Implementation)
 
-| Capability | mlx-lm | mlx-zig | Gap | Priority |
+| Capability | mlx-lm | dmlx | Gap | Priority |
 |------------|--------|---------|-----|----------|
 | Model architectures | 50+ | 5 | **High** | P1 |
 | Streaming token output | ✅ yield | ❌ batch output | **High** | P0 |
@@ -85,13 +85,13 @@
 | GGUF export | ✅ | ❌ | Low | P3 |
 
 **Highest priority leverage**:
-1. **Streaming token output** — mlx-lm's `generate_step` is yield pattern, outputting each token as generated. mlx-zig's generate waits for full completion.
-2. **EOS stop** — mlx-lm checks `eos_token_id` and terminates early. mlx-zig always generates max_tokens.
-3. **Chat template** — mlx-lm renders chat templates with Jinja2. mlx-zig only has chat template on V4 path, LLaMA path passes raw prompt.
+1. **Streaming token output** — mlx-lm's `generate_step` is yield pattern, outputting each token as generated. dmlx's generate waits for full completion.
+2. **EOS stop** — mlx-lm checks `eos_token_id` and terminates early. dmlx always generates max_tokens.
+3. **Chat template** — mlx-lm renders chat templates with Jinja2. dmlx only has chat template on V4 path, LLaMA path passes raw prompt.
 
 ### 4. vs oMLX (Production-Grade Server)
 
-| Capability | oMLX | mlx-zig | Gap | Priority |
+| Capability | oMLX | dmlx | Gap | Priority |
 |------------|------|---------|-----|----------|
 | Continuous Batching | ✅ Real | ⚠️ Framework exists but no real batch forward | **High** | P1 |
 | SSE keep-alive | ✅ | ❌ | Medium | P2 |
@@ -104,7 +104,7 @@
 
 ### 5. vs TileKernels (DeepSeek GPU Kernel Library)
 
-| Capability | TileKernels | mlx-zig | Gap |
+| Capability | TileKernels | dmlx | Gap |
 |------------|-------------|---------|-----|
 | Numerical verification framework | ✅ cosine sim + bias check | ✅ golden test | None |
 | Per-token/per-block quantization | ✅ | ✅ | None |
@@ -113,11 +113,11 @@
 | Custom CUDA kernel | ✅ | N/A (Metal) | — |
 | FP8/FP4 training kernel | ✅ | ❌ | Low (inference priority) |
 
-**Leverage direction**: No significant gap. TileKernels' core value (MoE routing, quantization kernels, numerical verification) is already implemented in mlx-zig.
+**Leverage direction**: No significant gap. TileKernels' core value (MoE routing, quantization kernels, numerical verification) is already implemented in dmlx.
 
 ### 6. vs vLLM (Industrial-Grade Inference Engine)
 
-| Capability | vLLM | mlx-zig | Gap | Priority |
+| Capability | vLLM | dmlx | Gap | Priority |
 |------------|------|---------|-----|----------|
 | PagedAttention | ✅ | ✅ | None | — |
 | Prefix Caching | ✅ Real | ⚠️ Hash registered but unused in lookup | Medium | P2 |
@@ -129,7 +129,7 @@
 | OpenAI API Completeness | ✅ | ⚠️ Basic | Medium | P2 |
 
 **Leverage direction**:
-1. **OpenAI API completeness** — vLLM supports full `/v1/chat/completions` including `stream`, `stop`, `temperature`, `top_p`, `max_tokens`, `logprobs`, `tool_calls`. mlx-zig's server only supports basic fields.
+1. **OpenAI API completeness** — vLLM supports full `/v1/chat/completions` including `stream`, `stop`, `temperature`, `top_p`, `max_tokens`, `logprobs`, `tool_calls`. dmlx's server only supports basic fields.
 2. **EAGLE speculative decoding** — more efficient than n-gram, but requires additional draft model head.
 
 ---

@@ -104,16 +104,10 @@ pub const MambaBlock = struct {
         defer xz.deinit();
 
         // 2. Split
-        const x_ssm = try ops.slice(self.ctx, xz,
-            &[_]i32{ 0, 0, 0 },
-            &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(ssm_dim) },
-            &[_]i32{ 1, 1, 1 });
+        const x_ssm = try ops.slice(self.ctx, xz, &[_]i32{ 0, 0, 0 }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(ssm_dim) }, &[_]i32{ 1, 1, 1 });
         defer x_ssm.deinit();
 
-        const z = try ops.slice(self.ctx, xz,
-            &[_]i32{ 0, 0, @intCast(ssm_dim) },
-            &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(2 * ssm_dim) },
-            &[_]i32{ 1, 1, 1 });
+        const z = try ops.slice(self.ctx, xz, &[_]i32{ 0, 0, @intCast(ssm_dim) }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(2 * ssm_dim) }, &[_]i32{ 1, 1, 1 });
         defer z.deinit();
 
         // 3. Causal Conv1d + SiLU

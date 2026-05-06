@@ -111,7 +111,7 @@ test "TokenizerStrategy interface works" {
     defer allocator.free(ids);
     try std.testing.expectEqualSlices(u32, &[_]u32{0}, ids);
 
-    const text = try strategy.decode(&[_]u32{0, 2, 1}, allocator);
+    const text = try strategy.decode(&[_]u32{ 0, 2, 1 }, allocator);
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello world", text);
 }
@@ -350,7 +350,6 @@ fn decodeTokenInternal(allocator: std.mem.Allocator, token: []const u8) ![]const
     try tokenizer.loadFromJson(json);
     return tokenizer.decode(&[_]u32{99});
 }
-
 
 // ============================================================================
 // Pre-tokenizer unit tests

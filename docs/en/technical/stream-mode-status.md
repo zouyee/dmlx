@@ -209,18 +209,18 @@ Top tokens: [18639]=18.70 [84202]=17.35 [46552]=17.02
 - `3ac642f` - Fix stream mode to match preload mode behavior
 
 ### Files Modified
-- `mlx-zig/src/models/expert_stream.zig` - Stream mode implementation (manual remap fix + performance optimizations)
-- `mlx-zig/src/models/expert_preload.zig` - Preload mode reference
-- `mlx-zig/src/models/expert_cache.zig` - LRU expert weight cache
-- `mlx-zig/src/models/layer_prefetcher.zig` - Async layer prefetching
-- `mlx-zig/src/io/safetensors_reader.zig` - Partial tensor reads + FdPool
-- `mlx-zig/src/tests/expert_remap_test.zig` - Remap correctness unit tests
-- `mlx-zig/tests/test_mlx_take.py` - Python MLX reference test
+- `dmlx/src/models/expert_stream.zig` - Stream mode implementation (manual remap fix + performance optimizations)
+- `dmlx/src/models/expert_preload.zig` - Preload mode reference
+- `dmlx/src/models/expert_cache.zig` - LRU expert weight cache
+- `dmlx/src/models/layer_prefetcher.zig` - Async layer prefetching
+- `dmlx/src/io/safetensors_reader.zig` - Partial tensor reads + FdPool
+- `dmlx/src/tests/expert_remap_test.zig` - Remap correctness unit tests
+- `dmlx/tests/test_mlx_take.py` - Python MLX reference test
 
 ### Testing Commands
 ```bash
 # Test stream mode (slow but works)
-./zig-out/bin/mlx-zig chat \
+./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 5 \
@@ -228,7 +228,7 @@ Top tokens: [18639]=18.70 [84202]=17.35 [46552]=17.02
   --smelt-strategy stream
 
 # Test preload mode (fast but OOMs)
-./zig-out/bin/mlx-zig chat \
+./zig-out/bin/dmlx chat \
   --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "2+2=" \
   --max-tokens 5 \

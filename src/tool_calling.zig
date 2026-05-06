@@ -185,7 +185,7 @@ fn parseDeepSeekFormat(allocator: std.mem.Allocator, text: []const u8) !?ParseRe
 
     for (markers) |marker| {
         const marker_idx = std.mem.indexOf(u8, text, marker) orelse continue;
-        const after = std.mem.trimStart(u8, text[marker_idx + marker.len..], " \t\n\r");
+        const after = std.mem.trimStart(u8, text[marker_idx + marker.len ..], " \t\n\r");
         if (try parseSingleToolCallJson(allocator, after)) |result| return result;
     }
 
@@ -286,7 +286,7 @@ fn extractJsonStringValue(allocator: std.mem.Allocator, text: []const u8, key: [
     defer allocator.free(key_pattern);
 
     const key_idx = std.mem.indexOf(u8, text, key_pattern) orelse return null;
-    const after_key = text[key_idx + key_pattern.len..];
+    const after_key = text[key_idx + key_pattern.len ..];
 
     // Skip whitespace and colon
     var val_start: usize = 0;
@@ -311,7 +311,7 @@ fn extractJsonObjectValue(allocator: std.mem.Allocator, text: []const u8, key: [
     defer allocator.free(key_pattern);
 
     const key_idx = std.mem.indexOf(u8, text, key_pattern) orelse return null;
-    const after_key = text[key_idx + key_pattern.len..];
+    const after_key = text[key_idx + key_pattern.len ..];
 
     // Skip whitespace and colon
     var val_start: usize = 0;

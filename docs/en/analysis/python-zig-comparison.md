@@ -1,4 +1,4 @@
-# Python mlx-lm vs Zig mlx-zig Item-by-Item Comparison
+# Python mlx-lm vs Zig dmlx Item-by-Item Comparison
 # Date: 2026-05-03
 
 ---

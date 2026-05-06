@@ -85,12 +85,11 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) !JangCon
                 const mode = parseMode(mode_str.string);
                 const group_size: i32 = if (item.object.get("group_size")) |gs|
                     @intCast(gs.integer)
-                else
-                    switch (mode) {
-                        .mxfp4, .mxfp8 => 32,
-                        .nvfp4 => 16,
-                        .affine => 64,
-                    };
+                else switch (mode) {
+                    .mxfp4, .mxfp8 => 32,
+                    .nvfp4 => 16,
+                    .affine => 64,
+                };
 
                 try layers.append(allocator, .{
                     .name = layer_name,

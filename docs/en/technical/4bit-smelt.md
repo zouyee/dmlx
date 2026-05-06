@@ -26,12 +26,12 @@ DeepSeek V4 是一个 **MoE (Mixture of Experts)** 模型，包含 256 个专家
 
 ```bash
 # 基本用法：自动检测可用专家
-mlx-zig chat --model ~/models/deepseek-v4-flash-4bit \
+dmlx chat --model ~/models/deepseek-v4-flash-4bit \
   --smelt \
   --prompt "Hello, how are you?"
 
 # 指定专家加载比例（可选）
-mlx-zig chat --model ~/models/deepseek-v4-flash-4bit \
+dmlx chat --model ~/models/deepseek-v4-flash-4bit \
   --smelt --smelt-experts 0.15 \
   --prompt "Hello, how are you?"
 ```
@@ -41,7 +41,7 @@ mlx-zig chat --model ~/models/deepseek-v4-flash-4bit \
 如果你有足够的内存（>100GB），可以使用未量化的完整模型：
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4-fp16 \
+dmlx chat --model ~/models/deepseek-v4-fp16 \
   --prompt "Hello, how are you?"
 ```
 
@@ -233,11 +233,11 @@ pub const SmeltConfig = struct {
 
 ```bash
 # 最小内存（6GB）
-mlx-zig chat --model <model-path> --smelt --smelt-experts 0.15 --prompt "Hello"
+dmlx chat --model <model-path> --smelt --smelt-experts 0.15 --prompt "Hello"
 
 # 平衡模式（12GB）
-mlx-zig chat --model <model-path> --smelt --smelt-experts 0.30 --prompt "Hello"
+dmlx chat --model <model-path> --smelt --smelt-experts 0.30 --prompt "Hello"
 
 # 高性能（20GB）
-mlx-zig chat --model <model-path> --smelt --smelt-experts 0.50 --prompt "Hello"
+dmlx chat --model <model-path> --smelt --smelt-experts 0.50 --prompt "Hello"
 ```

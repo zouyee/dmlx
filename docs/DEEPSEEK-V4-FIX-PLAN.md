@@ -201,4 +201,4 @@ const partial = try self.partial_reader.readExpertRows(tensor_name, expert_ids);
 
 ---
 
-*本计划基于 `mlx-lm` Python 参考实现与 `mlx-zig` Zig 实现的逐行源码对比。*
+*本计划基于 `mlx-lm` Python 参考实现与 `dmlx` Zig 实现的逐行源码对比。*

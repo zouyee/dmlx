@@ -1,4 +1,4 @@
-# MLX-Zig Code Review Report
+# dmlx Code Review Report
 
 > Review Date: 2026-05-03  
 > Review Scope: Entire codebase, 53,057 lines of Zig code (including tests)  
@@ -346,7 +346,7 @@ var prng = std.Random.DefaultPrng.init(42);  // Fixed seed!
 
 ## 11. Summary
 
-MLX-Zig is a project with **good architectural design but critical security vulnerabilities and performance issues**. Its VTable polymorphic design, modular layering, and Zig's memory safety features are commendable, but the following issues severely hinder production use:
+dmlx is a project with **good architectural design but critical security vulnerabilities and performance issues**. Its VTable polymorphic design, modular layering, and Zig's memory safety features are commendable, but the following issues severely hinder production use:
 
 1. **Stream leaks cause OOM** (verified at runtime)
 2. **Prompt Cache type safety vulnerability** (may crash under default configuration)

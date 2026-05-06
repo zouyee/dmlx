@@ -1,4 +1,4 @@
-# mlx-zig Complete Code Review Report
+# dmlx Complete Code Review Report
 
 **Review Date:** 2026-05-01  
 **Review Scope:** 130+ Zig files under `src/` (~52,572 lines), `build.zig`, `tests/`, `docs/`  
@@ -12,7 +12,7 @@
 ## Executive Summary
 
 ### Project Positioning
-`mlx-zig` is a Zig language binding for Apple's `mlx-c` C library, providing an LLM inference engine. It supports multiple architectures (LLaMA, DeepSeek V4, MiniMax, Nemotron-H, etc.), multiple KV cache strategies, quantization, continuous batching, and server mode.
+`dmlx` is a Zig language binding for Apple's `mlx-c` C library, providing an LLM inference engine. It supports multiple architectures (LLaMA, DeepSeek V4, MiniMax, Nemotron-H, etc.), multiple KV cache strategies, quantization, continuous batching, and server mode.
 
 ### Overall Score
 
@@ -448,4 +448,4 @@ return .{ .inner = c.c.mlx_fast_metal_kernel_new(name_z.ptr, ...) };
 
 ---
 
-*This report is based on six independent dimensional reviews of the mlx-zig codebase. All claims have been cross-verified against source code. Report generated: 2026-05-01.*
+*This report is based on six independent dimensional reviews of the dmlx codebase. All claims have been cross-verified against source code. Report generated: 2026-05-01.*

@@ -5,7 +5,7 @@
 当你运行以下命令时：
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4-flash-4bit --prompt "Hello"
 ```
 
 会得到错误：
@@ -111,7 +111,7 @@ for (0..n_routed_experts) |e| {  // n_routed_experts = 256
 现在运行：
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
 ```
 
 ### 阶段 1：命令行参数解析
@@ -324,7 +324,7 @@ if (smelt_mask != null and !smelt_mask[expert_id]) {
 使用 `--smelt` 标志：
 
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
+dmlx chat --model ~/models/deepseek-v4-flash-4bit --smelt --prompt "Hello"
 ```
 
 这会：

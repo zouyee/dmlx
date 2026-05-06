@@ -1,6 +1,6 @@
 # 性能基准测试与仪表盘
 
-本文档介绍了 mlx-zig 的性能基准测试基础设施。
+本文档介绍了 dmlx 的性能基准测试基础设施。
 
 ## 概述
 
@@ -21,7 +21,7 @@
 ### 1. 本地运行基准测试
 
 ```bash
-cd /Users/zouyee/work/code/mlx-zig
+cd /Users/zouyee/work/code/dmlx
 make benchmark
 ```
 

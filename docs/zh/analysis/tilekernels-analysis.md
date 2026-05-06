@@ -1,7 +1,7 @@
-# TileKernels 深度分析与 mlx-zig 借鉴方向
+# TileKernels 深度分析与 dmlx 借鉴方向
 
 > 基于 DeepSeek TileKernels 代码库的逐模块审计，提炼其设计哲学和工程实践，
-> 识别 mlx-zig 可以借鉴的关键模式，以充分发挥 MLX 在 Apple Silicon 上的优势。
+> 识别 dmlx 可以借鉴的关键模式，以充分发挥 MLX 在 Apple Silicon 上的优势。
 
 ---
 
@@ -115,13 +115,13 @@ modeling 层（torch.autograd.Function，支持前向+反向）
 
 ---
 
-## 第二部分：mlx-zig 可借鉴的关键模式
+## 第二部分：dmlx 可借鉴的关键模式
 
-### 借鉴 1：算子融合 — 解决 mlx-zig 最大的性能问题
+### 借鉴 1：算子融合 — 解决 dmlx 最大的性能问题
 
 **TileKernels 的做法：** 将 SwiGLU + 量化、RMSNorm + 门控 + 残差等融合为单个 kernel。
 
-**mlx-zig 当前问题：** `nn.zig` 中的层实现完全绕过 MLX 计算图，用 CPU 标量循环。
+**dmlx 当前问题：** `nn.zig` 中的层实现完全绕过 MLX 计算图，用 CPU 标量循环。
 
 **借鉴方案：**
 
@@ -131,7 +131,7 @@ mlx-c 已经提供了融合 kernel 的入口：
 - `mlx_fast_rope` — 融合 RoPE
 - `mlx_fast_scaled_dot_product_attention` — 融合 SDPA
 
-mlx-zig 的 `fast.zig` 已经绑定了这些函数，但 `nn.zig` 完全没有调用。
+dmlx 的 `fast.zig` 已经绑定了这些函数，但 `nn.zig` 完全没有调用。
 
 **具体行动：**
 
@@ -150,7 +150,7 @@ pub fn forward(self: *RMSNorm, input: Array) !Array {
 同理，LLaMA Attention 应该调用 `fast.scaledDotProductAttention`，
 RoPE 应该调用 `fast.rope`。
 
-**更进一步：** 参照 TileKernels 的 SwiGLU+量化融合模式，mlx-zig 可以通过
+**更进一步：** 参照 TileKernels 的 SwiGLU+量化融合模式，dmlx 可以通过
 `mlx_compile` 将多个 mlx-c 算子编译为融合图：
 
 ```zig
@@ -159,7 +159,7 @@ const swiglu_closure = try Closure.init(swiGluForward, allocator);
 const compiled_swiglu = try compile.compile(swiglu_closure, false);
 ```
 
-### 借鉴 2：量化基础设施 — mlx-zig 的 QLoRA 路线图
+### 借鉴 2：量化基础设施 — dmlx 的 QLoRA 路线图
 
 **TileKernels 的做法：**
 
@@ -179,7 +179,7 @@ class CastOutputConfig:
     use_packed_ue8m0: bool           # 是否使用 packed 格式
 ```
 
-**mlx-zig 当前状态：** 量化基础设施已完整实现（affine/MXFP4/FP8），QLoRA 已实现。
+**dmlx 当前状态：** 量化基础设施已完整实现（affine/MXFP4/FP8），QLoRA 已实现。
 
 **借鉴方案：**
 
@@ -213,7 +213,7 @@ scores → topk_gate → get_fused_mapping → expand_to_fused
 - `normalize_weight`：routing weight 归一化
 - `aux_fi`：负载均衡辅助损失
 
-**mlx-zig 当前状态：** `models/deepseek_v4.zig` + `moe_router.zig` 完整实现 MoE 路由管线。
+**dmlx 当前状态：** `models/deepseek_v4.zig` + `moe_router.zig` 完整实现 MoE 路由管线。
 
 **借鉴方案：**
 
@@ -247,12 +247,12 @@ tests/moe/test_topk_gate.py    ← 对比测试
 3. 偏差统计检查（`check_bias`）
 4. Benchmark 工具
 
-**mlx-zig 当前问题：** NN 层和 Autograd 零测试覆盖。
+**dmlx 当前问题：** NN 层和 Autograd 零测试覆盖。
 
 **借鉴方案：**
 
 1. 为每个 NN 层创建 Python MLX 参考实现，生成 golden test data
-2. Zig 测试加载 golden data，对比 mlx-zig 输出
+2. Zig 测试加载 golden data，对比 dmlx 输出
 3. 参照 TileKernels 的 `calc_diff` 实现数值相似度检查：
 
 ```zig
@@ -279,9 +279,9 @@ fn calcDiff(x: []const f32, y: []const f32) f64 {
 用于 Manifold HyperConnection 中的注意力权重矩阵双随机化。
 包含完整的前向和反向传播实现。
 
-**mlx-zig 的借鉴价值：**
+**dmlx 的借鉴价值：**
 
-这是 DeepSeek V4 架构的关键组件。如果 mlx-zig 要完整支持 DeepSeek V4，
+这是 DeepSeek V4 架构的关键组件。如果 dmlx 要完整支持 DeepSeek V4，
 需要实现 Sinkhorn 归一化。可以用 mlx-c 算子组合：
 
 ```zig
@@ -318,9 +318,9 @@ class EngramGateFn(torch.autograd.Function):
         # 调用 bwd kernel
 ```
 
-**mlx-zig 的借鉴：**
+**dmlx 的借鉴：**
 
-mlx-zig 的 `closure.zig` + `grad.zig` 已经提供了类似机制，
+dmlx 的 `closure.zig` + `grad.zig` 已经提供了类似机制，
 但当前的 NN 层（Linear、LSTM 等）没有利用它。
 
 应该为每个需要梯度的层实现 closure-based forward，
@@ -364,20 +364,20 @@ MLX 的编译器会自动：
 TileKernels 需要显式管理 CPU↔GPU 数据传输，
 而 MLX 的统一内存架构天然避免了这个问题。
 
-mlx-zig 应该**停止**在 CPU 端通过 `dataSliceMut` 操作数据，
+dmlx 应该**停止**在 CPU 端通过 `dataSliceMut` 操作数据，
 让所有计算留在 MLX 的惰性求值图中，由 MLX 决定最优执行位置。
 
 ### Metal 的 Tile 分组
 
 MLX 的 Steel GEMM 和 Metal shader 已经针对 Apple Silicon 的
 GPU 架构（TBDR、tile memory、SIMD groups）做了优化。
-mlx-zig 通过 mlx-c 调用这些优化实现，比手写 Metal shader 更可靠。
+dmlx 通过 mlx-c 调用这些优化实现，比手写 Metal shader 更可靠。
 
 ---
 
 ## 第四部分：具体行动项
 
-| 优先级 | 行动 | 参照 TileKernels | mlx-zig 实现方式 |
+| 优先级 | 行动 | 参照 TileKernels | dmlx 实现方式 |
 |--------|------|-----------------|-----------------|
 | P0 | NN 层改用 mlx-c 算子 | 所有 kernel 都走 GPU | 调用 `fast.zig` 绑定 |
 | P0 | 启用 `mlx_compile` 融合 | SwiGLU+cast 融合 | `compile.compile(closure)` |

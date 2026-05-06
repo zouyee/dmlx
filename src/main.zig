@@ -1,13 +1,13 @@
-/// MLX-Zig CLI tool.
+/// DMLX CLI tool.
 ///
 /// Commands:
-///   mlx-zig chat --model <path> --prompt "Hello"
-///   mlx-zig serve --model <path> --port 8080
-///   mlx-zig server --model <path> --port 8080  (alias for serve)
-///   mlx-zig benchmark --model <path>
-///   mlx-zig quantize --model <path> --output <path> --bits 4
-///   mlx-zig convert --from gguf --to safetensors --input model.gguf --output model.safetensors
-///   mlx-zig lora-train --model <path> --data dataset.jsonl --output adapter.safetensors
+///   dmlx chat --model <path> --prompt "Hello"
+///   dmlx serve --model <path> --port 8080
+///   dmlx server --model <path> --port 8080  (alias for serve)
+///   dmlx benchmark --model <path>
+///   dmlx quantize --model <path> --output <path> --bits 4
+///   dmlx convert --from gguf --to safetensors --input model.gguf --output model.safetensors
+///   dmlx lora-train --model <path> --data dataset.jsonl --output adapter.safetensors
 const std = @import("std");
 const root = @import("root.zig");
 const c = @import("c.zig");
@@ -226,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
         }
         try runImageGen(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "version")) {
-        std.debug.print("mlx-zig {s}\n", .{root.version});
+        std.debug.print("dmlx {s}\n", .{root.version});
     } else {
         std.log.err("Unknown command: {s}", .{command});
         printUsage();
@@ -235,10 +235,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn printUsage() void {
-    std.debug.print("mlx-zig {s}\n\n", .{root.version});
+    std.debug.print("dmlx {s}\n\n", .{root.version});
     std.debug.print(
         \\Usage:
-        \\  mlx-zig chat [options]
+        \\  dmlx chat [options]
         \\    --model <path>      Path to model directory
         \\    --prompt <text>     Prompt text
         \\    --max-tokens <n>    Maximum tokens (default: 256)
@@ -248,7 +248,7 @@ fn printUsage() void {
         \\    --seed <n>          Random seed for sampling (optional)
         \\    --max-kv-size <v>   KV cache size: "auto" (default) or integer
         \\
-        \\  mlx-zig serve [options]  (alias: server)
+        \\  dmlx serve [options]  (alias: server)
         \\    --model <path>      Path to model directory
         \\    --port <n>          HTTP port (default: 8080)
         \\    --max-tokens <n>    Maximum tokens per request (default: 256)
@@ -269,33 +269,33 @@ fn printUsage() void {
         \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
         \\    --distributed               Enable distributed tensor parallelism
         \\
-        \\  mlx-zig benchmark [options]
+        \\  dmlx benchmark [options]
         \\    --model <path>      Path to model directory
         \\    --input-tokens <n>  Number of input tokens (default: 32)
         \\    --output-tokens <n> Number of output tokens (default: 128)
         \\    --warmup-runs <n>   Warmup iterations (default: 1)
         \\    --num-runs <n>      Timed iterations (default: 3)
         \\
-        \\  mlx-zig quantize [options]
+        \\  dmlx quantize [options]
         \\    --model <path>      Path to model directory
         \\    --output <path>     Output path for quantized model
         \\    --bits <n>          Quantization bits: 4 or 8 (default: 4)
         \\    --group-size <n>    Quantization group size (default: 64)
         \\
-        \\  mlx-zig convert [options]
+        \\  dmlx convert [options]
         \\    --from <format>     Source format
         \\    --to <format>       Target format
         \\    --input <path>      Input file
         \\    --output <path>     Output file
         \\
-        \\  mlx-zig evaluate [options]
+        \\  dmlx evaluate [options]
         \\    --model <path>      Path to model directory
         \\    --data <path>       Path to evaluation text file
         \\    --max-tokens <n>    Maximum tokens to evaluate (default: all)
         \\    --stride <n>        Sliding window stride (default: 512)
         \\    --context-size <n>  Context window size (default: 1024)
         \\
-        \\  mlx-zig lora-train [options]
+        \\  dmlx lora-train [options]
         \\    --model <path>      Base model directory
         \\    --data <path>       Training dataset (JSONL)
         \\    --output <path>     Output adapter path
@@ -304,12 +304,12 @@ fn printUsage() void {
         \\    --lr <lr>           Learning rate (default: 1e-4)
         \\    --epochs <n>        Number of epochs (default: 3)
         \\
-        \\  mlx-zig jang-convert [options]
+        \\  dmlx jang-convert [options]
         \\    --model <path>      Path to FP16 model directory
         \\    --output <path>     Output path for JANG quantized model
         \\    --profile <name>    JANG profile: 2M|2L|3M|4M|6M
         \\
-        \\  mlx-zig image-gen [options]
+        \\  dmlx image-gen [options]
         \\    --model <path>      Path to Flux model directory
         \\    --prompt <text>     Text prompt for image generation
         \\    --height <n>        Image height (default: 512)
@@ -317,7 +317,7 @@ fn printUsage() void {
         \\    --steps <n>         Denoising steps (default: 20)
         \\    --output <path>     Output image path
         \\
-        \\  mlx-zig version
+        \\  dmlx version
         \\    Show version information
         \\
     , .{});

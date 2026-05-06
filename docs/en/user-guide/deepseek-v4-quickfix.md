@@ -51,7 +51,7 @@ Expected output:
 
 ### Method 2: Manual Test
 ```bash
-mlx-zig chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
+dmlx chat --model ~/models/deepseek-v4 --prompt "Hello" --max-tokens 10
 ```
 
 Look for this in the logs:
@@ -170,10 +170,10 @@ If you're still experiencing issues after applying this fix:
    - Output from verification script
    - Model path and variant
    - System information (macOS version, chip, RAM)
-   - Full log output from `mlx-zig chat` command
+   - Full log output from `dmlx chat` command
 
 ---
 
 **Commit:** `a18bc24`  
 **Date:** 2026-04-29  
-**Author:** mlx-zig team
+**Author:** dmlx team

@@ -97,8 +97,8 @@ const mlx_prefix = blk: {
 
 ### Build Artifacts
 
-- `libmlx-zig.a`: static library
-- `mlx-zig`: CLI tool
+- `libdmlx.a`: static library
+- `dmlx`: CLI tool
 - `example`: example program
 - `test`: test runner
 

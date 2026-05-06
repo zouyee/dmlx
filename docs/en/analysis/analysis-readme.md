@@ -1,4 +1,4 @@
-# MLX-Zig In-Depth Technical Analysis Report Collection
+# dmlx In-Depth Technical Analysis Report Collection
 
 > Analysis Date: 2026-05-03  
 > Analysis Rounds: Three progressive rounds of deep analysis  

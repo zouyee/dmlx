@@ -8,7 +8,7 @@
 
 ## 执行摘要
 
-基于对 Apple 官方 `mlx-lm/mlx_lm/models/deepseek_v4.py`（2153 行）的深度审计以及 mlx-zig 当前能力（含 `CustomMetalKernel` 支持），本文档提供了可执行的 5 周优化路线图。mlx-zig 与 mlx-lm 之间的三个关键架构差异驱动了优化策略：(1) MoE 权重格式（fused vs split），(2) KV 压缩子系统（有状态 vs 纯函数），(3) Indexer 设计（Apple 重设计 vs 论文原始设计）。
+基于对 Apple 官方 `mlx-lm/mlx_lm/models/deepseek_v4.py`（2153 行）的深度审计以及 dmlx 当前能力（含 `CustomMetalKernel` 支持），本文档提供了可执行的 5 周优化路线图。dmlx 与 mlx-lm 之间的三个关键架构差异驱动了优化策略：(1) MoE 权重格式（fused vs split），(2) KV 压缩子系统（有状态 vs 纯函数），(3) Indexer 设计（Apple 重设计 vs 论文原始设计）。
 
 此外，TurboQuant 分析确定了升级 FP8 KV 存储的具体步骤（现在可通过新的 `mlx-c` 0.6.0 绑定实现）以及实现最优 KV cache 量化的路径。
 
@@ -31,33 +31,33 @@ v2 修正了 v1 中的 8 类问题；v3 修正了 v2 中的 3 处事实性错误
 
 #### 2.1 MoE 权重格式：Fused vs Split
 
-| 维度 | mlx-lm | mlx-zig |
+| 维度 | mlx-lm | dmlx |
 |------|--------|---------|
 | **存储格式** | `switch_mlp.weight` 为 `[n_experts, out, in]`（fused） | loader 将 fused tensor **split 成 256 个独立专家** |
 | **Dispatch** | `mx.gather_mm` 一次性加载选中专家 | 遍历 256 个 `DSV4Expert` |
 | **量化态** | `QuantizedSwitchLinear` 保持打包 | loader 反量化为 float16/float32 |
 
-**结论：** mlx-zig 的 MoE 是 `fused → split → dequantize → per-expert loop` 路径，与 mlx-lm 的 `fused → gather_mm` 路径完全相反。优化需要**反向重构**。
+**结论：** dmlx 的 MoE 是 `fused → split → dequantize → per-expert loop` 路径，与 mlx-lm 的 `fused → gather_mm` 路径完全相反。优化需要**反向重构**。
 
 #### 2.2 KV 压缩子系统：模块状态 vs 纯函数
 
-| 维度 | mlx-lm | mlx-zig |
+| 维度 | mlx-lm | dmlx |
 |------|--------|---------|
 | **结构** | `Compressor` 是有状态的 `nn.Module` | `compressKV()` 是纯函数 |
 | **Cache 集成** | `Compressor.__call__` 内部调用 `cache.accumulate_windows` | `compressKV()` 完全不知道 cache 存在 |
 | **Overlap** | `_overlap_transform` 是成员方法 | 无 overlap 逻辑 |
 
-**结论：** mlx-zig 缺少 `Compressor` 模块和 `DeepseekV4Cache` 状态机。
+**结论：** dmlx 缺少 `Compressor` 模块和 `DeepseekV4Cache` 状态机。
 
 #### 2.3 Indexer：两种不同架构
 
-| 维度 | mlx-lm `Indexer` | mlx-zig `LightningIndexer` |
+| 维度 | mlx-lm `Indexer` | dmlx `LightningIndexer` |
 |------|-------------------|---------------------------|
 | **Q 投影** | `wq_b: Linear(q_lora_rank → n_heads * head_dim)` | `wq_index: [index_n_heads * index_head_dim, head_dim]` |
 | **K 来源** | **内部嵌套 `Compressor`** | 直接接收外部 `k_compressed` |
 | **FP4** | ❌ 全程 bfloat16/float32 | ⚠️ 有 `quantize4bit` 模拟（应删除） |
 
-**结论：** 两个 Indexer 架构完全不同。mlx-zig 的更接近 DeepSeek V3 论文设计，mlx-lm 的是 Apple 重设计。
+**结论：** 两个 Indexer 架构完全不同。dmlx 的更接近 DeepSeek V3 论文设计，mlx-lm 的是 Apple 重设计。
 
 ### 3. 优先级总览
 
@@ -79,7 +79,7 @@ v2 修正了 v1 中的 8 类问题；v3 修正了 v2 中的 3 处事实性错误
 | **问题** | `DSV4MoE.forward()` 遍历全部 256 个专家。loader 已将 fused `switch_mlp` split 为独立专家，丢失了 gather 的可能性 |
 | **mlx-lm 参考** | `DeepseekV4SwitchGLU` (`deepseek_v4.py:125-155`) |
 | **关键机制** | `_gather_sort`：按专家 ID 排序（`sort_threshold=8`）；`mx.gather_mm`/`mx.gather_qmm`：只加载选中专家；`scores` 在 `down_proj` 前乘入；`_scatter_unsort` 恢复顺序 |
-| **mlx-zig 行动** | 1. **停止 splitFusedExperts**：保留 fused 格式<br>2. **重构 DSV4MoE**：删除 `DSV4Expert` 数组<br>3. **接入 sort**：路由后按专家 ID `argsort`<br>4. **scores 前置融合** |
+| **dmlx 行动** | 1. **停止 splitFusedExperts**：保留 fused 格式<br>2. **重构 DSV4MoE**：删除 `DSV4Expert` 数组<br>3. **接入 sort**：路由后按专家 ID `argsort`<br>4. **scores 前置融合** |
 | **预期收益** | **10-100x** 专家计算提速 |
 | **相关文件** | `src/models/deepseek_v4.zig:638-777`, `src/models/deepseek_v4_loader.zig:495-536` |
 
@@ -88,7 +88,7 @@ v2 修正了 v1 中的 8 类问题；v3 修正了 v2 中的 3 处事实性错误
 | 属性 | 内容 |
 |------|------|
 | **问题** | 无 `_overlap_transform`：CSA 层丢失块重叠；无 `accumulate_windows`：尾部 token 被丢弃 |
-| **mlx-zig 行动** | 1. **引入 `Compressor` 结构体**<br>2. **引入 `DeepseekV4Cache`**<br>3. **实现 `_overlap_transform`**<br>4. **实现 `accumulate_windows`** |
+| **dmlx 行动** | 1. **引入 `Compressor` 结构体**<br>2. **引入 `DeepseekV4Cache`**<br>3. **实现 `_overlap_transform`**<br>4. **实现 `accumulate_windows`** |
 | **预期收益** | CSA 层正确性修复，支持任意长度输入 |
 | **相关文件** | `src/models/deepseek_v4.zig:1367-1441`, `src/kvcache.zig` |
 
@@ -97,7 +97,7 @@ v2 修正了 v1 中的 8 类问题；v3 修正了 v2 中的 3 处事实性错误
 | 属性 | 内容 |
 |------|------|
 | **问题** | 所有 CSA 层统一走 `gatherBlocks → concat → dense SDPA`，未区分 generate（L=1）和 prefill（L>1） |
-| **mlx-zig 行动** | 1. 增加 `if (seq_len == 1)` gather + dense SDPA 分支<br>2. 实现 `seq_len > 1` 的 `_sparse_pooled_attention` |
+| **dmlx 行动** | 1. 增加 `if (seq_len == 1)` gather + dense SDPA 分支<br>2. 实现 `seq_len > 1` 的 `_sparse_pooled_attention` |
 | **预期收益** | 解码阶段正确性修复 + latency 降低 |
 | **相关文件** | `src/models/deepseek_v4.zig:1113-1361` |
 
@@ -163,9 +163,9 @@ Week 5 (P2) — 量化与绑定补齐
 └── Task 11: 权重加载 fused 格式对齐
 ```
 
-### 8. 附录：mlx-lm vs mlx-zig 能力矩阵
+### 8. 附录：mlx-lm vs dmlx 能力矩阵
 
-| 特性 | mlx-lm (Python) | mlx-zig | 差距 |
+| 特性 | mlx-lm (Python) | dmlx | 差距 |
 |------|-----------------|---------|------|
 | MoE gather_mm dispatch | ✅ | ❌ split + per-expert loop | **高** |
 | CSA overlap transform | ✅ | ❌ 纯函数 compressKV | **高** |
@@ -182,7 +182,7 @@ Week 5 (P2) — 量化与绑定补齐
 
 ## 第二部分：TurboQuant 与 FP8 分析（来自 turboquant-analysis.md）
 
-> 基于 DeepSeek V4 技术报告（2026-04-24）和 TurboQuant 论文（arXiv:2504.19874），结合 mlx-zig 代码审计和 MXFP4/FP8 绑定实现。
+> 基于 DeepSeek V4 技术报告（2026-04-24）和 TurboQuant 论文（arXiv:2504.19874），结合 dmlx 代码审计和 MXFP4/FP8 绑定实现。
 
 ### 1. 当前实现状态
 
