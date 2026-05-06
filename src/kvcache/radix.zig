@@ -14,8 +14,8 @@
 /// Pros: massive speedup for multi-turn chat (2nd+ turn may skip 90%+ of prefill).
 /// Cons: tree management overhead, memory grows with unique prompt history.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 const iface = @import("interface.zig");
 
 const Array = array_mod.Array;

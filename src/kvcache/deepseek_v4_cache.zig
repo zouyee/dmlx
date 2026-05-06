@@ -12,11 +12,11 @@
 ///
 /// Reference: mlx-lm `DeepseekV4Cache` (deepseek_v4.py:888-1480)
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const shape_mod = @import("../ops/shape.zig");
-const reduce_mod = @import("../ops/reduce.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
+const reduce_mod = @import("mlx").reduce;
 const rotating = @import("rotating.zig");
 const iface = @import("interface.zig");
 

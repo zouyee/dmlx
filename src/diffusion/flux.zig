@@ -1,11 +1,11 @@
 /// Flux-style Diffusion Transformer (DiT) scaffolding.
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const array_mod = @import("../array.zig");
-const activations = @import("../ops/activations.zig");
-const random_mod = @import("../ops/random.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const array_mod = @import("mlx").array;
+const activations = @import("mlx").activations;
+const random_mod = @import("mlx").random;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

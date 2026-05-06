@@ -8,13 +8,13 @@
 /// All layers build on `ModelVTable` for model-agnostic inference and
 /// `KVCacheStrategy` for pluggable KV cache backends.
 const std = @import("std");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 const sampling_mod = @import("sampling.zig");
 const kvcache = @import("kvcache.zig");
-const shape_mod = @import("ops/shape.zig");
-const array_arena_mod = @import("array_arena.zig");
+const shape_mod = @import("mlx").shape;
+const array_arena_mod = @import("mlx").array_arena;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

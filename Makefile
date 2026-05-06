@@ -29,8 +29,10 @@ ZIG_BUILD_OPTS := -Doptimize=ReleaseFast
 
 # Metal stability (required for DeepSeek V4 on Apple Silicon)
 export MLX_METAL_FAST_SYNCH := 1
+# mlx-c prefix (now managed by mlx-zig dependency; use MLX_C_PREFIX env var)
+export MLX_C_PREFIX ?= $(shell pkg-config --variable=prefix mlxc 2>/dev/null)
 ifdef MLX_PREFIX
-	ZIG_BUILD_OPTS += -Dmlx_prefix=$(MLX_PREFIX)
+	export MLX_C_PREFIX := $(MLX_PREFIX)
 endif
 
 # ------------------------------------------------------------------

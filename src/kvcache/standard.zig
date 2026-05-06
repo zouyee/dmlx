@@ -7,8 +7,8 @@
 /// Pros: minimal allocation during inference, simple, works with any attention.
 /// Cons: memory grows with max_seq_len (not dynamically shrinkable).
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 const iface = @import("interface.zig");
 
 const Array = array_mod.Array;

@@ -6,18 +6,18 @@
 /// - Direct DeepSeek weight naming (no HF mapping needed)
 /// - mlx-community HF naming (model.* prefix, gate_proj/up_proj/down_proj)
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const creation = @import("../ops/creation.zig");
-const io = @import("../io/mlx_io.zig");
-const safetensors_reader = @import("../io/safetensors_reader.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const creation = @import("mlx").creation;
+const io = @import("mlx").io;
+const safetensors_reader = @import("mlx").safetensors_reader;
 const deepseek_v4 = @import("deepseek_v4.zig");
-const quantize_mod = @import("../quantize.zig");
-const shape_mod = @import("../ops/shape.zig");
-const cmp_mod = @import("../ops/comparison.zig");
-const math_mod = @import("../ops/math.zig");
+const quantize_mod = @import("mlx").quantize;
+const shape_mod = @import("mlx").shape;
+const cmp_mod = @import("mlx").comparison;
+const math_mod = @import("mlx").math;
 const kvcache = @import("../kvcache.zig");
 
 const Array = array_mod.Array;

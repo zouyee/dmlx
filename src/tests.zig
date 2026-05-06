@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("c.zig");
+const c = @import("mlx").c;
 
 pub const core_tests = @import("tests/core_tests.zig");
 pub const comparison_tests = @import("tests/comparison_tests.zig");
@@ -32,7 +32,7 @@ pub const server_tests = @import("server.zig");
 pub const batch_builder_tests = @import("tests/batch_builder_tests.zig");
 pub const speculative_tests = @import("speculative.zig");
 pub const guided_tests = @import("guided.zig");
-pub const quantize_tests = @import("quantize.zig");
+pub const quantize_tests = @import("mlx").quantize;
 pub const qlora_tests = @import("qlora.zig");
 pub const moe_router_tests = @import("moe_router.zig");
 pub const model_pool_tests = @import("model_pool.zig");
@@ -46,7 +46,7 @@ pub const model_smoke_tests = @import("tests/model_smoke_tests.zig");
 
 pub const tool_calling_tests = @import("tool_calling.zig");
 pub const tool_executor_tests = @import("tool_executor.zig");
-pub const jang_loader_tests = @import("io/jang_loader.zig");
+pub const jang_loader_tests = @import("mlx").jang_loader;
 pub const jang_quantizer_tests = @import("jang_quantizer.zig");
 
 pub const vision_preprocess_tests = @import("vision/preprocess.zig");
@@ -58,7 +58,7 @@ pub const expert_cache_tests = @import("models/expert_cache.zig");
 pub const layer_prefetcher_tests = @import("models/layer_prefetcher.zig");
 pub const numerical_equivalence_tests = @import("tests/numerical_equivalence_test.zig");
 pub const cache_integration_tests = @import("tests/cache_integration_test.zig");
-pub const safetensors_reader_tests = @import("io/safetensors_reader.zig");
+pub const safetensors_reader_tests = @import("mlx").safetensors_reader;
 pub const expert_stream_tests = @import("models/expert_stream.zig");
 
 test "init mlx error handler" {

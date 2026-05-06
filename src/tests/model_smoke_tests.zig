@@ -2,11 +2,11 @@
 /// Uses tiny random-weight models (no real weights needed).
 const std = @import("std");
 const mlx = @import("../root.zig");
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 
 const Array = mlx.Array;
 const EagerContext = mlx.EagerContext;
-const array_mod = @import("../array.zig");
+const array_mod = @import("mlx").array;
 
 // ============================================================
 // Helper: create random weights map for a tiny LLaMA model

@@ -7,12 +7,12 @@
 ///
 /// Requirements: R8.1, R8.2, R8.3
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const array_mod = @import("../array.zig");
-const eval_mod = @import("../eval.zig");
-const fused = @import("../ops/fused.zig");
-const random = @import("../ops/random.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
+const eval_mod = @import("mlx").eval;
+const fused = @import("mlx").fused;
+const random = @import("mlx").random;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

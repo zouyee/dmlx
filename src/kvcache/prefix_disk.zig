@@ -14,9 +14,9 @@
 ///
 /// _Gap: V4 "heterogeneous KV cache with on-disk storage for shared-prefix reuse"_
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const mlx_io = @import("../io/mlx_io.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const mlx_io = @import("mlx").io;
 const paged_mod = @import("paged.zig");
 const generation = @import("../generation.zig");
 

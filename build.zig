@@ -1,64 +1,20 @@
 const std = @import("std");
 
-fn configureMlxModule(b: *std.Build, module: *std.Build.Module, is_macos: bool, mlx_prefix: []const u8) void {
-    module.linkSystemLibrary("mlxc", .{});
-
-    const include_path = b.pathJoin(&.{ mlx_prefix, "include" });
-    const lib_path = b.pathJoin(&.{ mlx_prefix, "lib" });
-    module.addIncludePath(.{ .cwd_relative = include_path });
-    module.addLibraryPath(.{ .cwd_relative = lib_path });
-
-    if (is_macos) {
-        module.linkFramework("Accelerate", .{});
-        module.linkFramework("Metal", .{});
-        module.linkFramework("Foundation", .{});
-    }
-}
-
-/// Try to discover mlx-c prefix via pkg-config.
-/// Returns the prefix path (e.g. "/opt/homebrew") or null if pkg-config fails.
-fn pkgConfigMlxPrefix(b: *std.Build) ?[]const u8 {
-    // Run: pkg-config --variable=prefix mlxc
-    var code: u8 = undefined;
-    const stdout = b.runAllowFail(
-        &.{ "pkg-config", "--variable=prefix", "mlxc" },
-        &code,
-        .inherit,
-    ) catch return null;
-
-    const trimmed = std.mem.trim(u8, stdout, &std.ascii.whitespace);
-    if (trimmed.len == 0) {
-        b.allocator.free(stdout);
-        return null;
-    }
-    return trimmed;
-}
-
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const is_macos = target.result.os.tag == .macos;
-
-    // Resolve mlx-c prefix: -Dmlx_prefix > MLX_C_PREFIX env > pkg-config > /opt/homebrew fallback
-    const mlx_prefix = blk: {
-        // 1. Explicit build option takes priority
-        if (b.option([]const u8, "mlx_prefix", "Path to mlx-c installation prefix")) |p| break :blk p;
-
-        // 2. Environment variable
-        if (b.graph.environ_map.get("MLX_C_PREFIX")) |p| break :blk p;
-
-        // 3. pkg-config discovery
-        if (pkgConfigMlxPrefix(b)) |p| break :blk p;
-
-        // 4. Fallback to /opt/homebrew with a warning
-        std.log.warn("mlx-c not found via -Dmlx_prefix, MLX_C_PREFIX, or pkg-config; falling back to /opt/homebrew", .{});
-        break :blk "/opt/homebrew";
-    };
 
     const zig_regex = b.dependency("zig_regex", .{
         .target = target,
         .optimize = optimize,
     });
+
+    // mlx-zig handles mlx-c discovery and linking
+    const mlx_z_dep = b.dependency("mlx_z", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const mlx_z_module = mlx_z_dep.module("mlx");
 
     // --- Library ---
     const lib = b.addLibrary(.{
@@ -70,8 +26,8 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .static,
     });
+    lib.root_module.addImport("mlx", mlx_z_module);
     lib.root_module.addImport("regex", zig_regex.module("regex"));
-    configureMlxModule(b, lib.root_module, is_macos, mlx_prefix);
     b.installArtifact(lib);
 
     // --- Tests ---
@@ -82,8 +38,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    lib_tests.root_module.addImport("mlx", mlx_z_module);
     lib_tests.root_module.addImport("regex", zig_regex.module("regex"));
-    configureMlxModule(b, lib_tests.root_module, is_macos, mlx_prefix);
     const run_lib_tests = b.addRunArtifact(lib_tests);
     if (b.args) |args| {
         run_lib_tests.addArgs(args);
@@ -100,8 +56,8 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    example.root_module.addImport("mlx", mlx_z_module);
     example.root_module.addImport("regex", zig_regex.module("regex"));
-    configureMlxModule(b, example.root_module, is_macos, mlx_prefix);
     b.installArtifact(example);
 
     // --- CLI ---
@@ -113,7 +69,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    cli.root_module.addImport("mlx", mlx_z_module);
     cli.root_module.addImport("regex", zig_regex.module("regex"));
-    configureMlxModule(b, cli.root_module, is_macos, mlx_prefix);
     b.installArtifact(cli);
 }

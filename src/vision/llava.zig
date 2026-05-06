@@ -4,15 +4,15 @@
 /// For now, the vision tower weights are stored raw (encoder forward pass
 /// is not yet implemented); text-only inference delegates to the language model.
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const array_mod = @import("mlx").array;
 const llama = @import("../models/llama.zig");
 const kvcache = @import("../kvcache.zig");
 const generation = @import("../generation.zig");
 const vit = @import("vit.zig");
-const activations = @import("../ops/activations.zig");
+const activations = @import("mlx").activations;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

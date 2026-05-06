@@ -8,10 +8,10 @@
 /// for token generation, and ModelPool + MemoryLimiter for production ops.
 const std = @import("std");
 const root = @import("root.zig");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
-const shape_mod = @import("ops/shape.zig");
-const array_arena_mod = @import("array_arena.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
+const array_arena_mod = @import("mlx").array_arena;
 const memory_mod = @import("memory.zig");
 const model_registry_mod = @import("model_registry.zig");
 const generation_mod = @import("generation.zig");

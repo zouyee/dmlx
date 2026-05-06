@@ -1,8 +1,8 @@
 /// Flow Matching Scheduler for rectified-flow diffusion (Flux-style).
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

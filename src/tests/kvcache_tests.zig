@@ -4,7 +4,7 @@ const root = @import("../root.zig");
 const Array = root.Array;
 const kvcache = root.kvcache;
 const EagerContext = root.EagerContext;
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 
 /// Create a small KV tensor of shape [B=1, H=2, S=3, D=4] for testing.
 fn makeTestKV(allocator: std.mem.Allocator, stream: c.c.mlx_stream) !struct { keys: Array, values: Array } {

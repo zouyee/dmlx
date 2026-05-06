@@ -1,7 +1,7 @@
 const std = @import("std");
-const c = @import("../c.zig");
-const nn = @import("../ops/nn.zig");
-const ops = @import("../ops.zig");
+const c = @import("mlx").c;
+const nn = @import("mlx").nn;
+const ops = @import("mlx").ops;
 
 test "check random exists" {
     c.initErrorHandler();

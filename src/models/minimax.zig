@@ -3,15 +3,15 @@
 /// Simplified MoE transformer with standard GQA attention.
 /// Based on DeepSeek V4's MoE framework but without MLA, CSA/HCA, or mHC.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const shape_mod = @import("../ops/shape.zig");
-const reduce_mod = @import("../ops/reduce.zig");
-const cmp_mod = @import("../ops/comparison.zig");
-const nn = @import("../ops/nn.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
+const reduce_mod = @import("mlx").reduce;
+const cmp_mod = @import("mlx").comparison;
+const nn = @import("mlx").nn;
 const kvcache = @import("../kvcache.zig");
-const array_arena_mod = @import("../array_arena.zig");
+const array_arena_mod = @import("mlx").array_arena;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

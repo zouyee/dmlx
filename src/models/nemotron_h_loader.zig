@@ -1,10 +1,10 @@
 /// Nemotron-H model loader from HuggingFace Safetensors format.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const io = @import("../io/mlx_io.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const io = @import("mlx").io;
 const nemotron_h = @import("nemotron_h.zig");
 
 const Array = array_mod.Array;

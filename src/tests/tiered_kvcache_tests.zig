@@ -1,6 +1,6 @@
 const std = @import("std");
 const root = @import("../root.zig");
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 const posix_c = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");

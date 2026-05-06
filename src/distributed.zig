@@ -45,9 +45,9 @@
 ///
 /// This minimizes communication while distributing the compute-heavy operations.
 const std = @import("std");
-const c = @import("c.zig");
-const array_mod = @import("array.zig");
-const dtype_mod = @import("dtype.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const dtype_mod = @import("mlx").dtype;
 
 const Array = array_mod.Array;
 

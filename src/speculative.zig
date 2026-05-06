@@ -11,12 +11,12 @@
 ///   - Leviathan et al., "Fast Inference from Transformers via Speculative Decoding" (2023)
 ///   - Chen et al., "Accelerating Large Language Model Decoding with Speculative Sampling" (2023)
 const std = @import("std");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
 const kvcache = @import("kvcache.zig");
-const shape_mod = @import("ops/shape.zig");
-const array_arena_mod = @import("array_arena.zig");
+const shape_mod = @import("mlx").shape;
+const array_arena_mod = @import("mlx").array_arena;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -647,7 +647,7 @@ test "NgramDrafter: configurable n-gram size" {
 }
 
 test "verifyDraft: empty draft returns empty result" {
-    const c = @import("c.zig");
+    const c = @import("mlx").c;
     c.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
@@ -667,7 +667,7 @@ test "verifyDraft: empty draft returns empty result" {
 }
 
 test "verifyDraft: accepts tokens with high target probability" {
-    const c = @import("c.zig");
+    const c = @import("mlx").c;
     c.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
@@ -739,7 +739,7 @@ test "verifyDraft: accepts tokens with high target probability" {
 }
 
 test "verifyDraft: result tokens length is accepted + 1" {
-    const c = @import("c.zig");
+    const c = @import("mlx").c;
     c.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
@@ -953,7 +953,7 @@ test "Property 14: N-gram Draft Proposal Correctness — returns null when no re
 // ============================================================
 
 test "Property 15: Speculative Decoding Statistical Equivalence — tokens.len == accepted + 1 invariant (100 iterations)" {
-    const c = @import("c.zig");
+    const c = @import("mlx").c;
     c.initErrorHandler();
     const alloc = std.testing.allocator;
     const ctx = EagerContext.init(alloc);
@@ -1065,7 +1065,7 @@ test "Property 15: Speculative Decoding Statistical Equivalence — tokens.len =
 }
 
 test "Property 15: Speculative Decoding — high-probability drafts are mostly accepted (100 iterations)" {
-    const c = @import("c.zig");
+    const c = @import("mlx").c;
     c.initErrorHandler();
     const alloc = std.testing.allocator;
     const ctx = EagerContext.init(alloc);
@@ -1166,7 +1166,7 @@ test "EagleDrafter: not ready without weights" {
 }
 
 test "EagleDrafter: propose returns null without weights" {
-    const c_test = @import("c.zig");
+    const c_test = @import("mlx").c;
     c_test.initErrorHandler();
     const ctx = EagerContext.init(std.testing.allocator);
     const drafter = EagleDrafter.init(4096, 32000);
@@ -1177,7 +1177,7 @@ test "EagleDrafter: propose returns null without weights" {
 }
 
 test "EagleDrafter: propose with weights returns draft tokens" {
-    const c_test = @import("c.zig");
+    const c_test = @import("mlx").c;
     c_test.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);

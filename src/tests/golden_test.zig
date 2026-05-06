@@ -13,12 +13,12 @@
 /// **Validates: Requirements R3.1, R3.2, R3.3, R3.4, R3.5, R3.6, R26.1, R26.2**
 const std = @import("std");
 const mlx = @import("../root.zig");
-const c = @import("../c.zig");
-const fast = @import("../ops/fast.zig");
-const nn = @import("../ops/nn.zig");
-const loss_mod = @import("../ops/loss.zig");
-const shape_mod = @import("../ops/shape.zig");
-const creation_mod = @import("../ops/creation.zig");
+const c = @import("mlx").c;
+const fast = @import("mlx").fast;
+const nn = @import("mlx").nn;
+const loss_mod = @import("mlx").loss;
+const shape_mod = @import("mlx").shape;
+const creation_mod = @import("mlx").creation;
 
 const Array = mlx.ops.Array;
 const EagerContext = mlx.ops.EagerContext;

@@ -8,10 +8,10 @@
 ///
 /// _Requirements: 5.1, 5.2_
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const safetensors_reader = @import("../io/safetensors_reader.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const safetensors_reader = @import("mlx").safetensors_reader;
 const expert_cache = @import("../models/expert_cache.zig");
 
 const Array = array_mod.Array;

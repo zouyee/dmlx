@@ -6,8 +6,8 @@
 ///   - Logits vector (vocab_size) is small to copy CPU↔GPU
 ///   - Sampling logic is branching-heavy (poor fit for GPU SIMT)
 const std = @import("std");
-const c = @import("c.zig");
-const array_mod = @import("array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 
 const Array = array_mod.Array;
 

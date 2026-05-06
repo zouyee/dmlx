@@ -11,10 +11,10 @@
 ///
 /// Requirements: R19.1, R19.2, R19.3
 const std = @import("std");
-const c = @import("c.zig");
-const array_mod = @import("array.zig");
-const ops = @import("ops.zig");
-const quantize_mod = @import("quantize.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const quantize_mod = @import("mlx").quantize;
 const lora_mod = @import("lora.zig");
 
 const Array = array_mod.Array;

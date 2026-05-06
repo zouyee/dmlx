@@ -10,8 +10,8 @@
 /// Pros: bounded memory regardless of sequence length.
 /// Cons: tokens outside the window are lost (no access to distant context).
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 const iface = @import("interface.zig");
 
 const Array = array_mod.Array;

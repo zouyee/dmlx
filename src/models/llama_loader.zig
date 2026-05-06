@@ -4,14 +4,14 @@
 ///   var model = try LlamaModelLoader.load(allocator, &config, "path/to/model.safetensors", stream);
 ///   defer model.deinit();
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const io = @import("../io/mlx_io.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const io = @import("mlx").io;
 const hf_config = @import("../hf_config.zig");
 const llama = @import("llama.zig");
-const quantize_mod = @import("../quantize.zig");
+const quantize_mod = @import("mlx").quantize;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const mlx = @import("../root.zig");
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 
 const Array = mlx.Array;
 const EagerContext = mlx.EagerContext;

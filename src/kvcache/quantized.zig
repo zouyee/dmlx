@@ -9,8 +9,8 @@
 ///
 /// Requirements: R11.1, R11.2, R11.3, R11.4
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 const iface = @import("interface.zig");
 
 const Array = array_mod.Array;

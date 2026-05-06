@@ -12,17 +12,17 @@
 ///   - Checkpoint save/resume
 ///   - LR scheduling (cosine with warmup)
 const std = @import("std");
-const c = @import("c.zig");
-const array_mod = @import("array.zig");
-const ops = @import("ops.zig");
-const reduce_mod = @import("ops/reduce.zig");
-const loss_mod = @import("ops/loss.zig");
-const grad_mod = @import("grad.zig");
-const optim = @import("optim.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const reduce_mod = @import("mlx").reduce;
+const loss_mod = @import("mlx").loss;
+const grad_mod = @import("mlx").grad;
+const optim = @import("mlx").optim;
 const llama = @import("models/llama.zig");
-const tree_mod = @import("tree.zig");
+const tree_mod = @import("mlx").tree;
 const lora_mod = @import("lora.zig");
-const io = @import("io/mlx_io.zig");
+const io = @import("mlx").io;
 const tokenizer_mod = @import("tokenizer.zig");
 
 const Array = array_mod.Array;

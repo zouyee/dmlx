@@ -1,9 +1,9 @@
 /// Image preprocessing for Vision Transformer models.
 /// Normalizes images using ImageNet statistics and patchifies them.
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

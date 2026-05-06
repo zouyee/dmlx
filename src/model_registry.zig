@@ -7,10 +7,10 @@
 /// Re-exports `ModelVTable` and `ModelConfig` from `generation.zig` so that
 /// callers only need to import this module.
 const std = @import("std");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
 const kvcache = @import("kvcache.zig");
-const array_mod = @import("array.zig");
+const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
 
 // Model implementations

@@ -61,3 +61,4 @@ test_mlx_take_zero
 # Python cache
 __pycache__/
 *.pyc
+zig-pkg/

@@ -7,20 +7,20 @@
 /// - mHC (Manifold-Constrained Hyper-Connections)
 /// - YARN RoPE scaling
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const shape_mod = @import("../ops/shape.zig");
-const reduce_mod = @import("../ops/reduce.zig");
-const cmp_mod = @import("../ops/comparison.zig");
-const math_mod = @import("../ops/math.zig");
-const dtype_mod = @import("../dtype.zig");
-const nn = @import("../ops/nn.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
+const reduce_mod = @import("mlx").reduce;
+const cmp_mod = @import("mlx").comparison;
+const math_mod = @import("mlx").math;
+const dtype_mod = @import("mlx").dtype;
+const nn = @import("mlx").nn;
 const kvcache = @import("../kvcache.zig");
 const lora_mod = @import("../lora.zig");
-const fast_mod = @import("../ops/fast.zig");
-const array_arena_mod = @import("../array_arena.zig");
-const quantize_mod = @import("../quantize.zig");
+const fast_mod = @import("mlx").fast;
+const array_arena_mod = @import("mlx").array_arena;
+const quantize_mod = @import("mlx").quantize;
 const expert_stream = @import("expert_stream.zig");
 
 const Array = array_mod.Array;

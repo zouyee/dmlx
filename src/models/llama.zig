@@ -7,15 +7,15 @@
 ///   - SwiGLU MLP
 ///   - KV Cache integration
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const array_mod = @import("mlx").array;
 const kvcache = @import("../kvcache.zig");
-const tree_mod = @import("../tree.zig");
+const tree_mod = @import("mlx").tree;
 const lora_mod = @import("../lora.zig");
-const array_arena_mod = @import("../array_arena.zig");
-const quantize_mod = @import("../quantize.zig");
+const array_arena_mod = @import("mlx").array_arena;
+const quantize_mod = @import("mlx").quantize;
 const distributed_mod = @import("../distributed.zig");
 
 const Array = array_mod.Array;

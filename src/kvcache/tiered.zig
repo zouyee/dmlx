@@ -11,11 +11,11 @@
 ///
 /// Requirements: R22.1, R22.2, R22.3, R22.4
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 const iface = @import("interface.zig");
 const paged_mod = @import("paged.zig");
-const mlx_io = @import("../io/mlx_io.zig");
+const mlx_io = @import("mlx").io;
 const posix = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("unistd.h");

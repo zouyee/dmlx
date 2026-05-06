@@ -3,14 +3,14 @@
 /// Combines Mamba/GatedDeltaNet SSM layers with standard multi-head attention
 /// in a hybrid transformer stack.
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const array_mod = @import("mlx").array;
 const kvcache = @import("../kvcache.zig");
-const array_arena_mod = @import("../array_arena.zig");
-const activations = @import("../ops/activations.zig");
-const conv = @import("../ops/conv.zig");
+const array_arena_mod = @import("mlx").array_arena;
+const activations = @import("mlx").activations;
+const conv = @import("mlx").conv;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

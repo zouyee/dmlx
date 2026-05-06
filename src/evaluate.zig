@@ -16,9 +16,9 @@
 /// runs forward passes in sliding windows, and computes the average
 /// cross-entropy loss across all tokens.
 const std = @import("std");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 const generation_mod = @import("generation.zig");
 const kvcache = @import("kvcache.zig");
 

@@ -11,12 +11,12 @@
 /// On load, metadata is validated against the current model config.
 /// A descriptive error is returned on mismatch.
 const std = @import("std");
-const io = @import("io/mlx_io.zig");
+const io = @import("mlx").io;
 const kvcache = @import("kvcache.zig");
 const generation = @import("generation.zig");
-const array_mod = @import("array.zig");
-const dtype_mod = @import("dtype.zig");
-const c = @import("c.zig");
+const array_mod = @import("mlx").array;
+const dtype_mod = @import("mlx").dtype;
+const c = @import("mlx").c;
 
 const Array = array_mod.Array;
 const KVCacheStrategy = kvcache.KVCacheStrategy;

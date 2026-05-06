@@ -6,13 +6,13 @@
 ///
 /// Requirements: R20.1, R20.2, R20.3
 const std = @import("std");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
-const reduce_mod = @import("ops/reduce.zig");
-const shape_mod = @import("ops/shape.zig");
-const sort_mod = @import("ops/sort.zig");
-const cmp_mod = @import("ops/comparison.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
+const reduce_mod = @import("mlx").reduce;
+const shape_mod = @import("mlx").shape;
+const sort_mod = @import("mlx").sort;
+const cmp_mod = @import("mlx").comparison;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

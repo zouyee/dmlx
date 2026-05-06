@@ -5,11 +5,11 @@
 ///   - Multi-modal projector (pattern: `multi_modal_projector.*`)
 ///   - Language model (loaded via `llama_loader.buildModel`)
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const io = @import("../io/mlx_io.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const io = @import("mlx").io;
 const hf_config = @import("../hf_config.zig");
 const llama = @import("llama.zig");
 const llama_loader = @import("llama_loader.zig");

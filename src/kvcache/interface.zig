@@ -6,8 +6,8 @@
 ///   3. Attention decoupling: Attention layer depends only on KVCacheStrategy, not concrete type.
 ///   4. Unified lifecycle: CacheManager owns all layer caches; individual strategies own their buffers.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
 
 const Array = array_mod.Array;
 
@@ -137,7 +137,7 @@ pub const LayerConfig = struct {
     num_kv_heads: usize,
     head_dim: usize,
     max_seq_len: usize,
-    dtype: @import("../dtype.zig").Dtype,
+    dtype: @import("mlx").dtype.Dtype,
 };
 
 /// Factory signature for creating a KV cache strategy instance.

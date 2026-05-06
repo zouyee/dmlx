@@ -33,8 +33,8 @@ fn makeDecodeRequest(id: u64, prompt: []const u32, max_tokens: usize, generated:
     return req;
 }
 
-fn dummyCtx() @import("../ops.zig").EagerContext {
-    return @import("../ops.zig").EagerContext.init(allocator);
+fn dummyCtx() @import("mlx").ops.EagerContext {
+    return @import("mlx").ops.EagerContext.init(allocator);
 }
 
 // ---------------------------------------------------------------------------

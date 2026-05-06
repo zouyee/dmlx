@@ -7,7 +7,7 @@
 /// Design: doubly-linked list threaded through CacheEntry nodes for O(1) promotion/eviction,
 /// backed by an AutoHashMap for O(1) key lookup.
 const std = @import("std");
-const array_mod = @import("../array.zig");
+const array_mod = @import("mlx").array;
 const Array = array_mod.Array;
 
 /// Default cache budget: 4GB

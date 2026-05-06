@@ -11,7 +11,7 @@
 const std = @import("std");
 const expert_cache = @import("expert_cache.zig");
 const expert_stream = @import("expert_stream.zig");
-const safetensors_reader = @import("../io/safetensors_reader.zig");
+const safetensors_reader = @import("mlx").safetensors_reader;
 
 const ExpertCache = expert_cache.ExpertCache;
 const PartialTensorReader = safetensors_reader.PartialTensorReader;

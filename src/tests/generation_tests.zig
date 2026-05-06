@@ -8,9 +8,9 @@
 ///   - stop tokens halt generation early
 ///   - output length ≤ max_tokens
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const array_mod = @import("../array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 const generation = @import("../generation.zig");
 const kvcache = @import("../kvcache.zig");
 const sampling_mod = @import("../sampling.zig");

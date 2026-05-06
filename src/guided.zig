@@ -10,9 +10,9 @@
 ///
 /// Requirements: R17.1, R17.2, R17.3
 const std = @import("std");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
-const comparison = @import("ops/comparison.zig");
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
+const comparison = @import("mlx").comparison;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -838,7 +838,7 @@ test "GuidedDecoder: reset returns to initial state" {
 }
 
 test "GuidedDecoder: maskLogits sets disallowed tokens to -inf" {
-    const c_mod = @import("c.zig");
+    const c_mod = @import("mlx").c;
     c_mod.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
@@ -907,7 +907,7 @@ test "FiniteStateMachine: out of bounds state returns empty allowed tokens" {
 // ============================================================
 
 test "Property 16: Guided Decoding Constraint Satisfaction — maskLogits sets disallowed tokens to -inf and preserves allowed (100 iterations)" {
-    const c_mod = @import("c.zig");
+    const c_mod = @import("mlx").c;
     c_mod.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);
@@ -1002,7 +1002,7 @@ test "Property 16: Guided Decoding Constraint Satisfaction — maskLogits sets d
 }
 
 test "Property 16: Guided Decoding Constraint Satisfaction — generated token sequence satisfies FSM constraint (100 iterations)" {
-    const c_mod = @import("c.zig");
+    const c_mod = @import("mlx").c;
     c_mod.initErrorHandler();
     const allocator = std.testing.allocator;
     const ctx = EagerContext.init(allocator);

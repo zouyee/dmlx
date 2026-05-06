@@ -7,10 +7,10 @@
 /// Current implementation uses pages for memory management and continuous batching,
 /// while maintaining contiguous cached arrays for attention compatibility.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const shape_mod = @import("../ops/shape.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
 const iface = @import("interface.zig");
 const quantized_mod = @import("quantized.zig");
 
@@ -313,7 +313,7 @@ pub const PagedKVCache = struct {
     num_kv_heads: usize,
     head_dim: usize,
     max_pages: usize,
-    dtype: @import("../dtype.zig").Dtype,
+    dtype: @import("mlx").dtype.Dtype,
 
     // Quantization parameters (kv_bits=16 means no quantization).
     kv_bits: u8,

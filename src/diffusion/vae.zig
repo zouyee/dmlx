@@ -1,11 +1,11 @@
 /// Simplified VAE decoder for diffusion models.
 /// Operates on NCHW tensors externally; internally converts to NHWC for MLX conv.
 const std = @import("std");
-const c = @import("../c.zig");
-const ops = @import("../ops.zig");
-const conv_mod = @import("../ops/conv.zig");
-const array_mod = @import("../array.zig");
-const activations = @import("../ops/activations.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const conv_mod = @import("mlx").conv;
+const array_mod = @import("mlx").array;
+const activations = @import("mlx").activations;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

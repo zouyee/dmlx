@@ -1,8 +1,8 @@
 const std = @import("std");
 const deepseek_v4 = @import("../models/deepseek_v4.zig");
-const ops = @import("../ops.zig");
-const array_mod = @import("../array.zig");
-const device_mod = @import("../device.zig");
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
+const device_mod = @import("mlx").device;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

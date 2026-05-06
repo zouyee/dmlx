@@ -14,12 +14,12 @@
 /// - Higher memory usage than true streaming
 /// - Still saves memory vs loading all experts (10-50% vs 100%)
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const safetensors_reader = @import("../io/safetensors_reader.zig");
-const quantize_mod = @import("../quantize.zig");
-const shape_mod = @import("../ops/shape.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const safetensors_reader = @import("mlx").safetensors_reader;
+const quantize_mod = @import("mlx").quantize;
+const shape_mod = @import("mlx").shape;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -295,7 +295,7 @@ pub const ExpertPreloadProvider = struct {
         defer reshaped.deinit();
         const squeezed = try shape_mod.squeezeAxes(self.ctx, reshaped, &[_]i32{2});
         defer squeezed.deinit();
-        const reduce_mod = @import("../ops/reduce.zig");
+        const reduce_mod = @import("mlx").reduce;
         return reduce_mod.sumAxis(self.ctx, squeezed, 1, false);
     }
 
@@ -350,7 +350,7 @@ pub const ExpertPreloadProvider = struct {
         defer reshaped.deinit();
         const squeezed = try shape_mod.squeezeAxes(self.ctx, reshaped, &[_]i32{2});
         defer squeezed.deinit();
-        const reduce_mod = @import("../ops/reduce.zig");
+        const reduce_mod = @import("mlx").reduce;
         return reduce_mod.sumAxis(self.ctx, squeezed, 1, false);
     }
 

@@ -15,11 +15,11 @@ const batch_builder = @import("../batch_builder.zig");
 const model_pool_mod = @import("../model_pool.zig");
 const memory_mod = @import("../memory.zig");
 const server_mod = @import("../server.zig");
-const ops_mod = @import("../ops.zig");
+const ops_mod = @import("mlx").ops;
 const kvcache = @import("../kvcache.zig");
 const prompt_cache_mod = @import("../prompt_cache.zig");
 const generation_mod = @import("../generation.zig");
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 const root = @import("../root.zig");
 
 const Scheduler = scheduler_mod.Scheduler;

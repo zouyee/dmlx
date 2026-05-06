@@ -2,11 +2,11 @@
 ///
 /// Supports loading from safetensors with HF-format weight names.
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const nn = @import("../ops/nn.zig");
-const io = @import("../io/mlx_io.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const nn = @import("mlx").nn;
+const io = @import("mlx").io;
 const minimax = @import("minimax.zig");
 
 const Array = array_mod.Array;

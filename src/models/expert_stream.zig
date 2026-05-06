@@ -16,12 +16,12 @@
 /// - With preload (50%): ~70GB (attention + shared + 128 experts)
 /// - With stream: ~10GB (attention + shared expert + 8 active experts per step)
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops = @import("../ops.zig");
-const safetensors_reader = @import("../io/safetensors_reader.zig");
-const quantize_mod = @import("../quantize.zig");
-const shape_mod = @import("../ops/shape.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const safetensors_reader = @import("mlx").safetensors_reader;
+const quantize_mod = @import("mlx").quantize;
+const shape_mod = @import("mlx").shape;
 const expert_preload = @import("expert_preload.zig");
 const expert_cache = @import("expert_cache.zig");
 const layer_prefetcher_mod = @import("layer_prefetcher.zig");
@@ -553,7 +553,7 @@ pub const ExpertStreamProvider = struct {
         defer scores_expanded.deinit();
         const weighted_out = try ops.multiply(self.ctx, expert_out, scores_expanded);
         defer weighted_out.deinit();
-        const reduce_mod = @import("../ops/reduce.zig");
+        const reduce_mod = @import("mlx").reduce;
         const result = try reduce_mod.sumAxis(self.ctx, weighted_out, -2, false);
 
         // Kick off prefetch for the next layer (non-blocking)

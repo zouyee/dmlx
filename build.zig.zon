@@ -4,6 +4,10 @@
     .fingerprint = 0x42993a9e9ff056a0,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
+        .mlx_z = .{
+            .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.0.1.tar.gz",
+            .hash = "mlx_z-0.1.0--3FlNdj3BQC4F_VBxyLRkIcj0qkHtgYS7oltVrZUMTAh",
+        },
         .zig_regex = .{
             .url = "https://github.com/zig-utils/zig-regex/archive/49fae00540d26fd3e7bdeda70864021c90d3e38f.tar.gz",
             .hash = "zig_regex-0.1.1-omky0bjpBgCGUfsM_BacZnvhSz__1KxvI8gTJ8EFFkXl",

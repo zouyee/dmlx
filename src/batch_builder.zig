@@ -9,10 +9,10 @@
 ///
 /// Requirements: R13.1, R13.2, R13.3
 const std = @import("std");
-const array_mod = @import("array.zig");
-const ops = @import("ops.zig");
-const shape_ops = @import("ops/shape.zig");
-const creation = @import("ops/creation.zig");
+const array_mod = @import("mlx").array;
+const ops = @import("mlx").ops;
+const shape_ops = @import("mlx").shape;
+const creation = @import("mlx").creation;
 const scheduler_mod = @import("scheduler.zig");
 
 const Array = array_mod.Array;

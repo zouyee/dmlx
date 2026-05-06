@@ -18,11 +18,11 @@
 ///
 /// Reference: TurboQuant paper arXiv:2504.19874
 const std = @import("std");
-const c = @import("../c.zig");
-const array_mod = @import("../array.zig");
-const ops_mod = @import("../ops.zig");
-const linalg_mod = @import("../ops/linalg.zig");
-const reduce_mod = @import("../ops/reduce.zig");
+const c = @import("mlx").c;
+const array_mod = @import("mlx").array;
+const ops_mod = @import("mlx").ops;
+const linalg_mod = @import("mlx").linalg;
+const reduce_mod = @import("mlx").reduce;
 
 const Array = array_mod.Array;
 const EagerContext = ops_mod.EagerContext;

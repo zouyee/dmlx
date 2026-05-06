@@ -10,10 +10,10 @@
 ///   dmlx lora-train --model <path> --data dataset.jsonl --output adapter.safetensors
 const std = @import("std");
 const root = @import("root.zig");
-const c = @import("c.zig");
+const c = @import("mlx").c;
 const memory = @import("memory.zig");
-const safetensors_reader = @import("io/safetensors_reader.zig");
-const quantize_mod = @import("quantize.zig");
+const safetensors_reader = @import("mlx").safetensors_reader;
+const quantize_mod = @import("mlx").quantize;
 
 const Array = root.Array;
 const EagerContext = root.EagerContext;

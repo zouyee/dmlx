@@ -6,11 +6,11 @@
 /// Usage:
 ///   try jang_quantizer.quantizeModel(allocator, model_path, output_path, .JANG_3M, null, ctx);
 const std = @import("std");
-const c = @import("c.zig");
-const ops = @import("ops.zig");
-const array_mod = @import("array.zig");
+const c = @import("mlx").c;
+const ops = @import("mlx").ops;
+const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
-const quantize_mod = @import("quantize.zig");
+const quantize_mod = @import("mlx").quantize;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;

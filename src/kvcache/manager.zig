@@ -13,7 +13,7 @@
 ///   // Per-layer access during forward pass
 ///   const kv = try manager.caches[layer_idx].updateAndFetch(keys, values, stream);
 const std = @import("std");
-const c = @import("../c.zig");
+const c = @import("mlx").c;
 const iface = @import("interface.zig");
 
 const KVCacheStrategy = iface.KVCacheStrategy;
