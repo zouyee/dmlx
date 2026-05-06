@@ -8,7 +8,7 @@ on:
 
 jobs:
   build-and-test:
-    runs-on: macos-latest
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 
@@ -29,9 +29,11 @@ jobs:
 
       - name: Install mlx-c
         run: |
-          brew install mlx-c
-          ls -la /opt/homebrew/lib/libmlxc.dylib || ls -la /usr/local/lib/libmlxc.dylib
-          pkg-config --exists mlxc && echo "mlx-c found via pkg-config" || echo "WARNING: pkg-config mlxc not found"
+          set -x
+          brew update 2>&1 | tail -3
+          brew install mlx-c 2>&1
+          ls -la /opt/homebrew/lib/libmlxc.dylib 2>/dev/null || ls -la /usr/local/lib/libmlxc.dylib 2>/dev/null || echo "LIBRARY NOT FOUND"
+          pkg-config --libs mlxc 2>&1 || echo "pkg-config failed"
 
       - name: Build
         run: |
