@@ -228,7 +228,7 @@ def generate_index(
 <html>
 <head>
 <meta charset="utf-8">
-<title>mlx-zig Performance Dashboard</title>
+<title>dmlx Performance Dashboard</title>
 <style>
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f5f5f5; }
   .container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
@@ -245,7 +245,7 @@ def generate_index(
 </head>
 <body>
 <div class="container">
-  <h1>📊 mlx-zig Performance Dashboard</h1>
+  <h1>📊 dmlx Performance Dashboard</h1>
   <p>Benchmark results for DeepSeek V4 inference. Auto-generated from <code>benchmark-results</code> branch.</p>
 
   <h2>Machines</h2>
@@ -299,7 +299,7 @@ def main() -> None:
         # Create a placeholder index
         placeholder = args.output_dir / "index.html"
         placeholder.write_text(
-            "<h1>mlx-zig Performance Dashboard</h1>"
+            "<h1>dmlx Performance Dashboard</h1>"
             "<p>No benchmark results yet. Run <code>make benchmark && make upload-benchmark</code> to populate.</p>"
         )
         return

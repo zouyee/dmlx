@@ -76,7 +76,7 @@ def ensure_results_branch() -> Path:
             readme = PROJECT_DIR / "README.md"
             readme.write_text(
                 "# Benchmark Results\\n\\n"
-                "This branch stores performance benchmark results for the mlx-zig project.\\n"
+                "This branch stores performance benchmark results for the dmlx project.\\n"
                 "Do not edit manually — results are uploaded by `scripts/upload_benchmark.py`.\\n"
             )
             run(["git", "add", "README.md"])

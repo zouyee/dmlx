@@ -811,4 +811,14 @@ The two model categories have completely different KV cache compression strategi
 >
 > Example with Llama-3-8B (GQA-8, head_dim=128, 32 layers) + kv_bits=4:
 > `bytes_per_token = 2 × 8 × 128 × 0.5 × 32 = 32,768 bytes ≈ 32KB/token`
+
+---
+
+## Phase: Self-Contained Runtime
+
+| Task | Priority | Description |
+|------|----------|-------------|
+| **mlx-c migration** | P0 | Migrate wrapped mlx-c C library (currently external dependency via Homebrew) into dmlx project as built-in module. Eliminates `-Dmlx_prefix` / `MLX_C_PREFIX` / pkg-config installation requirement. Single `zig build` produces fully self-contained binary with embedded Metal GPU support. |
+| Static Metal linking | P1 | Bundle Metal shaders and GPU kernels directly into binary. Remove runtime dependency on `/opt/homebrew/lib/libmlxc.dylib`. |
+| Cross-compilation | P2 | Enable `zig build -Dtarget=aarch64-macos` for CI/CD without Homebrew on build machines. |
 > 64GB device, model ~4GB → available ~59GB → max_kv_size ≈ 59GB / 32KB ≈ 1,900,000 tokens

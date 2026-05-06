@@ -55,7 +55,7 @@ e2e_rows = "\n".join(
     for i, m in enumerate(e2e_matches)
 )
 
-report = f"""# mlx-zig 性能基准测试报告
+report = f"""# dmlx 性能基准测试报告
 # 日期: {date}
 # Commit: {commit} ({branch})
 # 模型: DeepSeek-V4-Flash-4bit (~150GB, 33 shards)

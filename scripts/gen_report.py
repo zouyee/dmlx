@@ -74,7 +74,7 @@ def main():
     lines = []
     w = lines.append
 
-    w(f"# mlx-zig 性能基准测试报告")
+    w(f"# dmlx 性能基准测试报告")
     w(f"# 日期: {today}")
     w(f"# Commit: {commit} ({branch})")
     w(f"# 模型: DeepSeek-V4-Flash-4bit (~150GB, 33 shards)")
