@@ -31,7 +31,7 @@ pub fn dataSliceMut(self: Array, comptime T: type) ![]T {
 - `models/minimax.zig`：**4 处**
 - 合计：**38 处**
 
-**项目声称已修复**（`production-roadmap.md`）："安全：`@constCast` 绕过 CoW → 全部改用 mlx-c 算子链 ✅"
+**项目声称已修复**（`ROADMAP.md`）："安全：`@constCast` 绕过 CoW → 全部改用 mlx-c 算子链 ✅"
 
 **实际状态**：修复未完全完成。`nn.zig` 中 BatchNorm、LSTM、GRU、RNN、MultiHeadAttention、RoPE、Embedding 仍通过 `dataSliceMut` 使用纯 CPU 标量循环。
 

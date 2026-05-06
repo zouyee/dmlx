@@ -161,4 +161,4 @@ const strategy = switch (config.mode) {
 2. [DeepSeek V4 Quick Fix](../user-guide/deepseek-v4-quickfix.md) — Fix garbled output
 3. [DeepSeek MoE Deep Dive](../deepseek-moe/README.md) — How it works technically
 4. [Benchmarks](../technical/benchmarks.md) — Performance data
-5. [Performance Roadmap](../technical/performance-roadmap.md) — Future improvements
+5. [Project Roadmap](../../ROADMAP.md) — Future improvements

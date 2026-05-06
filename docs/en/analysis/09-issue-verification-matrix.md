@@ -2,7 +2,7 @@
 
 ## 9.1 Cross-Verification with Project Self-Audit
 
-`docs/deep-analysis.md` is the self-audit document from v0.3.0, and `production-roadmap.md` claims all issues have been fixed. This analysis verifies each claim:
+`docs/deep-analysis.md` is the self-audit document from v0.3.0, and `ROADMAP.md` claims all issues have been fixed. This analysis verifies each claim:
 
 | Original Issue | Original Severity | Project Claim | Actual Status | Deviation |
 |--------|---------|---------|------|------|

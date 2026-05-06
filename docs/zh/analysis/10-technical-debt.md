@@ -106,7 +106,7 @@ std.sort.pdq(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
 
 ## 10.5 与生产路线图的对比
 
-`production-roadmap.md` 声称所有 Phase 0–7 + Task 13–34 已完成。
+`ROADMAP.md` 声称所有 Phase 0–7 + Task 13–34 已完成。
 
 | 维度 | 声称 | 实际 | 偏差 |
 |------|------|------|------|

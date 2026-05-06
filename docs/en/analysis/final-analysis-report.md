@@ -29,7 +29,7 @@ MLX-Zig is a full-stack LLM inference and training system built on Apple MLX C b
 | Total Lines of Code | ~52,933 |
 | Source Lines (excluding tests) | ~42,455 |
 | Test Modules | 50+ |
-| Passing Tests | 350 (per production-roadmap.md) |
+| Passing Tests | 350 (per ROADMAP.md) |
 | Largest Source File | `models/deepseek_v4.zig` (3,091 lines) |
 | Second Largest Source File | `models/deepseek_v4_loader.zig` (2,071 lines) |
 | Third Largest Source File | `main.zig` (1,764 lines) |
@@ -426,7 +426,7 @@ Total **10** `@constCast` calls across the library:
 | `deepseek_v4.zig` | 198-199 | YARN RoPE sin/cos cache initialization | **High** (same as above) |
 | `deepseek_v4.zig` | 399 | Attention mask initialization | **High** (direct write to shared buffer) |
 
-**Project Claims Fixed**: `production-roadmap.md` states "Safety: `@constCast` bypassing CoW → All replaced with mlx-c operator chains ✅"
+**Project Claims Fixed**: `ROADMAP.md` states "Safety: `@constCast` bypassing CoW → All replaced with mlx-c operator chains ✅"
 
 **Actual Status**: `nn.zig` has extensive `dataSliceMut` calls (34 locations), `minimax.zig` and `deepseek_v4.zig` still have direct `@constCast` usage. **Fix is not fully complete**.
 
@@ -540,7 +540,7 @@ High Impact ↑
 
 ### 11.3 Comparison with Production Roadmap
 
-`production-roadmap.md` claims all Phase 0–7 + Task 13–34 completed, 350 tests passing. This analysis verifies:
+`ROADMAP.md` claims all Phase 0–7 + Task 13–34 completed, 350 tests passing. This analysis verifies:
 
 - **Feature Completeness**: ✅ Claim substantially accurate — speculative decoding, guided decoding, MoE, tiered caching all implemented
 - **Quality Completeness**: ⚠️ Partial overclaim — `nn.zig` GPU-ization, `@constCast` cleanup, stream leak fix not fully complete
@@ -580,7 +580,7 @@ High Impact ↑
 | Document | Type | Content |
 |----------|------|---------|
 | `deep-analysis.md` | Audit Report | v0.3.0 self-audit, P0-P3 issue list |
-| `production-roadmap.md` | Roadmap | Phase 0-7 progress tracking |
+| `ROADMAP.md` | Roadmap | Phase 0-7 progress tracking |
 | `design.md` | Design Doc | Six-layer architecture design |
 | `design-paged-kv-cache.md` | Design Doc | PagedKVCache algorithm details |
 | `design-server.md` | Design Doc | Server architecture |

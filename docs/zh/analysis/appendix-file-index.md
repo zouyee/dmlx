@@ -28,7 +28,7 @@
 | 文档 | 类型 | 内容 |
 |----------|------|---------|
 | `docs/deep-analysis.md` | 审计报告 | v0.3.0 自审计，P0-P3 问题列表 |
-| `docs/production-roadmap.md` | 路线图 | Phase 0-7 进度跟踪，Task 13-34 完成状态 |
+| `ROADMAP.md` | 路线图 | Phase 0-7 进度跟踪，Task 13-34 完成状态 |
 | `.kiro/specs/production-deployment/design.md` | 设计文档 | 六层架构设计，Mermaid 图表 |
 | `.kiro/specs/production-deployment/design-paged-kv-cache.md` | 设计文档 | PagedKVCache 算法细节 (updateAndFetch 六步法) |
 | `.kiro/specs/production-deployment/design-server.md` | 设计文档 | 服务器架构、请求流、调度器设计 |

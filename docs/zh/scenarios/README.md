@@ -161,4 +161,4 @@ const strategy = switch (config.mode) {
 2. [DeepSeek V4 快速修复](../user-guide/deepseek-v4-quickfix.md) — 修复乱码输出
 3. [DeepSeek MoE 深度解析](../deepseek-moe/README.md) — 技术原理
 4. [性能基准](../technical/benchmarks.md) — 性能数据
-5. [性能路线图](../technical/performance-roadmap.md) — 未来改进
+5. [项目路线图](../../ROADMAP.md) — 未来改进

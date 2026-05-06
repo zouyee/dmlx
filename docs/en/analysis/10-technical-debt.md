@@ -106,7 +106,7 @@ Priority ordering:
 
 ## 10.5 Comparison with Production Roadmap
 
-`production-roadmap.md` claims all Phase 0–7 + Task 13–34 are completed.
+`ROADMAP.md` claims all Phase 0–7 + Task 13–34 are completed.
 
 | Dimension | Claim | Actual | Deviation |
 |------|------|------|------|

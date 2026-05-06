@@ -31,7 +31,7 @@ Call statistics:
 - `models/minimax.zig`: **4 locations**
 - Total: **38 locations**
 
-**Project claims fixed** (`production-roadmap.md`): "Safety: `@constCast` bypasses CoW → all replaced with mlx-c op chains ✅"
+**Project claims fixed** (`ROADMAP.md`): "Safety: `@constCast` bypasses CoW → all replaced with mlx-c op chains ✅"
 
 **Actual status**: the fix is not fully completed. `nn.zig`'s BatchNorm, LSTM, GRU, RNN, MultiHeadAttention, RoPE, Embedding still use pure CPU scalar loops via `dataSliceMut`.
 

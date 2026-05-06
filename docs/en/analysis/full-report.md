@@ -773,7 +773,7 @@ pub fn dataSliceMut(self: Array, comptime T: type) ![]T {
 - `models/minimax.zig`：**4 处**
 - 合计：**38 处**
 
-**项目声称已修复**（`production-roadmap.md`）："安全：`@constCast` 绕过 CoW → 全部改用 mlx-c 算子链 ✅"
+**项目声称已修复**（`ROADMAP.md`）："安全：`@constCast` 绕过 CoW → 全部改用 mlx-c 算子链 ✅"
 
 **实际状态**：修复未完全完成。`nn.zig` 中 BatchNorm、LSTM、GRU、RNN、MultiHeadAttention、RoPE、Embedding 仍通过 `dataSliceMut` 使用纯 CPU 标量循环。
 
@@ -837,7 +837,7 @@ pub const LoadedModel = struct {
 
 ## 9.1 与项目自我审计的交叉验证
 
-`docs/deep-analysis.md` 是 v0.3.0 时的自我审计文档，`production-roadmap.md` 声称所有问题已修复。本分析逐条验证：
+`docs/deep-analysis.md` 是 v0.3.0 时的自我审计文档，`ROADMAP.md` 声称所有问题已修复。本分析逐条验证：
 
 | 原问题 | 原严重度 | 项目声称 | 实际状态 | 偏差 |
 |--------|---------|---------|---------|------|
@@ -1005,7 +1005,7 @@ std.sort.pdq(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
 
 ## 10.5 与生产路线图的对比
 
-`production-roadmap.md` 声称所有 Phase 0–7 + Task 13–34 已完成。
+`ROADMAP.md` 声称所有 Phase 0–7 + Task 13–34 已完成。
 
 | 维度 | 声称 | 实际 | 偏差 |
 |------|------|------|------|
@@ -1044,7 +1044,7 @@ std.sort.pdq(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
 | 文档 | 类型 | 内容 |
 |------|------|------|
 | `docs/deep-analysis.md` | 审计报告 | v0.3.0 自我审计，P0-P3 问题清单 |
-| `docs/production-roadmap.md` | 路线图 | Phase 0-7 进度追踪，Task 13-34 完成状态 |
+| `ROADMAP.md` | 路线图 | Phase 0-7 进度追踪，Task 13-34 完成状态 |
 | `.kiro/specs/production-deployment/design.md` | 设计文档 | 六层架构设计、Mermaid 图表 |
 | `.kiro/specs/production-deployment/design-paged-kv-cache.md` | 设计文档 | PagedKVCache 算法细节（updateAndFetch六步法） |
 | `.kiro/specs/production-deployment/design-server.md` | 设计文档 | 服务器架构、请求流、Scheduler 设计 |

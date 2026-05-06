@@ -248,4 +248,4 @@ Source: src/models/deepseek_v4.zig:2395-2441
 - [Quantization Pipeline](../analysis/06-quantization-training.md) — All formats explained
 - [TTFT Optimization](../technical/ttft-optimization.md) — Model loading optimization
 - [SMELT System](../technical/smelt-flow.md) — Expert streaming architecture
-- [Performance Roadmap](../technical/performance-roadmap.md) — Future improvements
+- [Project Roadmap](../../ROADMAP.md) — Future improvements

@@ -48,8 +48,9 @@
 - [Optimization Roadmap](en/deepseek-v4/DEEPSEEK-V4-OPTIMIZATION-AND-ROADMAP.md)
 
 ### ⚙️ Technical
+- [Continuous Batching Design](en/technical/continuous-batching-design.md) — Scheduler + BatchBuilder + Paged KV cache architecture
 - [Benchmarks](en/technical/benchmarks.md) — Performance data
-- [Performance Roadmap](en/technical/performance-roadmap.md) — Future plans
+- [Project Roadmap](../ROADMAP.md) — Full project plan
 - [Stream Mode Status](en/technical/stream-mode-status.md)
 - [Debug: argmax16](en/troubleshooting/debug-argmax16.md)
 
@@ -94,8 +95,9 @@
 - [优化路线图](zh/deepseek-v4/DEEPSEEK-V4-OPTIMIZATION-AND-ROADMAP.md)
 
 ### ⚙️ 技术文档
+- [Continuous Batching 设计](zh/technical/continuous-batching-design.md) — Scheduler + BatchBuilder + Paged KV cache 架构
 - [性能基准](zh/technical/benchmarks.md)
-- [生产路线图](zh/technical/performance-roadmap.md)
+- [项目路线图](../ROADMAP.md)
 - [流式模式状态](zh/technical/stream-mode-status.md)
 - [调试: argmax16](zh/troubleshooting/debug-argmax16.md)
 

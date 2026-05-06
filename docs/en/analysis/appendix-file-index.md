@@ -28,7 +28,7 @@
 | Document | Type | Content |
 |----------|------|---------|
 | `docs/deep-analysis.md` | Audit report | v0.3.0 self-audit, P0-P3 issue list |
-| `docs/production-roadmap.md` | Roadmap | Phase 0-7 progress tracking, Task 13-34 completion status |
+| `ROADMAP.md` | Roadmap | Phase 0-7 progress tracking, Task 13-34 completion status |
 | `.kiro/specs/production-deployment/design.md` | Design doc | Six-layer architecture design, Mermaid diagrams |
 | `.kiro/specs/production-deployment/design-paged-kv-cache.md` | Design doc | PagedKVCache algorithm details (updateAndFetch six-step method) |
 | `.kiro/specs/production-deployment/design-server.md` | Design doc | Server architecture, request flow, Scheduler design |
