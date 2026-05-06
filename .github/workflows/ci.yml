@@ -29,11 +29,15 @@ jobs:
 
       - name: Install mlx-c
         run: |
-          brew install mlxc || true
-          pkg-config --exists mlxc || echo "mlx-c not found via pkg-config"
+          brew install mlx-c
+          ls -la /opt/homebrew/lib/libmlxc.dylib || ls -la /usr/local/lib/libmlxc.dylib
+          pkg-config --exists mlxc && echo "mlx-c found via pkg-config" || echo "WARNING: pkg-config mlxc not found"
 
       - name: Build
-        run: zig build -Doptimize=ReleaseFast
+        run: |
+          export LIBRARY_PATH="/opt/homebrew/lib:/usr/local/lib:$LIBRARY_PATH"
+          export CPATH="/opt/homebrew/include:/usr/local/include:$CPATH"
+          zig build -Doptimize=ReleaseFast
 
       - name: Run unit tests
         run: zig build test
