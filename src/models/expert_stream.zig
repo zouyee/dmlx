@@ -216,6 +216,20 @@ pub const ExpertStreamProvider = struct {
                 try mmap.mmapAll(index);
                 provider.mmap_pool = mmap;
 
+                // Override madvise for random expert access pattern (MoE routing is random, not sequential)
+                {
+                    const posix_c = @cImport(@cInclude("sys/mman.h"));
+                    var map_it = mmap.mappings.iterator();
+                    while (map_it.next()) |map_entry| {
+                        const region = map_entry.value_ptr.*;
+                        _ = posix_c.posix_madvise(
+                            @ptrCast(@constCast(region.ptr)),
+                            region.len,
+                            posix_c.POSIX_MADV_RANDOM,
+                        );
+                    }
+                }
+
                 // Initialize PartialTensorReader for reading only selected expert rows
                 const reader = try allocator.create(safetensors_reader.PartialTensorReader);
                 reader.* = safetensors_reader.PartialTensorReader.init(allocator, index, pool);

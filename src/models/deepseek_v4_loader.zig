@@ -616,7 +616,7 @@ pub fn loadWeightsSelective(
         while (sort_it.next()) |entry| {
             const items = entry.value_ptr.*.items;
             if (items.len > 1) {
-                std.sort.insertion(EntryWithName, items, {}, struct {
+                std.mem.sort(EntryWithName, items, {}, struct {
                     fn lessThan(_: void, a: EntryWithName, b: EntryWithName) bool {
                         return a.info.data_offset_start < b.info.data_offset_start;
                     }

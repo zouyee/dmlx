@@ -1033,38 +1033,6 @@ pub const DSV4MoE = struct {
         };
         defer y.deinit();
 
-        // DIAGNOSTIC: Compare expert output (y) and shared expert output magnitudes
-        if (self.layer_idx == 0 and self.stream_provider != null) {
-            try y.eval();
-            try shared_out.eval();
-            const y_f32 = try ops.astype(self.ctx, y, .float32);
-            defer y_f32.deinit();
-            try y_f32.eval();
-            const s_f32 = try ops.astype(self.ctx, shared_out, .float32);
-            defer s_f32.deinit();
-            try s_f32.eval();
-            const y_data = try y_f32.dataSlice(f32);
-            const s_data = try s_f32.dataSlice(f32);
-            var y_max: f32 = -std.math.inf(f32);
-            var s_max: f32 = -std.math.inf(f32);
-            var y_sum: f64 = 0;
-            var s_sum: f64 = 0;
-            const n = @min(y_data.len, 1000);
-            for (0..n) |i| {
-                if (y_data[i] > y_max) y_max = y_data[i];
-                y_sum += y_data[i];
-            }
-            for (0..@min(s_data.len, 1000)) |i| {
-                if (s_data[i] > s_max) s_max = s_data[i];
-                s_sum += s_data[i];
-            }
-            std.log.info("MOE DIAG layer 0: y shape={any} shared shape={any}", .{ y.shape(), shared_out.shape() });
-            std.log.info("MOE DIAG layer 0: y mean={d:.6} max={d:.6}, shared mean={d:.6} max={d:.6}", .{
-                y_sum / @as(f64, @floatFromInt(n)),                      y_max,
-                s_sum / @as(f64, @floatFromInt(@min(s_data.len, 1000))), s_max,
-            });
-        }
-
         // Add shared expert
         const final_out = try ops.add(self.ctx, y, shared_out);
         defer final_out.deinit();
@@ -2758,12 +2726,10 @@ pub const DSV4Model = struct {
         // Pass through layers (eval after each to allow memory paging)
         for (self.layers, 0..) |*layer, i| {
             const cache = if (caches) |cache_arr| cache_arr[i] else null;
-            std.debug.print("Layer {d}/43 forward start\n", .{i});
             hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
             // Eval after each layer to materialize results and free lazy weight references
             // This allows MLX to page weights in/out of memory for large models
             try hidden.eval();
-            std.debug.print("Layer {d}/43 forward done\n", .{i});
         }
 
         // Compress from mHC format before final norm using HyperHead
@@ -2843,55 +2809,6 @@ pub const DSV4Model = struct {
             const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
             const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
-
-            // Diagnostic: show logits stats
-            {
-                const logits_data = try f32_logits.dataSlice(f32);
-                var max_val: f32 = -std.math.inf(f32);
-                var min_val: f32 = std.math.inf(f32);
-                var max_idx: usize = 0;
-                var sum: f64 = 0;
-                var nan_count: usize = 0;
-                var inf_count: usize = 0;
-                for (logits_data, 0..) |v, idx| {
-                    if (std.math.isNan(v)) {
-                        nan_count += 1;
-                        continue;
-                    }
-                    if (std.math.isInf(v)) {
-                        inf_count += 1;
-                        continue;
-                    }
-                    sum += v;
-                    if (v > max_val) {
-                        max_val = v;
-                        max_idx = idx;
-                    }
-                    if (v < min_val) {
-                        min_val = v;
-                    }
-                }
-                const mean = sum / @as(f64, @floatFromInt(logits_data.len));
-                std.log.info("Logits: len={d} max={d:.4} min={d:.4} mean={d:.4} argmax={d} nan={d} inf={d}", .{
-                    logits_data.len, max_val, min_val, mean, max_idx, nan_count, inf_count,
-                });
-                var top5 = [_]struct { idx: usize, val: f32 }{.{ .idx = 0, .val = -std.math.inf(f32) }} ** 5;
-                for (logits_data, 0..) |v, idx| {
-                    if (std.math.isNan(v) or std.math.isInf(v)) continue;
-                    for (&top5) |*t| {
-                        if (v > t.val) {
-                            t.* = .{ .idx = idx, .val = v };
-                            break;
-                        }
-                    }
-                }
-                std.log.info("Top tokens: [{d}]={d:.2} [{d}]={d:.2} [{d}]={d:.2}", .{
-                    top5[0].idx, top5[0].val, top5[1].idx, top5[1].val, top5[2].idx, top5[2].val,
-                });
-                if (logits_data.len > 22) {
-                    std.log.info("Token 22 ('4') logit: {d:.4}", .{logits_data[22]});
-                }
-            }
 
             const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
             tokens[current_len] = next_token;
