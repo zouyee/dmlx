@@ -6,13 +6,13 @@
 
 ## 问题所在
 
-DeepSeek V4 是一个 671B 参数的 Mixture-of-Experts 模型。即使在 4-bit 量化下，完整模型仍重约 40GB。在 FP16 下，仅权重就超过 150GB。在一台只有 48GB 统一内存的消费级 MacBook Pro 上运行它看似不可能——但 dmlx 做到了。
+DeepSeek V4 是一个 284B 参数的 Mixture-of-Experts 模型。即使在 4-bit 量化下，完整模型仍重约 40GB。在 FP16 下，仅权重就超过 150GB。在一台只有 48GB 统一内存的消费级 MacBook Pro 上运行它看似不可能——但 dmlx 做到了。
 
 ## 解决方案：五层内存优化
 
 ### 第一层：MoE Expert Streaming（138GB → 10GB）
 
-DeepSeek V4 使用 256 个路由专家 + 共享专家，采用 top-k 路由。每个 token 仅激活一小部分专家（通常 top-8）。dmlx 的 `expert_stream.zig`（649 行）利用了这种稀疏性：
+DeepSeek V4 使用 256 个路由专家 + 共享专家，采用 top-k 路由。每个 token 仅激活一小部分专家（top-6 路由 + 1 共享）。dmlx 的 `expert_stream.zig`（649 行）利用了这种稀疏性：
 
 - **按需加载**：仅通过 `PartialTensorReader`（基于 pread 的部分张量读取）将活跃专家加载到内存中
 - **LRU 专家缓存**：常用专家常驻内存；冷门专家被淘汰
@@ -45,16 +45,17 @@ Source: docs/en/technical/4bit-smelt.md
         docs/en/technical/smelt-flow.md
 ```
 
-### 第三层：MLA KV Cache 压缩（2×heads×dim → 2×latent_dim）
+### 第三层：CSA + HCA 混合注意力（KV Cache 压缩）
 
-Multi-head Latent Attention (MLA) 通过低秩投影压缩 KV Cache：
+DeepSeek V4 采用混合注意力架构，交错使用压缩稀疏注意力（CSA）和重度压缩注意力（HCA）：
 
-- **MLA 之前**：KV cache 大小 = 2 × n_heads × head_dim（长上下文时巨大）
-- **MLA 之后**：KV cache 大小 = 2 × latent_dim（显著缩小）
+- **CSA**（压缩率 m=4）：每 4 个 KV 条目压缩为 1 个，再通过闪电索引器进行稀疏 top-k 选择（k=512）
+- **HCA**（压缩率 m'=128）：每 128 个 KV 条目压缩为 1 个，实现极致压缩
 - **FP8 存储**：非 RoPE KV 维度以 FP8 (E4M3) 存储，进一步将内存减半
+- **效果**：在 1M 上下文下，KV cache 比 DeepSeek-V3.2 小约 9.5 倍
 
 ```
-Source: src/models/deepseek_v4.zig (MLA implementation, 3,091 lines)
+Source: src/models/deepseek_v4.zig (CSA+HCA implementation, 3,091 lines)
 ```
 
 ### 第四层：六级 KV Cache 策略系统
@@ -98,7 +99,7 @@ Source: docs/en/technical/ttft-optimization.md
 │                    dmlx Inference Engine               │
 ├─────────────────────────────────────────────────────────┤
 │  Model (DeepSeek V4, 3,091 lines)                        │
-│  ├── MLA (Multi-head Latent Attention)                   │
+│  ├── CSA+HCA (Hybrid Compressed Attention)              │
 │  ├── MoE Router (top-k, 256 experts)                     │
 │  ├── Expert Stream (on-demand loading, 10GB peak)        │
 │  ├── YARN RoPE (1M+ context)                             │
@@ -158,7 +159,7 @@ Source: docs/en/technical/ttft-optimization.md
 
 | 场景 | dmlx 的优势 |
 |----------|-------------|
-| **本地 LLM 推理** | 在笔记本上运行 671B 模型——无需云端 |
+| **本地 LLM 推理** | 在笔记本上运行 284B 模型——无需云端 |
 | **隐私优先应用** | 所有数据保留在设备上，零网络出站 |
 | **边缘部署** | Mac mini 作为团队的私有推理服务器 |
 | **离线/受限区域访问** | 无需互联网即可获得完整 LLM 能力 |

@@ -4,9 +4,9 @@
 
 ### MoE Expert Streaming + SMELT (~3.5–4 bits per weight)
 
-| 🔢 Model Size | 🧠 Parameters | ⚙️ Backend | 💻 Hardware |
-|:---:|:---:|:---:|:---:|
-| ~40 GiB (4-bit) | 671 B | Metal (MLX) | Apple M4 Pro, 48GB |
+| 🔢 Model Size | 🧠 Total Params | ⚡ Activated | ⚙️ Backend | 💻 Hardware |
+|:---:|:---:|:---:|:---:|:---:|
+| ~40 GiB (4-bit) | 284 B | 13 B / token | Metal (MLX) | Apple M4 Pro, 48GB |
 
 ---
 
@@ -19,8 +19,25 @@
 | 🟢 Memory | 48 GB unified (shared CPU/GPU) |
 | 🟢 Quantization | INT4 + SMELT 15% (~6 GB active weights) |
 | 🟢 KV Cache | Paged (CoW) + Tiered (RAM+SSD) |
-| 🟢 Expert Strategy | Stream + LRU cache (top-8 of 256) |
+| 🟢 Expert Strategy | Stream + LRU cache (top-6 of 256) |
 | 🟢 Context | 128K+ tokens supported |
+
+---
+
+## MODEL ARCHITECTURE (from DeepSeek-V4 Paper)
+
+| Parameter | Value | Parameter | Value |
+|-----------|-------|-----------|-------|
+| Transformer Layers | 43 | Hidden Dim (d) | 4096 |
+| Attention Type | CSA + HCA (hybrid interleaved) | Query Heads (nₕ) | 64 |
+| Head Dim (c) | 512 | Query Compress Dim (d_c) | 1024 |
+| CSA Compress Rate (m) | 4 | HCA Compress Rate (m') | 128 |
+| Attention Top-k | 512 | Sliding Window (n_win) | 128 |
+| Routed Experts | 256 | Shared Experts | 1 |
+| Activated Experts | 6 per token | Expert FFN Dim | 2048 |
+| mHC Expansion (n_hc) | 4 | Output Groups (g) | 8 |
+| Vocab Size | 128K | Max Context | 1M tokens |
+| Total Parameters | **284B** | Activated per Token | **13B** |
 
 ---
 
@@ -57,9 +74,9 @@
 ## MEMORY OPTIMIZATION LAYERS
 
 ```
- Layer 1: Expert Streaming     138 GB → 10 GB    (top-8 of 256 experts)
+ Layer 1: Expert Streaming     138 GB → 10 GB    (top-6 of 256 experts)
  Layer 2: SMELT 15%             40 GB →  6 GB    (partial expert loading)
- Layer 3: MLA KV Compression    Dramatic reduction (low-rank projection)
+ Layer 3: CSA+HCA KV Compress   Dramatic reduction (m=4, m'=128)
  Layer 4: Paged KV Cache        Fixed pages + CoW (production batching)
  Layer 5: Zero-Copy Loading     137s → 41s TTFT  (mmap, no memcpy)
 ```
@@ -80,7 +97,7 @@
 
 ## 🏆 KEY TAKEAWAYS
 
-- ✅ **671B MoE model on 48GB Mac** — impossible with mlx-lm (OOM)
+- ✅ **284B MoE model (13B activated) on 48GB Mac** — impossible with mlx-lm (OOM)
 - ✅ **~12.2 tok/s** steady-state generation with SMELT 15%
 - ✅ **370ms prefill** (Time-To-First-Token), 48% improvement over initial
 - ✅ **128K+ context** via Paged + Tiered KV cache (RAM+SSD)
@@ -105,7 +122,7 @@
 
 ✨ *Pushing the limits of local LLM performance on Apple Silicon.*
 
-**Model**: DeepSeek-V4-Flash-4bit (671B MoE, 256 experts)
+**Model**: DeepSeek-V4-Flash-4bit (284B MoE, 256 experts)
 **Runtime**: dmlx (Zig + Metal via mlx-c)
 
 ---
@@ -116,9 +133,9 @@
 
 ### MoE 专家流式加载 + SMELT（约 3.5–4 比特量化）
 
-| 🔢 模型大小 | 🧠 参数量 | ⚙️ 后端 | 💻 硬件 |
-|:---:|:---:|:---:|:---:|
-| ~40 GiB (4-bit) | 6710 亿 | Metal (MLX) | Apple M4 Pro, 48GB |
+| 🔢 模型大小 | 🧠 总参数量 | ⚡ 激活参数 | ⚙️ 后端 | 💻 硬件 |
+|:---:|:---:|:---:|:---:|:---:|
+| ~40 GiB (4-bit) | 2840 亿 | 130 亿/token | Metal (MLX) | Apple M4 Pro, 48GB |
 
 ---
 
@@ -131,8 +148,25 @@
 | 🟢 内存 | 48 GB 统一内存（CPU/GPU 共享） |
 | 🟢 量化 | INT4 + SMELT 15%（约 6 GB 活跃权重） |
 | 🟢 KV 缓存 | 分页（CoW）+ 分层（RAM+SSD） |
-| 🟢 专家策略 | 流式加载 + LRU 缓存（256 中取 top-8） |
+| 🟢 专家策略 | 流式加载 + LRU 缓存（256 中取 top-6） |
 | 🟢 上下文 | 支持 128K+ tokens |
+
+---
+
+## 模型架构参数（来自 DeepSeek-V4 论文）
+
+| 参数 | 值 | 参数 | 值 |
+|------|------|------|------|
+| Transformer 层数 | 43 | 隐藏维度 (d) | 4096 |
+| 注意力类型 | CSA + HCA（混合交错） | 查询头数 (nₕ) | 64 |
+| 头维度 (c) | 512 | 查询压缩维度 (d_c) | 1024 |
+| CSA 压缩率 (m) | 4 | HCA 压缩率 (m') | 128 |
+| 注意力 Top-k | 512 | 滑动窗口 (n_win) | 128 |
+| 路由专家数 | 256 | 共享专家数 | 1 |
+| 激活专家数 | 每 token 6 个 | 专家 FFN 维度 | 2048 |
+| mHC 扩展因子 (n_hc) | 4 | 输出分组 (g) | 8 |
+| 词表大小 | 128K | 最大上下文 | 100 万 tokens |
+| 总参数量 | **2840 亿** | 每 token 激活 | **130 亿** |
 
 ---
 
@@ -169,9 +203,9 @@
 ## 五层内存优化
 
 ```
- 第一层: 专家流式加载     138 GB → 10 GB    （256 专家中仅加载 top-8）
+ 第一层: 专家流式加载     138 GB → 10 GB    （256 专家中仅加载 top-6）
  第二层: SMELT 15%        40 GB →  6 GB    （部分专家预加载）
- 第三层: MLA KV 压缩      大幅缩减          （低秩投影）
+ 第三层: CSA+HCA 压缩     大幅缩减          （m=4, m'=128 KV 压缩）
  第四层: 分页 KV 缓存     固定页 + CoW      （生产级连续批处理）
  第五层: 零拷贝加载       137s → 41s TTFT   （mmap，无 memcpy）
 ```
@@ -192,7 +226,7 @@
 
 ## 🏆 核心亮点
 
-- ✅ **6710 亿参数 MoE 模型在 48GB Mac 上运行** — mlx-lm 无法做到（OOM）
+- ✅ **2840 亿参数 MoE 模型在 48GB Mac 上运行**（每 token 激活 130 亿）— mlx-lm 无法做到（OOM）
 - ✅ **约 12.2 tok/s** 稳态生成速度（SMELT 15% 模式）
 - ✅ **370ms 预填充**（首 Token 时间），比初始版本快 48%
 - ✅ **128K+ 上下文**，通过分页 + 分层 KV 缓存（RAM+SSD）
@@ -217,5 +251,5 @@
 
 ✨ *突破 Apple Silicon 本地 LLM 推理性能极限。*
 
-**模型**: DeepSeek-V4-Flash-4bit（6710 亿参数 MoE，256 专家）
+**模型**: DeepSeek-V4-Flash-4bit（2840 亿参数 MoE，256 专家）
 **运行时**: dmlx（Zig + Metal，基于 mlx-c）

@@ -6,13 +6,13 @@
 
 ## The Problem
 
-DeepSeek V4 is a 671B-parameter Mixture-of-Experts model. Even at 4-bit quantization, the full model weighs ~40GB. In FP16, the weights alone exceed 150GB. Running this on a consumer MacBook Pro with 48GB unified memory seems impossible — yet dmlx does it.
+DeepSeek V4 is a 284B-parameter Mixture-of-Experts model. Even at 4-bit quantization, the full model weighs ~40GB. In FP16, the weights alone exceed 150GB. Running this on a consumer MacBook Pro with 48GB unified memory seems impossible — yet dmlx does it.
 
 ## The Solution: Five Layers of Memory Optimization
 
 ### Layer 1: MoE Expert Streaming (138GB → 10GB)
 
-DeepSeek V4 uses 256 routed experts + shared experts with top-k routing. Per token, only a small subset (typically top-8) of experts are activated. dmlx's `expert_stream.zig` (649 lines) exploits this sparsity:
+DeepSeek V4 uses 256 routed experts + shared experts with top-k routing. Per token, only a small subset (top-6 routed + 1 shared) of experts are activated. dmlx's `expert_stream.zig` (649 lines) exploits this sparsity:
 
 - **On-demand loading**: Only active experts are loaded into memory via `PartialTensorReader` (pread-based partial tensor reads)
 - **LRU expert cache**: Frequently used experts stay resident; cold experts are evicted
@@ -45,16 +45,18 @@ Source: docs/en/technical/4bit-smelt.md
         docs/en/technical/smelt-flow.md
 ```
 
-### Layer 3: MLA KV Cache Compression (2×heads×dim → 2×latent_dim)
+### Layer 3: CSA + HCA Hybrid Attention (KV Cache Compression)
 
-Multi-head Latent Attention (MLA) compresses the KV cache via low-rank projection:
+DeepSeek V4 uses a hybrid attention architecture combining Compressed Sparse Attention (CSA)
+and Heavily Compressed Attention (HCA) in an interleaved configuration:
 
-- **Before MLA**: KV cache size = 2 × n_heads × head_dim (huge for long contexts)
-- **After MLA**: KV cache size = 2 × latent_dim (dramatically smaller)
+- **CSA** (compression rate m=4): Compresses every 4 KV entries into 1, then applies sparse top-k selection (k=512)
+- **HCA** (compression rate m'=128): Compresses every 128 KV entries into 1 for extreme reduction
 - **FP8 storage**: Non-RoPE KV dimensions stored as FP8 (E4M3), further halving memory
+- **Result**: KV cache is ~9.5× smaller than DeepSeek-V3.2 at 1M context
 
 ```
-Source: src/models/deepseek_v4.zig (MLA implementation, 3,091 lines)
+Source: src/models/deepseek_v4.zig (CSA+HCA implementation, 3,091 lines)
 ```
 
 ### Layer 4: Six-Level KV Cache Strategy System
@@ -98,7 +100,7 @@ Source: docs/en/technical/ttft-optimization.md
 │                    dmlx Inference Engine               │
 ├─────────────────────────────────────────────────────────┤
 │  Model (DeepSeek V4, 3,091 lines)                        │
-│  ├── MLA (Multi-head Latent Attention)                   │
+│  ├── CSA+HCA (Hybrid Compressed Attention)              │
 │  ├── MoE Router (top-k, 256 experts)                     │
 │  ├── Expert Stream (on-demand loading, 10GB peak)        │
 │  ├── YARN RoPE (1M+ context)                             │
@@ -232,7 +234,7 @@ Source: src/models/deepseek_v4.zig:2395-2441
 
 | Scenario | Why dmlx |
 |----------|-------------|
-| **Local LLM inference** | Run 671B model on a laptop — no cloud needed |
+| **Local LLM inference** | Run 284B model on a laptop — no cloud needed |
 | **Privacy-first applications** | All data stays on-device, zero network egress |
 | **Edge deployment** | Mac mini as private inference server for team |
 | **Offline/censored-region access** | Full LLM capability without internet |

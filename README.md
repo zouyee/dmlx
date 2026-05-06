@@ -2,7 +2,7 @@
 
 [**How It Works**](#how-it-works-5-layer-memory-optimization) | [**Performance**](#real-world-performance) | [**Scenarios**](#application-scenarios) | [**Quick Start**](#quick-start) | [**Installation**](#installation) | [**Architecture**](#architecture)
 
-> **Run a 671B-parameter MoE model on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
+> **Run a 284B-parameter MoE model (13B activated per token) on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
 >
 > dmlx combines Apple's MLX Metal backend with five layers of memory optimization to make the
 > impossible possible — and wraps it in a single static Zig binary with an OpenAI-compatible API.
@@ -11,9 +11,10 @@
 
 ## Why dmlx?
 
-The DeepSeek V4 model is **671 billion parameters** across 256 routed experts. At full precision,
-its weights exceed **150 GB** — more than 3× the memory of a 48GB MacBook Pro. Even at 4-bit
-quantization (~40 GB), it won't fit without aggressive memory management.
+The DeepSeek V4 Flash model is **284 billion parameters** across 256 routed experts (with 6 activated
+per token, plus 1 shared expert). At BF16 precision, its weights require **~568 GB** — more than
+10× the memory of a 48GB MacBook Pro. Even at 4-bit quantization (~40 GB), it won't fit without
+aggressive memory management.
 
 dmlx solves this through **five complementary layers of memory optimization**, plus a production-grade
 inference stack that makes frontier LLMs practical on consumer hardware.
@@ -35,8 +36,8 @@ inference stack that makes frontier LLMs practical on consumer hardware.
 
 ### Layer 1: MoE Expert Streaming → 138 GB → 10 GB
 
-DeepSeek V4 activates only **top-8 of 256 experts** per token. dmlx exploits this sparsity
-via `expert_stream.zig` (649 lines):
+DeepSeek V4 Flash activates only **top-6 of 256 routed experts** (plus 1 shared expert) per token.
+dmlx exploits this sparsity via `expert_stream.zig` (649 lines):
 
 - **On-demand loading**: Only active expert weights are loaded via `PartialTensorReader`
 - **LRU expert cache**: Frequently-used experts stay resident; cold ones are evicted
@@ -66,16 +67,19 @@ fall back to streaming on-demand.
 Source: docs/en/technical/4bit-smelt.md | docs/en/technical/smelt-flow.md
 ```
 
-### Layer 3: MLA KV Cache Compression
+### Layer 3: CSA + HCA Hybrid Attention (KV Cache Compression)
 
-**Multi-head Latent Attention** (MLA) compresses the KV cache via low-rank projection:
+DeepSeek V4 introduces a **hybrid attention architecture** combining Compressed Sparse Attention
+(CSA) and Heavily Compressed Attention (HCA) in an interleaved configuration:
 
-- **Before MLA**: KV cache = `2 × n_heads × head_dim` (huge for long contexts)
-- **After MLA**: KV cache = `2 × latent_dim` (dramatically smaller)
+- **CSA** (compression rate m=4): Compresses every 4 KV entries into 1, then applies sparse
+  top-k selection (k=512) via a lightning indexer
+- **HCA** (compression rate m'=128): Compresses every 128 KV entries into 1 for extreme reduction
 - **FP8 storage**: Non-RoPE KV dimensions stored as FP8 (E4M3), further halving memory
+- **Result**: KV cache is ~9.5× smaller than DeepSeek-V3.2 at 1M context
 
 ```
-Source: src/models/deepseek_v4.zig (MLA implementation, 3,091 lines)
+Source: src/models/deepseek_v4.zig (CSA+HCA implementation, 3,091 lines)
 ```
 
 ### Layer 4: Six-Level KV Cache Strategy System
@@ -116,7 +120,7 @@ Source: docs/en/technical/ttft-optimization.md
 ## Real-World Performance
 
 **Hardware**: Apple M4 Pro, 48 GB unified memory
-**Model**: DeepSeek-V4-Flash-4bit, 33 shards (~150 GB raw, ~40 GB 4-bit)
+**Model**: DeepSeek-V4-Flash-4bit, 33 shards (~40 GB 4-bit quantized)
 **Mode**: SMELT + stream, ExpertCache 4GB, temperature=0
 **Commit**: `7e72a7` (2026-05-05) — [benchmark log](docs/en/analysis/performance-benchmark.md)
 
@@ -368,7 +372,7 @@ Comprehensive documentation is available in [docs/](docs/index.md) (bilingual EN
 
 | Section | Description |
 |---------|-------------|
-| [DeepSeek MoE Deep Dive](docs/en/deepseek-moe/README.md) | How 671B runs on 48GB — 5-layer optimization |
+| [DeepSeek MoE Deep Dive](docs/en/deepseek-moe/README.md) | How 284B runs on 48GB — 5-layer optimization |
 | [Application Scenarios](docs/en/scenarios/README.md) | 6 real-world use cases |
 | [Competitive Analysis](docs/en/analysis/competitive-advantages.md) | dmlx vs mlx-lm, llama.cpp, LM Studio — verified benchmarks |
 | [User Guide](docs/en/user-guide/) | Quick fixes and troubleshooting |

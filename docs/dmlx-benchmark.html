@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>dmlx Benchmark — DeepSeek-V4 on Apple Silicon</title>
+<title>dmlx Benchmark — DeepSeek-V4-Flash on Apple Silicon</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body {
@@ -40,6 +40,7 @@ body {
   font-weight: 700;
   color: #ffffff;
   margin-bottom: 8px;
+  letter-spacing: -0.5px;
 }
 .quant-info {
   font-size: 16px;
@@ -50,8 +51,9 @@ body {
 /* Stats row */
 .stats-row {
   display: flex;
-  gap: 30px;
+  gap: 24px;
   margin-bottom: 30px;
+  flex-wrap: wrap;
 }
 .stat-item {
   display: flex;
@@ -75,7 +77,7 @@ body {
   text-transform: uppercase;
 }
 .stat-value {
-  font-size: 16px;
+  font-size: 15px;
   font-weight: 600;
   color: #ffffff;
 }
@@ -115,7 +117,7 @@ body {
 }
 .env-key {
   color: #8b949e;
-  min-width: 120px;
+  min-width: 130px;
 }
 .env-val {
   color: #e6edf3;
@@ -145,6 +147,7 @@ body {
   border: 1px solid #30363d;
   border-radius: 10px;
   padding: 24px;
+  position: relative;
 }
 .chart-header {
   display: flex;
@@ -170,7 +173,9 @@ body {
 
 /* Best badge */
 .best-badge {
-  float: right;
+  position: absolute;
+  top: 20px;
+  right: 20px;
   background: rgba(139, 92, 246, 0.1);
   border: 1px solid rgba(139, 92, 246, 0.4);
   border-radius: 8px;
@@ -209,8 +214,8 @@ body {
   justify-content: flex-end;
 }
 .bar-value {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 700;
   color: #ffffff;
   margin-bottom: 4px;
 }
@@ -279,7 +284,7 @@ body {
   padding: 3px 8px;
   border-radius: 4px;
   font-weight: 600;
-  min-width: 100px;
+  min-width: 80px;
   text-align: center;
 }
 .badge-purple { background: rgba(139, 92, 246, 0.2); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.4); }
@@ -312,6 +317,45 @@ body {
   flex-shrink: 0;
 }
 
+/* Model params table */
+.params-box {
+  background: rgba(22, 27, 34, 0.6);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 30px;
+}
+.params-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #fbbf24;
+  margin-bottom: 14px;
+}
+.params-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 10px;
+}
+.param-item {
+  background: rgba(139, 92, 246, 0.05);
+  border: 1px solid rgba(139, 92, 246, 0.15);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.param-key {
+  font-size: 10px;
+  color: #8b949e;
+  text-transform: uppercase;
+  margin-bottom: 2px;
+}
+.param-val {
+  font-size: 14px;
+  font-weight: 600;
+  color: #e6edf3;
+}
+
 /* Footer */
 .footer {
   margin-top: 30px;
@@ -334,21 +378,21 @@ body {
   <!-- Header -->
   <div class="header" style="display: flex; justify-content: space-between; align-items: flex-start;">
     <div>
-      <div class="runtime-badge">dmlx (Apple Silicon Native Runtime)</div>
+      <div class="runtime-badge">dmlx / mlx-zig (Apple Silicon Native Runtime)</div>
       <div class="model-name">DeepSeek-V4-Flash-4bit</div>
       <div class="quant-info">MoE Expert Streaming + SMELT 15% (~3.5–4 bits per weight)</div>
     </div>
-    <div class="env-box" style="margin-bottom: 0; min-width: 380px;">
+    <div class="env-box" style="margin-bottom: 0; min-width: 400px;">
       <div class="env-title">Benchmark Environment</div>
       <div class="env-grid">
-        <div class="env-item"><div class="env-dot"></div><span class="env-key">Runtime</span><span class="env-val">dmlx</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Runtime</span><span class="env-val">dmlx (mlx-zig, static binary)</span></div>
         <div class="env-item"><div class="env-dot"></div><span class="env-key">GPU</span><span class="env-val">Apple M4 Pro (Metal)</span></div>
         <div class="env-item"><div class="env-dot"></div><span class="env-key">Memory</span><span class="env-val">48 GB Unified</span></div>
         <div class="env-item"><div class="env-dot"></div><span class="env-key">Quantization</span><span class="env-val">INT4 + SMELT 15%</span></div>
-        <div class="env-item"><div class="env-dot"></div><span class="env-key">KV Cache</span><span class="env-val">Paged + Tiered</span></div>
-        <div class="env-item"><div class="env-dot"></div><span class="env-key">Experts</span><span class="env-val">top-8 of 256 (stream)</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">KV Cache</span><span class="env-val">Paged (CoW) + Tiered</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Expert Strategy</span><span class="env-val">Stream + LRU (top-6/256)</span></div>
         <div class="env-item"><div class="env-dot"></div><span class="env-key">Context</span><span class="env-val">128K+ tokens</span></div>
-        <div class="env-item"><div class="env-dot"></div><span class="env-key">Binary</span><span class="env-val">Single static (~10MB)</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Binary Size</span><span class="env-val">~10 MB (single static)</span></div>
       </div>
     </div>
   </div>
@@ -357,23 +401,48 @@ body {
   <div class="stats-row">
     <div class="stat-item">
       <div class="stat-icon">🔢</div>
-      <div><div class="stat-label">Model Size</div><div class="stat-value">~40 GiB (4-bit)</div></div>
+      <div><div class="stat-label">Model Size (4-bit)</div><div class="stat-value">~40 GiB</div></div>
     </div>
     <div class="stat-item">
       <div class="stat-icon">🧠</div>
-      <div><div class="stat-label">Parameters</div><div class="stat-value">671 B</div></div>
+      <div><div class="stat-label">Total Parameters</div><div class="stat-value">284 B</div></div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-icon">⚡</div>
+      <div><div class="stat-label">Activated Params</div><div class="stat-value">13 B</div></div>
     </div>
     <div class="stat-item">
       <div class="stat-icon">⚙️</div>
       <div><div class="stat-label">Backend</div><div class="stat-value">Metal (MLX)</div></div>
     </div>
     <div class="stat-item">
-      <div class="stat-icon">💻</div>
+      <div class="stat-icon">💾</div>
       <div><div class="stat-label">Active Memory</div><div class="stat-value">~6 GB (SMELT)</div></div>
     </div>
-    <div class="stat-item">
-      <div class="stat-icon">🏗️</div>
-      <div><div class="stat-label">Experts</div><div class="stat-value">256 (MoE)</div></div>
+  </div>
+
+  <!-- Model Architecture Parameters -->
+  <div class="params-box">
+    <div class="params-title">DeepSeek-V4-Flash Architecture (from paper)</div>
+    <div class="params-grid">
+      <div class="param-item"><div class="param-key">Layers</div><div class="param-val">43</div></div>
+      <div class="param-item"><div class="param-key">Hidden Dim (d)</div><div class="param-val">4096</div></div>
+      <div class="param-item"><div class="param-key">Attention</div><div class="param-val">CSA + HCA (hybrid)</div></div>
+      <div class="param-item"><div class="param-key">Query Heads (nₕ)</div><div class="param-val">64</div></div>
+      <div class="param-item"><div class="param-key">Head Dim (c)</div><div class="param-val">512</div></div>
+      <div class="param-item"><div class="param-key">Query Compress (d_c)</div><div class="param-val">1024</div></div>
+      <div class="param-item"><div class="param-key">CSA Compress Rate (m)</div><div class="param-val">4</div></div>
+      <div class="param-item"><div class="param-key">HCA Compress Rate (m')</div><div class="param-val">128</div></div>
+      <div class="param-item"><div class="param-key">Attention Top-k</div><div class="param-val">512</div></div>
+      <div class="param-item"><div class="param-key">Routed Experts</div><div class="param-val">256</div></div>
+      <div class="param-item"><div class="param-key">Shared Experts</div><div class="param-val">1</div></div>
+      <div class="param-item"><div class="param-key">Activated Experts</div><div class="param-val">6 per token</div></div>
+      <div class="param-item"><div class="param-key">Expert FFN Dim</div><div class="param-val">2048</div></div>
+      <div class="param-item"><div class="param-key">Sliding Window (n_win)</div><div class="param-val">128</div></div>
+      <div class="param-item"><div class="param-key">mHC Expansion (n_hc)</div><div class="param-val">4</div></div>
+      <div class="param-item"><div class="param-key">Output Groups (g)</div><div class="param-val">8</div></div>
+      <div class="param-item"><div class="param-key">Vocab Size</div><div class="param-val">128K</div></div>
+      <div class="param-item"><div class="param-key">Max Context</div><div class="param-val">1M tokens</div></div>
     </div>
   </div>
 
@@ -474,45 +543,45 @@ body {
   <!-- Bottom row -->
   <div class="bottom-row">
     <div class="config-box">
-      <div class="config-title">Memory Optimization Layers</div>
+      <div class="config-title">5-Layer Memory Optimization</div>
       <div class="config-item">
         <span class="config-badge badge-purple">Layer 1</span>
-        <span class="config-detail">Expert Streaming: 138 GB → 10 GB (top-8 of 256)</span>
+        <span class="config-detail">Expert Stream: 256→6 active (top-6 routing)</span>
       </div>
       <div class="config-item">
         <span class="config-badge badge-purple">Layer 2</span>
-        <span class="config-detail">SMELT 15%: 40 GB → 6 GB (partial loading)</span>
+        <span class="config-detail">SMELT 15%: ~40 GB → ~6 GB (38/256 experts)</span>
       </div>
       <div class="config-item">
         <span class="config-badge badge-purple">Layer 3</span>
-        <span class="config-detail">MLA KV Compression (low-rank projection)</span>
+        <span class="config-detail">CSA+HCA KV Compress (m=4, m'=128)</span>
       </div>
       <div class="config-item">
         <span class="config-badge badge-green">Layer 4</span>
-        <span class="config-detail">Paged KV Cache: 32-token pages + CoW</span>
+        <span class="config-detail">Paged KV: 32-token pages + CoW batching</span>
       </div>
       <div class="config-item">
         <span class="config-badge badge-green">Layer 5</span>
-        <span class="config-detail">Zero-Copy Loading: 137s → 41s TTFT (mmap)</span>
+        <span class="config-detail">Zero-Copy Load: 137s → 41s TTFT (mmap)</span>
       </div>
     </div>
 
     <div class="takeaway-box">
       <div class="takeaway-title">Key Takeaways</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> 671B MoE model on 48GB Mac (mlx-lm: OOM)</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> ~12.2 tok/s steady-state with only ~6GB active weights</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 284B MoE (13B active) on 48GB Mac — mlx-lm: OOM</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> ~12.2 tok/s with only ~6GB active weights (SMELT 15%)</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> 370ms TTFT — 48% faster than initial version</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> 128K+ context via Paged + Tiered KV (RAM+SSD)</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> Single static binary, zero GC, sub-ms latency</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> 7/7 correctness on end-to-end validation</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> Single static binary (~10MB), zero GC, sub-ms latency</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 7/7 correctness on end-to-end prompt validation</div>
     </div>
   </div>
 
   <!-- Footer -->
   <div class="footer">
     <span class="footer-highlight">✨ Pushing the limits of local LLM performance on Apple Silicon.</span>
-    <span>Model: DeepSeek-V4-Flash-4bit (671B MoE)</span>
-    <span>Runtime: <span class="footer-highlight">dmlx</span> (Zig + Metal via mlx-c)</span>
+    <span>Model: DeepSeek-V4-Flash (284B total, 13B activated, 256 MoE experts)</span>
+    <span>Runtime: <span class="footer-highlight">dmlx / mlx-zig</span></span>
   </div>
 
 </div>
