@@ -39,6 +39,8 @@ Thumbs.db
 out.txt
 .sisyphus.json
 .sisyphus/
+.kiro/
+.agents/
 *.bak
 test_random
 

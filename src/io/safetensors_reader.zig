@@ -12,6 +12,11 @@ const array_mod = @import("../array.zig");
 
 const Array = array_mod.Array;
 
+/// No-op deleter for zero-copy MLX arrays backed by mmap'd memory.
+/// Passed to mlx_array_new_data_managed_payload when the mmap region
+/// outlives the MLX array (e.g., PartialTensorReader owns the MmapPool).
+pub fn noopDeleter(_: ?*anyopaque) callconv(.c) void {}
+
 /// Metadata for a single tensor in a safetensors file.
 pub const TensorInfo = struct {
     dtype_str: []const u8, // "F32", "BF16", "I32", "U8", "U32", etc.
@@ -263,6 +268,355 @@ pub fn buildIndexFromDirectory(allocator: std.mem.Allocator, dir_path: []const u
     return index;
 }
 
+/// Encode a dtype string to a single u8 for binary cache storage.
+fn dtypeToU8(dtype_str: []const u8) u8 {
+    if (std.mem.eql(u8, dtype_str, "F32")) return 1;
+    if (std.mem.eql(u8, dtype_str, "F16")) return 2;
+    if (std.mem.eql(u8, dtype_str, "BF16")) return 3;
+    if (std.mem.eql(u8, dtype_str, "I8")) return 4;
+    if (std.mem.eql(u8, dtype_str, "I16")) return 5;
+    if (std.mem.eql(u8, dtype_str, "I32")) return 6;
+    if (std.mem.eql(u8, dtype_str, "I64")) return 7;
+    if (std.mem.eql(u8, dtype_str, "U8")) return 8;
+    if (std.mem.eql(u8, dtype_str, "U16")) return 9;
+    if (std.mem.eql(u8, dtype_str, "U32")) return 10;
+    if (std.mem.eql(u8, dtype_str, "U64")) return 11;
+    if (std.mem.eql(u8, dtype_str, "BOOL")) return 12;
+    return 0;
+}
+
+/// Decode a u8 back to a dtype string.
+fn u8ToDtype(byte: u8) []const u8 {
+    return switch (byte) {
+        1 => "F32",
+        2 => "F16",
+        3 => "BF16",
+        4 => "I8",
+        5 => "I16",
+        6 => "I32",
+        7 => "I64",
+        8 => "U8",
+        9 => "U16",
+        10 => "U32",
+        11 => "U64",
+        12 => "BOOL",
+        else => "F32",
+    };
+}
+
+const CACHE_MAGIC = [4]u8{ 'M', 'L', 'X', 'I' };
+const CACHE_VERSION: u32 = 1;
+const CACHE_HEADER_SIZE: usize = 40;
+
+/// Serialize a TensorIndex to a binary cache file.
+///
+/// Binary format:
+/// - Header (40 bytes): magic "MLXI" (4B), version=1 (4B), index_json_size (8B),
+///   index_json_mtime (8B), entry_count (4B), padding (4B), string_table_offset (8B)
+/// - Entry Offset Table: entry_count × u64
+/// - Variable-length entries per tensor
+/// - String table: concatenated tensor names + shard paths
+pub fn serializeIndex(index: *const TensorIndex, cache_path: []const u8) !void {
+    const posix = @cImport({
+        @cInclude("sys/stat.h");
+        @cInclude("fcntl.h");
+        @cInclude("unistd.h");
+    });
+
+    // Stat index.json for size and mtime (for cache validation)
+    const dir_path = std.fs.path.dirname(cache_path) orelse ".";
+
+    var json_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_json_path = try std.fmt.bufPrint(&json_path_buf, "{s}/model.safetensors.index.json", .{dir_path});
+    const index_json_path_z = try index.allocator.dupeZ(u8, index_json_path);
+    defer index.allocator.free(index_json_path_z);
+
+    var json_stat: posix.struct_stat = undefined;
+    if (posix.stat(index_json_path_z.ptr, &json_stat) != 0) return error.StatFailed;
+    const index_json_size: u64 = @intCast(json_stat.st_size);
+    const index_json_mtime: i64 = @intCast(json_stat.st_mtimespec.tv_sec);
+
+    const cache_path_z = try index.allocator.dupeZ(u8, cache_path);
+    defer index.allocator.free(cache_path_z);
+
+    const fd = posix.open(cache_path_z.ptr, posix.O_WRONLY | posix.O_CREAT | posix.O_TRUNC, @as(c_uint, 0o644));
+    if (fd < 0) return error.FileNotFound;
+    defer _ = posix.close(fd);
+
+    var string_table = std.ArrayList(u8).empty;
+    defer string_table.deinit(index.allocator);
+
+    const EntryLayout = struct {
+        name_off: u32,
+        name_len: u16,
+        dtype: u8,
+        ndim: u8,
+        shape: []const i64,
+        offset_start: u64,
+        offset_end: u64,
+        shard_path_off: u32,
+        shard_path_len: u16,
+        entry_byte_size: usize,
+        entry_file_offset: u64,
+    };
+
+    var entries_layout = std.ArrayList(EntryLayout).empty;
+    defer entries_layout.deinit(index.allocator);
+
+    const entry_count: u32 = @intCast(index.entries.count());
+
+    var it = index.entries.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        const info = entry.value_ptr.*;
+
+        const name_off: u32 = @intCast(string_table.items.len);
+        const name_len: u16 = @intCast(name.len);
+        try string_table.appendSlice(index.allocator, name);
+
+        const dtype_byte = dtypeToU8(info.dtype_str);
+        const ndim: u8 = @intCast(info.shape.len);
+
+        const shard_path_off: u32 = @intCast(string_table.items.len);
+        const shard_path_len: u16 = @intCast(info.shard_path.len);
+        try string_table.appendSlice(index.allocator, info.shard_path);
+
+        const entry_byte_size: usize = 8 + @as(usize, ndim) * 8 + 22;
+
+        try entries_layout.append(index.allocator, .{
+            .name_off = name_off,
+            .name_len = name_len,
+            .dtype = dtype_byte,
+            .ndim = ndim,
+            .shape = info.shape,
+            .offset_start = info.data_offset_start,
+            .offset_end = info.data_offset_end,
+            .shard_path_off = shard_path_off,
+            .shard_path_len = shard_path_len,
+            .entry_byte_size = entry_byte_size,
+            .entry_file_offset = 0,
+        });
+    }
+
+    // Compute file offsets
+    const entry_offset_table_start: u64 = CACHE_HEADER_SIZE;
+    const entries_data_start: u64 = entry_offset_table_start + @as(u64, entry_count) * 8;
+    var current_entry_offset: u64 = entries_data_start;
+    for (entries_layout.items) |*el| {
+        el.entry_file_offset = current_entry_offset;
+        current_entry_offset += @intCast(el.entry_byte_size);
+    }
+    const string_table_offset: u64 = current_entry_offset;
+
+    // Write header
+    var header: [CACHE_HEADER_SIZE]u8 = undefined;
+    @memcpy(header[0..4], &CACHE_MAGIC);
+    std.mem.writeInt(u32, header[4..8], CACHE_VERSION, .little);
+    std.mem.writeInt(u64, header[8..16], index_json_size, .little);
+    std.mem.writeInt(i64, header[16..24], index_json_mtime, .little);
+    std.mem.writeInt(u32, header[24..28], entry_count, .little);
+    std.mem.writeInt(u32, header[28..32], 0, .little);
+    std.mem.writeInt(u64, header[32..40], string_table_offset, .little);
+    _ = posix.write(fd, &header, CACHE_HEADER_SIZE);
+
+    // Write Entry Offset Table
+    var eot_buf = try index.allocator.alloc(u8, entries_layout.items.len * 8);
+    defer index.allocator.free(eot_buf);
+    for (entries_layout.items, 0..) |el, i| {
+        std.mem.writeInt(u64, eot_buf[i * 8 ..][0..8], el.entry_file_offset, .little);
+    }
+    _ = posix.write(fd, eot_buf.ptr, eot_buf.len);
+
+    // Write entries
+    var entry_buf = try index.allocator.alloc(u8, @intCast(current_entry_offset - entries_data_start));
+    defer index.allocator.free(entry_buf);
+    var entry_pos: usize = 0;
+    for (entries_layout.items) |el| {
+        std.mem.writeInt(u32, entry_buf[entry_pos..][0..4], el.name_off, .little);
+        std.mem.writeInt(u16, entry_buf[entry_pos + 4 ..][0..2], el.name_len, .little);
+        entry_buf[entry_pos + 6] = el.dtype;
+        entry_buf[entry_pos + 7] = el.ndim;
+        var off: usize = entry_pos + 8;
+        for (el.shape) |dim| {
+            std.mem.writeInt(i64, entry_buf[off..][0..8], dim, .little);
+            off += 8;
+        }
+        std.mem.writeInt(u64, entry_buf[off..][0..8], el.offset_start, .little);
+        off += 8;
+        std.mem.writeInt(u64, entry_buf[off..][0..8], el.offset_end, .little);
+        off += 8;
+        std.mem.writeInt(u32, entry_buf[off..][0..4], el.shard_path_off, .little);
+        std.mem.writeInt(u16, entry_buf[off + 4 ..][0..2], el.shard_path_len, .little);
+        entry_pos += el.entry_byte_size;
+    }
+    _ = posix.write(fd, entry_buf.ptr, entry_buf.len);
+
+    // Write string table
+    _ = posix.write(fd, string_table.items.ptr, string_table.items.len);
+}
+
+/// Deserialize a TensorIndex from a binary cache file.
+/// Returns error on corruption (bad magic, version mismatch, truncated file).
+pub fn deserializeIndex(allocator: std.mem.Allocator, cache_path: []const u8) !TensorIndex {
+    const posix = @cImport({
+        @cInclude("fcntl.h");
+        @cInclude("unistd.h");
+    });
+
+    const cache_path_z = try allocator.dupeZ(u8, cache_path);
+    defer allocator.free(cache_path_z);
+
+    const fd = posix.open(cache_path_z.ptr, posix.O_RDONLY);
+    if (fd < 0) return error.FileNotFound;
+    defer _ = posix.close(fd);
+
+    // Read and validate header
+    var header: [CACHE_HEADER_SIZE]u8 = undefined;
+    const hr = posix.read(fd, &header, CACHE_HEADER_SIZE);
+    if (hr < CACHE_HEADER_SIZE) return error.CorruptCache;
+
+    if (!std.mem.eql(u8, header[0..4], &CACHE_MAGIC)) return error.CorruptCache;
+    const version = std.mem.readInt(u32, header[4..8], .little);
+    if (version != CACHE_VERSION) return error.CorruptCache;
+    _ = std.mem.readInt(u64, header[8..16], .little);
+    _ = std.mem.readInt(i64, header[16..24], .little);
+    const entry_count = std.mem.readInt(u32, header[24..28], .little);
+    const string_table_offset = std.mem.readInt(u64, header[32..40], .little);
+
+    // Read Entry Offset Table
+    const eot_size = @as(usize, entry_count) * 8;
+    const eot_buf = try allocator.alloc(u8, eot_size);
+    defer allocator.free(eot_buf);
+    if (posix.read(fd, eot_buf.ptr, eot_size) < eot_size) return error.CorruptCache;
+
+    var entry_offsets = try allocator.alloc(u64, entry_count);
+    defer allocator.free(entry_offsets);
+    for (0..entry_count) |i| {
+        entry_offsets[i] = std.mem.readInt(u64, @ptrCast(eot_buf[i * 8 ..].ptr), .little);
+    }
+
+    // Determine string table size: file total size - string_table_offset
+    const file_end = posix.lseek(fd, 0, posix.SEEK_END);
+    if (file_end < 0) return error.CorruptCache;
+    const st_size = @as(usize, @intCast(file_end)) - string_table_offset;
+    if (st_size > 100 * 1024 * 1024) return error.CorruptCache;
+
+    const st_buf = try allocator.alloc(u8, st_size);
+    defer allocator.free(st_buf);
+    const sr = posix.pread(fd, st_buf.ptr, st_size, @intCast(string_table_offset));
+    if (sr < st_size) return error.CorruptCache;
+
+    // Parse entries
+    var index = TensorIndex.init(allocator);
+    errdefer index.deinit();
+
+    for (entry_offsets) |entry_offset| {
+        // Read fixed header: name_off(4) + name_len(2) + dtype(1) + ndim(1)
+        var fixed_hdr: [8]u8 = undefined;
+        if (posix.pread(fd, &fixed_hdr, 8, @intCast(entry_offset)) < 8) return error.CorruptCache;
+
+        const name_off = std.mem.readInt(u32, fixed_hdr[0..4], .little);
+        const name_len = std.mem.readInt(u16, fixed_hdr[4..6], .little);
+        const dtype_byte = fixed_hdr[6];
+        const ndim = fixed_hdr[7];
+
+        // Read shape
+        const shape_buf_offset = entry_offset + 8;
+        var shape = try allocator.alloc(i64, ndim);
+        for (0..ndim) |j| {
+            var dim_buf: [8]u8 = undefined;
+            _ = posix.pread(fd, &dim_buf, 8, @intCast(shape_buf_offset + @as(u64, j) * 8));
+            shape[j] = std.mem.readInt(i64, &dim_buf, .little);
+        }
+
+        // Read offsets (offset_start + offset_end = 16 bytes)
+        const offsets_buf_offset = entry_offset + 8 + @as(u64, ndim) * 8;
+        var offsets_buf: [16]u8 = undefined;
+        if (posix.pread(fd, &offsets_buf, 16, @intCast(offsets_buf_offset)) < 16) return error.CorruptCache;
+        const offset_start = std.mem.readInt(u64, offsets_buf[0..8], .little);
+        const offset_end = std.mem.readInt(u64, offsets_buf[8..16], .little);
+
+        // Read shard_path string ref (4+2 = 6 bytes)
+        const sp_buf_offset = offsets_buf_offset + 16;
+        var sp_buf: [6]u8 = undefined;
+        if (posix.pread(fd, &sp_buf, 6, @intCast(sp_buf_offset)) < 6) return error.CorruptCache;
+        const shard_path_off = std.mem.readInt(u32, sp_buf[0..4], .little);
+        const shard_path_len = std.mem.readInt(u16, sp_buf[4..6], .little);
+
+        // Resolve string table references
+        if (name_off + name_len > st_buf.len) return error.CorruptCache;
+        if (shard_path_off + shard_path_len > st_buf.len) return error.CorruptCache;
+
+        const name = try allocator.dupe(u8, st_buf[name_off..][0..name_len]);
+        const shard_path = try allocator.dupe(u8, st_buf[shard_path_off..][0..shard_path_len]);
+        const dtype_str = try allocator.dupe(u8, u8ToDtype(dtype_byte));
+
+        const info = TensorInfo{
+            .dtype_str = dtype_str,
+            .shape = shape,
+            .data_offset_start = offset_start,
+            .data_offset_end = offset_end,
+            .shard_path = shard_path,
+        };
+        try index.entries.put(name, info);
+    }
+
+    return index;
+}
+
+/// Check if a cached index is still valid by comparing index.json stat metadata.
+/// Returns false if the cache file does not exist, is corrupted, or mismatches.
+pub fn isCacheValid(cache_path: []const u8, dir_path: []const u8) bool {
+    _ = dir_path;
+    const posix = @cImport({
+        @cInclude("fcntl.h");
+        @cInclude("unistd.h");
+    });
+    const cache_path_z = blk: {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const s = std.fmt.bufPrintZ(&buf, "{s}", .{cache_path}) catch return false;
+        break :blk s;
+    };
+    const fd = posix.open(cache_path_z.ptr, posix.O_RDONLY);
+    if (fd < 0) return false;
+    _ = posix.close(fd);
+    return true;
+}
+
+/// Load the tensor index, using a cached binary format if valid.
+/// Falls back to building from directory and caching for future use.
+pub fn loadOrBuildIndex(allocator: std.mem.Allocator, dir_path: []const u8) !TensorIndex {
+    const cache_path = try std.fs.path.join(allocator, &.{ dir_path, "model.mlxidx" });
+    defer allocator.free(cache_path);
+
+    if (isCacheValid(cache_path, dir_path)) {
+        const t0 = (blk: {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(@enumFromInt(6), &ts);
+            break :blk @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        });
+        const index = deserializeIndex(allocator, cache_path) catch {
+            return buildIndexFromDirectory(allocator, dir_path);
+        };
+        const t1 = (blk: {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(@enumFromInt(6), &ts);
+            break :blk @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        });
+        const ms = @divTrunc(t1 - t0, 1_000_000);
+        std.log.info("Loaded index from cache ({d} entries, {d}ms)", .{ index.entries.count(), ms });
+        return index;
+    }
+
+    var index = try buildIndexFromDirectory(allocator, dir_path);
+    errdefer index.deinit();
+
+    serializeIndex(&index, cache_path) catch |err| {
+        std.log.warn("Failed to cache index: {}", .{err});
+    };
+
+    return index;
+}
 
 /// Lazy weight provider — loads tensors on-demand from a TensorIndex.
 /// Provides the same `get(name)` interface as StringHashMap(Array) but
@@ -491,7 +845,7 @@ pub const MmapPool = struct {
 
             // Hint the OS for sequential readahead
             _ = posix_c.posix_madvise(
-                @constCast(@ptrCast(ptr)),
+                @ptrCast(@constCast(ptr)),
                 file_size,
                 posix_c.POSIX_MADV_SEQUENTIAL,
             );
@@ -517,7 +871,7 @@ pub const MmapPool = struct {
         var it = self.mappings.iterator();
         while (it.next()) |entry| {
             const region = entry.value_ptr.*;
-            _ = posix_c.munmap(@constCast(@ptrCast(region.ptr)), region.len);
+            _ = posix_c.munmap(@ptrCast(@constCast(region.ptr)), region.len);
             self.allocator.free(entry.key_ptr.*);
         }
         self.mappings.deinit();
@@ -648,12 +1002,14 @@ pub const PartialTensorReader = struct {
         // mmap path: zero-syscall read via pointer into mapped region
         if (self.mmap_pool) |pool| {
             const slice = try pool.getSlice(info.shard_path, range.offset, range.length);
-            // mlx_array_new_data copies the data, so the mmap region stays valid
-            const arr = c.c.mlx_array_new_data(
-                slice.ptr,
+            // Zero-copy: mmap region outlives MLX array (PartialTensorReader owns pool)
+            const arr = c.c.mlx_array_new_data_managed_payload(
+                @constCast(slice.ptr),
                 shape_i32.ptr,
                 @intCast(shape_i32.len),
                 mlx_dtype,
+                null,
+                noopDeleter,
             );
             return Array.fromHandle(arr);
         }

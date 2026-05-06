@@ -45,8 +45,14 @@ fn consumeWeightKey(allocator: std.mem.Allocator, weights: *std.StringHashMap(Ar
 fn isExpertWeight(name: []const u8) bool {
     return std.mem.indexOf(u8, name, "switch_mlp") != null or
         (std.mem.indexOf(u8, name, "ffn.experts.") != null and
-        std.mem.indexOf(u8, name, "shared_experts") == null);
+            std.mem.indexOf(u8, name, "shared_experts") == null);
 }
+
+/// Entry with name and info for sequential I/O grouping.
+const EntryWithName = struct {
+    name: []const u8,
+    info: safetensors_reader.TensorInfo,
+};
 
 /// Slice a fused expert tensor [n_experts, ...] to keep only experts marked true in the mask.
 /// Returns a new tensor [n_loaded, ...] containing only the selected expert rows.
@@ -470,7 +476,7 @@ pub fn loadWeightsSelectiveLazy(
     dir_path: []const u8,
 ) !struct { index: *safetensors_reader.TensorIndex, provider: *safetensors_reader.LazyWeightProvider } {
     const index = try allocator.create(safetensors_reader.TensorIndex);
-    index.* = try safetensors_reader.buildIndexFromDirectory(allocator, dir_path);
+    index.* = try safetensors_reader.loadOrBuildIndex(allocator, dir_path);
     std.log.info("Indexed {d} tensors across shards", .{index.entries.count()});
 
     const provider = try allocator.create(safetensors_reader.LazyWeightProvider);
@@ -488,23 +494,38 @@ pub fn loadWeightsSelective(
     dir_path: []const u8,
     smelt: SmeltConfig,
 ) !std.StringHashMap(Array) {
+    const now = struct {
+        fn ns() i128 {
+            var ts: std.c.timespec = std.mem.zeroes(std.c.timespec);
+            _ = std.c.clock_gettime(@enumFromInt(6), &ts);
+            return @as(i128, ts.sec) * 1_000_000_000 + @as(i128, ts.nsec);
+        }
+    }.ns;
+    const t0_total = now();
+
     // Build tensor index from shard headers (only reads first few KB per file)
-    var index = try safetensors_reader.buildIndexFromDirectory(allocator, dir_path);
+    const t0_index = now();
+    var index = try safetensors_reader.loadOrBuildIndex(allocator, dir_path);
+    const t1_index = now();
     defer index.deinit();
 
     std.log.info("Indexed {d} tensors across shards", .{index.entries.count()});
 
     // Open all shard file descriptors once (avoids 2000+ open/close cycles)
+    const t0_fd = now();
     var fd_pool = safetensors_reader.FdPool.init(allocator);
     defer fd_pool.deinit();
     try fd_pool.openAll(&index);
+    const t1_fd = now();
 
     // mmap all shards for zero-syscall reads
+    const t0_mmap = now();
     var mmap_pool = safetensors_reader.MmapPool.init(allocator);
     defer mmap_pool.deinit();
     mmap_pool.mmapAll(&index) catch |err| {
         std.log.warn("Failed to mmap shards: {}, falling back to pread", .{err});
     };
+    const t1_mmap = now();
 
     // Build smelt mask
     var smelt_mask: ?[]bool = null;
@@ -521,14 +542,21 @@ pub fn loadWeightsSelective(
         var count_it = index.entries.iterator();
         while (count_it.next()) |entry| {
             const hf_name = entry.key_ptr.*;
-            if (skip_all_experts and isExpertWeight(hf_name)) { to_skip += 1; continue; }
-            if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) { to_skip += 1; continue; }
+            if (skip_all_experts and isExpertWeight(hf_name)) {
+                to_skip += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) {
+                to_skip += 1;
+                continue;
+            }
             to_load += 1;
         }
     }
     std.log.info("Loading {d} backbone weights ({d} expert weights skipped)", .{ to_load, to_skip });
 
     // Load each tensor using pre-opened file descriptors
+    const t0_load = now();
     var weights = std.StringHashMap(Array).init(allocator);
     errdefer {
         var it = weights.iterator();
@@ -543,83 +571,131 @@ pub fn loadWeightsSelective(
 
     var loaded_count: usize = 0;
     var skipped_count: usize = 0;
-    var idx_it = index.entries.iterator();
-    while (idx_it.next()) |entry| {
-        const hf_name = entry.key_ptr.*;
 
-        // Stream mode: skip ALL expert weights (loaded on-demand via ExpertStreamProvider)
-        if (skip_all_experts and isExpertWeight(hf_name)) {
-            skipped_count += 1;
-            continue;
+    // Collect filtered entries into per-shard lists for sequential I/O
+    var shard_groups = std.StringHashMap(std.ArrayList(EntryWithName)).init(allocator);
+    defer {
+        var it = shard_groups.iterator();
+        while (it.next()) |entry| {
+            entry.value_ptr.*.deinit(allocator);
         }
+        shard_groups.deinit();
+    }
+    {
+        var collect_it = index.entries.iterator();
+        while (collect_it.next()) |entry| {
+            const hf_name = entry.key_ptr.*;
 
-        // Skip expert weights for unloaded experts
-        if (smelt_mask != null and isExpertWeight(hf_name)) {
-            const eid = parseExpertIndexFromHF(hf_name);
-            if (eid) |e| {
-                if (e < smelt_mask.?.len and !smelt_mask.?[e]) { skipped_count += 1; continue; }
+            // Stream mode: skip ALL expert weights (loaded on-demand via ExpertStreamProvider)
+            if (skip_all_experts and isExpertWeight(hf_name)) continue;
+
+            // Skip expert weights for unloaded experts
+            if (smelt_mask != null and isExpertWeight(hf_name)) {
+                const eid = parseExpertIndexFromHF(hf_name);
+                if (eid) |e| {
+                    if (e < smelt_mask.?.len and !smelt_mask.?[e]) continue;
+                }
             }
-        }
 
-        // Skip __metadata__ and mtp.* weights
-        if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) {
-            skipped_count += 1;
-            continue;
-        }
+            // Skip __metadata__ and mtp.* weights
+            if (std.mem.startsWith(u8, hf_name, "__metadata__") or std.mem.startsWith(u8, hf_name, "mtp.")) continue;
 
-        // Load tensor using mmap (zero-syscall) or pread fallback
-        const info = entry.value_ptr.*;
-        const data_len: usize = @intCast(info.data_offset_end - info.data_offset_start);
-
-        // Map dtype and build shape first (needed for both paths)
-        const mlx_dtype = safetensors_reader.dtypeFromString(info.dtype_str) orelse {
-            skipped_count += 1;
-            continue;
-        };
-        var shape_i32 = allocator.alloc(i32, info.shape.len) catch {
-            skipped_count += 1;
-            continue;
-        };
-        defer allocator.free(shape_i32);
-        for (info.shape, 0..) |s, si| {
-            shape_i32[si] = @intCast(s);
-        }
-
-        // Try mmap path first (zero-copy pointer into mapped region)
-        const tensor = if (mmap_pool.getSlice(info.shard_path, info.data_offset_start, data_len)) |slice| blk: {
-            // mlx_array_new_data copies the data, so mmap region stays valid
-            const arr = c.c.mlx_array_new_data(slice.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
-            break :blk Array.fromHandle(arr);
-        } else |_| blk: {
-            // Fallback to pread via FdPool
-            const fd = fd_pool.getFd(info.shard_path) catch {
-                skipped_count += 1;
-                continue;
-            };
-            const buf = allocator.alloc(u8, data_len) catch {
-                skipped_count += 1;
-                continue;
-            };
-            defer allocator.free(buf);
-            const read_len = posix_c.pread(fd, buf.ptr, data_len, @intCast(info.data_offset_start));
-            if (read_len < @as(isize, @intCast(data_len))) {
-                skipped_count += 1;
-                continue;
+            const info = entry.value_ptr.*;
+            const shard_name = info.shard_path;
+            const gop = try shard_groups.getOrPut(shard_name);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = std.ArrayList(EntryWithName).empty;
             }
-            const arr = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
-            break :blk Array.fromHandle(arr);
-        };
-
-        // Apply name mapping
-        const mapped = try mapV4WeightName(allocator, hf_name);
-        const key = mapped orelse try allocator.dupe(u8, hf_name);
-        try weights.put(key, tensor);
-
-        loaded_count += 1;
-        if (loaded_count % 200 == 0) {
-            std.log.info("Loaded {d}/{d} tensors...", .{ loaded_count, to_load });
+            try gop.value_ptr.*.append(allocator, .{ .name = hf_name, .info = info });
         }
     }
+
+    // Sort each shard's entries by data_offset_start for sequential I/O
+    {
+        var sort_it = shard_groups.iterator();
+        while (sort_it.next()) |entry| {
+            const items = entry.value_ptr.*.items;
+            if (items.len > 1) {
+                std.sort.insertion(EntryWithName, items, {}, struct {
+                    fn lessThan(_: void, a: EntryWithName, b: EntryWithName) bool {
+                        return a.info.data_offset_start < b.info.data_offset_start;
+                    }
+                }.lessThan);
+            }
+        }
+    }
+
+    // Load tensors in sequential order per shard
+    {
+        var shard_it = shard_groups.iterator();
+        while (shard_it.next()) |shard_entry| {
+            const entries_list = shard_entry.value_ptr.*;
+            for (entries_list.items) |item| {
+                const hf_name = item.name;
+                const info = item.info;
+
+                const data_len: usize = @intCast(info.data_offset_end - info.data_offset_start);
+
+                // Map dtype and build shape first (needed for both paths)
+                const mlx_dtype = safetensors_reader.dtypeFromString(info.dtype_str) orelse {
+                    skipped_count += 1;
+                    continue;
+                };
+                var shape_i32 = allocator.alloc(i32, info.shape.len) catch {
+                    skipped_count += 1;
+                    continue;
+                };
+                defer allocator.free(shape_i32);
+                for (info.shape, 0..) |s, si| {
+                    shape_i32[si] = @intCast(s);
+                }
+
+                // Try mmap path first (zero-copy pointer into mapped region)
+                const tensor = if (mmap_pool.getSlice(info.shard_path, info.data_offset_start, data_len)) |slice| blk: {
+                    const arr = c.c.mlx_array_new_data(slice.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
+                    break :blk Array.fromHandle(arr);
+                } else |_| blk: {
+                    // Fallback to pread via FdPool
+                    const fd = fd_pool.getFd(info.shard_path) catch {
+                        skipped_count += 1;
+                        continue;
+                    };
+                    const buf = allocator.alloc(u8, data_len) catch {
+                        skipped_count += 1;
+                        continue;
+                    };
+                    defer allocator.free(buf);
+                    const read_len = posix_c.pread(fd, buf.ptr, data_len, @intCast(info.data_offset_start));
+                    if (read_len < @as(isize, @intCast(data_len))) {
+                        skipped_count += 1;
+                        continue;
+                    }
+                    const arr = c.c.mlx_array_new_data(buf.ptr, shape_i32.ptr, @intCast(shape_i32.len), mlx_dtype);
+                    break :blk Array.fromHandle(arr);
+                };
+
+                // Apply name mapping
+                const mapped = try mapV4WeightName(allocator, hf_name);
+                const key = mapped orelse try allocator.dupe(u8, hf_name);
+                try weights.put(key, tensor);
+
+                loaded_count += 1;
+                if (loaded_count % 200 == 0) {
+                    std.log.info("Loaded {d}/{d} tensors...", .{ loaded_count, to_load });
+                }
+            }
+        }
+    }
+
+    const t1_load = now();
+    const t1_total = now();
+    std.log.info("TTFT breakdown: index={d}ms fd={d}ms mmap={d}ms load={d}ms total={d}ms", .{
+        @divTrunc(t1_index - t0_index, 1_000_000),
+        @divTrunc(t1_fd - t0_fd, 1_000_000),
+        @divTrunc(t1_mmap - t0_mmap, 1_000_000),
+        @divTrunc(t1_load - t0_load, 1_000_000),
+        @divTrunc(t1_total - t0_total, 1_000_000),
+    });
 
     std.log.info("Loaded {d} weights selectively", .{weights.count()});
     return weights;
@@ -1218,10 +1294,22 @@ pub fn buildDSV4Model(
         if (weights.fetchRemove(wq_a_name)) |kv| allocator.free(kv.key);
         const wq_a_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_a.scales", .{idx_fmt});
         defer allocator.free(wq_a_s_name);
-        const wq_a_scales: ?Array = blk_s: { const v = weights.get(wq_a_s_name); if (v != null) { if (weights.fetchRemove(wq_a_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wq_a_scales: ?Array = blk_s: {
+            const v = weights.get(wq_a_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(wq_a_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const wq_a_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_a.biases", .{idx_fmt});
         defer allocator.free(wq_a_b_name);
-        const wq_a_biases: ?Array = blk_b: { const v = weights.get(wq_a_b_name); if (v != null) { if (weights.fetchRemove(wq_a_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const wq_a_biases: ?Array = blk_b: {
+            const v = weights.get(wq_a_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(wq_a_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const wq_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.weight", .{idx_fmt});
         defer allocator.free(wq_b_name);
@@ -1229,10 +1317,22 @@ pub fn buildDSV4Model(
         if (weights.fetchRemove(wq_b_name)) |kv| allocator.free(kv.key);
         const wq_b_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.scales", .{idx_fmt});
         defer allocator.free(wq_b_s_name);
-        const wq_b_scales: ?Array = blk_s: { const v = weights.get(wq_b_s_name); if (v != null) { if (weights.fetchRemove(wq_b_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wq_b_scales: ?Array = blk_s: {
+            const v = weights.get(wq_b_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(wq_b_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const wq_b_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wq_b.biases", .{idx_fmt});
         defer allocator.free(wq_b_b_name);
-        const wq_b_biases: ?Array = blk_b: { const v = weights.get(wq_b_b_name); if (v != null) { if (weights.fetchRemove(wq_b_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const wq_b_biases: ?Array = blk_b: {
+            const v = weights.get(wq_b_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(wq_b_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const wkv_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.weight", .{idx_fmt});
         defer allocator.free(wkv_name);
@@ -1240,10 +1340,22 @@ pub fn buildDSV4Model(
         if (weights.fetchRemove(wkv_name)) |kv| allocator.free(kv.key);
         const wkv_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.scales", .{idx_fmt});
         defer allocator.free(wkv_s_name);
-        const wkv_scales: ?Array = blk_s: { const v = weights.get(wkv_s_name); if (v != null) { if (weights.fetchRemove(wkv_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wkv_scales: ?Array = blk_s: {
+            const v = weights.get(wkv_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(wkv_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const wkv_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wkv.biases", .{idx_fmt});
         defer allocator.free(wkv_b_name);
-        const wkv_biases: ?Array = blk_b: { const v = weights.get(wkv_b_name); if (v != null) { if (weights.fetchRemove(wkv_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const wkv_biases: ?Array = blk_b: {
+            const v = weights.get(wkv_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(wkv_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const wo_a_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_a.weight", .{idx_fmt});
         defer allocator.free(wo_a_name);
@@ -1271,10 +1383,22 @@ pub fn buildDSV4Model(
         if (weights.fetchRemove(wo_b_name)) |kv| allocator.free(kv.key);
         const wo_b_s_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_b.scales", .{idx_fmt});
         defer allocator.free(wo_b_s_name);
-        const wo_b_scales: ?Array = blk_s: { const v = weights.get(wo_b_s_name); if (v != null) { if (weights.fetchRemove(wo_b_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const wo_b_scales: ?Array = blk_s: {
+            const v = weights.get(wo_b_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(wo_b_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const wo_b_b_name = try std.fmt.allocPrint(allocator, "{s}attn.wo_b.biases", .{idx_fmt});
         defer allocator.free(wo_b_b_name);
-        const wo_b_biases: ?Array = blk_b: { const v = weights.get(wo_b_b_name); if (v != null) { if (weights.fetchRemove(wo_b_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const wo_b_biases: ?Array = blk_b: {
+            const v = weights.get(wo_b_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(wo_b_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         // Attention norms
         const q_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.q_norm.weight", .{idx_fmt});
@@ -1545,11 +1669,11 @@ pub fn buildDSV4Model(
         }
 
         const is_hash = i < config.num_hash_layers;
-        
+
         // Build smelt_mask - auto-detect available experts if not explicitly using smelt
         var smelt_mask: []bool = undefined;
         var smelt_mask_owned: bool = false;
-        
+
         if (smelt.enabled and smelt.load_mode == .preload) {
             // Preload mode: create smelt_mask to restrict router to loaded experts
             smelt_mask = try smelt.buildMask(allocator, n_routed_experts);
@@ -1570,7 +1694,7 @@ pub fn buildDSV4Model(
             smelt_mask = try allocator.alloc(bool, n_routed_experts);
             smelt_mask_owned = true;
             @memset(smelt_mask, false);
-            
+
             var n_available: usize = 0;
             for (0..n_routed_experts) |e| {
                 const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
@@ -1580,16 +1704,16 @@ pub fn buildDSV4Model(
                     n_available += 1;
                 }
             }
-            
+
             if (n_available < n_routed_experts and n_available > 0) {
                 std.log.warn("⚠️  Layer {d}: Partial expert model detected: {d}/{d} experts available", .{ i, n_available, n_routed_experts });
                 std.log.warn("Auto-enabling smelt mode for this layer.", .{});
             }
         }
-        
+
         // Don't defer free - gate takes ownership of smelt_mask
         // defer if (smelt_mask_owned) allocator.free(smelt_mask);
-        
+
         const gate = deepseek_v4.DSV4Gate{
             .ctx = ctx,
             .weight = gate_weight,
@@ -1623,24 +1747,60 @@ pub fn buildDSV4Model(
         // Load shared expert quantized scales/biases
         const se_w1_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w1.scales", .{idx_fmt});
         defer allocator.free(se_w1_s_name);
-        const se_w1_scales: ?Array = blk_s: { const v = weights.get(se_w1_s_name); if (v != null) { if (weights.fetchRemove(se_w1_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w1_scales: ?Array = blk_s: {
+            const v = weights.get(se_w1_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w1_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const se_w1_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w1.biases", .{idx_fmt});
         defer allocator.free(se_w1_b_name);
-        const se_w1_biases: ?Array = blk_b: { const v = weights.get(se_w1_b_name); if (v != null) { if (weights.fetchRemove(se_w1_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const se_w1_biases: ?Array = blk_b: {
+            const v = weights.get(se_w1_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w1_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const se_w3_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w3.scales", .{idx_fmt});
         defer allocator.free(se_w3_s_name);
-        const se_w3_scales: ?Array = blk_s: { const v = weights.get(se_w3_s_name); if (v != null) { if (weights.fetchRemove(se_w3_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w3_scales: ?Array = blk_s: {
+            const v = weights.get(se_w3_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w3_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const se_w3_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w3.biases", .{idx_fmt});
         defer allocator.free(se_w3_b_name);
-        const se_w3_biases: ?Array = blk_b: { const v = weights.get(se_w3_b_name); if (v != null) { if (weights.fetchRemove(se_w3_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const se_w3_biases: ?Array = blk_b: {
+            const v = weights.get(se_w3_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w3_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const se_w2_s_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w2.scales", .{idx_fmt});
         defer allocator.free(se_w2_s_name);
-        const se_w2_scales: ?Array = blk_s: { const v = weights.get(se_w2_s_name); if (v != null) { if (weights.fetchRemove(se_w2_s_name)) |kv2| allocator.free(kv2.key); } break :blk_s v; };
+        const se_w2_scales: ?Array = blk_s: {
+            const v = weights.get(se_w2_s_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w2_s_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_s v;
+        };
         const se_w2_b_name = try std.fmt.allocPrint(allocator, "{s}ffn.shared_experts.w2.biases", .{idx_fmt});
         defer allocator.free(se_w2_b_name);
-        const se_w2_biases: ?Array = blk_b: { const v = weights.get(se_w2_b_name); if (v != null) { if (weights.fetchRemove(se_w2_b_name)) |kv2| allocator.free(kv2.key); } break :blk_b v; };
+        const se_w2_biases: ?Array = blk_b: {
+            const v = weights.get(se_w2_b_name);
+            if (v != null) {
+                if (weights.fetchRemove(se_w2_b_name)) |kv2| allocator.free(kv2.key);
+            }
+            break :blk_b v;
+        };
 
         const shared_expert = deepseek_v4.DSV4Expert{
             .ctx = ctx,
@@ -1702,7 +1862,7 @@ pub fn buildDSV4Model(
                         // No expert weights at all — shared-expert-only mode
                         // Create a minimal dummy SwitchGLU (won't be called in forward)
                         var dummy_raw = c.c.mlx_array_new();
-                        const dummy_shape = [_]i32{1, 1, 1};
+                        const dummy_shape = [_]i32{ 1, 1, 1 };
                         try c.check(c.c.mlx_zeros(&dummy_raw, &dummy_shape, 3, c.c.MLX_FLOAT32, ctx.stream.inner));
                         const dummy = Array.fromHandle(dummy_raw);
                         break :blk deepseek_v4.DSV4SwitchGLU{
@@ -1734,11 +1894,11 @@ pub fn buildDSV4Model(
                 } else {
                     // Individual experts — stack into fused format
                     // This handles checkpoints with experts.{e}.w1.weight format
-                    
+
                     // First pass: detect which experts are actually available
                     var available_experts = std.ArrayList(usize).empty;
                     defer available_experts.deinit(allocator);
-                    
+
                     for (0..n_routed_experts) |e| {
                         const ew1_name = try std.fmt.allocPrint(allocator, "{s}ffn.experts.{d}.w1.weight", .{ idx_fmt, e });
                         defer allocator.free(ew1_name);
@@ -1746,15 +1906,15 @@ pub fn buildDSV4Model(
                             try available_experts.append(allocator, e);
                         }
                     }
-                    
+
                     const n_available = available_experts.items.len;
-                    
+
                     // If no experts or only partial experts, auto-enable smelt mode
                     if (n_available == 0) {
                         std.log.warn("⚠️  No expert weights found in model files", .{});
                         std.log.warn("This model may be shared-expert-only or incorrectly formatted.", .{});
                         // Continue with dummy SwitchGLU (already handled above)
-                        const dummy = try creation.zeros(ctx, &[_]i32{1, 1, 1}, .float32);
+                        const dummy = try creation.zeros(ctx, &[_]i32{ 1, 1, 1 }, .float32);
                         break :blk deepseek_v4.DSV4SwitchGLU{
                             .ctx = ctx,
                             .gate_proj = dummy,
@@ -1774,13 +1934,13 @@ pub fn buildDSV4Model(
                             .sort_threshold = 8,
                         };
                     }
-                    
+
                     if (n_available < n_routed_experts) {
                         std.log.warn("⚠️  Partial expert model detected: {d}/{d} experts available", .{ n_available, n_routed_experts });
                         std.log.warn("Auto-enabling smelt mode for partial expert loading.", .{});
                         std.log.warn("💡 Tip: Use --smelt flag explicitly to suppress this warning.", .{});
                     }
-                    
+
                     var gate_list = try allocator.alloc(Array, n_available);
                     defer allocator.free(gate_list);
                     var up_list = try allocator.alloc(Array, n_available);
@@ -1873,9 +2033,15 @@ pub fn buildDSV4Model(
                         gate_biases = weights.get(gate_biases_name);
                         up_biases = weights.get(up_biases_name);
                         down_biases = weights.get(down_biases_name);
-                        if (gate_biases != null) { if (weights.fetchRemove(gate_biases_name)) |kv| allocator.free(kv.key); }
-                        if (up_biases != null) { if (weights.fetchRemove(up_biases_name)) |kv| allocator.free(kv.key); }
-                        if (down_biases != null) { if (weights.fetchRemove(down_biases_name)) |kv| allocator.free(kv.key); }
+                        if (gate_biases != null) {
+                            if (weights.fetchRemove(gate_biases_name)) |kv| allocator.free(kv.key);
+                        }
+                        if (up_biases != null) {
+                            if (weights.fetchRemove(up_biases_name)) |kv| allocator.free(kv.key);
+                        }
+                        if (down_biases != null) {
+                            if (weights.fetchRemove(down_biases_name)) |kv| allocator.free(kv.key);
+                        }
                     }
 
                     // Expert weights always use mxfp4 (group_size=32, no biases)
