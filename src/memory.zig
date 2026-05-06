@@ -331,7 +331,6 @@ test "enforceMemoryLimit: attempts pool eviction when over limit" {
     try std.testing.expectError(MemoryError.MemoryLimitExceeded, result);
 }
 
-
 // ------------------------------------------------------------------
 // autoMaxKvSize tests (R24.1, R24.2, R24.3, R24.4)
 // ------------------------------------------------------------------

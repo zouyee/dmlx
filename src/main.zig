@@ -1,17 +1,18 @@
-/// MLX-Zig CLI tool.
+/// DMLX CLI tool.
 ///
 /// Commands:
-///   mlx-zig chat --model <path> --prompt "Hello"
-///   mlx-zig serve --model <path> --port 8080
-///   mlx-zig server --model <path> --port 8080  (alias for serve)
-///   mlx-zig benchmark --model <path>
-///   mlx-zig quantize --model <path> --output <path> --bits 4
-///   mlx-zig convert --from gguf --to safetensors --input model.gguf --output model.safetensors
-///   mlx-zig lora-train --model <path> --data dataset.jsonl --output adapter.safetensors
+///   dmlx chat --model <path> --prompt "Hello"
+///   dmlx serve --model <path> --port 8080
+///   dmlx server --model <path> --port 8080  (alias for serve)
+///   dmlx benchmark --model <path>
+///   dmlx quantize --model <path> --output <path> --bits 4
+///   dmlx convert --from gguf --to safetensors --input model.gguf --output model.safetensors
+///   dmlx lora-train --model <path> --data dataset.jsonl --output adapter.safetensors
 const std = @import("std");
 const root = @import("root.zig");
 const c = @import("c.zig");
 const memory = @import("memory.zig");
+const safetensors_reader = @import("io/safetensors_reader.zig");
 const quantize_mod = @import("quantize.zig");
 
 const Array = root.Array;
@@ -30,6 +31,12 @@ const ChatCommand = struct {
     top_p: f32 = 1.0,
     seed: ?u64 = null,
     max_kv_size: memory.MaxKvSize = .auto,
+    smelt: bool = false,
+    smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload", // "preload" or "stream"
+    smelt_cache_mb: usize = 4096, // Expert cache size in MB (stream mode)
+    distributed: bool = false,
+    raw: bool = false, // Skip chat template, use raw prompt completion
 };
 
 const ServerCommand = struct {
@@ -48,6 +55,10 @@ const ServerCommand = struct {
     kv_cold_dir: ?[]const u8 = null,
     prompt_cache_file: ?[]const u8 = null,
     speculative_ngram: ?usize = null,
+    smelt: bool = false,
+    smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload", // "preload" or "stream"
+    distributed: bool = false,
 };
 
 const ConvertCommand = struct {
@@ -91,8 +102,24 @@ const EvaluateCommand = struct {
     context_size: usize = 1024,
 };
 
+const JangConvertCommand = struct {
+    model_path: []const u8,
+    output_path: []const u8,
+    profile: []const u8,
+};
+
+const ImageGenCommand = struct {
+    model_path: []const u8,
+    prompt: []const u8,
+    height: usize = 512,
+    width: usize = 512,
+    steps: usize = 20,
+    output_path: []const u8,
+};
+
 pub fn main(init: std.process.Init) !void {
-    const allocator = init.gpa;
+    // Use c_allocator for large model loading (DebugAllocator has too much overhead)
+    const allocator = std.heap.c_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -159,6 +186,9 @@ pub fn main(init: std.process.Init) !void {
             .kv_cold_dir = cmd.kv_cold_dir,
             .prompt_cache_file = cmd.prompt_cache_file,
             .speculative_ngram = cmd.speculative_ngram,
+            .smelt = cmd.smelt,
+            .smelt_experts = cmd.smelt_experts,
+            .smelt_strategy = cmd.smelt_strategy,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -179,8 +209,24 @@ pub fn main(init: std.process.Init) !void {
             allocator.free(cmd.data_path);
         }
         try runEvaluate(allocator, init.io, cmd);
+    } else if (std.mem.eql(u8, command, "jang-convert")) {
+        const cmd = try parseJangConvertArgs(allocator, args[2..]);
+        defer {
+            allocator.free(cmd.model_path);
+            allocator.free(cmd.output_path);
+            allocator.free(cmd.profile);
+        }
+        try runJangConvert(allocator, init.io, cmd);
+    } else if (std.mem.eql(u8, command, "image-gen")) {
+        const cmd = try parseImageGenArgs(allocator, args[2..]);
+        defer {
+            allocator.free(cmd.model_path);
+            allocator.free(cmd.prompt);
+            allocator.free(cmd.output_path);
+        }
+        try runImageGen(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "version")) {
-        std.debug.print("mlx-zig {s}\n", .{root.version});
+        std.debug.print("dmlx {s}\n", .{root.version});
     } else {
         std.log.err("Unknown command: {s}", .{command});
         printUsage();
@@ -189,10 +235,10 @@ pub fn main(init: std.process.Init) !void {
 }
 
 fn printUsage() void {
-    std.debug.print("mlx-zig {s}\n\n", .{root.version});
+    std.debug.print("dmlx {s}\n\n", .{root.version});
     std.debug.print(
         \\Usage:
-        \\  mlx-zig chat [options]
+        \\  dmlx chat [options]
         \\    --model <path>      Path to model directory
         \\    --prompt <text>     Prompt text
         \\    --max-tokens <n>    Maximum tokens (default: 256)
@@ -202,7 +248,7 @@ fn printUsage() void {
         \\    --seed <n>          Random seed for sampling (optional)
         \\    --max-kv-size <v>   KV cache size: "auto" (default) or integer
         \\
-        \\  mlx-zig serve [options]  (alias: server)
+        \\  dmlx serve [options]  (alias: server)
         \\    --model <path>      Path to model directory
         \\    --port <n>          HTTP port (default: 8080)
         \\    --max-tokens <n>    Maximum tokens per request (default: 256)
@@ -217,34 +263,39 @@ fn printUsage() void {
         \\    --kv-cold-dir <p>   SSD cold-tier directory (required when --kv-tier ssd)
         \\    --prompt-cache-file <path>  Prompt cache file for KV state persistence
         \\    --speculative-ngram <n>     Enable speculative decoding with n-gram size
+        \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
+        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
+        \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
+        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
+        \\    --distributed               Enable distributed tensor parallelism
         \\
-        \\  mlx-zig benchmark [options]
+        \\  dmlx benchmark [options]
         \\    --model <path>      Path to model directory
         \\    --input-tokens <n>  Number of input tokens (default: 32)
         \\    --output-tokens <n> Number of output tokens (default: 128)
         \\    --warmup-runs <n>   Warmup iterations (default: 1)
         \\    --num-runs <n>      Timed iterations (default: 3)
         \\
-        \\  mlx-zig quantize [options]
+        \\  dmlx quantize [options]
         \\    --model <path>      Path to model directory
         \\    --output <path>     Output path for quantized model
         \\    --bits <n>          Quantization bits: 4 or 8 (default: 4)
         \\    --group-size <n>    Quantization group size (default: 64)
         \\
-        \\  mlx-zig convert [options]
+        \\  dmlx convert [options]
         \\    --from <format>     Source format
         \\    --to <format>       Target format
         \\    --input <path>      Input file
         \\    --output <path>     Output file
         \\
-        \\  mlx-zig evaluate [options]
+        \\  dmlx evaluate [options]
         \\    --model <path>      Path to model directory
         \\    --data <path>       Path to evaluation text file
         \\    --max-tokens <n>    Maximum tokens to evaluate (default: all)
         \\    --stride <n>        Sliding window stride (default: 512)
         \\    --context-size <n>  Context window size (default: 1024)
         \\
-        \\  mlx-zig lora-train [options]
+        \\  dmlx lora-train [options]
         \\    --model <path>      Base model directory
         \\    --data <path>       Training dataset (JSONL)
         \\    --output <path>     Output adapter path
@@ -253,7 +304,20 @@ fn printUsage() void {
         \\    --lr <lr>           Learning rate (default: 1e-4)
         \\    --epochs <n>        Number of epochs (default: 3)
         \\
-        \\  mlx-zig version
+        \\  dmlx jang-convert [options]
+        \\    --model <path>      Path to FP16 model directory
+        \\    --output <path>     Output path for JANG quantized model
+        \\    --profile <name>    JANG profile: 2M|2L|3M|4M|6M
+        \\
+        \\  dmlx image-gen [options]
+        \\    --model <path>      Path to Flux model directory
+        \\    --prompt <text>     Text prompt for image generation
+        \\    --height <n>        Image height (default: 512)
+        \\    --width <n>         Image width (default: 512)
+        \\    --steps <n>         Denoising steps (default: 20)
+        \\    --output <path>     Output image path
+        \\
+        \\  dmlx version
         \\    Show version information
         \\
     , .{});
@@ -325,6 +389,18 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.prompt_cache_file = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--speculative-ngram")) {
             cmd.speculative_ngram = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--smelt")) {
+            cmd.smelt = true;
+            // Boolean flag: don't consume a value, step back so next iteration
+            // processes the same value as a flag (or adjust loop logic)
+            i -= 1;
+        } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
+            cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
+            cmd.smelt_strategy = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--distributed")) {
+            cmd.distributed = true;
+            i -= 1;
         }
     }
 
@@ -363,6 +439,21 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.system_prompt = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--max-kv-size")) {
             cmd.max_kv_size = memory.parseMaxKvSize(value) catch return error.InvalidArgument;
+        } else if (std.mem.eql(u8, flag, "--smelt")) {
+            cmd.smelt = true;
+            i -= 1;
+        } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
+            cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
+            cmd.smelt_strategy = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
+            cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--distributed")) {
+            cmd.distributed = true;
+            i -= 1;
+        } else if (std.mem.eql(u8, flag, "--raw")) {
+            cmd.raw = true;
+            i -= 1;
         }
     }
 
@@ -379,10 +470,10 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
 fn runChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand) !void {
     std.log.info("Loading model from {s}...", .{cmd.model_path});
 
-    const ctx = EagerContext.init(allocator);
+    // Use GPU stream for inference — gather_qmm with mxfp4 is ~20x faster on GPU
+    const stream = c.c.mlx_default_gpu_stream_new();
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
     defer ctx.deinit();
-    const stream = c.c.mlx_default_cpu_stream_new();
-    defer _ = c.c.mlx_stream_free(stream);
 
     // 1. Load config and detect model type
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "config.json" });
@@ -591,6 +682,13 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
 
+    std.log.info("Prompt text: '{s}'", .{prompt_text});
+    std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    std.log.info("Config: vocab={d}, layers={d}, heads={d}, kv_heads={d}, hidden={d}, head_dim={d}", .{
+        config.vocab_size,          config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.hidden_size,       config.getHeadDim(),
+    });
+
     const prompt_arr = c.c.mlx_array_new_data(
         prompt_tokens.ptr,
         &[_]c_int{ 1, @intCast(prompt_tokens.len) },
@@ -623,6 +721,25 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
 fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx: EagerContext, stream: c.c.mlx_stream, config_content: []const u8) !void {
     const ds_config = try root.deepseek_v4_loader.parseDSV4Config(allocator, config_content);
 
+    // 1b. Configure MLX memory limits for large MoE models
+    // Set wired_limit so MLX knows how much GPU memory it can use, enabling automatic eviction
+    {
+        const sysctl_c = @cImport(@cInclude("sys/sysctl.h"));
+        var memsize: u64 = 0;
+        var len: usize = @sizeOf(u64);
+        var mib = [_]c_int{ sysctl_c.CTL_HW, sysctl_c.HW_MEMSIZE };
+        _ = sysctl_c.sysctl(&mib, 2, &memsize, &len, null, 0);
+        // Use ~85% of system memory as wired limit — maximize GPU cache for large models
+        const limit: usize = @intCast(memsize * 85 / 100);
+        var old_wired: usize = 0;
+        _ = c.c.mlx_set_wired_limit(&old_wired, limit);
+        // Cache limit at ~80% — keep materialized weights in GPU memory between forward passes
+        var old_cache: usize = 0;
+        const cache_lim: usize = @intCast(memsize * 4 / 5);
+        _ = c.c.mlx_set_cache_limit(&old_cache, cache_lim);
+        std.log.info("MLX memory: wired_limit={d}MB cache_limit={d}MB (system={d}MB)", .{ limit / 1024 / 1024, cache_lim / 1024 / 1024, memsize / 1024 / 1024 });
+    }
+
     // 2. Load tokenizer
     const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "tokenizer.json" });
     defer allocator.free(tokenizer_path);
@@ -632,7 +749,28 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     const tokenizer = tokenizer_backend.asStrategy();
 
     // 3. Load model weights (sharded or single-file)
-    var weights = try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream);
+    const smelt_strategy: root.deepseek_v4_loader.SmeltConfig.LoadMode = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
+        .stream
+    else
+        .preload;
+
+    const smelt_config = root.deepseek_v4_loader.SmeltConfig{
+        .enabled = cmd.smelt,
+        .load_fraction = cmd.smelt_experts,
+        .load_mode = smelt_strategy,
+    };
+
+    // In stream mode, use selective loading via TensorIndex + mmap.
+    // Only reads shard headers (~few KB each), then loads backbone weights
+    // via mmap — skipping all expert weights entirely.
+    // This reduces disk I/O from ~141GB (all shards) to ~4.3GB (backbone only).
+    // ~3x faster than mlx_load_safetensors which reads entire shard files.
+    const use_selective = cmd.smelt and smelt_strategy == .stream;
+
+    var weights = if (use_selective)
+        try root.deepseek_v4_loader.loadWeightsSelective(allocator, cmd.model_path, smelt_config)
+    else
+        try root.deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, cmd.model_path, ctx, stream, smelt_config);
     defer {
         var it = weights.iterator();
         while (it.next()) |entry| {
@@ -643,26 +781,175 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     // 4. Build model
-    var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream);
-    defer model.deinit();
+    var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
+    // Don't defer model cleanup - we'll do it manually to control order
 
-    // 5. Format prompt with chat template
+    // 4b. Wire expert streaming when smelt is enabled (loads experts from SSD on demand)
+    var expert_sp: ?*root.expert_stream.ExpertStreamProvider = null;
+    var tensor_index: ?*safetensors_reader.TensorIndex = null;
+    defer if (expert_sp) |sp| {
+        sp.deinit();
+        allocator.destroy(sp);
+    };
+    defer if (tensor_index) |idx| {
+        idx.deinit();
+        allocator.destroy(idx);
+    };
+
+    if (cmd.smelt and !model.hasExpertsLoaded()) {
+        // Build tensor index for random-access reading
+        const idx = try allocator.create(safetensors_reader.TensorIndex);
+        idx.* = try safetensors_reader.buildIndexFromDirectory(allocator, cmd.model_path);
+        tensor_index = idx;
+
+        // Build per-layer metadata
+        const num_layers = ds_config.num_hidden_layers;
+        var layer_meta = try allocator.alloc(root.expert_stream.LayerExpertMeta, num_layers);
+        for (0..num_layers) |i| {
+            // Compute expert row bytes from tensor index
+            const gate_name = try std.fmt.allocPrint(allocator, "model.layers.{d}.mlp.experts.gate_proj.weight", .{i});
+            // Try fused switch_mlp format first
+            const fused_gate_name = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.weight", .{i});
+            defer allocator.free(gate_name);
+
+            const actual_gate_name = if (idx.entries.contains(fused_gate_name)) fused_gate_name else gate_name;
+            defer allocator.free(fused_gate_name);
+            _ = actual_gate_name;
+
+            // Use HF naming convention for switch_mlp
+            const hf_gate = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.weight", .{i});
+            const hf_up = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.weight", .{i});
+            const hf_down = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.weight", .{i});
+            const hf_gate_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.scales", .{i});
+            const hf_up_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.scales", .{i});
+            const hf_down_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.scales", .{i});
+
+            // Calculate row bytes from tensor info
+            var row_bytes: usize = 0;
+            var scale_row_bytes: usize = 0;
+            if (idx.entries.get(hf_gate)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+            if (idx.entries.get(hf_gate_s)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                scale_row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+
+            layer_meta[i] = .{
+                .gate_proj_name = hf_gate,
+                .up_proj_name = hf_up,
+                .down_proj_name = hf_down,
+                .gate_scales_name = if (idx.entries.contains(hf_gate_s)) hf_gate_s else blk: {
+                    allocator.free(hf_gate_s);
+                    break :blk null;
+                },
+                .up_scales_name = if (idx.entries.contains(hf_up_s)) hf_up_s else blk: {
+                    allocator.free(hf_up_s);
+                    break :blk null;
+                },
+                .down_scales_name = if (idx.entries.contains(hf_down_s)) hf_down_s else blk: {
+                    allocator.free(hf_down_s);
+                    break :blk null;
+                },
+                .expert_row_bytes = row_bytes,
+                .expert_scale_row_bytes = scale_row_bytes,
+                .n_experts = ds_config.n_routed_experts,
+            };
+        }
+
+        const sp = try allocator.create(root.expert_stream.ExpertStreamProvider);
+
+        // Determine strategy
+        const strategy: root.expert_stream.ExpertLoadStrategy = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
+            .stream
+        else
+            .preload;
+
+        // Calculate number of experts to load (for preload mode)
+        const n_experts_to_load = @as(usize, @intFromFloat(@as(f32, @floatFromInt(ds_config.n_routed_experts)) * cmd.smelt_experts));
+        var expert_ids = try allocator.alloc(u32, n_experts_to_load);
+        defer allocator.free(expert_ids);
+        for (0..n_experts_to_load) |i| {
+            expert_ids[i] = @intCast(i);
+        }
+
+        std.log.info("Expert strategy: {s}, loading {d}/{d} experts ({d:.1}%)", .{
+            @tagName(strategy),
+            n_experts_to_load,
+            ds_config.n_routed_experts,
+            cmd.smelt_experts * 100.0,
+        });
+
+        sp.* = try root.expert_stream.ExpertStreamProvider.initWithStrategy(
+            allocator,
+            ctx,
+            idx,
+            strategy,
+            expert_ids,
+            layer_meta,
+            true, // switch_mlp is always quantized in 4-bit models
+            32, // mxfp4 uses group_size=32
+            4, // 4-bit quantization
+            "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
+            ds_config.swiglu_limit,
+            cmd.smelt_cache_mb,
+        );
+        expert_sp = sp;
+
+        // Wire stream provider into each MoE layer
+        model.setExpertStreamProvider(sp);
+        std.log.info("Expert streaming enabled: loading experts from SSD on demand", .{});
+    }
+
+    // 5. Format prompt with chat template (or raw mode)
     var chat_template = root.tokenizer.ChatTemplate.initDeepSeek(allocator);
 
-    var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
-    defer messages.deinit(allocator);
+    var prompt_tokens: []u32 = undefined;
 
-    if (cmd.system_prompt.len > 0) {
-        try messages.append(allocator, .{ .role = "system", .content = cmd.system_prompt });
+    if (cmd.raw) {
+        // Raw mode: tokenize prompt directly without chat template
+        // Add BOS token (0 for DeepSeek V4 Flash) at the start
+        const raw_tokens = try tokenizer.encode(cmd.prompt, true, allocator);
+        // raw_tokens already includes BOS from add_special_tokens=true
+        prompt_tokens = raw_tokens;
+    } else {
+        var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
+        defer messages.deinit(allocator);
+
+        if (cmd.system_prompt.len > 0) {
+            try messages.append(allocator, .{ .role = "system", .content = cmd.system_prompt });
+        }
+        try messages.append(allocator, .{ .role = "user", .content = cmd.prompt });
+
+        const prompt_text = try chat_template.apply(messages.items, true);
+        defer allocator.free(prompt_text);
+        prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     }
-    try messages.append(allocator, .{ .role = "user", .content = cmd.prompt });
-
-    const prompt_text = try chat_template.apply(messages.items, true);
-    defer allocator.free(prompt_text);
-
-    // 6. Encode (no special tokens added by tokenizer, template handles them)
-    const prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
+
+    // Validate prompt format: first token should be BOS (0 for DeepSeek-V4-Flash)
+    if (prompt_tokens.len == 0) {
+        std.log.err("Empty prompt after tokenization", .{});
+        return error.InvalidPromptFormat;
+    }
+
+    const expected_bos: u32 = 0; // <｜begin▁of▁sentence｜> token ID
+    if (prompt_tokens[0] != expected_bos) {
+        std.log.err("❌ BOS token mismatch! Expected {d}, got {d}", .{ expected_bos, prompt_tokens[0] });
+        std.log.err("First 10 tokens: {any}", .{prompt_tokens[0..@min(prompt_tokens.len, 10)]});
+        std.log.err("This indicates the chat template format doesn't match the tokenizer.", .{});
+        std.log.err("DeepSeek V4 Flash uses: <｜begin▁of▁sentence｜> (token ID 0)", .{});
+        return error.InvalidPromptFormat;
+    }
+
+    if (cmd.raw) {
+        std.log.info("✅ Raw mode: prompt starts with BOS token {d}", .{expected_bos});
+        std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    } else {
+        std.log.info("✅ Prompt correctly formatted with BOS token {d}", .{expected_bos});
+        std.log.info("Prompt tokens ({d}): {any}", .{ prompt_tokens.len, prompt_tokens[0..@min(prompt_tokens.len, 20)] });
+    }
 
     const prompt_arr = c.c.mlx_array_new_data(
         prompt_tokens.ptr,
@@ -680,38 +967,36 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     sampler_config.top_k = cmd.top_k;
     sampler_config.top_p = cmd.top_p;
 
-    // Create per-layer KV caches for DeepSeek V4
-    var caches = try allocator.alloc(root.kvcache.KVCacheStrategy, ds_config.num_hidden_layers);
+    // Create per-layer KV caches for DeepSeek V4 (matching mlx-lm make_cache)
+    const caches = try root.deepseek_v4_loader.makeV4Caches(allocator, &ds_config, stream);
     defer {
         for (caches) |cache| {
             cache.deinit(allocator);
         }
         allocator.free(caches);
     }
-    const cache_max_seq = 8192; // Practical limit for inference
-    for (0..ds_config.num_hidden_layers) |i| {
-        const layer_config = root.kvcache.LayerConfig{
-            .batch_size = 1,
-            .num_heads = ds_config.num_attention_heads,
-            .num_kv_heads = ds_config.num_key_value_heads,
-            .head_dim = ds_config.head_dim,
-            .max_seq_len = cache_max_seq,
-            .dtype = .float32,
-        };
-        caches[i] = try root.kvcache.standard.createStandard(allocator, layer_config, stream);
+
+    std.debug.print("Starting generation...\n", .{});
+    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
+    std.log.info("DEBUG: model.generate returned {d} tokens", .{new_tokens.len});
+    defer allocator.free(new_tokens);
+
+    // Validate generated tokens
+    if (new_tokens.len == 0) {
+        std.log.warn("No tokens generated", .{});
+        return;
     }
 
-    const all_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
-    defer allocator.free(all_tokens);
-
-    // Extract only newly generated tokens
-    const new_tokens = if (all_tokens.len > prompt_tokens.len) all_tokens[prompt_tokens.len..] else all_tokens;
+    std.log.info("Generated {d} tokens: {any}", .{ new_tokens.len, new_tokens[0..@min(new_tokens.len, 10)] });
 
     // 8. Decode and print
     const output_text = try tokenizer.decode(new_tokens, allocator);
     defer allocator.free(output_text);
 
     std.debug.print("\n{s}\n", .{output_text});
+
+    // Manual cleanup to control order
+    model.deinit();
 }
 
 // ------------------------------------------------------------------
@@ -779,7 +1064,7 @@ fn runBenchmark(allocator: std.mem.Allocator, io: std.Io, cmd: BenchmarkCommand)
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     // 3. Create KV caches
@@ -962,7 +1247,7 @@ fn runQuantize(allocator: std.mem.Allocator, io: std.Io, cmd: QuantizeCommand) !
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     std.log.info("Model loaded ({s}). Quantization to {d}-bit with group_size={d} would be applied to weights.", .{
@@ -1043,7 +1328,7 @@ fn runEvaluate(allocator: std.mem.Allocator, io: std.Io, cmd: EvaluateCommand) !
         return error.UnsupportedArchitecture;
     };
 
-    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream);
+    var model_vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{});
     defer model_vtable.deinit(model_vtable.ptr, allocator);
 
     // 3. Load tokenizer
@@ -1140,9 +1425,9 @@ fn runConvert(allocator: std.mem.Allocator, io: std.Io, cmd: ConvertCommand) !vo
     // Delegate to mlx_lm.convert for HuggingFace model conversion
     const result = std.process.run(allocator, io, .{
         .argv = &.{
-            "python3", "-m", "mlx_lm.convert",
-            "--hf-path", cmd.input_path,
-            "--mlx-path", cmd.output_path,
+            "python3",       "-m",           "mlx_lm.convert",
+            "--hf-path",     cmd.input_path, "--mlx-path",
+            cmd.output_path,
         },
     }) catch |err| {
         std.log.err("Failed to run mlx_lm.convert: {s}. Ensure mlx-lm is installed (`pip install mlx-lm`).", .{@errorName(err)});
@@ -1356,4 +1641,124 @@ fn runLoraTrain(allocator: std.mem.Allocator, io: std.Io, cmd: LoraTrainCommand)
     }
 
     std.log.info("Training complete. Output saved to {s}", .{cmd.output_path});
+}
+
+// ------------------------------------------------------------------
+// JANG Convert Command
+// ------------------------------------------------------------------
+
+fn parseJangConvertArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !JangConvertCommand {
+    var cmd = JangConvertCommand{
+        .model_path = "",
+        .output_path = "",
+        .profile = "",
+    };
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 >= args.len) break;
+        const flag = args[i];
+        const value = args[i + 1];
+
+        if (std.mem.eql(u8, flag, "--model")) {
+            cmd.model_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--output")) {
+            cmd.output_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--profile")) {
+            cmd.profile = try allocator.dupe(u8, value);
+        }
+    }
+
+    if (cmd.model_path.len == 0 or cmd.output_path.len == 0 or cmd.profile.len == 0) {
+        return error.MissingRequiredArgument;
+    }
+
+    return cmd;
+}
+
+fn parseJangProfile(profile_str: []const u8) !root.jang_quantizer.JangProfile {
+    if (std.mem.eql(u8, profile_str, "2M")) return .JANG_2M;
+    if (std.mem.eql(u8, profile_str, "2L")) return .JANG_2L;
+    if (std.mem.eql(u8, profile_str, "3M")) return .JANG_3M;
+    if (std.mem.eql(u8, profile_str, "4M")) return .JANG_4M;
+    if (std.mem.eql(u8, profile_str, "6M")) return .JANG_6M;
+    return error.InvalidArgument;
+}
+
+fn runJangConvert(allocator: std.mem.Allocator, io: std.Io, cmd: JangConvertCommand) !void {
+    _ = io;
+    const profile = try parseJangProfile(cmd.profile);
+
+    std.log.info("JANG conversion: model={s} output={s} profile={s}", .{
+        cmd.model_path, cmd.output_path, cmd.profile,
+    });
+
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    try root.jang_quantizer.quantizeModel(allocator, cmd.model_path, cmd.output_path, profile, null, ctx);
+    std.log.info("JANG conversion complete.", .{});
+}
+
+// ------------------------------------------------------------------
+// Image Generation Command
+// ------------------------------------------------------------------
+
+fn parseImageGenArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !ImageGenCommand {
+    var cmd = ImageGenCommand{
+        .model_path = "",
+        .prompt = "",
+        .output_path = "",
+    };
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 2) {
+        if (i + 1 >= args.len) break;
+        const flag = args[i];
+        const value = args[i + 1];
+
+        if (std.mem.eql(u8, flag, "--model")) {
+            cmd.model_path = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--prompt")) {
+            cmd.prompt = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--height")) {
+            cmd.height = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--width")) {
+            cmd.width = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--steps")) {
+            cmd.steps = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--output")) {
+            cmd.output_path = try allocator.dupe(u8, value);
+        }
+    }
+
+    if (cmd.model_path.len == 0 or cmd.prompt.len == 0 or cmd.output_path.len == 0) {
+        return error.MissingRequiredArgument;
+    }
+
+    return cmd;
+}
+
+fn runImageGen(allocator: std.mem.Allocator, io: std.Io, cmd: ImageGenCommand) !void {
+    _ = io;
+    std.log.info("Image generation: model={s} prompt=\"{s}\" height={d} width={d} steps={d} output={s}", .{
+        cmd.model_path, cmd.prompt, cmd.height, cmd.width, cmd.steps, cmd.output_path,
+    });
+
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    // Stub: use default Flux config; full integration would load from model_path
+    const config = root.diffusion_flux.FluxConfig{};
+    var pipeline = try root.diffusion_flux.FluxPipeline.init(allocator, config, ctx);
+    defer pipeline.deinit();
+
+    // Stub prompt embeddings (text encoder not yet integrated)
+    const prompt_embeds = try root.array.zeros(allocator, &[_]i32{ 1, 1, @intCast(config.hidden_size) }, .float32);
+    defer prompt_embeds.deinit();
+
+    const result = try pipeline.generate(ctx, prompt_embeds, cmd.height, cmd.width, cmd.steps);
+    defer result.deinit();
+
+    std.log.info("Image generation complete. Output would be saved to {s} (VAE decode stub).", .{cmd.output_path});
 }

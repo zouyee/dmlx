@@ -1,0 +1,5 @@
+# Performance baselines are machine-specific.
+# Each developer/machine generates their own baseline on first run.
+# To share a baseline across team, commit a specific file manually:
+#   git add -f baselines/performance_<hostname>_<model>.json
+*.json

@@ -1,50 +1,239 @@
-# MLX-Zig
+# dmlx — Run Frontier LLMs on Your Mac
 
-[**Quick Start**](#quick-start) | [**Installation**](#installation) | [**Architecture**](#architecture)
+[**How It Works**](#how-it-works-5-layer-memory-optimization) | [**Performance**](#real-world-performance) | [**Scenarios**](#application-scenarios) | [**Quick Start**](#quick-start) | [**Installation**](#installation) | [**Architecture**](#architecture)
 
-MLX-Zig provides Zig-native bindings for [Apple's MLX](https://github.com/ml-explore/mlx)
-machine learning framework, built on top of the official `mlx-c` C library.
+> **Run a 671B-parameter MoE model on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
+>
+> dmlx combines Apple's MLX Metal backend with five layers of memory optimization to make the
+> impossible possible — and wraps it in a single static Zig binary with an OpenAI-compatible API.
+
+---
+
+## Why dmlx?
+
+The DeepSeek V4 model is **671 billion parameters** across 256 routed experts. At full precision,
+its weights exceed **150 GB** — more than 3× the memory of a 48GB MacBook Pro. Even at 4-bit
+quantization (~40 GB), it won't fit without aggressive memory management.
+
+dmlx solves this through **five complementary layers of memory optimization**, plus a production-grade
+inference stack that makes frontier LLMs practical on consumer hardware.
+
+| Capability | mlx-lm (Python) | dmlx (Zig) |
+|-----------|-----------------|-----------------|
+| DeepSeek V4 on 48GB Mac | ❌ OOM (~40GB weights needed) | ✅ ~6GB via SMELT 15% |
+| DeepSeek V4 on 96GB+ Mac | ✅ (if RAM sufficient) | ✅ |
+| KV cache strategies | 1 (fixed) | 6 (runtime-switchable, incl. Tiered SSD) |
+| Max context on 48GB | Limited by RAM | 128K+ tokens (RAM+SSD) |
+| Deployment | Python + pip + venv (~500MB+) | Single static binary (~5-15MB) |
+| Deterministic latency | ❌ Python GC (10–100ms pauses) | ✅ Zero GC (sub-ms) |
+| Model architectures | 50+ | 8 (LLaMA, DeepSeek V4, Qwen2/3, Mistral, Gemma, GLM-4, Phi) |
+| iOS/macOS embedding | ❌ No Python runtime on iOS | ✅ C ABI → Swift |
+
+---
+
+## How It Works: 5-Layer Memory Optimization
+
+### Layer 1: MoE Expert Streaming → 138 GB → 10 GB
+
+DeepSeek V4 activates only **top-8 of 256 experts** per token. dmlx exploits this sparsity
+via `expert_stream.zig` (649 lines):
+
+- **On-demand loading**: Only active expert weights are loaded via `PartialTensorReader`
+- **LRU expert cache**: Frequently-used experts stay resident; cold ones are evicted
+- **Layer prefetching**: Next layer's experts are fetched during current layer computation
+- **Result**: Peak memory drops from ~138 GB (all experts) to ~10 GB (streaming only active ones)
+
+```
+Source: src/models/expert_stream.zig | src/models/moe_router.zig
+```
+
+### Layer 2: 4-bit Quantization + SMELT → 40 GB → 6 GB
+
+Six quantization formats (INT4/8, MXFP4, FP8 E4M3, TurboQuant) with the **SMELT system** for
+partial expert loading:
+
+| Mode | Experts Loaded | Memory | Latency Impact |
+|------|---------------|--------|----------------|
+| Full 4-bit | 256 (100%) | ~40 GB | Baseline |
+| SMELT 30% | ~77 | ~12 GB | +10–15% |
+| SMELT 15% | ~38 | **~6 GB** | +10–15% |
+
+SMELT auto-detects how many experts actually exist in the model files, loads only those, and
+applies a routing bias (`smelt_mask`) to prevent selecting unloaded experts. Missing experts
+fall back to streaming on-demand.
+
+```
+Source: docs/en/technical/4bit-smelt.md | docs/en/technical/smelt-flow.md
+```
+
+### Layer 3: MLA KV Cache Compression
+
+**Multi-head Latent Attention** (MLA) compresses the KV cache via low-rank projection:
+
+- **Before MLA**: KV cache = `2 × n_heads × head_dim` (huge for long contexts)
+- **After MLA**: KV cache = `2 × latent_dim` (dramatically smaller)
+- **FP8 storage**: Non-RoPE KV dimensions stored as FP8 (E4M3), further halving memory
+
+```
+Source: src/models/deepseek_v4.zig (MLA implementation, 3,091 lines)
+```
+
+### Layer 4: Six-Level KV Cache Strategy System
+
+Runtime-switchable strategies for any memory budget:
+
+| Strategy | Memory Profile | Best For |
+|----------|---------------|----------|
+| **Standard** | Full KV buffer | Short sequences, single request |
+| **Rotating** | Fixed window ring buffer | Ultra-long sequences (avoid OOM) |
+| **Quantized** | 4/8/16-bit KV compression | Memory-constrained scenarios |
+| **Paged** ⭐ | 32-token pages + CoW | Continuous batching (production default) |
+| **PagedQuantized** | Paged + Quantized combined | Extreme memory optimization |
+| **Tiered** | RAM hot + SSD cold + LRU | Ultra-long context (128K+) + multi-model |
+
+```
+Source: src/kvcache/paged.zig (1,152 lines) | src/kvcache/tiered.zig
+```
+
+### Layer 5: Zero-Copy Model Loading (TTFT Optimization)
+
+Eliminates unnecessary memory copies during model loading:
+
+| Phase | What | Before | After |
+|-------|------|--------|-------|
+| P0 | Binary index cache | 67s parsing 33 shards | ~1s mmap read |
+| P2 | Zero-copy weight loading | ~7 GB memcpy | 0 (direct mmap) |
+| P3 | Batched shard I/O | Random reads | Sequential OS readahead |
+
+Combined: model loading from **~137s → ~41–46s** (66–70% reduction).
+
+```
+Source: docs/en/technical/ttft-optimization.md
+```
+
+---
+
+## Real-World Performance
+
+**Hardware**: Apple M4 Pro, 48 GB unified memory
+**Model**: DeepSeek-V4-Flash-4bit, 33 shards (~150 GB raw, ~40 GB 4-bit)
+**Mode**: SMELT + stream, ExpertCache 4GB, temperature=0
+**Commit**: `7e72a7` (2026-05-05) — [benchmark log](docs/en/analysis/performance-benchmark.md)
+
+| Metric | Value |
+|--------|-------|
+| Prefill (token 1) | 370.5 ms |
+| Steady-state (tokens 3-10 avg) | 82.2 ms |
+| Throughput (steady-state) | **~12.2 tok/s** |
+| Memory (SMELT 15%) | ~6 GB weights + KV cache |
+| Max context (Paged + Tiered) | 128K+ tokens |
+| 7-prompt correctness | **7/7 PASS, 0 FAIL** |
+
+| Benchmark Trend | Initial (`a024bee`) | Current (`7e72a7`) | Improvement |
+|-----------------|---------------------|---------------------|-------------|
+| Prefill | 716ms | **370.5ms** | +48% |
+| Steady-state avg | ~125ms | **82.2ms** | +34% |
+| Throughput | ~8 tok/s | **~12.2 tok/s** | **+52%** |
+
+> **Why this matters**: mlx-lm cannot run DeepSeek V4 on 48GB Macs at all — it requires loading
+> all ~40GB of 4-bit weights simultaneously, causing OOM. dmlx's SMELT system runs the same
+> model with ~6GB of weights. Raw Metal compute is similar (same `mlx-c` backend), so on larger
+> Macs (96GB+) where mlx-lm can fit, performance is comparable.
+>
+> **dmlx's advantage is not raw speed — it's that the model runs at all on small Macs.**
+
+[→ Performance Dashboard](https://dmlx.ai/) | [→ Benchmarking Guide](docs/en/technical/benchmarks.md) | [→ Competitive Analysis](docs/en/analysis/competitive-advantages.md)
+
+---
+
+## Application Scenarios
+
+### 1. Local LLM Inference
+
+Run GPT-4-class intelligence entirely on-device. All computation happens on your Mac's Metal GPU
+via Apple's unified memory architecture — zero network egress, no API keys, no per-token pricing.
+
+### 2. Privacy-First Applications
+
+HIPAA, GDPR, and enterprise compliance: all data stays on-device. Air-gapped deployment supported.
+Your models, your data, your hardware — no third-party processors.
+
+### 3. Edge Deployment — Mac mini Inference Server
+
+Deploy a Mac mini as a private team inference server with OpenAI-compatible API:
+
+```bash
+dmlx server --model ~/models/deepseek-v4-flash-4bit \
+  --port 8080 --kv-strategy paged
+
+# Any OpenAI client works as a drop-in replacement
+curl http://mac-mini:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4","messages":[{"role":"user","content":"Hello"}]}'
+```
+
+### 4. Offline & Censored-Region Access
+
+Download once, run anywhere — no internet required. Full model capability without content filtering.
+Works on trains, planes, remote locations, and secure facilities.
+
+### 5. Development & Testing Without GPU Clusters
+
+Iterate on LLM applications locally — no A100 reservations at $3+/hr. Develop locally, validate,
+then optionally scale up to cloud.
+
+### 6. Research & Experimentation
+
+Full-stack access for ML research: modify MoE routing (`moe_router.zig`), swap KV cache strategies
+at runtime, test quantization formats (INT4, MXFP4, TurboQuant), compare speculative decoding
+strategies (PLD vs EAGLE).
+
+[→ Detailed Scenario Guide](docs/en/scenarios/README.md) | [→ DeepSeek MoE Deep Dive](docs/en/deepseek-moe/README.md)
+
+---
 
 ## Features
 
-- **Official MLX backend**: Full access to Metal GPU, CPU (Accelerate/BLAS), unified memory,
-  and Steel GEMM via Apple's `mlx-c` — no reimplemented kernels.
+### LLM Inference Engine
 
-- **Zig-native API**: Type-safe wrappers around `mlx-c` with idiomatic Zig patterns:
-  `Array`, `Dtype`, `Device`, `Stream`, and `EagerContext`.
+- **9 model architectures**: DeepSeek V4, LLaMA, Mistral, Qwen2, Qwen3, Gemma, GLM-4, Phi, Phi-3
+- **OpenAI-compatible HTTP server** with SSE streaming and continuous batching
+- **Speculative decoding**: PLD (Prompt Lookup Decoding) + EAGLE draft head for faster generation
+- **Guided decoding**: JSON Schema / Regex FSM for constrained, structured output
+- **6-level KV cache**: Standard, Rotating, Quantized, Paged (CoW), PagedQuantized, Tiered (RAM+SSD)
+- **Quantization**: Affine INT4/INT8, MXFP4, FP8 (E4M3), TurboQuant (Lloyd-Max + QJL)
+- **Expert streaming**: SMELT partial loading + on-demand stream mode for MoE models
+- **Training**: QLoRA fine-tuning, AdamW optimizer with compiled fusion, SFT Trainer
+- **Model I/O**: Safetensors, GGUF, NumPy `.npy` loading and saving
+- **Custom Metal kernels**: TileKernels reproduction — fused Sinkhorn normalization, fused SwitchGLU with gather_mm
 
-- **200+ operations**: Comprehensive coverage across comparison, math, shape manipulation,
-  reductions, sorting, creation, random, linear algebra, FFT, convolution, and fast custom ops
-  (layer norm, RMS norm, RoPE, scaled dot-product attention).
+### Core MLX Library
 
-- **Automatic differentiation**: `grad`, `value_and_grad`, `vjp`, `jvp`, and graph `compile`
-  via `mlx-c` transforms.
+- **200+ operations**: Comparison, math, shape manipulation, reductions, sorting, creation,
+  random, linear algebra, FFT, convolution, fast custom ops (layer norm, RMS norm, RoPE, SDPA)
+- **Autograd**: `grad`, `value_and_grad`, `vjp`, `jvp`, graph `compile`
+- **NN layers**: Linear, LSTM, GRU, MultiHeadAttention, 21 activations, 10 loss functions
+- **Zig-native API**: Type-safe wrappers with idiomatic Zig patterns — `Array`, `Dtype`, `Device`, `Stream`, `EagerContext`
+- **Official MLX backend**: Full access to Metal GPU, CPU (Accelerate/BLAS), unified memory
 
-- **Model I/O**: Load and save Safetensors, GGUF, and NumPy `.npy` formats.
-
-- **Neural network layers**: Built-in Linear, LSTM, GRU, MultiHeadAttention, 21 activations,
-  and 10 loss functions — all backed by MLX.
-
-- **LLM inference engine**: Production-grade inference with LLaMA and DeepSeek V4 support,
-  OpenAI-compatible HTTP server with SSE streaming, continuous batching, speculative decoding,
-  and guided decoding (JSON schema / regex).
-
-- **KV cache**: 6 strategies (Standard, Rotating, Quantized 4/8-bit, Paged with CoW,
-  Paged+Quantized, Tiered RAM+SSD) with prefix caching and on-disk shared-prefix reuse.
-
-- **Quantization**: Affine INT4/INT8, MXFP4 (Microscaling FP4), FP8 (E4M3), and
-  TurboQuant (near-optimal Lloyd-Max + QJL for unbiased inner products).
-
-- **Quantized model loading**: Direct loading of mlx-lm 4-bit/8-bit quantized models
-  with fused `quantizedMatmul` for inference — no dequantization overhead.
-
-- **Training**: QLoRA fine-tuning, AdamW optimizer with compiled fusion, SFT Trainer.
+---
 
 ## Quick Start
 
+### One-Command Chat
+
+```bash
+# Start chatting with DeepSeek V4 on your Mac
+dmlx chat --model ~/models/DeepSeek-V4-Flash-4bit \
+  --prompt "Explain quantum computing in one sentence" \
+  --smelt --smelt-experts 0.15
+```
+
+### Core Library Usage
+
 ```zig
 const std = @import("std");
-const mlx = @import("mlx-zig");
+const mlx = @import("dmlx");
 
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}).init;
@@ -72,6 +261,8 @@ pub fn main() !void {
 }
 ```
 
+---
+
 ## Installation
 
 ### Requirements
@@ -83,34 +274,36 @@ pub fn main() !void {
   brew install mlx-c
   ```
 
-### As a Zig dependency
+### As a Zig Dependency
 
 Add to your `build.zig.zon`:
 
 ```zig
 .dependencies = .{
-    .mlx_zig = .{
-        .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.3.0.tar.gz",
+    .dmlx = .{
+        .url = "https://github.com/zouyee/dmlx/archive/refs/tags/v0.3.0.tar.gz",
         .hash = "...",
     },
 },
 ```
 
-### Build from source
+### Build from Source
 
 ```bash
-git clone https://github.com/zouyee/mlx-zig.git
-cd mlx-zig
+git clone https://github.com/zouyee/dmlx.git
+cd dmlx
 zig build          # Build library + example
 zig build test     # Run tests
 zig build run      # Run demo
 ```
 
+---
+
 ## Architecture
 
 ```
-mlx-zig/
-├── build.zig              # Build configuration (links mlx-c + frameworks)
+dmlx/
+├── build.zig              # Build configuration (links mlx-c + Metal/Accelerate)
 ├── build.zig.zon          # Package manifest
 ├── src/
 │   ├── c.zig              # @cImport of mlx-c headers
@@ -133,103 +326,85 @@ mlx-zig/
 │   │   ├── nn.zig         # Linear, LSTM, GRU, MultiHeadAttention
 │   │   ├── activations.zig # 21 activation functions
 │   │   └── loss.zig       # 10 loss functions
+│   ├── models/            # LLM architectures
+│   │   ├── deepseek_v4.zig        # DeepSeek V4 (3,091 lines)
+│   │   ├── deepseek_v4_loader.zig # Weight loading + SMELT config
+│   │   ├── expert_stream.zig      # MoE on-demand streaming (649 lines)
+│   │   ├── expert_cache.zig       # LRU expert cache
+│   │   ├── moe_router.zig         # Top-k MoE routing (629 lines)
+│   │   ├── llama.zig              # LLaMA architecture
+│   │   └── llama_loader.zig       # LLaMA weight loading
+│   ├── kvcache/            # KV cache strategies
+│   │   ├── standard.zig    # Full buffer
+│   │   ├── rotating.zig    # Ring buffer for long sequences
+│   │   ├── quantized.zig   # 4/8/16-bit compressed KV
+│   │   ├── paged.zig       # 32-token pages + CoW (1,152 lines)
+│   │   ├── tiered.zig      # RAM hot + SSD cold + LRU
+│   │   ├── turboquant.zig  # TurboQuant: Lloyd-Max + QJL
+│   │   └── prefix_disk.zig # On-disk prefix caching
+│   ├── speculative.zig     # PLD + EAGLE speculative decoding
+│   ├── guided.zig          # JSON Schema / Regex guided decoding
+│   ├── server.zig          # OpenAI-compatible HTTP server
+│   ├── batch_builder.zig   # Continuous batching builder
+│   ├── memory.zig          # Auto memory budgeting + enforcement
+│   ├── generation.zig      # Three-layer generation API
 │   ├── io/
-│   │   ├── mlx_io.zig     # Safetensors / GGUF via mlx-c
-│   │   └── npy.zig        # NumPy .npy read/write
-│   ├── eval.zig           # eval / async_eval
-│   ├── closure.zig        # Closure wrapper for transforms
-│   ├── grad.zig           # grad, value_and_grad, vjp, jvp
-│   ├── compile.zig        # compile, enable_compile, compile modes
-│   └── tests/
-│       └── core_tests.zig # Core test suite
-└── README.md              # This file
+│   │   ├── mlx_io.zig      # Safetensors / GGUF via mlx-c
+│   │   └── npy.zig         # NumPy .npy read/write
+│   ├── eval.zig            # eval / async_eval
+│   ├── closure.zig         # Closure wrapper for transforms
+│   ├── grad.zig            # grad, value_and_grad, vjp, jvp
+│   ├── compile.zig         # compile, enable_compile, compile modes
+│   └── tests/              # Comprehensive test suite (350+ tests)
+├── docs/                   # Bilingual EN/ZH documentation
+└── README.md
 ```
 
-## Modules
+---
 
-### Core types
+## Documentation
 
-- `mlx.Array` — multi-dimensional array backed by `mlx_array`
-- `mlx.Dtype` — type enum (`float32`, `int32`, `bool`, ...)
-- `mlx.Device` / `mlx.Stream` — execution device and stream
-- `mlx.EagerContext` — execution context for eager ops
+Comprehensive documentation is available in [docs/](docs/index.md) (bilingual EN/ZH):
 
-### Operations
+| Section | Description |
+|---------|-------------|
+| [DeepSeek MoE Deep Dive](docs/en/deepseek-moe/README.md) | How 671B runs on 48GB — 5-layer optimization |
+| [Application Scenarios](docs/en/scenarios/README.md) | 6 real-world use cases |
+| [Competitive Analysis](docs/en/analysis/competitive-advantages.md) | dmlx vs mlx-lm, llama.cpp, LM Studio — verified benchmarks |
+| [User Guide](docs/en/user-guide/) | Quick fixes and troubleshooting |
+| [Technical Docs](docs/en/technical/) | Benchmarks, TTFT, SMELT, roadmap |
+| [Analysis Reports](analysis-report/) | Comprehensive project analysis (52K+ lines) |
+| [Contributing Guide](CONTRIBUTING.md) | Developer guidelines |
 
-All operations are organized into sub-modules:
+→ [Documentation Index](docs/index.md)
 
-```zig
-const mlx = @import("mlx-zig");
-const ctx = mlx.EagerContext.init(allocator);
-
-// Element-wise
-const s = try mlx.math.sin(ctx, a);
-const eq = try mlx.comparison.equal(ctx, a, b);
-
-// Shape
-const r = try mlx.shape.reshape(ctx, a, &.{ 2, 5 });
-
-// Reduce
-const total = try mlx.reduce.sumAxis(ctx, a, 0, false);
-
-// Linear algebra
-const inv_a = try mlx.linalg.inv(ctx, a);
-
-// Random
-const noise = try mlx.random.normal(ctx, &.{ 3, 3 }, .float32, 0.0, 1.0, null);
-
-// FFT
-const spectrum = try mlx.fft.fft(ctx, a, 256, -1);
-```
-
-### Autograd
-
-```zig
-const closure = try mlx.closure.Closure.init(myForwardFn, allocator);
-defer closure.deinit();
-
-// Value and gradient
-const vg = try mlx.grad.valueAndGrad(closure, &.{0});
-defer vg.deinit();
-const result = try vg.apply(&.{x}, allocator);
-defer allocator.free(result.value);
-defer allocator.free(result.grad);
-
-// VJP
-const vjp_result = try mlx.grad.vjp(closure, &.{x}, &.{dy}, allocator);
-defer allocator.free(vjp_result.outputs);
-defer allocator.free(vjp_result.grads);
-```
-
-### I/O
-
-```zig
-// Safetensors
-const st = try mlx.io.loadSafetensors(allocator, "model.safetensors");
-defer st.deinit(allocator);
-const weight = st.weights.get("layer1.weight").?;
-
-// Save
-try mlx.io.saveSafetensors(allocator, "out.safetensors", weights, metadata);
-```
+---
 
 ## Platform Support
 
 | Platform | Status | Backend |
 |----------|--------|---------|
 | macOS Apple Silicon | ✅ Primary | Metal + CPU (Accelerate) |
-| macOS Intel | ⚠️ Experimental | CPU only |
-| Linux | ⚠️ Experimental | CPU + CUDA (if available) |
+
+---
 
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
+---
+
 ## Acknowledgments
 
-MLX-Zig is inspired by and built on [Apple's MLX](https://github.com/ml-explore/mlx)
-and the official `mlx-c` C bindings. See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for details.
+dmlx is inspired by and built on [Apple's MLX](https://github.com/ml-explore/mlx)
+and the official `mlx-c` C bindings. Custom Metal kernels reproduce optimizations from
+[DeepSeek's TileKernels](https://github.com/deepseek-ai/tilekernels), adapted from
+CUDA to Apple Silicon.
+
+See [ACKNOWLEDGMENTS.md](ACKNOWLEDGMENTS.md) for details.
+
+---
 
 ## License
 
-MLX-Zig is released under the [MIT License](LICENSE).
+dmlx is released under the [MIT License](LICENSE).

@@ -1,7 +1,7 @@
 .{
-    .name = .mlx_zig,
+    .name = .dmlx,
     .version = "0.3.0",
-    .fingerprint = 0x6c784013e41268f7,
+    .fingerprint = 0x42993a9e9ff056a0,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zig_regex = .{

@@ -7,10 +7,6 @@ const closure_mod = @import("closure.zig");
 const Array = array_mod.Array;
 pub const Closure = closure_mod.Closure;
 
-inline fn defaultStream() c.c.mlx_stream {
-    return c.c.mlx_default_cpu_stream_new();
-}
-
 fn toVectorArray(allocator: std.mem.Allocator, arrs: []const Array) !c.c.mlx_vector_array {
     var list = try allocator.alloc(c.c.mlx_array, arrs.len);
     defer allocator.free(list);

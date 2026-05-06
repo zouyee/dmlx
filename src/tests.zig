@@ -17,10 +17,14 @@ pub const safetensors_tests = @import("tests/safetensors_tests.zig");
 pub const trainer_tests = @import("tests/trainer_tests.zig");
 pub const e2e_tests = @import("tests/e2e_tests.zig");
 pub const deepseek_v4_tests = @import("tests/deepseek_v4_tests.zig");
+pub const minimax_tests = @import("tests/minimax_tests.zig");
+pub const nemotron_h = @import("models/nemotron_h.zig");
+pub const nemotron_h_loader = @import("models/nemotron_h_loader.zig");
 pub const golden_tests = @import("tests/golden_test.zig");
 pub const arena_tests = @import("tests/arena_tests.zig");
 pub const generation_tests = @import("tests/generation_tests.zig");
 pub const model_registry_tests = @import("model_registry.zig");
+pub const llava_tests = @import("vision/llava.zig");
 pub const prompt_cache_tests = @import("prompt_cache.zig");
 pub const fused_tests = @import("tests/fused_tests.zig");
 pub const scheduler_tests = @import("tests/scheduler_tests.zig");
@@ -39,6 +43,23 @@ pub const memory_property_tests = @import("tests/memory_property_tests.zig");
 pub const benchmark_tests = @import("benchmark.zig");
 pub const integration_tests = @import("tests/integration_tests.zig");
 pub const model_smoke_tests = @import("tests/model_smoke_tests.zig");
+
+pub const tool_calling_tests = @import("tool_calling.zig");
+pub const tool_executor_tests = @import("tool_executor.zig");
+pub const jang_loader_tests = @import("io/jang_loader.zig");
+pub const jang_quantizer_tests = @import("jang_quantizer.zig");
+
+pub const vision_preprocess_tests = @import("vision/preprocess.zig");
+pub const vision_vit_tests = @import("vision/vit.zig");
+pub const vision_llava_tests = @import("vision/llava.zig");
+
+pub const expert_remap_tests = @import("tests/expert_remap_test.zig");
+pub const expert_cache_tests = @import("models/expert_cache.zig");
+pub const layer_prefetcher_tests = @import("models/layer_prefetcher.zig");
+pub const numerical_equivalence_tests = @import("tests/numerical_equivalence_test.zig");
+pub const cache_integration_tests = @import("tests/cache_integration_test.zig");
+pub const safetensors_reader_tests = @import("io/safetensors_reader.zig");
+pub const expert_stream_tests = @import("models/expert_stream.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -61,10 +82,13 @@ test {
     _ = trainer_tests;
     _ = e2e_tests;
     _ = deepseek_v4_tests;
+    _ = nemotron_h;
+    _ = nemotron_h_loader;
     _ = golden_tests;
     _ = arena_tests;
     _ = generation_tests;
     _ = model_registry_tests;
+    _ = llava_tests;
     _ = prompt_cache_tests;
     _ = fused_tests;
     _ = scheduler_tests;
@@ -83,4 +107,21 @@ test {
     _ = benchmark_tests;
     _ = integration_tests;
     _ = model_smoke_tests;
+
+    _ = tool_calling_tests;
+    _ = tool_executor_tests;
+    _ = jang_loader_tests;
+    _ = jang_quantizer_tests;
+
+    _ = vision_preprocess_tests;
+    _ = vision_vit_tests;
+    _ = vision_llava_tests;
+
+    _ = expert_remap_tests;
+    _ = expert_cache_tests;
+    _ = layer_prefetcher_tests;
+    _ = numerical_equivalence_tests;
+    _ = cache_integration_tests;
+    _ = safetensors_reader_tests;
+    _ = expert_stream_tests;
 }

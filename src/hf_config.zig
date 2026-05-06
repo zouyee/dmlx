@@ -102,6 +102,21 @@ pub fn parseLlamaConfig(allocator: std.mem.Allocator, json_text: []const u8) !Ll
     // Explicit head_dim (Qwen3 uses head_dim=128 with hidden_size=1024, num_heads=16)
     const explicit_head_dim: ?usize = if (getInt(obj, "head_dim")) |hd| @intCast(hd) else null;
 
+    // RoPE scaling (Phi-4, LLaMA-3.1)
+    var rope_scaling_type: ?[]const u8 = null;
+    var rope_scaling_factor: f32 = 1.0;
+    var rope_scaling_original_max_pos: ?usize = null;
+    if (obj.get("rope_scaling")) |rs| {
+        if (rs == .object) {
+            const rs_obj = rs.object;
+            if (rs_obj.get("type")) |t| {
+                if (t == .string) rope_scaling_type = try allocator.dupe(u8, t.string);
+            }
+            if (getFloat(rs_obj, "factor")) |f| rope_scaling_factor = @floatCast(f);
+            if (getInt(rs_obj, "original_max_position_embeddings")) |omp| rope_scaling_original_max_pos = @intCast(omp);
+        }
+    }
+
     return LlamaConfig{
         .vocab_size = final_vocab_size,
         .hidden_size = hidden_size,
@@ -116,6 +131,9 @@ pub fn parseLlamaConfig(allocator: std.mem.Allocator, json_text: []const u8) !Ll
         .quantize_bits = quantize_bits,
         .quantize_group_size = quantize_group_size,
         .eos_token_id = eos_token_id,
+        .rope_scaling_type = rope_scaling_type,
+        .rope_scaling_factor = rope_scaling_factor,
+        .rope_scaling_original_max_position_embeddings = rope_scaling_original_max_pos,
     };
 }
 

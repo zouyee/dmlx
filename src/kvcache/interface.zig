@@ -19,6 +19,13 @@ pub const KVSlice = struct {
     values: Array,
 };
 
+/// Cache state snapshot for serialization.
+pub const CacheState = struct {
+    keys: Array,
+    values: Array,
+    offset: usize,
+};
+
 /// VTable for runtime polymorphic KV cache strategies.
 /// Every concrete strategy implements these functions and registers them in its VTable.
 pub const VTable = struct {
@@ -44,6 +51,15 @@ pub const VTable = struct {
         indices: []const usize,
         allocator: std.mem.Allocator,
     ) anyerror!void,
+
+    /// Roll back the cache to a previous sequence length.
+    /// Used in speculative decoding when draft tokens are rejected.
+    /// null if the strategy does not support rollback.
+    rollback: ?*const fn (ctx: *anyopaque, to_len: usize) void,
+
+    /// Get raw keys, values, and offset for serialization (prompt cache).
+    /// Only StandardKVCache implements this; other strategies return null.
+    getState: ?*const fn (ctx: *anyopaque) ?CacheState = null,
 
     /// Release all resources held by this strategy.
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
@@ -90,6 +106,21 @@ pub const KVCacheStrategy = struct {
             return f(self.ptr, indices, allocator);
         }
         return error.FilterNotSupported;
+    }
+
+    /// Roll back to a previous sequence length.
+    pub fn rollback(self: KVCacheStrategy, to_len: usize) void {
+        if (self.vtable.rollback) |f| {
+            return f(self.ptr, to_len);
+        }
+    }
+
+    /// Get raw cache state for serialization. Returns null if not supported.
+    pub fn getState(self: KVCacheStrategy) ?CacheState {
+        if (self.vtable.getState) |f| {
+            return f(self.ptr);
+        }
+        return null;
     }
 
     /// Release resources.

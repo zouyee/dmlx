@@ -1,4 +1,4 @@
-/// Minimal OpenAI-compatible HTTP server for MLX-Zig inference.
+/// Minimal OpenAI-compatible HTTP server for DMLX inference.
 ///
 /// Endpoints:
 ///   POST /v1/chat/completions  — Chat completion (streaming & non-streaming)
@@ -22,6 +22,8 @@ const batch_builder_mod = @import("batch_builder.zig");
 const prompt_cache_mod = @import("prompt_cache.zig");
 const speculative_mod = @import("speculative.zig");
 const guided_mod = @import("guided.zig");
+const tool_calling_mod = @import("tool_calling.zig");
+const tool_executor_mod = @import("tool_executor.zig");
 const prefix_disk_mod = @import("kvcache/prefix_disk.zig");
 
 const Array = root.Array;
@@ -72,6 +74,10 @@ pub const ServerConfig = struct {
     speculative_ngram: ?usize = null,
     kv_tier: KvTier = .ram,
     kv_cold_dir: ?[]const u8 = null,
+    allow_unsafe_tools: bool = false,
+    smelt: bool = false,
+    smelt_experts: f32 = 1.0,
+    smelt_strategy: []const u8 = "preload",
 };
 
 // ------------------------------------------------------------------
@@ -147,7 +153,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !vo
     var listener = try address.listen(io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
-    std.log.info("MLX-Zig server listening on http://0.0.0.0:{d}", .{config.port});
+    std.log.info("DMLX server listening on http://0.0.0.0:{d}", .{config.port});
 
     while (true) {
         const connection = try listener.accept(io);
@@ -274,7 +280,17 @@ fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !Mo
         return error.UnsupportedArchitecture;
     };
 
-    const vtable = try loader(allocator, config_content, config.model_path, ctx, stream);
+    const smelt_load_mode: root.deepseek_v4_loader.SmeltConfig.LoadMode =
+        if (std.mem.eql(u8, config.smelt_strategy, "stream"))
+            .stream
+        else
+            .preload;
+
+    const vtable = try loader(allocator, config_content, config.model_path, ctx, stream, io, .{
+        .enabled = config.smelt,
+        .load_fraction = config.smelt_experts,
+        .load_mode = smelt_load_mode,
+    });
 
     // 3. Load tokenizer
     const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "tokenizer.json" });
@@ -797,6 +813,8 @@ const ChatCompletionRequest = struct {
     stream: ?bool = false,
     temperature: ?f32 = null,
     max_tokens: ?u32 = null,
+    /// Optional seed for deterministic sampling.
+    seed: ?u64 = null,
     /// Optional stop strings — generation stops when any of these are produced.
     stop: ?[]const []const u8 = null,
     /// Optional response format constraint for guided decoding.
@@ -845,6 +863,40 @@ fn generateChatCompletion(allocator: std.mem.Allocator, state: *ModelState, requ
     var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
     defer messages.deinit(allocator);
 
+    // 3a. If tools are provided, inject tool system prompt as the first message
+    if (req.tools) |tools| {
+        const family = tool_calling_mod.detectFamily(req.model);
+        var tool_defs = std.ArrayList(tool_calling_mod.ToolDefinition).empty;
+        defer {
+            for (tool_defs.items) |*td| {
+                allocator.free(td.name);
+                if (td.description) |d| allocator.free(d);
+                if (td.parameters) |p| allocator.free(p);
+            }
+            tool_defs.deinit(allocator);
+        }
+        for (tools) |tool| {
+            const fn_info = tool.function orelse continue;
+            const params_json = if (fn_info.parameters) |params| blk: {
+                const out = try std.json.Stringify.valueAlloc(allocator, params, .{});
+                break :blk out;
+            } else null;
+            try tool_defs.append(allocator, .{
+                .name = try allocator.dupe(u8, fn_info.name),
+                .description = if (fn_info.description) |d| try allocator.dupe(u8, d) else null,
+                .parameters = params_json,
+            });
+        }
+        if (tool_defs.items.len > 0) {
+            const tool_prompt = try tool_calling_mod.buildToolSystemPrompt(allocator, tool_defs.items, family);
+            defer allocator.free(tool_prompt);
+            try messages.append(allocator, .{
+                .role = "system",
+                .content = tool_prompt,
+            });
+        }
+    }
+
     for (req.messages) |msg| {
         try messages.append(allocator, .{
             .role = msg.role,
@@ -864,7 +916,7 @@ fn generateChatCompletion(allocator: std.mem.Allocator, state: *ModelState, requ
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
     const temperature = req.temperature orelse server_config.temperature;
 
-    const seed = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
+    const seed = req.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
 
     const gen_config = generation_mod.GenerateConfig{
         .max_tokens = max_tokens,
@@ -874,59 +926,48 @@ fn generateChatCompletion(allocator: std.mem.Allocator, state: *ModelState, requ
         .seed = seed,
     };
 
-    const new_tokens = try generation_mod.generate(
-        state.vtable,
-        prompt_tokens,
-        gen_config,
-        state.caches,
-        state.ctx,
-    );
-    defer allocator.free(new_tokens);
+    var new_tokens: []u32 = undefined;
+    var new_tokens_owned = std.ArrayList(u32).empty;
+    defer new_tokens_owned.deinit(allocator);
 
-    // --- Speculative decoding integration point ---
-    // When state.speculative_ngram is set (e.g. 3 for trigram drafting),
-    // the standard generate() call above would be replaced with a
-    // propose-verify cycle using speculative_mod:
-    //
-    //   const n = state.speculative_ngram.?;
-    //   var drafter = speculative_mod.NgramDrafter{ .n = n };
-    //   // In a loop:
-    //   //   1. drafter.propose(context, k, allocator) → draft tokens
-    //   //   2. speculative_mod.verifyDraft(model, context, draft, caches, ctx, seed) → VerifyResult
-    //   //   3. Append result.tokens to output, advance context
-    //   //   4. If no draft proposed, fall back to single generateStep
-    //
-    // This replaces the standard token-by-token generateStep loop with a
-    // propose-verify cycle that can accept multiple tokens per forward pass.
-    // TODO: Implement full speculative generation loop (requires careful
-    // KV cache state management across propose/verify cycles).
+    if (state.speculative_ngram) |n| {
+        // Prompt Lookup Decoding: build prompt n-gram index and speculative decode
+        var drafter = try speculative_mod.PldDrafter.init(allocator, prompt_tokens, n);
+        defer drafter.deinit();
 
-    // --- Guided decoding integration point ---
-    // When req.response_format is set, guided decoding constrains token generation:
-    //
-    //   if (req.response_format) |rf| {
-    //       if (rf.schema) |schema| {
-    //           var fsm = if (std.mem.eql(u8, rf.type, "json_schema"))
-    //               try guided_mod.FiniteStateMachine.fromJsonSchema(allocator, schema)
-    //           else if (std.mem.eql(u8, rf.type, "regex"))
-    //               try guided_mod.FiniteStateMachine.fromRegex(allocator, schema)
-    //           else
-    //               null;
-    //           if (fsm) |*f| {
-    //               defer f.deinit();
-    //               var decoder = guided_mod.GuidedDecoder.init(f.*);
-    //               // In the generation loop (inside generation_mod.generate):
-    //               //   1. logits = model.forward(...)
-    //               //   2. logits = decoder.maskLogits(logits, ctx)  // mask disallowed tokens
-    //               //   3. token = sample(logits)
-    //               //   4. decoder.advance(token)                    // advance FSM state
-    //           }
-    //       }
-    //   }
-    //
-    // This requires passing the GuidedDecoder into the generation loop in
-    // generation.zig, which needs a callback or config extension.
-    // TODO: Extend GenerateConfig or generation API to accept an optional GuidedDecoder.
+        const CollectState = struct {
+            var s_allocator: std.mem.Allocator = undefined;
+            var s_tokens: *std.ArrayList(u32) = undefined;
+            fn callback(token: u32, is_done: bool) void {
+                s_tokens.append(s_allocator, token) catch {};
+                _ = is_done;
+            }
+        };
+        CollectState.s_allocator = allocator;
+        CollectState.s_tokens = &new_tokens_owned;
+
+        try generation_mod.streamGenerateSpeculative(
+            state.vtable,
+            prompt_tokens,
+            gen_config,
+            state.caches,
+            state.ctx,
+            &drafter,
+            &CollectState.callback,
+        );
+        new_tokens = new_tokens_owned.items;
+    } else {
+        new_tokens = try generation_mod.generate(
+            state.vtable,
+            prompt_tokens,
+            gen_config,
+            state.caches,
+            state.ctx,
+        );
+        try new_tokens_owned.appendSlice(allocator, new_tokens);
+        allocator.free(new_tokens);
+        new_tokens = new_tokens_owned.items;
+    }
 
     // 7. Decode output
     const output_text = try state.tokenizer_strategy.decode(new_tokens, allocator);
@@ -943,31 +984,71 @@ fn generateChatCompletion(allocator: std.mem.Allocator, state: *ModelState, requ
         }
     }
 
-    // 8. Build OpenAI-compatible response
+    // 8. Tool calling loop (single round)
+    if (req.tools) |tools| {
+        _ = tools;
+        const family = tool_calling_mod.detectFamily(req.model);
+        if (try tool_calling_mod.parse(allocator, final_text, family)) |parse_result| {
+            defer parse_result.deinit();
+
+            if (parse_result.calls.len > 0) {
+                // Execute tools and build tool results
+                var tool_results = std.ArrayList(u8).empty;
+                defer tool_results.deinit(allocator);
+
+                const exec_config = tool_executor_mod.ExecutorConfig{
+                    .allow_shell_exec = server_config.allow_unsafe_tools,
+                    .max_file_size = 1024 * 1024,
+                    .io = state.io,
+                };
+
+                for (parse_result.calls) |call| {
+                    const result = try tool_executor_mod.execute(allocator, exec_config, call.function.name, call.function.arguments);
+                    defer result.deinit();
+
+                    const result_text = if (result.success) result.output else result.error_message orelse "error";
+                    try tool_results.appendSlice(allocator, "Tool '");
+                    try tool_results.appendSlice(allocator, call.function.name);
+                    try tool_results.appendSlice(allocator, "' result: ");
+                    try tool_results.appendSlice(allocator, result_text);
+                    try tool_results.appendSlice(allocator, "\n");
+                }
+
+                // Build OpenAI-compatible response with tool_calls
+                const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
+                var tool_calls_json = std.ArrayList(u8).empty;
+                defer tool_calls_json.deinit(allocator);
+                try tool_calls_json.appendSlice(allocator, "[");
+                for (parse_result.calls, 0..) |call, i| {
+                    if (i > 0) try tool_calls_json.appendSlice(allocator, ",");
+                    try tool_calls_json.print(allocator,
+                        \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
+                    , .{ call.id, call.function.name, call.function.arguments });
+                }
+                try tool_calls_json.appendSlice(allocator, "]");
+
+                return try std.fmt.allocPrint(allocator,
+                    \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+                , .{
+                    created,
+                    created,
+                    req.model,
+                    tool_calls_json.items,
+                    prompt_tokens.len,
+                    new_tokens.len,
+                    prompt_tokens.len + new_tokens.len,
+                });
+            }
+        }
+    }
+
+    // 9. Build standard OpenAI-compatible response
     const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
 
     // JSON-escape the output text
     var escaped = std.ArrayList(u8).empty;
     defer escaped.deinit(allocator);
     try jsonEscapeInto(&escaped, allocator, final_text);
-
-    // 8b. Check for tool call patterns if tools were provided
-    if (req.tools != null) {
-        if (detectToolCalls(allocator, final_text)) |tool_calls_json| {
-            defer allocator.free(tool_calls_json);
-            return try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-            , .{
-                created,
-                created,
-                req.model,
-                tool_calls_json,
-                prompt_tokens.len,
-                new_tokens.len,
-                prompt_tokens.len + new_tokens.len,
-            });
-        }
-    }
 
     return try std.fmt.allocPrint(allocator,
         \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
@@ -1033,7 +1114,7 @@ fn handleStreamingCompletion(
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
     const temperature = req.temperature orelse server_config.temperature;
 
-    const seed = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
+    const seed = req.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
 
     const gen_config = generation_mod.GenerateConfig{
         .max_tokens = max_tokens,
@@ -1054,11 +1135,40 @@ fn handleStreamingCompletion(
         var s_model_name: []const u8 = "";
         var s_tokenizer: root.tokenizer.TokenizerStrategy = undefined;
         var s_token_count: usize = 0;
+        var s_stop_strings: ?[]const []const u8 = null;
+        var s_text_buffer: std.ArrayList(u8) = undefined;
+        var s_stopped: bool = false;
 
         fn callback(token: u32, is_done: bool) void {
+            if (s_stopped) return;
+
             // Decode token to text
             const token_text = s_tokenizer.decode(&[_]u32{token}, s_allocator) catch return;
             defer s_allocator.free(token_text);
+
+            // Accumulate text for stop-string detection
+            s_text_buffer.appendSlice(s_allocator, token_text) catch return;
+
+            // Check stop strings
+            if (s_stop_strings) |stop_strings| {
+                for (stop_strings) |stop_str| {
+                    if (std.mem.indexOf(u8, s_text_buffer.items, stop_str)) |_| {
+                        s_stopped = true;
+                        const done_chunk = formatSSEChunk(
+                            s_allocator,
+                            s_completion_id,
+                            s_created,
+                            s_model_name,
+                            null,
+                            "stop",
+                        ) catch return;
+                        defer s_allocator.free(done_chunk);
+                        s_sse.sendEvent(done_chunk) catch return;
+                        s_sse.sendEvent("[DONE]") catch return;
+                        return;
+                    }
+                }
+            }
 
             s_token_count += 1;
 
@@ -1088,65 +1198,51 @@ fn handleStreamingCompletion(
     StreamState.s_model_name = req.model;
     StreamState.s_tokenizer = state.tokenizer_strategy;
     StreamState.s_token_count = 0;
+    StreamState.s_stop_strings = req.stop;
+    StreamState.s_text_buffer = std.ArrayList(u8).empty;
+    StreamState.s_stopped = false;
 
-    // 8. Run generation using the Generation API's streamGenerate
-    //
-    // --- Speculative decoding integration point (streaming) ---
-    // When state.speculative_ngram is set, the streamGenerate call below
-    // would be replaced with a speculative generation loop:
-    //
-    //   const n = state.speculative_ngram.?;
-    //   var drafter = speculative_mod.NgramDrafter{ .n = n };
-    //   // In a loop:
-    //   //   1. drafter.propose(context, k, allocator) → draft tokens
-    //   //   2. speculative_mod.verifyDraft(model, context, draft, caches, ctx, seed) → VerifyResult
-    //   //   3. For each accepted token, invoke the SSE callback
-    //   //   4. If no draft proposed, fall back to single generateStep
-    //
-    // TODO: Implement speculative streaming loop with per-token SSE emission.
-    //
-    // --- Guided decoding integration point (streaming) ---
-    // When req.response_format is set, guided decoding constrains each streamed token:
-    //
-    //   if (req.response_format) |rf| {
-    //       if (rf.schema) |schema| {
-    //           var fsm = if (std.mem.eql(u8, rf.type, "json_schema"))
-    //               try guided_mod.FiniteStateMachine.fromJsonSchema(allocator, schema)
-    //           else if (std.mem.eql(u8, rf.type, "regex"))
-    //               try guided_mod.FiniteStateMachine.fromRegex(allocator, schema)
-    //           else
-    //               null;
-    //           if (fsm) |*f| {
-    //               defer f.deinit();
-    //               var decoder = guided_mod.GuidedDecoder.init(f.*);
-    //               // In the streaming generation loop (inside streamGenerate callback):
-    //               //   1. logits = model.forward(...)
-    //               //   2. logits = decoder.maskLogits(logits, ctx)  // mask disallowed tokens
-    //               //   3. token = sample(logits)
-    //               //   4. decoder.advance(token)                    // advance FSM state
-    //               //   5. callback(token, decoder.isComplete())     // emit SSE event
-    //           }
-    //       }
-    //   }
-    //
-    // This requires passing the GuidedDecoder into streamGenerate in
-    // generation.zig, which needs a callback or config extension.
-    // TODO: Extend streamGenerate or GenerateConfig to accept an optional GuidedDecoder.
-    generation_mod.streamGenerate(
-        state.vtable,
-        prompt_tokens,
-        gen_config,
-        state.caches,
-        state.ctx,
-        &StreamState.callback,
-    ) catch |err| {
-        std.log.err("streamGenerate error: {}", .{err});
-        // Send error event if generation fails mid-stream
-        const err_chunk = formatSSEChunk(allocator, completion_id, created, req.model, null, "error") catch return;
-        defer allocator.free(err_chunk);
-        sse.sendEvent(err_chunk) catch return;
-        sse.sendEvent("[DONE]") catch return;
-    };
+    // 8. Start keep-alive fiber to prevent proxy timeout during long prefill
+    _ = io.async(keepAliveLoop, .{ io, &sse, &StreamState.s_token_count });
+
+    // 9. Run generation using the Generation API
+    if (state.speculative_ngram) |n| {
+        // Prompt Lookup Decoding: build prompt n-gram index and speculative decode
+        var drafter = try speculative_mod.PldDrafter.init(allocator, prompt_tokens, n);
+        defer drafter.deinit();
+
+        generation_mod.streamGenerateSpeculative(
+            state.vtable,
+            prompt_tokens,
+            gen_config,
+            state.caches,
+            state.ctx,
+            &drafter,
+            &StreamState.callback,
+        ) catch |err| {
+            std.log.err("streamGenerateSpeculative error: {}", .{err});
+            const err_chunk = formatSSEChunk(allocator, completion_id, created, req.model, null, "error") catch return;
+            defer allocator.free(err_chunk);
+            sse.sendEvent(err_chunk) catch return;
+            sse.sendEvent("[DONE]") catch return;
+        };
+    } else {
+        generation_mod.streamGenerate(
+            state.vtable,
+            prompt_tokens,
+            gen_config,
+            state.caches,
+            state.ctx,
+            &StreamState.callback,
+        ) catch |err| {
+            std.log.err("streamGenerate error: {}", .{err});
+            // Send error event if generation fails mid-stream
+            const err_chunk = formatSSEChunk(allocator, completion_id, created, req.model, null, "error") catch return;
+            defer allocator.free(err_chunk);
+            sse.sendEvent(err_chunk) catch return;
+            sse.sendEvent("[DONE]") catch return;
+        };
+    }
 
     // If streamGenerate completed without calling callback with is_done=true
     // (e.g., empty prompt), send [DONE]
@@ -1155,6 +1251,16 @@ fn handleStreamingCompletion(
         defer allocator.free(final_chunk);
         try sse.sendEvent(final_chunk);
         try sse.sendEvent("[DONE]");
+    }
+}
+
+/// SSE keep-alive fiber: sends a comment every 5s until the first token
+/// is generated (indicating prefill is complete).
+fn keepAliveLoop(io_arg: std.Io, sse_arg: *SSEWriter, token_count: *usize) void {
+    while (token_count.* == 0) {
+        io_arg.sleep(.fromMilliseconds(5000), .awake) catch break;
+        if (token_count.* > 0) break;
+        sse_arg.sendKeepAlive() catch break;
     }
 }
 

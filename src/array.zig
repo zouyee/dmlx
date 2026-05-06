@@ -50,7 +50,9 @@ pub const Array = struct {
     pub fn zeros(allocator: std.mem.Allocator, shape_: []const ShapeElem, dt: Dtype) !Array {
         _ = allocator;
         var arr = c.c.mlx_array_new();
-        try c.check(c.c.mlx_zeros(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), c.c.mlx_default_cpu_stream_new()));
+        const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
+        try c.check(c.c.mlx_zeros(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), stream));
         return fromHandle(arr);
     }
 
@@ -58,7 +60,9 @@ pub const Array = struct {
     pub fn ones(allocator: std.mem.Allocator, shape_: []const ShapeElem, dt: Dtype) !Array {
         _ = allocator;
         var arr = c.c.mlx_array_new();
-        try c.check(c.c.mlx_ones(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), c.c.mlx_default_cpu_stream_new()));
+        const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
+        try c.check(c.c.mlx_ones(&arr, shape_.ptr, shape_.len, @intCast(@intFromEnum(dt)), stream));
         return fromHandle(arr);
     }
 
@@ -68,9 +72,16 @@ pub const Array = struct {
         _ = c.c.mlx_array_free(self.inner);
     }
 
-    /// Evaluate the array (for lazy arrays).
+    /// Evaluate the array (handles cross-device scheduling).
     pub fn eval(self: Array) !void {
-        return c.check(c.c.mlx_array_eval(self.inner));
+        // Use mlx_eval (vector version) which handles cross-device scheduling
+        // (e.g., Load primitives on CPU, compute on GPU).
+        // mlx_array_eval only evaluates on the array's stream which may fail
+        // for Load primitives on GPU stream.
+        const vec = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(vec);
+        try c.check(c.c.mlx_vector_array_append_data(vec, &self.inner, 1));
+        try c.check(c.c.mlx_eval(vec));
     }
 
     // === Properties ===
@@ -138,6 +149,12 @@ pub const Array = struct {
     }
 
     /// Get mutable typed slice. Array must be evaluated.
+    ///
+    /// SAFETY: This bypasses MLX's copy-on-write semantics via @constCast.
+    /// Only safe when the array has a unique reference (ref_count == 1),
+    /// e.g. immediately after creation via zeros/ones/fromData.
+    /// Using this on shared arrays (slices, reshapes, broadcasts) will
+    /// silently corrupt the shared buffer. Prefer MLX ops for mutations.
     pub fn dataSliceMut(self: Array, comptime T: type) ![]T {
         const ptr = try self.dataPtr(T);
         return @constCast(ptr)[0..self.size()];

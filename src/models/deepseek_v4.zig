@@ -20,6 +20,8 @@ const kvcache = @import("../kvcache.zig");
 const lora_mod = @import("../lora.zig");
 const fast_mod = @import("../ops/fast.zig");
 const array_arena_mod = @import("../array_arena.zig");
+const quantize_mod = @import("../quantize.zig");
+const expert_stream = @import("expert_stream.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -35,6 +37,7 @@ pub const DSV4Config = struct {
     num_key_value_heads: usize = 1,
     q_lora_rank: usize = 1024,
     o_lora_rank: usize = 1024,
+    o_groups: usize = 8,
     qk_rope_head_dim: usize = 64,
     max_position_embeddings: usize = 1048576,
     n_routed_experts: usize = 256,
@@ -88,6 +91,85 @@ pub const DSV4Config = struct {
         beta_fast: f32 = 32.0,
         beta_slow: f32 = 1.0,
     };
+};
+
+/// HyperHead: compress mHC-expanded [B,S,mult,H] back to [B,S,H]
+/// using RMSNorm-weighted learnable mixing (matching mlx-lm HyperHead).
+pub const HyperHead = struct {
+    ctx: EagerContext,
+    fn_weight: Array, // [mix, mult*hidden_size] where mix = (2+mult)*mult
+    base: Array, // [mix]
+    scale: Array, // [3]
+    hc_mult: usize,
+    norm_eps: f32,
+
+    pub fn deinit(self: *HyperHead) void {
+        self.fn_weight.deinit();
+        self.base.deinit();
+        self.scale.deinit();
+    }
+
+    pub fn forward(self: *HyperHead, x: Array, stream: c.c.mlx_stream) !Array {
+        _ = stream;
+        const shape = x.shape();
+        const batch = @as(usize, @intCast(shape[0]));
+        const seq_len = @as(usize, @intCast(shape[1]));
+        const mult = @as(usize, @intCast(shape[2]));
+        const dim = @as(usize, @intCast(shape[3]));
+
+        // flat = reshape(x, [B, S, mult*dim]).astype(f32)
+        const flat = try ops.reshape(self.ctx, x, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(mult * dim) });
+        defer flat.deinit();
+        const flat_f32 = try ops.astype(self.ctx, flat, .float32);
+        defer flat_f32.deinit();
+
+        // RMSNorm rsqrt
+        const sq = try ops.multiply(self.ctx, flat_f32, flat_f32);
+        defer sq.deinit();
+        const mean_sq = try reduce_mod.meanAxis(self.ctx, sq, -1, true);
+        defer mean_sq.deinit();
+        const eps_arr = try ops.scalarF32(self.ctx, self.norm_eps);
+        defer eps_arr.deinit();
+        const denom = try ops.add(self.ctx, mean_sq, eps_arr);
+        defer denom.deinit();
+        const rsqrt = try math_mod.rsqrt(self.ctx, denom);
+        defer rsqrt.deinit();
+
+        // mixes = (flat @ fn^T) * rsqrt
+        const fn_t = try ops.transpose(self.ctx, self.fn_weight);
+        defer fn_t.deinit();
+        const mixes_raw = try ops.matmul(self.ctx, flat_f32, fn_t);
+        defer mixes_raw.deinit();
+        const mixes = try ops.multiply(self.ctx, mixes_raw, rsqrt);
+        defer mixes.deinit();
+
+        // pre = sigmoid(mixes * scale[0] + base) + eps
+        const scale0 = try ops.slice(self.ctx, self.scale, &[_]i32{0}, &[_]i32{1}, &[_]i32{});
+        defer scale0.deinit();
+        const scale0_s = try shape_mod.squeeze(self.ctx, scale0);
+        defer scale0_s.deinit();
+        const mixes_scaled = try ops.multiply(self.ctx, mixes, scale0_s);
+        defer mixes_scaled.deinit();
+        const mixes_biased = try ops.add(self.ctx, mixes_scaled, self.base);
+        defer mixes_biased.deinit();
+        const sigmoided = try ops.sigmoid(self.ctx, mixes_biased);
+        defer sigmoided.deinit();
+        const hc_eps_arr = try ops.scalarF32(self.ctx, self.norm_eps);
+        defer hc_eps_arr.deinit();
+        const pre = try ops.add(self.ctx, sigmoided, hc_eps_arr);
+        defer pre.deinit();
+
+        // return (pre[..., None] * x.astype(f32)).sum(axis=2).astype(x.dtype)
+        const x_f32 = try ops.astype(self.ctx, x, .float32);
+        defer x_f32.deinit();
+        const pre_exp = try ops.expandDims(self.ctx, pre, 3);
+        defer pre_exp.deinit();
+        const weighted = try ops.multiply(self.ctx, pre_exp, x_f32);
+        defer weighted.deinit();
+        const summed = try reduce_mod.sumAxis(self.ctx, weighted, 2, false);
+        defer summed.deinit();
+        return ops.astype(self.ctx, summed, x.dtype());
+    }
 };
 
 /// YARN-scaled RoPE positional encoding.
@@ -153,81 +235,100 @@ pub const DSV4YarnRoPE = struct {
         };
     }
 
-    /// Apply RoPE in-place to the last `dim` dimensions of input.
-    /// Input shape: (..., dim) where dim = self.dim
-    pub fn apply(self: *DSV4YarnRoPE, input: Array, start_pos: usize, stream: c.c.mlx_stream) !Array {
+    /// Apply RoPE using MLX ops (GPU-accelerated).
+    /// Input shape: (..., seq_len, dim) where dim = self.dim
+    /// Applies RoPE to the LAST self.dim dimensions. If input's last dim > self.dim,
+    /// the first (last_dim - self.dim) dimensions are left unchanged (partial RoPE).
+    pub fn apply(self: *DSV4YarnRoPE, input: Array, start_pos: usize, stream: c.c.mlx_stream, inverse: bool) !Array {
         _ = stream;
         const shape = input.shape();
+        const last_dim = @as(usize, @intCast(shape[shape.len - 1]));
         const seq_len = @as(usize, @intCast(shape[shape.len - 2]));
         const dim = self.dim;
         const half_dim = dim / 2;
+        const nope_dim = if (last_dim > dim) last_dim - dim else 0;
 
-        const out = try array_mod.zeros(self.ctx.allocator, shape, input.dtype());
-        const src = try input.dataSliceMut(f32);
-        const dst = try out.dataSliceMut(f32);
-        const cos_data = try self.cos_cache.dataSliceMut(f32);
-        const sin_data = try self.sin_cache.dataSliceMut(f32);
+        // Slice cos/sin cache for the relevant positions: [seq_len, half_dim]
+        const cos_slice = try ops.slice(self.ctx, self.cos_cache, &[_]i32{ @intCast(start_pos), 0 }, &[_]i32{ @intCast(start_pos + seq_len), @intCast(half_dim) }, &[_]i32{});
+        defer cos_slice.deinit();
+        const sin_slice = try ops.slice(self.ctx, self.sin_cache, &[_]i32{ @intCast(start_pos), 0 }, &[_]i32{ @intCast(start_pos + seq_len), @intCast(half_dim) }, &[_]i32{});
+        defer sin_slice.deinit();
 
-        const total_elements = input.size();
-        const seq_stride = dim;
-        const non_seq_elements = total_elements / (seq_len * dim);
+        // Cast cos/sin to input dtype
+        const cos_typed = try ops.astype(self.ctx, cos_slice, input.dtype());
+        defer cos_typed.deinit();
+        var sin_typed = try ops.astype(self.ctx, sin_slice, input.dtype());
+        defer sin_typed.deinit();
 
-        for (0..non_seq_elements) |n| {
-            for (0..seq_len) |s| {
-                const pos = start_pos + s;
-                if (pos >= self.max_seq_len) continue;
-                const base_idx = n * seq_len * seq_stride + s * seq_stride;
-                const cache_idx = pos * half_dim;
-                for (0..half_dim) |i| {
-                    const x1 = src[base_idx + i];
-                    const x2 = src[base_idx + half_dim + i];
-                    const cos_val = cos_data[cache_idx + i];
-                    const sin_val = sin_data[cache_idx + i];
-                    dst[base_idx + i] = x1 * cos_val - x2 * sin_val;
-                    dst[base_idx + half_dim + i] = x1 * sin_val + x2 * cos_val;
-                }
-            }
+        if (inverse) {
+            const neg_sin = try ops.negative(self.ctx, sin_typed);
+            sin_typed.deinit();
+            sin_typed = neg_sin;
         }
 
-        return out;
-    }
-
-    pub fn applyInverse(self: *DSV4YarnRoPE, input: Array, start_pos: usize, stream: c.c.mlx_stream) !Array {
-        _ = stream;
-        const shape = input.shape();
-        const seq_len = @as(usize, @intCast(shape[shape.len - 2]));
-        const dim = self.dim;
-        const half_dim = dim / 2;
-
-        const out = try array_mod.zeros(self.ctx.allocator, shape, input.dtype());
-        const src = try input.dataSliceMut(f32);
-        const dst = try out.dataSliceMut(f32);
-        const cos_data = try self.cos_cache.dataSliceMut(f32);
-        const sin_data = try self.sin_cache.dataSliceMut(f32);
-
-        const total_elements = input.size();
-        const seq_stride = dim;
-        const non_seq_elements = total_elements / (seq_len * dim);
-
-        for (0..non_seq_elements) |n| {
-            for (0..seq_len) |s| {
-                const pos = start_pos + s;
-                if (pos >= self.max_seq_len) continue;
-                const base_idx = n * seq_len * seq_stride + s * seq_stride;
-                const cache_idx = pos * half_dim;
-                for (0..half_dim) |i| {
-                    const x1 = src[base_idx + i];
-                    const x2 = src[base_idx + half_dim + i];
-                    const cos_val = cos_data[cache_idx + i];
-                    const sin_val = sin_data[cache_idx + i];
-                    // Inverse rotation: conjugate
-                    dst[base_idx + i] = x1 * cos_val + x2 * sin_val;
-                    dst[base_idx + half_dim + i] = -x1 * sin_val + x2 * cos_val;
-                }
-            }
+        // Extract the PE portion (last `dim` dimensions)
+        var pe: Array = undefined;
+        if (nope_dim > 0) {
+            pe = try ops.slice(self.ctx, input, &[_]i32{ 0, 0, 0, @intCast(nope_dim) }, &[_]i32{ shape[0], shape[1], shape[2], shape[3] }, &[_]i32{});
+        } else {
+            pe = try ops.copy(self.ctx, input);
         }
+        defer pe.deinit();
 
-        return out;
+        // Reshape PE to (..., seq_len, half_dim, 2) for rotation
+        const pe_shape = pe.shape();
+        var new_shape_buf: [8]i32 = undefined;
+        const ndim = pe_shape.len;
+        for (0..ndim - 1) |i| new_shape_buf[i] = pe_shape[i];
+        new_shape_buf[ndim - 1] = @intCast(half_dim);
+        new_shape_buf[ndim] = 2;
+        const pe_pairs = try ops.reshape(self.ctx, pe, new_shape_buf[0 .. ndim + 1]);
+        defer pe_pairs.deinit();
+
+        // Split into x0, x1
+        const x0 = try ops.slice(self.ctx, pe_pairs, &[_]i32{ 0, 0, 0, 0, 0 }, &[_]i32{ pe_shape[0], pe_shape[1], @intCast(seq_len), @intCast(half_dim), 1 }, &[_]i32{});
+        defer x0.deinit();
+        const x1 = try ops.slice(self.ctx, pe_pairs, &[_]i32{ 0, 0, 0, 0, 1 }, &[_]i32{ pe_shape[0], pe_shape[1], @intCast(seq_len), @intCast(half_dim), 2 }, &[_]i32{});
+        defer x1.deinit();
+        const x0_sq = try ops.squeeze(self.ctx, x0);
+        defer x0_sq.deinit();
+        const x1_sq = try ops.squeeze(self.ctx, x1);
+        defer x1_sq.deinit();
+
+        // Rotate: out0 = x0*cos - x1*sin, out1 = x0*sin + x1*cos
+        const x0_cos = try ops.multiply(self.ctx, x0_sq, cos_typed);
+        defer x0_cos.deinit();
+        const x1_sin = try ops.multiply(self.ctx, x1_sq, sin_typed);
+        defer x1_sin.deinit();
+        const out0 = try ops.subtract(self.ctx, x0_cos, x1_sin);
+        defer out0.deinit();
+
+        const x0_sin = try ops.multiply(self.ctx, x0_sq, sin_typed);
+        defer x0_sin.deinit();
+        const x1_cos = try ops.multiply(self.ctx, x1_sq, cos_typed);
+        defer x1_cos.deinit();
+        const out1 = try ops.add(self.ctx, x0_sin, x1_cos);
+        defer out1.deinit();
+
+        // Stack and reshape back: [out0, out1] → (..., seq_len, half_dim, 2) → (..., seq_len, dim)
+        const out0_exp = try ops.expandDims(self.ctx, out0, -1);
+        defer out0_exp.deinit();
+        const out1_exp = try ops.expandDims(self.ctx, out1, -1);
+        defer out1_exp.deinit();
+        const stacked = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ out0_exp, out1_exp }, -1);
+        defer stacked.deinit();
+
+        // Reshape back to original PE shape
+        const pe_out = try ops.reshape(self.ctx, stacked, pe_shape);
+        defer pe_out.deinit();
+
+        // Concat nope + pe_out if partial RoPE
+        if (nope_dim > 0) {
+            const nope = try ops.slice(self.ctx, input, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ shape[0], shape[1], shape[2], @intCast(nope_dim) }, &[_]i32{});
+            defer nope.deinit();
+            return shape_mod.concatenateAxis(self.ctx, &[_]Array{ nope, pe_out }, -1);
+        }
+        return ops.copy(self.ctx, pe_out);
     }
 };
 
@@ -276,7 +377,7 @@ fn topkIndices(ctx: EagerContext, input: Array, k: i32, n_experts: usize, stream
     const stop_y = @as(i32, @intCast(n_experts));
     const batch_size = sorted.shape()[0];
     const result = try ops.slice(ctx, sorted, &[_]i32{ 0, start_y }, &[_]i32{ batch_size, stop_y }, &[_]i32{ 1, 1 });
-    try result.eval();
+
     return result;
 }
 
@@ -322,49 +423,83 @@ fn createCausalMask(ctx: EagerContext, batch: usize, num_heads: usize, seq_len: 
 }
 
 /// Single MoE expert: SwiGLU FFN.
+/// Weights may be null when the expert is not loaded (Smelt mode).
+/// Supports quantized weights via quantizedMatmul when scales are present.
 pub const DSV4Expert = struct {
     ctx: EagerContext,
-    w1: Array, // gate projection
-    w2: Array, // down projection
-    w3: Array, // up projection
+    w1: ?Array, // gate projection
+    w2: ?Array, // down projection
+    w3: ?Array, // up projection
+    // Optional quantized scales/biases for quantizedMatmul
+    w1_scales: ?Array = null,
+    w1_biases: ?Array = null,
+    w2_scales: ?Array = null,
+    w2_biases: ?Array = null,
+    w3_scales: ?Array = null,
+    w3_biases: ?Array = null,
+    quant_group_size: i32 = 64,
+    quant_bits: u8 = 4,
+    quant_mode: quantize_mod.QuantMode = .affine,
     swiglu_limit: f32,
 
     pub fn deinit(self: *DSV4Expert) void {
-        self.w1.deinit();
-        self.w2.deinit();
-        self.w3.deinit();
+        if (self.w1) |w| w.deinit();
+        if (self.w2) |w| w.deinit();
+        if (self.w3) |w| w.deinit();
+        if (self.w1_scales) |s| s.deinit();
+        if (self.w1_biases) |b| b.deinit();
+        if (self.w2_scales) |s| s.deinit();
+        if (self.w2_biases) |b| b.deinit();
+        if (self.w3_scales) |s| s.deinit();
+        if (self.w3_biases) |b| b.deinit();
+    }
+
+    /// Perform matmul: x @ w^T, using quantizedMatmul when scales are present.
+    fn expertMatmul(self: *DSV4Expert, x: Array, w: Array, scales: ?Array, biases: ?Array) !Array {
+        if (scales) |s| {
+            const qw = quantize_mod.QuantizedWeight{
+                .data = w,
+                .scales = s,
+                .biases = biases orelse Array.fromHandle(c.c.mlx_array_new()),
+                .config = .{ .group_size = self.quant_group_size, .bits = self.quant_bits, .mode = self.quant_mode },
+                .original_shape = &[_]i32{},
+            };
+            return quantize_mod.quantizedMatmul(self.ctx, x, qw, true);
+        } else {
+            const w_t = try ops.transpose(self.ctx, w);
+            defer w_t.deinit();
+            return ops.matmul(self.ctx, x, w_t);
+        }
     }
 
     pub fn forward(self: *DSV4Expert, x: Array, stream: c.c.mlx_stream) !Array {
         _ = stream;
-        // SwiGLU: gate = silu(w1(x)) * w3(x) -> w2(gate)
-        //
-        // FUSION INTEGRATION POINT (R8.1): The manual gate_proj + silu + up_proj + down_proj
-        // chain below can be replaced with a single `compiledSwiGLU` call from
-        // `src/ops/fused.zig`, which fuses all intermediate ops into fewer GPU kernel
-        // launches via mlx_compile. Usage:
-        //   const fused = try fused_ops.compiledSwiGLU(self.ctx.allocator);
-        //   defer fused.deinit();
-        //   const result = try fused.call(&.{ x, self.w1, self.w3, self.w2 }, self.ctx.allocator);
-        //   return result[0];
-        //
-        const w1_t = try ops.transpose(self.ctx, self.w1);
-        defer w1_t.deinit();
-        const gate_proj = try ops.matmul(self.ctx, x, w1_t);
+        const w1 = self.w1 orelse return error.UnloadedExpert;
+        const w2 = self.w2 orelse return error.UnloadedExpert;
+        const w3 = self.w3 orelse return error.UnloadedExpert;
+
+        var gate_proj = try self.expertMatmul(x, w1, self.w1_scales, self.w1_biases);
         defer gate_proj.deinit();
-        const w3_t = try ops.transpose(self.ctx, self.w3);
-        defer w3_t.deinit();
-        const up_proj = try ops.matmul(self.ctx, x, w3_t);
+        var up_proj = try self.expertMatmul(x, w3, self.w3_scales, self.w3_biases);
         defer up_proj.deinit();
+
+        // Apply limited SwiGLU: clip gate and up to prevent numerical explosion
+        if (self.swiglu_limit > 0) {
+            const limit_pos = try ops.scalarF32(self.ctx, self.swiglu_limit);
+            defer limit_pos.deinit();
+            gate_proj = try math_mod.minimum(self.ctx, gate_proj, limit_pos);
+            const limit_neg = try ops.scalarF32(self.ctx, -self.swiglu_limit);
+            defer limit_neg.deinit();
+            up_proj = try math_mod.maximum(self.ctx, up_proj, limit_neg);
+            up_proj = try math_mod.minimum(self.ctx, up_proj, limit_pos);
+        }
 
         const silu_gate = try ops.multiply(self.ctx, gate_proj, try ops.sigmoid(self.ctx, gate_proj));
         defer silu_gate.deinit();
         const hidden = try ops.multiply(self.ctx, silu_gate, up_proj);
         defer hidden.deinit();
 
-        const w2_t = try ops.transpose(self.ctx, self.w2);
-        defer w2_t.deinit();
-        return ops.matmul(self.ctx, hidden, w2_t);
+        return self.expertMatmul(hidden, w2, self.w2_scales, self.w2_biases);
     }
 };
 
@@ -379,11 +514,19 @@ pub const DSV4Gate = struct {
     route_scale: f32,
     scoring_func: DSV4Config.ScoringFunc,
     is_hash: bool,
+    /// Smelt mode: optional mask of resident experts. If present, non-resident
+    /// experts receive a large negative routing bias to prevent selection.
+    /// Owned by the gate; freed in deinit.
+    smelt_mask: ?[]bool = null,
+    allocator: ?std.mem.Allocator = null,
 
     pub fn deinit(self: *DSV4Gate) void {
         self.weight.deinit();
         if (self.bias) |b| b.deinit();
         if (self.tid2eid) |t| t.deinit();
+        if (self.smelt_mask) |mask| {
+            if (self.allocator) |alloc| alloc.free(mask);
+        }
     }
 
     pub fn forward(self: *DSV4Gate, hidden_states: Array, input_ids: ?Array, stream: c.c.mlx_stream) !struct { Array, Array } {
@@ -401,29 +544,21 @@ pub const DSV4Gate = struct {
         const logits = try ops.matmul(self.ctx, flat, weight_t);
         defer logits.deinit();
 
+        // Promote to float32 for numerical stability (matching Python: logits.astype(mx.float32))
+        const logits_f32 = try ops.astype(self.ctx, logits, .float32);
+        defer logits_f32.deinit();
+
         // Apply scoring function
         var scores: Array = undefined;
         switch (self.scoring_func) {
             .softmax => {
-                scores = try ops.softmax(self.ctx, logits, &[_]i32{-1});
+                scores = try ops.softmax(self.ctx, logits_f32, &[_]i32{-1});
             },
             .sigmoid => {
-                // sigmoid(x) = 1 / (1 + exp(-x))
-                const neg = try ops.negative(self.ctx, logits);
-                defer neg.deinit();
-                const exp_neg = try ops.exp(self.ctx, neg);
-                defer exp_neg.deinit();
-                const one = try ops.scalarF32(self.ctx, 1.0);
-                defer one.deinit();
-                const denom = try ops.add(self.ctx, one, exp_neg);
-                defer denom.deinit();
-                scores = try ops.divide(self.ctx, one, denom);
+                scores = try ops.sigmoid(self.ctx, logits_f32);
             },
             .sqrtsoftplus => {
-                // softplus(x) = log(1 + exp(x))
-                // For numerical stability: softplus(x) = max(0, x) + log(1 + exp(-|x|))
-                // Simplified: log(1 + exp(x))
-                const exp_logits = try ops.exp(self.ctx, logits);
+                const exp_logits = try ops.exp(self.ctx, logits_f32);
                 defer exp_logits.deinit();
                 const one = try ops.scalarF32(self.ctx, 1.0);
                 defer one.deinit();
@@ -448,6 +583,23 @@ pub const DSV4Gate = struct {
             const biased = try ops.add(self.ctx, scores, bias_exp);
             scores_for_choice = biased;
         }
+
+        // Apply Smelt mode routing bias: non-resident experts get -inf score
+        if (self.smelt_mask) |mask| {
+            var bias_data = try self.ctx.allocator.alloc(f32, mask.len);
+            defer self.ctx.allocator.free(bias_data);
+            for (mask, 0..) |resident, i| {
+                bias_data[i] = if (resident) 0.0 else -1e9;
+            }
+            const smelt_bias = try Array.fromData(self.ctx.allocator, f32, bias_data, &[_]i32{@intCast(mask.len)});
+            defer smelt_bias.deinit();
+            const bias_exp = try ops.expandDims(self.ctx, smelt_bias, 0);
+            defer bias_exp.deinit();
+            const biased = try ops.add(self.ctx, scores_for_choice, bias_exp);
+            if (scores_for_choice.inner.ctx != scores.inner.ctx) scores_for_choice.deinit();
+            scores_for_choice = biased;
+        }
+
         defer if (scores_for_choice.inner.ctx != scores.inner.ctx) scores_for_choice.deinit();
 
         // Hash-based routing (first num_hash_layers) or score-based top-k
@@ -515,22 +667,330 @@ pub const DSV4Gate = struct {
     }
 };
 
+/// Fused SwitchGLU for MoE expert dispatch using gather_mm.
+/// Stores expert weights in fused [n_experts, out, in] format and dispatches
+/// via gather_mm (or gather_qmm for quantized) — matching mlx-lm's SwitchGLU.
+pub const DSV4SwitchGLU = struct {
+    ctx: EagerContext,
+    // Fused expert weights: [n_experts, intermediate, hidden] or quantized equivalents
+    gate_proj: Array, // w1: [n_experts, moe_intermediate_size, hidden_size]
+    up_proj: Array, // w3: [n_experts, moe_intermediate_size, hidden_size]
+    down_proj: Array, // w2: [n_experts, hidden_size, moe_intermediate_size]
+    // Optional quantized scales/biases for gatherQmm
+    gate_proj_scales: ?Array,
+    gate_proj_biases: ?Array,
+    up_proj_scales: ?Array,
+    up_proj_biases: ?Array,
+    down_proj_scales: ?Array,
+    down_proj_biases: ?Array,
+    is_quantized: bool,
+    quant_group_size: i32,
+    quant_bits: u8,
+    quant_mode: []const u8,
+    swiglu_limit: f32,
+    sort_threshold: usize,
+
+    pub fn deinit(self: *DSV4SwitchGLU) void {
+        self.gate_proj.deinit();
+        self.up_proj.deinit();
+        self.down_proj.deinit();
+        if (self.gate_proj_scales) |s| s.deinit();
+        if (self.gate_proj_biases) |b| b.deinit();
+        if (self.up_proj_scales) |s| s.deinit();
+        if (self.up_proj_biases) |b| b.deinit();
+        if (self.down_proj_scales) |s| s.deinit();
+        if (self.down_proj_biases) |b| b.deinit();
+    }
+
+    /// Dispatch tokens to experts via gather_mm, matching mlx-lm DeepseekV4SwitchGLU.
+    /// x: [N, hidden_size], indices: [N, topk] (expert IDs), scores: [N, topk] (weights)
+    pub fn forward(self: *DSV4SwitchGLU, x: Array, indices: Array, scores: Array, stream: c.c.mlx_stream) !Array {
+        _ = stream;
+        const out_shape_arr = x.shape();
+        const route_shape = indices.shape();
+        const n_tokens = @as(usize, @intCast(out_shape_arr[0]));
+        const hidden_dim = @as(usize, @intCast(out_shape_arr[1]));
+        const topk = @as(usize, @intCast(route_shape[route_shape.len - 1]));
+
+        // Expand x: [N, D] → [N, 1, 1, D] for gather_mm compatibility
+        const x_4d = try ops.expandDims(self.ctx, x, -2);
+        defer x_4d.deinit();
+        const x_exp = try ops.expandDims(self.ctx, x_4d, -2);
+        defer x_exp.deinit();
+
+        // Sort tokens by expert ID for memory locality (when enough tokens)
+        const total_indices = indices.size();
+        const do_sort = total_indices >= self.sort_threshold;
+
+        // Prepare transposed weights (swapaxes -1, -2 on [n_experts, out, in] → [n_experts, in, out])
+        const gate_proj_t = try ops.transposeAxes(self.ctx, self.gate_proj, &[_]i32{ 0, 2, 1 });
+        defer gate_proj_t.deinit();
+        const up_proj_t = try ops.transposeAxes(self.ctx, self.up_proj, &[_]i32{ 0, 2, 1 });
+        defer up_proj_t.deinit();
+        const down_proj_t = try ops.transposeAxes(self.ctx, self.down_proj, &[_]i32{ 0, 2, 1 });
+        defer down_proj_t.deinit();
+
+        if (do_sort) {
+            // Flatten indices, argsort, reorder
+            const flat_indices = try ops.reshape(self.ctx, indices, &[_]i32{@intCast(total_indices)});
+            defer flat_indices.deinit();
+
+            var order_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&order_handle, flat_indices.inner, 0, self.ctx.stream.inner));
+            const order = Array.fromHandle(order_handle);
+            defer order.deinit();
+
+            var inv_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&inv_handle, order.inner, 0, self.ctx.stream.inner));
+            const inv_order = Array.fromHandle(inv_handle);
+            defer inv_order.deinit();
+
+            // Reorder x: x_exp.flatten(0, -3)[order // topk]
+            const x_flat = try shape_mod.flatten(self.ctx, x_exp, 0, @as(i32, @intCast(x_exp.ndim())) - 3);
+            defer x_flat.deinit();
+            const topk_scalar = try ops.scalarI32(self.ctx, @intCast(topk));
+            defer topk_scalar.deinit();
+            const order_i32 = try ops.astype(self.ctx, order, .int32);
+            defer order_i32.deinit();
+            const token_idx_f = try ops.divide(self.ctx, order_i32, topk_scalar);
+            defer token_idx_f.deinit();
+            const token_idx = try ops.astype(self.ctx, token_idx_f, .int32);
+            defer token_idx.deinit();
+            const sx = try shape_mod.takeAxis(self.ctx, x_flat, token_idx, 0);
+            defer sx.deinit();
+
+            // Sorted indices and scores
+            const si_raw = try shape_mod.take(self.ctx, flat_indices, order);
+            defer si_raw.deinit();
+            const si = try ops.astype(self.ctx, si_raw, .uint32);
+            defer si.deinit();
+            const flat_scores = try ops.reshape(self.ctx, scores, &[_]i32{@intCast(total_indices)});
+            defer flat_scores.deinit();
+            const ss = try shape_mod.take(self.ctx, flat_scores, order);
+            defer ss.deinit();
+
+            // Expert dispatch
+            const x_up = try self.dispatchGatherMm(sx, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, si, true);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(sx, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, si, true);
+            defer x_gate.deinit();
+
+            // LimitedSwiGLU
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Multiply scores before down_proj
+            const ss_exp = try ops.expandDims(self.ctx, ss, -1);
+            defer ss_exp.deinit();
+            const ss_exp2 = try ops.expandDims(self.ctx, ss_exp, -1);
+            defer ss_exp2.deinit();
+            const weighted = try ops.multiply(self.ctx, activated, ss_exp2);
+            defer weighted.deinit();
+
+            // Down projection
+            const x_down = try self.dispatchGatherMm(weighted, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, si, true);
+            defer x_down.deinit();
+
+            // Unsort
+            const unsorted = try shape_mod.takeAxis(self.ctx, x_down, inv_order, 0);
+            defer unsorted.deinit();
+            const unflat = try shape_mod.unflatten(self.ctx, unsorted, 0, &[_]i32{ @intCast(n_tokens), @intCast(topk) });
+            defer unflat.deinit();
+
+            // Squeeze and sum over topk
+            const squeezed = try ops.squeeze(self.ctx, unflat);
+            defer squeezed.deinit();
+            const summed = try reduce_mod.sumAxis(self.ctx, squeezed, -2, false);
+            defer summed.deinit();
+            return ops.reshape(self.ctx, summed, &[_]i32{ @intCast(n_tokens), @intCast(hidden_dim) });
+        } else {
+            // No sorting — direct dispatch
+            const x_up = try self.dispatchGatherMm(x_exp, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, indices, false);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(x_exp, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, indices, false);
+            defer x_gate.deinit();
+
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Multiply scores before down_proj
+            const s_exp = try ops.expandDims(self.ctx, scores, -1);
+            defer s_exp.deinit();
+            const s_exp2 = try ops.expandDims(self.ctx, s_exp, -1);
+            defer s_exp2.deinit();
+            const weighted = try ops.multiply(self.ctx, activated, s_exp2);
+            defer weighted.deinit();
+
+            const x_down = try self.dispatchGatherMm(weighted, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, indices, false);
+            defer x_down.deinit();
+
+            // Squeeze and sum over topk
+            const squeezed = try ops.squeeze(self.ctx, x_down);
+            defer squeezed.deinit();
+            const summed = try reduce_mod.sumAxis(self.ctx, squeezed, -2, false);
+            defer summed.deinit();
+            return ops.reshape(self.ctx, summed, &[_]i32{ @intCast(n_tokens), @intCast(hidden_dim) });
+        }
+    }
+
+    /// Forward pass WITHOUT score weighting — matches Python mlx-lm SwitchGLU.__call__.
+    /// Returns [N, topk, D] (not summed over topk). Caller applies scores and sums.
+    /// This is the correct behavior per Python reference:
+    ///   y = switch_mlp(x, inds)                    # this function
+    ///   y = (y * scores[..., None]).sum(axis=-2)    # caller does this
+    pub fn forwardNoScores(self: *DSV4SwitchGLU, x: Array, indices: Array, stream: c.c.mlx_stream) !Array {
+        _ = stream;
+        const route_shape = indices.shape();
+        const topk = @as(usize, @intCast(route_shape[route_shape.len - 1]));
+
+        // Expand x: [N, D] → [N, 1, 1, D]
+        const x_4d = try ops.expandDims(self.ctx, x, -2);
+        defer x_4d.deinit();
+        const x_exp = try ops.expandDims(self.ctx, x_4d, -2);
+        defer x_exp.deinit();
+
+        const total_indices = indices.size();
+        const do_sort = total_indices >= self.sort_threshold;
+
+        const gate_proj_t = try ops.transposeAxes(self.ctx, self.gate_proj, &[_]i32{ 0, 2, 1 });
+        defer gate_proj_t.deinit();
+        const up_proj_t = try ops.transposeAxes(self.ctx, self.up_proj, &[_]i32{ 0, 2, 1 });
+        defer up_proj_t.deinit();
+        const down_proj_t = try ops.transposeAxes(self.ctx, self.down_proj, &[_]i32{ 0, 2, 1 });
+        defer down_proj_t.deinit();
+
+        if (do_sort) {
+            const flat_indices = try ops.reshape(self.ctx, indices, &[_]i32{@intCast(total_indices)});
+            defer flat_indices.deinit();
+
+            var order_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&order_handle, flat_indices.inner, 0, self.ctx.stream.inner));
+            const order = Array.fromHandle(order_handle);
+            defer order.deinit();
+
+            var inv_handle = c.c.mlx_array_new();
+            try c.check(c.c.mlx_argsort_axis(&inv_handle, order.inner, 0, self.ctx.stream.inner));
+            const inv_order = Array.fromHandle(inv_handle);
+            defer inv_order.deinit();
+
+            const x_flat = try shape_mod.flatten(self.ctx, x_exp, 0, @as(i32, @intCast(x_exp.ndim())) - 3);
+            defer x_flat.deinit();
+            const topk_scalar = try ops.scalarI32(self.ctx, @intCast(topk));
+            defer topk_scalar.deinit();
+            const order_i32 = try ops.astype(self.ctx, order, .int32);
+            defer order_i32.deinit();
+            const token_idx_f = try ops.divide(self.ctx, order_i32, topk_scalar);
+            defer token_idx_f.deinit();
+            const token_idx = try ops.astype(self.ctx, token_idx_f, .int32);
+            defer token_idx.deinit();
+            const sx = try shape_mod.takeAxis(self.ctx, x_flat, token_idx, 0);
+            defer sx.deinit();
+
+            const si_raw = try shape_mod.take(self.ctx, flat_indices, order);
+            defer si_raw.deinit();
+            const si = try ops.astype(self.ctx, si_raw, .uint32);
+            defer si.deinit();
+
+            const x_up = try self.dispatchGatherMm(sx, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, si, true);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(sx, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, si, true);
+            defer x_gate.deinit();
+
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Down projection WITHOUT score weighting
+            const x_down = try self.dispatchGatherMm(activated, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, si, true);
+            defer x_down.deinit();
+
+            // Unsort and unflatten to [N, topk, 1, D]
+            const unsorted = try shape_mod.takeAxis(self.ctx, x_down, inv_order, 0);
+            defer unsorted.deinit();
+            const unflat = try shape_mod.unflatten(self.ctx, unsorted, 0, indices.shape());
+            defer unflat.deinit();
+            // Squeeze only axis -2 (the singleton dim from gather_mm), not all singletons
+            // Python: return x.squeeze(-2)
+            return shape_mod.squeezeAxes(self.ctx, unflat, &[_]i32{-2});
+        } else {
+            const x_up = try self.dispatchGatherMm(x_exp, self.up_proj, up_proj_t, self.up_proj_scales, self.up_proj_biases, indices, false);
+            defer x_up.deinit();
+            const x_gate = try self.dispatchGatherMm(x_exp, self.gate_proj, gate_proj_t, self.gate_proj_scales, self.gate_proj_biases, indices, false);
+            defer x_gate.deinit();
+
+            const activated = try self.limitedSwiGLU(x_gate, x_up);
+            defer activated.deinit();
+
+            // Down projection WITHOUT score weighting
+            const x_down = try self.dispatchGatherMm(activated, self.down_proj, down_proj_t, self.down_proj_scales, self.down_proj_biases, indices, false);
+            defer x_down.deinit();
+
+            // Squeeze only axis -2 (the singleton dim from gather_mm)
+            // Python: return x.squeeze(-2)
+            return shape_mod.squeezeAxes(self.ctx, x_down, &[_]i32{-2});
+        }
+    }
+
+    fn limitedSwiGLU(self: *DSV4SwitchGLU, gate: Array, up: Array) !Array {
+        if (self.swiglu_limit > 0) {
+            const limit_pos = try ops.scalarF32(self.ctx, self.swiglu_limit);
+            defer limit_pos.deinit();
+            const limit_neg = try ops.scalarF32(self.ctx, -self.swiglu_limit);
+            defer limit_neg.deinit();
+            const gate_clipped = try math_mod.minimum(self.ctx, gate, limit_pos);
+            defer gate_clipped.deinit();
+            const up_lo = try math_mod.maximum(self.ctx, up, limit_neg);
+            defer up_lo.deinit();
+            const up_clipped = try math_mod.minimum(self.ctx, up_lo, limit_pos);
+            defer up_clipped.deinit();
+            const silu_g = try ops.multiply(self.ctx, gate_clipped, try ops.sigmoid(self.ctx, gate_clipped));
+            defer silu_g.deinit();
+            return ops.multiply(self.ctx, silu_g, up_clipped);
+        }
+        const silu_g = try ops.multiply(self.ctx, gate, try ops.sigmoid(self.ctx, gate));
+        defer silu_g.deinit();
+        return ops.multiply(self.ctx, silu_g, up);
+    }
+
+    /// Dispatch matmul to either gatherMm (float) or gatherQmm (quantized).
+    fn dispatchGatherMm(self: *DSV4SwitchGLU, x: Array, weight: Array, weight_t: Array, scales: ?Array, biases: ?Array, indices_arr: Array, sorted: bool) !Array {
+        if (self.is_quantized) {
+            const qconfig = quantize_mod.QuantConfig{
+                .group_size = self.quant_group_size,
+                .bits = self.quant_bits,
+                .mode = if (std.mem.eql(u8, self.quant_mode, "mxfp4")) .mxfp4 else .affine,
+            };
+            return quantize_mod.gatherQmm(self.ctx, x, weight, scales.?, biases, null, indices_arr, true, qconfig, sorted);
+        }
+        return ops.gatherMm(self.ctx, x, weight_t, null, indices_arr, sorted);
+    }
+};
+
 /// MoE layer: routed experts + shared expert.
+/// Uses fused gather_mm dispatch (matching mlx-lm DeepseekV4MoE).
 pub const DSV4MoE = struct {
     ctx: EagerContext,
     gate: DSV4Gate,
-    experts: []DSV4Expert,
+    switch_mlp: DSV4SwitchGLU,
     shared_expert: DSV4Expert,
     n_routed_experts: usize,
     n_activated_experts: usize,
+    /// When smelt slices fused weights, maps original expert ID → sliced row index.
+    /// null when all experts are loaded (no remapping needed).
+    expert_remap: ?Array,
+    /// When true, switch_mlp experts are loaded. When false, uses stream_provider or shared-expert-only.
+    experts_loaded: bool,
+    /// Expert streaming provider — loads expert weights from SSD on demand.
+    /// When set, forward uses streaming instead of pre-loaded fused weights.
+    stream_provider: ?*expert_stream.ExpertStreamProvider = null,
+    /// Layer index for streaming (each MoE layer needs to know its index).
+    layer_idx: usize = 0,
 
     pub fn deinit(self: *DSV4MoE) void {
         self.gate.deinit();
-        for (self.experts) |*expert| {
-            expert.deinit();
-        }
-        self.ctx.allocator.free(self.experts);
+        if (self.experts_loaded) self.switch_mlp.deinit();
         self.shared_expert.deinit();
+        if (self.expert_remap) |r| r.deinit();
+        // stream_provider is owned by the model, not individual MoE layers
     }
 
     pub fn forward(self: *DSV4MoE, hidden_states: Array, input_ids: Array, stream: c.c.mlx_stream) !Array {
@@ -543,111 +1003,71 @@ pub const DSV4MoE = struct {
         const flat = try ops.reshape(self.ctx, hidden_states, &[_]i32{ @intCast(batch * seq_len), @intCast(dim) });
         defer flat.deinit();
 
-        // Gate routing
-        const weights, const indices = try self.gate.forward(flat, input_ids, stream);
-        defer weights.deinit();
+        // Shared expert always runs
+        const shared_out = try self.shared_expert.forward(flat, stream);
+        defer shared_out.deinit();
+
+        // Gate routing: returns (scores [N, topk], indices [N, topk])
+        const weights_arr, const indices = try self.gate.forward(flat, input_ids, stream);
+        defer weights_arr.deinit();
         defer indices.deinit();
 
-        // Initialize output
-        const output_shape = [_]i32{ @intCast(batch * seq_len), @intCast(dim) };
-        var y = try array_mod.zeros(self.ctx.allocator, &output_shape, .float32);
-        errdefer y.deinit();
+        // Expert dispatch — choose path based on available resources
+        const y = if (self.stream_provider) |sp| blk: {
+            // Streaming path: load expert weights from SSD on demand
+            break :blk try sp.streamForward(self.layer_idx, flat, indices, weights_arr);
+        } else if (self.experts_loaded) blk: {
+            // Pre-loaded path: use fused weights in memory
+            const remapped_indices = if (self.expert_remap) |remap| blk2: {
+                var res = c.c.mlx_array_new();
+                try c.check(c.c.mlx_take(&res, remap.inner, indices.inner, self.ctx.stream.inner));
+                break :blk2 Array.fromHandle(res);
+            } else indices;
+            defer if (self.expert_remap != null) remapped_indices.deinit();
+            break :blk try self.switch_mlp.forward(flat, remapped_indices, weights_arr, stream);
+        } else blk: {
+            // No experts available — return zeros (shared expert only)
+            var zeros_raw = c.c.mlx_array_new();
+            try c.check(c.c.mlx_zeros_like(&zeros_raw, shared_out.inner, self.ctx.stream.inner));
+            break :blk Array.fromHandle(zeros_raw);
+        };
+        defer y.deinit();
 
-        // MOE ROUTER INTEGRATION POINT (R20.2): The inline expert dispatch loop below
-        // (mask computation, per-expert iteration, weighted accumulation) can be replaced
-        // with `moe_router.MoERouter.expandTokens()` and `moe_router.MoERouter.reduceExperts()`.
-        //
-        // expandTokens duplicates each token k times (one per selected expert), producing
-        // [N*k, dim]. Each expert processes its assigned slice. reduceExperts then performs
-        // the weighted sum back to [N, dim]. Usage:
-        //
-        //   const moe_router = @import("../moe_router.zig");
-        //   const route = moe_router.RouteResult{
-        //       .indices = indices, .weights = weights, .k = self.n_activated_experts,
-        //   };
-        //   const expanded = try moe_router.MoERouter.expandTokens(self.ctx, flat, route);
-        //   // ... run each expert on its slice of expanded tokens ...
-        //   const y = try moe_router.MoERouter.reduceExperts(self.ctx, expert_outs, route);
-        //
-        // Note: The current mask-based approach runs all experts and masks inactive tokens
-        // to zero, while expandTokens/reduceExperts uses a gather/scatter pattern. Both
-        // produce equivalent results but the router approach avoids redundant expert
-        // computation on zero-masked inputs.
-
-        // Precompute all-expert mask in one broadcasted equal op:
-        // indices: [N, topk] -> expand to [N, topk, 1]
-        // expert_range: [1, 1, n_routed_experts]
-        // all_masks: [N, topk, n_routed_experts]
-        const indices_exp = try ops.expandDims(self.ctx, indices, 2);
-        defer indices_exp.deinit();
-
-        var expert_range_data = try self.ctx.allocator.alloc(f32, self.n_routed_experts);
-        defer self.ctx.allocator.free(expert_range_data);
-        for (0..self.n_routed_experts) |i| expert_range_data[i] = @floatFromInt(i);
-        const expert_range = try Array.fromData(self.ctx.allocator, f32, expert_range_data, &[_]i32{ 1, 1, @intCast(self.n_routed_experts) });
-        defer expert_range.deinit();
-
-        const all_masks = try cmp_mod.equal(self.ctx, indices_exp, expert_range);
-        defer all_masks.deinit();
-
-        // Route each token to its selected experts
-        for (0..self.n_routed_experts) |eid| {
-            const expert = &self.experts[eid];
-
-            // Extract mask for this expert: [N, topk, 1]
-            const mask = try ops.slice(self.ctx, all_masks, &[_]i32{ 0, 0, @intCast(eid) }, &[_]i32{ @intCast(batch * seq_len), @intCast(self.n_activated_experts), @intCast(eid + 1) }, &[_]i32{});
-            defer mask.deinit();
-
-            // Check if any token is routed to this expert
-            const has_tokens = try reduce_mod.sumAxes(self.ctx, mask, &[_]i32{ 0, 1, 2 }, false);
-            defer has_tokens.deinit();
-            const has_tokens_val = try has_tokens.dataPtr(f32);
-            if (has_tokens_val[0] == 0.0) continue;
-
-            // For each position in top-k
-            for (0..self.n_activated_experts) |k| {
-                const k_slice = try ops.slice(self.ctx, mask, &[_]i32{ 0, @intCast(k), 0 }, &[_]i32{ @intCast(batch * seq_len), @intCast(k + 1), 1 }, &[_]i32{});
-                defer k_slice.deinit();
-                const k_mask = try ops.reshape(self.ctx, k_slice, &[_]i32{ @intCast(batch * seq_len) });
-                defer k_mask.deinit();
-
-                // Gather tokens for this expert at this k position
-                const mask_f32 = try ops.astype(self.ctx, k_mask, .float32);
-                defer mask_f32.deinit();
-                const mask_exp = try ops.expandDims(self.ctx, mask_f32, 1);
-                defer mask_exp.deinit();
-
-                const masked_input = try ops.multiply(self.ctx, flat, mask_exp);
-                defer masked_input.deinit();
-
-                // Run expert
-                const expert_out = try expert.forward(masked_input, stream);
-                defer expert_out.deinit();
-
-                // Get weight for this k position
-                const k_weight = try ops.slice(self.ctx, weights, &[_]i32{ 0, @intCast(k) }, &[_]i32{ @intCast(batch * seq_len), @intCast(k + 1) }, &[_]i32{});
-                defer k_weight.deinit();
-                const k_weight_flat = try ops.reshape(self.ctx, k_weight, &[_]i32{ @intCast(batch * seq_len) });
-                defer k_weight_flat.deinit();
-                const k_weight_exp = try ops.expandDims(self.ctx, k_weight_flat, 1);
-                defer k_weight_exp.deinit();
-
-                // Weighted output
-                const weighted_out = try ops.multiply(self.ctx, expert_out, k_weight_exp);
-                defer weighted_out.deinit();
-
-                // Accumulate
-                const new_y = try ops.add(self.ctx, y, weighted_out);
-                y.deinit();
-                y = new_y;
+        // DIAGNOSTIC: Compare expert output (y) and shared expert output magnitudes
+        if (self.layer_idx == 0 and self.stream_provider != null) {
+            try y.eval();
+            try shared_out.eval();
+            const y_f32 = try ops.astype(self.ctx, y, .float32);
+            defer y_f32.deinit();
+            try y_f32.eval();
+            const s_f32 = try ops.astype(self.ctx, shared_out, .float32);
+            defer s_f32.deinit();
+            try s_f32.eval();
+            const y_data = try y_f32.dataSlice(f32);
+            const s_data = try s_f32.dataSlice(f32);
+            var y_max: f32 = -std.math.inf(f32);
+            var s_max: f32 = -std.math.inf(f32);
+            var y_sum: f64 = 0;
+            var s_sum: f64 = 0;
+            const n = @min(y_data.len, 1000);
+            for (0..n) |i| {
+                if (y_data[i] > y_max) y_max = y_data[i];
+                y_sum += y_data[i];
             }
+            for (0..@min(s_data.len, 1000)) |i| {
+                if (s_data[i] > s_max) s_max = s_data[i];
+                s_sum += s_data[i];
+            }
+            std.log.info("MOE DIAG layer 0: y shape={any} shared shape={any}", .{ y.shape(), shared_out.shape() });
+            std.log.info("MOE DIAG layer 0: y mean={d:.6} max={d:.6}, shared mean={d:.6} max={d:.6}", .{
+                y_sum / @as(f64, @floatFromInt(n)),                      y_max,
+                s_sum / @as(f64, @floatFromInt(@min(s_data.len, 1000))), s_max,
+            });
         }
 
         // Add shared expert
-        const shared_out = try self.shared_expert.forward(flat, stream);
-        defer shared_out.deinit();
         const final_out = try ops.add(self.ctx, y, shared_out);
-        y.deinit();
+        defer final_out.deinit();
 
         // Reshape back
         return ops.reshape(self.ctx, final_out, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(dim) });
@@ -668,7 +1088,127 @@ pub const DSV4MoE = struct {
 ///   4. Select top-k blocks by score
 ///   5. Gather only selected blocks for full attention
 ///
-/// This reduces CSA attention cost from O(n_compressed_blocks) to O(index_topk).
+/// Indexer module for CSA sparse block selection (matching mlx-lm Indexer).
+/// Contains its own Compressor for independent pooling, plus Q projection and scoring.
+pub const Indexer = struct {
+    ctx: EagerContext,
+    n_heads: usize,
+    head_dim: usize,
+    index_topk: usize,
+    wq_b: Array, // Linear weight: [n_heads * head_dim, q_lora_rank]
+    weights_proj: Array, // Linear weight: [n_heads, hidden_size]
+    compressor: Compressor,
+    scale: f32,
+
+    pub fn deinit(self: *Indexer) void {
+        self.wq_b.deinit();
+        self.weights_proj.deinit();
+        self.compressor.deinit();
+    }
+
+    /// Forward: score compressed blocks and return top-k indices.
+    /// x: [B, L, hidden_size], q_residual: [B, L, q_lora_rank]
+    /// compress_rope: RoPE for compressor, position_rope: RoPE for Q projection
+    /// Returns: top-k indices [B, L, K] or null if no pooled blocks
+    pub fn forward(
+        self: *Indexer,
+        x: Array,
+        q_residual: Array,
+        compress_rope: *DSV4YarnRoPE,
+        position_rope: *DSV4YarnRoPE,
+        cache: ?*kvcache.DeepseekV4Cache,
+        start_pos: usize,
+    ) !?Array {
+        const x_shape = x.shape();
+        const B = @as(usize, @intCast(x_shape[0]));
+        const L = @as(usize, @intCast(x_shape[1]));
+
+        // Run internal compressor
+        const pooled = try self.compressor.forward(x, compress_rope, cache, start_pos, "indexer_state");
+        defer pooled.deinit();
+
+        if (pooled.shape()[1] == 0) return null;
+
+        const N_pooled = @as(usize, @intCast(pooled.shape()[1]));
+
+        // Q projection: wq_b(q_residual) → [B, L, n_heads, head_dim]
+        const wq_t = try ops.transpose(self.ctx, self.wq_b);
+        defer wq_t.deinit();
+        const q_proj = try ops.matmul(self.ctx, q_residual, wq_t);
+        defer q_proj.deinit();
+        const q_rs = try ops.reshape(self.ctx, q_proj, &[_]i32{ @intCast(B), @intCast(L), @intCast(self.n_heads), @intCast(self.head_dim) });
+        defer q_rs.deinit();
+        const q_t = try ops.transposeAxes(self.ctx, q_rs, &[_]i32{ 0, 2, 1, 3 }); // [B, n_heads, L, head_dim]
+        defer q_t.deinit();
+
+        // Apply position RoPE to Q
+        const q_roped = try position_rope.apply(q_t, start_pos, self.ctx.stream.inner, false);
+        defer q_roped.deinit();
+
+        // Scores: q @ pooled^T → [B, n_heads, L, N_pooled]
+        const q_f32 = try ops.astype(self.ctx, q_roped, .float32);
+        defer q_f32.deinit();
+        const pooled_exp = try ops.expandDims(self.ctx, pooled, 1); // [B, 1, N_pooled, head_dim]
+        defer pooled_exp.deinit();
+        const pooled_t = try ops.transposeAxes(self.ctx, pooled_exp, &[_]i32{ 0, 1, 3, 2 }); // [B, 1, head_dim, N_pooled]
+        defer pooled_t.deinit();
+        const pooled_f32 = try ops.astype(self.ctx, pooled_t, .float32);
+        defer pooled_f32.deinit();
+        const scores_raw = try ops.matmul(self.ctx, q_f32, pooled_f32); // [B, n_heads, L, N_pooled]
+        defer scores_raw.deinit();
+
+        // max(0, scores) * scale
+        const zero = try ops.scalarF32(self.ctx, 0.0);
+        defer zero.deinit();
+        const scores_relu = try math_mod.maximum(self.ctx, scores_raw, zero);
+        defer scores_relu.deinit();
+        const scale_arr = try ops.scalarF32(self.ctx, self.scale);
+        defer scale_arr.deinit();
+        const scores_scaled = try ops.multiply(self.ctx, scores_relu, scale_arr);
+        defer scores_scaled.deinit();
+
+        // weights_proj(x) weighting: [B, L, n_heads] → [B, n_heads, L] → [B, n_heads, L, 1]
+        const wp_t = try ops.transpose(self.ctx, self.weights_proj);
+        defer wp_t.deinit();
+        const w_proj = try ops.matmul(self.ctx, x, wp_t); // [B, L, n_heads]
+        defer w_proj.deinit();
+        const w_f32 = try ops.astype(self.ctx, w_proj, .float32);
+        defer w_f32.deinit();
+        const n_heads_scale = try ops.scalarF32(self.ctx, 1.0 / @sqrt(@as(f32, @floatFromInt(self.n_heads))));
+        defer n_heads_scale.deinit();
+        const w_scaled = try ops.multiply(self.ctx, w_f32, n_heads_scale);
+        defer w_scaled.deinit();
+        // Transpose to [B, n_heads, L] then expand to [B, n_heads, L, 1]
+        const w_t = try ops.transposeAxes(self.ctx, w_scaled, &[_]i32{ 0, 2, 1 }); // [B, n_heads, L]
+        defer w_t.deinit();
+        const w_exp = try ops.expandDims(self.ctx, w_t, -1); // [B, n_heads, L, 1]
+        defer w_exp.deinit();
+
+        // Weighted scores: (scores * weights[..., None]).sum(axis=1) → [B, L, N_pooled]
+        const weighted_scores = try ops.multiply(self.ctx, scores_scaled, w_exp);
+        defer weighted_scores.deinit();
+        const summed = try reduce_mod.sumAxis(self.ctx, weighted_scores, 1, false); // [B, L, N_pooled]
+        defer summed.deinit();
+
+        // Top-k selection: argpartition(-scores, kth=k-1)[:, :, :k]
+        const k = @min(self.index_topk, N_pooled);
+        const neg_scores = try ops.negative(self.ctx, summed);
+        defer neg_scores.deinit();
+
+        // Use argsort + slice for top-k (argpartition not available in mlx-c)
+        var sorted_handle = c.c.mlx_array_new();
+        try c.check(c.c.mlx_argsort_axis(&sorted_handle, neg_scores.inner, -1, self.ctx.stream.inner));
+        const sorted_indices = Array.fromHandle(sorted_handle);
+        defer sorted_indices.deinit();
+
+        // Take first k indices
+        const topk_indices = try ops.slice(self.ctx, sorted_indices, &[_]i32{ 0, 0, 0 }, &[_]i32{ @intCast(B), @intCast(L), @intCast(k) }, &[_]i32{});
+
+        return topk_indices;
+    }
+};
+
+/// FP4 Lightning Indexer for CSA sparse block selection (LEGACY — replaced by Indexer).
 pub const LightningIndexer = struct {
     ctx: EagerContext,
     wq_index: Array, // [index_n_heads * index_head_dim, head_dim] — query projection
@@ -726,7 +1266,7 @@ pub const LightningIndexer = struct {
 
         // Reshape to multi-head: [B, S, n_heads, head_dim] -> [B, n_heads, S, head_dim]
         const q_mh = try ops.reshape(ctx, q_fp4, &[_]i32{
-            @intCast(batch),     @intCast(seq_len),
+            @intCast(batch),              @intCast(seq_len),
             @intCast(self.index_n_heads), @intCast(self.index_head_dim),
         });
         defer q_mh.deinit();
@@ -734,7 +1274,7 @@ pub const LightningIndexer = struct {
         defer q_mh_t.deinit();
 
         const k_mh = try ops.reshape(ctx, k_fp4, &[_]i32{
-            @intCast(batch),     @intCast(n_blocks),
+            @intCast(batch),              @intCast(n_blocks),
             @intCast(self.index_n_heads), @intCast(self.index_head_dim),
         });
         defer k_mh.deinit();
@@ -773,94 +1313,16 @@ pub const LightningIndexer = struct {
         const topk_indices = try ops.slice(ctx, sorted_indices, &[_]i32{ 0, 0, 0 }, &[_]i32{
             @intCast(batch), @intCast(seq_len), @intCast(self.index_topk),
         }, &[_]i32{});
-        try topk_indices.eval();
+
         return topk_indices;
     }
 
     /// Quantize a tensor to FP4 (E2M1) and immediately dequantize back to float32.
-    /// Uses real MXFP4 quantization via mlx_quantize(mode="mxfp4") for true E2M1 precision,
-    /// matching DeepSeek V4's Lightning Indexer FP4 QK path.
+    /// NOTE: This was originally a simulate path for FP4, but MLX qqmm does not support
+    /// mxfp4 for two-dynamic-activation matmul. We now skip quantization and use
+    /// bfloat16/float32 direct matmul like mlx-lm.
     fn quantize4bit(self: *LightningIndexer, tensor: Array) !Array {
-        const ctx = self.ctx;
-        const stream = ctx.stream.inner;
-
-        // Reshape to 2D for mlx_quantize (requires 2D input)
-        const shape = tensor.shape();
-        const ndim = shape.len;
-        var flat_rows: i32 = 1;
-        for (0..ndim - 1) |i| flat_rows *= shape[i];
-        const last_dim = shape[ndim - 1];
-
-        // MXFP4 requires group_size=32, last dim must be divisible by 32.
-        const group_size: i32 = 32;
-        if (last_dim < group_size) {
-            // Too small to quantize meaningfully, return as-is (copy)
-            return ops.copy(ctx, tensor);
-        }
-
-        const flat = try ops.reshape(ctx, tensor, &[_]i32{ flat_rows, last_dim });
-        defer flat.deinit();
-
-        // Ensure float32 for quantization
-        const flat_f32 = if (tensor.dtype() != .float32)
-            try ops.astype(ctx, flat, .float32)
-        else
-            try ops.copy(ctx, flat);
-        defer flat_f32.deinit();
-
-        // Quantize to MXFP4 (E2M1) — true FP4 precision
-        var vec = c.c.mlx_vector_array_new();
-        defer _ = c.c.mlx_vector_array_free(vec);
-
-        const opt_group: c.c.mlx_optional_int = .{ .value = group_size, .has_value = true };
-        const opt_bits: c.c.mlx_optional_int = .{ .value = 4, .has_value = true };
-
-        try c.check(c.c.mlx_quantize(
-            &vec,
-            flat_f32.inner,
-            opt_group,
-            opt_bits,
-            "mxfp4",
-            .{ .ctx = null },
-            stream,
-        ));
-
-        const vec_size = c.c.mlx_vector_array_size(vec);
-        var packed_arr = c.c.mlx_array_new();
-        var scales_arr = c.c.mlx_array_new();
-        try c.check(c.c.mlx_vector_array_get(&packed_arr, vec, 0));
-        try c.check(c.c.mlx_vector_array_get(&scales_arr, vec, 1));
-        defer _ = c.c.mlx_array_free(packed_arr);
-        defer _ = c.c.mlx_array_free(scales_arr);
-
-        // MXFP4 may not return biases (uses global_scale instead)
-        var biases_arr = c.c.mlx_array_new();
-        if (vec_size >= 3) {
-            try c.check(c.c.mlx_vector_array_get(&biases_arr, vec, 2));
-        }
-        defer _ = c.c.mlx_array_free(biases_arr);
-
-        // Dequantize back to float32 using MXFP4 mode
-        const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_FLOAT32, .has_value = true };
-        var deq = c.c.mlx_array_new();
-        try c.check(c.c.mlx_dequantize(
-            &deq,
-            packed_arr,
-            scales_arr,
-            biases_arr,
-            opt_group,
-            opt_bits,
-            "mxfp4",
-            .{ .ctx = null },
-            no_dtype,
-            stream,
-        ));
-
-        const deq_arr = Array.fromHandle(deq);
-        defer deq_arr.deinit();
-
-        // Reshape back to original shape
-        return ops.reshape(ctx, deq_arr, shape);
+        return ops.copy(self.ctx, tensor);
     }
 
     /// Generate indices [0..n_blocks) for all blocks when n_blocks <= index_topk.
@@ -929,10 +1391,154 @@ pub const LightningIndexer = struct {
         var res = c.c.mlx_array_new();
         try c.check(c.c.mlx_take_along_axis(&res, k_3d.inner, idx_broadcast.inner, 1, ctx.stream.inner));
         const result = Array.fromHandle(res);
-        try result.eval();
+
         return result;
     }
 };
+
+/// Apply score mask: if mask is bool, use where; if float, add.
+fn applyScoreMask(ctx: EagerContext, scores_in: Array, mask_opt: ?Array) !Array {
+    const mask_arr = mask_opt orelse return ops.copy(ctx, scores_in);
+    if (mask_arr.dtype() == .bool_) {
+        const neg_inf = try ops.scalarF32(ctx, -std.math.inf(f32));
+        defer neg_inf.deinit();
+        return ops.where(ctx, mask_arr, scores_in, neg_inf);
+    }
+    const mask_typed = try ops.astype(ctx, mask_arr, scores_in.dtype());
+    defer mask_typed.deinit();
+    return ops.add(ctx, scores_in, mask_typed);
+}
+
+/// Sparse pooled attention: separate local and pooled score computation with concat softmax.
+/// Matches mlx-lm `_sparse_pooled_attention` (deepseek_v4.py:295-333).
+///
+/// q: [B, H, L, D], local_kv: [B, 1, S_local, D], pooled: [B, N_pooled, D],
+/// topk: [B, L, K], local_mask: optional, pooled_mask: optional,
+/// scale: attention scale, sinks: optional [H] attention sink logits
+fn sparsePooledAttention(
+    ctx: EagerContext,
+    q: Array,
+    local_kv: Array,
+    pooled: Array,
+    topk: Array,
+    local_mask: ?Array,
+    pooled_mask: ?Array,
+    scale: f32,
+    sinks: ?Array,
+) !Array {
+    const q_shape = q.shape();
+    const B = q_shape[0];
+    const H = q_shape[1];
+    const L = q_shape[2];
+    const D = q_shape[3];
+    const pooled_shape = pooled.shape();
+    const N_pooled = pooled_shape[1];
+
+    // Gather pooled blocks using topk indices
+    // idx: [B, 1, L, K, 1]
+    const topk_exp = try ops.expandDims(ctx, topk, 1); // [B, 1, L, K]
+    defer topk_exp.deinit();
+    const idx = try ops.expandDims(ctx, topk_exp, -1); // [B, 1, L, K, 1]
+    defer idx.deinit();
+
+    // pooled_broadcast: [B, 1, L, N_pooled, D]
+    const pooled_exp = try ops.expandDims(ctx, pooled, 1); // [B, 1, N_pooled, D]
+    defer pooled_exp.deinit();
+    const pooled_exp2 = try ops.expandDims(ctx, pooled_exp, 2); // [B, 1, 1, N_pooled, D]
+    defer pooled_exp2.deinit();
+    const pooled_bc = try ops.broadcastTo(ctx, pooled_exp2, &[_]i32{ B, 1, L, N_pooled, D });
+    defer pooled_bc.deinit();
+
+    // idx_broadcast: [B, 1, L, K, D]
+    const topk_shape = topk.shape();
+    const K = topk_shape[topk_shape.len - 1];
+    const idx_bc = try ops.broadcastTo(ctx, idx, &[_]i32{ B, 1, L, K, D });
+    defer idx_bc.deinit();
+
+    // Gather: take_along_axis on axis 3
+    var gathered_raw = c.c.mlx_array_new();
+    try c.check(c.c.mlx_take_along_axis(&gathered_raw, pooled_bc.inner, idx_bc.inner, 3, ctx.stream.inner));
+    const gathered_pooled = Array.fromHandle(gathered_raw); // [B, 1, L, K, D]
+    defer gathered_pooled.deinit();
+
+    // q_scaled = q * scale
+    const scale_arr = try ops.scalarF32(ctx, scale);
+    defer scale_arr.deinit();
+    const q_scaled = try ops.multiply(ctx, q, scale_arr);
+    defer q_scaled.deinit();
+
+    // local_scores = q_scaled @ local_kv^T: [B, H, L, S_local]
+    const local_kv_t = try ops.transposeAxes(ctx, local_kv, &[_]i32{ 0, 1, 3, 2 });
+    defer local_kv_t.deinit();
+    const local_scores_raw = try ops.matmul(ctx, q_scaled, local_kv_t);
+    defer local_scores_raw.deinit();
+    const local_scores = try applyScoreMask(ctx, local_scores_raw, local_mask);
+    defer local_scores.deinit();
+
+    // pooled_scores = (q_scaled[:,:,:,None] * gathered_pooled).sum(axis=-1): [B, H, L, K]
+    const q_exp = try ops.expandDims(ctx, q_scaled, 3); // [B, H, L, 1, D]
+    defer q_exp.deinit();
+    // Broadcast gathered_pooled from [B, 1, L, K, D] to [B, H, L, K, D]
+    const gp_bc = try ops.broadcastTo(ctx, gathered_pooled, &[_]i32{ B, H, L, K, D });
+    defer gp_bc.deinit();
+    const qp_prod = try ops.multiply(ctx, q_exp, gp_bc);
+    defer qp_prod.deinit();
+    const pooled_scores_raw = try reduce_mod.sumAxis(ctx, qp_prod, -1, false);
+    defer pooled_scores_raw.deinit();
+    const pooled_scores = try applyScoreMask(ctx, pooled_scores_raw, pooled_mask);
+    defer pooled_scores.deinit();
+
+    // Concatenate scores: [local_scores, pooled_scores] along last axis
+    var all_scores: Array = undefined;
+    var sink_offset: usize = 0;
+    if (sinks) |sink_logits| {
+        sink_offset = 1;
+        // sink_scores: [B, H, L, 1]
+        const sink_rs = try ops.reshape(ctx, sink_logits, &[_]i32{ 1, H, 1, 1 });
+        defer sink_rs.deinit();
+        const sink_bc = try ops.broadcastTo(ctx, sink_rs, &[_]i32{ B, H, L, 1 });
+        defer sink_bc.deinit();
+        const sink_typed = try ops.astype(ctx, sink_bc, local_scores.dtype());
+        defer sink_typed.deinit();
+        all_scores = try shape_mod.concatenateAxis(ctx, &[_]Array{ sink_typed, local_scores, pooled_scores }, -1);
+    } else {
+        all_scores = try shape_mod.concatenateAxis(ctx, &[_]Array{ local_scores, pooled_scores }, -1);
+    }
+    defer all_scores.deinit();
+
+    // Softmax
+    const weights_arr = try ops.softmax(ctx, all_scores, &[_]i32{-1});
+    defer weights_arr.deinit();
+
+    // Split weights back
+    const local_len = local_kv.shape()[2];
+    const sink_i32 = @as(i32, @intCast(sink_offset));
+    const local_end = sink_i32 + local_len;
+    const scores_last = all_scores.shape()[all_scores.ndim() - 1];
+
+    // local_weights: weights[..., sink_offset : sink_offset + local_len]
+    const local_w = try ops.slice(ctx, weights_arr, &[_]i32{ 0, 0, 0, sink_i32 }, &[_]i32{ B, H, L, local_end }, &[_]i32{});
+    defer local_w.deinit();
+    // pooled_weights: weights[..., sink_offset + local_len :]
+    const pooled_w = try ops.slice(ctx, weights_arr, &[_]i32{ 0, 0, 0, local_end }, &[_]i32{ B, H, L, scores_last }, &[_]i32{});
+    defer pooled_w.deinit();
+
+    // out = local_weights @ local_kv
+    const out_local = try ops.matmul(ctx, local_w, local_kv);
+    defer out_local.deinit();
+
+    // out += (pooled_weights[..., None] * gathered_pooled).sum(axis=-2)
+    const pw_exp = try ops.expandDims(ctx, pooled_w, -1); // [B, H, L, K, 1]
+    defer pw_exp.deinit();
+    const pw_pooled = try ops.multiply(ctx, pw_exp, gp_bc);
+    defer pw_pooled.deinit();
+    const pooled_sum = try reduce_mod.sumAxis(ctx, pw_pooled, -2, false); // [B, H, L, D]
+    defer pooled_sum.deinit();
+
+    const out = try ops.add(ctx, out_local, pooled_sum);
+    defer out.deinit();
+    return ops.astype(ctx, out, q.dtype());
+}
 
 /// MLA (Multi-head Latent Attention).
 pub const DSV4Attention = struct {
@@ -940,19 +1546,34 @@ pub const DSV4Attention = struct {
     config: *const DSV4Config,
     layer_idx: usize,
 
-    // Q projection with lora
+    // Q projection with lora (may be quantized)
     wq_a: Array,
+    wq_a_scales: ?Array,
+    wq_a_biases: ?Array,
     wq_b: Array,
+    wq_b_scales: ?Array,
+    wq_b_biases: ?Array,
     q_norm: nn.RMSNorm,
 
-    // KV projection with compression
+    // KV projection (may be quantized)
     wkv: Array,
+    wkv_scales: ?Array,
+    wkv_biases: ?Array,
     kv_norm: nn.RMSNorm,
     kv_b: ?Array,
 
-    // O projection with lora
+    // O projection with lora (may be quantized)
     wo_a: Array,
+    wo_a_scales: ?Array,
+    wo_a_biases: ?Array,
     wo_b: Array,
+    wo_b_scales: ?Array,
+    wo_b_biases: ?Array,
+
+    // Quantization config for attention weights
+    attn_quant_group_size: i32,
+    attn_quant_bits: u8,
+    attn_quant_mode: quantize_mod.QuantMode = .affine,
 
     // RoPE
     rope: DSV4YarnRoPE,
@@ -971,11 +1592,21 @@ pub const DSV4Attention = struct {
 
     pub fn deinit(self: *DSV4Attention) void {
         self.wq_a.deinit();
+        if (self.wq_a_scales) |s| s.deinit();
+        if (self.wq_a_biases) |b| b.deinit();
         self.wq_b.deinit();
+        if (self.wq_b_scales) |s| s.deinit();
+        if (self.wq_b_biases) |b| b.deinit();
         self.wkv.deinit();
+        if (self.wkv_scales) |s| s.deinit();
+        if (self.wkv_biases) |b| b.deinit();
         if (self.kv_b) |kb| kb.deinit();
         self.wo_a.deinit();
+        if (self.wo_a_scales) |s| s.deinit();
+        if (self.wo_a_biases) |b| b.deinit();
         self.wo_b.deinit();
+        if (self.wo_b_scales) |s| s.deinit();
+        if (self.wo_b_biases) |b| b.deinit();
         self.rope.deinit();
         self.q_norm.weight.deinit();
         self.kv_norm.weight.deinit();
@@ -996,250 +1627,365 @@ pub const DSV4Attention = struct {
         start_pos: usize,
         stream: c.c.mlx_stream,
     ) !Array {
-        _ = mask;
         const shape = hidden_states.shape();
         const batch = @as(usize, @intCast(shape[0]));
         const seq_len = @as(usize, @intCast(shape[1]));
         const num_heads = self.config.num_attention_heads;
         const head_dim = self.config.head_dim;
-        const rope_dim = self.config.qk_rope_head_dim;
-        const nope_dim = head_dim - rope_dim;
-        const window_size = self.config.sliding_window;
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
-        // 1. Q projection: x @ wq_a^T -> q_norm -> q @ wq_b^T
-        const wq_a_t = try ops.transpose(self.ctx, self.wq_a);
-        defer wq_a_t.deinit();
-        const q_a = try ops.matmul(self.ctx, hidden_states, wq_a_t);
+        // === Q path ===
+        // Use quantizedMatmul if weights are quantized, else plain matmul
+        const q_a = if (self.wq_a_scales != null) blk: {
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_a, .scales = self.wq_a_scales.?, .biases = self.wq_a_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
+            break :blk try quantize_mod.quantizedMatmul(self.ctx, hidden_states, qw, true);
+        } else blk: {
+            const wq_a_t = try ops.transpose(self.ctx, self.wq_a);
+            defer wq_a_t.deinit();
+            break :blk try ops.matmul(self.ctx, hidden_states, wq_a_t);
+        };
         defer q_a.deinit();
-        const q_normed = try self.q_norm.forward(q_a);
-        defer q_normed.deinit();
-        const wq_b_t = try ops.transpose(self.ctx, self.wq_b);
-        defer wq_b_t.deinit();
-        const q_b = try ops.matmul(self.ctx, q_normed, wq_b_t);
-        defer q_b.deinit();
-
-        // Reshape to [B, S, n_heads, head_dim]
-        const q_rs = try ops.reshape(self.ctx, q_b, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim) });
+        const q_residual = try self.q_norm.forward(q_a);
+        defer q_residual.deinit();
+        const q_proj = if (self.wq_b_scales != null) blk: {
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wq_b, .scales = self.wq_b_scales.?, .biases = self.wq_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
+            break :blk try quantize_mod.quantizedMatmul(self.ctx, q_residual, qw, true);
+        } else blk: {
+            const wq_b_t = try ops.transpose(self.ctx, self.wq_b);
+            defer wq_b_t.deinit();
+            break :blk try ops.matmul(self.ctx, q_residual, wq_b_t);
+        };
+        defer q_proj.deinit();
+        const q_rs = try ops.reshape(self.ctx, q_proj, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim) });
         defer q_rs.deinit();
-
-        // Q RMSNorm (per-head): q *= rsqrt(mean(q^2) + eps)
-        const q_scaled = try applyRMSNorm(self.ctx, q_rs, self.config.rms_norm_eps);
-        defer q_scaled.deinit();
-
-        // Split q into nope and pe parts
-        const q_nope = try ops.slice(self.ctx, q_scaled, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(nope_dim) }, &[_]i32{});
-        defer q_nope.deinit();
-        const q_pe = try ops.slice(self.ctx, q_scaled, &[_]i32{ 0, 0, 0, @intCast(nope_dim) }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim) }, &[_]i32{});
-        defer q_pe.deinit();
-
-        // Apply RoPE to q_pe
-        // q_pe is [B, S, H, rope_dim]; reshape to [B*H, S, rope_dim] for apply
-        const q_pe_rs = try ops.reshape(self.ctx, q_pe, &[_]i32{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(rope_dim) });
-        defer q_pe_rs.deinit();
-        const q_pe_rot = try self.rope.apply(q_pe_rs, start_pos, stream);
-        defer q_pe_rot.deinit();
-        const q_pe_rot_rs = try ops.reshape(self.ctx, q_pe_rot, &[_]i32{ @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(rope_dim) });
-        defer q_pe_rot_rs.deinit();
-        const q_pe_rot_t = try ops.transposeAxes(self.ctx, q_pe_rot_rs, &[_]i32{ 0, 2, 1, 3 });
-        defer q_pe_rot_t.deinit();
-
-        // Concat q_nope and q_pe_rot back
-        const q_rot = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ q_nope, q_pe_rot_t }, 3);
-        defer q_rot.deinit();
-
-        // 2. KV projection: x @ wkv^T -> kv_norm
-        const wkv_t = try ops.transpose(self.ctx, self.wkv);
-        defer wkv_t.deinit();
-        const kv = try ops.matmul(self.ctx, hidden_states, wkv_t);
-        defer kv.deinit();
-        const kv_normed = try self.kv_norm.forward(kv);
-        defer kv_normed.deinit();
-
-        // Apply RoPE to kv[..., -rope_dim:]
-        const kv_nope = try ops.slice(self.ctx, kv_normed, &[_]i32{ 0, 0, 0 }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(nope_dim) }, &[_]i32{});
-        defer kv_nope.deinit();
-        const kv_pe = try ops.slice(self.ctx, kv_normed, &[_]i32{ 0, 0, @intCast(nope_dim) }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(head_dim) }, &[_]i32{});
-        defer kv_pe.deinit();
-        const kv_pe_rot = try self.rope.apply(kv_pe, start_pos, stream);
-        defer kv_pe_rot.deinit();
-
-        // FP8 KV storage: cast non-RoPE dims to FP8 (E4M3), RoPE dims to bfloat16.
-        // DeepSeek V4 stores most KV dimensions in FP8 (reduced precision) while keeping
-        // RoPE dimensions in BF16 for positional encoding fidelity.
-        // Uses native mlx_to_fp8/mlx_from_fp8 for true FP8 storage.
-        const use_fp8 = self.config.kv_storage_dtype != .float32;
-        const kv_nope_stored = if (use_fp8)
-            try ops.toFp8(self.ctx, kv_nope)
-        else
-            kv_nope;
-        defer if (use_fp8) kv_nope_stored.deinit();
-
-        const kv_pe_stored = if (use_fp8)
-            try ops.astype(self.ctx, kv_pe_rot, .bfloat16)
-        else
-            kv_pe_rot;
-        defer if (use_fp8) kv_pe_stored.deinit();
-
-        // Before concatenation, restore FP8 nope dims to bfloat16 for uniform cache dtype.
-        // MLX promotes to wider type during concat, so both must be bfloat16.
-        const kv_nope_for_cat = if (use_fp8)
-            try ops.fromFp8(self.ctx, kv_nope_stored, .bfloat16)
-        else
-            kv_nope_stored;
-        defer if (use_fp8) kv_nope_for_cat.deinit();
-
-        const kv_rot = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ kv_nope_for_cat, kv_pe_stored }, 2);
-        defer kv_rot.deinit();
-
-        // 3. KV compression for CSA/HCA
-        const k_compressed = try compressKV(self.ctx, kv_rot, self.compress_ratio, window_size, self.compress_gate_weight, self.compress_pos_bias, stream);
-        defer if (self.compress_ratio > 1) k_compressed.deinit();
-
-        // 3b. Lightning Indexer: sparse block selection for CSA
-        // If indexer is present and we have compressed blocks, select top-k blocks
-        // instead of attending to all compressed blocks.
-        const k_final = if (self.compress_ratio > 1 and self.indexer != null) blk: {
-            var idx = self.indexer.?;
-            // q_rot is [B, S, n_heads, head_dim] — average across heads for indexer query
-            const q_for_index = try reduce_mod.meanAxis(self.ctx, q_rot, 2, false);
-            defer q_for_index.deinit();
-            // k_compressed is [B, N_blocks, D]
-            const top_indices = try idx.selectTopK(q_for_index, k_compressed);
-            defer top_indices.deinit();
-            const selected = try idx.gatherBlocks(k_compressed, top_indices);
-            break :blk selected;
-        } else if (self.compress_ratio > 1) k_compressed else kv_rot;
-        defer if (self.compress_ratio > 1 and self.indexer != null) k_final.deinit();
-
-        // 4. Sparse attention (simplified: full attention within window)
-        // Transpose q to [B, n_heads, S, head_dim]
-        const q_t = try ops.transposeAxes(self.ctx, q_rot, &[_]i32{ 0, 2, 1, 3 });
+        const q_normed = try applyRMSNorm(self.ctx, q_rs, self.config.rms_norm_eps);
+        defer q_normed.deinit();
+        const q_t = try ops.transposeAxes(self.ctx, q_normed, &[_]i32{ 0, 2, 1, 3 });
         defer q_t.deinit();
+        const q = try self.rope.apply(q_t, start_pos, stream, false);
+        defer q.deinit();
 
-        // For MQA, kv is [B, S, head_dim]. Expand to [B, 1, S, head_dim] for broadcasting.
-        const kv_exp = try ops.expandDims(self.ctx, k_final, 1);
-        defer kv_exp.deinit();
+        // === KV path ===
+        const kv_raw = if (self.wkv_scales != null) blk: {
+            const qw = quantize_mod.QuantizedWeight{ .data = self.wkv, .scales = self.wkv_scales.?, .biases = self.wkv_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
+            break :blk try quantize_mod.quantizedMatmul(self.ctx, hidden_states, qw, true);
+        } else blk: {
+            const wkv_t = try ops.transpose(self.ctx, self.wkv);
+            defer wkv_t.deinit();
+            break :blk try ops.matmul(self.ctx, hidden_states, wkv_t);
+        };
+        defer kv_raw.deinit();
+        const kv_normed = try self.kv_norm.forward(kv_raw);
+        defer kv_normed.deinit();
+        const kv_4d = try ops.reshape(self.ctx, kv_normed, &[_]i32{ @intCast(batch), 1, @intCast(seq_len), @intCast(head_dim) });
+        defer kv_4d.deinit();
+        const kv_roped = try self.rope.apply(kv_4d, start_pos, stream, false);
+        defer kv_roped.deinit();
 
-        // KV Cache integration: append new KV and fetch full cached sequence
-        var k_full: Array = kv_exp;
-        var v_full: Array = kv_exp;
+        // Update local cache
+        var full_kv = kv_roped;
         var kv_slice: ?kvcache.KVSlice = null;
-        if (cache) |cache_strategy| {
-            kv_slice = try cache_strategy.updateAndFetch(kv_exp, kv_exp, stream);
-            k_full = kv_slice.?.keys;
-            v_full = kv_slice.?.values;
+        if (cache) |cs| {
+            kv_slice = try cs.updateAndFetch(kv_roped, kv_roped, stream);
+            full_kv = kv_slice.?.keys;
         }
-        defer if (kv_slice) |slice| {
-            slice.keys.deinit();
-            slice.values.deinit();
+        defer if (kv_slice) |sl| {
+            sl.keys.deinit();
+            sl.values.deinit();
         };
 
-        // Cast KV back to float32 before attention computation for numerical accuracy.
-        // The cache stores in reduced precision (bfloat16 after FP8 round-trip);
-        // attention needs full precision.
-        const k_for_attn = if (use_fp8)
-            try ops.astype(self.ctx, k_full, .float32)
-        else
-            k_full;
-        defer if (use_fp8) k_for_attn.deinit();
-
-        const v_for_attn = if (use_fp8)
-            try ops.astype(self.ctx, v_full, .float32)
-        else
-            v_full;
-        defer if (use_fp8) v_for_attn.deinit();
-
-        // Fast scaled dot-product attention
-        const mask_mode: []const u8 = if (start_pos == 0 and seq_len > 1) "causal" else "";
-        const scale = self.rope.scale;
-        const attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q_t, k_for_attn, v_for_attn, scale, mask_mode, null, self.sink_logits);
+        // === Attention (simplified: concat pooled to local KV for dense SDPA) ===
+        var attn_out: Array = undefined;
+        if (self.compress_ratio > 0 and self.compress_gate_weight != null) {
+            const kv_3d = try ops.reshape(self.ctx, kv_roped, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(head_dim) });
+            defer kv_3d.deinit();
+            const pooled = try compressKV(self.ctx, kv_3d, self.compress_ratio, self.config.sliding_window, self.compress_gate_weight, self.compress_pos_bias, stream);
+            defer pooled.deinit();
+            if (pooled.shape()[1] > 0) {
+                const pooled_4d = try ops.expandDims(self.ctx, pooled, 1);
+                defer pooled_4d.deinit();
+                const combined = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ full_kv, pooled_4d }, 2);
+                defer combined.deinit();
+                // When explicit mask is provided, don't use "causal" string (they conflict in MLX)
+                const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
+                attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, combined, combined, scale, mm, mask, self.sink_logits);
+            } else {
+                const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
+                attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, full_kv, full_kv, scale, mm, mask, self.sink_logits);
+            }
+        } else {
+            const mm: []const u8 = if (mask != null) "" else if (start_pos == 0 and seq_len > 1) "causal" else "";
+            attn_out = try fast_mod.scaledDotProductAttention(self.ctx, q, full_kv, full_kv, scale, mm, mask, self.sink_logits);
+        }
         defer attn_out.deinit();
 
-        // Transpose back: [B, n_heads, S, head_dim] -> [B, S, n_heads, head_dim]
-        const attn_t = try ops.transposeAxes(self.ctx, attn_out, &[_]i32{ 0, 2, 1, 3 });
-        defer attn_t.deinit();
-
-        // Apply inverse RoPE to output pe dimensions
-        const out_nope = try ops.slice(self.ctx, attn_t, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(nope_dim) }, &[_]i32{});
-        defer out_nope.deinit();
-        const out_pe = try ops.slice(self.ctx, attn_t, &[_]i32{ 0, 0, 0, @intCast(nope_dim) }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads), @intCast(head_dim) }, &[_]i32{});
-        defer out_pe.deinit();
-        // out_pe is [B, S, H, rope_dim]; reshape to [B*H, S, rope_dim] for applyInverse
-        const out_pe_rs = try ops.reshape(self.ctx, out_pe, &[_]i32{ @intCast(batch * num_heads), @intCast(seq_len), @intCast(rope_dim) });
-        defer out_pe_rs.deinit();
-        const out_pe_derot = try self.rope.applyInverse(out_pe_rs, start_pos, stream);
-        defer out_pe_derot.deinit();
-        const out_pe_derot_rs = try ops.reshape(self.ctx, out_pe_derot, &[_]i32{ @intCast(batch), @intCast(num_heads), @intCast(seq_len), @intCast(rope_dim) });
-        defer out_pe_derot_rs.deinit();
-        const out_pe_derot_t = try ops.transposeAxes(self.ctx, out_pe_derot_rs, &[_]i32{ 0, 2, 1, 3 });
-        defer out_pe_derot_t.deinit();
-        const o_rot = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ out_nope, out_pe_derot_t }, 3);
-        defer o_rot.deinit();
-
-        // 5. O projection with grouped lora
-        const o_flat = try ops.reshape(self.ctx, o_rot, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads * head_dim) });
-        defer o_flat.deinit();
+        // === Output: inverse partial RoPE → grouped projection → wo_b ===
+        const out_deroped = try self.rope.apply(attn_out, start_pos, stream, true);
+        defer out_deroped.deinit();
 
         const out = if (self.wo_a.ndim() == 3) blk: {
-            // Grouped LoRA path
+            // Grouped LoRA path: wo_a is [n_groups, o_lora_rank, group_feat]
             const wo_a_shape = self.wo_a.shape();
             const n_groups = @as(usize, @intCast(wo_a_shape[0]));
             const o_lora_rank = @as(usize, @intCast(wo_a_shape[1]));
             const heads_per_group = num_heads / n_groups;
-
-            // o_rot: [B, S, n_heads, head_dim] -> [B, S, n_groups, heads_per_group, head_dim]
-            const o_grouped = try ops.reshape(self.ctx, o_rot, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(n_groups), @intCast(heads_per_group), @intCast(head_dim) });
-            defer o_grouped.deinit();
-
-            // Process each group
-            var group_outputs = try self.ctx.allocator.alloc(Array, n_groups);
-            defer self.ctx.allocator.free(group_outputs);
-
+            const o_rs = try ops.reshape(self.ctx, out_deroped, &[_]i32{ @intCast(batch), @intCast(n_groups), @intCast(heads_per_group), @intCast(seq_len), @intCast(head_dim) });
+            defer o_rs.deinit();
+            const o_tr = try ops.transposeAxes(self.ctx, o_rs, &[_]i32{ 1, 0, 3, 2, 4 });
+            defer o_tr.deinit();
+            const o_flat = try ops.reshape(self.ctx, o_tr, &[_]i32{ @intCast(n_groups), @intCast(batch * seq_len), @intCast(heads_per_group * head_dim) });
+            defer o_flat.deinit();
+            var grp_outs = try self.ctx.allocator.alloc(Array, n_groups);
+            defer self.ctx.allocator.free(grp_outs);
             for (0..n_groups) |g| {
-                // Extract group slice: [B, S, heads_per_group, head_dim]
-                const g_slice = try ops.slice(self.ctx, o_grouped, &[_]i32{ 0, 0, @intCast(g), 0, 0 }, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(g + 1), @intCast(heads_per_group), @intCast(head_dim) }, &[_]i32{});
-                defer g_slice.deinit();
-                const g_flat = try ops.reshape(self.ctx, g_slice, &[_]i32{ @intCast(batch * seq_len), @intCast(heads_per_group * head_dim) });
-                defer g_flat.deinit();
-
-                // Extract wo_a for this group: [o_lora_rank, heads_per_group*head_dim]
-                const wa_g = try ops.slice(self.ctx, self.wo_a, &[_]i32{ @intCast(g), 0, 0 }, &[_]i32{ @intCast(g + 1), @intCast(o_lora_rank), @intCast(heads_per_group * head_dim) }, &[_]i32{});
-                defer wa_g.deinit();
-                const wa_g_rs = try ops.reshape(self.ctx, wa_g, &[_]i32{ @intCast(o_lora_rank), @intCast(heads_per_group * head_dim) });
-                defer wa_g_rs.deinit();
-                const wa_g_t = try ops.transpose(self.ctx, wa_g_rs);
-                defer wa_g_t.deinit();
-
-                const g_out = try ops.matmul(self.ctx, g_flat, wa_g_t);
-                group_outputs[g] = g_out;
+                const gi = try ops.slice(self.ctx, o_flat, &[_]i32{ @intCast(g), 0, 0 }, &[_]i32{ @intCast(g + 1), @intCast(batch * seq_len), @intCast(heads_per_group * head_dim) }, &[_]i32{});
+                defer gi.deinit();
+                const gi2 = try ops.reshape(self.ctx, gi, &[_]i32{ @intCast(batch * seq_len), @intCast(heads_per_group * head_dim) });
+                defer gi2.deinit();
+                const wa = try ops.slice(self.ctx, self.wo_a, &[_]i32{ @intCast(g), 0, 0 }, &[_]i32{ @intCast(g + 1), @intCast(o_lora_rank), @intCast(heads_per_group * head_dim) }, &[_]i32{});
+                defer wa.deinit();
+                const wa2 = try ops.reshape(self.ctx, wa, &[_]i32{ @intCast(o_lora_rank), @intCast(heads_per_group * head_dim) });
+                defer wa2.deinit();
+                const wat = try ops.transpose(self.ctx, wa2);
+                defer wat.deinit();
+                grp_outs[g] = try ops.matmul(self.ctx, gi2, wat);
             }
-            defer for (group_outputs) |arr| arr.deinit();
-
-            // Concatenate groups: [B*S, n_groups*o_lora_rank]
-            const o_a_cat = try shape_mod.concatenateAxis(self.ctx, group_outputs, 1);
-            defer o_a_cat.deinit();
-            const o_a_rs = try ops.reshape(self.ctx, o_a_cat, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(n_groups * o_lora_rank) });
-            defer o_a_rs.deinit();
-
-            const wo_b_t = try ops.transpose(self.ctx, self.wo_b);
-            defer wo_b_t.deinit();
-            break :blk try ops.matmul(self.ctx, o_a_rs, wo_b_t);
+            defer for (grp_outs) |a| a.deinit();
+            const cat = try shape_mod.concatenateAxis(self.ctx, grp_outs, 1);
+            defer cat.deinit();
+            const rs = try ops.reshape(self.ctx, cat, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(n_groups * o_lora_rank) });
+            defer rs.deinit();
+            break :blk if (self.wo_b_scales != null) blk2: {
+                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
+                break :blk2 try quantize_mod.quantizedMatmul(self.ctx, rs, qw, true);
+            } else blk2: {
+                const wbt = try ops.transpose(self.ctx, self.wo_b);
+                defer wbt.deinit();
+                break :blk2 try ops.matmul(self.ctx, rs, wbt);
+            };
         } else blk: {
-            // Standard LoRA path
-            const wo_a_t = try ops.transpose(self.ctx, self.wo_a);
-            defer wo_a_t.deinit();
-            const o_a = try ops.matmul(self.ctx, o_flat, wo_a_t);
-            defer o_a.deinit();
-            const wo_b_t = try ops.transpose(self.ctx, self.wo_b);
-            defer wo_b_t.deinit();
-            break :blk try ops.matmul(self.ctx, o_a, wo_b_t);
+            // Non-grouped path: wo_a is 2D
+            const ot = try ops.transposeAxes(self.ctx, out_deroped, &[_]i32{ 0, 2, 1, 3 });
+            defer ot.deinit();
+            const of = try ops.reshape(self.ctx, ot, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(num_heads * head_dim) });
+            defer of.deinit();
+            // Use quantizedMatmul if wo_a has scales
+            const oa = if (self.wo_a_scales != null) blk_qa: {
+                const qw = quantize_mod.QuantizedWeight{
+                    .data = self.wo_a,
+                    .scales = self.wo_a_scales.?,
+                    .biases = self.wo_a_biases orelse Array.fromHandle(c.c.mlx_array_new()),
+                    .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode },
+                    .original_shape = &[_]i32{},
+                };
+                break :blk_qa try quantize_mod.quantizedMatmul(self.ctx, of, qw, true);
+            } else blk_qa: {
+                const wat = try ops.transpose(self.ctx, self.wo_a);
+                defer wat.deinit();
+                break :blk_qa try ops.matmul(self.ctx, of, wat);
+            };
+            defer oa.deinit();
+            break :blk if (self.wo_b_scales != null) blk2: {
+                const qw = quantize_mod.QuantizedWeight{ .data = self.wo_b, .scales = self.wo_b_scales.?, .biases = self.wo_b_biases orelse Array.fromHandle(c.c.mlx_array_new()), .config = .{ .group_size = self.attn_quant_group_size, .bits = self.attn_quant_bits, .mode = self.attn_quant_mode }, .original_shape = &[_]i32{} };
+                break :blk2 try quantize_mod.quantizedMatmul(self.ctx, oa, qw, true);
+            } else blk2: {
+                const wbt = try ops.transpose(self.ctx, self.wo_b);
+                defer wbt.deinit();
+                break :blk2 try ops.matmul(self.ctx, oa, wbt);
+            };
         };
-
         return out;
+    }
+};
+/// Compressor module for KV compression (matching mlx-lm Compressor).
+/// Performs learned softmax-gated pooling with optional overlap transform.
+/// CSA (ratio=4): overlap=true, out_dim=head_dim*2
+/// HCA (ratio=128): overlap=false, out_dim=head_dim
+pub const Compressor = struct {
+    ctx: EagerContext,
+    wkv: Array, // Linear weight: [out_dim, hidden_size]
+    wgate: Array, // Linear weight: [out_dim, hidden_size]
+    ape: Array, // Positional bias: [compress_ratio, out_dim]
+    norm_weight: Array, // RMSNorm weight: [head_dim]
+    compress_ratio: usize,
+    head_dim: usize,
+    rope_head_dim: usize,
+    overlap: bool,
+    out_dim: usize,
+    norm_eps: f32,
+
+    pub fn deinit(self: *Compressor) void {
+        self.wkv.deinit();
+        self.wgate.deinit();
+        self.ape.deinit();
+        self.norm_weight.deinit();
+    }
+
+    /// Overlap transform for CSA (ratio=4): doubles the window by concatenating
+    /// previous block's first half with current block's second half.
+    fn overlapTransform(self: *Compressor, x: Array, fill_value: f32) !Array {
+        // x: [B, W, R, out_dim] where out_dim = head_dim * 2
+        const x_shape = x.shape();
+        const B = x_shape[0];
+        const W = x_shape[1];
+        const R = x_shape[2];
+
+        // second_half = x[:, :, :, head_dim:]
+        const second_half = try ops.slice(self.ctx, x, &[_]i32{ 0, 0, 0, @intCast(self.head_dim) }, &[_]i32{ B, W, R, @intCast(self.out_dim) }, &[_]i32{});
+        defer second_half.deinit();
+
+        // fill_row = full([B, 1, R, head_dim], fill_value)
+        var fill_raw = c.c.mlx_array_new();
+        const fill_shape = [_]i32{ B, 1, R, @intCast(self.head_dim) };
+        const fill_scalar = try ops.scalarF32(self.ctx, fill_value);
+        defer fill_scalar.deinit();
+        try c.check(c.c.mlx_full(&fill_raw, &fill_shape, fill_shape.len, fill_scalar.inner, @intCast(@intFromEnum(x.dtype())), self.ctx.stream.inner));
+        const fill_row = Array.fromHandle(fill_raw);
+        defer fill_row.deinit();
+
+        // prev_first = concat([fill_row, x[:, :-1, :, :head_dim]], axis=1)
+        const first_half = try ops.slice(self.ctx, x, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ B, W - 1, R, @intCast(self.head_dim) }, &[_]i32{});
+        defer first_half.deinit();
+        const prev_first = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ fill_row, first_half }, 1);
+        defer prev_first.deinit();
+
+        // result = concat([prev_first, second_half], axis=2) → [B, W, 2R, head_dim]
+        return shape_mod.concatenateAxis(self.ctx, &[_]Array{ prev_first, second_half }, 2);
+    }
+
+    /// Forward pass: compress input sequence into pooled blocks.
+    /// x: [B, L, hidden_size]
+    /// rope: RoPE module for position encoding on pooled output
+    /// cache: optional DeepseekV4Cache for stateful accumulation
+    /// start_pos: current position offset
+    /// state_key: "compressor_state" or "indexer_state"
+    /// Returns: pooled [B, N_pooled, head_dim]
+    pub fn forward(
+        self: *Compressor,
+        x: Array,
+        rope: *DSV4YarnRoPE,
+        cache: ?*kvcache.DeepseekV4Cache,
+        start_pos: usize,
+        state_key: []const u8,
+    ) !Array {
+        const x_shape = x.shape();
+        const B = @as(usize, @intCast(x_shape[0]));
+
+        // Project: kv = wkv(x), gate = wgate(x)
+        const wkv_t = try ops.transpose(self.ctx, self.wkv);
+        defer wkv_t.deinit();
+        const kv = try ops.matmul(self.ctx, x, wkv_t);
+        defer kv.deinit();
+
+        const wgate_t = try ops.transpose(self.ctx, self.wgate);
+        defer wgate_t.deinit();
+        const gate_raw = try ops.matmul(self.ctx, x, wgate_t);
+        defer gate_raw.deinit();
+
+        // Accumulate windows via cache (or direct computation)
+        var ready_kv: Array = undefined;
+        var ready_gate: Array = undefined;
+        var pool_base: usize = undefined;
+
+        if (cache) |v4_cache| {
+            const result = try v4_cache.accumulateWindows(kv, gate_raw, state_key, self.compress_ratio, start_pos);
+            ready_kv = result[0];
+            ready_gate = result[1];
+            pool_base = result[2];
+        } else {
+            const kv_len = @as(usize, @intCast(kv.shape()[1]));
+            const usable = (kv_len / self.compress_ratio) * self.compress_ratio;
+            if (usable > 0) {
+                ready_kv = try ops.slice(self.ctx, kv, &[_]i32{ 0, 0, 0 }, &[_]i32{ @intCast(B), @intCast(usable), @intCast(self.out_dim) }, &[_]i32{});
+                ready_gate = try ops.slice(self.ctx, gate_raw, &[_]i32{ 0, 0, 0 }, &[_]i32{ @intCast(B), @intCast(usable), @intCast(self.out_dim) }, &[_]i32{});
+            } else {
+                ready_kv = try array_mod.zeros(self.ctx.allocator, &[_]i32{ @intCast(B), 0, @intCast(self.out_dim) }, x.dtype());
+                ready_gate = try array_mod.zeros(self.ctx.allocator, &[_]i32{ @intCast(B), 0, @intCast(self.out_dim) }, x.dtype());
+            }
+            pool_base = start_pos;
+        }
+        defer ready_kv.deinit();
+        defer ready_gate.deinit();
+
+        const ready_len = @as(usize, @intCast(ready_kv.shape()[1]));
+        if (ready_len == 0) {
+            const empty = try array_mod.zeros(self.ctx.allocator, &[_]i32{ @intCast(B), 0, @intCast(self.head_dim) }, x.dtype());
+            if (cache) |v4_cache| {
+                return v4_cache.updatePool(empty, state_key);
+            }
+            return empty;
+        }
+
+        const W = ready_len / self.compress_ratio;
+
+        // Reshape to [B, W, ratio, out_dim]
+        var kv_rs = try ops.reshape(self.ctx, ready_kv, &[_]i32{ @intCast(B), @intCast(W), @intCast(self.compress_ratio), @intCast(self.out_dim) });
+        defer kv_rs.deinit();
+
+        // gate + ape (positional bias)
+        var gate_rs = try ops.reshape(self.ctx, ready_gate, &[_]i32{ @intCast(B), @intCast(W), @intCast(self.compress_ratio), @intCast(self.out_dim) });
+        defer gate_rs.deinit();
+        const ape_typed = try ops.astype(self.ctx, self.ape, gate_rs.dtype());
+        defer ape_typed.deinit();
+        const gate_biased = try ops.add(self.ctx, gate_rs, ape_typed);
+        defer gate_biased.deinit();
+
+        // Apply overlap transform if CSA (ratio=4)
+        var kv_final: Array = kv_rs;
+        var gate_final: Array = gate_biased;
+        var kv_overlap_free = false;
+        var gate_overlap_free = false;
+        if (self.overlap) {
+            kv_final = try self.overlapTransform(kv_rs, 0.0);
+            kv_overlap_free = true;
+            gate_final = try self.overlapTransform(gate_biased, -std.math.inf(f32));
+            gate_overlap_free = true;
+        }
+        defer if (kv_overlap_free) kv_final.deinit();
+        defer if (gate_overlap_free) gate_final.deinit();
+
+        // Softmax gated pooling: weights = softmax(gate, axis=2), pooled = (kv * weights).sum(axis=2)
+        const gate_f32 = try ops.astype(self.ctx, gate_final, .float32);
+        defer gate_f32.deinit();
+        const weights_arr = try ops.softmax(self.ctx, gate_f32, &[_]i32{2});
+        defer weights_arr.deinit();
+        const weights_typed = try ops.astype(self.ctx, weights_arr, kv_final.dtype());
+        defer weights_typed.deinit();
+        const weighted = try ops.multiply(self.ctx, kv_final, weights_typed);
+        defer weighted.deinit();
+        const new_pooled_raw = try reduce_mod.sumAxis(self.ctx, weighted, 2, false); // [B, W, out_dim or head_dim]
+        defer new_pooled_raw.deinit();
+
+        // RMSNorm on pooled output
+        const normed = try fast_mod.rmsNorm(self.ctx, new_pooled_raw, self.norm_weight, self.norm_eps);
+        defer normed.deinit();
+
+        // Apply RoPE with compressed positions
+        const normed_typed = try ops.astype(self.ctx, normed, x.dtype());
+        defer normed_typed.deinit();
+
+        // Positions: arange(W) * compress_ratio + pool_base
+        // For simplicity, apply RoPE to the last rope_head_dim dimensions
+        const normed_exp = try ops.expandDims(self.ctx, normed_typed, 1); // [B, 1, W, head_dim]
+        defer normed_exp.deinit();
+
+        // Apply partial RoPE (last rope_head_dim dims)
+        // TODO: Use proper position computation with pool_base
+        const roped = try rope.apply(normed_exp, pool_base, self.ctx.stream.inner, false);
+        defer roped.deinit();
+        const roped_sq = try shape_mod.squeezeAxis(self.ctx, roped, 1); // [B, W, head_dim]
+        defer roped_sq.deinit();
+
+        // Update cache pool
+        if (cache) |v4_cache| {
+            return v4_cache.updatePool(roped_sq, state_key);
+        }
+        return ops.copy(self.ctx, roped_sq);
     }
 };
 
 /// Compress KV cache along sequence dimension for CSA/HCA layers.
+/// (Legacy pure-function interface — kept for backward compatibility)
 /// - ratio <= 1: passthrough (no compression)
 /// - ratio > 1 with gate weights: learned softmax-gated pooling with positional bias
 /// - ratio > 1 without gate weights: fallback to mean-pool
@@ -1305,7 +2051,7 @@ pub fn compressKV(
         raw[1] = rem_comp;
         raw[2] = suffix;
         const result = try shape_mod.concatenateAxis(ctx, raw, 1);
-        try result.eval();
+
         return result;
     } else {
         const raw = try ctx.allocator.alloc(Array, 2);
@@ -1313,7 +2059,7 @@ pub fn compressKV(
         raw[0] = prefix_comp;
         raw[1] = suffix;
         const result = try shape_mod.concatenateAxis(ctx, raw, 1);
-        try result.eval();
+
         return result;
     }
 }
@@ -1499,7 +2245,7 @@ pub fn mhcPreNormFn(
     const sqrsum = try reduce_mod.sumAxis(ctx, res_sq, 1, false);
     defer sqrsum.deinit();
 
-    const group_size_f = try Array.fromData(ctx.allocator, f32, &[_]f32{ @floatFromInt(mhc_hidden_size) }, &[_]i32{1});
+    const group_size_f = try Array.fromData(ctx.allocator, f32, &[_]f32{@floatFromInt(mhc_hidden_size)}, &[_]i32{1});
     defer group_size_f.deinit();
     const sqrsum_div = try ops.divide(ctx, sqrsum, group_size_f);
     defer sqrsum_div.deinit();
@@ -1516,7 +2262,7 @@ pub fn mhcPreNormFn(
     defer mixes_scaled.deinit();
 
     const result = try ops.reshape(ctx, mixes_scaled, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(mhc_mult3) });
-    try result.eval();
+
     return result;
 }
 
@@ -1541,14 +2287,22 @@ pub fn mhcPreSplitMixes(
     const seq_len = @as(usize, @intCast(shape[1]));
     const mhc_mult_sq = mhc_mult * mhc_mult;
 
-    // Build expanded scale on CPU to avoid complex concat ops
-    const scale_vals = try scale.dataSlice(f32);
-    var scale_data = try ctx.allocator.alloc(f32, mhc_mult * 2 + mhc_mult_sq);
-    defer ctx.allocator.free(scale_data);
-    for (0..mhc_mult) |i| scale_data[i] = scale_vals[0];
-    for (0..mhc_mult) |i| scale_data[mhc_mult + i] = scale_vals[1];
-    for (0..mhc_mult_sq) |i| scale_data[2 * mhc_mult + i] = scale_vals[2];
-    const scale_expanded = try Array.fromData(ctx.allocator, f32, scale_data, &[_]i32{ @intCast(mhc_mult * 2 + mhc_mult_sq) });
+    // Build expanded scale using MLX ops (no dataSlice to avoid forcing evaluation)
+    // scale has 3 values: [pre_scale, post_scale, comb_scale]
+    // Expand to [mhc_mult * pre_scale, mhc_mult * post_scale, mhc_mult_sq * comb_scale]
+    const scale_0 = try ops.slice(ctx, scale, &[_]i32{0}, &[_]i32{1}, &[_]i32{});
+    defer scale_0.deinit();
+    const scale_1 = try ops.slice(ctx, scale, &[_]i32{1}, &[_]i32{2}, &[_]i32{});
+    defer scale_1.deinit();
+    const scale_2 = try ops.slice(ctx, scale, &[_]i32{2}, &[_]i32{3}, &[_]i32{});
+    defer scale_2.deinit();
+    const pre_scales = try ops.broadcastTo(ctx, scale_0, &[_]i32{@intCast(mhc_mult)});
+    defer pre_scales.deinit();
+    const post_scales = try ops.broadcastTo(ctx, scale_1, &[_]i32{@intCast(mhc_mult)});
+    defer post_scales.deinit();
+    const comb_scales = try ops.broadcastTo(ctx, scale_2, &[_]i32{@intCast(mhc_mult_sq)});
+    defer comb_scales.deinit();
+    const scale_expanded = try shape_mod.concatenateAxis(ctx, &[_]Array{ pre_scales, post_scales, comb_scales }, 0);
     defer scale_expanded.deinit();
 
     const mixes_scaled = try ops.multiply(ctx, mixes, scale_expanded);
@@ -1570,7 +2324,6 @@ pub fn mhcPreSplitMixes(
     const pre_mix = try ops.add(ctx, pre_sigmoid, pre_eps_arr);
     defer pre_mix.deinit();
     const pre_mix_expanded = try ops.expandDims(ctx, pre_mix, 3);
-    try pre_mix_expanded.eval();
 
     const post_sigmoid = try ops.sigmoid(ctx, post_mix_slice);
     defer post_sigmoid.deinit();
@@ -1579,13 +2332,65 @@ pub fn mhcPreSplitMixes(
     const post_mix = try ops.multiply(ctx, post_sigmoid, post_mult_arr);
     defer post_mix.deinit();
     const post_mix_expanded = try ops.expandDims(ctx, post_mix, 3);
-    try post_mix_expanded.eval();
 
     const comb_mix = try ops.reshape(ctx, comb_mix_slice, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(mhc_mult), @intCast(mhc_mult) });
-    try comb_mix.eval();
 
     return .{ pre_mix_expanded, post_mix_expanded, comb_mix };
 }
+
+/// Metal kernel source for fused hc_split_sinkhorn (matching mlx-lm).
+/// Performs pre/post sigmoid + comb softmax + Sinkhorn normalization in a single dispatch.
+const hc_split_sinkhorn_metal_source =
+    \\uint idx = thread_position_in_grid.x;
+    \\constexpr int MIX  = (2 + HC) * HC;
+    \\constexpr int BASE = 2 * HC;
+    \\const device float* mix = (const device float*)mixes + idx * MIX;
+    \\device float* pre_out   = (device float*)pre  + idx * HC;
+    \\device float* post_out  = (device float*)post + idx * HC;
+    \\device float* comb_out  = (device float*)comb + idx * HC * HC;
+    \\const float pre_scale  = scale[0];
+    \\const float post_scale = scale[1];
+    \\const float comb_scale = scale[2];
+    \\const float epsv       = eps[0];
+    \\{
+    \\    float4 z = *(const device float4*)mix * pre_scale + *(const device float4*)base;
+    \\    *(device float4*)pre_out = 1.0f / (1.0f + metal::fast::exp(-z)) + epsv;
+    \\}
+    \\{
+    \\    float4 z = *(const device float4*)(mix + HC) * post_scale + *(const device float4*)(base + HC);
+    \\    *(device float4*)post_out = 2.0f * 1.0f / (1.0f + metal::fast::exp(-z));
+    \\}
+    \\float4 v0 = *(const device float4*)(mix + BASE) * comb_scale + *(const device float4*)(base + BASE);
+    \\float4 v1 = *(const device float4*)(mix + BASE + 4) * comb_scale + *(const device float4*)(base + BASE + 4);
+    \\float4 v2 = *(const device float4*)(mix + BASE + 8) * comb_scale + *(const device float4*)(base + BASE + 8);
+    \\float4 v3 = *(const device float4*)(mix + BASE + 12) * comb_scale + *(const device float4*)(base + BASE + 12);
+    \\float m0 = metal::max(metal::max(v0.x, v0.y), metal::max(v0.z, v0.w));
+    \\float m1 = metal::max(metal::max(v1.x, v1.y), metal::max(v1.z, v1.w));
+    \\float m2 = metal::max(metal::max(v2.x, v2.y), metal::max(v2.z, v2.w));
+    \\float m3 = metal::max(metal::max(v3.x, v3.y), metal::max(v3.z, v3.w));
+    \\float4 e0 = metal::fast::exp(v0 - m0);
+    \\float4 e1 = metal::fast::exp(v1 - m1);
+    \\float4 e2 = metal::fast::exp(v2 - m2);
+    \\float4 e3 = metal::fast::exp(v3 - m3);
+    \\float4 r0 = e0 * 1.0f / (e0.x + e0.y + e0.z + e0.w) + epsv;
+    \\float4 r1 = e1 * 1.0f / (e1.x + e1.y + e1.z + e1.w) + epsv;
+    \\float4 r2 = e2 * 1.0f / (e2.x + e2.y + e2.z + e2.w) + epsv;
+    \\float4 r3 = e3 * 1.0f / (e3.x + e3.y + e3.z + e3.w) + epsv;
+    \\float4 col = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+    \\r0 *= col; r1 *= col; r2 *= col; r3 *= col;
+    \\for (int iter = 1; iter < ITERS; ++iter) {
+    \\    r0 *= 1.0f / (r0.x + r0.y + r0.z + r0.w + epsv);
+    \\    r1 *= 1.0f / (r1.x + r1.y + r1.z + r1.w + epsv);
+    \\    r2 *= 1.0f / (r2.x + r2.y + r2.z + r2.w + epsv);
+    \\    r3 *= 1.0f / (r3.x + r3.y + r3.z + r3.w + epsv);
+    \\    col = 1.0f / (r0 + r1 + r2 + r3 + epsv);
+    \\    r0 *= col; r1 *= col; r2 *= col; r3 *= col;
+    \\}
+    \\*(device float4*)(comb_out) = r0;
+    \\*(device float4*)(comb_out + 4) = r1;
+    \\*(device float4*)(comb_out + 8) = r2;
+    \\*(device float4*)(comb_out + 12) = r3;
+;
 
 /// Sinkhorn normalization on comb_res_mix.
 pub fn sinkhornNormalize(
@@ -1596,7 +2401,8 @@ pub fn sinkhornNormalize(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
-    const softmaxed = try ops.softmax(ctx, x, &[_]i32{ -1 });
+    // Use softmaxPrecise to match Python's precise=True behavior
+    const softmaxed = try ops.softmaxPrecise(ctx, x, &[_]i32{-1});
     defer softmaxed.deinit();
 
     const eps_arr = try Array.fromData(ctx.allocator, f32, &[_]f32{eps}, &[_]i32{1});
@@ -1635,6 +2441,7 @@ pub fn sinkhornNormalize(
 }
 
 /// Apply pre-layer mix to residual.
+/// Matches Python: (pre[..., None] * y).sum(axis=2).astype(x.dtype) where y = x.astype(f32)
 pub fn mhcPreApplyMix(
     ctx: EagerContext,
     residual: Array,
@@ -1642,14 +2449,22 @@ pub fn mhcPreApplyMix(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
-    const weighted = try ops.multiply(ctx, residual, mix);
+    const orig_dtype = residual.dtype();
+    // Promote to float32 for precision (matching Python .astype(mx.float32))
+    const res_f32 = try ops.astype(ctx, residual, .float32);
+    defer res_f32.deinit();
+    const mix_f32 = try ops.astype(ctx, mix, .float32);
+    defer mix_f32.deinit();
+    const weighted = try ops.multiply(ctx, res_f32, mix_f32);
     defer weighted.deinit();
-    const result = try reduce_mod.sumAxis(ctx, weighted, 2, false);
-    try result.eval();
-    return result;
+    const summed = try reduce_mod.sumAxis(ctx, weighted, 2, false);
+    defer summed.deinit();
+    // Cast back to original dtype
+    return ops.astype(ctx, summed, orig_dtype);
 }
 
 /// MHC post: combine sublayer output with residual using post_mix and comb_mix.
+/// Matches Python: all intermediate computation in float32, comb is transposed.
 pub fn mhcPost(
     ctx: EagerContext,
     x: Array,
@@ -1659,6 +2474,7 @@ pub fn mhcPost(
     stream: c.c.mlx_stream,
 ) !Array {
     _ = stream;
+    const orig_dtype = x.dtype();
     const shape = x.shape();
     const batch = @as(usize, @intCast(shape[0]));
     const seq_len = @as(usize, @intCast(shape[1]));
@@ -1666,24 +2482,38 @@ pub fn mhcPost(
     const res_shape = residual.shape();
     const mhc_mult = @as(usize, @intCast(res_shape[2]));
 
-    const x_expanded = try ops.expandDims(ctx, x, 2);
+    // Promote to float32 for precision (matching Python .astype(mx.float32))
+    const x_f32 = try ops.astype(ctx, x, .float32);
+    defer x_f32.deinit();
+    const res_f32 = try ops.astype(ctx, residual, .float32);
+    defer res_f32.deinit();
+    const post_mix_f32 = try ops.astype(ctx, post_mix, .float32);
+    defer post_mix_f32.deinit();
+
+    const x_expanded = try ops.expandDims(ctx, x_f32, 2);
     defer x_expanded.deinit();
-    const term1 = try ops.multiply(ctx, x_expanded, post_mix);
+    const term1 = try ops.multiply(ctx, x_expanded, post_mix_f32);
     defer term1.deinit();
 
     const bs = batch * seq_len;
+    // Python: mx.matmul(comb.swapaxes(-1, -2), residual) — comb is transposed
     const comb_2d = try ops.reshape(ctx, comb_mix, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(mhc_mult) });
     defer comb_2d.deinit();
-    const res_2d = try ops.reshape(ctx, residual, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(h) });
+    const comb_2d_f32 = try ops.astype(ctx, comb_2d, .float32);
+    defer comb_2d_f32.deinit();
+    const comb_2d_t = try ops.transposeAxes(ctx, comb_2d_f32, &[_]i32{ 0, 2, 1 });
+    defer comb_2d_t.deinit();
+    const res_2d = try ops.reshape(ctx, res_f32, &[_]i32{ @intCast(bs), @intCast(mhc_mult), @intCast(h) });
     defer res_2d.deinit();
-    const term2_2d = try ops.matmul(ctx, comb_2d, res_2d);
+    const term2_2d = try ops.matmul(ctx, comb_2d_t, res_2d);
     defer term2_2d.deinit();
     const term2 = try ops.reshape(ctx, term2_2d, &[_]i32{ @intCast(batch), @intCast(seq_len), @intCast(mhc_mult), @intCast(h) });
     defer term2.deinit();
 
-    const result = try ops.add(ctx, term1, term2);
-    try result.eval();
-    return result;
+    const result_f32 = try ops.add(ctx, term1, term2);
+    defer result_f32.deinit();
+    // Cast back to original dtype
+    return ops.astype(ctx, result_f32, orig_dtype);
 }
 
 /// MHC head compression: compress residual from [B,S,mhc_mult,H] to [B,S,H] for lm_head.
@@ -1759,11 +2589,11 @@ pub const DSV4HyperConn = struct {
         }
         const mixes = try mhcPreNormFn(ctx, x, self.hc_fn, null, self.hc_eps, stream);
         defer mixes.deinit();
-        const pre_mix, const post_mix, const comb_mix = try mhcPreSplitMixes(ctx, mixes, self.hc_scale, self.hc_base, self.hc_mult, 1.0, self.hc_eps, stream);
+        const pre_mix, const post_mix, const comb_mix = try mhcPreSplitMixes(ctx, mixes, self.hc_scale, self.hc_base, self.hc_mult, 2.0, self.hc_eps, stream);
         defer pre_mix.deinit();
 
         const comb_mix_norm = try sinkhornNormalize(ctx, comb_mix, self.hc_sinkhorn_iters, self.hc_eps, stream);
-        try comb_mix_norm.eval();
+
         defer comb_mix.deinit();
 
         const layer_input = try mhcPreApplyMix(ctx, x, pre_mix, stream);
@@ -1874,7 +2704,7 @@ pub const DSV4Model = struct {
     embed_tokens: nn.Embedding,
     layers: []DSV4TransformerBlock,
     norm: nn.RMSNorm,
-    head_norm: ?nn.RMSNorm,
+    hc_head: ?HyperHead,
     lm_head: Array,
 
     pub fn deinit(self: *DSV4Model) void {
@@ -1884,10 +2714,26 @@ pub const DSV4Model = struct {
         }
         self.allocator.free(self.layers);
         self.norm.weight.deinit();
-        if (self.head_norm) |*hn| {
-            hn.weight.deinit();
+        if (self.hc_head) |*hh| {
+            hh.deinit();
         }
         self.lm_head.deinit();
+    }
+
+    /// Check if any layer has expert weights loaded in memory.
+    pub fn hasExpertsLoaded(self: *DSV4Model) bool {
+        for (self.layers) |*layer| {
+            if (layer.ffn.experts_loaded) return true;
+        }
+        return false;
+    }
+
+    /// Set expert stream provider on all MoE layers.
+    pub fn setExpertStreamProvider(self: *DSV4Model, sp: *expert_stream.ExpertStreamProvider) void {
+        for (self.layers, 0..) |*layer, i| {
+            layer.ffn.stream_provider = sp;
+            layer.ffn.layer_idx = i;
+        }
     }
 
     pub fn forward(
@@ -1909,24 +2755,29 @@ pub const DSV4Model = struct {
             hidden = try arena.track(try expandToMHC(self.ctx, hidden, self.config.hc_mult, stream));
         }
 
-        // Pass through layers
+        // Pass through layers (eval after each to allow memory paging)
         for (self.layers, 0..) |*layer, i| {
             const cache = if (caches) |cache_arr| cache_arr[i] else null;
+            std.debug.print("Layer {d}/43 forward start\n", .{i});
             hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
+            // Eval after each layer to materialize results and free lazy weight references
+            // This allows MLX to page weights in/out of memory for large models
+            try hidden.eval();
+            std.debug.print("Layer {d}/43 forward done\n", .{i});
         }
 
-        // Compress from mHC format before final norm if needed
+        // Compress from mHC format before final norm using HyperHead
         if (self.config.use_mhc and hidden.shape().len == 4) {
-            hidden = try arena.track(try reduce_mod.meanAxis(self.ctx, hidden, 2, false));
+            if (self.hc_head) |*hh| {
+                hidden = try arena.track(try hh.forward(hidden, stream));
+            } else {
+                // Fallback to simple mean if HyperHead weights not loaded
+                hidden = try arena.track(try reduce_mod.meanAxis(self.ctx, hidden, 2, false));
+            }
         }
 
         // Final norm
-        var final_hidden = try arena.track(try self.norm.forward(hidden));
-
-        // Optional head norm
-        if (self.head_norm) |*hn| {
-            final_hidden = try arena.track(try hn.forward(final_hidden));
-        }
+        const final_hidden = try arena.track(try self.norm.forward(hidden));
 
         // LM head: [B, S, dim] @ [dim, vocab] -> [B, S, vocab] — final output NOT tracked
         const lm_head_t = try arena.track(try ops.transpose(self.ctx, self.lm_head));
@@ -1943,6 +2794,12 @@ pub const DSV4Model = struct {
         stream: c.c.mlx_stream,
     ) ![]u32 {
         const allocator = self.allocator;
+
+        // Guard against max_new_tokens=0 underflow (usize 0-1 wraps to maxInt)
+        if (max_new_tokens == 0) {
+            return try allocator.alloc(u32, 0);
+        }
+
         var tokens = try allocator.alloc(u32, prompt_tokens.len + max_new_tokens);
         defer allocator.free(tokens);
         @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
@@ -1955,15 +2812,88 @@ pub const DSV4Model = struct {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
-            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{1, @intCast(prompt_tokens.len)}));
-            const logits = try self.forward(prompt_arr, null, caches, start_pos, stream);
+            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
+
+            // Create explicit causal mask with sliding window for prefill
+            // Matches Python: create_attention_mask(return_array=True, window_size=sliding_window)
+            const prefill_mask = if (prompt_tokens.len > 1) blk: {
+                const sl = prompt_tokens.len;
+                const ws = self.config.sliding_window;
+                var mask_data = try allocator.alloc(f32, sl * sl);
+                defer allocator.free(mask_data);
+                @memset(mask_data, 0);
+                const neg_inf = -std.math.inf(f32);
+                for (0..sl) |i| {
+                    for (0..sl) |j| {
+                        const causal = j > i;
+                        const outside_window = ws > 0 and i >= ws and j < i + 1 - ws;
+                        if (causal or outside_window) {
+                            mask_data[i * sl + j] = neg_inf;
+                        }
+                    }
+                }
+                const mask_arr = try Array.fromData(allocator, f32, mask_data, &[_]i32{ 1, 1, @intCast(sl), @intCast(sl) });
+                break :blk mask_arr;
+            } else null;
+            defer if (prefill_mask) |m| m.deinit();
+
+            const logits = try self.forward(prompt_arr, prefill_mask, caches, start_pos, stream);
 
             // Get last token logits
             const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
             const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
-            const next_token = try sampler_config.sample(f32_logits, allocator);
+            // Diagnostic: show logits stats
+            {
+                const logits_data = try f32_logits.dataSlice(f32);
+                var max_val: f32 = -std.math.inf(f32);
+                var min_val: f32 = std.math.inf(f32);
+                var max_idx: usize = 0;
+                var sum: f64 = 0;
+                var nan_count: usize = 0;
+                var inf_count: usize = 0;
+                for (logits_data, 0..) |v, idx| {
+                    if (std.math.isNan(v)) {
+                        nan_count += 1;
+                        continue;
+                    }
+                    if (std.math.isInf(v)) {
+                        inf_count += 1;
+                        continue;
+                    }
+                    sum += v;
+                    if (v > max_val) {
+                        max_val = v;
+                        max_idx = idx;
+                    }
+                    if (v < min_val) {
+                        min_val = v;
+                    }
+                }
+                const mean = sum / @as(f64, @floatFromInt(logits_data.len));
+                std.log.info("Logits: len={d} max={d:.4} min={d:.4} mean={d:.4} argmax={d} nan={d} inf={d}", .{
+                    logits_data.len, max_val, min_val, mean, max_idx, nan_count, inf_count,
+                });
+                var top5 = [_]struct { idx: usize, val: f32 }{.{ .idx = 0, .val = -std.math.inf(f32) }} ** 5;
+                for (logits_data, 0..) |v, idx| {
+                    if (std.math.isNan(v) or std.math.isInf(v)) continue;
+                    for (&top5) |*t| {
+                        if (v > t.val) {
+                            t.* = .{ .idx = idx, .val = v };
+                            break;
+                        }
+                    }
+                }
+                std.log.info("Top tokens: [{d}]={d:.2} [{d}]={d:.2} [{d}]={d:.2}", .{
+                    top5[0].idx, top5[0].val, top5[1].idx, top5[1].val, top5[2].idx, top5[2].val,
+                });
+                if (logits_data.len > 22) {
+                    std.log.info("Token 22 ('4') logit: {d:.4}", .{logits_data[22]});
+                }
+            }
+
+            const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos = prompt_tokens.len;
@@ -1976,16 +2906,22 @@ pub const DSV4Model = struct {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
-            const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tokens[current_len - 1]}, &[_]i32{1, 1}));
+            const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tokens[current_len - 1]}, &[_]i32{ 1, 1 }));
             const logits = try self.forward(input_arr, null, caches, start_pos, stream);
 
-            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, logits, &[_]i32{0, 1}));
+            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, logits, &[_]i32{ 0, 1 }));
             const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
-            const next_token = try sampler_config.sample(f32_logits, allocator);
+            const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
+
+            // Check for EOS token (ID 1 for DeepSeek V4)
+            if (next_token == 1) {
+                std.log.info("EOS token generated, stopping", .{});
+                break;
+            }
         }
 
         // Return only generated tokens (skip prompt)

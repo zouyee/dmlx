@@ -75,6 +75,7 @@ pub const QuantizedKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -229,6 +230,11 @@ pub const QuantizedKVCache = struct {
         self.offset = 0;
     }
 
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *QuantizedKVCache = @ptrCast(@alignCast(ctx));
+        self.offset = to_len;
+    }
+
     fn filterImpl(
         ctx: *anyopaque,
         indices: []const usize,
@@ -262,6 +268,7 @@ pub const QuantizedKVCache = struct {
                 var new_k = c.c.mlx_array_new();
                 var new_v = c.c.mlx_array_new();
                 const stream = c.c.mlx_default_cpu_stream_new();
+                defer _ = c.c.mlx_stream_free(stream);
                 try c.check(c.c.mlx_take_axis(&new_k, rk.inner, idx_arr, 0, stream));
                 try c.check(c.c.mlx_take_axis(&new_v, self.raw_values.?.inner, idx_arr, 0, stream));
                 self.raw_keys.?.deinit();
@@ -478,6 +485,7 @@ pub const QuantizedKVCache = struct {
         var new_biases = c.c.mlx_array_new();
 
         const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
         try c.check(c.c.mlx_take_axis(&new_packed, tuple.packed_data.inner, idx_arr, 0, stream));
         try c.check(c.c.mlx_take_axis(&new_scales, tuple.scales.inner, idx_arr, 0, stream));
         try c.check(c.c.mlx_take_axis(&new_biases, tuple.biases.inner, idx_arr, 0, stream));

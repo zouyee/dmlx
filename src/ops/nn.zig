@@ -29,17 +29,19 @@ pub const Linear = struct {
         const scale = @sqrt(2.0 / @as(f32, @floatFromInt(input_dims)));
 
         const weight_shape = [_]ShapeElem{ @intCast(output_dims), @intCast(input_dims) };
-        const weight = try ops_mod.random(ctx, &weight_shape, dtype_mod.float32, @truncate(@as(u64, @bitCast(@as(f32, @floatFromInt(std.mem.readInt(u32, &.{ 0x3dcccccd, 0x3dcccccd }, .little)))))));
+        const weight = try array_mod.zeros(ctx.allocator, &weight_shape, dtype_mod.float32);
 
         const weight_data = try weight.dataSliceMut(f32);
+        var prng = std.Random.DefaultPrng.init(42);
+        const rng = prng.random();
         for (0..weight_data.len) |i| {
-            weight_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale;
+            weight_data[i] = (rng.float(f32) * 2 - 1) * scale;
         }
 
         var bias_arr: ?Array = null;
         if (bias) {
             const bias_shape = [_]ShapeElem{@intCast(output_dims)};
-            bias_arr = try ops_mod.zeros(ctx, &bias_shape, dtype_mod.float32);
+            bias_arr = try array_mod.zeros(ctx.allocator, &bias_shape, dtype_mod.float32);
         }
 
         return Linear{
@@ -80,8 +82,8 @@ pub const BatchNorm = struct {
         const shape = [_]ShapeElem{@intCast(num_features)};
 
         const gamma = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
-        const beta = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
-        const running_mean = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const beta = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const running_mean = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
         const running_var = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
 
         return BatchNorm{
@@ -132,6 +134,7 @@ pub const BatchNorm = struct {
             // Compute batch variance
             var var_buf = try self.ctx.allocator.alloc(f32, num_features);
             defer self.ctx.allocator.free(var_buf);
+            @memset(var_buf, 0);
 
             for (0..batch) |n| {
                 for (0..num_features) |f| {
@@ -210,7 +213,9 @@ pub const Dropout = struct {
         const scale: f32 = 1.0 / (1.0 - self.p);
 
         for (0..size) |i| {
-            dst[i] = if (std.crypto.random.float(f32) < self.p) 0 else src[i] * scale;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            dst[i] = if (rng.random().float(f32) < self.p) 0 else src[i] * scale;
         }
 
         return out;
@@ -242,19 +247,23 @@ pub const LSTM = struct {
         const w_hh_shape = [_]ShapeElem{ @intCast(4 * hidden_size), @intCast(hidden_size) };
         const b_shape = [_]ShapeElem{@intCast(4 * hidden_size)};
 
-        const weight_ih = try ops_mod.random(ctx, &w_ih_shape, dtype_mod.float32, @truncate(@as(u64, @bitCast(@as(f32, 0.0)))));
-        const weight_hh = try ops_mod.random(ctx, &w_hh_shape, dtype_mod.float32, @truncate(@as(u64, @bitCast(@as(f32, 0.0)))));
-        const bias_ih = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
-        const bias_hh = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const weight_ih = try array_mod.zeros(ctx.allocator, &w_ih_shape, dtype_mod.float32);
+        const weight_hh = try array_mod.zeros(ctx.allocator, &w_hh_shape, dtype_mod.float32);
+        const bias_ih = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const bias_hh = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
 
         // Initialize with random values
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-            w_ih_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_ih;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-            w_hh_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_hh;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 
         return LSTM{
@@ -408,18 +417,22 @@ pub const GRU = struct {
         const w_hh_shape = [_]ShapeElem{ @intCast(3 * hidden_size), @intCast(hidden_size) };
         const b_shape = [_]ShapeElem{@intCast(3 * hidden_size)};
 
-        const weight_ih = try ops_mod.random(ctx, &w_ih_shape, dtype_mod.float32, 0);
-        const weight_hh = try ops_mod.random(ctx, &w_hh_shape, dtype_mod.float32, 0);
-        const bias_ih = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
-        const bias_hh = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const weight_ih = try array_mod.zeros(ctx.allocator, &w_ih_shape, dtype_mod.float32);
+        const weight_hh = try array_mod.zeros(ctx.allocator, &w_hh_shape, dtype_mod.float32);
+        const bias_ih = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const bias_hh = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
 
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-            w_ih_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_ih;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-            w_hh_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_hh;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 
         return GRU{
@@ -545,7 +558,7 @@ pub const GroupNorm = struct {
 
         const shape = [_]ShapeElem{@intCast(num_channels)};
         const gamma = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
-        const beta = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const beta = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
 
         return GroupNorm{
             .ctx = ctx,
@@ -641,7 +654,7 @@ pub const InstanceNorm = struct {
     pub fn init(ctx: EagerContext, num_features: usize, eps: f32) !InstanceNorm {
         const shape = [_]ShapeElem{@intCast(num_features)};
         const gamma = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
-        const beta = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const beta = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
 
         return InstanceNorm{
             .ctx = ctx,
@@ -756,18 +769,22 @@ pub const RNN = struct {
         const w_hh_shape = [_]ShapeElem{ @intCast(hidden_size), @intCast(hidden_size) };
         const b_shape = [_]ShapeElem{@intCast(hidden_size)};
 
-        const weight_ih = try ops_mod.random(ctx, &w_ih_shape, dtype_mod.float32, 0);
-        const weight_hh = try ops_mod.random(ctx, &w_hh_shape, dtype_mod.float32, 0);
-        const bias_ih = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
-        const bias_hh = try ops_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const weight_ih = try array_mod.zeros(ctx.allocator, &w_ih_shape, dtype_mod.float32);
+        const weight_hh = try array_mod.zeros(ctx.allocator, &w_hh_shape, dtype_mod.float32);
+        const bias_ih = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
+        const bias_hh = try creation_mod.zeros(ctx, &b_shape, dtype_mod.float32);
 
         const w_ih_data = try weight_ih.dataSliceMut(f32);
         const w_hh_data = try weight_hh.dataSliceMut(f32);
         for (0..w_ih_data.len) |i| {
-            w_ih_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_ih;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_ih_data[i] = (rng.random().float(f32) * 2 - 1) * scale_ih;
         }
         for (0..w_hh_data.len) |i| {
-            w_hh_data[i] = (std.crypto.random.float(f32) * 2 - 1) * scale_hh;
+            var prng = std.Random.DefaultPrng.init(42);
+            const rng = prng.random();
+            w_hh_data[i] = (rng.random().float(f32) * 2 - 1) * scale_hh;
         }
 
         return RNN{
@@ -1060,7 +1077,7 @@ const LayerNorm = struct {
     pub fn init(ctx: EagerContext, dims: usize) !LayerNorm {
         const shape = [_]ShapeElem{@intCast(dims)};
         const weight = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
-        const bias = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const bias = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
         return LayerNorm{ .ctx = ctx, .weight = weight, .bias = bias, .eps = 1e-5 };
     }
 
@@ -1176,7 +1193,7 @@ const DecoderLayerNorm = struct {
     pub fn init(ctx: EagerContext, dims: usize) !DecoderLayerNorm {
         const shape = [_]ShapeElem{@intCast(dims)};
         const weight = try array_mod.ones(ctx.allocator, &shape, dtype_mod.float32);
-        const bias = try ops_mod.zeros(ctx, &shape, dtype_mod.float32);
+        const bias = try creation_mod.zeros(ctx, &shape, dtype_mod.float32);
         return DecoderLayerNorm{ .ctx = ctx, .weight = weight, .bias = bias, .eps = 1e-5 };
     }
 
@@ -1262,13 +1279,15 @@ pub const Embedding = struct {
 
     pub fn init(ctx: EagerContext, num_embeddings: usize, embedding_dim: usize) !Embedding {
         const shape = [_]ShapeElem{ @intCast(num_embeddings), @intCast(embedding_dim) };
-        const weight = try ops_mod.random(ctx, &shape, dtype_mod.float32, 0);
+        const weight = try array_mod.zeros(ctx.allocator, &shape, dtype_mod.float32);
 
         // Xavier-like initialization
         const scale = @sqrt(1.0 / @as(f32, @floatFromInt(num_embeddings)));
         const w_data = try weight.dataSliceMut(f32);
+        var prng = std.Random.DefaultPrng.init(42);
+        const rng = prng.random();
         for (0..w_data.len) |i| {
-            w_data[i] = (std.crypto.random.float(f32) * 2.0 - 1.0) * scale;
+            w_data[i] = (rng.float(f32) * 2.0 - 1.0) * scale;
         }
 
         return Embedding{
@@ -1302,75 +1321,35 @@ pub const RoPE = struct {
     pub fn init(ctx: EagerContext, head_dim: usize, max_seq_len: usize, theta: f32) !RoPE {
         std.debug.assert(head_dim % 2 == 0);
 
-        const half_dim = head_dim / 2;
-        const cache_shape = [_]ShapeElem{ @intCast(max_seq_len), @intCast(half_dim) };
-
-        const cos_cache = try array_mod.zeros(ctx.allocator, &cache_shape, dtype_mod.float32);
-        const sin_cache = try array_mod.zeros(ctx.allocator, &cache_shape, dtype_mod.float32);
-
-        const cos_data = @constCast(try cos_cache.dataPtr(f32))[0 .. max_seq_len * half_dim];
-        const sin_data = @constCast(try sin_cache.dataPtr(f32))[0 .. max_seq_len * half_dim];
-
-        // Precompute frequencies
-        for (0..max_seq_len) |pos| {
-            for (0..half_dim) |i| {
-                const freq = 1.0 / std.math.pow(f32, theta, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(head_dim)));
-                const angle = @as(f32, @floatFromInt(pos)) * freq;
-                const idx = pos * half_dim + i;
-                cos_data[idx] = @cos(angle);
-                sin_data[idx] = @sin(angle);
-            }
-        }
-
         return RoPE{
             .ctx = ctx,
             .head_dim = head_dim,
             .max_seq_len = max_seq_len,
             .theta = theta,
-            .cos_cache = cos_cache,
-            .sin_cache = sin_cache,
+            .cos_cache = try array_mod.zeros(ctx.allocator, &[_]ShapeElem{1}, dtype_mod.float32),
+            .sin_cache = try array_mod.zeros(ctx.allocator, &[_]ShapeElem{1}, dtype_mod.float32),
         };
     }
 
-    /// Apply RoPE to query/key tensor.
+    /// Apply RoPE to query/key tensor using MLX fast kernel.
     /// Input shape: (batch, num_heads, seq_len, head_dim)
     /// Output shape: same, with rotation applied
     pub fn apply(self: *RoPE, input: Array) !Array {
-        const shape = input.shape();
-        std.debug.assert(shape.len == 4);
-        std.debug.assert(shape[3] == @as(ShapeElem, @intCast(self.head_dim)));
+        return self.applyWithOffset(input, 0);
+    }
 
-        const batch = @as(usize, @intCast(shape[0]));
-        const num_heads = @as(usize, @intCast(shape[1]));
-        const seq_len = @as(usize, @intCast(shape[2]));
-        const head_dim = self.head_dim;
-        const half_dim = head_dim / 2;
-
-        const out = try array_mod.zeros(self.ctx.allocator, shape, input.dtype());
-        const src = try input.dataSliceMut(f32);
-        const dst = try out.dataSliceMut(f32);
-        const cos_data = try self.cos_cache.dataSliceMut(f32);
-        const sin_data = try self.sin_cache.dataSliceMut(f32);
-
-        for (0..batch) |b| {
-            for (0..num_heads) |h| {
-                for (0..seq_len) |s| {
-                    for (0..half_dim) |i| {
-                        const base_idx = ((b * num_heads + h) * seq_len + s) * head_dim;
-                        const x1 = src[base_idx + i];
-                        const x2 = src[base_idx + half_dim + i];
-
-                        const cache_idx = s * half_dim + i;
-                        const c = cos_data[cache_idx];
-                        const s_ = sin_data[cache_idx];
-
-                        dst[base_idx + i] = x1 * c - x2 * s_;
-                        dst[base_idx + half_dim + i] = x1 * s_ + x2 * c;
-                    }
-                }
-            }
-        }
-
-        return out;
+    /// Apply RoPE with a position offset (for KV cache incremental decoding).
+    pub fn applyWithOffset(self: *RoPE, input: Array, offset: i32) !Array {
+        const fast = @import("fast.zig");
+        return fast.rope(
+            self.ctx,
+            input,
+            @intCast(self.head_dim),
+            false, // traditional=false (non-interleaved, matches mlx-lm)
+            self.theta,
+            1.0, // scale
+            offset,
+            null, // no custom freqs
+        );
     }
 };

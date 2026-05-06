@@ -268,7 +268,10 @@ fn matchPattern(pat: Pattern, text: []const u8) MatchResult {
         .digits_1_3 => {
             var i: usize = 0;
             while (i < text.len) {
-                const res = decodeCp(text[i..]) catch { i += 1; continue; };
+                const res = decodeCp(text[i..]) catch {
+                    i += 1;
+                    continue;
+                };
                 if (isNumberCp(res.cp)) {
                     var end = i + res.len;
                     var count: usize = 1;
@@ -286,7 +289,10 @@ fn matchPattern(pat: Pattern, text: []const u8) MatchResult {
         .cjk_kana => {
             var i: usize = 0;
             while (i < text.len) {
-                const res = decodeCp(text[i..]) catch { i += 1; continue; };
+                const res = decodeCp(text[i..]) catch {
+                    i += 1;
+                    continue;
+                };
                 if (isCjkKanaCp(res.cp)) {
                     var end = i + res.len;
                     while (end < text.len) {
@@ -529,18 +535,18 @@ pub const Split = struct {
                 // This matches the common case where invert=false.
                 // TODO: implement proper invert logic if needed.
                 if (m.start > 0) {
-                    const prefix = try allocator.dupe(u8, text[pos..pos + m.start]);
+                    const prefix = try allocator.dupe(u8, text[pos .. pos + m.start]);
                     try result.append(allocator, prefix);
                 }
-                const matched = try allocator.dupe(u8, text[pos + m.start..pos + m.end]);
+                const matched = try allocator.dupe(u8, text[pos + m.start .. pos + m.end]);
                 try result.append(allocator, matched);
             } else {
                 // Normal: matching parts are isolated
                 if (m.start > 0) {
-                    const prefix = try allocator.dupe(u8, text[pos..pos + m.start]);
+                    const prefix = try allocator.dupe(u8, text[pos .. pos + m.start]);
                     try result.append(allocator, prefix);
                 }
-                const matched = try allocator.dupe(u8, text[pos + m.start..pos + m.end]);
+                const matched = try allocator.dupe(u8, text[pos + m.start .. pos + m.end]);
                 try result.append(allocator, matched);
             }
 
@@ -717,7 +723,7 @@ pub const ByteLevelDecoder = struct {
                 byte = reverse[cp - 0x100];
             } else {
                 // Fallback: write raw UTF-8 bytes
-                @memcpy(out[out_pos..out_pos + len], text[i..i + len]);
+                @memcpy(out[out_pos .. out_pos + len], text[i .. i + len]);
                 out_pos += len;
                 i += len;
                 first = false;

@@ -503,9 +503,18 @@ fn buildRegexFSM(allocator: std.mem.Allocator, pattern: []const u8) !FiniteState
         var quant: Quantifier = .one;
         if (pi < pattern.len) {
             switch (pattern[pi]) {
-                '*' => { quant = .zero_or_more; pi += 1; },
-                '+' => { quant = .one_or_more; pi += 1; },
-                '?' => { quant = .optional; pi += 1; },
+                '*' => {
+                    quant = .zero_or_more;
+                    pi += 1;
+                },
+                '+' => {
+                    quant = .one_or_more;
+                    pi += 1;
+                },
+                '?' => {
+                    quant = .optional;
+                    pi += 1;
+                },
                 else => {},
             }
         }

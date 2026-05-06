@@ -739,3 +739,133 @@ test "quantizedMatmul produces correct output shape" {
     try std.testing.expectEqual(@as(i32, 4), result_shape[0]);
     try std.testing.expectEqual(@as(i32, 64), result_shape[1]);
 }
+
+test "gatherQmm with mxfp4 mode" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Exact shapes from DeepSeek V4 Flash
+    const n_experts: i32 = 256;
+    const out_dim: i32 = 2048;
+    const in_dim: i32 = 4096;
+    const group_size: i32 = 32;
+    const packed_in = in_dim / 8; // = 512
+
+    // Create w: uint32 [256, 2048, 512]
+    const w_shape = &[_]i32{ n_experts, out_dim, packed_in };
+    const w_size = @as(usize, @intCast(n_experts * out_dim * packed_in));
+    const w_data = try allocator.alloc(u32, w_size);
+    defer allocator.free(w_data);
+    for (w_data) |*v| v.* = 1;
+    const w = try Array.fromData(allocator, u32, w_data, w_shape);
+    defer w.deinit();
+
+    // Create scales: uint8 [256, 2048, 128]
+    const s_shape = &[_]i32{ n_experts, out_dim, in_dim / group_size };
+    const s_size = @as(usize, @intCast(n_experts * out_dim * (in_dim / group_size)));
+    const s_data = try allocator.alloc(u8, s_size);
+    defer allocator.free(s_data);
+    for (s_data) |*v| v.* = 1;
+    const scales = try Array.fromData(allocator, u8, s_data, s_shape);
+    defer scales.deinit();
+
+    // Create x: float32 [48, 1, 4096]
+    const n_tokens: i32 = 8;
+    const topk: i32 = 6;
+    const x_shape = &[_]i32{ n_tokens * topk, 1, in_dim };
+    const x_size = @as(usize, @intCast(n_tokens * topk * 1 * in_dim));
+    const x_data = try allocator.alloc(f32, x_size);
+    defer allocator.free(x_data);
+    for (x_data) |*v| v.* = 0.1;
+    const x = try Array.fromData(allocator, f32, x_data, x_shape);
+    defer x.deinit();
+
+    // Create indices: uint32 [48]
+    const i_shape = &[_]i32{n_tokens * topk};
+    const i_size = @as(usize, @intCast(n_tokens * topk));
+    const i_data = try allocator.alloc(u32, i_size);
+    defer allocator.free(i_data);
+    for (i_data, 0..) |*v, j| v.* = @intCast(j % @as(usize, @intCast(n_experts)));
+    const indices = try Array.fromData(allocator, u32, i_data, i_shape);
+    defer indices.deinit();
+
+    const qconfig = QuantConfig{
+        .group_size = group_size,
+        .bits = 4,
+        .mode = .mxfp4,
+    };
+
+    const result = try gatherQmm(ctx, x, w, scales, null, null, indices, true, qconfig, true);
+    defer result.deinit();
+
+    try result.eval();
+
+    const result_shape = result.shape();
+    try std.testing.expectEqual(@as(usize, 3), result_shape.len);
+    try std.testing.expectEqual(@as(i32, n_tokens * topk), result_shape[0]);
+    try std.testing.expectEqual(@as(i32, 1), result_shape[1]);
+    try std.testing.expectEqual(@as(i32, out_dim), result_shape[2]);
+}
+
+test "gatherQmm with mxfp4 mode - GPU stream" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+
+    const stream_handle = c.c.mlx_default_gpu_stream_new();
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream_handle });
+
+    const n_experts: i32 = 256;
+    const out_dim: i32 = 2048;
+    const in_dim: i32 = 4096;
+    const group_size: i32 = 32;
+    const packed_in = in_dim / 8;
+
+    const w_shape = &[_]i32{ n_experts, out_dim, packed_in };
+    const w_size = @as(usize, @intCast(n_experts * out_dim * packed_in));
+    const w_data = try allocator.alloc(u32, w_size);
+    defer allocator.free(w_data);
+    for (w_data) |*v| v.* = 1;
+    const w = try Array.fromData(allocator, u32, w_data, w_shape);
+    defer w.deinit();
+
+    const s_shape = &[_]i32{ n_experts, out_dim, in_dim / group_size };
+    const s_size = @as(usize, @intCast(n_experts * out_dim * (in_dim / group_size)));
+    const s_data = try allocator.alloc(u8, s_size);
+    defer allocator.free(s_data);
+    for (s_data) |*v| v.* = 1;
+    const scales = try Array.fromData(allocator, u8, s_data, s_shape);
+    defer scales.deinit();
+
+    const x_shape = &[_]i32{ 48, 1, in_dim };
+    const x_size = @as(usize, @intCast(48 * 1 * in_dim));
+    const x_data = try allocator.alloc(f32, x_size);
+    defer allocator.free(x_data);
+    for (x_data) |*v| v.* = 0.1;
+    const x = try Array.fromData(allocator, f32, x_data, x_shape);
+    defer x.deinit();
+
+    const i_shape = &[_]i32{48};
+    const i_data = try allocator.alloc(u32, 48);
+    defer allocator.free(i_data);
+    for (i_data, 0..) |*v, j| v.* = @intCast(j % 256);
+    const indices = try Array.fromData(allocator, u32, i_data, i_shape);
+    defer indices.deinit();
+
+    const qconfig = QuantConfig{
+        .group_size = group_size,
+        .bits = 4,
+        .mode = .mxfp4,
+    };
+
+    const result = try gatherQmm(ctx, x, w, scales, null, null, indices, true, qconfig, true);
+    defer result.deinit();
+
+    try result.eval();
+
+    const result_shape = result.shape();
+    try std.testing.expectEqual(@as(usize, 3), result_shape.len);
+    try std.testing.expectEqual(@as(i32, 48), result_shape[0]);
+    try std.testing.expectEqual(@as(i32, 1), result_shape[1]);
+    try std.testing.expectEqual(@as(i32, out_dim), result_shape[2]);
+}

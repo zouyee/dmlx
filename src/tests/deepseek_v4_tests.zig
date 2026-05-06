@@ -12,12 +12,12 @@ test "ops.slice on 1D array" {
     const ctx = EagerContext.init(allocator);
 
     const data = &[_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
-    const arr = try Array.fromData(allocator, f32, data, &[_]i32{ 8 });
+    const arr = try Array.fromData(allocator, f32, data, &[_]i32{8});
     defer arr.deinit();
 
-    const sliced = try ops.slice(ctx, arr, &[_]i32{ 2 }, &[_]i32{ 6 }, &[_]i32{ 1 });
+    const sliced = try ops.slice(ctx, arr, &[_]i32{2}, &[_]i32{6}, &[_]i32{1});
     defer sliced.deinit();
-    
+
     try std.testing.expectEqual(@as(i32, 4), sliced.shape()[0]);
 }
 
@@ -26,15 +26,15 @@ test "ops.slice on 3D array" {
     const ctx = EagerContext.init(allocator);
 
     const data = &[_]f32{
-        1,  2,  3,  4,  5,  6,  7,  8,
-        9,  10, 11, 12, 13, 14, 15, 16,
+        1, 2,  3,  4,  5,  6,  7,  8,
+        9, 10, 11, 12, 13, 14, 15, 16,
     };
     const kv = try Array.fromData(allocator, f32, data, &[_]i32{ 1, 8, 2 });
     defer kv.deinit();
 
     const suffix = try ops.slice(ctx, kv, &[_]i32{ 0, 4, 0 }, &[_]i32{ 1, 8, 2 }, &[_]i32{ 1, 1, 1 });
     defer suffix.deinit();
-    
+
     try std.testing.expectEqual(@as(i32, 1), suffix.shape()[0]);
     try std.testing.expectEqual(@as(i32, 4), suffix.shape()[1]);
     try std.testing.expectEqual(@as(i32, 2), suffix.shape()[2]);
@@ -64,8 +64,8 @@ test "compressKV mean pools prefix and keeps window" {
 
     // [B=1, S=8, D=2]
     const data = &[_]f32{
-        1,  2,  3,  4,  5,  6,  7,  8,
-        9,  10, 11, 12, 13, 14, 15, 16,
+        1, 2,  3,  4,  5,  6,  7,  8,
+        9, 10, 11, 12, 13, 14, 15, 16,
     };
     const kv = try Array.fromData(allocator, f32, data, &[_]i32{ 1, 8, 2 });
     defer kv.deinit();
@@ -84,8 +84,8 @@ test "compressKV handles remainder" {
     const ctx = EagerContext.init(allocator);
 
     const data = &[_]f32{
-        1,  2,  3,  4,  5,  6,  7,  8,
-        9,  10, 11, 12, 13, 14,
+        1, 2,  3,  4,  5,  6,  7, 8,
+        9, 10, 11, 12, 13, 14,
     };
     const kv = try Array.fromData(allocator, f32, data, &[_]i32{ 1, 7, 2 });
     defer kv.deinit();
@@ -123,7 +123,7 @@ test "compressKV softmax-gated pooling with learned weights" {
     // [B=1, S=8, D=2], compress_ratio=2, window=4
     // prefix_len=4, num_groups=2, remainder=0
     const data = &[_]f32{
-        1, 2, 3, 4, 5, 6, 7, 8,
+        1, 2,  3,  4,  5,  6,  7,  8,
         9, 10, 11, 12, 13, 14, 15, 16,
     };
     const kv = try Array.fromData(allocator, f32, data, &[_]i32{ 1, 8, 2 });
@@ -156,7 +156,7 @@ test "compressKV softmax-gated pooling with remainder" {
     // [B=1, S=7, D=2], compress_ratio=2, window=4
     // prefix_len=3, num_groups=1, remainder=1
     const data = &[_]f32{
-        1, 2, 3, 4, 5, 6, 7, 8,
+        1, 2,  3,  4,  5,  6,  7, 8,
         9, 10, 11, 12, 13, 14,
     };
     const kv = try Array.fromData(allocator, f32, data, &[_]i32{ 1, 7, 2 });
@@ -290,10 +290,10 @@ test "mhcPreNormFn computes mixes" {
     defer residual.deinit();
 
     const fn_data = &[_]f32{
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1,
+        1,   0,   0,   0,
+        0,   1,   0,   0,
+        0,   0,   1,   0,
+        0,   0,   0,   1,
         0.1, 0.1, 0.1, 0.1,
         0.1, 0.1, 0.1, 0.1,
         0.1, 0.1, 0.1, 0.1,
@@ -345,10 +345,10 @@ test "DSV4HyperConn pre/post roundtrip" {
     defer residual.deinit();
 
     const fn_data = &[_]f32{
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1,
+        1,   0,   0,   0,
+        0,   1,   0,   0,
+        0,   0,   1,   0,
+        0,   0,   0,   1,
         0.1, 0.1, 0.1, 0.1,
         0.1, 0.1, 0.1, 0.1,
         0.1, 0.1, 0.1, 0.1,
@@ -412,6 +412,7 @@ test "DSV4Model dummy build and forward+generate" {
         .num_key_value_heads = 1,
         .q_lora_rank = 4,
         .o_lora_rank = 4,
+        .o_groups = 1,
         .qk_rope_head_dim = 4,
         .max_position_embeddings = 128,
         .n_routed_experts = 2,
@@ -473,7 +474,7 @@ test "DSV4Model dummy build and forward+generate" {
     try W.put(&weights, allocator, "layers.0.attn_norm.weight", &[_]i32{16});
     try W.put(&weights, allocator, "layers.0.ffn_norm.weight", &[_]i32{16});
 
-    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner);
+    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner, .{});
     defer model.deinit();
 
     const input_ids = try Array.fromData(allocator, u32, &[_]u32{ 1, 2, 3 }, &[_]i32{ 1, 3 });
@@ -509,7 +510,6 @@ test "DSV4Model dummy build and forward+generate" {
     try std.testing.expectEqual(@as(usize, 3), generated.len);
 }
 
-
 test "DSV4Model with MHC enabled" {
     const loader = @import("../models/deepseek_v4_loader.zig");
     const allocator = std.testing.allocator;
@@ -524,6 +524,7 @@ test "DSV4Model with MHC enabled" {
         .num_key_value_heads = 1,
         .q_lora_rank = 4,
         .o_lora_rank = 4,
+        .o_groups = 1,
         .qk_rope_head_dim = 4,
         .max_position_embeddings = 128,
         .n_routed_experts = 2,
@@ -593,7 +594,7 @@ test "DSV4Model with MHC enabled" {
     try W.put(&weights, allocator, "layers.0.hc_ffn_base", &[_]i32{8});
     try W.put(&weights, allocator, "layers.0.hc_ffn_scale", &[_]i32{3});
 
-    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner);
+    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner, .{});
     defer model.deinit();
 
     const input_ids = try Array.fromData(allocator, u32, &[_]u32{ 1, 2, 3 }, &[_]i32{ 1, 3 });

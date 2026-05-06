@@ -334,6 +334,7 @@ pub const PagedKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = filterImpl,
+        .rollback = rollbackImpl,
         .deinit = deinitImpl,
     };
 
@@ -543,7 +544,7 @@ pub const PagedKVCache = struct {
                 const k_start = &[_]i32{ @intCast(b), 0, @intCast(written), 0 };
                 const k_stop = &[_]i32{ @intCast(b + 1), std.math.maxInt(i32), @intCast(written + write_len), std.math.maxInt(i32) };
                 const k_strides = &[_]i32{ 1, 1, 1, 1 };
-                var new_k_slice= c.c.mlx_array_new();
+                var new_k_slice = c.c.mlx_array_new();
                 try c.check(c.c.mlx_slice(
                     &new_k_slice,
                     keys.inner,
@@ -561,7 +562,7 @@ pub const PagedKVCache = struct {
                 const v_start = &[_]i32{ @intCast(b), 0, @intCast(written), 0 };
                 const v_stop = &[_]i32{ @intCast(b + 1), std.math.maxInt(i32), @intCast(written + write_len), std.math.maxInt(i32) };
                 const v_strides = &[_]i32{ 1, 1, 1, 1 };
-                var new_v_slice= c.c.mlx_array_new();
+                var new_v_slice = c.c.mlx_array_new();
                 try c.check(c.c.mlx_slice(
                     &new_v_slice,
                     values.inner,
@@ -598,7 +599,7 @@ pub const PagedKVCache = struct {
                     const upd_k_start = &[_]i32{ 0, 0, @intCast(page_offset), 0 };
                     const upd_k_stop = &[_]i32{ 1, std.math.maxInt(i32), @intCast(page_offset + write_len), std.math.maxInt(i32) };
                     const upd_k_strides = &[_]i32{ 1, 1, 1, 1 };
-                    var updated_keys= c.c.mlx_array_new();
+                    var updated_keys = c.c.mlx_array_new();
                     try c.check(c.c.mlx_slice_update(
                         &updated_keys,
                         page.keys.inner,
@@ -617,7 +618,7 @@ pub const PagedKVCache = struct {
                     const upd_v_start = &[_]i32{ 0, 0, @intCast(page_offset), 0 };
                     const upd_v_stop = &[_]i32{ 1, std.math.maxInt(i32), @intCast(page_offset + write_len), std.math.maxInt(i32) };
                     const upd_v_strides = &[_]i32{ 1, 1, 1, 1 };
-                    var updated_values= c.c.mlx_array_new();
+                    var updated_values = c.c.mlx_array_new();
                     try c.check(c.c.mlx_slice_update(
                         &updated_values,
                         page.values.inner,
@@ -707,7 +708,7 @@ pub const PagedKVCache = struct {
                 const g_start = &[_]i32{ 0, 0, 0, 0 };
                 const g_strides = &[_]i32{ 1, 1, 1, 1 };
                 const g_k_stop = &[_]i32{ 1, std.math.maxInt(i32), @intCast(new_total), std.math.maxInt(i32) };
-                var k_contig= c.c.mlx_array_new();
+                var k_contig = c.c.mlx_array_new();
                 try c.check(c.c.mlx_slice(
                     &k_contig,
                     page.keys.inner,
@@ -719,7 +720,7 @@ pub const PagedKVCache = struct {
                     g_strides.len,
                     stream,
                 ));
-                var v_contig= c.c.mlx_array_new();
+                var v_contig = c.c.mlx_array_new();
                 try c.check(c.c.mlx_slice(
                     &v_contig,
                     page.values.inner,
@@ -747,7 +748,7 @@ pub const PagedKVCache = struct {
                     const p_start = &[_]i32{ 0, 0, 0, 0 };
                     const p_stop = &[_]i32{ 1, std.math.maxInt(i32), @intCast(slice_len), std.math.maxInt(i32) };
                     const p_strides = &[_]i32{ 1, 1, 1, 1 };
-                    var k_slice= c.c.mlx_array_new();
+                    var k_slice = c.c.mlx_array_new();
                     try c.check(c.c.mlx_slice(
                         &k_slice,
                         page.keys.inner,
@@ -761,7 +762,7 @@ pub const PagedKVCache = struct {
                     ));
                     page_keys[pi] = Array.fromHandle(k_slice);
 
-                    var v_slice= c.c.mlx_array_new();
+                    var v_slice = c.c.mlx_array_new();
                     try c.check(c.c.mlx_slice(
                         &v_slice,
                         page.values.inner,
@@ -782,7 +783,7 @@ pub const PagedKVCache = struct {
                 for (page_keys) |arr| {
                     try c.check(c.c.mlx_vector_array_append_data(k_vec, &arr.inner, 1));
                 }
-                var k_concat= c.c.mlx_array_new();
+                var k_concat = c.c.mlx_array_new();
                 try c.check(c.c.mlx_concatenate_axis(&k_concat, k_vec, 2, stream));
                 out_keys[b] = Array.fromHandle(k_concat);
 
@@ -791,7 +792,7 @@ pub const PagedKVCache = struct {
                 for (page_values) |arr| {
                     try c.check(c.c.mlx_vector_array_append_data(v_vec, &arr.inner, 1));
                 }
-                var v_concat= c.c.mlx_array_new();
+                var v_concat = c.c.mlx_array_new();
                 try c.check(c.c.mlx_concatenate_axis(&v_concat, v_vec, 2, stream));
                 out_values[b] = Array.fromHandle(v_concat);
 
@@ -819,7 +820,7 @@ pub const PagedKVCache = struct {
         for (out_keys) |arr| {
             try c.check(c.c.mlx_vector_array_append_data(k_vec, &arr.inner, 1));
         }
-        var k_result= c.c.mlx_array_new();
+        var k_result = c.c.mlx_array_new();
         try c.check(c.c.mlx_concatenate_axis(&k_result, k_vec, 0, stream));
 
         const v_vec = c.c.mlx_vector_array_new();
@@ -827,7 +828,7 @@ pub const PagedKVCache = struct {
         for (out_values) |arr| {
             try c.check(c.c.mlx_vector_array_append_data(v_vec, &arr.inner, 1));
         }
-        var v_result= c.c.mlx_array_new();
+        var v_result = c.c.mlx_array_new();
         try c.check(c.c.mlx_concatenate_axis(&v_result, v_vec, 0, stream));
 
         // Clean up per-batch arrays since we now own result.
@@ -855,6 +856,21 @@ pub const PagedKVCache = struct {
         for (self.sequences.items, 0..) |*seq, i| {
             seq.pages.clearRetainingCapacity();
             seq.cached_len = 0;
+            self.freeCached(i);
+        }
+    }
+
+    fn rollbackImpl(ctx: *anyopaque, to_len: usize) void {
+        const self: *PagedKVCache = @ptrCast(@alignCast(ctx));
+        for (self.sequences.items, 0..) |*seq, i| {
+            const new_pages_needed = (to_len + self.page_size - 1) / self.page_size;
+            while (seq.pages.items.len > new_pages_needed) {
+                const pt = seq.pages.pop().?;
+                const page = &self.pages.items[pt.physical];
+                page.used = false;
+                page.ref_count = 0;
+            }
+            seq.cached_len = to_len;
             self.freeCached(i);
         }
     }

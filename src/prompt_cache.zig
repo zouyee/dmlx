@@ -69,17 +69,20 @@ pub fn savePromptCache(
     var cache_dtype: Dtype = .float32;
 
     for (caches, 0..) |cache, i| {
-        // Get the current cached state by doing a zero-length update
-        // We access the underlying StandardKVCache to read keys/values directly
-        const std_cache: *StandardKVCache = @ptrCast(@alignCast(cache.ptr));
+        // Use VTable getState to safely access cache internals
+        const state = cache.getState() orelse {
+            std.log.warn("savePromptCache: layer {d} cache type does not support getState, skipping", .{i});
+            continue;
+        };
 
-        const current_len = std_cache.offset;
+        const current_len = state.offset;
         if (current_len == 0) continue;
 
         // Slice the valid portion of keys and values
         const stream = c.c.mlx_default_cpu_stream_new();
-        const keys = try sliceCache(std_cache.keys, current_len, stream);
-        const values = try sliceCache(std_cache.values, current_len, stream);
+        defer _ = c.c.mlx_stream_free(stream);
+        const keys = try sliceCache(state.keys, current_len, stream);
+        const values = try sliceCache(state.values, current_len, stream);
 
         // Store shape info from first non-empty layer
         if (seq_len == 0) {
@@ -175,6 +178,7 @@ pub fn loadPromptCache(
 
     // Reconstruct KV caches
     const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
     var caches = try allocator.alloc(KVCacheStrategy, num_layers);
     errdefer {
         for (caches) |*cache_strategy| {
@@ -402,8 +406,7 @@ test "Property 5: Prompt Cache Round-Trip — save/load equality and mismatch er
         const seq_len = rand.intRangeAtMost(usize, 1, 16);
 
         const stream = c.c.mlx_default_cpu_stream_new();
-
-        // --- Create caches with random data ---
+        defer _ = c.c.mlx_stream_free(stream);
         var caches = try allocator.alloc(KVCacheStrategy, num_layers);
         defer {
             for (caches) |cache_strat| {
@@ -460,7 +463,7 @@ test "Property 5: Prompt Cache Round-Trip — save/load equality and mismatch er
         }
 
         // --- Save to temp file ---
-        const tmp_path = "/tmp/mlx_zig_pbt_prompt_cache.safetensors";
+        const tmp_path = "/tmp/dmlx_pbt_prompt_cache.safetensors";
         try savePromptCache(allocator, caches, tmp_path);
 
         // --- Load with matching config → verify element-wise equality ---

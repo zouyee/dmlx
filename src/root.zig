@@ -1,4 +1,4 @@
-/// MLX-Zig: Apple MLX bindings via mlx-c.
+/// DMLX: Apple MLX bindings via mlx-c.
 const std = @import("std");
 
 pub const dtype = @import("dtype.zig");
@@ -24,6 +24,11 @@ pub const models = @import("models/llama.zig");
 pub const model_loader = @import("models/llama_loader.zig");
 pub const deepseek_v4 = @import("models/deepseek_v4.zig");
 pub const deepseek_v4_loader = @import("models/deepseek_v4_loader.zig");
+pub const expert_stream = @import("models/expert_stream.zig");
+pub const layer_prefetcher = @import("models/layer_prefetcher.zig");
+pub const nemotron_h = @import("models/nemotron_h.zig");
+pub const nemotron_h_loader = @import("models/nemotron_h_loader.zig");
+pub const llava_loader = @import("models/llava_loader.zig");
 pub const lora = @import("lora.zig");
 pub const hf_config = @import("hf_config.zig");
 pub const tokenizer = @import("tokenizer.zig");
@@ -34,10 +39,17 @@ pub const model_registry = @import("model_registry.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 pub const server = @import("server.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const diffusion_scheduler = @import("diffusion/scheduler.zig");
+pub const diffusion_vae = @import("diffusion/vae.zig");
+pub const diffusion_flux = @import("diffusion/flux.zig");
+pub const vision_preprocess = @import("vision/preprocess.zig");
+pub const vision_vit = @import("vision/vit.zig");
+pub const vision_llava = @import("vision/llava.zig");
 pub const batch_builder = @import("batch_builder.zig");
 pub const speculative = @import("speculative.zig");
 pub const guided = @import("guided.zig");
 pub const quantize = @import("quantize.zig");
+pub const jang_quantizer = @import("jang_quantizer.zig");
 pub const qlora = @import("qlora.zig");
 pub const moe_router = @import("moe_router.zig");
 pub const model_pool = @import("model_pool.zig");

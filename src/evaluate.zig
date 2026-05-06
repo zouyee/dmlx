@@ -1,4 +1,4 @@
-/// Perplexity evaluation tool for MLX-Zig.
+/// Perplexity evaluation tool for DMLX.
 ///
 /// Computes perplexity on a text dataset to measure model quality:
 ///   perplexity = exp(mean(cross_entropy_per_token))
@@ -10,7 +10,7 @@
 ///   - Detecting model corruption or loading errors
 ///
 /// Usage:
-///   mlx-zig evaluate --model <path> --data <file> [--max-tokens N] [--stride S]
+///   dmlx evaluate --model <path> --data <file> [--max-tokens N] [--stride S]
 ///
 /// The data file should be a plain text file. The tool tokenizes the text,
 /// runs forward passes in sliding windows, and computes the average

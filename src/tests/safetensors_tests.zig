@@ -7,7 +7,7 @@ const Array = mlx.Array;
 test "save and load safetensors roundtrip" {
     const allocator = std.testing.allocator;
 
-    const full_path = "/tmp/mlx_zig_test_roundtrip.safetensors";
+    const full_path = "/tmp/dmlx_test_roundtrip.safetensors";
 
     // Prepare weights
     var weights = std.StringHashMap(Array).init(allocator);
@@ -67,7 +67,7 @@ test "save and load safetensors roundtrip" {
 test "loadSafetensors empty metadata" {
     const allocator = std.testing.allocator;
 
-    const full_path = "/tmp/mlx_zig_test_empty.safetensors";
+    const full_path = "/tmp/dmlx_test_empty.safetensors";
 
     var weights = std.StringHashMap(Array).init(allocator);
     defer {
@@ -79,7 +79,7 @@ test "loadSafetensors empty metadata" {
         weights.deinit();
     }
 
-    const data = [_]f32{ 42.0 };
+    const data = [_]f32{42.0};
     const arr = c.c.mlx_array_new_data(&data, &[_]c_int{1}, 1, c.c.MLX_FLOAT32);
     const owned_key = try allocator.dupe(u8, "scalar");
     try weights.put(owned_key, Array.fromHandle(arr));

@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>dmlx Benchmark — DeepSeek-V4 on Apple Silicon</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: #0d1117;
+  color: #e6edf3;
+  font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  padding: 40px;
+  min-height: 100vh;
+}
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+/* Header */
+.header {
+  margin-bottom: 30px;
+}
+.runtime-badge {
+  display: inline-block;
+  background: rgba(139, 92, 246, 0.15);
+  border: 1px solid #8b5cf6;
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 13px;
+  color: #a78bfa;
+  margin-bottom: 12px;
+}
+.runtime-badge::before {
+  content: "⚡ ";
+}
+.model-name {
+  font-size: 36px;
+  font-weight: 700;
+  color: #ffffff;
+  margin-bottom: 8px;
+}
+.quant-info {
+  font-size: 16px;
+  color: #4ade80;
+  margin-bottom: 20px;
+}
+
+/* Stats row */
+.stats-row {
+  display: flex;
+  gap: 30px;
+  margin-bottom: 30px;
+}
+.stat-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.stat-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 18px;
+}
+.stat-label {
+  font-size: 11px;
+  color: #8b949e;
+  text-transform: uppercase;
+}
+.stat-value {
+  font-size: 16px;
+  font-weight: 600;
+  color: #ffffff;
+}
+
+/* Environment box */
+.env-box {
+  background: rgba(22, 27, 34, 0.8);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 30px;
+}
+.env-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #4ade80;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 12px;
+}
+.env-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.env-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+.env-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #4ade80;
+}
+.env-key {
+  color: #8b949e;
+  min-width: 120px;
+}
+.env-val {
+  color: #e6edf3;
+  font-weight: 500;
+}
+
+/* Section title */
+.section-title {
+  text-align: center;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  color: #8b949e;
+  margin: 40px 0 30px;
+}
+
+/* Charts area */
+.charts-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 30px;
+  margin-bottom: 40px;
+}
+.chart-box {
+  background: rgba(22, 27, 34, 0.6);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 24px;
+}
+.chart-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.chart-header-icon {
+  font-size: 18px;
+}
+.chart-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #a78bfa;
+}
+.chart-subtitle {
+  font-size: 11px;
+  color: #8b949e;
+  margin-bottom: 20px;
+}
+
+/* Best badge */
+.best-badge {
+  float: right;
+  background: rgba(139, 92, 246, 0.1);
+  border: 1px solid rgba(139, 92, 246, 0.4);
+  border-radius: 8px;
+  padding: 8px 14px;
+  text-align: center;
+}
+.best-badge-icon { font-size: 16px; }
+.best-badge-label {
+  font-size: 10px;
+  color: #8b949e;
+}
+.best-badge-value {
+  font-size: 20px;
+  font-weight: 700;
+  color: #a78bfa;
+}
+.best-badge-detail {
+  font-size: 10px;
+  color: #8b949e;
+}
+
+/* Bar chart */
+.bar-chart {
+  display: flex;
+  align-items: flex-end;
+  gap: 16px;
+  height: 180px;
+  padding-top: 20px;
+}
+.bar-group {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100%;
+  justify-content: flex-end;
+}
+.bar-value {
+  font-size: 12px;
+  font-weight: 600;
+  color: #ffffff;
+  margin-bottom: 4px;
+}
+.bar-variance {
+  font-size: 9px;
+  color: #8b949e;
+  margin-bottom: 4px;
+}
+.bar {
+  width: 50px;
+  border-radius: 4px 4px 0 0;
+  transition: height 0.3s;
+}
+.bar-purple { background: linear-gradient(180deg, #a78bfa, #7c3aed); }
+.bar-green { background: linear-gradient(180deg, #4ade80, #16a34a); }
+.bar-label {
+  margin-top: 8px;
+  text-align: center;
+}
+.bar-label-main {
+  font-size: 11px;
+  color: #e6edf3;
+}
+.bar-label-sub {
+  font-size: 9px;
+  color: #8b949e;
+}
+.bar-tag {
+  display: inline-block;
+  font-size: 9px;
+  padding: 2px 6px;
+  border-radius: 3px;
+  margin-top: 4px;
+}
+.tag-purple { background: rgba(139, 92, 246, 0.2); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.4); }
+.tag-green { background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3); }
+
+/* Bottom row */
+.bottom-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 30px;
+}
+.config-box, .takeaway-box {
+  background: rgba(22, 27, 34, 0.6);
+  border: 1px solid #30363d;
+  border-radius: 10px;
+  padding: 20px;
+}
+.config-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #a78bfa;
+  margin-bottom: 12px;
+}
+.config-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.config-badge {
+  font-size: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-weight: 600;
+  min-width: 100px;
+  text-align: center;
+}
+.badge-purple { background: rgba(139, 92, 246, 0.2); color: #a78bfa; border: 1px solid rgba(139, 92, 246, 0.4); }
+.badge-green { background: rgba(74, 222, 128, 0.15); color: #4ade80; border: 1px solid rgba(74, 222, 128, 0.3); }
+.config-detail {
+  font-size: 12px;
+  color: #8b949e;
+}
+
+.takeaway-title {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: #fbbf24;
+  margin-bottom: 12px;
+}
+.takeaway-title::before { content: "🏆 "; }
+.takeaway-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #e6edf3;
+}
+.takeaway-check {
+  color: #4ade80;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Footer */
+.footer {
+  margin-top: 30px;
+  padding-top: 20px;
+  border-top: 1px solid #30363d;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 12px;
+  color: #8b949e;
+}
+.footer-highlight {
+  color: #a78bfa;
+}
+</style>
+</head>
+<body>
+<div class="container">
+
+  <!-- Header -->
+  <div class="header" style="display: flex; justify-content: space-between; align-items: flex-start;">
+    <div>
+      <div class="runtime-badge">dmlx (Apple Silicon Native Runtime)</div>
+      <div class="model-name">DeepSeek-V4-Flash-4bit</div>
+      <div class="quant-info">MoE Expert Streaming + SMELT 15% (~3.5–4 bits per weight)</div>
+    </div>
+    <div class="env-box" style="margin-bottom: 0; min-width: 380px;">
+      <div class="env-title">Benchmark Environment</div>
+      <div class="env-grid">
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Runtime</span><span class="env-val">dmlx</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">GPU</span><span class="env-val">Apple M4 Pro (Metal)</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Memory</span><span class="env-val">48 GB Unified</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Quantization</span><span class="env-val">INT4 + SMELT 15%</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">KV Cache</span><span class="env-val">Paged + Tiered</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Experts</span><span class="env-val">top-8 of 256 (stream)</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Context</span><span class="env-val">128K+ tokens</span></div>
+        <div class="env-item"><div class="env-dot"></div><span class="env-key">Binary</span><span class="env-val">Single static (~10MB)</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Stats row -->
+  <div class="stats-row">
+    <div class="stat-item">
+      <div class="stat-icon">🔢</div>
+      <div><div class="stat-label">Model Size</div><div class="stat-value">~40 GiB (4-bit)</div></div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-icon">🧠</div>
+      <div><div class="stat-label">Parameters</div><div class="stat-value">671 B</div></div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-icon">⚙️</div>
+      <div><div class="stat-label">Backend</div><div class="stat-value">Metal (MLX)</div></div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-icon">💻</div>
+      <div><div class="stat-label">Active Memory</div><div class="stat-value">~6 GB (SMELT)</div></div>
+    </div>
+    <div class="stat-item">
+      <div class="stat-icon">🏗️</div>
+      <div><div class="stat-label">Experts</div><div class="stat-value">256 (MoE)</div></div>
+    </div>
+  </div>
+
+  <!-- Section title -->
+  <div class="section-title">B E N C H M A R K &nbsp; R E S U L T S</div>
+
+  <!-- Charts -->
+  <div class="charts-row">
+    <!-- Left chart: Prefill / TTFT -->
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-header-icon">🚀</span>
+        <span class="chart-title">Prefill / TTFT (ms)</span>
+      </div>
+      <div class="chart-subtitle">Lower is better</div>
+      <div class="best-badge">
+        <div class="best-badge-icon">🏆</div>
+        <div class="best-badge-label">Best (TTFT)</div>
+        <div class="best-badge-value">370.5 ms</div>
+        <div class="best-badge-detail">+48% vs initial</div>
+      </div>
+      <div class="bar-chart">
+        <div class="bar-group">
+          <div class="bar-value">716</div>
+          <div class="bar-variance">initial</div>
+          <div class="bar bar-purple" style="height: 100%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">a024bee</div>
+            <div class="bar-tag tag-purple">Initial</div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-value">446.8</div>
+          <div class="bar-variance">-38%</div>
+          <div class="bar bar-purple" style="height: 62%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">8ced50c</div>
+            <div class="bar-tag tag-purple">Tuning</div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-value" style="color: #4ade80;">370.5</div>
+          <div class="bar-variance">-48%</div>
+          <div class="bar bar-green" style="height: 52%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">7e72a7</div>
+            <div class="bar-tag tag-green">Best</div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Right chart: Token Generation -->
+    <div class="chart-box">
+      <div class="chart-header">
+        <span class="chart-header-icon">⚡</span>
+        <span class="chart-title">Token Generation (tok/s)</span>
+      </div>
+      <div class="chart-subtitle">Higher is better</div>
+      <div class="best-badge">
+        <div class="best-badge-icon">⭐</div>
+        <div class="best-badge-label">Best (TG)</div>
+        <div class="best-badge-value">12.2 t/s</div>
+        <div class="best-badge-detail">SMELT 15%</div>
+      </div>
+      <div class="bar-chart">
+        <div class="bar-group">
+          <div class="bar-value">~8.0</div>
+          <div class="bar-variance">initial</div>
+          <div class="bar bar-purple" style="height: 65%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">a024bee</div>
+            <div class="bar-tag tag-purple">Initial</div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-value">9.4</div>
+          <div class="bar-variance">+17%</div>
+          <div class="bar bar-purple" style="height: 77%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">8ced50c</div>
+            <div class="bar-tag tag-purple">Tuning</div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-value" style="color: #4ade80;">12.2</div>
+          <div class="bar-variance">+52%</div>
+          <div class="bar bar-green" style="height: 100%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">7e72a7</div>
+            <div class="bar-tag tag-green">Best</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Bottom row -->
+  <div class="bottom-row">
+    <div class="config-box">
+      <div class="config-title">Memory Optimization Layers</div>
+      <div class="config-item">
+        <span class="config-badge badge-purple">Layer 1</span>
+        <span class="config-detail">Expert Streaming: 138 GB → 10 GB (top-8 of 256)</span>
+      </div>
+      <div class="config-item">
+        <span class="config-badge badge-purple">Layer 2</span>
+        <span class="config-detail">SMELT 15%: 40 GB → 6 GB (partial loading)</span>
+      </div>
+      <div class="config-item">
+        <span class="config-badge badge-purple">Layer 3</span>
+        <span class="config-detail">MLA KV Compression (low-rank projection)</span>
+      </div>
+      <div class="config-item">
+        <span class="config-badge badge-green">Layer 4</span>
+        <span class="config-detail">Paged KV Cache: 32-token pages + CoW</span>
+      </div>
+      <div class="config-item">
+        <span class="config-badge badge-green">Layer 5</span>
+        <span class="config-detail">Zero-Copy Loading: 137s → 41s TTFT (mmap)</span>
+      </div>
+    </div>
+
+    <div class="takeaway-box">
+      <div class="takeaway-title">Key Takeaways</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 671B MoE model on 48GB Mac (mlx-lm: OOM)</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> ~12.2 tok/s steady-state with only ~6GB active weights</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 370ms TTFT — 48% faster than initial version</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 128K+ context via Paged + Tiered KV (RAM+SSD)</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> Single static binary, zero GC, sub-ms latency</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 7/7 correctness on end-to-end validation</div>
+    </div>
+  </div>
+
+  <!-- Footer -->
+  <div class="footer">
+    <span class="footer-highlight">✨ Pushing the limits of local LLM performance on Apple Silicon.</span>
+    <span>Model: DeepSeek-V4-Flash-4bit (671B MoE)</span>
+    <span>Runtime: <span class="footer-highlight">dmlx</span> (Zig + Metal via mlx-c)</span>
+  </div>
+
+</div>
+</body>
+</html>

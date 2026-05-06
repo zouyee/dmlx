@@ -856,7 +856,6 @@ test "integration: chunked prefill with concurrent decode in batch builder" {
     try testing.expectEqual(@as(usize, 3), req2.prefill_offset);
 }
 
-
 // ===========================================================================
 // Task 14.5: KV cache quantization via config
 //
@@ -1116,7 +1115,7 @@ test "integration: prompt cache save and load functions are callable" {
     }
 
     // Save to temp file — verifies savePromptCache is callable
-    const tmp_path = "/tmp/mlx_zig_integ_prompt_cache.safetensors";
+    const tmp_path = "/tmp/dmlx_integ_prompt_cache.safetensors";
     try prompt_cache_mod.savePromptCache(allocator, caches, tmp_path);
 
     // Load with matching config — verifies loadPromptCache is callable

@@ -108,7 +108,6 @@ fn createLlamaWeights(
     return weights;
 }
 
-
 // ============================================================
 // Test 1: LLaMA forward pass smoke test
 // ============================================================
@@ -140,7 +139,7 @@ test "llama smoke test - forward pass with tiny random model" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     // Forward pass: batch=1, seq_len=3, tokens [1, 2, 3]
@@ -195,7 +194,7 @@ test "llama smoke test - generate tokens with tiny random model" {
         weights.deinit();
     }
 
-    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream);
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
     defer model.deinit();
 
     // Prompt: [1, 2, 3], generate 5 new tokens
@@ -300,7 +299,7 @@ test "deepseek v4 smoke test - forward pass with tiny random model" {
     try W.put(&weights, allocator, "layers.0.attn_norm.weight", &[_]i32{16});
     try W.put(&weights, allocator, "layers.0.ffn_norm.weight", &[_]i32{16});
 
-    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner);
+    var model = try loader.buildDSV4Model(allocator, &config, &weights, ctx, ctx.stream.inner, .{});
     defer model.deinit();
 
     // Forward pass: batch=1, seq_len=3, tokens [1, 2, 3]
