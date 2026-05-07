@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **44% end-to-end speedup**: 7-prompt test suite reduced from 2400s to 1340s
+- Remove hot-path Layer forward debug prints (86 write syscalls/token)
+- Remove MoE diagnostic sync block (4× forced eval + 2× GPU→CPU copy per token)
+- Remove prefill logits diagnostic (128K vocab iteration ×2)
+- Replace `std.sort.insertion` with `std.mem.sort` in model loader (O(n²) → O(n log n))
+- Add `POSIX_MADV_RANDOM` mmap advisory for MoE expert streaming (fixes page cache thrashing)
+
 ### Fixed
 - **DeepSeek V4 chat template special tokens**: Corrected special token format from
   full-width characters (`<｜begin▁of▁sentence｜>`) to half-width ASCII
@@ -21,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive troubleshooting guide for DeepSeek V4 (`docs/en/deepseek-v4/troubleshooting.md`)
 - Chat template unit tests to validate special token formatting
 - Automatic prompt validation with detailed error messages for debugging
+- Performance optimization tracking document (`docs/en/analysis/perf-optimization-log.md`)
 
 ## [0.0.3] - 2026-04-21
 
