@@ -293,14 +293,7 @@ pub const ExpertStreamProvider = struct {
 
         // Use PartialTensorReader if available: read only selected expert rows
         if (self.partial_reader) |reader| {
-            const arr = try reader.readExpertRows(tensor_name, expert_ids);
-            // DEBUG: Force copy to ensure contiguous strides. The partial-read path
-            // (mmap/pread + mlx_array_new_data) may create tensors with non-standard
-            // strides that gatherQmm cannot process correctly.
-            const copied = try ops.copy(self.ctx, arr);
-            arr.deinit();
-            try copied.eval();
-            return copied;
+            return try reader.readExpertRows(tensor_name, expert_ids);
         }
 
         const info = self.index.entries.get(tensor_name) orelse return error.TensorNotFound;
