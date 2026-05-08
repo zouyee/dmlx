@@ -13,8 +13,8 @@ export BM_HW=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "?")
 export BM_MEM=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fGB",$1/1073741824}' || echo "?")
 T0=$(date +%s)
 
-echo "🔧 Build..."
-zig build 2>/dev/null
+echo "🔧 Build (ReleaseFast)..."
+zig build -Doptimize=ReleaseFast 2>/dev/null
 
 echo "🧪 Unit tests..."
 T1=$(date +%s)
