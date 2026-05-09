@@ -12,6 +12,8 @@ const ops = @import("mlx").ops;
 const kvcache = @import("kvcache.zig");
 const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
+const safetensors_reader = @import("mlx").safetensors_reader;
+const expert_stream = @import("models/expert_stream.zig");
 
 // Model implementations
 const llama = @import("models/llama.zig");
@@ -178,10 +180,15 @@ fn llamaLoader(
 /// Wraps a heap-allocated `DSV4Model` behind the `ModelVTable` interface.
 /// The adapter tracks `start_pos` internally and stores the MLX stream
 /// so that the VTable `forward` signature stays uniform.
-const DeepseekV4VTableAdapter = struct {
+pub const DeepseekV4VTableAdapter = struct {
     model: *deepseek_v4.DSV4Model,
     stream: c.c.mlx_stream,
     start_pos: usize,
+    /// Weights HashMap — kept alive for the model's lifetime.
+    /// buildDSV4Model borrows arrays from this map; releasing them
+    /// while the model is alive corrupts MLX array handles.
+    weights: std.StringHashMap(Array),
+    allocator: std.mem.Allocator,
 
     fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
         const self: *DeepseekV4VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
@@ -196,6 +203,13 @@ const DeepseekV4VTableAdapter = struct {
         const self: *DeepseekV4VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         self.model.deinit();
         allocator.destroy(self.model);
+        // Release remaining weights (model has ownership of the ones it fetchRemoved)
+        var it = self.weights.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        self.weights.deinit();
         allocator.destroy(self);
     }
 };
@@ -211,20 +225,99 @@ fn deepseekV4Loader(
 ) anyerror!ModelVTable {
     const dsv4_config = try deepseek_v4_loader.parseDSV4Config(allocator, config_json);
 
-    var weights = try deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, model_path, ctx, stream, smelt);
-    defer {
-        var it = weights.iterator();
-        while (it.next()) |entry| {
-            allocator.free(entry.key_ptr.*);
-            entry.value_ptr.*.deinit();
-        }
-        weights.deinit();
-    }
+    const use_selective = smelt.enabled and smelt.load_mode == .stream;
+    var weights = if (use_selective)
+        try deepseek_v4_loader.loadWeightsSelective(allocator, model_path, smelt)
+    else
+        try deepseek_v4_loader.loadWeightsFromDirectory(allocator, io, model_path, ctx, stream, smelt);
+    // NOTE: weights are NOT freed here — they are transferred to the adapter
+    // and released when the model is destroyed. buildDSV4Model borrows arrays
+    // from this map; releasing them while the model is alive corrupts MLX
+    // array handles (observed as "Cannot reshape array" with garbage values).
 
     const model_ptr = try allocator.create(deepseek_v4.DSV4Model);
     errdefer allocator.destroy(model_ptr);
 
     model_ptr.* = try deepseek_v4_loader.buildDSV4Model(allocator, &dsv4_config, &weights, ctx, stream, smelt);
+
+    // Wire expert streaming when smelt is enabled (matches CLI path in main.zig)
+    if (smelt.enabled and !model_ptr.hasExpertsLoaded()) {
+        // Build tensor index for random-access reading
+        const idx = try allocator.create(safetensors_reader.TensorIndex);
+        idx.* = try safetensors_reader.buildIndexFromDirectory(allocator, model_path);
+
+        // Build per-layer metadata
+        const num_layers = dsv4_config.num_hidden_layers;
+        var layer_meta = try allocator.alloc(expert_stream.LayerExpertMeta, num_layers);
+        for (0..num_layers) |i| {
+            const hf_gate = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.weight", .{i});
+            const hf_up = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.weight", .{i});
+            const hf_down = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.weight", .{i});
+            const hf_gate_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.gate_proj.scales", .{i});
+            const hf_up_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.up_proj.scales", .{i});
+            const hf_down_s = try std.fmt.allocPrint(allocator, "model.layers.{d}.ffn.switch_mlp.down_proj.scales", .{i});
+
+            var row_bytes: usize = 0;
+            var scale_row_bytes: usize = 0;
+            if (idx.entries.get(hf_gate)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+            if (idx.entries.get(hf_gate_s)) |info| {
+                const total = info.data_offset_end - info.data_offset_start;
+                scale_row_bytes = @intCast(total / @as(u64, @intCast(info.shape[0])));
+            }
+
+            layer_meta[i] = .{
+                .gate_proj_name = hf_gate,
+                .up_proj_name = hf_up,
+                .down_proj_name = hf_down,
+                .gate_scales_name = if (idx.entries.contains(hf_gate_s)) hf_gate_s else blk: {
+                    allocator.free(hf_gate_s);
+                    break :blk null;
+                },
+                .up_scales_name = if (idx.entries.contains(hf_up_s)) hf_up_s else blk: {
+                    allocator.free(hf_up_s);
+                    break :blk null;
+                },
+                .down_scales_name = if (idx.entries.contains(hf_down_s)) hf_down_s else blk: {
+                    allocator.free(hf_down_s);
+                    break :blk null;
+                },
+                .expert_row_bytes = row_bytes,
+                .expert_scale_row_bytes = scale_row_bytes,
+                .n_experts = dsv4_config.n_routed_experts,
+            };
+        }
+
+        const sp = try allocator.create(expert_stream.ExpertStreamProvider);
+
+        const strategy: expert_stream.ExpertLoadStrategy = if (smelt.load_mode == .stream) .stream else .preload;
+        const n_experts_to_load = @as(usize, @intFromFloat(@as(f32, @floatFromInt(dsv4_config.n_routed_experts)) * smelt.load_fraction));
+        var expert_ids = try allocator.alloc(u32, n_experts_to_load);
+        defer allocator.free(expert_ids);
+        for (0..n_experts_to_load) |i| {
+            expert_ids[i] = @intCast(i);
+        }
+
+        sp.* = try expert_stream.ExpertStreamProvider.initWithStrategy(
+            allocator,
+            ctx,
+            idx,
+            strategy,
+            expert_ids,
+            layer_meta,
+            true, // quantized
+            32, // group_size
+            4, // bits
+            "mxfp4",
+            dsv4_config.swiglu_limit,
+            4096, // cache_budget_mb
+        );
+
+        model_ptr.setExpertStreamProvider(sp);
+        std.log.info("model_registry: Expert streaming enabled for DeepSeek V4", .{});
+    }
 
     const adapter = try allocator.create(DeepseekV4VTableAdapter);
     errdefer allocator.destroy(adapter);
@@ -232,6 +325,8 @@ fn deepseekV4Loader(
         .model = model_ptr,
         .stream = stream,
         .start_pos = 0,
+        .weights = weights,
+        .allocator = allocator,
     };
 
     return ModelVTable{
