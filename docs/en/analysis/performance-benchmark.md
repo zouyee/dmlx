@@ -1,11 +1,15 @@
+---
+日期: 2026-05-09
+Commit: cd8d29f (tuning)
+模型: DeepSeek-V4-Flash-4bit (~40GB 4-bit, 33 shards)
+硬件: Apple M4 Pro, 48GB
+模式: smelt + stream, ExpertCache 4GB, temperature=0
+编译: zig build -Doptimize=ReleaseFast
+生成方式: scripts/run_benchmark.sh (自动化)
+总耗时: 1582s (perf 85s + e2e 1491s)
+---
+
 # dmlx 性能基准测试报告
-# 日期: 2026-05-09
-# Commit: b2e7113 (tuning)
-# 模型: DeepSeek-V4-Flash-4bit (~150GB, 33 shards)
-# 硬件: Apple M4 Pro, 48GB
-# 模式: smelt + stream, ExpertCache 4GB, temperature=0
-# 生成方式: scripts/run_benchmark.sh (自动化)
-# 总耗时: 1582s (perf 85s + e2e 1491s)
 
 ---
 
@@ -29,13 +33,25 @@
 - 稳态 (token 3-10): **40.9-84.1ms**, 平均 56.6ms
 - 吞吐量: **~17.7 tok/s**
 
-### 与初始版本对比
+### 与上一版本对比 (dff154d → cd8d29f)
 
-| 指标 | 初始 (a024bee) | 最终 (b2e7113) | 变化 |
-|------|---------------|-----------------|------|
-| Prefill | 716ms | **273.9ms** | **+62%** |
-| 稳态平均 | ~125ms | **56.6ms** | **+55%** |
+| 指标 | 上一版 dff154d (ReleaseFast) | 本次 cd8d29f (ReleaseFast) | 变化 |
+|------|----------------------------|---------------------------|------|
+| Prefill | 278.3ms | **273.9ms** | **-2%** |
+| 稳态平均 | 102.3ms | **56.6ms** | **-45%** |
+| 吞吐量 | ~9.8 tok/s | **~17.7 tok/s** | **+81%** |
+| Perf 阶段 (加载+10tok) | 104s | **85s** | **-18%** |
+
+注: dff154d 数据来自同机器 ReleaseFast 实测 (bench-baseline 分支, 2026-05-09)。
+
+### 与初始版本对比 (a024bee → cd8d29f)
+
+| 指标 | 初始 (a024bee) | 本次 (cd8d29f) | 总变化 |
+|------|---------------|----------------|--------|
+| Prefill | 716ms | **273.9ms** | **-62%** |
+| 稳态平均 | ~125ms | **56.6ms** | **-55%** |
 | 吞吐量 | ~8 tok/s | **~17.7 tok/s** | **+121%** |
+| 7-Prompt 通过率 | 1/7 | **7/7** | — |
 
 ---
 
@@ -55,17 +71,17 @@ bash scripts/best_test.sh → 7 passed, 0 failed (1491s)
 | P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
 | P7 | ✅ | to user's query. The user's query is "What is capital of France?" The correct an |
 
-### 修复前后对比
+### 正确性验证 (dff154d → cd8d29f)
 
-| # | Prompt | 修复前 (a024bee) | 修复后 (b2e7113) |
+| # | Prompt | 上一版 (dff154d) | 本次 (cd8d29f) |
 |---|--------|-----------------|-----------------|
-| P1 | 2+2= | ✅ (记忆型) | ✅ |
-| P2 | Capital of France | ⚠️ 15 token | ✅ |
-| P3 | Water freezes at | ⚠️ 20 token | ✅ |
-| P4 | Is Earth round? | ❌ 安全文本 | ✅ |
-| P5 | 3*3= | ❌ 错误 token | ✅ |
-| P6 | 10-5= | ❌ 乱码 | ✅ |
-| P7 | Capital of France? | ⚠️ 15 token | ✅ |
+| P1 | 2+2= | ✅ | ✅ |
+| P2 | Capital of France | ✅ | ✅ |
+| P3 | Water freezes at | ✅ | ✅ |
+| P4 | Is Earth round? | ✅ | ✅ |
+| P5 | 3*3= | ✅ | ✅ |
+| P6 | 10-5= | ✅ | ✅ |
+| P7 | Capital of France? | ✅ | ✅ |
 
 **7/7 PASS, 0 FAIL, 0 SKIP**
 
@@ -81,13 +97,21 @@ zig build test → PASS (430+)
 
 ## 四、关键性能指标
 
-| 指标 | 初始 (a024bee) | 最终 (b2e7113) | 变化 |
-|------|---------------|-----------------|------|
-| TTFT (模型加载→首 token) | ~140s | ~85s | — |
-| Prefill 延迟 | ~716ms | 273.9ms | **+62%** |
-| 稳态 token 延迟 | ~125ms | 56.6ms | **+55%** |
-| 稳态吞吐量 | ~8 tok/s | ~17.7 tok/s | **+121%** |
-| 7-Prompt 通过率 | 1/7 | 7/7 | — |
-| ExpertCache | 4GB / ~40% hit | 4GB / ~40% hit | — |
+| 指标 | 初始 (a024bee) | TTFT优化 (8ced50c) | 5项优化 (dff154d) | + copy removal (cd8d29f) |
+|------|---------------|-------------------|-------------------|--------------------------|
+| Prefill 延迟 | ~716ms | 446.8ms | 278.3ms | **273.9ms** |
+| 稳态 token 延迟 | ~125ms | 106.5ms | 102.3ms | **56.6ms** |
+| 稳态吞吐量 | ~8 tok/s | ~9.4 tok/s | ~9.8 tok/s | **~17.7 tok/s** |
+| 7-Prompt 通过率 | 1/7 | 7/7 | 7/7 | **7/7** |
+| ExpertCache | 4GB / ~40% hit | 4GB / ~40% hit | 4GB / ~40% hit | **4GB / ~40% hit** |
 
-注: TTFT 瓶颈是模型加载 (33 shard 索引 × 2)，prefill 本身仅 273.9ms。
+### dff154d → cd8d29f 增量对比 (实测)
+
+| 指标 | dff154d (上一版) | cd8d29f (最新) | 变化 |
+|------|-----------------|----------------|------|
+| Prefill | 278.3ms | **273.9ms** | **-2%** |
+| 稳态延迟 (平均) | 102.3ms | **56.6ms** | **-45%** |
+| 吞吐量 | ~9.8 tok/s | **~17.7 tok/s** | **+81%** |
+| Perf 阶段总耗时 | 104s | **85s** | **-18%** |
+
+注: 两组数据均为 ReleaseFast 编译，同机器同条件实测 (2026-05-09)。
