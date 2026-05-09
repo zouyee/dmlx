@@ -22,6 +22,7 @@ const fast_mod = @import("mlx").fast;
 const array_arena_mod = @import("mlx").array_arena;
 const quantize_mod = @import("mlx").quantize;
 const expert_stream = @import("expert_stream.zig");
+const compile_mode = @import("../compile_mode.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -2674,8 +2675,13 @@ pub const DSV4Model = struct {
     norm: nn.RMSNorm,
     hc_head: ?HyperHead,
     lm_head: Array,
+    compile_module: ?*compile_mode.CompileModule = null,
 
     pub fn deinit(self: *DSV4Model) void {
+        if (self.compile_module) |cm| {
+            cm.deinit();
+            self.allocator.destroy(cm);
+        }
         self.embed_tokens.weight.deinit();
         for (self.layers) |*layer| {
             layer.deinit();
@@ -2723,13 +2729,42 @@ pub const DSV4Model = struct {
             hidden = try arena.track(try expandToMHC(self.ctx, hidden, self.config.hc_mult, stream));
         }
 
-        // Pass through layers (eval after each to allow memory paging)
-        for (self.layers, 0..) |*layer, i| {
-            const cache = if (caches) |cache_arr| cache_arr[i] else null;
-            hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
-            // Eval after each layer to materialize results and free lazy weight references
-            // This allows MLX to page weights in/out of memory for large models
-            try hidden.eval();
+        // Pass through layers
+        if (self.compile_module) |cm| {
+            // Compiled path: group layers, eval only between groups.
+            // With MLX global compile mode enabled, operations between eval() calls
+            // are automatically traced and fused into compiled kernels.
+            var group_idx: u32 = 0;
+            while (group_idx < cm.numGroups()) : (group_idx += 1) {
+                const range = cm.groupLayerRange(group_idx);
+
+                // Execute layers in this group WITHOUT per-layer eval
+                var layer_i: u32 = range.start;
+                while (layer_i < range.end) : (layer_i += 1) {
+                    const cache = if (caches) |cache_arr| cache_arr[layer_i] else null;
+                    hidden = try arena.track(try self.layers[layer_i].forward(
+                        hidden,
+                        input_ids,
+                        mask,
+                        cache,
+                        start_pos,
+                        stream,
+                    ));
+                }
+
+                // Eval between groups to materialize results and allow Smelt memory paging.
+                // Skip eval after the last group (will be eval'd by caller or final norm).
+                if (group_idx + 1 < cm.numGroups()) {
+                    try hidden.eval();
+                }
+            }
+        } else {
+            // Original eager path: eval after each layer to allow memory paging
+            for (self.layers, 0..) |*layer, i| {
+                const cache = if (caches) |cache_arr| cache_arr[i] else null;
+                hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
+                try hidden.eval();
+            }
         }
 
         // Compress from mHC format before final norm using HyperHead

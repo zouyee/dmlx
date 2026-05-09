@@ -60,6 +60,7 @@ pub const numerical_equivalence_tests = @import("tests/numerical_equivalence_tes
 pub const cache_integration_tests = @import("tests/cache_integration_test.zig");
 pub const safetensors_reader_tests = @import("mlx").safetensors_reader;
 pub const expert_stream_tests = @import("models/expert_stream.zig");
+pub const compile_mode_tests = @import("compile_mode.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -124,4 +125,5 @@ test {
     _ = cache_integration_tests;
     _ = safetensors_reader_tests;
     _ = expert_stream_tests;
+    _ = compile_mode_tests;
 }

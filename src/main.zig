@@ -20,6 +20,7 @@ const EagerContext = root.EagerContext;
 
 const benchmark_mod = @import("benchmark.zig");
 const evaluate_mod = @import("evaluate.zig");
+const compile_mode = @import("compile_mode.zig");
 
 const ChatCommand = struct {
     model_path: []const u8,
@@ -37,6 +38,8 @@ const ChatCommand = struct {
     smelt_cache_mb: usize = 4096, // Expert cache size in MB (stream mode)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
+    compile: bool = false, // Enable layer-group compilation
+    compile_group_size: ?u32 = null, // Number of layers per compiled group (null = auto-detect)
 };
 
 const ServerCommand = struct {
@@ -59,6 +62,8 @@ const ServerCommand = struct {
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     distributed: bool = false,
+    compile: bool = false, // Enable layer-group compilation
+    compile_group_size: ?u32 = null, // Number of layers per compiled group (null = auto-detect)
 };
 
 const ConvertCommand = struct {
@@ -267,6 +272,8 @@ fn printUsage() void {
         \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
         \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
         \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
+        \\    --compile                   Enable layer-group compilation for faster inference
+        \\    --compile-group-size <n>    Layers per compiled group (default: auto-detect)
         \\    --distributed               Enable distributed tensor parallelism
         \\
         \\  dmlx benchmark [options]
@@ -401,11 +408,38 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
+        } else if (std.mem.eql(u8, flag, "--compile")) {
+            cmd.compile = true;
+            i -= 1;
+        } else if (std.mem.startsWith(u8, flag, "--compile-group-size=")) {
+            const val = flag["--compile-group-size=".len..];
+            cmd.compile_group_size = std.fmt.parseInt(u32, val, 10) catch {
+                std.log.err("Invalid --compile-group-size value: {s}", .{val});
+                std.process.exit(1);
+            };
+            i -= 1; // No separate value consumed
+        } else if (std.mem.eql(u8, flag, "--compile-group-size")) {
+            cmd.compile_group_size = std.fmt.parseInt(u32, value, 10) catch {
+                std.log.err("Invalid --compile-group-size value: {s}", .{value});
+                std.process.exit(1);
+            };
         }
     }
 
     if (cmd.model_path.len == 0) {
         return error.MissingRequiredArgument;
+    }
+
+    // Validate compile flags
+    if (cmd.compile_group_size != null and !cmd.compile) {
+        std.log.err("--compile-group-size requires --compile to be enabled", .{});
+        std.process.exit(1);
+    }
+    if (cmd.compile_group_size) |gs| {
+        if (gs < 2) {
+            std.log.err("--compile-group-size must be at least 2, got {d}", .{gs});
+            std.process.exit(1);
+        }
     }
 
     return cmd;
@@ -454,6 +488,21 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         } else if (std.mem.eql(u8, flag, "--raw")) {
             cmd.raw = true;
             i -= 1;
+        } else if (std.mem.eql(u8, flag, "--compile")) {
+            cmd.compile = true;
+            i -= 1;
+        } else if (std.mem.startsWith(u8, flag, "--compile-group-size=")) {
+            const val = flag["--compile-group-size=".len..];
+            cmd.compile_group_size = std.fmt.parseInt(u32, val, 10) catch {
+                std.log.err("Invalid --compile-group-size value: {s}", .{val});
+                std.process.exit(1);
+            };
+            i -= 1; // No separate value consumed
+        } else if (std.mem.eql(u8, flag, "--compile-group-size")) {
+            cmd.compile_group_size = std.fmt.parseInt(u32, value, 10) catch {
+                std.log.err("Invalid --compile-group-size value: {s}", .{value});
+                std.process.exit(1);
+            };
         }
     }
 
@@ -462,6 +511,18 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
 
     if (cmd.model_path.len == 0) {
         return error.MissingRequiredArgument;
+    }
+
+    // Validate compile flags
+    if (cmd.compile_group_size != null and !cmd.compile) {
+        std.log.err("--compile-group-size requires --compile to be enabled", .{});
+        std.process.exit(1);
+    }
+    if (cmd.compile_group_size) |gs| {
+        if (gs < 2) {
+            std.log.err("--compile-group-size must be at least 2, got {d}", .{gs});
+            std.process.exit(1);
+        }
     }
 
     return cmd;
@@ -783,6 +844,25 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     // 4. Build model
     var model = try root.deepseek_v4_loader.buildDSV4Model(allocator, &ds_config, &weights, ctx, stream, smelt_config);
     // Don't defer model cleanup - we'll do it manually to control order
+
+    // 4a. Construct CompileConfig from CLI flags
+    const compile_config = compile_mode.CompileConfig{
+        .enabled = cmd.compile,
+        .group_size = cmd.compile_group_size orelse 4,
+        .auto_detect = cmd.compile and cmd.compile_group_size == null,
+        .smelt_overhead_bytes = if (smelt_config.enabled and smelt_config.load_mode == .stream)
+            4 * 1024 * 1024 * 1024 // 4GB for expert cache
+        else
+            0,
+        .num_layers = @intCast(ds_config.num_hidden_layers),
+    };
+    if (compile_config.enabled) {
+        const num_groups = (compile_config.num_layers + compile_config.group_size - 1) / compile_config.group_size;
+        std.log.info("Compile mode: enabled, group_size={d}, groups={d}", .{
+            compile_config.group_size,
+            num_groups,
+        });
+    }
 
     // 4b. Wire expert streaming when smelt is enabled (loads experts from SSD on demand)
     var expert_sp: ?*root.expert_stream.ExpertStreamProvider = null;

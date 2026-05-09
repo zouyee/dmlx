@@ -72,6 +72,7 @@ pub const memory = @import("memory.zig");
 pub const benchmark = @import("benchmark.zig");
 pub const evaluate = @import("evaluate.zig");
 pub const distributed = @import("distributed.zig");
+pub const compile_mode = @import("compile_mode.zig");
 
 // Re-exports for convenience
 pub const Dtype = dtype.Dtype;
