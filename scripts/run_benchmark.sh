@@ -21,6 +21,9 @@ T1=$(date +%s)
 if zig build test >/dev/null 2>&1; then export BM_UNIT="PASS (430+)"; else export BM_UNIT="FAIL"; fi
 echo "   $BM_UNIT ($(($(date +%s)-T1))s)"
 
+# Rebuild ReleaseFast after test (zig build test compiles in Debug mode, overwriting the binary)
+zig build -Doptimize=ReleaseFast 2>/dev/null
+
 echo "📊 Perf (10 tok)..."
 T2=$(date +%s)
 PERF=$("$CLI" chat --model "$MODEL_PATH" --prompt "Hello" --max-tokens 10 --temperature 0 --smelt --smelt-strategy stream --smelt-experts 0.1 2>&1)
