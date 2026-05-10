@@ -444,12 +444,18 @@ pub fn parseDSV4Config(allocator: std.mem.Allocator, json_text: []const u8) !DSV
             break :blk @intCast(getInt(qc.object, "group_size") orelse 64);
         },
         .quantize_default_mode = blk: {
-            const qc = obj.get("quantization") orelse obj.get("quantization_config") orelse break :blk "affine";
-            if (qc != .object) break :blk "affine";
-            if (qc.object.get("mode")) |m| {
-                if (m == .string) break :blk m.string;
+            if (obj.get("quantization")) |qc| {
+                if (qc != .object) break :blk try allocator.dupe(u8, "affine");
+                if (qc.object.get("mode")) |m| {
+                    if (m == .string) break :blk try allocator.dupe(u8, m.string);
+                }
+            } else if (obj.get("quantization_config")) |qc| {
+                if (qc != .object) break :blk try allocator.dupe(u8, "affine");
+                if (qc.object.get("mode")) |m| {
+                    if (m == .string) break :blk try allocator.dupe(u8, m.string);
+                }
             }
-            break :blk "affine";
+            break :blk try allocator.dupe(u8, "affine");
         },
     };
 }
@@ -1189,13 +1195,15 @@ pub fn buildDSV4Model(
     smelt: SmeltConfig,
 ) !DSV4Model {
     _ = stream;
-    const num_layers = config.num_hidden_layers;
-    const hidden_size = config.hidden_size;
-    const vocab_size = config.vocab_size;
-    const head_dim = config.head_dim;
-    const rope_dim = config.qk_rope_head_dim;
-    const n_routed_experts = config.n_routed_experts;
-    _ = config.moe_intermediate_size;
+    const model_config = try config.clone(allocator);
+    errdefer model_config.deinitClone(allocator);
+    const num_layers = model_config.num_hidden_layers;
+    const hidden_size = model_config.hidden_size;
+    const vocab_size = model_config.vocab_size;
+    const head_dim = model_config.head_dim;
+    const rope_dim = model_config.qk_rope_head_dim;
+    const n_routed_experts = model_config.n_routed_experts;
+    _ = model_config.moe_intermediate_size;
 
     // === Embedding ===
     // Embedding weights must be dequantized because mlx_take (used in Embedding.forward)
@@ -1217,8 +1225,8 @@ pub fn buildDSV4Model(
         const null_array: c.c.mlx_array = .{ .ctx = null };
         const biases_inner = if (embed_biases) |b| b.inner else null_array;
         const embed_is_mxfp4 = embed_biases == null;
-        const opt_group: c.c.mlx_optional_int = .{ .value = if (embed_is_mxfp4) 32 else config.quantize_default_group_size, .has_value = true };
-        const opt_bits: c.c.mlx_optional_int = .{ .value = @as(i32, @intCast(if (config.quantize_default_bits > 0) config.quantize_default_bits else 4)), .has_value = true };
+        const opt_group: c.c.mlx_optional_int = .{ .value = if (embed_is_mxfp4) 32 else model_config.quantize_default_group_size, .has_value = true };
+        const opt_bits: c.c.mlx_optional_int = .{ .value = @as(i32, @intCast(if (model_config.quantize_default_bits > 0) model_config.quantize_default_bits else 4)), .has_value = true };
         const no_dtype: c.c.mlx_optional_dtype = .{ .value = c.c.MLX_BFLOAT16, .has_value = true };
         var deq_res = c.c.mlx_array_new();
         try c.check(c.c.mlx_dequantize(&deq_res, embed_weight.inner, embed_scales.?.inner, biases_inner, opt_group, opt_bits, if (embed_is_mxfp4) "mxfp4" else "affine", null_array, no_dtype, ctx.stream.inner));
@@ -1235,7 +1243,7 @@ pub fn buildDSV4Model(
 
     // === Output norms ===
     const norm_weight = weights.get("norm.weight") orelse return LoadError.MissingWeight;
-    var norm = try nn.RMSNorm.init(ctx, hidden_size, config.rms_norm_eps);
+    var norm = try nn.RMSNorm.init(ctx, hidden_size, model_config.rms_norm_eps);
     norm.weight.deinit();
     norm.weight = norm_weight;
     if (weights.fetchRemove("norm.weight")) |kv| allocator.free(kv.key);
@@ -1262,8 +1270,8 @@ pub fn buildDSV4Model(
             .fn_weight = hc_fn.?,
             .base = hc_base.?,
             .scale = hc_scale.?,
-            .hc_mult = config.hc_mult,
-            .norm_eps = config.rms_norm_eps,
+            .hc_mult = model_config.hc_mult,
+            .norm_eps = model_config.rms_norm_eps,
         };
     }
 
@@ -1368,10 +1376,10 @@ pub fn buildDSV4Model(
 
         // If wo_a is 2D but o_groups > 1, reshape to 3D for grouped LoRA path
         var wo_a = wo_a_deq;
-        const attn_o_groups = config.o_groups;
-        const attn_o_lora_rank = config.o_lora_rank;
-        const attn_num_heads = config.num_attention_heads;
-        const attn_head_dim = config.head_dim;
+        const attn_o_groups = model_config.o_groups;
+        const attn_o_lora_rank = model_config.o_lora_rank;
+        const attn_num_heads = model_config.num_attention_heads;
+        const attn_head_dim = model_config.head_dim;
         if (wo_a.ndim() == 2 and attn_o_groups > 1 and attn_num_heads % attn_o_groups == 0) {
             const group_feat = (attn_num_heads * attn_head_dim) / attn_o_groups;
             wo_a = try ops.reshape(ctx, wo_a_deq, &[_]i32{ @intCast(attn_o_groups), @intCast(attn_o_lora_rank), @intCast(group_feat) });
@@ -1404,7 +1412,7 @@ pub fn buildDSV4Model(
         const q_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.q_norm.weight", .{idx_fmt});
         defer allocator.free(q_norm_name);
         const q_norm_w = weights.get(q_norm_name) orelse return LoadError.MissingWeight;
-        var q_norm = try nn.RMSNorm.init(ctx, config.q_lora_rank, config.rms_norm_eps);
+        var q_norm = try nn.RMSNorm.init(ctx, model_config.q_lora_rank, model_config.rms_norm_eps);
         q_norm.weight.deinit();
         q_norm.weight = q_norm_w;
         if (weights.fetchRemove(q_norm_name)) |kv| allocator.free(kv.key);
@@ -1412,7 +1420,7 @@ pub fn buildDSV4Model(
         const kv_norm_name = try std.fmt.allocPrint(allocator, "{s}attn.kv_norm.weight", .{idx_fmt});
         defer allocator.free(kv_norm_name);
         const kv_norm_w = weights.get(kv_norm_name) orelse return LoadError.MissingWeight;
-        var kv_norm = try nn.RMSNorm.init(ctx, head_dim, config.rms_norm_eps);
+        var kv_norm = try nn.RMSNorm.init(ctx, head_dim, model_config.rms_norm_eps);
         kv_norm.weight.deinit();
         kv_norm.weight = kv_norm_w;
         if (weights.fetchRemove(kv_norm_name)) |kv| allocator.free(kv.key);
@@ -1427,9 +1435,9 @@ pub fn buildDSV4Model(
         }
 
         // RoPE
-        const compress_ratio = if (i < config.compress_ratios.len) config.compress_ratios[i] else 0;
-        const rope_config = config.rope_scaling orelse DSV4Config.YarnRoPEConfig{};
-        const rope = try deepseek_v4.DSV4YarnRoPE.init(ctx, rope_dim, config.max_position_embeddings, config.rope_theta, rope_config);
+        const compress_ratio = if (i < model_config.compress_ratios.len) model_config.compress_ratios[i] else 0;
+        const rope_config = model_config.rope_scaling orelse DSV4Config.YarnRoPEConfig{};
+        const rope = try deepseek_v4.DSV4YarnRoPE.init(ctx, rope_dim, model_config.max_position_embeddings, model_config.rope_theta, rope_config);
 
         // Compressor module (for CSA/HCA layers with compress_ratio > 0)
         var compressor: ?deepseek_v4.Compressor = null;
@@ -1479,7 +1487,7 @@ pub fn buildDSV4Model(
                     .rope_head_dim = rope_dim,
                     .overlap = comp_overlap,
                     .out_dim = if (comp_overlap) head_dim * 2 else head_dim,
-                    .norm_eps = config.rms_norm_eps,
+                    .norm_eps = model_config.rms_norm_eps,
                 };
             }
             // Also try loading old-style compress_gate_weight (backward compat)
@@ -1549,14 +1557,14 @@ pub fn buildDSV4Model(
                 defer allocator.free(ic_wgate_base);
                 consumeWeightKey(allocator, weights, ic_wgate_base);
 
-                const idx_head_dim = config.index_head_dim;
+                const idx_head_dim = model_config.index_head_dim;
                 const idx_overlap = compress_ratio == 4;
 
                 indexer_new = deepseek_v4.Indexer{
                     .ctx = ctx,
-                    .n_heads = config.index_n_heads,
+                    .n_heads = model_config.index_n_heads,
                     .head_dim = idx_head_dim,
-                    .index_topk = config.index_topk,
+                    .index_topk = model_config.index_topk,
                     .wq_b = idx_wqb.?,
                     .weights_proj = idx_wp.?,
                     .compressor = deepseek_v4.Compressor{
@@ -1570,7 +1578,7 @@ pub fn buildDSV4Model(
                         .rope_head_dim = rope_dim,
                         .overlap = idx_overlap,
                         .out_dim = if (idx_overlap) idx_head_dim * 2 else idx_head_dim,
-                        .norm_eps = config.rms_norm_eps,
+                        .norm_eps = model_config.rms_norm_eps,
                     },
                     .scale = 1.0 / @sqrt(@as(f32, @floatFromInt(idx_head_dim))),
                 };
@@ -1591,20 +1599,20 @@ pub fn buildDSV4Model(
                         .ctx = ctx,
                         .wq_index = wq_idx.?,
                         .wk_index = wk_idx.?,
-                        .index_n_heads = config.index_n_heads,
-                        .index_head_dim = config.index_head_dim,
-                        .index_topk = config.index_topk,
+                        .index_n_heads = model_config.index_n_heads,
+                        .index_head_dim = model_config.index_head_dim,
+                        .index_topk = model_config.index_topk,
                     };
                 }
             }
         }
 
         // --- Attention struct ---
-        const qgs = config.quantize_default_group_size;
-        const qbits: u8 = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4;
+        const qgs = model_config.quantize_default_group_size;
+        const qbits: u8 = if (model_config.quantize_default_bits > 0) model_config.quantize_default_bits else 4;
         const attention = deepseek_v4.DSV4Attention{
             .ctx = ctx,
-            .config = config,
+            .config = model_config,
             .layer_idx = i,
             .wq_a = wq_a,
             .wq_a_scales = wq_a_scales,
@@ -1668,7 +1676,7 @@ pub fn buildDSV4Model(
             if (weights.fetchRemove(tid2eid_name)) |kv| allocator.free(kv.key);
         }
 
-        const is_hash = i < config.num_hash_layers;
+        const is_hash = i < model_config.num_hash_layers;
 
         // Build smelt_mask - auto-detect available experts if not explicitly using smelt
         var smelt_mask: []bool = undefined;
@@ -1719,10 +1727,10 @@ pub fn buildDSV4Model(
             .weight = gate_weight,
             .bias = gate_bias,
             .tid2eid = tid2eid,
-            .topk = config.num_experts_per_tok,
+            .topk = model_config.num_experts_per_tok,
             .n_routed_experts = n_routed_experts,
-            .route_scale = config.routed_scaling_factor,
-            .scoring_func = config.scoring_func,
+            .route_scale = model_config.routed_scaling_factor,
+            .scoring_func = model_config.scoring_func,
             .is_hash = is_hash,
             .smelt_mask = if (smelt_mask_owned and smelt.load_mode == .preload) smelt_mask else null,
             .allocator = if (smelt_mask_owned and smelt.load_mode == .preload) allocator else null,
@@ -1813,8 +1821,8 @@ pub fn buildDSV4Model(
             .w2_biases = se_w2_biases,
             .w3_scales = se_w3_scales,
             .w3_biases = se_w3_biases,
-            .quant_group_size = if (se_w1_biases == null) 32 else config.quantize_default_group_size,
-            .quant_bits = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4,
+            .quant_group_size = if (se_w1_biases == null) 32 else model_config.quantize_default_group_size,
+            .quant_bits = if (model_config.quantize_default_bits > 0) model_config.quantize_default_bits else 4,
             .quant_mode = if (se_w1_biases == null) .mxfp4 else .affine,
             .swiglu_limit = 0,
         };
@@ -1880,7 +1888,7 @@ pub fn buildDSV4Model(
                             .quant_group_size = 32,
                             .quant_bits = 4,
                             .quant_mode = "mxfp4",
-                            .swiglu_limit = config.swiglu_limit,
+                            .swiglu_limit = model_config.swiglu_limit,
                             .sort_threshold = 8,
                         };
                     }
@@ -1930,7 +1938,7 @@ pub fn buildDSV4Model(
                             .quant_group_size = 32,
                             .quant_bits = 4,
                             .quant_mode = "mxfp4",
-                            .swiglu_limit = config.swiglu_limit,
+                            .swiglu_limit = model_config.swiglu_limit,
                             .sort_threshold = 8,
                         };
                     }
@@ -2045,10 +2053,10 @@ pub fn buildDSV4Model(
                     }
 
                     // Expert weights always use mxfp4 (group_size=32, no biases)
-                    // This is specified in the per-weight quantization_config in config.json
-                    const qmode: []const u8 = if (gate_biases == null) "mxfp4" else config.quantize_default_mode;
-                    const expert_qbits: u8 = if (config.quantize_default_bits > 0) config.quantize_default_bits else 4;
-                    const qgroup: i32 = if (gate_biases == null) 32 else config.quantize_default_group_size;
+                    // This is specified in the per-weight quantization_config in model_config.json
+                    const qmode: []const u8 = if (gate_biases == null) "mxfp4" else model_config.quantize_default_mode;
+                    const expert_qbits: u8 = if (model_config.quantize_default_bits > 0) model_config.quantize_default_bits else 4;
+                    const qgroup: i32 = if (gate_biases == null) 32 else model_config.quantize_default_group_size;
 
                     break :blk2 deepseek_v4.DSV4SwitchGLU{
                         .ctx = ctx,
@@ -2065,14 +2073,14 @@ pub fn buildDSV4Model(
                         .quant_group_size = qgroup,
                         .quant_bits = expert_qbits,
                         .quant_mode = qmode,
-                        .swiglu_limit = config.swiglu_limit,
+                        .swiglu_limit = model_config.swiglu_limit,
                         .sort_threshold = 8,
                     };
                 };
             },
             .shared_expert = shared_expert,
             .n_routed_experts = n_routed_experts,
-            .n_activated_experts = config.num_experts_per_tok,
+            .n_activated_experts = model_config.num_experts_per_tok,
             .experts_loaded = has_fused_experts,
             .expert_remap = if (smelt.enabled and smelt.load_fraction < 1.0 and has_fused_experts) blk_remap: {
                 // Build remap: original_expert_id → sliced_row_index
@@ -2098,7 +2106,7 @@ pub fn buildDSV4Model(
         const attn_norm_name = try std.fmt.allocPrint(allocator, "{s}attn_norm.weight", .{idx_fmt});
         defer allocator.free(attn_norm_name);
         const attn_norm_w = weights.get(attn_norm_name) orelse return LoadError.MissingWeight;
-        var attn_norm = try nn.RMSNorm.init(ctx, hidden_size, config.rms_norm_eps);
+        var attn_norm = try nn.RMSNorm.init(ctx, hidden_size, model_config.rms_norm_eps);
         attn_norm.weight.deinit();
         attn_norm.weight = attn_norm_w;
         if (weights.fetchRemove(attn_norm_name)) |kv| allocator.free(kv.key);
@@ -2106,7 +2114,7 @@ pub fn buildDSV4Model(
         const ffn_norm_name = try std.fmt.allocPrint(allocator, "{s}ffn_norm.weight", .{idx_fmt});
         defer allocator.free(ffn_norm_name);
         const ffn_norm_w = weights.get(ffn_norm_name) orelse return LoadError.MissingWeight;
-        var ffn_norm = try nn.RMSNorm.init(ctx, hidden_size, config.rms_norm_eps);
+        var ffn_norm = try nn.RMSNorm.init(ctx, hidden_size, model_config.rms_norm_eps);
         ffn_norm.weight.deinit();
         ffn_norm.weight = ffn_norm_w;
         if (weights.fetchRemove(ffn_norm_name)) |kv| allocator.free(kv.key);
@@ -2150,22 +2158,22 @@ pub fn buildDSV4Model(
             .hc_fn = hc_attn_fn orelse dummy_arr,
             .hc_base = hc_attn_base orelse try array_mod.zeros(allocator, &[_]i32{1}, .float32),
             .hc_scale = hc_attn_scale orelse try array_mod.zeros(allocator, &[_]i32{1}, .float32),
-            .hc_mult = config.hc_mult,
-            .hc_sinkhorn_iters = config.hc_sinkhorn_iters,
-            .hc_eps = config.hc_eps,
+            .hc_mult = model_config.hc_mult,
+            .hc_sinkhorn_iters = model_config.hc_sinkhorn_iters,
+            .hc_eps = model_config.hc_eps,
         };
         const hc_ffn = deepseek_v4.DSV4HyperConn{
             .hc_fn = hc_ffn_fn orelse try array_mod.zeros(allocator, &[_]i32{1}, .float32),
             .hc_base = hc_ffn_base orelse try array_mod.zeros(allocator, &[_]i32{1}, .float32),
             .hc_scale = hc_ffn_scale orelse try array_mod.zeros(allocator, &[_]i32{1}, .float32),
-            .hc_mult = config.hc_mult,
-            .hc_sinkhorn_iters = config.hc_sinkhorn_iters,
-            .hc_eps = config.hc_eps,
+            .hc_mult = model_config.hc_mult,
+            .hc_sinkhorn_iters = model_config.hc_sinkhorn_iters,
+            .hc_eps = model_config.hc_eps,
         };
 
         layers[i] = deepseek_v4.DSV4TransformerBlock{
             .ctx = ctx,
-            .config = config,
+            .config = model_config,
             .layer_idx = i,
             .attn_norm = attn_norm,
             .ffn_norm = ffn_norm,
@@ -2194,7 +2202,7 @@ pub fn buildDSV4Model(
     return deepseek_v4.DSV4Model{
         .allocator = allocator,
         .ctx = ctx,
-        .config = config.*,
+        .config = model_config,
         .embed_tokens = embed,
         .layers = layers,
         .norm = norm,

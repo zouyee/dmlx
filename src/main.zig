@@ -472,8 +472,17 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand) !void {
 
     // Use GPU stream for inference — gather_qmm with mxfp4 is ~20x faster on GPU
     const stream = c.c.mlx_default_gpu_stream_new();
+    _ = c.c.mlx_set_default_stream(stream);
+    var stream_idx: c_int = -1;
+    _ = c.c.mlx_stream_get_index(&stream_idx, stream);
+    std.log.info("[CLI] Default GPU stream index: {d}", .{stream_idx});
     const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
-    defer ctx.deinit();
+    defer {
+        const cpu_stream = c.c.mlx_default_cpu_stream_new();
+        _ = c.c.mlx_set_default_stream(cpu_stream);
+        _ = c.c.mlx_stream_free(cpu_stream);
+        ctx.deinit();
+    }
 
     // 1. Load config and detect model type
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "config.json" });

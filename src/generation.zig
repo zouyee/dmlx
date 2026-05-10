@@ -211,6 +211,83 @@ pub fn streamGenerate(
     }
 }
 
+/// Context-aware streaming generation. Same as `streamGenerate` but passes
+/// a user-provided context pointer to the callback, enabling per-request
+/// state without mutable statics.
+pub fn streamGenerateCtx(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    ctx_ptr: *anyopaque,
+    callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
+) !void {
+    var sampler = SamplerConfig{
+        .temperature = config.temperature,
+        .top_k = config.top_k,
+        .top_p = config.top_p,
+        .prng = std.Random.DefaultPrng.init(config.seed),
+        .repetition_penalty = config.repetition_penalty,
+    };
+
+    // Prefill: run the full prompt through the model
+    if (prompt_tokens.len > 0) {
+        const prompt_arr = try Array.fromData(
+            ctx.allocator,
+            u32,
+            prompt_tokens,
+            &[_]i32{ 1, @intCast(prompt_tokens.len) },
+        );
+        defer prompt_arr.deinit();
+
+        var generated_tokens = std.ArrayList(u32).empty;
+        defer generated_tokens.deinit(ctx.allocator);
+
+        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+
+        if (isStopToken(first_result.token, config.stop_tokens)) {
+            callback(ctx_ptr, first_result.token, true);
+            return;
+        }
+        if (config.max_tokens <= 1) {
+            callback(ctx_ptr, first_result.token, true);
+            return;
+        }
+        callback(ctx_ptr, first_result.token, false);
+        try generated_tokens.append(ctx.allocator, first_result.token);
+        sampler.context_tokens = generated_tokens.items;
+
+        // Decode loop: feed one token at a time
+        var prev_token = first_result.token;
+        var generated: usize = 1;
+
+        while (generated < config.max_tokens) {
+            const input_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                &[_]u32{prev_token},
+                &[_]i32{ 1, 1 },
+            );
+            defer input_arr.deinit();
+
+            const next_result = try generateStep(model, input_arr, caches, &sampler, ctx);
+            generated += 1;
+
+            const is_stop = isStopToken(next_result.token, config.stop_tokens);
+            const is_done = is_stop or generated >= config.max_tokens;
+
+            callback(ctx_ptr, next_result.token, is_done);
+
+            if (is_done) return;
+
+            try generated_tokens.append(ctx.allocator, next_result.token);
+            sampler.context_tokens = generated_tokens.items;
+            prev_token = next_result.token;
+        }
+    }
+}
+
 // ============================================================
 // Layer 3: generate — collect full token sequence
 // ============================================================

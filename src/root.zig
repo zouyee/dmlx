@@ -55,6 +55,7 @@ pub const model_registry = @import("model_registry.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 pub const server = @import("server.zig");
 pub const scheduler = @import("scheduler.zig");
+pub const engine = @import("engine/root.zig");
 pub const diffusion_scheduler = @import("diffusion/scheduler.zig");
 pub const diffusion_vae = @import("diffusion/vae.zig");
 pub const diffusion_flux = @import("diffusion/flux.zig");

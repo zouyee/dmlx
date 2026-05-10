@@ -91,6 +91,20 @@ pub const DSV4Config = struct {
         beta_fast: f32 = 32.0,
         beta_slow: f32 = 1.0,
     };
+
+    /// Deep-copy the config, duplicating any heap-allocated slices.
+    pub fn clone(self: DSV4Config, allocator: std.mem.Allocator) !DSV4Config {
+        var copy = self;
+        copy.compress_ratios = try allocator.dupe(usize, self.compress_ratios);
+        copy.quantize_default_mode = try allocator.dupe(u8, self.quantize_default_mode);
+        return copy;
+    }
+
+    /// Release heap-allocated slices owned by this config.
+    pub fn deinitClone(self: *const DSV4Config, allocator: std.mem.Allocator) void {
+        allocator.free(self.compress_ratios);
+        allocator.free(self.quantize_default_mode);
+    }
 };
 
 /// HyperHead: compress mHC-expanded [B,S,mult,H] back to [B,S,H]
@@ -1511,7 +1525,7 @@ fn sparsePooledAttention(
 /// MLA (Multi-head Latent Attention).
 pub const DSV4Attention = struct {
     ctx: EagerContext,
-    config: *const DSV4Config,
+    config: DSV4Config,
     layer_idx: usize,
 
     // Q projection with lora (may be quantized)
@@ -2577,7 +2591,7 @@ pub const DSV4HyperConn = struct {
 /// Single transformer block with mHC.
 pub const DSV4TransformerBlock = struct {
     ctx: EagerContext,
-    config: *const DSV4Config,
+    config: DSV4Config,
     layer_idx: usize,
     attn_norm: nn.RMSNorm,
     ffn_norm: nn.RMSNorm,
@@ -2676,6 +2690,7 @@ pub const DSV4Model = struct {
     lm_head: Array,
 
     pub fn deinit(self: *DSV4Model) void {
+        self.config.deinitClone(self.allocator);
         self.embed_tokens.weight.deinit();
         for (self.layers) |*layer| {
             layer.deinit();

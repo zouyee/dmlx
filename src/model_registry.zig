@@ -152,6 +152,17 @@ fn llamaLoader(
 
     model_ptr.* = try llama_loader.loadFromSafetensors(allocator, &llama_config, st_path, ctx, stream);
 
+    // Fixup: LlamaAttention / LlamaMLP / LlamaTransformerBlock store pointers
+    // to LlamaConfig. After the model is returned by value from buildModel(),
+    // those pointers point to the loader's stack frame (llama_config) which is
+    // invalidated once llamaLoader returns. Redirect them to the stable heap
+    // address inside model_ptr.
+    for (model_ptr.layers) |*layer| {
+        layer.config = &model_ptr.config;
+        layer.attention.config = &model_ptr.config;
+        layer.mlp.config = &model_ptr.config;
+    }
+
     const adapter = try allocator.create(LlamaVTableAdapter);
     errdefer allocator.destroy(adapter);
     adapter.* = .{ .model = model_ptr };
