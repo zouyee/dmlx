@@ -4,6 +4,7 @@ const root = @import("../root.zig");
 const c = @import("mlx").c;
 const memory_mod = @import("../memory.zig");
 const engine = @import("../engine/root.zig");
+const dynamic_buffer_mod = @import("../engine/dynamic_buffer.zig");
 const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
@@ -14,6 +15,7 @@ const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
 const handleAnthropicMessages = anthropic_mod.handleAnthropicMessages;
+const DynamicBuffer = dynamic_buffer_mod.DynamicBuffer;
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;
@@ -25,20 +27,24 @@ fn handleRequest(
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
 ) !void {
-    var buf: [65536]u8 = undefined;
-    var total_read: usize = 0;
+    // Use a growable DynamicBuffer instead of a fixed 64KB stack buffer.
+    // Max size 16MB — requests larger than this are rejected with PayloadTooLarge.
+    var dyn_buf = DynamicBuffer.init(16 * 1024 * 1024);
+    defer dyn_buf.deinit(allocator);
+
+    var read_buf: [4096]u8 = undefined;
 
     // Read the complete HTTP request (headers + body).
     // The socket from listener.accept is non-blocking; when no data is
     // available we sleep briefly to yield the async fiber.
     var expected_total: ?usize = null;
     var would_block_count: usize = 0;
-    while (total_read < buf.len) {
-        const bytes_read = std.posix.read(connection.socket.handle, buf[total_read..]) catch |err| {
+    while (true) {
+        const bytes_read = std.posix.read(connection.socket.handle, &read_buf) catch |err| {
             if (err == error.WouldBlock) {
                 // If we already know how many bytes to expect, check if we're done.
                 if (expected_total) |et| {
-                    if (total_read >= et) break;
+                    if (dyn_buf.len() >= et) break;
                 }
                 would_block_count += 1;
                 if (would_block_count > 100) break;
@@ -48,31 +54,29 @@ fn handleRequest(
             return err;
         };
         if (bytes_read == 0) break;
-        total_read += bytes_read;
+        try dyn_buf.append(allocator, read_buf[0..bytes_read]);
         would_block_count = 0;
 
         // Check if we have the full headers
-        if (std.mem.find(u8, buf[0..total_read], "\r\n\r\n")) |header_end| {
+        if (std.mem.find(u8, dyn_buf.items(), "\r\n\r\n")) |header_end| {
             const cl_prefix = "Content-Length: ";
-            if (std.mem.find(u8, buf[0..header_end], cl_prefix)) |cl_start| {
+            if (std.mem.find(u8, dyn_buf.items()[0..header_end], cl_prefix)) |cl_start| {
                 const cl_value_start = cl_start + cl_prefix.len;
-                // Search up to header_end + 2 to include the \r\n after Content-Length
-                const search_end = @min(buf.len, header_end + 2);
-                const cl_end = std.mem.find(u8, buf[cl_value_start..search_end], "\r\n") orelse continue;
-                const cl_str = buf[cl_value_start .. cl_value_start + cl_end];
+                const cl_end = std.mem.find(u8, dyn_buf.items()[cl_value_start..header_end], "\r\n") orelse continue;
+                const cl_str = dyn_buf.items()[cl_value_start .. cl_value_start + cl_end];
                 const content_length = std.fmt.parseInt(usize, cl_str, 10) catch continue;
                 const body_start = header_end + 4;
                 expected_total = body_start + content_length;
-                if (total_read >= body_start + content_length) break;
+                if (dyn_buf.len() >= body_start + content_length) break;
             } else {
                 break; // No body expected
             }
         }
     }
 
-    if (total_read == 0) return;
-    const request = buf[0..total_read];
-    std.log.info("[HTTP] Request received: {d} bytes", .{total_read});
+    if (dyn_buf.len() == 0) return;
+    const request = dyn_buf.items();
+    std.log.info("[HTTP] Request received: {d} bytes", .{dyn_buf.len()});
 
     if (std.mem.startsWith(u8, request, "POST /v1/chat/completions")) {
         // Enforce memory limit before processing the request.
