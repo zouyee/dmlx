@@ -81,6 +81,10 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     var engine_loop = engine.EngineLoop.init(engine_config);
     server_state.engine_loop = engine_loop;
 
+    // Install signal handlers for graceful shutdown.
+    installSignalHandlers();
+    std.log.info("Signal handlers installed (SIGTERM, SIGINT)", .{});
+
     // Start the accept loop in an async fiber (may run on a worker thread).
     // The engine loop runs on the main thread so it shares the same MLX
     // stream that was used during model loading. MLX 0.31.2+ makes streams
@@ -90,6 +94,27 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
 
     // Run the engine loop on the main thread (current fiber).
     engineLoopRun(&engine_loop);
+
+    // Engine stopped — perform graceful shutdown.
+    std.log.info("Engine stopped, initiating graceful shutdown...", .{});
+
+    // Drain pending requests from the queue.
+    const pending = server_state.request_queue.drainAll(allocator) catch blk: {
+        const empty: []const *engine.RequestState = &[_]*engine.RequestState{};
+        break :blk empty;
+    };
+    defer allocator.free(pending);
+    for (pending) |req| {
+        req.completion.deliverError(io, "Server shutting down");
+    }
+
+    // Wait for in-flight requests to complete (up to 30 seconds).
+    waitForActiveRequests(io, &server_state);
+
+    // Final cleanup.
+    std.log.info("Shutting down, cleaning up resources...", .{});
+    server_state.deinit();
+    std.log.info("Shutdown complete.", .{});
 }
 
 fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerState, server_config: ServerConfig) void {
@@ -105,8 +130,9 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
 
     std.log.info("DMLX server listening on http://0.0.0.0:{d}", .{server_config.port});
 
-    while (true) {
+    while (!engine.isShutdownRequested()) {
         const connection = listener.accept(io) catch |err| {
+            if (engine.isShutdownRequested()) break;
             std.log.err("Failed to accept connection: {}", .{err});
             continue;
         };
@@ -116,8 +142,48 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
         _ = fc.fcntl(connection.socket.handle, fc.F_SETFL, @as(c_int, flags | fc.O_NONBLOCK));
         _ = io.async(http.handleConnection, .{ allocator, io, server_state, connection, server_config });
     }
+
+    std.log.info("Accept loop stopped, no longer accepting new connections.", .{});
 }
 
 fn engineLoopRun(loop: *engine.EngineLoop) void {
     loop.run();
+}
+
+fn installSignalHandlers() void {
+    const handler = struct {
+        fn handle(signo: c_int) callconv(.c) void {
+            _ = signo;
+            // NOTE: Only async-signal-safe operations here. No logging, no allocations.
+            engine.requestShutdown();
+        }
+    };
+
+    const csig = @cImport(@cInclude("signal.h"));
+    var act: csig.struct_sigaction = .{};
+    act.__sigaction_u.__sa_handler = @ptrCast(&handler.handle);
+    _ = csig.sigemptyset(&act.sa_mask);
+    act.sa_flags = 0;
+    _ = csig.sigaction(csig.SIGTERM, &act, null);
+    _ = csig.sigaction(csig.SIGINT, &act, null);
+}
+
+fn waitForActiveRequests(io: std.Io, server_state: *ServerState) void {
+    const max_wait_ns: i96 = 30_000_000_000; // 30 seconds
+    const start_time = std.Io.Timestamp.now(io, .awake);
+
+    while (server_state.active_requests.load(.acquire) > 0) {
+        const now = std.Io.Timestamp.now(io, .awake);
+        const elapsed_ns = now.durationTo(start_time).toNanoseconds();
+        if (elapsed_ns >= max_wait_ns) {
+            const remaining = server_state.active_requests.load(.acquire);
+            std.log.warn("Graceful shutdown timeout: {d} request(s) still in-flight", .{remaining});
+            break;
+        }
+        engine.threadSleepMs(100);
+    }
+
+    if (server_state.active_requests.load(.acquire) == 0) {
+        std.log.info("All in-flight requests completed.", .{});
+    }
 }

@@ -262,17 +262,17 @@ test "integration: SSE event formatting for streaming response tokens" {
     };
 
     for (token_payloads) |payload| {
-        try server_mod.writeSSEEvent(&writer, payload);
+        try server_mod.sse.writeSSEEvent(&writer, payload);
     }
 
     // Final event with finish_reason
-    try server_mod.writeSSEEvent(&writer, "{\"choices\":[{\"finish_reason\":\"stop\"}]}");
+    try server_mod.sse.writeSSEEvent(&writer, "{\"choices\":[{\"finish_reason\":\"stop\"}]}");
 
     // Keep-alive comment (simulating prefill delay)
-    try server_mod.writeSSEKeepAlive(&writer);
+    try server_mod.sse.writeSSEKeepAlive(&writer);
 
     // [DONE] sentinel
-    try server_mod.writeSSEEvent(&writer, "[DONE]");
+    try server_mod.sse.writeSSEEvent(&writer, "[DONE]");
 
     const output = writer.getWritten();
 

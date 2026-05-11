@@ -37,6 +37,31 @@ const CompletionSignal = completion_signal.CompletionSignal;
 const TokenEvent = completion_signal.TokenEvent;
 const TokenFinishReason = completion_signal.TokenEvent.FinishReason;
 
+/// Platform-native sleep that does NOT enter the std.Io event loop.
+/// Safe to call from the main thread (where io.sleep would deadlock with
+/// a pending listener.accept in another fiber).
+pub fn threadSleepMs(ms: u64) void {
+    const ts = std.c.timespec{
+        .sec = @intCast(ms / 1000),
+        .nsec = @intCast((ms % 1000) * 1_000_000),
+    };
+    _ = std.c.nanosleep(&ts, null);
+}
+
+/// Global shutdown flag. Set by signal handlers to request graceful shutdown.
+pub var g_shutdown_requested = std.atomic.Value(bool).init(false);
+
+/// Request engine shutdown (thread-safe, callable from signal handlers).
+pub fn requestShutdown() void {
+    std.log.info("[Engine] Shutdown requested", .{});
+    g_shutdown_requested.store(true, .release);
+}
+
+/// Check if shutdown has been requested.
+pub fn isShutdownRequested() bool {
+    return g_shutdown_requested.load(.acquire);
+}
+
 /// Context passed to the streamGenerateCtx callback.
 const StreamCallbackCtx = struct {
     signal: *CompletionSignal,
@@ -159,22 +184,24 @@ pub const EngineLoop = struct {
 
     /// Main loop. Runs in an io.async fiber (may be on a worker thread).
     pub fn run(self: *EngineLoop) void {
-        while (self.running.load(.acquire)) {
+        std.log.info("[Engine] Engine loop started", .{});
+        defer std.log.info("[Engine] Engine loop exiting", .{});
+        while (self.running.load(.acquire) and !g_shutdown_requested.load(.acquire)) {
             const requests = self.request_queue.drainAll(self.allocator) catch {
-                self.io.sleep(.fromMilliseconds(1), .awake) catch break;
+                threadSleepMs(1);
                 continue;
             };
             defer self.allocator.free(requests);
 
             if (requests.len == 0) {
-                self.io.sleep(.fromMilliseconds(1), .awake) catch break;
+                threadSleepMs(1);
                 continue;
             }
 
             std.log.info("[Engine] Drained {d} requests", .{requests.len});
 
             // Process each request serially (one at a time).
-            // Future: process multiple requests in a batch.
+            // Future: process multiple requests in a batch (Task 2).
             for (requests) |req| {
                 if (req.isCancelled()) {
                     req.completion.deliverError(self.io, "Request cancelled");
@@ -182,12 +209,15 @@ pub const EngineLoop = struct {
                 }
                 std.log.info("[Engine] Processing request {d}", .{req.id});
                 self.processRequest(req);
-                std.log.info("[Engine] Request {d} done", .{req.id});
+                logRequestCompletion(self.io, req);
             }
         }
     }
 
     fn processRequest(self: *EngineLoop, req: *RequestState) void {
+        // Record start time for request latency tracking.
+        req.start_time_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+
         // Create fresh KV caches for this request.
         const caches = self.createCaches() catch |err| {
             std.log.err("EngineLoop: failed to create caches: {}", .{err});
@@ -252,6 +282,9 @@ pub const EngineLoop = struct {
             req.completion.deliverError(self.io, "Generation failed");
             return;
         };
+
+        // Record generated token count for logging.
+        req.token_count = stream_ctx.token_count;
 
         // Ensure a final done event is sent if not already.
         if (!req.completion.isDone(self.io)) {
@@ -379,6 +412,22 @@ pub const EngineLoop = struct {
 
         req.token_count = @intCast(tokens.len);
         req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+    }
+
+    fn logRequestCompletion(io: std.Io, req: *RequestState) void {
+        const end_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        const duration_ns = end_time_ns - req.start_time_ns;
+        const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
+        const prompt_len = req.prompt_tokens.len;
+        const gen_len = req.token_count;
+        const tokens_per_sec = if (duration_ns > 0 and gen_len > 0)
+            @as(f64, @floatFromInt(gen_len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(duration_ns))
+        else
+            0.0;
+        std.log.info(
+            "[RequestLog] id={d} model={s} streaming={} prompt_tokens={d} generated_tokens={d} duration_ms={d:.2} tokens_per_sec={d:.2}",
+            .{ req.id, req.model_name, req.streaming, prompt_len, gen_len, duration_ms, tokens_per_sec },
+        );
     }
 
     fn createCaches(self: *EngineLoop) ![]KVCacheStrategy {

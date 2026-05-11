@@ -36,6 +36,7 @@ pub const ServerState = struct {
     tokenizer_strategy: root.tokenizer.TokenizerStrategy,
     tokenizer_backend: *root.tokenizer.BpeTokenizer,
     chat_template: root.tokenizer.ChatTemplate,
+    model_name: []const u8,
     caches: []kvcache.KVCacheStrategy,
     model_pool: ?ModelPool,
     block_manager: ?scheduler_mod.BlockManager,
@@ -72,6 +73,7 @@ pub const ServerState = struct {
         self.vtable.deinit(self.vtable.ptr, self.allocator);
         self.tokenizer_backend.deinit();
         self.allocator.destroy(self.tokenizer_backend);
+        self.allocator.free(self.model_name);
         for (self.caches) |cache_item| {
             cache_item.deinit(self.allocator);
         }
@@ -102,6 +104,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     // 2. Detect architecture and load via ModelRegistry
     const arch_name = detectArchitecture(config_content);
     std.log.info("Detected architecture: {s}", .{arch_name});
+    const model_name = try allocator.dupe(u8, arch_name);
 
     const loader = model_registry_mod.getLoader(arch_name) catch {
         std.log.err("Unsupported architecture: {s}", .{arch_name});
@@ -286,6 +289,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .vtable = vtable,
         .tokenizer_strategy = undefined,
         .tokenizer_backend = tokenizer_backend,
+        .model_name = model_name,
         .chat_template = chat_template,
         .caches = caches,
         .model_pool = model_pool,

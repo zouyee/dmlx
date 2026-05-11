@@ -232,6 +232,7 @@ pub fn main(init: std.process.Init) !void {
         printUsage();
         std.process.exit(1);
     }
+    std.c._exit(0);
 }
 
 fn printUsage() void {

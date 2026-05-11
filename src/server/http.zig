@@ -78,6 +78,10 @@ fn handleRequest(
     const request = dyn_buf.items();
     std.log.info("[HTTP] Request received: {d} bytes", .{dyn_buf.len()});
 
+    const libc = @cImport(@cInclude("unistd.h"));
+    const msg = "[HTTP] Request received\n";
+    _ = libc.write(2, msg, msg.len);
+
     if (std.mem.startsWith(u8, request, "POST /v1/chat/completions")) {
         // Enforce memory limit before processing the request.
         memory_mod.enforceMemoryLimit(
@@ -147,7 +151,17 @@ fn handleRequest(
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
-        try writeJsonResponse(connection, io, 200, "{\"status\":\"ok\"}");
+        const active = state.active_requests.load(.acquire);
+        const health_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"status\":\"ok\",\"model\":\"{s}\",\"active_requests\":{d}}}",
+            .{ state.model_name, active },
+        );
+        defer allocator.free(health_json);
+        try writeJsonResponse(connection, io, 200, health_json);
+    } else if (std.mem.startsWith(u8, request, "POST /shutdown")) {
+        engine.requestShutdown();
+        try writeJsonResponse(connection, io, 200, "{\"status\":\"shutting_down\"}");
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {

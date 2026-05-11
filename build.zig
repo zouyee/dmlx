@@ -18,7 +18,7 @@ pub fn build(b: *std.Build) void {
 
     // --- Library ---
     const lib = b.addLibrary(.{
-        .name = "dmlx",
+        .name = "dmlx_lib",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/root.zig"),
             .target = target,

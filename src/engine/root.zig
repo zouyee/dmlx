@@ -20,3 +20,6 @@ pub const QueueNode = request_queue.Node;
 
 pub const EngineLoop = engine_loop.EngineLoop;
 pub const EngineConfig = engine_loop.EngineConfig;
+pub const requestShutdown = engine_loop.requestShutdown;
+pub const isShutdownRequested = engine_loop.isShutdownRequested;
+pub const threadSleepMs = engine_loop.threadSleepMs;

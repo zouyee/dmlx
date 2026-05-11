@@ -86,6 +86,8 @@ pub const RequestState = struct {
     completion: CompletionSignal,
     /// Whether cancellation has been requested (by HTTP fiber on disconnect).
     cancel_requested: std.atomic.Value(bool),
+    /// Start timestamp (nanoseconds) for request latency tracking.
+    start_time_ns: i128,
 
     /// Allocate and initialize a new RequestState on the heap.
     pub fn init(allocator: std.mem.Allocator, id: u64, config: RequestConfig) !*RequestState {
@@ -115,6 +117,7 @@ pub const RequestState = struct {
             .error_msg = null,
             .completion = CompletionSignal.init(allocator),
             .cancel_requested = std.atomic.Value(bool).init(false),
+            .start_time_ns = 0,
         };
         return self;
     }
