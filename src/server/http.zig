@@ -35,10 +35,22 @@ fn handleRequest(
     var read_buf: [4096]u8 = undefined;
 
     // Read the complete HTTP request (headers + body).
-    // The socket from listener.accept is non-blocking; when no data is
-    // available we sleep briefly to yield the async fiber.
+    //
+    // Design note: We use std.posix.read on an O_NONBLOCK socket instead of
+    // std.Io.net.Stream.reader. The Zig 0.16.0 Threaded backend's netReadPosix
+    // treats EAGAIN as a bug (errnoBug), which makes std.Io.Reader unreliable
+    // on non-blocking sockets. On blocking sockets, readSliceShort attempts to
+    // fill the entire buffer, causing the worker thread to block indefinitely
+    // when the client has sent all data but keeps the connection open.
+    //
+    // Reference: omlx (Python/FastAPI) and SwiftLM (Swift/Hummingbird) both
+    // delegate HTTP request parsing to mature frameworks (Starlette/Hummingbird)
+    // rather than handling raw socket reads themselves. In Zig 0.16.0, where
+    // a production-grade HTTP framework is not yet available, std.posix.read
+    // + O_NONBLOCK + explicit timeout is the most robust approach.
     var expected_total: ?usize = null;
-    var would_block_count: usize = 0;
+    const read_start = std.Io.Timestamp.now(io, .awake);
+    const read_timeout_ns: i96 = 5_000_000_000; // 5 seconds total read timeout
     while (true) {
         const bytes_read = std.posix.read(connection.socket.handle, &read_buf) catch |err| {
             if (err == error.WouldBlock) {
@@ -46,8 +58,17 @@ fn handleRequest(
                 if (expected_total) |et| {
                     if (dyn_buf.len() >= et) break;
                 }
-                would_block_count += 1;
-                if (would_block_count > 100) break;
+                // Check total read timeout.
+                const elapsed = std.Io.Timestamp.durationTo(read_start, std.Io.Timestamp.now(io, .awake)).toNanoseconds();
+                if (elapsed >= read_timeout_ns) {
+                    std.log.warn("[HTTP] Read timeout after {d}ms, received {d} bytes", .{
+                        @divTrunc(elapsed, 1_000_000),
+                        dyn_buf.len(),
+                    });
+                    break;
+                }
+                // Yield fiber briefly. io.sleep is safe here because we are
+                // running inside an io.async fiber (not the main thread).
                 io.sleep(.fromMilliseconds(1), .awake) catch break;
                 continue;
             }
@@ -55,14 +76,13 @@ fn handleRequest(
         };
         if (bytes_read == 0) break;
         try dyn_buf.append(allocator, read_buf[0..bytes_read]);
-        would_block_count = 0;
 
         // Check if we have the full headers
         if (std.mem.find(u8, dyn_buf.items(), "\r\n\r\n")) |header_end| {
             const cl_prefix = "Content-Length: ";
             if (std.mem.find(u8, dyn_buf.items()[0..header_end], cl_prefix)) |cl_start| {
                 const cl_value_start = cl_start + cl_prefix.len;
-                const cl_end = std.mem.find(u8, dyn_buf.items()[cl_value_start..header_end], "\r\n") orelse continue;
+                const cl_end = std.mem.find(u8, dyn_buf.items()[cl_value_start..], "\r\n") orelse continue;
                 const cl_str = dyn_buf.items()[cl_value_start .. cl_value_start + cl_end];
                 const content_length = std.fmt.parseInt(usize, cl_str, 10) catch continue;
                 const body_start = header_end + 4;
