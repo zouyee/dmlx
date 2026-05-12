@@ -46,6 +46,10 @@ pub const RequestConfig = struct {
     model_name: []const u8 = "default",
     api_format: ApiFormat = .openai,
     speculative_ngram: ?usize = null,
+    /// Guided decoding: JSON schema constraint (null = unconstrained).
+    guided_json_schema: ?[]const u8 = null,
+    /// Guided decoding: regex pattern constraint (null = unconstrained).
+    guided_regex: ?[]const u8 = null,
     /// Sequence index in the shared PagedKVCache (assigned by EngineLoop).
     seq_index: usize = 0,
 };
@@ -78,6 +82,10 @@ pub const RequestState = struct {
     api_format: ApiFormat,
     /// Model name for response formatting.
     model_name: []const u8,
+    /// Guided decoding: JSON schema constraint (null = unconstrained).
+    guided_json_schema: ?[]const u8,
+    /// Guided decoding: regex pattern constraint (null = unconstrained).
+    guided_regex: ?[]const u8,
 
     // --- Mutable state (written by Engine via signal, read by HTTP after signal) ---
     /// Accumulated generated tokens.
@@ -131,6 +139,8 @@ pub const RequestState = struct {
             .stop_tokens = config.stop_tokens,
             .api_format = config.api_format,
             .model_name = config.model_name,
+            .guided_json_schema = config.guided_json_schema,
+            .guided_regex = config.guided_regex,
             .phase = .waiting,
             .seq_index = config.seq_index,
             .sampler = SamplerConfig.init(config.seed),

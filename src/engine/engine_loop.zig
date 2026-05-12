@@ -26,6 +26,8 @@ const completion_signal = @import("completion_signal.zig");
 const root = @import("../root.zig");
 const dsv4_mod = @import("../models/deepseek_v4.zig");
 const dsv4_loader = @import("../models/deepseek_v4_loader.zig");
+const speculative_mod = @import("../speculative.zig");
+const guided_mod = @import("../guided.zig");
 
 const Array = array_mod.Array;
 const ScopedArrayArena = array_arena_mod.ScopedArrayArena;
@@ -152,6 +154,8 @@ pub const EngineConfig = struct {
     dsv4_model: ?*dsv4_mod.DSV4Model = null,
     /// Maximum number of requests to batch together in the decode phase.
     max_batch_size: usize = 8,
+    /// Speculative decoding: n-gram size for draft proposal (null = disabled).
+    speculative_ngram: ?usize = null,
 };
 
 pub const EngineLoop = struct {
@@ -176,6 +180,8 @@ pub const EngineLoop = struct {
     seq_index_counter: usize,
     /// Active requests currently in the batch (prefilling or decoding).
     active_requests: std.ArrayList(*RequestState),
+    /// Speculative decoding: n-gram size for draft proposal (null = disabled).
+    speculative_ngram: ?usize,
 
     pub fn init(config: EngineConfig) !EngineLoop {
         // Note: batch_caches is lazily initialized via BatchKVCache.merge()
@@ -199,6 +205,7 @@ pub const EngineLoop = struct {
             .max_batch_size = config.max_batch_size,
             .seq_index_counter = 0,
             .active_requests = std.ArrayList(*RequestState).empty,
+            .speculative_ngram = config.speculative_ngram,
         };
     }
 
@@ -218,6 +225,14 @@ pub const EngineLoop = struct {
     pub fn run(self: *EngineLoop) void {
         std.log.info("[Engine] Engine loop started", .{});
         defer std.log.info("[Engine] Engine loop exiting", .{});
+
+        // Warmup: run a dummy forward pass to pre-populate the expert cache.
+        // Without this, the first user request pays the full SSD expert loading
+        // cost (~50s for smelt 0.1 stream mode). After warmup, subsequent requests
+        // hit the in-memory expert cache and complete in ~1-2s.
+        // Reference: omlx benchmark does the same warmup before real requests.
+        self.warmupExpertCache();
+
         while (self.running.load(.acquire) and !g_shutdown_requested.load(.acquire)) {
             // Drain new requests from the queue.
             const new_requests = self.request_queue.drainAll(self.allocator) catch {
@@ -274,7 +289,7 @@ pub const EngineLoop = struct {
 
     fn processRequest(self: *EngineLoop, req: *RequestState) void {
         // Record start time for request latency tracking.
-        req.start_time_ns = std.Io.Timestamp.now(self.io, .awake).nanoseconds;
+        req.start_time_ns = @intCast(std.c.mach_absolute_time());
 
         // Create per-request caches to avoid cross-request cache contamination.
         // Shared caches are reserved for future batched decode; until the batch
@@ -306,7 +321,12 @@ pub const EngineLoop = struct {
                 self.processDSV4NonStreamingRequest(req, caches, gen_config, model);
             }
         } else {
-            if (req.streaming) {
+            // Check for guided decoding constraints (non-streaming only).
+            // Guided decoding applies logit masks at each step, which is
+            // incompatible with the streaming callback architecture.
+            if (!req.streaming and (req.guided_json_schema != null or req.guided_regex != null)) {
+                self.processGuidedRequest(req, caches, gen_config);
+            } else if (req.streaming) {
                 self.processStreamingRequest(req, caches, gen_config);
             } else {
                 self.processNonStreamingRequest(req, caches, gen_config);
@@ -785,6 +805,12 @@ pub const EngineLoop = struct {
         caches: []KVCacheStrategy,
         gen_config: GenerateConfig,
     ) void {
+        // If speculative decoding is enabled, use the speculative path.
+        if (self.speculative_ngram) |ngram_n| {
+            self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
+            return;
+        }
+
         const tokens = generation_mod.generate(
             self.model,
             req.prompt_tokens,
@@ -819,6 +845,237 @@ pub const EngineLoop = struct {
         // Record token count and deliver the full text as a single token event.
         req.token_count = @intCast(tokens.len);
         req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+    }
+
+    /// Speculative decoding path: uses n-gram draft proposal + target model verification.
+    /// Generates multiple tokens per forward pass when draft proposals are accepted.
+    ///
+    /// Architecture (following mlx-lm / omlx pattern):
+    ///   1. Generate tokens normally until enough context for n-gram matching
+    ///   2. Use NgramDrafter to propose continuation tokens from context
+    ///   3. Verify proposals in a single forward pass via speculative sampling
+    ///   4. Accept verified tokens, resample on rejection
+    ///   5. Repeat until max_tokens or stop condition
+    fn processSpeculativeRequest(
+        self: *EngineLoop,
+        req: *RequestState,
+        caches: []KVCacheStrategy,
+        gen_config: GenerateConfig,
+        ngram_n: usize,
+    ) void {
+        const drafter = speculative_mod.NgramDrafter{ .n = ngram_n };
+        const max_draft_tokens: usize = 5; // Number of tokens to propose per step
+
+        // Build context: prompt + generated tokens
+        var context = std.ArrayList(u32).empty;
+        defer context.deinit(self.allocator);
+        context.appendSlice(self.allocator, req.prompt_tokens) catch {
+            req.completion.deliverError(self.io, "Speculative: context allocation failed");
+            return;
+        };
+
+        // Initial prefill: run the prompt through the model to populate caches
+        const first_result = generation_mod.generateStep(
+            self.model,
+            array_mod.Array.fromData(
+                self.allocator,
+                u32,
+                req.prompt_tokens,
+                &[_]i32{ 1, @intCast(req.prompt_tokens.len) },
+            ) catch {
+                req.completion.deliverError(self.io, "Speculative: failed to create prompt array");
+                return;
+            },
+            caches,
+            &req.sampler,
+            self.ctx,
+        ) catch |err| {
+            std.log.err("EngineLoop: speculative prefill failed: {}", .{err});
+            req.completion.deliverError(self.io, "Speculative: prefill failed");
+            return;
+        };
+
+        context.append(self.allocator, first_result.token) catch {
+            req.completion.deliverError(self.io, "Speculative: token append failed");
+            return;
+        };
+        var total_generated: usize = 1;
+
+        // Check if first token is a stop token
+        if (generation_mod.isStopToken(first_result.token, gen_config.stop_tokens)) {
+            const text = self.tokenizer.decode(context.items[req.prompt_tokens.len..], self.allocator) catch {
+                req.completion.deliverError(self.io, "Failed to decode tokens");
+                return;
+            };
+            defer self.allocator.free(text);
+            req.token_count = total_generated;
+            req.completion.deliverToken(self.io, 0, text, true, .stop);
+            return;
+        }
+
+        // Main speculative decoding loop
+        while (total_generated < gen_config.max_tokens) {
+            // Try to propose draft tokens from context
+            const draft_tokens = drafter.propose(context.items, max_draft_tokens, self.allocator);
+
+            if (draft_tokens) |draft| {
+                defer self.allocator.free(draft);
+
+                // Verify draft tokens against the target model
+                const verify_result = speculative_mod.verifyDraft(
+                    self.model,
+                    context.items,
+                    draft,
+                    caches,
+                    self.ctx,
+                    gen_config.seed +% total_generated,
+                ) catch {
+                    // Verification failed — fall back to normal generation for this step
+                    const step_result = generation_mod.generateStep(
+                        self.model,
+                        array_mod.Array.fromData(
+                            self.allocator,
+                            u32,
+                            context.items[context.items.len - 1 ..],
+                            &[_]i32{ 1, 1 },
+                        ) catch break,
+                        caches,
+                        &req.sampler,
+                        self.ctx,
+                    ) catch break;
+
+                    context.append(self.allocator, step_result.token) catch break;
+                    total_generated += 1;
+
+                    if (generation_mod.isStopToken(step_result.token, gen_config.stop_tokens)) break;
+                    continue;
+                };
+                defer self.allocator.free(verify_result.tokens);
+
+                // Append accepted + bonus tokens to context
+                var stopped = false;
+                for (verify_result.tokens) |token| {
+                    if (generation_mod.isStopToken(token, gen_config.stop_tokens)) {
+                        stopped = true;
+                        break;
+                    }
+                    context.append(self.allocator, token) catch break;
+                    total_generated += 1;
+                    if (total_generated >= gen_config.max_tokens) break;
+                }
+
+                if (stopped or total_generated >= gen_config.max_tokens) break;
+            } else {
+                // No draft available — fall back to normal single-token generation
+                const input_token = context.items[context.items.len - 1];
+                const step_result = generation_mod.generateStep(
+                    self.model,
+                    array_mod.Array.fromData(
+                        self.allocator,
+                        u32,
+                        &[_]u32{input_token},
+                        &[_]i32{ 1, 1 },
+                    ) catch break,
+                    caches,
+                    &req.sampler,
+                    self.ctx,
+                ) catch break;
+
+                context.append(self.allocator, step_result.token) catch break;
+                total_generated += 1;
+
+                if (generation_mod.isStopToken(step_result.token, gen_config.stop_tokens)) break;
+            }
+        }
+
+        // Decode generated tokens to text
+        const generated_slice = context.items[req.prompt_tokens.len..];
+        const text = self.tokenizer.decode(generated_slice, self.allocator) catch {
+            req.completion.deliverError(self.io, "Failed to decode tokens");
+            return;
+        };
+        defer self.allocator.free(text);
+
+        // Check stop strings and truncate if needed
+        var final_text = text;
+        if (req.stop_strings) |stop_strings| {
+            for (stop_strings) |stop_str| {
+                if (std.mem.indexOf(u8, text, stop_str)) |idx| {
+                    final_text = text[0..idx];
+                    break;
+                }
+            }
+        }
+
+        req.token_count = total_generated;
+        req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+    }
+
+    /// Guided decoding path: uses FSM-based logit masking to constrain output.
+    /// Supports JSON schema and regex pattern constraints.
+    ///
+    /// Interface design: creates a GuidedDecoder from the request's constraint,
+    /// then uses generateGuided() for the actual generation loop.
+    fn processGuidedRequest(
+        self: *EngineLoop,
+        req: *RequestState,
+        caches: []KVCacheStrategy,
+        gen_config: GenerateConfig,
+    ) void {
+        // Build the FSM from the constraint
+        var fsm: guided_mod.FiniteStateMachine = undefined;
+        if (req.guided_json_schema) |schema| {
+            fsm = guided_mod.FiniteStateMachine.fromJsonSchema(self.allocator, schema) catch {
+                req.completion.deliverError(self.io, "Failed to build guided decoding FSM from JSON schema");
+                return;
+            };
+        } else if (req.guided_regex) |pattern| {
+            fsm = guided_mod.FiniteStateMachine.fromRegex(self.allocator, pattern) catch {
+                req.completion.deliverError(self.io, "Failed to build guided decoding FSM from regex");
+                return;
+            };
+        } else {
+            // No constraint — shouldn't reach here, but fall back to normal generation
+            self.processNonStreamingRequest(req, caches, gen_config);
+            return;
+        }
+
+        var decoder = guided_mod.GuidedDecoder.init(fsm);
+        defer decoder.deinit();
+
+        var sampler = SamplerConfig{
+            .temperature = gen_config.temperature,
+            .top_k = gen_config.top_k,
+            .top_p = gen_config.top_p,
+            .prng = std.Random.DefaultPrng.init(gen_config.seed),
+            .repetition_penalty = gen_config.repetition_penalty,
+        };
+
+        const tokens = generateGuided(
+            self.model,
+            req.prompt_tokens,
+            gen_config.max_tokens,
+            &decoder,
+            &sampler,
+            caches,
+            self.ctx,
+            self.allocator,
+        ) catch |err| {
+            std.log.err("EngineLoop: guided generation failed: {}", .{err});
+            req.completion.deliverError(self.io, "Guided generation failed");
+            return;
+        };
+        defer self.allocator.free(tokens);
+
+        // Decode tokens to text
+        const text = self.tokenizer.decode(tokens, self.allocator) catch {
+            req.completion.deliverError(self.io, "Failed to decode guided tokens");
+            return;
+        };
+        defer self.allocator.free(text);
+
+        req.token_count = @intCast(tokens.len);
+        req.completion.deliverToken(self.io, 0, text, true, .stop);
     }
 
     fn processDSV4StreamingRequest(
@@ -858,7 +1115,15 @@ pub const EngineLoop = struct {
                 const token_text = ctx.engine.tokenizer.decode(&[_]u32{token}, ctx.engine.allocator) catch "";
                 defer if (token_text.len > 0) ctx.engine.allocator.free(token_text);
 
-                // Deliver token immediately
+                // Deliver token immediately via CompletionSignal.
+                // CompletionSignal uses atomic spinlock + Darwin ulock for cross-thread
+                // notification. The wakeWaiter() inside deliverToken wakes up the
+                // HTTP worker thread immediately — no io.sleep needed here.
+                //
+                // Architecture: Engine runs on main thread, HTTP handlers on worker threads.
+                // io.sleep(0) only yields to fibers on the SAME thread, which is useless
+                // here. The cross-thread ulock wake is the correct synchronization
+                // mechanism (matches omlx's asyncio.Event pattern).
                 ctx.req.completion.deliverToken(
                     ctx.engine.io,
                     token,
@@ -866,12 +1131,6 @@ pub const EngineLoop = struct {
                     is_final,
                     if (is_final) .stop else null,
                 );
-
-                // Yield to allow HTTP fiber to process the token.
-                // This is critical for streaming latency: without this, the main thread
-                // continues generating tokens without giving the HTTP fiber a chance to run.
-                // The io.sleep duration of 0 means "yield to other fibers if any are ready".
-                ctx.engine.io.sleep(.fromMilliseconds(0), .awake) catch {};
             }
         }.callback;
 
@@ -944,7 +1203,8 @@ pub const EngineLoop = struct {
     }
 
     fn logRequestCompletion(io: std.Io, req: *RequestState) void {
-        const end_time_ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
+        _ = io;
+        const end_time_ns: i128 = @intCast(std.c.mach_absolute_time());
         const duration_ns = end_time_ns - req.start_time_ns;
         const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
         const prompt_len = req.prompt_tokens.len;
@@ -957,6 +1217,49 @@ pub const EngineLoop = struct {
             "[RequestLog] id={d} model={s} streaming={} prompt_tokens={d} generated_tokens={d} duration_ms={d:.2} tokens_per_sec={d:.2}",
             .{ req.id, req.model_name, req.streaming, prompt_len, gen_len, duration_ms, tokens_per_sec },
         );
+    }
+
+    /// Warmup: run a short dummy generation to pre-populate the expert cache.
+    /// This ensures the first real user request doesn't pay the full SSD loading cost.
+    ///
+    /// For smelt stream mode, the first forward pass through all 43 layers triggers
+    /// ~12000 expert cache misses (loading from SSD). After warmup, subsequent
+    /// requests hit the in-memory cache and complete in ~1-2s instead of ~50s.
+    ///
+    /// Design: uses a minimal prompt (single token) with max_tokens=1 to trigger
+    /// one full forward pass through all layers, populating the expert cache with
+    /// the most common experts. This matches omlx's benchmark warmup pattern.
+    fn warmupExpertCache(self: *EngineLoop) void {
+        if (self.dsv4_model == null) return; // Only needed for DSV4 with smelt
+
+        std.log.info("[Engine] Warming up expert cache (first forward pass)...", .{});
+
+        const caches = self.createCaches() catch |err| {
+            std.log.warn("[Engine] Warmup: failed to create caches: {}", .{err});
+            return;
+        };
+        defer {
+            for (caches) |cache| cache.deinit(self.allocator);
+            self.allocator.free(caches);
+        }
+
+        // Use a minimal prompt: just the BOS token (ID=1 for most models)
+        const warmup_prompt = [_]u32{1};
+        var sampler = sampling_mod.SamplerConfig{
+            .temperature = 0,
+            .top_k = 1,
+            .prng = std.Random.DefaultPrng.init(0),
+        };
+
+        const model = self.dsv4_model.?;
+        // Generate 1 token to trigger a full prefill + 1 decode step
+        const tokens = model.generate(&warmup_prompt, 1, &sampler, caches, self.stream) catch |err| {
+            std.log.warn("[Engine] Warmup: generate failed: {}", .{err});
+            return;
+        };
+        self.allocator.free(tokens);
+
+        std.log.info("[Engine] Expert cache warmup complete", .{});
     }
 
     /// Create per-request private KV caches (used for individual prefill).
@@ -1070,4 +1373,92 @@ fn createCachesShared(
         caches[i] = try kvcache.createStandard(allocator, lc, stream);
     }
     return caches;
+}
+
+// ============================================================
+// Guided Decoding Integration
+// ============================================================
+
+/// Generate tokens with guided decoding (JSON schema or regex constraint).
+/// Uses the GuidedDecoder FSM to mask logits at each step, ensuring output
+/// conforms to the specified grammar.
+///
+/// Interface design: accepts a GuidedDecoder that can be created from either
+/// a JSON schema or regex pattern. The caller is responsible for creating
+/// and destroying the decoder.
+///
+/// Extensibility: new constraint types can be added by implementing new
+/// FSM builders in guided.zig without modifying this function.
+pub fn generateGuided(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    max_tokens: usize,
+    decoder: *guided_mod.GuidedDecoder,
+    sampler: *SamplerConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    allocator: std.mem.Allocator,
+) ![]u32 {
+    var result = std.ArrayList(u32).empty;
+    errdefer result.deinit(allocator);
+
+    // Prefill: run prompt through model
+    const prompt_arr = try array_mod.Array.fromData(
+        allocator,
+        u32,
+        prompt_tokens,
+        &[_]i32{ 1, @intCast(prompt_tokens.len) },
+    );
+    defer prompt_arr.deinit();
+
+    const prefill_logits = try model.forward(model.ptr, prompt_arr, null, caches);
+    defer prefill_logits.deinit();
+
+    // Extract last position logits: shape [1, seq_len, vocab] → [1, 1, vocab]
+    const logits_shape = prefill_logits.shape();
+    const seq_len: usize = @intCast(logits_shape[1]);
+    const last_logits = try ops.slice(
+        ctx,
+        prefill_logits,
+        &[_]i32{ 0, @intCast(seq_len - 1), 0 },
+        &[_]i32{ 1, @intCast(seq_len), @intCast(logits_shape[2]) },
+        &[_]i32{ 1, 1, 1 },
+    );
+    defer last_logits.deinit();
+
+    // Apply guided decoding mask
+    const masked_logits = try decoder.maskLogits(last_logits, ctx);
+    defer masked_logits.deinit();
+
+    // Sample first token using SamplerConfig
+    const first_sample = try sampler.sample(masked_logits, allocator);
+    try result.append(allocator, first_sample.token);
+    decoder.advance(first_sample.token);
+
+    // Autoregressive generation with guided masking
+    var step: usize = 1;
+    while (step < max_tokens and !decoder.isComplete()) : (step += 1) {
+        const input_token = result.items[result.items.len - 1];
+        const input_arr = try array_mod.Array.fromData(
+            allocator,
+            u32,
+            &[_]u32{input_token},
+            &[_]i32{ 1, 1 },
+        );
+        defer input_arr.deinit();
+
+        const step_logits = try model.forward(model.ptr, input_arr, null, caches);
+        defer step_logits.deinit();
+
+        // Apply guided decoding mask
+        const step_masked = try decoder.maskLogits(step_logits, ctx);
+        defer step_masked.deinit();
+
+        // Sample
+        const step_sample = try sampler.sample(step_masked, allocator);
+        try result.append(allocator, step_sample.token);
+        decoder.advance(step_sample.token);
+    }
+
+    return try result.toOwnedSlice(allocator);
 }

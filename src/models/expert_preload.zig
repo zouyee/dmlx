@@ -373,6 +373,10 @@ pub const LayerMeta = struct {
 
 /// Load full tensor and slice to get expert subset.
 /// This is the key operation that matches Python vmlx's _load_expert_subset.
+///
+/// IMPORTANT: We eval() the sliced result immediately to allow the full tensor
+/// to be freed. Without eval(), MLX's lazy evaluation keeps the full tensor
+/// alive as a dependency, causing OOM when loading multiple layers.
 fn loadAndSliceExpert(
     allocator: std.mem.Allocator,
     index: *TensorIndex,
@@ -389,7 +393,9 @@ fn loadAndSliceExpert(
     // If all experts selected, return full tensor
     if (expert_ids.len >= n_experts) {
         const ctx = ops.EagerContext.init(allocator);
-        return ops.copy(ctx, full_tensor);
+        const result = try ops.copy(ctx, full_tensor);
+        try result.eval();
+        return result;
     }
 
     // Slice to get subset: full_tensor[expert_ids, ...]
@@ -400,5 +406,10 @@ fn loadAndSliceExpert(
     const indices_i32 = try ops.astype(ctx, indices_arr, .int32);
     defer indices_i32.deinit();
 
-    return shape_mod.takeAxis(ctx, full_tensor, indices_i32, 0);
+    const result = try shape_mod.takeAxis(ctx, full_tensor, indices_i32, 0);
+    // Force evaluation so the full tensor can be freed immediately.
+    // Without this, MLX keeps full_tensor alive as a lazy dependency,
+    // causing peak memory to be N_layers × full_tensor_size → OOM.
+    try result.eval();
+    return result;
 }

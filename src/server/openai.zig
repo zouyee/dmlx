@@ -135,6 +135,14 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         .stop_strings = req.stop,
         .streaming = false,
         .model_name = req.model,
+        .guided_json_schema = if (req.response_format) |rf| blk: {
+            if (std.mem.eql(u8, rf.type, "json_schema")) break :blk rf.schema;
+            break :blk null;
+        } else null,
+        .guided_regex = if (req.response_format) |rf| blk: {
+            if (std.mem.eql(u8, rf.type, "regex")) break :blk rf.schema;
+            break :blk null;
+        } else null,
     };
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);

@@ -23,3 +23,4 @@ pub const EngineConfig = engine_loop.EngineConfig;
 pub const requestShutdown = engine_loop.requestShutdown;
 pub const isShutdownRequested = engine_loop.isShutdownRequested;
 pub const threadSleepMs = engine_loop.threadSleepMs;
+pub const generateGuided = engine_loop.generateGuided;
