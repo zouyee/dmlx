@@ -836,26 +836,59 @@ pub const EngineLoop = struct {
             .repetition_penalty = gen_config.repetition_penalty,
         };
 
-        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream) catch |err| {
+        // Context for streaming callback
+        const StreamCtx = struct {
+            engine: *EngineLoop,
+            req: *RequestState,
+            token_count: usize,
+        };
+        var stream_ctx = StreamCtx{
+            .engine = self,
+            .req = req,
+            .token_count = 0,
+        };
+
+        // Callback function that delivers tokens immediately
+        const streamCallback = struct {
+            fn callback(ctx_ptr: *anyopaque, token: u32, is_final: bool) void {
+                const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
+                ctx.token_count += 1;
+
+                // Decode token to text
+                const token_text = ctx.engine.tokenizer.decode(&[_]u32{token}, ctx.engine.allocator) catch "";
+                defer if (token_text.len > 0) ctx.engine.allocator.free(token_text);
+
+                // Deliver token immediately
+                ctx.req.completion.deliverToken(
+                    ctx.engine.io,
+                    token,
+                    token_text,
+                    is_final,
+                    if (is_final) .stop else null,
+                );
+            }
+        }.callback;
+
+        // Generate with streaming callback - tokens are delivered immediately
+        const tokens = model.generateWithCallback(
+            req.prompt_tokens,
+            req.max_tokens,
+            &sampler,
+            caches,
+            self.stream,
+            &stream_ctx,
+            streamCallback,
+        ) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
             return;
         };
         defer self.allocator.free(tokens);
 
-        // Record generated token count for logging.
+        // Record generated token count for logging
         req.token_count = @intCast(tokens.len);
 
-        // Decode and deliver tokens one by one to simulate streaming.
-        for (tokens, 0..) |token, i| {
-            const token_text = self.tokenizer.decode(&[_]u32{token}, self.allocator) catch continue;
-            defer self.allocator.free(token_text);
-
-            const is_final = i == tokens.len - 1;
-            req.completion.deliverToken(self.io, token, token_text, is_final, if (is_final) .stop else null);
-        }
-
-        // Ensure a final done event is sent if not already.
+        // Ensure a final done event is sent if not already
         if (!req.completion.isDone(self.io)) {
             req.completion.deliverDone(self.io, .stop);
         }

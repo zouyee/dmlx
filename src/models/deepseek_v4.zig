@@ -2766,6 +2766,123 @@ pub const DSV4Model = struct {
         return logits;
     }
 
+    /// Callback type for streaming generation.
+    /// Called after each token is generated with the token ID and whether it's the final token.
+    pub const StreamCallback = *const fn (ctx: *anyopaque, token: u32, is_final: bool) void;
+
+    /// Generate tokens with optional streaming callback.
+    /// When callback is provided, tokens are delivered immediately after generation.
+    /// Returns only the generated tokens (excluding prompt).
+    pub fn generateWithCallback(
+        self: *DSV4Model,
+        prompt_tokens: []const u32,
+        max_new_tokens: usize,
+        sampler_config: *@import("../sampling.zig").SamplerConfig,
+        caches: []kvcache.KVCacheStrategy,
+        stream: c.c.mlx_stream,
+        callback_ctx: ?*anyopaque,
+        callback: ?StreamCallback,
+    ) ![]u32 {
+        const allocator = self.allocator;
+
+        if (max_new_tokens == 0) {
+            return try allocator.alloc(u32, 0);
+        }
+
+        var tokens = try allocator.alloc(u32, prompt_tokens.len + max_new_tokens);
+        defer allocator.free(tokens);
+        @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
+
+        var current_len = prompt_tokens.len;
+        var start_pos: usize = 0;
+
+        // Prefill: process all prompt tokens at once
+        if (prompt_tokens.len > 0) {
+            var arena = ScopedArrayArena.init(allocator);
+            defer arena.deinit();
+
+            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
+
+            const prefill_mask = if (prompt_tokens.len > 1) blk: {
+                const sl = prompt_tokens.len;
+                const ws = self.config.sliding_window;
+                var mask_data = try allocator.alloc(f32, sl * sl);
+                defer allocator.free(mask_data);
+                @memset(mask_data, 0);
+                const neg_inf = -std.math.inf(f32);
+                for (0..sl) |i| {
+                    for (0..sl) |j| {
+                        const causal = j > i;
+                        const outside_window = ws > 0 and i >= ws and j < i + 1 - ws;
+                        if (causal or outside_window) {
+                            mask_data[i * sl + j] = neg_inf;
+                        }
+                    }
+                }
+                const mask_arr = try Array.fromData(allocator, f32, mask_data, &[_]i32{ 1, 1, @intCast(sl), @intCast(sl) });
+                break :blk mask_arr;
+            } else null;
+            defer if (prefill_mask) |m| m.deinit();
+
+            const logits = try self.forward(prompt_arr, prefill_mask, caches, start_pos, stream);
+
+            const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
+            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
+            const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
+
+            const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
+            tokens[current_len] = next_token;
+            current_len += 1;
+            start_pos = prompt_tokens.len;
+
+            // Call callback immediately after first token is generated
+            if (callback) |cb| {
+                const is_final = max_new_tokens == 1 or next_token == 1;
+                cb(callback_ctx.?, next_token, is_final);
+            }
+
+            if (next_token == 1) {
+                std.log.info("EOS token generated after prefill, stopping", .{});
+            }
+        }
+
+        // Generate new tokens autoregressively
+        for (0..max_new_tokens - 1) |i| {
+            if (current_len >= tokens.len) break;
+
+            var arena = ScopedArrayArena.init(allocator);
+            defer arena.deinit();
+
+            const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tokens[current_len - 1]}, &[_]i32{ 1, 1 }));
+            const logits = try self.forward(input_arr, null, caches, start_pos, stream);
+
+            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, logits, &[_]i32{ 0, 1 }));
+            const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
+
+            const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
+            tokens[current_len] = next_token;
+            current_len += 1;
+            start_pos += 1;
+
+            // Call callback immediately after each token is generated
+            if (callback) |cb| {
+                const is_final = i + 1 >= max_new_tokens - 1 or next_token == 1;
+                cb(callback_ctx.?, next_token, is_final);
+            }
+
+            // Check for EOS token (ID 1 for DeepSeek V4)
+            if (next_token == 1) {
+                std.log.info("EOS token generated, stopping", .{});
+                break;
+            }
+        }
+
+        // Return only generated tokens (skip prompt)
+        const result = try allocator.alloc(u32, current_len - prompt_tokens.len);
+        @memcpy(result, tokens[prompt_tokens.len..current_len]);
+        return result;
+    }
+
     pub fn generate(
         self: *DSV4Model,
         prompt_tokens: []const u32,
