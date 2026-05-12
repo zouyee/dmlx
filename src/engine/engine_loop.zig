@@ -866,6 +866,12 @@ pub const EngineLoop = struct {
                     is_final,
                     if (is_final) .stop else null,
                 );
+
+                // Yield to allow HTTP fiber to process the token.
+                // This is critical for streaming latency: without this, the main thread
+                // continues generating tokens without giving the HTTP fiber a chance to run.
+                // The io.sleep duration of 0 means "yield to other fibers if any are ready".
+                ctx.engine.io.sleep(.fromMilliseconds(0), .awake) catch {};
             }
         }.callback;
 
