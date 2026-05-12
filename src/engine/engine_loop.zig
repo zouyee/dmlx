@@ -226,13 +226,6 @@ pub const EngineLoop = struct {
         std.log.info("[Engine] Engine loop started", .{});
         defer std.log.info("[Engine] Engine loop exiting", .{});
 
-        // Warmup: run a dummy forward pass to pre-populate the expert cache.
-        // Without this, the first user request pays the full SSD expert loading
-        // cost (~50s for smelt 0.1 stream mode). After warmup, subsequent requests
-        // hit the in-memory expert cache and complete in ~1-2s.
-        // Reference: omlx benchmark does the same warmup before real requests.
-        self.warmupExpertCache();
-
         while (self.running.load(.acquire) and !g_shutdown_requested.load(.acquire)) {
             // Drain new requests from the queue.
             const new_requests = self.request_queue.drainAll(self.allocator) catch {
@@ -1219,47 +1212,59 @@ pub const EngineLoop = struct {
         );
     }
 
-    /// Warmup: run a short dummy generation to pre-populate the expert cache.
+    /// Warmup: run multiple dummy generations to pre-populate the expert cache.
     /// This ensures the first real user request doesn't pay the full SSD loading cost.
     ///
-    /// For smelt stream mode, the first forward pass through all 43 layers triggers
-    /// ~12000 expert cache misses (loading from SSD). After warmup, subsequent
-    /// requests hit the in-memory cache and complete in ~1-2s instead of ~50s.
+    /// Strategy (Router-Aware Preloading):
+    /// Different prompts trigger different expert routing paths. By running
+    /// multiple diverse dummy prompts, we populate the cache with a wider
+    /// variety of experts. After warmup, real requests are more likely to
+    /// hit cached experts, reducing SSD I/O.
     ///
-    /// Design: uses a minimal prompt (single token) with max_tokens=1 to trigger
-    /// one full forward pass through all layers, populating the expert cache with
-    /// the most common experts. This matches omlx's benchmark warmup pattern.
+    /// With 5 warmup prompts × 6 experts/layer × 43 layers = ~1290 unique
+    /// expert slots cached (out of 256 × 43 = 11008 total). This covers
+    /// the most common routing paths for typical user queries.
     fn warmupExpertCache(self: *EngineLoop) void {
         if (self.dsv4_model == null) return; // Only needed for DSV4 with smelt
 
-        std.log.info("[Engine] Warming up expert cache (first forward pass)...", .{});
+        std.log.info("[Engine] Warming up expert cache (multi-prompt prefetch)...", .{});
 
-        const caches = self.createCaches() catch |err| {
-            std.log.warn("[Engine] Warmup: failed to create caches: {}", .{err});
-            return;
+        // Use diverse token IDs to trigger different expert routing paths.
+        // Each prompt activates different experts via the MoE router.
+        const warmup_prompts = [_][]const u32{
+            &[_]u32{1}, // BOS token
+            &[_]u32{ 1, 2, 3 }, // short sequence
+            &[_]u32{ 100, 200, 300, 400 }, // different token range
+            &[_]u32{ 1000, 2000, 3000 }, // higher token IDs
+            &[_]u32{ 50000, 60000, 70000, 80000, 90000 }, // very high IDs
         };
-        defer {
-            for (caches) |cache| cache.deinit(self.allocator);
-            self.allocator.free(caches);
-        }
 
-        // Use a minimal prompt: just the BOS token (ID=1 for most models)
-        const warmup_prompt = [_]u32{1};
+        const model = self.dsv4_model.?;
         var sampler = sampling_mod.SamplerConfig{
             .temperature = 0,
             .top_k = 1,
             .prng = std.Random.DefaultPrng.init(0),
         };
 
-        const model = self.dsv4_model.?;
-        // Generate 1 token to trigger a full prefill + 1 decode step
-        const tokens = model.generate(&warmup_prompt, 1, &sampler, caches, self.stream) catch |err| {
-            std.log.warn("[Engine] Warmup: generate failed: {}", .{err});
-            return;
-        };
-        self.allocator.free(tokens);
+        for (warmup_prompts, 0..) |prompt, i| {
+            const caches = self.createCaches() catch {
+                std.log.warn("[Engine] Warmup {d}: failed to create caches", .{i});
+                continue;
+            };
+            defer {
+                for (caches) |cache| cache.deinit(self.allocator);
+                self.allocator.free(caches);
+            }
 
-        std.log.info("[Engine] Expert cache warmup complete", .{});
+            // Generate 1 token per prompt to trigger prefill through all layers
+            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream) catch {
+                std.log.warn("[Engine] Warmup {d}: generate failed", .{i});
+                continue;
+            };
+            self.allocator.free(tokens);
+        }
+
+        std.log.info("[Engine] Expert cache warmup complete ({d} prompts)", .{warmup_prompts.len});
     }
 
     /// Create per-request private KV caches (used for individual prefill).

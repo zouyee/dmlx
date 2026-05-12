@@ -1,0 +1,50 @@
+info: Detected architecture: DeepseekV4ForCausalLM
+info: Loaded index from cache (2481 entries, 3ms)
+info: Indexed 2481 tensors across shards
+info: Loading 2223 backbone weights (258 expert weights skipped)
+info: Loaded 200/2223 tensors...
+info: Loaded 400/2223 tensors...
+info: Loaded 600/2223 tensors...
+info: Loaded 800/2223 tensors...
+info: Loaded 1000/2223 tensors...
+info: Loaded 1200/2223 tensors...
+info: Loaded 1400/2223 tensors...
+info: Loaded 1600/2223 tensors...
+info: Loaded 1800/2223 tensors...
+info: Loaded 2000/2223 tensors...
+info: Loaded 2200/2223 tensors...
+info: TTFT breakdown: index=3ms fd=0ms mmap=35ms load=461ms total=501ms
+info: Loaded 2223 weights selectively
+info: Building layer 0/43...
+info: Layer 0: Stream mode - router can select any expert (on-demand loading)
+info: mHC: hc_attn_fn found for layer 0, ndim=2
+info: Layer 1: Stream mode - router can select any expert (on-demand loading)
+info: Layer 2: Stream mode - router can select any expert (on-demand loading)
+info: Layer 3: Stream mode - router can select any expert (on-demand loading)
+info: Layer 4: Stream mode - router can select any expert (on-demand loading)
+info: Layer 5: Stream mode - router can select any expert (on-demand loading)
+info: Layer 6: Stream mode - router can select any expert (on-demand loading)
+info: Layer 7: Stream mode - router can select any expert (on-demand loading)
+info: Layer 8: Stream mode - router can select any expert (on-demand loading)
+info: Layer 9: Stream mode - router can select any expert (on-demand loading)
+info: Building layer 10/43...
+info: Layer 10: Stream mode - router can select any expert (on-demand loading)
+info: Layer 11: Stream mode - router can select any expert (on-demand loading)
+info: Layer 12: Stream mode - router can select any expert (on-demand loading)
+info: Layer 13: Stream mode - router can select any expert (on-demand loading)
+info: Layer 14: Stream mode - router can select any expert (on-demand loading)
+info: Layer 15: Stream mode - router can select any expert (on-demand loading)
+info: Layer 16: Stream mode - router can select any expert (on-demand loading)
+info: Layer 17: Stream mode - router can select any expert (on-demand loading)
+info: Layer 18: Stream mode - router can select any expert (on-demand loading)
+info: Layer 19: Stream mode - router can select any expert (on-demand loading)
+info: Building layer 20/43...
+info: Layer 20: Stream mode - router can select any expert (on-demand loading)
+info: Layer 21: Stream mode - router can select any expert (on-demand loading)
+info: Layer 22: Stream mode - router can select any expert (on-demand loading)
+info: Layer 23: Stream mode - router can select any expert (on-demand loading)
+info: Layer 24: Stream mode - router can select any expert (on-demand loading)
+info: Layer 25: Stream mode - router can select any expert (on-demand loading)
+info: Layer 26: Stream mode - router can select any expert (on-demand loading)
+info: Layer 27: Stream mode - router can select any expert (on-demand loading)
+info: Layer 28: Stream mode - router can select any expert (on-demand loading)
