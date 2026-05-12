@@ -57,6 +57,17 @@ pub const VTable = struct {
     /// null if the strategy does not support rollback.
     rollback: ?*const fn (ctx: *anyopaque, to_len: usize) void,
 
+    /// Extend this cache by appending per-request caches.
+    /// Used in continuous batching when newly-prefilled requests join the
+    /// active decode batch. Each source cache is assumed to be a single-request
+    /// cache of the same concrete type.
+    /// null if the strategy does not support dynamic batch extension.
+    extend: ?*const fn (
+        ctx: *anyopaque,
+        sources: []KVCacheStrategy,
+        allocator: std.mem.Allocator,
+    ) anyerror!void,
+
     /// Get raw keys, values, and offset for serialization (prompt cache).
     /// Only StandardKVCache implements this; other strategies return null.
     getState: ?*const fn (ctx: *anyopaque) ?CacheState = null,
@@ -106,6 +117,23 @@ pub const KVCacheStrategy = struct {
             return f(self.ptr, indices, allocator);
         }
         return error.FilterNotSupported;
+    }
+
+    /// Whether this strategy supports batch extension.
+    pub fn supportsExtend(self: KVCacheStrategy) bool {
+        return self.vtable.extend != null;
+    }
+
+    /// Extend this cache by appending per-request caches.
+    pub fn extend(
+        self: KVCacheStrategy,
+        sources: []KVCacheStrategy,
+        allocator: std.mem.Allocator,
+    ) !void {
+        if (self.vtable.extend) |f| {
+            return f(self.ptr, sources, allocator);
+        }
+        return error.ExtendNotSupported;
     }
 
     /// Roll back to a previous sequence length.

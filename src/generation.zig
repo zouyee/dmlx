@@ -90,6 +90,60 @@ pub const GenerateConfig = struct {
 /// a token using the provided sampler configuration.
 ///
 /// Returns the sampled token and its log-probability.
+/// Batched generation step. Performs a single forward pass for multiple requests.
+///
+/// Args:
+///   model: The model to run forward on.
+///   tokens: Input token IDs, shape [batch, seq_len].
+///   caches: KV caches (one per layer), shared across the batch.
+///   samplers: One sampler per request in the batch.
+///   ctx: Eager context for array operations.
+///
+/// Returns:
+///   A slice of SampleResult, one per request. Caller owns the slice and must free it.
+pub fn generateBatchStep(
+    model: ModelVTable,
+    tokens: Array,
+    caches: []KVCacheStrategy,
+    samplers: []*SamplerConfig,
+    ctx: EagerContext,
+) ![]sampling_mod.SampleResult {
+    var arena = ScopedArrayArena.init(ctx.allocator);
+    defer arena.deinit();
+
+    // Forward pass: [batch, seq_len] → [batch, seq_len, vocab_size]
+    const logits = try arena.track(try model.forward(model.ptr, tokens, null, caches));
+
+    const logits_shape = logits.shape();
+    const batch = @as(usize, @intCast(logits_shape[0]));
+    const seq_len = @as(usize, @intCast(logits_shape[1]));
+    const vocab_size = @as(usize, @intCast(logits_shape[2]));
+
+    var results = try ctx.allocator.alloc(sampling_mod.SampleResult, batch);
+
+    for (0..batch) |b| {
+        // Extract last token logits for this batch: [1, 1, vocab]
+        const last_logits = try arena.track(try ops.slice(
+            ctx,
+            logits,
+            &[_]i32{ @intCast(b), @intCast(seq_len - 1), 0 },
+            &[_]i32{ @intCast(b + 1), @intCast(seq_len), @intCast(vocab_size) },
+            &[_]i32{ 1, 1, 1 },
+        ));
+
+        // Squeeze batch and seq dims: [1, 1, vocab] → [vocab]
+        const squeezed = try arena.track(try shape_mod.squeezeAxes(ctx, last_logits, &[_]i32{ 0, 1 }));
+
+        // Cast to float32 for CPU sampling
+        const logits_f32 = try arena.track(try ops.astype(ctx, squeezed, .float32));
+
+        // Sample
+        results[b] = try samplers[b].sample(logits_f32, ctx.allocator);
+    }
+
+    return results;
+}
+
 pub fn generateStep(
     model: ModelVTable,
     tokens: Array,
@@ -97,33 +151,10 @@ pub fn generateStep(
     sampler: *SamplerConfig,
     ctx: EagerContext,
 ) !sampling_mod.SampleResult {
-    var arena = ScopedArrayArena.init(ctx.allocator);
-    defer arena.deinit();
-
-    // Forward pass: [1, seq_len] → [1, seq_len, vocab_size]
-    const logits = try arena.track(try model.forward(model.ptr, tokens, null, caches));
-
-    // Extract last token logits: [1, seq_len, vocab] → [1, 1, vocab]
-    const logits_shape = logits.shape();
-    const seq_len = logits_shape[1];
-    const vocab_size = logits_shape[2];
-
-    const last_logits = try arena.track(try ops.slice(
-        ctx,
-        logits,
-        &[_]i32{ 0, seq_len - 1, 0 },
-        &[_]i32{ 1, seq_len, vocab_size },
-        &[_]i32{ 1, 1, 1 },
-    ));
-
-    // Squeeze batch and seq dims: [1, 1, vocab] → [vocab]
-    const squeezed = try arena.track(try shape_mod.squeezeAxes(ctx, last_logits, &[_]i32{ 0, 1 }));
-
-    // Cast to float32 for CPU sampling
-    const logits_f32 = try arena.track(try ops.astype(ctx, squeezed, .float32));
-
-    // Sample
-    return sampler.sample(logits_f32, ctx.allocator);
+    var samplers = [_]*SamplerConfig{sampler};
+    const results = try generateBatchStep(model, tokens, caches, &samplers, ctx);
+    defer ctx.allocator.free(results);
+    return results[0];
 }
 
 // ============================================================
@@ -680,7 +711,7 @@ pub fn streamGenerateEagle(
     }
 }
 
-fn isStopToken(token: u32, stop_tokens: []const u32) bool {
+pub fn isStopToken(token: u32, stop_tokens: []const u32) bool {
     for (stop_tokens) |st| {
         if (token == st) return true;
     }

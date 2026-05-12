@@ -5,9 +5,11 @@
 /// The HTTP handler fiber owns the RequestState lifecycle (alloc + free).
 const std = @import("std");
 const completion_signal = @import("completion_signal.zig");
+const sampling_mod = @import("../sampling.zig");
 
 pub const CompletionSignal = completion_signal.CompletionSignal;
 pub const TokenEvent = completion_signal.TokenEvent;
+pub const SamplerConfig = sampling_mod.SamplerConfig;
 
 /// API format for response formatting.
 pub const ApiFormat = enum {
@@ -20,6 +22,14 @@ pub const FinishReason = enum {
     stop,
     length,
     error_,
+};
+
+/// Phase of a request in the continuous batching lifecycle.
+pub const RequestPhase = enum {
+    waiting,
+    prefilling,
+    decoding,
+    done,
 };
 
 /// Configuration for creating a new request.
@@ -36,6 +46,8 @@ pub const RequestConfig = struct {
     model_name: []const u8 = "default",
     api_format: ApiFormat = .openai,
     speculative_ngram: ?usize = null,
+    /// Sequence index in the shared PagedKVCache (assigned by EngineLoop).
+    seq_index: usize = 0,
 };
 
 /// Per-request mutable state, heap-allocated and owned by the HTTP handler fiber.
@@ -81,6 +93,16 @@ pub const RequestState = struct {
     /// Error message if generation failed.
     error_msg: ?[]const u8,
 
+    // --- Continuous batching state ---
+    /// Current phase in the request lifecycle.
+    phase: RequestPhase,
+    /// Sequence index in the shared PagedKVCache.
+    seq_index: usize,
+    /// Per-request sampler (independent random state).
+    sampler: SamplerConfig,
+    /// Offset into prompt_tokens for incremental prefill.
+    prefill_offset: usize,
+
     // --- Synchronization ---
     /// Signal for engine→HTTP token delivery.
     completion: CompletionSignal,
@@ -109,6 +131,10 @@ pub const RequestState = struct {
             .stop_tokens = config.stop_tokens,
             .api_format = config.api_format,
             .model_name = config.model_name,
+            .phase = .waiting,
+            .seq_index = config.seq_index,
+            .sampler = SamplerConfig.init(config.seed),
+            .prefill_offset = 0,
             .generated_tokens = std.ArrayList(u32).empty,
             .text_buffer = std.ArrayList(u8).empty,
             .token_count = 0,
@@ -130,6 +156,16 @@ pub const RequestState = struct {
         self.text_buffer.deinit(allocator);
         self.completion.deinit();
         allocator.destroy(self);
+    }
+
+    /// Check if this request is in the decoding phase.
+    pub fn isDecoding(self: *const RequestState) bool {
+        return self.phase == .decoding;
+    }
+
+    /// Check if this request is active (prefilling or decoding).
+    pub fn isActive(self: *const RequestState) bool {
+        return self.phase == .prefilling or self.phase == .decoding;
     }
 
     /// Check if this request has been cancelled by the HTTP fiber.

@@ -335,6 +335,7 @@ pub const PagedKVCache = struct {
         .reset = resetImpl,
         .filter = filterImpl,
         .rollback = rollbackImpl,
+        .extend = extendImpl,
         .deinit = deinitImpl,
     };
 
@@ -941,6 +942,170 @@ pub const PagedKVCache = struct {
                 page.used = false;
             }
         }
+    }
+
+    fn extendImpl(
+        ctx: *anyopaque,
+        sources: []KVCacheStrategy,
+        allocator: std.mem.Allocator,
+    ) anyerror!void {
+        const self: *PagedKVCache = @ptrCast(@alignCast(ctx));
+        if (sources.len == 0) return;
+
+        // If self only contains empty sequences, clear them so we don't
+        // leave stale batch entries that mismatch active_requests len.
+        var all_empty = true;
+        for (self.sequences.items) |seq| {
+            if (seq.cached_len > 0 or seq.pages.items.len > 0) {
+                all_empty = false;
+                break;
+            }
+        }
+        if (all_empty) {
+            for (self.sequences.items) |*seq| {
+                seq.pages.deinit(allocator);
+            }
+            self.sequences.clearRetainingCapacity();
+            for (self.cached_keys.items) |maybe_arr| {
+                if (maybe_arr) |arr| arr.deinit();
+            }
+            self.cached_keys.clearRetainingCapacity();
+            for (self.cached_values.items) |maybe_arr| {
+                if (maybe_arr) |arr| arr.deinit();
+            }
+            self.cached_values.clearRetainingCapacity();
+            self.seq_prev_hashes.clearRetainingCapacity();
+        }
+
+        for (sources) |src| {
+            const src_ptr: *PagedKVCache = @ptrCast(@alignCast(src.ptr));
+
+            for (src_ptr.sequences.items, 0..) |seq, seq_idx| {
+                var new_seq = SequenceState{
+                    .pages = std.ArrayList(PageTableEntry).empty,
+                    .cached_len = seq.cached_len,
+                };
+                errdefer new_seq.pages.deinit(allocator);
+
+                try new_seq.pages.ensureTotalCapacity(allocator, seq.pages.items.len);
+
+                for (seq.pages.items) |pt| {
+                    const src_page = &src_ptr.pages.items[pt.physical];
+
+                    // Find a free page slot in self.
+                    var physical_idx: usize = undefined;
+                    var found = false;
+                    for (self.pages.items, 0..) |*page, i| {
+                        if (!page.used) {
+                            physical_idx = i;
+                            found = true;
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        physical_idx = self.pages.items.len;
+                        try self.pages.append(allocator, .{
+                            .keys = Array.fromHandle(c.c.mlx_array_new()),
+                            .values = Array.fromHandle(c.c.mlx_array_new()),
+                            .quantized_keys = null,
+                            .quantized_values = null,
+                            .used = false,
+                            .ref_count = 0,
+                        });
+                    }
+
+                    const dst_page = &self.pages.items[physical_idx];
+                    dst_page.used = true;
+                    dst_page.ref_count = 1;
+
+                    // Copy keys.
+                    if (src_page.keys.size() > 0) {
+                        if (dst_page.keys.size() > 0) dst_page.keys.deinit();
+                        var new_k = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_k, src_page.keys.inner));
+                        dst_page.keys = Array.fromHandle(new_k);
+                    }
+                    // Copy values.
+                    if (src_page.values.size() > 0) {
+                        if (dst_page.values.size() > 0) dst_page.values.deinit();
+                        var new_v = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_v, src_page.values.inner));
+                        dst_page.values = Array.fromHandle(new_v);
+                    }
+                    // Copy quantized keys.
+                    if (src_page.quantized_keys) |qk| {
+                        if (dst_page.quantized_keys) |dqk| {
+                            dqk.packed_data.deinit();
+                            dqk.scales.deinit();
+                            dqk.biases.deinit();
+                        }
+                        var new_pd = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_pd, qk.packed_data.inner));
+                        var new_sc = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_sc, qk.scales.inner));
+                        var new_bi = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_bi, qk.biases.inner));
+                        dst_page.quantized_keys = .{
+                            .packed_data = Array.fromHandle(new_pd),
+                            .scales = Array.fromHandle(new_sc),
+                            .biases = Array.fromHandle(new_bi),
+                        };
+                    }
+                    // Copy quantized values.
+                    if (src_page.quantized_values) |qv| {
+                        if (dst_page.quantized_values) |dqv| {
+                            dqv.packed_data.deinit();
+                            dqv.scales.deinit();
+                            dqv.biases.deinit();
+                        }
+                        var new_pd = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_pd, qv.packed_data.inner));
+                        var new_sc = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_sc, qv.scales.inner));
+                        var new_bi = c.c.mlx_array_new();
+                        try c.check(c.c.mlx_array_set(&new_bi, qv.biases.inner));
+                        dst_page.quantized_values = .{
+                            .packed_data = Array.fromHandle(new_pd),
+                            .scales = Array.fromHandle(new_sc),
+                            .biases = Array.fromHandle(new_bi),
+                        };
+                    }
+
+                    new_seq.pages.appendAssumeCapacity(.{
+                        .physical = physical_idx,
+                    });
+                }
+
+                try self.sequences.append(allocator, new_seq);
+
+                // Copy cached_keys / cached_values if present.
+                const ck = src_ptr.cached_keys.items[seq_idx];
+                if (ck) |arr| {
+                    var new_ck = c.c.mlx_array_new();
+                    try c.check(c.c.mlx_array_set(&new_ck, arr.inner));
+                    try self.cached_keys.append(allocator, Array.fromHandle(new_ck));
+                } else {
+                    try self.cached_keys.append(allocator, null);
+                }
+                const cv = src_ptr.cached_values.items[seq_idx];
+                if (cv) |arr| {
+                    var new_cv = c.c.mlx_array_new();
+                    try c.check(c.c.mlx_array_set(&new_cv, arr.inner));
+                    try self.cached_values.append(allocator, Array.fromHandle(new_cv));
+                } else {
+                    try self.cached_values.append(allocator, null);
+                }
+
+                // Append seq_prev_hash entry.
+                const src_hash = if (seq_idx < src_ptr.seq_prev_hashes.items.len)
+                    src_ptr.seq_prev_hashes.items[seq_idx]
+                else
+                    0;
+                try self.seq_prev_hashes.append(allocator, src_hash);
+            }
+        }
+
+        self.batch_size = self.sequences.items.len;
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {

@@ -99,6 +99,7 @@ const StubKVCache = struct {
         .reset = @ptrCast(&reset),
         .filter = null,
         .rollback = null,
+        .extend = null,
         .deinit = @ptrCast(&deinitFn),
     };
 

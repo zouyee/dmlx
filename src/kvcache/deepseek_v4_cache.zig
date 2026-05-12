@@ -231,6 +231,7 @@ pub const DeepseekV4Cache = struct {
         .reset = resetImpl,
         .filter = null,
         .rollback = null,
+        .extend = null,
         .deinit = deinitImpl,
     };
 

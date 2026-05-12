@@ -40,6 +40,7 @@ pub const StandardKVCache = struct {
         .reset = resetImpl,
         .filter = filterImpl,
         .rollback = rollbackImpl,
+        .extend = extendImpl,
         .getState = getStateImpl,
         .deinit = deinitImpl,
     };
@@ -203,6 +204,64 @@ pub const StandardKVCache = struct {
     fn getStateImpl(ctx: *anyopaque) ?iface.CacheState {
         const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
         return .{ .keys = self.keys, .values = self.values, .offset = self.offset };
+    }
+
+    fn extendImpl(
+        ctx: *anyopaque,
+        sources: []KVCacheStrategy,
+        allocator: std.mem.Allocator,
+    ) anyerror!void {
+        _ = allocator;
+        const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
+        if (sources.len == 0) return;
+
+        // Compute max cached length among self and all sources.
+        var max_len: usize = self.offset;
+        for (sources) |src| {
+            max_len = @max(max_len, src.currentLen());
+        }
+
+        const stream = c.c.mlx_default_cpu_stream_new();
+        defer _ = c.c.mlx_stream_free(stream);
+
+        const k_vec = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(k_vec);
+        const v_vec = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(v_vec);
+
+        // Only include self if it holds actual cached data.
+        const include_self = self.offset > 0;
+
+        if (include_self) {
+            try c.check(c.c.mlx_vector_array_append_data(k_vec, &self.keys.inner, 1));
+            try c.check(c.c.mlx_vector_array_append_data(v_vec, &self.values.inner, 1));
+        }
+
+        for (sources) |src| {
+            if (src.vtable.getState) |getStateFn| {
+                const state = getStateFn(src.ptr);
+                if (state) |s| {
+                    try c.check(c.c.mlx_vector_array_append_data(k_vec, &s.keys.inner, 1));
+                    try c.check(c.c.mlx_vector_array_append_data(v_vec, &s.values.inner, 1));
+                } else {
+                    return error.InvalidSourceCache;
+                }
+            } else {
+                return error.InvalidSourceCache;
+            }
+        }
+
+        var new_keys = c.c.mlx_array_new();
+        var new_values = c.c.mlx_array_new();
+        try c.check(c.c.mlx_concatenate_axis(&new_keys, k_vec, 0, stream));
+        try c.check(c.c.mlx_concatenate_axis(&new_values, v_vec, 0, stream));
+
+        self.keys.deinit();
+        self.values.deinit();
+        self.keys = Array.fromHandle(new_keys);
+        self.values = Array.fromHandle(new_values);
+        self.batch_size = if (include_self) self.batch_size + sources.len else sources.len;
+        self.offset = max_len;
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {

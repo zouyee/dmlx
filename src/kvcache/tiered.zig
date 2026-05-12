@@ -55,6 +55,7 @@ pub const TieredKVCache = struct {
         .reset = resetImpl,
         .filter = null,
         .rollback = rollbackImpl,
+        .extend = null,
         .deinit = deinitImpl,
     };
 

@@ -76,6 +76,7 @@ pub const QuantizedKVCache = struct {
         .reset = resetImpl,
         .filter = filterImpl,
         .rollback = rollbackImpl,
+        .extend = null,
         .deinit = deinitImpl,
     };
 

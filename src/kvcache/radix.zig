@@ -103,6 +103,7 @@ pub const RadixKVCache = struct {
         .currentLen = currentLenImpl,
         .reset = resetImpl,
         .filter = null, // Radix cache doesn't support arbitrary batch filtering.
+        .extend = null,
         .deinit = deinitImpl,
     };
 

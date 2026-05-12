@@ -70,6 +70,10 @@ pub const DeepseekV4Cache = dsv4_cache.DeepseekV4Cache;
 pub const BranchState = dsv4_cache.BranchState;
 pub const createDeepseekV4Cache = dsv4_cache.createDeepseekV4Cache;
 
+pub const batch = @import("kvcache/batch.zig");
+pub const BatchKVCache = batch.BatchKVCache;
+pub const createBatch = batch.createBatch;
+
 // Convenience factory re-exports
 pub const createStandard = standard.createStandard;
 pub const createRotating = rotating.createRotating;

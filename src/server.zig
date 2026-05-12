@@ -78,7 +78,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
         .dsv4_model = server_state.dsv4_model,
     };
 
-    var engine_loop = engine.EngineLoop.init(engine_config);
+    var engine_loop = try engine.EngineLoop.init(engine_config);
     server_state.engine_loop = engine_loop;
 
     // Install signal handlers for graceful shutdown.

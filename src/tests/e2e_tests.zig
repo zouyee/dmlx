@@ -300,3 +300,234 @@ test "tiny random model generate with GQA" {
     defer allocator.free(tokens);
     try std.testing.expectEqual(@as(usize, 4), tokens.len);
 }
+
+test "tiny random model batch prefill + decode with StandardKVCache extend" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = mlx.models.LlamaConfig{
+        .vocab_size = 128,
+        .hidden_size = 32,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 4,
+        .intermediate_size = 64,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 10000.0,
+        .max_position_embeddings = 128,
+    };
+
+    var weights = try createRandomWeights(allocator, &config, ctx);
+    defer {
+        var it = weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        weights.deinit();
+    }
+
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
+    defer model.deinit();
+
+    const layer_config = mlx.kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = config.num_attention_heads,
+        .num_kv_heads = config.num_key_value_heads,
+        .head_dim = config.hidden_size / config.num_attention_heads,
+        .max_seq_len = config.max_position_embeddings,
+        .dtype = .float32,
+    };
+
+    // Shared caches (initially empty)
+    var shared_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (shared_caches) |cache| cache.deinit(allocator);
+        allocator.free(shared_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        shared_caches[i] = try mlx.kvcache.createStandard(allocator, layer_config, stream);
+    }
+
+    // Request 1 caches
+    var req1_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (req1_caches) |cache| cache.deinit(allocator);
+        allocator.free(req1_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        req1_caches[i] = try mlx.kvcache.createStandard(allocator, layer_config, stream);
+    }
+
+    // Request 2 caches
+    var req2_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (req2_caches) |cache| cache.deinit(allocator);
+        allocator.free(req2_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        req2_caches[i] = try mlx.kvcache.createStandard(allocator, layer_config, stream);
+    }
+
+    // Prefill request 1: prompt [1,2,3]
+    const prompt1_data = [_]u32{ 1, 2, 3 };
+    const prompt1 = try Array.fromData(allocator, u32, &prompt1_data, &[_]i32{ 1, 3 });
+    defer prompt1.deinit();
+    _ = try model.forward(prompt1, null, req1_caches);
+    try std.testing.expectEqual(@as(usize, 3), req1_caches[0].currentLen());
+
+    // Prefill request 2: prompt [10,20]
+    const prompt2_data = [_]u32{ 10, 20 };
+    const prompt2 = try Array.fromData(allocator, u32, &prompt2_data, &[_]i32{ 1, 2 });
+    defer prompt2.deinit();
+    _ = try model.forward(prompt2, null, req2_caches);
+    try std.testing.expectEqual(@as(usize, 2), req2_caches[0].currentLen());
+
+    // Extend both request caches into shared caches
+    for (shared_caches, 0..) |shared_cache, i| {
+        var sources = [_]mlx.kvcache.KVCacheStrategy{ req1_caches[i], req2_caches[i] };
+        try shared_cache.extend(&sources, allocator);
+    }
+
+    // Verify shared cache batch size = 2, offset = max(3, 2) = 3
+    const shared_state = shared_caches[0].getState().?;
+    const shared_shape = shared_state.keys.shape();
+    try std.testing.expectEqual(@as(i32, 2), shared_shape[0]); // batch
+    try std.testing.expectEqual(@as(usize, 3), shared_state.offset); // max offset
+
+    // Batch decode: [batch=2, seq=1]
+    const decode_tokens = [_]u32{ 50, 60 };
+    const decode_input = try Array.fromData(allocator, u32, &decode_tokens, &[_]i32{ 2, 1 });
+    defer decode_input.deinit();
+
+    const logits = try model.forward(decode_input, null, shared_caches);
+    defer logits.deinit();
+
+    // Logits should be [2, 1, vocab_size]
+    const logits_shape = logits.shape();
+    try std.testing.expectEqual(@as(i32, 2), logits_shape[0]);
+    try std.testing.expectEqual(@as(i32, 1), logits_shape[1]);
+    try std.testing.expectEqual(@as(i32, 128), logits_shape[2]);
+
+    // Verify shared cache grew by 1 (decode seq_len = 1)
+    try std.testing.expectEqual(@as(usize, 4), shared_caches[0].currentLen());
+}
+
+test "tiny random model batch prefill + decode with PagedKVCache extend" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = mlx.models.LlamaConfig{
+        .vocab_size = 128,
+        .hidden_size = 32,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 4,
+        .intermediate_size = 64,
+        .rms_norm_eps = 1e-6,
+        .rope_theta = 10000.0,
+        .max_position_embeddings = 128,
+    };
+
+    var weights = try createRandomWeights(allocator, &config, ctx);
+    defer {
+        var it = weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        weights.deinit();
+    }
+
+    var model = try mlx.model_loader.buildModel(allocator, &config, &weights, ctx, stream, null);
+    defer model.deinit();
+
+    const layer_config = mlx.kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = config.num_attention_heads,
+        .num_kv_heads = config.num_key_value_heads,
+        .head_dim = config.hidden_size / config.num_attention_heads,
+        .max_seq_len = config.max_position_embeddings,
+        .dtype = .float32,
+    };
+
+    // Shared caches (initially empty)
+    var shared_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (shared_caches) |cache| cache.deinit(allocator);
+        allocator.free(shared_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        shared_caches[i] = try mlx.kvcache.createPaged(allocator, layer_config, stream);
+    }
+
+    // Request 1 caches
+    var req1_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (req1_caches) |cache| cache.deinit(allocator);
+        allocator.free(req1_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        req1_caches[i] = try mlx.kvcache.createPaged(allocator, layer_config, stream);
+    }
+
+    // Request 2 caches
+    var req2_caches = try allocator.alloc(mlx.kvcache.KVCacheStrategy, config.num_hidden_layers);
+    defer {
+        for (req2_caches) |cache| cache.deinit(allocator);
+        allocator.free(req2_caches);
+    }
+    for (0..config.num_hidden_layers) |i| {
+        req2_caches[i] = try mlx.kvcache.createPaged(allocator, layer_config, stream);
+    }
+
+    // Prefill request 1: prompt [1,2,3]
+    const prompt1_data = [_]u32{ 1, 2, 3 };
+    const prompt1 = try Array.fromData(allocator, u32, &prompt1_data, &[_]i32{ 1, 3 });
+    defer prompt1.deinit();
+    _ = try model.forward(prompt1, null, req1_caches);
+    try std.testing.expectEqual(@as(usize, 3), req1_caches[0].currentLen());
+
+    // Prefill request 2: prompt [10,20,30] (same length as req1 for uniform batch offset)
+    const prompt2_data = [_]u32{ 10, 20, 30 };
+    const prompt2 = try Array.fromData(allocator, u32, &prompt2_data, &[_]i32{ 1, 3 });
+    defer prompt2.deinit();
+    _ = try model.forward(prompt2, null, req2_caches);
+    try std.testing.expectEqual(@as(usize, 3), req2_caches[0].currentLen());
+
+    // Extend both request caches into shared caches
+    for (shared_caches, 0..) |shared_cache, i| {
+        var sources = [_]mlx.kvcache.KVCacheStrategy{ req1_caches[i], req2_caches[i] };
+        try shared_cache.extend(&sources, allocator);
+    }
+
+    // Verify shared cache state: batch size = 2, offset = 3
+    try std.testing.expectEqual(@as(usize, 3), shared_caches[0].currentLen());
+
+    // Debug: verify each sequence's cached_len
+    const dbg_ptr: *mlx.kvcache.paged.PagedKVCache = @ptrCast(@alignCast(shared_caches[0].ptr));
+    try std.testing.expectEqual(@as(usize, 2), dbg_ptr.sequences.items.len);
+    try std.testing.expectEqual(@as(usize, 3), dbg_ptr.sequences.items[0].cached_len);
+    try std.testing.expectEqual(@as(usize, 3), dbg_ptr.sequences.items[1].cached_len);
+
+    // Batch decode: [batch=2, seq=1]
+    const decode_tokens = [_]u32{ 50, 60 };
+    const decode_input = try Array.fromData(allocator, u32, &decode_tokens, &[_]i32{ 2, 1 });
+    defer decode_input.deinit();
+
+    const logits = try model.forward(decode_input, null, shared_caches);
+    defer logits.deinit();
+
+    // Logits should be [2, 1, vocab_size]
+    const logits_shape = logits.shape();
+    try std.testing.expectEqual(@as(i32, 2), logits_shape[0]);
+    try std.testing.expectEqual(@as(i32, 1), logits_shape[1]);
+    try std.testing.expectEqual(@as(i32, 128), logits_shape[2]);
+
+    // Verify shared cache grew by 1 (decode seq_len = 1)
+    try std.testing.expectEqual(@as(usize, 4), shared_caches[0].currentLen());
+}

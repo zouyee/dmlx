@@ -151,7 +151,11 @@ pub const CompletionSignal = struct {
             }
 
             self.mutex.unlock(io);
-            io.sleep(.fromMilliseconds(1), .awake) catch return error.Canceled;
+            // Use shorter sleep to reduce latency between token delivery and HTTP response.
+            // The HTTP fiber polls the completion signal while the Engine fiber generates tokens.
+            // With 1ms sleep, there could be up to 1ms delay per token, adding significant
+            // overhead when generating many tokens.
+            io.sleep(.fromMicroseconds(100), .awake) catch return error.Canceled;
         }
     }
 

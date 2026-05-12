@@ -102,6 +102,190 @@ test "StandardKVCache asStrategy updateAndFetch" {
     try std.testing.expectEqual(@as(usize, 0), strategy.currentLen());
 }
 
+test "StandardKVCache extend: empty cache + single source" {
+    const allocator = std.testing.allocator;
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = 4,
+        .num_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 16,
+        .dtype = .float32,
+    };
+
+    var shared = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer shared.keys.deinit();
+    defer shared.values.deinit();
+
+    var src1 = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer src1.keys.deinit();
+    defer src1.values.deinit();
+    const kv1 = try makeTestKV(allocator, stream);
+    defer kv1.keys.deinit();
+    defer kv1.values.deinit();
+    _ = try src1.asStrategy().updateAndFetch(kv1.keys, kv1.values, stream);
+
+    try std.testing.expectEqual(@as(usize, 3), src1.offset);
+
+    var sources = [_]kvcache.KVCacheStrategy{src1.asStrategy()};
+    try shared.asStrategy().extend(&sources, allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), shared.batch_size);
+    try std.testing.expectEqual(@as(usize, 3), shared.offset);
+    const k_shape = shared.keys.shape();
+    try std.testing.expectEqual(@as(i32, 1), k_shape[0]); // batch
+    try std.testing.expectEqual(@as(i32, 2), k_shape[1]); // heads
+    try std.testing.expectEqual(@as(i32, 16), k_shape[2]); // seq
+    try std.testing.expectEqual(@as(i32, 4), k_shape[3]); // dim
+}
+
+test "StandardKVCache extend: empty cache + multiple sources with different offsets" {
+    const allocator = std.testing.allocator;
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = 4,
+        .num_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 16,
+        .dtype = .float32,
+    };
+
+    var shared = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer shared.keys.deinit();
+    defer shared.values.deinit();
+
+    var src1 = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer src1.keys.deinit();
+    defer src1.values.deinit();
+    const kv1 = try makeTestKV(allocator, stream);
+    defer kv1.keys.deinit();
+    defer kv1.values.deinit();
+    _ = try src1.asStrategy().updateAndFetch(kv1.keys, kv1.values, stream); // offset = 3
+
+    var src2 = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer src2.keys.deinit();
+    defer src2.values.deinit();
+    const kv2 = try makeTestKV2(allocator, stream); // shape [1,2,5,4]
+    defer kv2.keys.deinit();
+    defer kv2.values.deinit();
+    _ = try src2.asStrategy().updateAndFetch(kv2.keys, kv2.values, stream); // offset = 5
+
+    try std.testing.expectEqual(@as(usize, 3), src1.offset);
+    try std.testing.expectEqual(@as(usize, 5), src2.offset);
+
+    var sources = [_]kvcache.KVCacheStrategy{ src1.asStrategy(), src2.asStrategy() };
+    try shared.asStrategy().extend(&sources, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), shared.batch_size);
+    try std.testing.expectEqual(@as(usize, 5), shared.offset); // max of offsets
+    const k_shape = shared.keys.shape();
+    try std.testing.expectEqual(@as(i32, 2), k_shape[0]);
+}
+
+test "StandardKVCache extend: non-empty cache + sources" {
+    const allocator = std.testing.allocator;
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = 4,
+        .num_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 16,
+        .dtype = .float32,
+    };
+
+    var shared = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer shared.keys.deinit();
+    defer shared.values.deinit();
+
+    // Pre-fill shared cache with 3 tokens.
+    const kv_shared = try makeTestKV(allocator, stream);
+    defer kv_shared.keys.deinit();
+    defer kv_shared.values.deinit();
+    _ = try shared.asStrategy().updateAndFetch(kv_shared.keys, kv_shared.values, stream);
+    try std.testing.expectEqual(@as(usize, 3), shared.offset);
+
+    var src1 = try kvcache.StandardKVCache.init(allocator, config, stream);
+    defer src1.keys.deinit();
+    defer src1.values.deinit();
+    const kv1 = try makeTestKV(allocator, stream);
+    defer kv1.keys.deinit();
+    defer kv1.values.deinit();
+    _ = try src1.asStrategy().updateAndFetch(kv1.keys, kv1.values, stream); // offset = 3
+
+    var sources = [_]kvcache.KVCacheStrategy{src1.asStrategy()};
+    try shared.asStrategy().extend(&sources, allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), shared.batch_size); // 1 self + 1 source
+    try std.testing.expectEqual(@as(usize, 3), shared.offset);
+    const k_shape = shared.keys.shape();
+    try std.testing.expectEqual(@as(i32, 2), k_shape[0]);
+}
+
+/// Create a KV tensor of shape [B=1, H=2, S=5, D=4] for testing different seq lengths.
+fn makeTestKV2(allocator: std.mem.Allocator, stream: c.c.mlx_stream) !struct { keys: Array, values: Array } {
+    _ = allocator;
+    const shape = &[_]i32{ 1, 2, 5, 4 };
+
+    var keys = c.c.mlx_array_new();
+    var values = c.c.mlx_array_new();
+
+    try c.check(c.c.mlx_zeros(&keys, shape.ptr, shape.len, c.c.MLX_FLOAT32, stream));
+    try c.check(c.c.mlx_zeros(&values, shape.ptr, shape.len, c.c.MLX_FLOAT32, stream));
+
+    return .{
+        .keys = Array.fromHandle(keys),
+        .values = Array.fromHandle(values),
+    };
+}
+
+test "PagedKVCache extend: empty cache + multiple sources" {
+    const allocator = std.testing.allocator;
+    const stream = c.c.mlx_default_cpu_stream_new();
+    defer _ = c.c.mlx_stream_free(stream);
+
+    const config = kvcache.LayerConfig{
+        .batch_size = 1,
+        .num_heads = 4,
+        .num_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 128,
+        .dtype = .float32,
+    };
+
+    var shared = try kvcache.createPaged(allocator, config, stream);
+    defer shared.deinit(allocator);
+
+    var src1 = try kvcache.createPaged(allocator, config, stream);
+    defer src1.deinit(allocator);
+    const kv1 = try makeTestKV(allocator, stream);
+    defer kv1.keys.deinit();
+    defer kv1.values.deinit();
+    _ = try src1.updateAndFetch(kv1.keys, kv1.values, stream);
+    try std.testing.expectEqual(@as(usize, 3), src1.currentLen());
+
+    var src2 = try kvcache.createPaged(allocator, config, stream);
+    defer src2.deinit(allocator);
+    const kv2 = try makeTestKV2(allocator, stream);
+    defer kv2.keys.deinit();
+    defer kv2.values.deinit();
+    _ = try src2.updateAndFetch(kv2.keys, kv2.values, stream);
+    try std.testing.expectEqual(@as(usize, 5), src2.currentLen());
+
+    var sources = [_]kvcache.KVCacheStrategy{ src1, src2 };
+    try shared.extend(&sources, allocator);
+
+    try std.testing.expectEqual(@as(usize, 5), shared.currentLen());
+}
+
 // ------------------------------------------------------------------
 // CacheManager tests
 // ------------------------------------------------------------------
