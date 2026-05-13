@@ -371,6 +371,7 @@ pub const ExpertStreamProvider = struct {
                 const cached_row = cache_inst.get(key).?;
                 cached_rows[i] = try ops.copy(self.ctx, cached_row);
             }
+            defer for (cached_rows) |row| row.deinit(); // Clean up intermediate arrays
             return try shape_mod.concatenateAxis(self.ctx, cached_rows, 0);
         }
 
@@ -378,9 +379,6 @@ pub const ExpertStreamProvider = struct {
         const result = try self.loadExpertSlices(tensor_name, expert_ids, row_bytes);
 
         // Cache individual expert rows lazily for future token reuse
-        // CRITICAL: Do NOT call eval() per-row here — it causes 5,160 eval() calls per token
-        // (40 experts × 3 weights × 43 layers). MLX operations are lazy by default;
-        // eval() will be called once at the end of the forward pass.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -394,7 +392,6 @@ pub const ExpertStreamProvider = struct {
             const row_copy = try ops.copy(self.ctx, row);
             row.deinit();
             idx_arr.deinit();
-            // REMOVED: try row_copy.eval(); — this was causing 12+ minute hangs
 
             const sz = row_copy.nbytes();
             cache_inst.put(key, row_copy, sz);
