@@ -401,6 +401,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
             cmd.smelt_strategy = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
+            cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
             i -= 1;
