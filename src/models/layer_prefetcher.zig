@@ -5,7 +5,7 @@
 /// the ExpertCache so that the next layer's streamingForward finds them as
 /// cache hits, hiding disk latency behind compute time.
 ///
-/// Implementation uses atomic flags for synchronization (Zig 0.16 compatible).
+/// Implementation uses atomic flags with yield for synchronization.
 /// A background thread polls for prefetch requests and loads expert weights
 /// via PartialTensorReader into the ExpertCache.
 const std = @import("std");
@@ -27,9 +27,8 @@ pub const LayerPrefetcher = struct {
     thread: ?std.Thread = null,
 
     /// Atomic flags for lock-free synchronization
-    /// 0 = idle, 1 = request pending, 2 = done
+    /// 0 = idle, 1 = request pending, 2 = done, 3 = stopped
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    should_stop: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Request parameters (written by main thread, read by worker)
     request_layer: usize = 0,
@@ -40,6 +39,7 @@ pub const LayerPrefetcher = struct {
     const STATE_IDLE: u32 = 0;
     const STATE_PENDING: u32 = 1;
     const STATE_DONE: u32 = 2;
+    const STATE_STOPPED: u32 = 3;
 
     /// Initialize the prefetcher and spawn the background worker thread.
     pub fn init(
@@ -66,7 +66,7 @@ pub const LayerPrefetcher = struct {
 
     /// Stop the background thread and clean up.
     pub fn deinit(self: *LayerPrefetcher) void {
-        self.should_stop.store(1, .release);
+        self.state.store(STATE_STOPPED, .release);
 
         if (self.thread) |t| {
             t.join();
@@ -108,9 +108,9 @@ pub const LayerPrefetcher = struct {
     pub fn waitForCompletion(self: *LayerPrefetcher) void {
         if (self.thread == null) return;
 
-        // Spin-wait for completion (short wait — prefetch should be fast)
+        // Wait for completion with yield (avoids busy-wait CPU usage)
         while (self.state.load(.acquire) == STATE_PENDING) {
-            std.atomic.spinLoopHint();
+            std.Thread.yield() catch {};
         }
         // Reset to idle for next request
         if (self.state.load(.acquire) == STATE_DONE) {
@@ -120,10 +120,10 @@ pub const LayerPrefetcher = struct {
 
     /// Background worker thread entry point.
     fn prefetchWorker(self: *LayerPrefetcher) void {
-        while (self.should_stop.load(.acquire) == 0) {
-            // Wait for a pending request
+        while (self.state.load(.acquire) != STATE_STOPPED) {
+            // Wait for a pending request with yield
             if (self.state.load(.acquire) != STATE_PENDING) {
-                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
                 continue;
             }
 
@@ -174,74 +174,34 @@ pub const LayerPrefetcher = struct {
         expert_ids: []const u32,
         layer_idx: usize,
     ) void {
-        // Build cache key (same strategy as loadExpertSlicesCached)
         const name_hash = expert_cache.hashTensorName(tensor_name);
-        var ids_hasher = std.hash.Wyhash.init(name_hash);
-        ids_hasher.update(std.mem.sliceAsBytes(expert_ids));
-        const ids_hash = ids_hasher.final();
+        const lx: u32 = @intCast(layer_idx);
 
-        const key = expert_cache.CacheKey{
-            .layer_idx = @intCast(layer_idx),
-            .tensor_name_hash = ids_hash,
-            .expert_id = @intCast(expert_ids.len),
-        };
+        for (expert_ids) |eid| {
+            const key = expert_cache.CacheKey{
+                .layer_idx = lx,
+                .tensor_name_hash = name_hash,
+                .expert_id = eid,
+            };
 
-        // Skip if already cached
-        if (self.cache.get(key) != null) return;
+            // Skip if this expert row is already cached
+            if (self.cache.get(key) != null) continue;
 
-        // Read expert rows via partial reader
-        const tensor = self.reader.readExpertRows(tensor_name, expert_ids) catch |err| {
-            std.log.warn("LayerPrefetcher: failed to read {s} for layer {d}: {}", .{ tensor_name, layer_idx, err });
-            return;
-        };
+            // Read single expert row via partial reader
+            const row = self.reader.readExpertRow(tensor_name, eid) catch |err| {
+                std.log.warn("LayerPrefetcher: failed to read {s} expert {d} for layer {d}: {}", .{ tensor_name, eid, layer_idx, err });
+                continue;
+            };
 
-        // Compute byte size for cache tracking
-        const info = self.reader.index.entries.get(tensor_name) orelse {
-            std.log.warn("LayerPrefetcher: tensor {s} not found in index", .{tensor_name});
-            tensor.deinit();
-            return;
-        };
-        const range = self.reader.computeExpertByteRange(&info, 0);
-        const total_bytes = range.length * expert_ids.len;
-
-        // Insert into cache
-        self.cache.put(key, tensor, total_bytes);
+            const sz = row.nbytes();
+            self.cache.put(key, row, sz);
+        }
     }
 };
 
 // ── Tests ──
 
 test "LayerPrefetcher: prefetch for out-of-bounds layer is ignored" {
-    // Test that prefetch with an out-of-bounds layer index is a no-op.
-    // We can't easily create a full LayerPrefetcher with real dependencies,
-    // but we can test the bounds check in the prefetch method.
-    //
-    // The prefetch method checks: if (layer_idx >= self.layer_meta.len) return;
-    // With an empty layer_meta, any layer_idx should be ignored.
-    const allocator = std.testing.allocator;
-
-    // Create a minimal prefetcher without spawning a thread
-    // (thread is null, so prefetch returns early)
-    var prefetcher = LayerPrefetcher{
-        .allocator = allocator,
-        .reader = undefined, // won't be used since thread is null
-        .cache = undefined, // won't be used since thread is null
-        .layer_meta = &[_]LayerExpertMeta{}, // empty
-    };
-
-    // prefetch should be a no-op since thread is null
-    prefetcher.prefetch(0, &[_]u32{ 1, 2, 3 });
-    prefetcher.prefetch(999, &[_]u32{ 1, 2, 3 });
-
-    // waitForCompletion should also be a no-op
-    prefetcher.waitForCompletion();
-
-    // deinit should work cleanly with no thread
-    prefetcher.deinit();
-}
-
-test "LayerPrefetcher: init/deinit lifecycle without real I/O" {
-    // Test that a prefetcher with null thread can be created and destroyed cleanly.
     const allocator = std.testing.allocator;
 
     var prefetcher = LayerPrefetcher{
@@ -251,11 +211,24 @@ test "LayerPrefetcher: init/deinit lifecycle without real I/O" {
         .layer_meta = &[_]LayerExpertMeta{},
     };
 
-    // Verify initial state
+    prefetcher.prefetch(0, &[_]u32{ 1, 2, 3 });
+    prefetcher.prefetch(999, &[_]u32{ 1, 2, 3 });
+    prefetcher.waitForCompletion();
+    prefetcher.deinit();
+}
+
+test "LayerPrefetcher: init/deinit lifecycle without real I/O" {
+    const allocator = std.testing.allocator;
+
+    var prefetcher = LayerPrefetcher{
+        .allocator = allocator,
+        .reader = undefined,
+        .cache = undefined,
+        .layer_meta = &[_]LayerExpertMeta{},
+    };
+
     try std.testing.expect(prefetcher.thread == null);
     try std.testing.expectEqual(@as(u32, 0), prefetcher.state.load(.acquire));
-    try std.testing.expectEqual(@as(u32, 0), prefetcher.should_stop.load(.acquire));
 
-    // deinit should be clean
     prefetcher.deinit();
 }

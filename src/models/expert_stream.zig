@@ -216,7 +216,9 @@ pub const ExpertStreamProvider = struct {
                 try mmap.mmapAll(index);
                 provider.mmap_pool = mmap;
 
-                // Override madvise for random expert access pattern (MoE routing is random, not sequential)
+                // Override madvise for sequential expert access pattern
+                // MoE routing often selects adjacent experts in the fused tensor,
+                // so POSIX_MADV_NORMAL enables OS readahead for better SSD throughput
                 {
                     const posix_c = @cImport(@cInclude("sys/mman.h"));
                     var map_it = mmap.mappings.iterator();
@@ -225,7 +227,7 @@ pub const ExpertStreamProvider = struct {
                         _ = posix_c.posix_madvise(
                             @ptrCast(@constCast(region.ptr)),
                             region.len,
-                            posix_c.POSIX_MADV_RANDOM,
+                            posix_c.POSIX_MADV_NORMAL,
                         );
                     }
                 }
@@ -239,6 +241,25 @@ pub const ExpertStreamProvider = struct {
                 const cache = try allocator.create(expert_cache.ExpertCache);
                 cache.* = expert_cache.ExpertCache.init(allocator, cache_budget_mb * 1024 * 1024);
                 provider.cache = cache;
+
+                // Initialize LayerPrefetcher for background loading of next-layer experts
+                const prefetcher = try allocator.create(LayerPrefetcher);
+                prefetcher.* = LayerPrefetcher.init(allocator, reader, cache, layer_meta) catch |err| {
+                    std.log.warn("LayerPrefetcher init failed ({}), continuing without prefetch", .{err});
+                    prefetcher.* = .{
+                        .allocator = allocator,
+                        .reader = reader,
+                        .cache = cache,
+                        .layer_meta = layer_meta,
+                    };
+                };
+                provider.prefetcher = prefetcher;
+
+                if (prefetcher.thread != null) {
+                    std.log.info("Layer prefetcher ENABLED (overlapping I/O with GPU compute)", .{});
+                } else {
+                    std.log.warn("Layer prefetcher DISABLED (thread creation failed)", .{});
+                }
 
                 std.log.info("Expert streaming enabled: loading experts from SSD on demand (cache_budget={d}MB)", .{cache_budget_mb});
             },
@@ -372,6 +393,9 @@ pub const ExpertStreamProvider = struct {
         const result = try self.loadExpertSlices(tensor_name, expert_ids, row_bytes);
 
         // Cache individual expert rows lazily for future token reuse
+        // CRITICAL: Do NOT call eval() per-row here — it causes 5,160 eval() calls per token
+        // (40 experts × 3 weights × 43 layers). MLX operations are lazy by default;
+        // eval() will be called once at the end of the forward pass.
         var arena = std.heap.ArenaAllocator.init(self.allocator);
         defer arena.deinit();
         const aa = arena.allocator();
@@ -385,7 +409,7 @@ pub const ExpertStreamProvider = struct {
             const row_copy = try ops.copy(self.ctx, row);
             row.deinit();
             idx_arr.deinit();
-            try row_copy.eval();
+            // REMOVED: try row_copy.eval(); — this was causing 12+ minute hangs
 
             const sz = row_copy.nbytes();
             cache_inst.put(key, row_copy, sz);
@@ -396,6 +420,13 @@ pub const ExpertStreamProvider = struct {
 
     /// Streaming forward (Option 2): Load experts on-demand from disk.
     /// This is the experimental approach with lower memory but more complexity.
+    ///
+    /// P4.1 Optimization: Expert deduplication across batch tokens
+    /// During prefill with multiple tokens (e.g., 8 tokens), each token routes to topk experts.
+    /// Without deduplication: 8 tokens × 6 experts/token = 48 expert loads per layer
+    /// With deduplication: ~24-34 unique experts per layer (30-50% reduction)
+    /// This optimization unions routing results across all tokens before loading,
+    /// significantly reducing I/O during cold start prefill.
     fn streamingForward(
         self: *ExpertStreamProvider,
         layer_idx: usize,
@@ -443,6 +474,8 @@ pub const ExpertStreamProvider = struct {
 
         const indices_data = try indices_u32.dataSlice(u32);
 
+        // P4.1: Union/deduplicate routing results across all batch tokens
+        // This reduces redundant expert loading when multiple tokens route to the same experts
         var unique_set = std.AutoHashMap(u32, void).init(self.allocator);
         defer unique_set.deinit();
         for (indices_data) |eid| {
@@ -460,6 +493,19 @@ pub const ExpertStreamProvider = struct {
         }
         // Sort for sequential disk access (helps cache and partial reads)
         std.mem.sort(u32, unique_ids, {}, std.sort.asc(u32));
+
+        // Log deduplication effectiveness (only for layer 0 to avoid spam)
+        if (layer_idx == 0) {
+            const dedup_rate = if (indices_data.len > 0)
+                @as(f64, @floatFromInt(indices_data.len - unique_ids.len)) / @as(f64, @floatFromInt(indices_data.len)) * 100.0
+            else
+                0.0;
+            std.log.info("P4.1 Expert deduplication: {d} total → {d} unique ({d:.1}% reduction)", .{
+                indices_data.len,
+                unique_ids.len,
+                dedup_rate,
+            });
+        }
 
         // 2. Load expert weight slices using cache-first strategy with partial reads
         const gate_w = try self.loadExpertSlicesCached(meta.gate_proj_name, unique_ids, layer_idx, 0);

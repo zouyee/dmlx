@@ -61,6 +61,7 @@ pub const cache_integration_tests = @import("tests/cache_integration_test.zig");
 pub const safetensors_reader_tests = @import("mlx").safetensors_reader;
 pub const expert_stream_tests = @import("models/expert_stream.zig");
 pub const engine_property_tests = @import("tests/engine_property_tests.zig");
+pub const expert_dedup_verification_tests = @import("tests/expert_dedup_verification_test.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -126,4 +127,5 @@ test {
     _ = safetensors_reader_tests;
     _ = expert_stream_tests;
     _ = engine_property_tests;
+    _ = expert_dedup_verification_tests;
 }
