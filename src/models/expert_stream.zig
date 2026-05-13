@@ -242,24 +242,9 @@ pub const ExpertStreamProvider = struct {
                 cache.* = expert_cache.ExpertCache.init(allocator, cache_budget_mb * 1024 * 1024);
                 provider.cache = cache;
 
-                // Initialize LayerPrefetcher for background loading of next-layer experts
-                const prefetcher = try allocator.create(LayerPrefetcher);
-                prefetcher.* = LayerPrefetcher.init(allocator, reader, cache, layer_meta) catch |err| {
-                    std.log.warn("LayerPrefetcher init failed ({}), continuing without prefetch", .{err});
-                    prefetcher.* = .{
-                        .allocator = allocator,
-                        .reader = reader,
-                        .cache = cache,
-                        .layer_meta = layer_meta,
-                    };
-                };
-                provider.prefetcher = prefetcher;
-
-                if (prefetcher.thread != null) {
-                    std.log.info("Layer prefetcher ENABLED (overlapping I/O with GPU compute)", .{});
-                } else {
-                    std.log.warn("Layer prefetcher DISABLED (thread creation failed)", .{});
-                }
+                // LayerPrefetcher is NOT enabled due to MLX thread safety constraints
+                // See tasks.md P0 for details: MLX tensor operations are not thread-safe
+                provider.prefetcher = null;
 
                 std.log.info("Expert streaming enabled: loading experts from SSD on demand (cache_budget={d}MB)", .{cache_budget_mb});
             },
