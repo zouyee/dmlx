@@ -327,6 +327,26 @@ fn deepseekV4Loader(
         );
 
         model_ptr.setExpertStreamProvider(sp);
+
+        // Log memory usage after expert stream provider setup
+        const posix_c_mem = @cImport({
+            @cInclude("mach/mach.h");
+            @cInclude("mach/task.h");
+        });
+        var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
+        var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
+        const kr = posix_c_mem.task_info(
+            posix_c_mem.mach_task_self(),
+            posix_c_mem.MACH_TASK_BASIC_INFO,
+            @ptrCast(&task_info),
+            &count,
+        );
+        if (kr == posix_c_mem.KERN_SUCCESS) {
+            const rss_mb = task_info.resident_size / (1024 * 1024);
+            const virt_mb = task_info.virtual_size / (1024 * 1024);
+            std.log.info("Memory after expert stream setup: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+        }
+
         std.log.info("model_registry: Expert streaming enabled for DeepSeek V4", .{});
     }
 

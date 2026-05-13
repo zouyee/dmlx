@@ -561,6 +561,25 @@ pub fn loadWeightsSelective(
     }
     std.log.info("Loading {d} backbone weights ({d} expert weights skipped)", .{ to_load, to_skip });
 
+    // Log memory usage before loading
+    const posix_c_mem = @cImport({
+        @cInclude("mach/mach.h");
+        @cInclude("mach/task.h");
+    });
+    var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
+    var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
+    const kr = posix_c_mem.task_info(
+        posix_c_mem.mach_task_self(),
+        posix_c_mem.MACH_TASK_BASIC_INFO,
+        @ptrCast(&task_info),
+        &count,
+    );
+    if (kr == posix_c_mem.KERN_SUCCESS) {
+        const rss_mb = task_info.resident_size / (1024 * 1024);
+        const virt_mb = task_info.virtual_size / (1024 * 1024);
+        std.log.info("Memory before loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+    }
+
     // Load each tensor using pre-opened file descriptors
     const t0_load = now();
     var weights = std.StringHashMap(Array).init(allocator);
@@ -695,6 +714,22 @@ pub fn loadWeightsSelective(
 
     const t1_load = now();
     const t1_total = now();
+
+    // Log memory usage after loading
+    {
+        const kr2 = posix_c_mem.task_info(
+            posix_c_mem.mach_task_self(),
+            posix_c_mem.MACH_TASK_BASIC_INFO,
+            @ptrCast(&task_info),
+            &count,
+        );
+        if (kr2 == posix_c_mem.KERN_SUCCESS) {
+            const rss_mb = task_info.resident_size / (1024 * 1024);
+            const virt_mb = task_info.virtual_size / (1024 * 1024);
+            std.log.info("Memory after loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+        }
+    }
+
     std.log.info("TTFT breakdown: index={d}ms fd={d}ms mmap={d}ms load={d}ms total={d}ms", .{
         @divTrunc(t1_index - t0_index, 1_000_000),
         @divTrunc(t1_fd - t0_fd, 1_000_000),
@@ -1195,6 +1230,28 @@ pub fn buildDSV4Model(
     smelt: SmeltConfig,
 ) !DSV4Model {
     _ = stream;
+
+    // Log memory usage at start of model building
+    const posix_c_mem = @cImport({
+        @cInclude("mach/mach.h");
+        @cInclude("mach/task.h");
+    });
+    var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
+    var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
+    {
+        const kr = posix_c_mem.task_info(
+            posix_c_mem.mach_task_self(),
+            posix_c_mem.MACH_TASK_BASIC_INFO,
+            @ptrCast(&task_info),
+            &count,
+        );
+        if (kr == posix_c_mem.KERN_SUCCESS) {
+            const rss_mb = task_info.resident_size / (1024 * 1024);
+            const virt_mb = task_info.virtual_size / (1024 * 1024);
+            std.log.info("Memory at start of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+        }
+    }
+
     const model_config = try config.clone(allocator);
     errdefer model_config.deinitClone(allocator);
     const num_layers = model_config.num_hidden_layers;
@@ -2197,6 +2254,21 @@ pub fn buildDSV4Model(
         if (std.mem.endsWith(u8, k, ".scales")) continue;
         if (std.mem.endsWith(u8, k, ".biases")) continue;
         std.log.warn("Unused weight: {s}", .{k});
+    }
+
+    // Log memory usage at end of model building
+    {
+        const kr2 = posix_c_mem.task_info(
+            posix_c_mem.mach_task_self(),
+            posix_c_mem.MACH_TASK_BASIC_INFO,
+            @ptrCast(&task_info),
+            &count,
+        );
+        if (kr2 == posix_c_mem.KERN_SUCCESS) {
+            const rss_mb = task_info.resident_size / (1024 * 1024);
+            const virt_mb = task_info.virtual_size / (1024 * 1024);
+            std.log.info("Memory at end of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+        }
     }
 
     return deepseek_v4.DSV4Model{
