@@ -263,6 +263,9 @@ pub const SmeltConfig = struct {
     /// Load mode: preload (load subset at init) or stream (load on-demand from disk).
     /// In stream mode, smelt_mask is NOT used - router can select any expert.
     load_mode: LoadMode = .preload,
+    /// Expert cache budget in MB (stream mode only).
+    /// Default 2048MB to stay within 48GB Mac memory limits.
+    cache_budget_mb: usize = 2048,
 
     /// Build a per-expert residency mask for the given number of experts.
     /// Caller owns the returned slice and must free with allocator.
@@ -524,15 +527,6 @@ pub fn loadWeightsSelective(
     try fd_pool.openAll(&index);
     const t1_fd = now();
 
-    // mmap all shards for zero-syscall reads
-    const t0_mmap = now();
-    var mmap_pool = safetensors_reader.MmapPool.init(allocator);
-    defer mmap_pool.deinit();
-    mmap_pool.mmapAll(&index) catch |err| {
-        std.log.warn("Failed to mmap shards: {}, falling back to pread", .{err});
-    };
-    const t1_mmap = now();
-
     // Build smelt mask
     var smelt_mask: ?[]bool = null;
     defer if (smelt_mask) |m| allocator.free(m);
@@ -540,6 +534,21 @@ pub fn loadWeightsSelective(
     if (smelt.enabled and smelt.load_fraction < 1.0 and !skip_all_experts) {
         smelt_mask = try smelt.buildMask(allocator, 256);
     }
+
+    // mmap all shards for zero-syscall reads
+    // In stream mode, skip mmap to avoid 141GB virtual memory pressure during backbone loading.
+    // The ExpertStreamProvider will do its own mmap later for on-demand expert access.
+    const t0_mmap = now();
+    var mmap_pool = safetensors_reader.MmapPool.init(allocator);
+    defer mmap_pool.deinit();
+    if (!skip_all_experts) {
+        mmap_pool.mmapAll(&index) catch |err| {
+            std.log.warn("Failed to mmap shards: {}, falling back to pread", .{err});
+        };
+    } else {
+        std.log.info("Stream mode: skipping mmap for backbone loading (reduces virtual memory pressure)", .{});
+    }
+    const t1_mmap = now();
 
     // Count how many tensors to load (for progress reporting)
     var to_load: usize = 0;

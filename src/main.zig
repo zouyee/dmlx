@@ -34,7 +34,7 @@ const ChatCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
-    smelt_cache_mb: usize = 4096, // Expert cache size in MB (stream mode)
+    smelt_cache_mb: usize = 2048, // Expert cache size in MB (stream mode, reduced for 48GB Mac)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -58,6 +58,7 @@ const ServerCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
+    smelt_cache_mb: usize = 2048,
     distributed: bool = false,
 };
 
@@ -189,6 +190,7 @@ pub fn main(init: std.process.Init) !void {
             .smelt = cmd.smelt,
             .smelt_experts = cmd.smelt_experts,
             .smelt_strategy = cmd.smelt_strategy,
+            .smelt_cache_mb = cmd.smelt_cache_mb,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -768,6 +770,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         .enabled = cmd.smelt,
         .load_fraction = cmd.smelt_experts,
         .load_mode = smelt_strategy,
+        .cache_budget_mb = cmd.smelt_cache_mb,
     };
 
     // In stream mode, use selective loading via TensorIndex + mmap.

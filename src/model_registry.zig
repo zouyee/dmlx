@@ -323,7 +323,7 @@ fn deepseekV4Loader(
             4, // bits
             "mxfp4",
             dsv4_config.swiglu_limit,
-            4096, // cache_budget_mb
+            smelt.cache_budget_mb,
         );
 
         model_ptr.setExpertStreamProvider(sp);
