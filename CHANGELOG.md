@@ -5,6 +5,55 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.0.4] - 2026-05-14
+
+### Added
+- **Server Engine V2**: Production-grade HTTP server with continuous batching
+  - OpenAI-compatible `/v1/chat/completions` (streaming + non-streaming)
+  - Anthropic Messages API `/v1/messages` compatibility
+  - True streaming via SSE with per-token delivery
+  - Speculative decoding (N-gram drafter + verification)
+  - Guided decoding (JSON schema + regex constraints via FSM)
+  - Graceful shutdown (SIGTERM/SIGINT + `/shutdown` endpoint)
+  - Error isolation (per-request error handling, no server crash)
+  - Request logging (duration, token count, tokens/sec)
+  - Health endpoint with model info and active request count
+
+- **Expert Stream Mode**: Run 141GB DeepSeek V4 Flash 4-bit on 48GB Mac
+  - On-demand expert loading from SSD via mmap + pread
+  - LFU (Least Frequently Used) expert cache with configurable budget
+  - Expert deduplication across batch tokens (20.8% I/O reduction on prefill)
+  - `madvise(WILLNEED)` async prefetch for expert data
+  - Skip mmap during backbone loading to reduce virtual memory pressure
+  - Configurable cache budget via `--smelt-cache <MB>` flag
+
+- **Continuous Batching Infrastructure**
+  - `BatchKVCache` with merge/filter/extend for multi-request batching
+  - MPSC atomic request queue (lock-free push, batch drain)
+  - Cross-thread token delivery via Darwin ulock (zero-latency wake)
+  - Per-request KV cache isolation (no cross-contamination)
+
+- **Block-based KV Cache Manager** (PagedKVCache)
+  - Reference-counted blocks with Copy-on-Write
+  - Prefix caching via chain-based content hashing
+  - LRU eviction with O(1) doubly-linked list
+
+### Performance
+- **Cold start (first prompt)**: 61s for 10 tokens (SSD I/O bound, 43 layers × 6 experts)
+- **Warm cache (subsequent prompts)**: 2.5s for 5 tokens, 2.03 tok/s
+- **Decode speed**: ~100-124ms/token (ReleaseFast)
+- **Model loading**: 46s (ReleaseFast) vs 110s (Debug)
+- **Memory**: RSS stable at ~15GB backbone + 2GB cache = ~17GB total
+
+### Fixed
+- `mlx_eval()` 20s/token regression: set default stream to GPU stream
+- Tokenizer segfault: heap-allocate BpeTokenizer (AutoHashMap not memcpy-safe)
+- Weight lifetime bug: transfer ownership to VTable adapter
+- P4 performance regression: remove 5,160 excessive `eval()` calls per token
+- Streaming latency: replace io.sleep polling with Darwin ulock cross-thread wake
+- OOM during startup: skip mmap for backbone loading in stream mode
+- Cache budget: reduce default from 4096→2048MB to prevent OS kills
+
 ## [Unreleased]
 
 ### Performance
