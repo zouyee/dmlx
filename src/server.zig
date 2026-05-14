@@ -170,10 +170,12 @@ fn acceptLoopThread(allocator: std.mem.Allocator, server_state: *ServerState, se
             if (engine.isShutdownRequested()) break;
             continue;
         }
+        const accept_time = std.c.mach_absolute_time();
+        std.log.info("[Accept] Connection accepted fd={d}", .{client_fd});
 
         // Wrap the raw fd for handleConnectionThread (uses raw fd directly)
         const thread = std.Thread.spawn(.{}, http.handleConnectionThreadRaw, .{
-            allocator, server_state, client_fd, server_config,
+            allocator, server_state, client_fd, server_config, accept_time,
         }) catch {
             _ = posix_c.close(client_fd);
             continue;

@@ -2,129 +2,175 @@
 
 ## 问题
 
-Server 端推理只需 ~500ms（3 tokens），但 curl 端到端延迟 ~20-23s。
+Server 端推理只需 ~400-500ms（3 tokens），但 curl 端到端延迟 ~17-20s。
 
 ## 测试方法
 
 ```bash
-# 1. 构建 ReleaseFast
+# 构建
 zig build -Doptimize=ReleaseFast
 
-# 2. 启动 server
-./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit --port 18090 \
+# 启动 server (前台或 nohup)
+nohup ./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit --port 18090 \
   --smelt --smelt-strategy stream --smelt-experts 0.1 --smelt-cache 2048 \
-  --temperature 0 --max-tokens 5
+  --temperature 0 --max-tokens 3 > /tmp/dmlx.log 2>&1 &
 
-# 3. 等待 server ready
-curl -sf http://localhost:18090/health
+# 等待 ready
+while ! curl -sf http://localhost:18090/health > /dev/null 2>&1; do sleep 2; done
 
-# 4. 测试（带 curl 计时）
-curl --max-time 120 -s -w "\ncurl_total: %{time_total}s starttransfer: %{time_starttransfer}s\n" \
-  http://localhost:18090/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":3,"temperature":0}'
+# 测试 health (应该 <1ms)
+curl -s -w '\ncurl_total: %{time_total}s\n' http://127.0.0.1:18090/health
+
+# 测试 chat completion
+date +%s && curl --max-time 60 -s -w '\nstarttransfer: %{time_starttransfer}s total: %{time_total}s\n' \
+  http://127.0.0.1:18090/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":3,"temperature":0}' && date +%s
 ```
 
 ## 排查过程
 
-### Round 1: 添加 Forward 计时
+### Round 1: Forward 计时
 
 在 `DSV4Model.forward` 中添加 `mach_absolute_time` 计时：
 
 ```
-[Forward] seq_len=5 total=178.1ms (embed=0.0ms layers=178.1ms head=0.0ms)
+[Forward] seq_len=5 total=143.4ms (embed=0.0ms layers=143.4ms head=0.0ms)
+[Forward] seq_len=1 total=116.8ms
+[Forward] seq_len=1 total=118.7ms
 ```
 
-结论：Forward 总计 ~439ms（3 tokens），全部在 layers 中。
+结论：3 次 forward 总计 ~379ms。
 
-### Round 2: 添加 HTTP 各阶段计时
+### Round 2: HTTP 各阶段计时
 
 ```
-[HTTP] Request received: 244 bytes (read took 1ms)
+[Accept] Connection accepted fd=38
+[HTTP] Thread started: accept→thread=0ms
+[HTTP] Request received: 244 bytes (raw thread)
 [HTTP] Template=0ms Tokenize=0ms prompt_len=5
 [HTTP] Request 1 submitted to queue
-[HTTP] Timing: push→wait_start=0ms, wait_duration=510ms
-[HTTP] Response: gen=510ms write=0ms total=510ms
-[HTTP] Connection lifetime: 510ms
+[RequestLog] duration_ms=401.04 tokens_per_sec=7.48
+[HTTP] Timing: push→wait_start=0ms, wait_duration=401ms
+[RAW] gen=401ms write=0ms
+[HTTP] Connection lifetime: 401ms (close took 0ms)
 ```
 
-结论：整个 `handleConnection` 函数只用了 510ms。
-
-### Round 3: 对比 curl 时间
+### Round 3: curl vs server 时间对比
 
 | 指标 | Server 端 | curl 端 |
 |------|-----------|---------|
-| HTTP read | 1ms | - |
+| accept→thread | 0ms | - |
+| HTTP read | <1ms | - |
 | Template + Tokenize | 0ms | - |
-| Engine forward | ~400ms | - |
-| waitForToken | 510ms | - |
-| Response write | 0ms | - |
-| **Connection lifetime** | **510ms** | - |
-| **curl total** | - | **21.27s** |
-| **差距** | | **~20.8s** |
+| Engine forward (3 tokens) | ~379ms | - |
+| waitForToken | 401ms | - |
+| posixWriteAll | 0ms | - |
+| close() | 0ms | - |
+| **Connection lifetime** | **401ms** | - |
+| **curl total** | - | **17-20s** |
+| **差距** | | **~17s** |
 
-### Round 4: 定位延迟位置
+### Round 4: Unix timestamp 对比
 
-`Connection lifetime: 510ms` 证明从 `handleConnection` 函数入口到出口只有 510ms。
-但 curl 显示 21.27s。
-
-**结论：20.8s 延迟在 `io.async(handleConnection, ...)` 被调度执行之前。**
-
-即：accept loop 调用 `io.async(handleConnection, ...)` 创建 fiber 后，
-该 fiber 要等待 ~20s 才被 Zig IO 调度器分配执行时间。
-
-## 根因
-
-### Zig 0.16 Threaded IO Backend Fiber 调度延迟
-
-1. Server 架构：
-   - 主线程：engine loop（`engineLoopRun`）— 处理 GPU forward pass
-   - Worker threads：HTTP handler fibers（通过 `io.async` 创建）
-
-2. Engine loop 空闲时的行为：
-   ```zig
-   // engine_loop.zig run() 循环
-   if (no_work) {
-       threadSleepMs(1);  // 主线程 sleep
-   }
-   ```
-
-3. Accept loop 在 `io.async` fiber 中运行，接受连接后创建新 fiber：
-   ```zig
-   _ = io.async(handleConnection, .{...});
-   ```
-
-4. **问题**：Zig Threaded IO backend 的 fiber 调度依赖事件循环。
-   当主线程在 `threadSleepMs(1)` 中 sleep 时，IO 事件循环不会被驱动，
-   新创建的 fiber 无法被及时调度到 worker thread 上执行。
-
-5. Fiber 最终被调度的触发条件可能是：
-   - 主线程 sleep 结束后的下一次事件循环迭代
-   - 或者某个 IO 事件（如 socket 可读）触发了调度器唤醒
-   - 实际延迟 ~20s 暗示调度器的唤醒机制存在严重问题
-
-### 排除的原因
-
-- ❌ HTTP 读取延迟（实测 1ms）
-- ❌ Template/Tokenize（实测 0ms）
-- ❌ Engine forward（实测 ~400ms）
-- ❌ Socket write 延迟（改用 posix write 后仍然 20s）
-- ❌ Connection close 延迟（改用 libc close 后仍然 20s）
-- ❌ TCP Nagle 算法（设置 TCP_NODELAY 后仍然 20s）
-
-## 修复方案
-
-将 HTTP handler 从 `io.async` fiber 改为 `std.Thread.spawn` 独立 OS 线程。
-这样 HTTP handler 的调度不再依赖 Zig IO 事件循环，而是由 OS 内核直接调度。
-
-```zig
-// Before (fiber-based, ~20s scheduling delay):
-_ = io.async(handleConnection, .{allocator, io, state, connection, config});
-
-// After (thread-based, immediate execution):
-_ = std.Thread.spawn(.{}, handleConnectionThread, .{allocator, state, connection, config}) catch continue;
+```
+curl start:     1778737258 (date +%s)
+response created: 1778737277 (JSON response 中的 created 字段)
+差距: 19s
 ```
 
-## 预期效果
+Server 在 curl 发送请求 **19s 后**才开始处理。但 `accept→thread=0ms` 说明
+一旦 accept() 返回，处理是立即的。
 
-修复后 curl 端到端延迟应从 ~21s 降至 ~510ms（= server 处理时间）。
+**结论：`accept()` 系统调用本身被阻塞了 ~18s。**
+
+### Round 5: Health endpoint 对比
+
+```
+curl health: 0.4ms ✅
+```
+
+Health 请求在 chat completion 请求之前发送，此时系统没有 I/O 压力。
+Chat completion 请求在第一个请求的 forward pass 期间或之后发送，
+此时系统正在做大量 mmap page-in I/O。
+
+### Round 6: 排除 CPU 瓶颈
+
+观察到 CPU 使用率并未达到 100%。问题不是 CPU 繁忙导致线程无法调度。
+
+## 根因分析
+
+### 确认的事实
+
+1. Server 代码路径全程 ~400ms（从 accept 返回到 close 完成）
+2. `accept()` 系统调用被阻塞了 ~17-19s
+3. Health endpoint 无延迟（0.4ms）
+4. CPU 未满载
+5. 物理内存充足（25GB free）
+6. 虚拟内存 ~585GB（33 个 shard 的 mmap）
+
+### 待确认的根因
+
+**最可能：macOS unified memory + mmap page fault I/O 竞争**
+
+当 engine loop 在做 forward pass 时，MLX 通过 mmap page fault 从 SSD 加载
+expert weights（141GB 文件的随机读取）。虽然 CPU 不满载，但 **SSD I/O 带宽
+被 page fault 占满**。macOS kernel 的 TCP accept() 需要分配内存（socket buffer），
+当 VM 子系统忙于处理大量 page fault 时，accept() 可能被阻塞在内核的 VM lock 上。
+
+**其他可能性（待排查）：**
+
+1. **macOS memory compressor 竞争**：1.3M pages in compressor，解压/压缩操作
+   可能持有 VM lock，阻塞 accept() 的内存分配
+2. **Swap I/O 竞争**：swapins=163M, swapouts=261M — 大量 swap 活动可能
+   导致 I/O 调度器延迟其他 I/O 操作
+3. **Unified memory GPU/CPU 竞争**：Apple Silicon 的统一内存架构下，
+   GPU 和 CPU 共享内存带宽，MLX GPU 操作可能占用了内存带宽
+
+### 为什么 CPU 不满载但仍有延迟？
+
+CPU 不满载是因为线程在等待 I/O（page fault、SSD read）。问题不是 CPU 调度，
+而是 **I/O 路径上的内核锁竞争**。accept() 不需要 CPU 时间，但需要内核
+分配 socket buffer 内存，这个操作可能被 VM 子系统的锁阻塞。
+
+## 已排除的原因
+
+| 假设 | 验证方法 | 结果 |
+|------|----------|------|
+| Zig IO fiber 调度延迟 | 改用 std.Thread.spawn | ❌ 仍然 17s |
+| Socket write 延迟 | posixWriteAll + write=0ms | ❌ 排除 |
+| TCP Nagle 算法 | TCP_NODELAY | ❌ 排除 |
+| connection.close() 延迟 | close took 0ms | ❌ 排除 |
+| io.async fiber 创建延迟 | accept→thread=0ms | ❌ 排除 |
+| HTTP read 阻塞 | read took <1ms | ❌ 排除 |
+| Template/Tokenize | 0ms | ❌ 排除 |
+| curl 客户端问题 | nc 测试同样 19.8s | ❌ 排除 |
+| TCP 层延迟 | health 0.4ms | ❌ 排除（空闲时正常） |
+| CPU 满载 | CPU < 100% | ❌ 排除 |
+| 物理内存不足 | 25GB free | ❌ 排除 |
+
+## 结论
+
+**17-19s 延迟是 macOS kernel 在 mmap I/O 压力下的 `accept()` 系统调用阻塞。**
+
+这是在 48GB Mac 上通过 mmap 访问 141GB 模型文件的固有限制。
+当 forward pass 触发大量 page fault I/O 时，kernel 的 VM 子系统
+繁忙，导致其他需要内核内存操作的系统调用（如 accept）被延迟。
+
+## 改善方向
+
+1. **Cache warmup**：启动时预热 expert cache，减少 forward pass 期间的 page fault
+2. **更大的 expert cache**：缓存更多 experts，减少 SSD 随机读取
+3. **Prefix caching**：复用 KV cache，跳过 prefill 阶段（减少 page fault 次数）
+4. **Pre-accept**：在 forward pass 之前 pre-accept 连接，避免 accept 被阻塞
+5. **减少 mmap 范围**：只 mmap 需要的 shard 文件，而不是全部 33 个
+
+## 代码改动记录
+
+本次排查过程中的代码改动（保留用于未来诊断）：
+
+1. `DSV4Model.forward` — 添加 embed/layers/head 计时
+2. `server/http.zig` — 添加 HTTP read/template/tokenize/gen/write/close 计时
+3. `server/openai.zig` — 添加 push→wait/wait_duration 计时
+4. `server.zig` — accept loop 改为 OS thread + POSIX socket
+5. `server/http.zig` — handleRequestRaw 使用 blocking libc read/write

@@ -255,7 +255,19 @@ fn handleRequestRaw(
     fd: c_int,
     server_config: ServerConfig,
 ) !void {
-    const libc = @cImport(@cInclude("unistd.h"));
+    const libc = @cImport({
+        @cInclude("unistd.h");
+        @cInclude("sys/socket.h");
+        @cInclude("netinet/tcp.h");
+        @cInclude("sys/time.h");
+    });
+
+    // Set TCP_NODELAY to disable Nagle's algorithm (flush immediately)
+    const one: c_int = 1;
+    _ = libc.setsockopt(fd, libc.IPPROTO_TCP, libc.TCP_NODELAY, &one, @sizeOf(c_int));
+    // Set read timeout (5s)
+    const tv = libc.struct_timeval{ .tv_sec = 5, .tv_usec = 0 };
+    _ = libc.setsockopt(fd, libc.SOL_SOCKET, libc.SO_RCVTIMEO, &tv, @sizeOf(@TypeOf(tv)));
 
     // Read HTTP request using blocking read
     var dyn_buf = DynamicBuffer.init(16 * 1024 * 1024);
@@ -308,8 +320,10 @@ fn handleRequestRaw(
                 return;
             }
 
+            const t_gen_start = std.c.mach_absolute_time();
             const response = try generateChatCompletion(allocator, state.io, state, body, server_config);
             defer allocator.free(response);
+            const t_gen_end = std.c.mach_absolute_time();
 
             var cl_buf: [64]u8 = undefined;
             const cl_line = std.fmt.bufPrint(&cl_buf, "{d}", .{response.len}) catch "0";
@@ -317,6 +331,11 @@ fn handleRequestRaw(
             posixWriteAll(fd, cl_line);
             posixWriteAll(fd, "\r\nConnection: close\r\n\r\n");
             posixWriteAll(fd, response);
+            const t_write_end = std.c.mach_absolute_time();
+            std.log.info("[RAW] gen={d}ms write={d}ms", .{
+                (t_gen_end - t_gen_start) / 1_000_000,
+                (t_write_end - t_gen_end) / 1_000_000,
+            });
         }
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
         const active = state.active_requests.load(.acquire);
@@ -367,13 +386,20 @@ pub fn handleConnectionThreadRaw(
     state: *ServerState,
     fd: c_int,
     config: ServerConfig,
+    accept_time: u64,
 ) void {
+    const thread_start = std.c.mach_absolute_time();
+    std.log.info("[HTTP] Thread started: accept→thread={d}ms", .{(thread_start - accept_time) / 1_000_000});
     const conn_start = std.c.mach_absolute_time();
     defer {
-        const conn_end = std.c.mach_absolute_time();
-        std.log.info("[HTTP] Connection lifetime: {d}ms", .{(conn_end - conn_start) / 1_000_000});
+        const before_close = std.c.mach_absolute_time();
         const libc = @cImport(@cInclude("unistd.h"));
         _ = libc.close(fd);
+        const after_close = std.c.mach_absolute_time();
+        std.log.info("[HTTP] Connection lifetime: {d}ms (close took {d}ms)", .{
+            (after_close - conn_start) / 1_000_000,
+            (after_close - before_close) / 1_000_000,
+        });
     }
     handleRequestRaw(allocator, state, fd, config) catch |err| {
         std.log.err("Request error: {}", .{err});
