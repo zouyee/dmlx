@@ -1,115 +1,130 @@
-# Socket Write Latency Analysis (2026-05-14)
+# HTTP Response Latency Analysis (2026-05-14)
 
 ## 问题
 
-Server 端推理只需 ~470ms（3 tokens），但 curl 端到端延迟 ~19s。
-差距 ~18.5s 不在 HTTP 读取、模板处理、tokenization、engine forward 中。
+Server 端推理只需 ~500ms（3 tokens），但 curl 端到端延迟 ~20-23s。
+
+## 测试方法
+
+```bash
+# 1. 构建 ReleaseFast
+zig build -Doptimize=ReleaseFast
+
+# 2. 启动 server
+./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit --port 18090 \
+  --smelt --smelt-strategy stream --smelt-experts 0.1 --smelt-cache 2048 \
+  --temperature 0 --max-tokens 5
+
+# 3. 等待 server ready
+curl -sf http://localhost:18090/health
+
+# 4. 测试（带 curl 计时）
+curl --max-time 120 -s -w "\ncurl_total: %{time_total}s starttransfer: %{time_starttransfer}s\n" \
+  http://localhost:18090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"default","messages":[{"role":"user","content":"hi"}],"max_tokens":3,"temperature":0}'
+```
 
 ## 排查过程
 
-### 1. 添加 Forward 计时
+### Round 1: 添加 Forward 计时
 
 在 `DSV4Model.forward` 中添加 `mach_absolute_time` 计时：
 
 ```
 [Forward] seq_len=5 total=178.1ms (embed=0.0ms layers=178.1ms head=0.0ms)
-[Forward] seq_len=1 total=132.3ms (embed=0.0ms layers=132.3ms head=0.0ms)
-[Forward] seq_len=1 total=128.8ms (embed=0.0ms layers=128.8ms head=0.0ms)
 ```
 
-结论：Forward 总计 ~439ms，全部在 layers 中（attention + MoE expert loading）。
+结论：Forward 总计 ~439ms（3 tokens），全部在 layers 中。
 
-### 2. 添加 HTTP 读取计时
+### Round 2: 添加 HTTP 各阶段计时
 
 ```
 [HTTP] Request received: 244 bytes (read took 1ms)
-```
-
-结论：HTTP 读取正常，1ms 完成。
-
-### 3. 添加 Template/Tokenize 计时
-
-```
 [HTTP] Template=0ms Tokenize=0ms prompt_len=5
+[HTTP] Request 1 submitted to queue
+[HTTP] Timing: push→wait_start=0ms, wait_duration=510ms
+[HTTP] Response: gen=510ms write=0ms total=510ms
+[HTTP] Connection lifetime: 510ms
 ```
 
-结论：模板和分词瞬间完成。
+结论：整个 `handleConnection` 函数只用了 510ms。
 
-### 4. 添加 waitForToken 计时
+### Round 3: 对比 curl 时间
 
-```
-[HTTP] Timing: push→wait_start=0ms, wait_duration=468ms
-[RequestLog] duration_ms=468.94 tokens_per_sec=6.40
-[Signal] waitForToken got id=0 waited 468ms
-```
+| 指标 | Server 端 | curl 端 |
+|------|-----------|---------|
+| HTTP read | 1ms | - |
+| Template + Tokenize | 0ms | - |
+| Engine forward | ~400ms | - |
+| waitForToken | 510ms | - |
+| Response write | 0ms | - |
+| **Connection lifetime** | **510ms** | - |
+| **curl total** | - | **21.27s** |
+| **差距** | | **~20.8s** |
 
-结论：从 queue push 到拿到所有 tokens 只需 468ms。
+### Round 4: 定位延迟位置
 
-### 5. 添加响应写入计时
+`Connection lifetime: 510ms` 证明从 `handleConnection` 函数入口到出口只有 510ms。
+但 curl 显示 21.27s。
 
-```
-[HTTP] Response: gen=468ms write=0ms total=468ms
-```
+**结论：20.8s 延迟在 `io.async(handleConnection, ...)` 被调度执行之前。**
 
-结论：`writeJsonResponse` 返回耗时 0ms。
-
-### 6. 最终定位
-
-| 阶段 | Server 端计时 | 说明 |
-|------|--------------|------|
-| HTTP read | 1ms | ✅ |
-| Template + Tokenize | 0ms | ✅ |
-| Queue push → wait start | 0ms | ✅ |
-| waitForToken (engine) | 468ms | ✅ |
-| writeJsonResponse | 0ms | ✅ |
-| **Server 总计** | **469ms** | |
-| **curl 总计** | **19.5s** | |
-| **差距** | **~19s** | ❌ |
+即：accept loop 调用 `io.async(handleConnection, ...)` 创建 fiber 后，
+该 fiber 要等待 ~20s 才被 Zig IO 调度器分配执行时间。
 
 ## 根因
 
-### Socket 非阻塞模式 + Zig IO 调度器延迟
+### Zig 0.16 Threaded IO Backend Fiber 调度延迟
 
-1. 连接 socket 在 accept 后被设为 `O_NONBLOCK`：
+1. Server 架构：
+   - 主线程：engine loop（`engineLoopRun`）— 处理 GPU forward pass
+   - Worker threads：HTTP handler fibers（通过 `io.async` 创建）
+
+2. Engine loop 空闲时的行为：
    ```zig
-   _ = fc.fcntl(connection.socket.handle, fc.F_SETFL, flags | fc.O_NONBLOCK);
+   // engine_loop.zig run() 循环
+   if (no_work) {
+       threadSleepMs(1);  // 主线程 sleep
+   }
    ```
 
-2. `writeJsonResponse` 使用 Zig IO writer：
+3. Accept loop 在 `io.async` fiber 中运行，接受连接后创建新 fiber：
    ```zig
-   var writer = stream.writer(io, &buf);
-   try writer.interface.writeAll(data);
-   try writer.interface.flush();
+   _ = io.async(handleConnection, .{...});
    ```
 
-3. Zig 的 `writer.interface.flush()` 在非阻塞 socket 上：
-   - 如果 kernel send buffer 满或 TCP 窗口受限，write 返回 EAGAIN
-   - Zig IO backend 将 fiber yield，等待 socket 可写
-   - Fiber 重新调度依赖 Zig Threaded IO backend 的 epoll/kqueue 循环
+4. **问题**：Zig Threaded IO backend 的 fiber 调度依赖事件循环。
+   当主线程在 `threadSleepMs(1)` 中 sleep 时，IO 事件循环不会被驱动，
+   新创建的 fiber 无法被及时调度到 worker thread 上执行。
 
-4. **关键问题**：当 engine loop 在主线程做 GPU forward pass 时，
-   Zig IO backend 的事件循环无法及时处理 socket 可写事件，
-   导致 HTTP worker fiber 被延迟调度。
+5. Fiber 最终被调度的触发条件可能是：
+   - 主线程 sleep 结束后的下一次事件循环迭代
+   - 或者某个 IO 事件（如 socket 可读）触发了调度器唤醒
+   - 实际延迟 ~20s 暗示调度器的唤醒机制存在严重问题
 
-### 为什么 `write=0ms` 但 curl 收到数据要 19s？
+### 排除的原因
 
-`writeJsonResponse` 中的 `flush()` 可能只是将数据放入了 Zig IO 的
-内部缓冲区，实际的 socket write 系统调用被延迟到 fiber 下次被调度时执行。
-或者 `flush()` 确实调用了 write syscall，但由于 O_NONBLOCK，
-只写入了部分数据，剩余数据需要等待 fiber 重新调度后继续写入。
-
-### 对比 HTTP 读取
-
-HTTP 读取使用 `std.posix.read`（直接系统调用）+ 手动 `io.sleep(1ms)` 轮询，
-绕过了 Zig IO writer。这就是为什么读取只需 1ms 而写入需要 19s。
+- ❌ HTTP 读取延迟（实测 1ms）
+- ❌ Template/Tokenize（实测 0ms）
+- ❌ Engine forward（实测 ~400ms）
+- ❌ Socket write 延迟（改用 posix write 后仍然 20s）
+- ❌ Connection close 延迟（改用 libc close 后仍然 20s）
+- ❌ TCP Nagle 算法（设置 TCP_NODELAY 后仍然 20s）
 
 ## 修复方案
 
-将 `streamWriteAll` 改为直接使用 `std.posix.write`（阻塞模式），
-与 HTTP 读取的 `std.posix.read` 方式保持一致。
+将 HTTP handler 从 `io.async` fiber 改为 `std.Thread.spawn` 独立 OS 线程。
+这样 HTTP handler 的调度不再依赖 Zig IO 事件循环，而是由 OS 内核直接调度。
 
-在写响应前临时切回阻塞模式，写完后恢复非阻塞模式（供下次读取使用）。
+```zig
+// Before (fiber-based, ~20s scheduling delay):
+_ = io.async(handleConnection, .{allocator, io, state, connection, config});
+
+// After (thread-based, immediate execution):
+_ = std.Thread.spawn(.{}, handleConnectionThread, .{allocator, state, connection, config}) catch continue;
+```
 
 ## 预期效果
 
-修复后 curl 端到端延迟应从 ~19s 降至 ~500ms（= engine 处理时间）。
+修复后 curl 端到端延迟应从 ~21s 降至 ~510ms（= server 处理时间）。

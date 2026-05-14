@@ -86,12 +86,18 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     installSignalHandlers();
     std.log.info("Signal handlers installed (SIGTERM, SIGINT)", .{});
 
-    // Start the accept loop in an async fiber (may run on a worker thread).
-    // The engine loop runs on the main thread so it shares the same MLX
-    // stream that was used during model loading. MLX 0.31.2+ makes streams
-    // thread-local; using the main thread avoids the worker-thread stream
-    // mismatch bug.
-    _ = io.async(acceptLoop, .{ allocator, io, &server_state, server_config });
+    // Start the accept loop in a dedicated OS thread.
+    // Previously used io.async (fiber), but Zig 0.16 Threaded IO backend has
+    // ~20s fiber scheduling delays when the main thread is busy with GPU ops.
+    // Using a real OS thread ensures accept() is responsive immediately.
+    // See docs/analysis/socket-write-latency.md for the full investigation.
+    const accept_thread = std.Thread.spawn(.{}, acceptLoopThread, .{
+        allocator, &server_state, server_config,
+    }) catch {
+        std.log.err("Failed to spawn accept loop thread", .{});
+        return error.ThreadSpawnFailed;
+    };
+    defer accept_thread.join();
 
     // Run the engine loop on the main thread (current fiber).
     engineLoopRun(&engine_loop);
@@ -118,6 +124,64 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     std.log.info("Shutdown complete.", .{});
 }
 
+fn acceptLoopThread(allocator: std.mem.Allocator, server_state: *ServerState, server_config: ServerConfig) void {
+    const posix_c = @cImport({
+        @cInclude("sys/socket.h");
+        @cInclude("netinet/in.h");
+        @cInclude("unistd.h");
+        @cInclude("arpa/inet.h");
+    });
+
+    // Create listening socket directly via POSIX
+    const listen_fd = posix_c.socket(posix_c.AF_INET, posix_c.SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+        std.log.err("Failed to create socket", .{});
+        return;
+    }
+    defer _ = posix_c.close(listen_fd);
+
+    // SO_REUSEADDR
+    const one: c_int = 1;
+    _ = posix_c.setsockopt(listen_fd, posix_c.SOL_SOCKET, posix_c.SO_REUSEADDR, &one, @sizeOf(c_int));
+
+    // Bind
+    var addr: posix_c.struct_sockaddr_in = std.mem.zeroes(posix_c.struct_sockaddr_in);
+    addr.sin_family = posix_c.AF_INET;
+    addr.sin_port = std.mem.nativeToBig(u16, server_config.port);
+    addr.sin_addr.s_addr = posix_c.INADDR_ANY;
+
+    if (posix_c.bind(listen_fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr))) < 0) {
+        std.log.err("Failed to bind to port {d}", .{server_config.port});
+        return;
+    }
+
+    if (posix_c.listen(listen_fd, 128) < 0) {
+        std.log.err("Failed to listen", .{});
+        return;
+    }
+
+    std.log.info("DMLX server listening on http://0.0.0.0:{d}", .{server_config.port});
+
+    while (!engine.isShutdownRequested()) {
+        var client_addr: posix_c.struct_sockaddr_in = std.mem.zeroes(posix_c.struct_sockaddr_in);
+        var addr_len: posix_c.socklen_t = @sizeOf(@TypeOf(client_addr));
+        const client_fd = posix_c.accept(listen_fd, @ptrCast(&client_addr), &addr_len);
+        if (client_fd < 0) {
+            if (engine.isShutdownRequested()) break;
+            continue;
+        }
+
+        // Wrap the raw fd for handleConnectionThread (uses raw fd directly)
+        const thread = std.Thread.spawn(.{}, http.handleConnectionThreadRaw, .{
+            allocator, server_state, client_fd, server_config,
+        }) catch {
+            _ = posix_c.close(client_fd);
+            continue;
+        };
+        thread.detach();
+    }
+}
+
 fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerState, server_config: ServerConfig) void {
     const address = std.Io.net.IpAddress.parseIp4("0.0.0.0", server_config.port) catch |err| {
         std.log.err("Failed to parse address: {}", .{err});
@@ -137,11 +201,20 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
             std.log.err("Failed to accept connection: {}", .{err});
             continue;
         };
-        // Set socket to non-blocking mode for async fiber I/O.
-        const fc = @cImport(@cInclude("fcntl.h"));
-        const flags = fc.fcntl(connection.socket.handle, fc.F_GETFL, @as(c_int, 0));
-        _ = fc.fcntl(connection.socket.handle, fc.F_SETFL, @as(c_int, flags | fc.O_NONBLOCK));
-        _ = io.async(http.handleConnection, .{ allocator, io, server_state, connection, server_config });
+        // Spawn a dedicated OS thread for each connection.
+        // Previously used io.async (fiber-based), but Zig 0.16 Threaded IO backend
+        // has ~20s fiber scheduling delays when the main thread is busy with GPU ops.
+        // OS threads are scheduled by the kernel independently, avoiding this issue.
+        // See docs/analysis/socket-write-latency.md for the full investigation.
+        const thread = std.Thread.spawn(.{}, http.handleConnectionThread, .{
+            allocator, server_state, connection, server_config,
+        }) catch |err| {
+            std.log.err("Failed to spawn connection thread: {}", .{err});
+            const libc = @cImport(@cInclude("unistd.h"));
+            _ = libc.close(connection.socket.handle);
+            continue;
+        };
+        thread.detach();
     }
 
     std.log.info("Accept loop stopped, no longer accepting new connections.", .{});
