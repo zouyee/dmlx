@@ -2730,8 +2730,12 @@ pub const DSV4Model = struct {
         var arena = ScopedArrayArena.init(self.allocator);
         defer arena.deinit();
 
+        const forward_start = std.c.mach_absolute_time();
+
         // Embedding lookup
         var hidden = try arena.track(try self.embed_tokens.forward(input_ids));
+
+        const embed_end = std.c.mach_absolute_time();
 
         // Expand to mHC format if enabled
         if (self.config.use_mhc) {
@@ -2739,12 +2743,16 @@ pub const DSV4Model = struct {
         }
 
         // Pass through layers (eval after each to allow memory paging)
+        var layer_total_ns: u64 = 0;
         for (self.layers, 0..) |*layer, i| {
+            const layer_start = std.c.mach_absolute_time();
             const cache = if (caches) |cache_arr| cache_arr[i] else null;
             hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
             // Eval after each layer to materialize results and free lazy weight references
             // This allows MLX to page weights in/out of memory for large models
             try hidden.eval();
+            const layer_end = std.c.mach_absolute_time();
+            layer_total_ns += layer_end - layer_start;
         }
 
         // Compress from mHC format before final norm using HyperHead
@@ -2763,6 +2771,16 @@ pub const DSV4Model = struct {
         // LM head: [B, S, dim] @ [dim, vocab] -> [B, S, vocab] — final output NOT tracked
         const lm_head_t = try arena.track(try ops.transpose(self.ctx, self.lm_head));
         const logits = try ops.matmul(self.ctx, final_hidden, lm_head_t);
+
+        const forward_end = std.c.mach_absolute_time();
+        const embed_ms = @as(f64, @floatFromInt(embed_end - forward_start)) / 1_000_000.0;
+        const layers_ms = @as(f64, @floatFromInt(layer_total_ns)) / 1_000_000.0;
+        const total_ms = @as(f64, @floatFromInt(forward_end - forward_start)) / 1_000_000.0;
+        const head_ms = total_ms - layers_ms - embed_ms;
+        const input_shape = input_ids.shape();
+        const seq_len: usize = @intCast(input_shape[1]);
+        std.log.info("[Forward] seq_len={d} total={d:.1}ms (embed={d:.1}ms layers={d:.1}ms head={d:.1}ms)", .{ seq_len, total_ms, embed_ms, layers_ms, head_ms });
+
         return logits;
     }
 

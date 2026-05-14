@@ -96,7 +96,9 @@ fn handleRequest(
 
     if (dyn_buf.len() == 0) return;
     const request = dyn_buf.items();
-    std.log.info("[HTTP] Request received: {d} bytes", .{dyn_buf.len()});
+    const read_end = std.Io.Timestamp.now(io, .awake);
+    const read_elapsed_ns = std.Io.Timestamp.durationTo(read_start, read_end).toNanoseconds();
+    std.log.info("[HTTP] Request received: {d} bytes (read took {d}ms)", .{ dyn_buf.len(), @divTrunc(read_elapsed_ns, 1_000_000) });
 
     const libc = @cImport(@cInclude("unistd.h"));
     const msg = "[HTTP] Request received\n";
@@ -163,9 +165,17 @@ fn handleRequest(
             if (parsed.value.stream orelse false) {
                 try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
             } else {
+                const t_gen_start = std.c.mach_absolute_time();
                 const response = try generateChatCompletion(allocator, io, state, body, server_config);
                 defer allocator.free(response);
+                const t_gen_end = std.c.mach_absolute_time();
                 try writeJsonResponse(connection, io, 200, response);
+                const t_write_end = std.c.mach_absolute_time();
+                std.log.info("[HTTP] Response: gen={d}ms write={d}ms total={d}ms", .{
+                    (t_gen_end - t_gen_start) / 1_000_000,
+                    (t_write_end - t_gen_end) / 1_000_000,
+                    (t_write_end - t_gen_start) / 1_000_000,
+                });
             }
         } else {
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
@@ -200,6 +210,7 @@ fn handleRequest(
 // ------------------------------------------------------------------
 
 pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) !void {
+    _ = io;
     var status_buf: [32]u8 = undefined;
     const status_text = switch (status) {
         200 => "OK",
@@ -213,12 +224,40 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
     var cl_buf: [64]u8 = undefined;
     const cl_line = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len});
 
-    try streamWriteAll(connection, io, status_line);
-    try streamWriteAll(connection, io, "Content-Type: application/json\r\n");
-    try streamWriteAll(connection, io, cl_line);
-    try streamWriteAll(connection, io, "Connection: close\r\n");
-    try streamWriteAll(connection, io, "\r\n");
-    try streamWriteAll(connection, io, body);
+    // Use direct posix write (blocking) to avoid Zig IO scheduler delays.
+    // The socket is O_NONBLOCK for async reads, but we temporarily switch to
+    // blocking mode for writes to ensure data is flushed immediately.
+    // See docs/analysis/socket-write-latency.md for the full investigation.
+    const fc = @cImport({
+        @cInclude("fcntl.h");
+        @cInclude("sys/socket.h");
+        @cInclude("netinet/tcp.h");
+    });
+    const fd = connection.socket.handle;
+    const flags = fc.fcntl(fd, fc.F_GETFL, @as(c_int, 0));
+    _ = fc.fcntl(fd, fc.F_SETFL, @as(c_int, flags & ~@as(c_int, fc.O_NONBLOCK))); // blocking
+    // Disable Nagle's algorithm to flush data immediately
+    const one: c_int = 1;
+    _ = fc.setsockopt(fd, fc.IPPROTO_TCP, fc.TCP_NODELAY, &one, @sizeOf(c_int));
+    defer _ = fc.fcntl(fd, fc.F_SETFL, @as(c_int, flags)); // restore
+
+    posixWriteAll(fd, status_line);
+    posixWriteAll(fd, "Content-Type: application/json\r\n");
+    posixWriteAll(fd, cl_line);
+    posixWriteAll(fd, "Connection: close\r\n");
+    posixWriteAll(fd, "\r\n");
+    posixWriteAll(fd, body);
+}
+
+fn posixWriteAll(fd: std.posix.fd_t, data: []const u8) void {
+    const libc = @cImport(@cInclude("unistd.h"));
+    var written: usize = 0;
+    while (written < data.len) {
+        const remaining = data[written..];
+        const n = libc.write(fd, remaining.ptr, remaining.len);
+        if (n <= 0) return;
+        written += @intCast(n);
+    }
 }
 
 pub fn streamWriteAll(stream: std.Io.net.Stream, io: std.Io, data: []const u8) !void {
@@ -237,7 +276,13 @@ pub fn handleConnection(
     connection: std.Io.net.Stream,
     config: ServerConfig,
 ) void {
-    defer connection.close(io);
+    defer {
+        // Use direct close syscall to avoid Zig IO scheduler delays.
+        // connection.close(io) goes through the IO backend which may be delayed
+        // when the main thread is busy with GPU operations.
+        const libc = @cImport(@cInclude("unistd.h"));
+        _ = libc.close(connection.socket.handle);
+    }
     handleRequest(allocator, io, state, connection, config) catch |err| {
         std.log.err("Request error: {}", .{err});
     };

@@ -40,6 +40,7 @@
 - [SMELT Expert Streaming](en/technical/smelt-flow.md) — Expert loading flow
 - [4-bit + SMELT](en/technical/4bit-smelt.md) — Quantization + partial loading
 - [TTFT Optimization](en/technical/ttft-optimization.md) — Model loading optimization
+- [Inference Speed Optimization](en/technical/inference-optimization.md) — Per-token latency reduction plan
 - [Auto-Detect Experts](en/technical/auto-detect-experts.md) — Partial expert detection
 
 ### 📊 DeepSeek V4 Fix History
@@ -50,6 +51,7 @@
 ### ⚙️ Technical
 - [Continuous Batching Design](en/technical/continuous-batching-design.md) — Scheduler + BatchBuilder + Paged KV cache architecture
 - [Benchmarks](en/technical/benchmarks.md) — Performance data
+- [Inference Speed Optimization](en/technical/inference-optimization.md) — Per-token latency reduction plan (82ms → 24ms)
 - [Project Roadmap](../ROADMAP.md) — Full project plan
 - [Stream Mode Status](en/technical/stream-mode-status.md)
 - [Debug: argmax16](en/troubleshooting/debug-argmax16.md)
@@ -87,6 +89,7 @@
 - [SMELT 专家流式加载](zh/technical/smelt-flow.md)
 - [4-bit + SMELT](zh/technical/4bit-smelt.md)
 - [TTFT 优化](zh/technical/ttft-optimization.md)
+- [推理速度优化](zh/technical/inference-optimization.md) — 逐 token 延迟优化方案
 - [自动检测专家](zh/technical/auto-detect-experts.md)
 
 ### 📊 DeepSeek V4 修复历史
@@ -97,6 +100,7 @@
 ### ⚙️ 技术文档
 - [Continuous Batching 设计](zh/technical/continuous-batching-design.md) — Scheduler + BatchBuilder + Paged KV cache 架构
 - [性能基准](zh/technical/benchmarks.md)
+- [推理速度优化](zh/technical/inference-optimization.md) — 逐 token 延迟优化方案（82ms → 24ms）
 - [项目路线图](../ROADMAP.md)
 - [流式模式状态](zh/technical/stream-mode-status.md)
 - [调试: argmax16](zh/troubleshooting/debug-argmax16.md)
