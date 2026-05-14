@@ -113,21 +113,12 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     }
 
     // 4. Apply chat template
-    const t_template_start = std.c.mach_absolute_time();
     const prompt_text = try state.chat_template.apply(messages.items, true);
     defer allocator.free(prompt_text);
-    const t_template_end = std.c.mach_absolute_time();
 
     // 5. Tokenize (template already includes special tokens)
     const prompt_tokens = try state.tokenizer_strategy.encode(prompt_text, false, allocator);
     defer allocator.free(prompt_tokens);
-    const t_tokenize_end = std.c.mach_absolute_time();
-
-    std.log.info("[HTTP] Template={d}ms Tokenize={d}ms prompt_len={d}", .{
-        (t_template_end - t_template_start) / 1_000_000,
-        (t_tokenize_end - t_template_end) / 1_000_000,
-        prompt_tokens.len,
-    });
 
     // 6. Submit request to engine queue and wait for completion.
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
@@ -161,7 +152,6 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     _ = state.active_requests.fetchAdd(1, .monotonic);
     defer _ = state.active_requests.fetchSub(1, .monotonic);
 
-    const t_push_start = std.c.mach_absolute_time();
     var node = engine.QueueNode.init(req_state);
     state.request_queue.push(&node);
     std.log.info("[HTTP] Request {d} submitted to queue", .{request_id});
@@ -170,7 +160,6 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     var all_text = std.ArrayList(u8).empty;
     defer all_text.deinit(allocator);
 
-    const t_wait_start = std.c.mach_absolute_time();
     while (true) {
         const event = req_state.completion.waitForToken(io) catch break;
         if (event) |e| {
@@ -183,11 +172,6 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
             break;
         }
     }
-    const t_wait_end = std.c.mach_absolute_time();
-    std.log.info("[HTTP] Timing: push→wait_start={d}ms, wait_duration={d}ms", .{
-        (t_wait_start - t_push_start) / 1_000_000,
-        (t_wait_end - t_wait_start) / 1_000_000,
-    });
 
     // Check if the engine signaled an error.
     if (req_state.completion.hasError(io)) {
