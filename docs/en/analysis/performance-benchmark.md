@@ -1,85 +1,96 @@
 ---
-date: 2026-05-09
-Commit: 538f930 (tuning)
-model: DeepSeek-V4-Flash-4bit (~40GB 4-bit, 33 shards)
+date: 2026-05-15
+Commit: 6d339e0 (main)
+model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
-mode: smelt + stream, ExpertCache 4GB, temperature=0
+mode: serve, smelt 0.1 + stream, ExpertCache 10240MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 1739s (perf 92s + e2e 1616s)
+total_time: 1050s (perf 681s + e2e 300s)
 ---
 
 # dmlx Performance Benchmark Report
 
 ---
 
-## 1. Token Generation Latency
+## 1. Token Generation Latency (Serve Mode)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 247.4 | 0 | 7920 |
-| 2 | 101.2 | 22 | 1795 |
-| 3 | 50.6 | 840 | 1176 |
-| 4 | 44.6 | 816 | 1182 |
-| 5 | 43.8 | 882 | 1134 |
-| 6 | 67.2 | 708 | 1266 |
-| 7 | 79.0 | 846 | 1134 |
-| 8 | 89.3 | 558 | 1344 |
-| 9 | 91.9 | 708 | 1242 |
-| 10 | 85.1 | 750 | 1230 |
+| 1 | 216.1 | 0 | 7920 |
+| 2 | 440.7 | 84 | 1740 |
+| 3 | 127.6 | 876 | 1146 |
+| 4 | 120.1 | 1002 | 1092 |
+| 5 | 114.8 | 1194 | 894 |
+| 6 | 126.6 | 1188 | 954 |
+| 7 | 146.1 | 1428 | 792 |
+| 8 | 134.8 | 870 | 1128 |
+| 9 | 134.9 | 1248 | 942 |
+| 10 | 144.7 | 1128 | 1014 |
+| 11 | 122.8 | 1068 | 1032 |
+| 12 | 132.1 | 1182 | 924 |
+| 13 | 129.7 | 1206 | 930 |
+| 14 | 121.0 | 1452 | 798 |
+| 15 | 126.7 | 924 | 1098 |
 
 **Summary**:
-- Prefill (token 1): **247.4ms**
-- Steady-state (token 3-10): **43.8-91.9ms**, avg 68.9ms
-- Throughput: **~14.5 tok/s**
+- Prefill (token 1): **216.1ms**
+- Steady-state (token 3+): **43.0-558.3ms**, avg 93.7ms
+- Throughput: **~10.7 tok/s**
+- Cache hit rate: **42.3%** (180084 hits / 245682 misses)
 
-### Comparison with Previous Version (dff154d → 538f930)
+### HTTP End-to-End Latency
 
-| Metric | Previous (dff154d) | Current (538f930) | Change |
-|--------|-------------------|-------------------|--------|
-| Prefill | 261.0ms | **247.4ms** | **+5%** |
-| Steady-state avg | 95.4ms | **68.9ms** | **+28%** |
-| Throughput | ~10.5 tok/s | **~14.5 tok/s** | **+38%** |
-| Perf phase (load+10tok) | 102s | **92s** | **+10%** |
-| E2E total | 1707s | **1616s** | **+5%** |
+| Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
+|------|--------|----------|-----------|-----------------|
+| 30-token | 30 | 175.58 | 175.58 | — |
+| 100-token | 100 | 457.57 | 457.57 | — |
 
-Note: Both runs use ReleaseFast with the fixed run_benchmark.sh (rebuild after zig build test).
+### Comparison with Previous Version (6d339e0 → 6d339e0)
+
+| Metric | Previous (6d339e0) | Current (6d339e0) | Change |
+|--------|-------------------------|-------------------|--------|
+| Prefill | 226.4ms | **216.1ms** | **+5%** |
+| Steady-state avg | 96.2ms | **93.7ms** | **+3%** |
+| Throughput | ~10.4 tok/s | **~10.7 tok/s** | **+3%** |
+| Perf phase | 690s | **681s** | **+1%** |
+
+Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
 ---
 
-## 2. 7-Prompt End-to-End Test
+## 2. Server Configuration & Resources
 
-```
-bash scripts/best_test.sh → 7 passed, 0 failed (1616s)
-```
+| Parameter | Value |
+|-----------|-------|
+| Mode | serve (HTTP API) |
+| SMELT strategy | stream |
+| SMELT experts | 0.1 (preloaded) |
+| Expert cache | 10240 MB |
+| Temperature | 0 (greedy) |
+| Startup time | 48s (incl. warmup) |
+| Server RSS | 15000 MB |
+| Port | 18090 |
+
+---
+
+## 3. 7-Prompt End-to-End Test (Serve Mode)
 
 | # | Result | Model Output (truncated) |
 |---|--------|--------------------------|
-| P1 | ✅ | . The user's query is "2+2=?". The assistant's response is "4". The user's query |
-| P2 | ✅ | . The capital of France is Paris. The capital of France is Paris. The capital of |
-| P3 | ✅ | .</think> The temperature at which water freezes is 0 degrees Celsius. This is a |
-| P4 | ✅ | , but the user's question is "Is the Earth round?" The answer is yes. The user's |
-| P5 | ✅ | . The user's query is "3*3=". This is a simple multiplication problem. The answe |
-| P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
-| P7 | ✅ | to user's query. The user's query is "What is capital of France?" The correct an |
+| P1 | ✅ | . The user's query is "2+2=?". The assistant's response is "4". |
+| P2 | ✅ | . The capital of France is Paris. |
+| P3 | ✅ | 0 degrees Celsius |
+| P4 | ✅ | yes |
+| P5 | ✅ | 9 |
+| P6 | ✅ | 5 |
+| P7 | ✅ | Paris |
 
-### Correctness Verification
-
-| # | Prompt | Previous (dff154d) | Current (538f930) |
-|---|--------|-------------------|-------------------|
-| P1 | 2+2= | ✅ | ✅ |
-| P2 | Capital of France | ✅ | ✅ |
-| P3 | Water freezes at | ✅ | ✅ |
-| P4 | Is Earth round? | ✅ | ✅ |
-| P5 | 3*3= | ✅ | ✅ |
-| P6 | 10-5= | ✅ | ✅ |
-| P7 | Capital of France? | ✅ | ✅ |
-
-**7/7 PASS, 0 FAIL, 0 SKIP**
+**7/7 PASS, 0 FAIL**
 
 ---
 
-## 3. Unit Tests
+## 4. Unit Tests
 
 ```
 zig build test → PASS (430+)
@@ -87,16 +98,19 @@ zig build test → PASS (430+)
 
 ---
 
-## 4. Key Performance Metrics
+## 5. Key Performance Metrics
 
-| Metric | Previous (dff154d) | Current (538f930) | Change |
-|--------|-------------------|-------------------|--------|
-| Perf phase (load+gen) | 102s | **92s** | **+10%** |
-| Prefill latency | 261.0ms | **247.4ms** | **+5%** |
-| Steady-state latency | 95.4ms | **68.9ms** | **+28%** |
-| Steady-state throughput | ~10.5 tok/s | **~14.5 tok/s** | **+38%** |
+| Metric | Previous (6d339e0) | Current (6d339e0) | Change |
+|--------|-------------------------|-------------------|--------|
+| Prefill latency | 226.4ms | **216.1ms** | **+5%** |
+| Steady-state ITL | 96.2ms | **93.7ms** | **+3%** |
+| Steady-state tok/s | ~10.4 | **~10.7** | **+3%** |
+| Cache hit rate | — | **42.3%** | — |
+| 100-token HTTP total | — | **457.57s** | — |
+| Server RSS | — | **15000 MB** | — |
+| Startup time | — | **48s** | — |
 | 7-Prompt pass rate | 7/7 | **7/7** | — |
-| ExpertCache | 4GB / ~40% hit | 4GB / ~40% hit | — |
 
-Note: Both runs use ReleaseFast. Perf phase includes model loading + 10 token generation.
-dff154d data measured on same machine, same day (bench-dff154d branch).
+---
+
+*Generated by `scripts/run_benchmark.sh` on 2026-05-15*

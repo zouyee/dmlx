@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Generate PERFORMANCE_BENCHMARK.md from perf + e2e data files.
+"""Generate performance-benchmark.md from serve-mode perf + e2e data.
+
 Usage: python3 _gen_report.py <perf_file> <e2e_file> <output_md>
 Reads BM_* env vars for metadata.
 
 The script reads the existing report at <output_md> to extract the previous
-benchmark data (commit, prefill, steady-state, throughput, perf_secs) and uses
-it as the "previous" comparison baseline in the new report.
+benchmark data (commit, prefill, steady-state, throughput) and uses it as
+the "previous" comparison baseline in the new report.
 """
 import sys, re, os
 
@@ -29,32 +30,26 @@ def parse_previous_report(path):
     except FileNotFoundError:
         return prev
 
-    # Extract commit from front-matter or header
     m = re.search(r'Commit: (\w+)', content)
     if m:
         prev["commit"] = m[1]
 
-    # Extract prefill: "Prefill (token 1): **273.9ms**"
     m = re.search(r'Prefill \(token 1\): \*\*([\d.]+)ms\*\*', content)
     if m:
         prev["prefill"] = float(m[1])
 
-    # Extract steady avg: "avg 56.6ms" or "平均 56.6ms"
     m = re.search(r'(?:avg|平均) ([\d.]+)ms', content)
     if m:
         prev["steady"] = float(m[1])
 
-    # Extract throughput: "Throughput: **~17.7 tok/s**" or "吞吐量: **~17.7 tok/s**"
     m = re.search(r'(?:Throughput|吞吐量): \*\*~([\d.]+) tok/s\*\*', content)
     if m:
         prev["tput"] = float(m[1])
 
-    # Extract perf_secs from front-matter: "perf XXs"
     m = re.search(r'perf (\d+)s', content)
     if m:
         prev["perf_secs"] = int(m[1])
 
-    # Extract e2e pass rate: "7/7 PASS"
     m = re.search(r'(\d+)/7 PASS', content)
     if m:
         prev["e2e"] = f"{m[1]}/7"
@@ -64,7 +59,7 @@ def parse_previous_report(path):
 
 prev = parse_previous_report(report_path)
 
-# --- Parse perf ---
+# --- Parse perf (Token step logs) ---
 steps = []
 for line in open(perf_file):
     m = re.search(r'step (\d+) complete: ([\d.]+)ms.*hits=(\d+) misses=(\d+)', line)
@@ -72,17 +67,38 @@ for line in open(perf_file):
         steps.append((int(m[1]), float(m[2]), int(m[3]), int(m[4])))
 
 prefill = steps[0][1] if steps else 0
-steady = [s[1] for s in steps[2:]]
+steady = [s[1] for s in steps[2:]]  # skip step 1 (prefill) and step 2 (cold)
 savg = sum(steady) / len(steady) if steady else 0
 smin = min(steady) if steady else 0
 smax = max(steady) if steady else 0
 tput = 1000 / savg if savg > 0 else 0
 
+total_hits = sum(s[2] for s in steps)
+total_misses = sum(s[3] for s in steps)
+hit_rate = total_hits / (total_hits + total_misses) * 100 if (total_hits + total_misses) > 0 else 0
+
 # --- Parse e2e ---
 e2e_raw = open(e2e_file).read()
-e2e_matches = list(re.finditer(r'(✅ PASSED|❌ FAILED)[^\n]*\n\s*Generated: ([^\n]*)', e2e_raw))
-e2e_pass = len([m for m in e2e_matches if "PASSED" in m[1]])
-e2e_fail = len(e2e_matches) - e2e_pass
+e2e_lines = [l.strip() for l in e2e_raw.strip().split('\n') if l.strip()]
+
+e2e_results = []
+i = 0
+while i < len(e2e_lines):
+    line = e2e_lines[i]
+    generated = ""
+    if i + 1 < len(e2e_lines) and e2e_lines[i+1].startswith("Generated:"):
+        generated = e2e_lines[i+1].replace("Generated:", "").strip()
+        i += 2
+    else:
+        i += 1
+    
+    if "PASSED" in line:
+        e2e_results.append(("✅", generated))
+    elif "FAILED" in line:
+        e2e_results.append(("❌", generated))
+
+e2e_pass = int(env.get("BM_E2E_PASS", sum(1 for r in e2e_results if r[0] == "✅")))
+e2e_fail = int(env.get("BM_E2E_FAIL", sum(1 for r in e2e_results if r[0] == "❌")))
 
 
 def delta(old, new, lower_better=True):
@@ -108,6 +124,16 @@ unit = env.get("BM_UNIT", "?")
 perf_secs = env.get("BM_PERF_SECS", "?")
 e2e_secs = env.get("BM_E2E_SECS", "?")
 total_secs = env.get("BM_TOTAL_SECS", "?")
+smelt_experts = env.get("BM_SMELT_EXPERTS", "0.1")
+cache_mb = env.get("BM_CACHE_MB", "10240")
+perf_ttfr = env.get("BM_PERF_TTFR", "?")
+perf_total = env.get("BM_PERF_TOTAL", "?")
+perf_tokens = env.get("BM_PERF_TOKENS", "30")
+long_ttfr = env.get("BM_LONG_TTFR", "?")
+long_total = env.get("BM_LONG_TOTAL", "?")
+long_tokens = env.get("BM_LONG_TOKENS", "100")
+server_rss = env.get("BM_SERVER_RSS", "?")
+startup_secs = env.get("BM_STARTUP_SECS", "?")
 
 # --- Previous baseline ---
 PREV_COMMIT = prev["commit"]
@@ -115,26 +141,25 @@ PREV_PREFILL = prev["prefill"]
 PREV_STEADY = prev["steady"]
 PREV_TPUT = prev["tput"]
 PREV_PERF_SECS = prev["perf_secs"]
-PREV_E2E = prev["e2e"]
 
-# Build per-prompt pass/fail list
-e2e_results = ['✅' if 'PASSED' in m[1] else '❌' for m in e2e_matches]
-while len(e2e_results) < 7:
-    e2e_results.append('—')
+# Build per-prompt result list
+result_icons = [r[0] for r in e2e_results]
+while len(result_icons) < 7:
+    result_icons.append('—')
 
 # --- Tables ---
-perf_rows = "\n".join(f"| {s[0]} | {s[1]} | {s[2]} | {s[3]} |" for s in steps)
+perf_rows = "\n".join(f"| {s[0]} | {s[1]:.1f} | {s[2]} | {s[3]} |" for s in steps[:15])
 e2e_rows = "\n".join(
-    f"| P{i+1} | {'✅' if 'PASSED' in m[1] else '❌'} | {m[2][:80].strip()} |"
-    for i, m in enumerate(e2e_matches)
+    f"| P{i+1} | {r[0]} | {r[1][:80]} |"
+    for i, r in enumerate(e2e_results)
 )
 
 report = f"""---
 date: {date}
 Commit: {commit} ({branch})
-model: DeepSeek-V4-Flash-4bit (~40GB 4-bit, 33 shards)
+model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: {hw}, {mem}
-mode: smelt + stream, ExpertCache 4GB, temperature=0
+mode: serve, smelt {smelt_experts} + stream, ExpertCache {cache_mb}MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
 total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
@@ -144,7 +169,7 @@ total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
 
 ---
 
-## 1. Token Generation Latency
+## 1. Token Generation Latency (Serve Mode)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
@@ -152,8 +177,16 @@ total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
 
 **Summary**:
 - Prefill (token 1): **{prefill:.1f}ms**
-- Steady-state (token 3-10): **{smin:.1f}-{smax:.1f}ms**, avg {savg:.1f}ms
+- Steady-state (token 3+): **{smin:.1f}-{smax:.1f}ms**, avg {savg:.1f}ms
 - Throughput: **~{tput:.1f} tok/s**
+- Cache hit rate: **{hit_rate:.1f}%** ({total_hits} hits / {total_misses} misses)
+
+### HTTP End-to-End Latency
+
+| Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
+|------|--------|----------|-----------|-----------------|
+| 30-token | {perf_tokens} | {perf_ttfr} | {perf_total} | — |
+| 100-token | {long_tokens} | {long_ttfr} | {long_total} | — |
 
 ### Comparison with Previous Version ({PREV_COMMIT} → {commit})
 
@@ -162,39 +195,38 @@ total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
 | Prefill | {PREV_PREFILL:.1f}ms | **{prefill:.1f}ms** | {delta(PREV_PREFILL, prefill)} |
 | Steady-state avg | {PREV_STEADY:.1f}ms | **{savg:.1f}ms** | {delta(PREV_STEADY, savg)} |
 | Throughput | ~{PREV_TPUT:.1f} tok/s | **~{tput:.1f} tok/s** | {delta(PREV_TPUT, tput, lower_better=False)} |
-| Perf phase (load+10tok) | {PREV_PERF_SECS}s | **{perf_secs}s** | {delta(PREV_PERF_SECS, perf_secs)} |
+| Perf phase | {PREV_PERF_SECS}s | **{perf_secs}s** | {delta(PREV_PERF_SECS, perf_secs)} |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
 ---
 
-## 2. 7-Prompt End-to-End Test
+## 2. Server Configuration & Resources
 
-```
-bash scripts/best_test.sh → {e2e_pass} passed, {e2e_fail} failed ({e2e_secs}s)
-```
+| Parameter | Value |
+|-----------|-------|
+| Mode | serve (HTTP API) |
+| SMELT strategy | stream |
+| SMELT experts | {smelt_experts} (preloaded) |
+| Expert cache | {cache_mb} MB |
+| Temperature | 0 (greedy) |
+| Startup time | {startup_secs}s (incl. warmup) |
+| Server RSS | {server_rss} MB |
+| Port | 18090 |
+
+---
+
+## 3. 7-Prompt End-to-End Test (Serve Mode)
 
 | # | Result | Model Output (truncated) |
 |---|--------|--------------------------|
 {e2e_rows}
 
-### Correctness Verification
-
-| # | Prompt | Previous ({PREV_COMMIT}) | Current ({commit}) |
-|---|--------|-------------------------|-------------------|
-| P1 | 2+2= | ✅ | {e2e_results[0]} |
-| P2 | Capital of France | ✅ | {e2e_results[1]} |
-| P3 | Water freezes at | ✅ | {e2e_results[2]} |
-| P4 | Is Earth round? | ✅ | {e2e_results[3]} |
-| P5 | 3*3= | ✅ | {e2e_results[4]} |
-| P6 | 10-5= | ✅ | {e2e_results[5]} |
-| P7 | Capital of France? | ✅ | {e2e_results[6]} |
-
-**{e2e_pass}/7 PASS, {e2e_fail} FAIL, 0 SKIP**
+**{e2e_pass}/7 PASS, {e2e_fail} FAIL**
 
 ---
 
-## 3. Unit Tests
+## 4. Unit Tests
 
 ```
 zig build test → {unit}
@@ -202,21 +234,25 @@ zig build test → {unit}
 
 ---
 
-## 4. Key Performance Metrics
+## 5. Key Performance Metrics
 
 | Metric | Previous ({PREV_COMMIT}) | Current ({commit}) | Change |
 |--------|-------------------------|-------------------|--------|
-| Perf phase (load+gen) | {PREV_PERF_SECS}s | **{perf_secs}s** | {delta(PREV_PERF_SECS, perf_secs)} |
 | Prefill latency | {PREV_PREFILL:.1f}ms | **{prefill:.1f}ms** | {delta(PREV_PREFILL, prefill)} |
-| Steady-state latency | {PREV_STEADY:.1f}ms | **{savg:.1f}ms** | {delta(PREV_STEADY, savg)} |
-| Steady-state throughput | ~{PREV_TPUT:.1f} tok/s | **~{tput:.1f} tok/s** | {delta(PREV_TPUT, tput, lower_better=False)} |
-| 7-Prompt pass rate | {PREV_E2E} | **{e2e_pass}/7** | — |
-| ExpertCache | 4GB / ~40% hit | 4GB / ~40% hit | — |
+| Steady-state ITL | {PREV_STEADY:.1f}ms | **{savg:.1f}ms** | {delta(PREV_STEADY, savg)} |
+| Steady-state tok/s | ~{PREV_TPUT:.1f} | **~{tput:.1f}** | {delta(PREV_TPUT, tput, lower_better=False)} |
+| Cache hit rate | — | **{hit_rate:.1f}%** | — |
+| 100-token HTTP total | — | **{long_total}s** | — |
+| Server RSS | — | **{server_rss} MB** | — |
+| Startup time | — | **{startup_secs}s** | — |
+| 7-Prompt pass rate | 7/7 | **{e2e_pass}/7** | — |
 
-Note: Both runs use ReleaseFast. Perf phase includes model loading + 10 token generation.
+---
+
+*Generated by `scripts/run_benchmark.sh` on {date}*
 """
 
 with open(report_path, "w") as f:
     f.write(report)
 
-print(f"Prefill: {prefill:.1f}ms | Steady: {savg:.1f}ms | {tput:.1f} tok/s | E2E: {e2e_pass}/7")
+print(f"Prefill: {prefill:.1f}ms | Steady: {savg:.1f}ms | {tput:.1f} tok/s | Cache: {hit_rate:.1f}% | E2E: {e2e_pass}/7")
