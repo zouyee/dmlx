@@ -461,8 +461,8 @@ body {
       <div class="best-badge">
         <div class="best-badge-icon">🏆</div>
         <div class="best-badge-label">Best (TTFT)</div>
-        <div class="best-badge-value">247.4 ms</div>
-        <div class="best-badge-detail">+65% vs initial</div>
+        <div class="best-badge-value">216.1 ms</div>
+        <div class="best-badge-detail">+70% vs initial</div>
       </div>
       <div class="bar-chart">
         <div class="bar-group">
@@ -484,20 +484,20 @@ body {
           </div>
         </div>
         <div class="bar-group">
-          <div class="bar-value">261.0</div>
-          <div class="bar-variance">-64%</div>
-          <div class="bar bar-purple" style="height: 36%;"></div>
+          <div class="bar-value">247.4</div>
+          <div class="bar-variance">-65%</div>
+          <div class="bar bar-purple" style="height: 35%;"></div>
           <div class="bar-label">
-            <div class="bar-label-main">dff154d</div>
-            <div class="bar-tag tag-purple">Perf Fix</div>
+            <div class="bar-label-main">538f930</div>
+            <div class="bar-tag tag-purple">Tuning</div>
           </div>
         </div>
         <div class="bar-group">
-          <div class="bar-value" style="color: #4ade80;">247.4</div>
-          <div class="bar-variance">-65%</div>
-          <div class="bar bar-green" style="height: 35%;"></div>
+          <div class="bar-value" style="color: #4ade80;">216.1</div>
+          <div class="bar-variance">-70%</div>
+          <div class="bar bar-green" style="height: 30%;"></div>
           <div class="bar-label">
-            <div class="bar-label-main">538f930</div>
+            <div class="bar-label-main">8c6c5c6</div>
             <div class="bar-tag tag-green">Latest</div>
           </div>
         </div>
@@ -514,8 +514,8 @@ body {
       <div class="best-badge">
         <div class="best-badge-icon">⭐</div>
         <div class="best-badge-label">Best (TG)</div>
-        <div class="best-badge-value">14.5 t/s</div>
-        <div class="best-badge-detail">SMELT 10%</div>
+        <div class="best-badge-value">9.1 t/s</div>
+        <div class="best-badge-detail">Serve mode</div>
       </div>
       <div class="bar-chart">
         <div class="bar-group">
@@ -528,15 +528,6 @@ body {
           </div>
         </div>
         <div class="bar-group">
-          <div class="bar-value">9.4</div>
-          <div class="bar-variance">+17%</div>
-          <div class="bar bar-purple" style="height: 65%;"></div>
-          <div class="bar-label">
-            <div class="bar-label-main">8ced50c</div>
-            <div class="bar-tag tag-purple">TTFT Opt</div>
-          </div>
-        </div>
-        <div class="bar-group">
           <div class="bar-value">10.5</div>
           <div class="bar-variance">+31%</div>
           <div class="bar bar-purple" style="height: 72%;"></div>
@@ -546,12 +537,21 @@ body {
           </div>
         </div>
         <div class="bar-group">
-          <div class="bar-value" style="color: #4ade80;">14.5</div>
+          <div class="bar-value">14.5</div>
           <div class="bar-variance">+81%</div>
-          <div class="bar bar-green" style="height: 100%;"></div>
+          <div class="bar bar-purple" style="height: 100%;"></div>
           <div class="bar-label">
             <div class="bar-label-main">538f930</div>
-            <div class="bar-tag tag-green">Latest</div>
+            <div class="bar-tag tag-purple">Chat mode</div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-value" style="color: #4ade80;">9.1</div>
+          <div class="bar-variance">serve</div>
+          <div class="bar bar-green" style="height: 63%;"></div>
+          <div class="bar-label">
+            <div class="bar-label-main">8c6c5c6</div>
+            <div class="bar-tag tag-green">Serve</div>
           </div>
         </div>
       </div>
@@ -587,8 +587,8 @@ body {
     <div class="takeaway-box">
       <div class="takeaway-title">Key Takeaways</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> 284B MoE (13B active) on 48GB Mac — mlx-lm: OOM</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> ~14.5 tok/s with only ~6GB active weights (SMELT 10%)</div>
-      <div class="takeaway-item"><span class="takeaway-check">✔</span> 247ms TTFT — 65% faster than initial version</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> ~9.1 tok/s serve mode with 10GB expert cache (SMELT 10%)</div>
+      <div class="takeaway-item"><span class="takeaway-check">✔</span> 216ms TTFT — 70% faster than initial version</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> 128K+ context via Paged + Tiered KV (RAM+SSD)</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> Single static binary (~10MB), zero GC, sub-ms latency</div>
       <div class="takeaway-item"><span class="takeaway-check">✔</span> 7/7 correctness on end-to-end prompt validation</div>

@@ -56,6 +56,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Serve-mode benchmark pipeline** (`scripts/run_benchmark.sh`)
+  - Full HTTP API testing (30-token + 100-token generation)
+  - Automatic report generation with delta comparison vs previous commit
+  - Metrics: prefill, ITL, tok/s, cache hit rate, HTTP latency, RSS, startup time
+  - 7-prompt correctness validation via serve API
+
+- **kqueue-based accept loop** (`src/server.zig`)
+  - Non-blocking connection accept to mitigate macOS VM pressure delays
+  - Fallback to blocking accept if kqueue unavailable
+
+- **Expert cache warmup at startup** (`src/engine/engine_loop.zig`, `src/server.zig`)
+  - Run 5 diverse prompts before accepting connections
+  - Pre-populates cache with common expert routing paths
+  - Reduces first-request cache misses by ~85% (18,630 → 2,709)
+
+### Changed
+- **Expert cache default: 4GB → 10GB** (`src/models/expert_cache.zig`)
+  - Safe on 48GB Mac (total RSS ~15GB)
+  - Improves cache hit rate for longer sessions
+
+### Performance
+- **Prefill**: 247ms → 216ms (+12%)
+- **Serve-mode tok/s**: 7.1 (cold) → 9.1 (warm cache)
+- **100-token server-side**: 10.98s
+- **Cache hit rate**: 42.3% (10GB cache, stream mode)
+- **Startup time**: 48s (including warmup)
+- **7/7 correctness**: All prompts pass in serve mode
+
 ### Performance
 - **44% end-to-end speedup**: 7-prompt test suite reduced from 2400s to 1340s
 - Remove hot-path Layer forward debug prints (86 write syscalls/token)
