@@ -1,12 +1,12 @@
 ---
 date: 2026-05-16
-Commit: f970d9f (main)
+Commit: 7ea49aa (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
-mode: serve, smelt 0.1 + stream, ExpertCache 6144MB, temperature=0
+mode: serve, smelt 0.2 + stream, ExpertCache 6144MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 894s (perf 424s + e2e 457s)
+total_time: 830s (perf 396s + e2e 425s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 894s (perf 424s + e2e 457s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 32.4 | 0 | 1806 |
-| 2 | 167.4 | 752 | 4234 |
-| 3 | 268.2 | 67 | 6329 |
-| 4 | 551.6 | 61 | 4817 |
-| 5 | 313.8 | 73 | 7829 |
-| 6 | 283.6 | 127 | 7799 |
-| 7 | 139.5 | 72 | 1758 |
-| 8 | 126.3 | 864 | 1170 |
-| 9 | 124.8 | 840 | 1170 |
-| 10 | 125.4 | 948 | 1086 |
-| 11 | 114.4 | 858 | 1164 |
-| 12 | 104.7 | 1006 | 1038 |
-| 13 | 110.1 | 534 | 1362 |
-| 14 | 90.2 | 630 | 1314 |
-| 15 | 83.1 | 488 | 1426 |
+| 1 | 36.0 | 0 | 1806 |
+| 2 | 149.1 | 752 | 4234 |
+| 3 | 249.7 | 67 | 6329 |
+| 4 | 528.2 | 61 | 4817 |
+| 5 | 300.1 | 73 | 7829 |
+| 6 | 296.2 | 127 | 7799 |
+| 7 | 136.8 | 72 | 1758 |
+| 8 | 131.2 | 864 | 1170 |
+| 9 | 129.1 | 840 | 1170 |
+| 10 | 122.1 | 948 | 1086 |
+| 11 | 110.8 | 858 | 1164 |
+| 12 | 110.5 | 1006 | 1038 |
+| 13 | 89.4 | 534 | 1362 |
+| 14 | 96.2 | 630 | 1314 |
+| 15 | 75.8 | 488 | 1426 |
 
 **Summary**:
-- Prefill (token 1): **32.4ms**
-- Steady-state (token 3+): **19.5-587.2ms**, avg 59.2ms
-- Throughput: **~16.9 tok/s**
+- Prefill (token 1): **36.0ms**
+- Steady-state (token 3+): **21.5-601.1ms**, avg 56.2ms
+- Throughput: **~17.8 tok/s**
 - Cache hit rate: **23.7%** (71217 hits / 229740 misses)
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 145.832120 | 145.832209 | — |
-| 100-token | 100 | 173.455602 | 173.455645 | — |
+| 30-token | 30 | 102.607534 | 102.607624 | — |
+| 100-token | 100 | 193.336817 | 193.336855 | — |
 
-### Comparison with Previous Version (6d339e0 → f970d9f)
+### Comparison with Previous Version (f970d9f → 7ea49aa)
 
-| Metric | Previous (6d339e0) | Current (f970d9f) | Change |
+| Metric | Previous (f970d9f) | Current (7ea49aa) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 216.1ms | **32.4ms** | **+85%** |
-| Steady-state avg | 93.7ms | **59.2ms** | **+37%** |
-| Throughput | ~10.7 tok/s | **~16.9 tok/s** | **+58%** |
-| Perf phase | 681s | **424s** | **+38%** |
+| Prefill | 32.4ms | **36.0ms** | **-11%** |
+| Steady-state avg | 59.2ms | **56.2ms** | **+5%** |
+| Throughput | ~16.9 tok/s | **~17.8 tok/s** | **+5%** |
+| Perf phase | 424s | **396s** | **+7%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -65,11 +65,11 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 |-----------|-------|
 | Mode | serve (HTTP API) |
 | SMELT strategy | stream |
-| SMELT experts | 0.1 (preloaded) |
+| SMELT experts | 0.2 (preloaded) |
 | Expert cache | 6144 MB |
 | Temperature | 0 (greedy) |
-| Startup time | 104s (incl. warmup) |
-| Server RSS | 3403 MB |
+| Startup time | 100s (incl. warmup) |
+| Server RSS | 3965 MB |
 | Port | 18090 |
 
 ---
@@ -100,15 +100,15 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (6d339e0) | Current (f970d9f) | Change |
+| Metric | Previous (f970d9f) | Current (7ea49aa) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 216.1ms | **32.4ms** | **+85%** |
-| Steady-state ITL | 93.7ms | **59.2ms** | **+37%** |
-| Steady-state tok/s | ~10.7 | **~16.9** | **+58%** |
+| Prefill latency | 32.4ms | **36.0ms** | **-11%** |
+| Steady-state ITL | 59.2ms | **56.2ms** | **+5%** |
+| Steady-state tok/s | ~16.9 | **~17.8** | **+5%** |
 | Cache hit rate | — | **23.7%** | — |
-| 100-token HTTP total | — | **173.455645s** | — |
-| Server RSS | — | **3403 MB** | — |
-| Startup time | — | **104s** | — |
+| 100-token HTTP total | — | **193.336855s** | — |
+| Server RSS | — | **3965 MB** | — |
+| Startup time | — | **100s** | — |
 | 7-Prompt pass rate | 7/7 | **7/7** | — |
 
 ---

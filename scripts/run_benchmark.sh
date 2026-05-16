@@ -15,7 +15,7 @@
 set -uo pipefail
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-SMELT_EXPERTS="${2:-0.1}"
+SMELT_EXPERTS="${2:-0.2}"
 CACHE_MB="${3:-6144}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"

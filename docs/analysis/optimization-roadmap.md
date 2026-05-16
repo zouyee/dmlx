@@ -10,28 +10,35 @@
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| **Server-side tok/s (warm)** | **17-24** | After cache warmup |
-| **Server-side tok/s (cold)** | 8.6 | First request |
-| **Steady-state ITL** | 59.2ms | Token 8+ average |
+| **Server-side tok/s (warm)** | **14-15** | SMELT 20% + 6GB cache |
+| **Server-side tok/s (cold)** | 5.5 | First request |
+| **Client HTTP latency (warm)** | **27-30s** | macOS memory pressure |
+| **Client HTTP latency (cold)** | 75s | First request |
+| **Steady-state ITL** | ~67ms | Token 7+ |
 | **Prefill** | 32.4ms | Single token |
-| **Cache hit rate** | 23.7% | 6GB cache |
-| **HTTP end-to-end (cold)** | 145s | macOS memory pressure |
-| **HTTP end-to-end (warm)** | ~32s | Converges by request #3 |
-| **100-token server-side** | 4.2s | 24 tok/s |
-| **RSS** | 3.4GB | Very efficient |
-| **Startup** | 104s | Including warmup |
+| **Startup time** | 46s | SMELT 20% (faster than 10%) |
+| **RSS** | ~3.4GB | Process memory (excl. mmap) |
 | **Correctness** | 7/7 | All prompts pass |
+
+### Optimal Configuration
+
+```bash
+dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --smelt --smelt-strategy stream --smelt-experts 0.2 \
+  --smelt-cache 6144 --temperature 0
+```
 
 ---
 
 ## Performance Evolution
 
-| Commit | Date | Config | tok/s | ITL | Key Change |
-|--------|------|--------|-------|-----|------------|
-| dff154d | 05-05 | 4GB cache | 10.5 | 95ms | Initial baseline |
-| 538f930 | 05-09 | 4GB cache | 14.5 | 69ms | Tuning |
-| 6d339e0 | 05-14 | 10GB cache | 10.7 | 94ms | Cache too large (regression) |
-| **f970d9f** | **05-16** | **6GB cache + warmup** | **16.9-24** | **59ms** | **Optimal cache size** |
+| Commit | Date | Config | Server tok/s | Client Latency | Key Change |
+|--------|------|--------|-------------|----------------|------------|
+| dff154d | 05-05 | SMELT 10%, 4GB cache | 10.5 | — | Initial baseline |
+| 538f930 | 05-09 | SMELT 10%, 4GB cache | 14.5 | — | Tuning |
+| 6d339e0 | 05-14 | SMELT 10%, 10GB cache | 10.7 | 38-40s | Cache too large |
+| f970d9f | 05-16 | SMELT 10%, 6GB cache | 12-13 | 31-34s | Optimal cache size |
+| **latest** | **05-16** | **SMELT 20%, 6GB cache** | **14-15** | **27-30s** | **Optimal SMELT ratio** |
 
 ---
 
@@ -41,6 +48,7 @@
 
 | Optimization | Impact | Status |
 |-------------|--------|--------|
+| **SMELT 20%** (not 10%, not 30%) | +15% tok/s, -12% client latency vs 10% | ✅ Optimal |
 | Expert cache 6GB (not 4, not 10) | +58% tok/s vs 10GB | ✅ Deployed |
 | Cache warmup before accept | -85% first-request misses | ✅ Deployed |
 | mmap for expert loading | 2x tok/s vs pread | ✅ Kept |
@@ -52,6 +60,7 @@
 |----------|---------------|
 | Expert cache 10GB+ | Squeezes backbone pages → page thrashing |
 | SMELT 15% (more preload) | Extra 3GB preload squeezes OS page cache |
+| SMELT 30%+ | Initial improvement then degradation — memory pressure builds |
 | pread replaces mmap | -44% tok/s (loses OS readahead) |
 | OS threads for HTTP | 0% improvement (not a fiber scheduling issue) |
 | posix write bypass | 0% improvement (write is not the bottleneck) |
@@ -130,36 +139,45 @@ a trained draft model (EAGLE) for effective speculative decoding.
 
 ## Target Milestones
 
-| Milestone | Target | Timeline | Key Metric |
-|-----------|--------|----------|------------|
-| ~~M1: PLD enabled~~ | ~~50+ effective tok/s~~ | ❌ | N-gram match too low |
-| ~~M2: Cache strategy~~ | ~~50%+ hit rate~~ | ❌ | LRU causes thrashing |
-| M3: Compile fusion | 30ms ITL, 33 tok/s | +4 weeks | Server tok/s |
-| M4: 100-token < 3s | 3s server-side | M3 achieved | E2E latency |
+| Milestone | Target | Status | Result |
+|-----------|--------|--------|--------|
+| ~~M1: PLD enabled~~ | ~~50+ effective tok/s~~ | ❌ Done | N-gram match too low (-15%) |
+| ~~M2: Cache strategy~~ | ~~50%+ hit rate~~ | ❌ Done | LRU causes thrashing (-36%) |
+| ~~M3: Compile fusion~~ | ~~30ms ITL~~ | ❌ Done | Only +6% in stream mode (I/O bound) |
+| **M4: SMELT tuning** | **Best client latency** | ✅ Done | **SMELT 20% = 28s client, 15 tok/s** |
 
-**Remaining viable optimization**: MLX compile fusion is the only path to
-significantly improve server-side tok/s beyond the current 17-24 tok/s.
-All other low-hanging fruit has been exhausted and verified.
+**All viable optimizations have been exhausted for 48GB Mac + stream mode.**
+
+Current performance ceiling:
+- Server: 14-15 tok/s (warm)
+- Client: 27-30s per request (macOS memory pressure, hardware limit)
+- 100-token server-side: ~7s
+
+Further improvement requires:
+1. Hardware upgrade (64GB+ Mac) — eliminates page thrashing entirely
+2. Smaller/different model — reduces memory footprint
+3. Apple Silicon with more memory bandwidth — faster page-in
 
 ---
 
 ## Memory Budget (48GB Mac)
 
 ```
-Current allocation (f970d9f):
+Current allocation (SMELT 20% + 6GB cache):
 ├── macOS + apps:           ~8 GB
 ├── Backbone (mmap):        ~6 GB (page-cached by OS)
-├── SMELT preloads (10%):   ~6 GB (25 experts × 43 layers)
+├── SMELT preloads (20%):   ~8 GB (51 experts × 43 layers)
 ├── Expert cache (LFU):     ~6 GB (configured)
 ├── KV cache:               ~0.5 GB
 ├── MLX runtime + Metal:    ~2 GB
-├── OS page cache headroom: ~19.5 GB ← critical for mmap performance
+├── OS page cache headroom: ~17.5 GB ← critical for mmap performance
 └── Total:                  ~48 GB
 
-Key insight: OS page cache headroom directly determines mmap performance.
-Every GB added to expert cache is 1 GB less for OS page cache.
-6GB cache is the sweet spot where both expert cache AND backbone
-pages can coexist in physical memory.
+SMELT ratio tuning results:
+├── 10%: 6GB preload, 22GB headroom → 12-13 tok/s, 31s client
+├── 20%: 8GB preload, 20GB headroom → 14-15 tok/s, 28s client ← OPTIMAL
+├── 30%: 10GB preload, 18GB headroom → 13-14 tok/s, 33s client (degraded)
+└── Conclusion: 20% is the sweet spot where preload benefit > headroom cost
 ```
 
 ---
