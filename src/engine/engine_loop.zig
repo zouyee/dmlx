@@ -1224,7 +1224,7 @@ pub const EngineLoop = struct {
     /// With 5 warmup prompts × 6 experts/layer × 43 layers = ~1290 unique
     /// expert slots cached (out of 256 × 43 = 11008 total). This covers
     /// the most common routing paths for typical user queries.
-    fn warmupExpertCache(self: *EngineLoop) void {
+    pub fn warmupExpertCache(self: *EngineLoop) void {
         if (self.dsv4_model == null) return; // Only needed for DSV4 with smelt
 
         std.log.info("[Engine] Warming up expert cache (multi-prompt prefetch)...", .{});

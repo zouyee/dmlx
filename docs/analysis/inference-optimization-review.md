@@ -262,14 +262,31 @@ PERF_PLAN 的 P4（expert deduplication）已在解决这个问题（12390 → 6
 
 ## 7. 已验证无效的方案（Do Not Retry）
 
-来源：PERF_PLAN.md 实测结论
+来源：PERF_PLAN.md 实测结论 + 2026-05-16 排查
 
 | 方案 | 原因 |
 |------|------|
 | P1.3 零拷贝 mmap Array | memcpy 不是瓶颈，safetensors offset 非 page-aligned，实际命中率极低 |
-| Warmup with dummy prompts | MoE routing 是 input-dependent，无法预测哪些 expert 会被选中 |
+| P1.1 eval skip (stream 模式) | stream 模式依赖 eval() 触发 mmap page-in，跳过导致 ITL 退化 40% |
 | 增大 cache 到 20GB | 触发系统 swap，反而更慢 |
 | Preload 模式 (全量加载) | 48GB 内存不够，OOM |
+| OS thread 替代 fiber | 实测证明 fiber 调度不是瓶颈，HTTP 延迟不变 |
+| posix write 替代 Zig IO write | 实测证明 response write 不是瓶颈 |
+| pread 完全替代 mmap | HTTP 延迟 -68% 但 tok/s -44%，得不偿失 |
+| Warmup with dummy prompts (旧版) | 旧版无效，但新版（pread + cache warmup）有效 |
+
+### 2026-05-16 新增发现
+
+**38s HTTP 延迟的真正根因**：不是 accept 阻塞、不是 fiber 调度、不是 write 延迟。
+是 **macOS 内存管理在 48GB Mac 上运行 141GB 模型的物理限制**：
+- warmup 加载 expert weights 后，backbone weights 被 OS 换出
+- 第一个请求需要重新 page-in 6GB backbone
+- SSD 随机读取 6GB 需要 ~30-40s
+
+**这是硬件限制，不可通过代码优化消除。** 唯一的解决方案是：
+1. 更大内存的 Mac (64GB+)
+2. 更小的模型
+3. MLX compile fusion 减少 forward pass 时间（间接减少 I/O 窗口）
 
 ---
 

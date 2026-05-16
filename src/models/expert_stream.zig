@@ -210,27 +210,15 @@ pub const ExpertStreamProvider = struct {
                 try pool.openAll(index);
                 provider.fd_pool = pool;
 
-                // Initialize MmapPool for zero-copy memory-mapped access
+                // Initialize MmapPool for zero-copy memory-mapped access.
+                // mmap provides OS-level readahead which is critical for tok/s performance.
+                // Trade-off: causes VM pressure that adds ~38s HTTP latency on 48GB Mac,
+                // but server-side tok/s is 2x better than pread (9.1 vs 4.9).
+                // See: docs/analysis/pread-expert-loading.md for full investigation.
                 const mmap = try allocator.create(safetensors_reader.MmapPool);
                 mmap.* = safetensors_reader.MmapPool.init(allocator);
                 try mmap.mmapAll(index);
                 provider.mmap_pool = mmap;
-
-                // Override madvise for sequential expert access pattern
-                // MoE routing often selects adjacent experts in the fused tensor,
-                // so POSIX_MADV_NORMAL enables OS readahead for better SSD throughput
-                {
-                    const posix_c = @cImport(@cInclude("sys/mman.h"));
-                    var map_it = mmap.mappings.iterator();
-                    while (map_it.next()) |map_entry| {
-                        const region = map_entry.value_ptr.*;
-                        _ = posix_c.posix_madvise(
-                            @ptrCast(@constCast(region.ptr)),
-                            region.len,
-                            posix_c.POSIX_MADV_NORMAL,
-                        );
-                    }
-                }
 
                 // Initialize PartialTensorReader for reading only selected expert rows
                 const reader = try allocator.create(safetensors_reader.PartialTensorReader);

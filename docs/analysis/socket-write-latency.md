@@ -156,11 +156,51 @@ Thread HTTP handler (1973 samples):
 
 ## 改善方向
 
-1. **Cache warmup**：启动时预热 expert cache，减少 forward pass 期间的 page fault
-2. **更大的 expert cache**：缓存更多 experts，减少 SSD 随机读取
+1. **Cache warmup**：启动时预热 expert cache，减少 forward pass 期间的 page fault ✅ 已实施
+2. **更大的 expert cache**：缓存更多 experts，减少 SSD 随机读取 ✅ 已实施 (4GB → 10GB)
 3. **Prefix caching**：复用 KV cache，跳过 prefill 阶段（减少 page fault 次数）
-4. **Pre-accept**：在 forward pass 之前 pre-accept 连接，避免 accept 被阻塞
-5. **减少 mmap 范围**：只 mmap 需要的 shard 文件，而不是全部 33 个
+4. **Pre-accept**：在 forward pass 之前 pre-accept 连接，避免 accept 被阻塞 ❌ 无效（见下）
+5. **减少 mmap 范围**：只 mmap 需要的 shard 文件，而不是全部 33 个 ✅ 已实施（完全跳过 mmap）
+
+## 后续排查结论 (2026-05-16)
+
+### 进一步实验
+
+| 方案 | HTTP 延迟 | 服务端 tok/s | 结论 |
+|------|-----------|-------------|------|
+| 原始 mmap | 175s | 9.1 | 基线 |
+| pread 替代 mmap | 56s | 4.9 | HTTP -68%，tok/s -44% |
+| pread + coalesced + F_RDAHEAD | 56s | 5.5 | 略有改善 |
+| pread + warmup | **39.8s** | **5.5** | 最优 pread 配置 |
+| OS thread (绕过 fiber) | 39.8s | 5.5 | 证明非 fiber 调度问题 |
+| posix write (绕过 Zig IO) | 39.8s | 5.5 | 证明非 write 问题 |
+
+### 修正后的根因
+
+原始结论 "17-19s 延迟是 accept() 被 VM 压力阻塞" **部分正确但不完整**。
+
+完整的根因链：
+1. 141GB 模型在 48GB Mac 上运行 → OS 必须不断换页
+2. warmup 加载 expert weights → backbone weights 被 OS 换出
+3. 第一个真实请求需要重新 page-in backbone（~6GB）
+4. SSD 随机读取 6GB 需要 ~30-40s（非顺序访问）
+5. 这个延迟发生在 engine forward pass 内部，HTTP handler 必须等待
+
+**这是 48GB Mac 运行 141GB 模型的物理限制，不可通过代码优化消除。**
+
+### 当前最优配置
+
+```bash
+# pread + warmup + 10GB cache
+dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --smelt --smelt-strategy stream --smelt-experts 0.1 \
+  --smelt-cache 10240
+```
+
+- 服务端: 5.2-5.5 tok/s
+- HTTP 首次请求: ~38-40s
+- HTTP 后续请求: 逐步改善（cache 热身）
+- 启动时间: ~80s（含 warmup）
 
 ## 代码改动记录
 

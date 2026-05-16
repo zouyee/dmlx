@@ -86,11 +86,15 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     installSignalHandlers();
     std.log.info("Signal handlers installed (SIGTERM, SIGINT)", .{});
 
-    // Start the accept loop in an async fiber (may run on a worker thread).
-    // The engine loop runs on the main thread so it shares the same MLX
-    // stream that was used during model loading. MLX 0.31.2+ makes streams
-    // thread-local; using the main thread avoids the worker-thread stream
-    // mismatch bug.
+    // Warmup expert cache BEFORE starting the accept loop.
+    // This pre-populates the cache so the first user request doesn't trigger
+    // massive SSD I/O that blocks the Zig IO event loop for 50+ seconds.
+    engine_loop.warmupExpertCache();
+
+    // Start the accept loop in an async fiber.
+    // Note: OS threads were tested (87943c0) but provided no improvement —
+    // the 38s HTTP delay is caused by macOS memory pressure, not fiber scheduling.
+    // See docs/analysis/pread-expert-loading.md for full investigation.
     _ = io.async(acceptLoop, .{ allocator, io, &server_state, server_config });
 
     // Run the engine loop on the main thread (current fiber).
