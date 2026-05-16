@@ -10,10 +10,13 @@ const std = @import("std");
 const array_mod = @import("mlx").array;
 const Array = array_mod.Array;
 
-/// Default cache budget: 10GB
-/// P1.2 Optimization: Expanded from 4GB to 10GB to improve hit rate from ~70% to ~95%.
-/// On 48GB Mac: 6GB backbone + 6GB SMELT preloads + 10GB cache + 2GB KV = 24GB total.
-pub const DEFAULT_MAX_BYTES: usize = 10 * 1024 * 1024 * 1024;
+/// Default cache budget: 6GB
+/// Tuned for 48GB Mac running DeepSeek-V4-Flash-4bit (141GB model).
+/// 6GB balances cache hit rate vs OS page cache pressure:
+/// - Too large (10GB+): squeezes backbone pages, causes page thrashing
+/// - Too small (2GB): low hit rate, more SSD I/O per token
+/// - 6GB: steady-state 6.5 tok/s, HTTP converges to ~32s by request #3
+pub const DEFAULT_MAX_BYTES: usize = 6 * 1024 * 1024 * 1024;
 
 /// Cache key identifying a specific expert tensor slice.
 pub const CacheKey = struct {
@@ -533,7 +536,7 @@ test "ExpertCache: update existing key" {
 }
 
 test "ExpertCache: default max bytes constant" {
-    try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024 * 1024), DEFAULT_MAX_BYTES);
+    try std.testing.expectEqual(@as(usize, 6 * 1024 * 1024 * 1024), DEFAULT_MAX_BYTES);
 }
 
 // ── Property-Based Tests ──
