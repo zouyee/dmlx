@@ -274,6 +274,8 @@ PERF_PLAN 的 P4（expert deduplication）已在解决这个问题（12390 → 6
 | posix write 替代 Zig IO write | 实测证明 response write 不是瓶颈 |
 | pread 完全替代 mmap | HTTP 延迟 -68% 但 tok/s -44%，得不偿失 |
 | Warmup with dummy prompts (旧版) | 旧版无效，但新版（pread + cache warmup）有效 |
+| PLD speculative decoding (ngram=3) | -15% tok/s，模型输出不重复 prompt，n-gram 匹配率极低 |
+| LRU 替代 LFU 驱逐策略 | -36% tok/s，MoE 每 token 258 新 entries 导致 cache thrashing |
 
 ### 2026-05-16 新增发现
 

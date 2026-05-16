@@ -57,6 +57,8 @@
 | posix write bypass | 0% improvement (write is not the bottleneck) |
 | P1.1 eval skip (stream mode) | -40% ITL (stream needs eval for page-in) |
 | Zero-copy mmap arrays | <7% gain, not page-aligned |
+| PLD speculative decoding | -15% tok/s (low n-gram match rate for this model) |
+| LRU cache eviction | -36% tok/s (cache thrashing: 258 new entries/token evict all) |
 
 ### Hardware Limits (Cannot Fix in Code)
 
@@ -87,32 +89,30 @@ Metal compute graph. Shapes are static during decode (batch=1, seq=1).
 
 **Effort**: 2-4 weeks.
 
-### Priority 2: Cache Strategy Optimization ⭐⭐⭐ (Expected: hit rate 24% → 50%+)
+### Priority 2: ~~Cache Strategy Optimization~~ ❌ Verified Ineffective
 
-**Current issue**: LFU eviction is suboptimal for MoE routing patterns.
-Different tokens route to different experts, making frequency counts unreliable.
+**Tested**: LRU eviction (replace LFU).
 
-**Options**:
-1. **Layer-partitioned LRU**: Reserve cache budget per layer (6GB / 43 = 140MB/layer).
-   Each layer keeps its most recently used experts. Prevents cross-layer eviction.
-2. **Predictive prefetch**: After gate routing computes expert indices for layer N,
-   prefetch layer N+1's likely experts (based on historical routing correlation).
-3. **Adaptive cache sizing**: Monitor per-layer hit rates, allocate more budget to
-   layers with higher miss rates.
+**Result**: -36% tok/s. LRU causes cache thrashing in MoE — each token routes to
+6 experts × 43 layers = 258 new cache entries, which evict all previous entries.
+Next token routes to different experts → 100% miss. LFU is better because it
+preserves high-frequency experts that are shared across multiple tokens.
 
-**Effort**: 1-2 weeks.
+**Conclusion**: LFU is already the optimal eviction policy for MoE routing patterns.
+Further cache strategy improvements would require fundamentally different approaches
+(e.g., layer-partitioned budgets or routing-prediction-based prefetch), which have
+diminishing returns given the 6GB budget constraint.
 
-### Priority 3: PLD Speculative Decoding ⭐⭐⭐ (Expected: 1.5-2x effective throughput)
+### Priority 3: ~~PLD Speculative Decoding~~ ❌ Verified Ineffective
 
-**Status**: Already implemented (`src/speculative.zig`), just needs enabling.
+**Tested**: `--speculative-ngram 3` (n-gram draft proposal).
 
-PLD (Prompt Lookup Decoding) proposes 2-3 draft tokens from recent context,
-verified in a single forward pass. With ~70% acceptance rate → 1.5-2.1x effective
-throughput multiplier on top of all other optimizations.
+**Result**: -15% tok/s (warm). The model's output rarely repeats prompt content,
+so n-gram match rate is very low. Most draft tokens are rejected, wasting the
+verification forward pass.
 
-**Expected result**: 24 tok/s × 1.7 = **~41 tok/s effective** (warm cache).
-
-**Effort**: 1-2 days (already built, just enable for greedy decoding).
+**Conclusion**: PLD is not suitable for this model/task combination. Would need
+a trained draft model (EAGLE) for effective speculative decoding.
 
 ### Priority 4: Reduce HTTP Cold Start ⭐⭐ (Expected: 145s → 60-80s)
 
@@ -132,15 +132,14 @@ throughput multiplier on top of all other optimizations.
 
 | Milestone | Target | Timeline | Key Metric |
 |-----------|--------|----------|------------|
-| M1: Compile fusion | 30ms ITL, 33 tok/s | +4 weeks | Server tok/s |
-| M2: PLD enabled | 50+ effective tok/s | +1 day | Effective throughput |
-| M3: Cache strategy | 50%+ hit rate | +2 weeks | Cache hit rate |
-| M4: 100-token < 3s | 3s server-side | M1 + M2 | E2E latency |
+| ~~M1: PLD enabled~~ | ~~50+ effective tok/s~~ | ❌ | N-gram match too low |
+| ~~M2: Cache strategy~~ | ~~50%+ hit rate~~ | ❌ | LRU causes thrashing |
+| M3: Compile fusion | 30ms ITL, 33 tok/s | +4 weeks | Server tok/s |
+| M4: 100-token < 3s | 3s server-side | M3 achieved | E2E latency |
 
-**Ultimate target** (from inference-optimization.md):
-- ITL: 24ms → 41.7 tok/s
-- With PLD: effective 11.4ms → 88 tok/s
-- 100-token request: < 3s server-side ✅ (already 4.2s, close)
+**Remaining viable optimization**: MLX compile fusion is the only path to
+significantly improve server-side tok/s beyond the current 17-24 tok/s.
+All other low-hanging fruit has been exhausted and verified.
 
 ---
 
