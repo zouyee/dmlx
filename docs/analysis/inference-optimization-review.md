@@ -297,17 +297,30 @@ PERF_PLAN 的 P4（expert deduplication）已在解决这个问题（12390 → 6
 优化路径 **cache hit rate → compile fusion → speculative decoding** 完全正确。
 物理极限分析、瓶颈分解、per-layer timing 都是高质量的工程分析。
 
-### 最大不确定性
+### 2026-05-16 实测验证结论
 
-P2.1（MLX compile）贡献了 49% 的预期收益。如果 compile 不兼容 CSA/HCA 或
-expert 动态绑定开销过大：
-- 目标（82ms → 24ms）退化为（82ms → 48ms）
-- 仍然是 40% 提升，但需要 PLD 才能达到 3s/100-token 目标
+| 原文档预期 | 实测结果 | 判定 |
+|-----------|---------|------|
+| P1.1 eval skip -5% | stream 模式退化 40% | ❌ 不可用 |
+| P1.2 cache 10GB → 95% hit | 10GB 只有 42% hit，且挤占 backbone | ❌ 过于乐观 |
+| P1.2 cache 最优 | **6GB 是最优**（16.9 tok/s vs 10GB 的 10.7） | ✅ 已验证 |
+| P1.3 zero-copy | 已验证无效 | ❌ 跳过 |
+| Cold start warmup | 有效，cache miss -85% | ✅ 已部署 |
+| OS thread 替代 fiber | 无效（非 fiber 调度问题） | ❌ 已验证 |
+| pread 替代 mmap | tok/s -44%，不可接受 | ❌ 已验证 |
 
-### 行动建议
+### 当前状态与下一步
 
-1. **立即执行** P1.2（扩大 cache）— 最高确定性，最低风险
-2. **第 2 周** 做 compile spike test — 决定后续路径
-3. **不要投入** P1.3（zero-copy）— 已验证无效
-4. **补充** cold start 优化 — 用户体验的第一印象
-5. **注明** batch=1 适用范围 — 避免 server 场景的误导
+**当前**: 16.9-24 tok/s (serve mode, 6GB cache, warmup)
+**目标**: 33-40 tok/s (Phase 2 compile fusion)
+**路径**: MLX compile spike test → PLD enable → cache strategy
+
+详见: `docs/analysis/optimization-roadmap.md`
+
+### 行动建议（修订版）
+
+1. **立即执行** PLD speculative decoding（已实现，只需启用）— 预期 1.5-2x
+2. **第 1-2 周** MLX compile spike test — 决定后续路径
+3. **第 2-3 周** Cache 策略优化（layer-partitioned LRU）
+4. **不要投入** P1.1 eval skip / P1.3 zero-copy / pread / OS thread — 已验证无效
+5. **不要增大** cache 超过 6GB — 会挤占 OS page cache
