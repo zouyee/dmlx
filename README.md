@@ -299,9 +299,10 @@ Add to your `build.zig.zon`:
 ```bash
 git clone https://github.com/zouyee/dmlx.git
 cd dmlx
-zig build          # Build library + example
-zig build test     # Run tests
-zig build run      # Run demo
+make              # Build (ReleaseFast)
+make test         # Run unit tests
+make benchmark    # Run performance regression
+make check        # Full check (build + test + verify + benchmark)
 ```
 
 ---
