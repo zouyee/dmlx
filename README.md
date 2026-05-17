@@ -19,16 +19,40 @@ aggressive memory management.
 dmlx solves this through **five complementary layers of memory optimization**, plus a production-grade
 inference stack that makes frontier LLMs practical on consumer hardware.
 
-| Capability | mlx-lm (Python) | dmlx (Zig) |
+| Capability | mlx-lm (Python) | dmlx (Zig 0.16) |
 |-----------|-----------------|-----------------|
 | DeepSeek V4 on 48GB Mac | ❌ OOM (~40GB weights needed) | ✅ ~8GB via SMELT 20% |
 | DeepSeek V4 on 96GB+ Mac | ✅ (if RAM sufficient) | ✅ |
 | KV cache strategies | 1 (fixed) | 6 (runtime-switchable, incl. Tiered SSD) |
 | Max context on 48GB | Limited by RAM | 128K+ tokens (RAM+SSD) |
-| Deployment | Python + pip + venv (~500MB+) | Single static binary (~5-15MB) |
+| Deployment | Python + pip + venv (~500MB+) | Single static binary (~10MB) |
 | Deterministic latency | ❌ Python GC (10–100ms pauses) | ✅ Zero GC (sub-ms) |
+| Startup time | ~30s (Python import + JIT) | ~2s (native binary, no runtime) |
 | Model architectures | 50+ | 8 (LLaMA, DeepSeek V4, Qwen2/3, Mistral, Gemma, GLM-4, Phi) |
-| iOS/macOS embedding | ❌ No Python runtime on iOS | ✅ C ABI → Swift |
+| iOS/macOS embedding | ❌ No Python runtime on iOS | ✅ C ABI → Swift/ObjC |
+
+### Why Zig 0.16?
+
+dmlx is built with **Zig 0.16** — chosen for its unique combination of systems programming
+capabilities that make it ideal for high-performance ML inference:
+
+| Feature | Benefit for LLM Inference |
+|---------|--------------------------|
+| **Comptime** | Zero-cost abstractions for tensor shapes, dtype dispatch, model config |
+| **No hidden allocations** | Predictable memory usage — critical when managing 48GB budget |
+| **C ABI interop** | Direct `@cImport` of mlx-c headers, zero-overhead FFI to Metal/Accelerate |
+| **Cross-compilation** | Single binary for any Apple Silicon target (M1/M2/M3/M4) |
+| **No GC, no runtime** | Sub-millisecond latency, no pause spikes during generation |
+| **Async I/O (io.async)** | Fiber-based concurrency for HTTP server without thread overhead |
+| **ReleaseFast** | LLVM backend with aggressive optimizations — 2x faster than Debug |
+| **Package manager** | First-class dependency management (`build.zig.zon`) |
+| **Safety + performance** | Bounds checking in Debug, zero-cost in Release — catch bugs early |
+
+Compared to alternatives:
+- **C/C++**: No package manager, manual memory management, header hell
+- **Rust**: Slower compile times, complex lifetime annotations for MLX interop
+- **Python**: 10-100ms GC pauses, 500MB+ runtime, no iOS deployment
+- **Swift**: Limited Linux support, no `@cImport` equivalent for mlx-c
 
 ---
 
@@ -274,9 +298,12 @@ pub fn main() !void {
 
 ### Requirements
 
-- Zig **0.16.0** or later
-- macOS with Apple Silicon (primary target)
-- `mlx-c` installed via Homebrew:
+- **Zig 0.16.0** (required — uses `io.async`, new package manager, `@cImport` improvements)
+  ```bash
+  brew install zig    # macOS (Homebrew installs latest stable)
+  ```
+- macOS with Apple Silicon (M1/M2/M3/M4)
+- `mlx-c` (Apple's MLX C bindings):
   ```bash
   brew install mlx-c
   ```
