@@ -313,59 +313,78 @@ make check        # Full check (build + test + verify + benchmark)
 dmlx/
 ├── build.zig              # Build configuration (links mlx-c + Metal/Accelerate)
 ├── build.zig.zon          # Package manifest
+├── Makefile               # Build/test/benchmark commands
 ├── src/
-│   ├── c.zig              # @cImport of mlx-c headers
-│   ├── array.zig          # Array wrapper (creation, eval, data access)
-│   ├── dtype.zig          # Dtype enum + comptime mapping
-│   ├── device.zig         # Device / Stream
-│   ├── ops.zig            # Core ops (unary, binary, matmul, reductions)
-│   ├── ops/
-│   │   ├── comparison.zig # equal, greater, all, any, isclose, ...
-│   │   ├── math.zig       # floor, clip, logaddexp, erf, ...
-│   │   ├── shape.zig      # reshape, slice, transpose, take, ...
-│   │   ├── reduce.zig     # sum, mean, argmax, cumsum, topk, ...
-│   │   ├── sort.zig       # sort, argsort, partition, ...
-│   │   ├── creation.zig   # zeros, ones, eye, arange, linspace, ...
-│   │   ├── random.zig     # normal, uniform, categorical, ...
-│   │   ├── linalg.zig     # cholesky, inv, svd, qr, solve, ...
-│   │   ├── fft.zig        # fft, rfft, fftshift, ...
-│   │   ├── conv.zig       # conv1d/2d/3d, conv_transpose, ...
-│   │   ├── fast.zig       # layer_norm, rms_norm, rope, sdpa
-│   │   ├── nn.zig         # Linear, LSTM, GRU, MultiHeadAttention
-│   │   ├── activations.zig # 21 activation functions
-│   │   └── loss.zig       # 10 loss functions
+│   ├── main.zig           # CLI entry point (chat, serve, benchmark)
+│   ├── root.zig           # Library root (re-exports all modules)
+│   │
 │   ├── models/            # LLM architectures
-│   │   ├── deepseek_v4.zig        # DeepSeek V4 (3,091 lines)
+│   │   ├── deepseek_v4.zig        # DeepSeek V4 Flash (MLA + CSA/HCA + MoE)
 │   │   ├── deepseek_v4_loader.zig # Weight loading + SMELT config
-│   │   ├── expert_stream.zig      # MoE on-demand streaming (649 lines)
-│   │   ├── expert_cache.zig       # LRU expert cache
-│   │   ├── moe_router.zig         # Top-k MoE routing (629 lines)
-│   │   ├── llama.zig              # LLaMA architecture
-│   │   └── llama_loader.zig       # LLaMA weight loading
-│   ├── kvcache/            # KV cache strategies
-│   │   ├── standard.zig    # Full buffer
-│   │   ├── rotating.zig    # Ring buffer for long sequences
-│   │   ├── quantized.zig   # 4/8/16-bit compressed KV
-│   │   ├── paged.zig       # 32-token pages + CoW (1,152 lines)
-│   │   ├── tiered.zig      # RAM hot + SSD cold + LRU
-│   │   ├── turboquant.zig  # TurboQuant: Lloyd-Max + QJL
-│   │   └── prefix_disk.zig # On-disk prefix caching
-│   ├── speculative.zig     # PLD + EAGLE speculative decoding
-│   ├── guided.zig          # JSON Schema / Regex guided decoding
-│   ├── server.zig          # OpenAI-compatible HTTP server
-│   ├── batch_builder.zig   # Continuous batching builder
-│   ├── memory.zig          # Auto memory budgeting + enforcement
-│   ├── generation.zig      # Three-layer generation API
-│   ├── io/
-│   │   ├── mlx_io.zig      # Safetensors / GGUF via mlx-c
-│   │   └── npy.zig         # NumPy .npy read/write
-│   ├── eval.zig            # eval / async_eval
-│   ├── closure.zig         # Closure wrapper for transforms
-│   ├── grad.zig            # grad, value_and_grad, vjp, jvp
-│   ├── compile.zig         # compile, enable_compile, compile modes
-│   └── tests/              # Comprehensive test suite (350+ tests)
-├── docs/                   # Bilingual EN/ZH documentation
-└── README.md
+│   │   ├── expert_stream.zig      # MoE on-demand streaming from SSD
+│   │   ├── expert_cache.zig       # LFU expert cache (6GB default)
+│   │   ├── expert_preload.zig     # SMELT preload strategy
+│   │   ├── layer_prefetcher.zig   # Next-layer expert prefetch
+│   │   ├── llama.zig              # LLaMA / Mistral / Qwen / Gemma
+│   │   ├── minimax.zig            # MiniMax architecture
+│   │   └── nemotron_h.zig         # Nemotron-H architecture
+│   │
+│   ├── engine/            # Server Engine V2
+│   │   ├── engine_loop.zig        # Main inference loop (serial processing)
+│   │   ├── request_queue.zig      # Lock-free MPSC queue
+│   │   ├── request_state.zig      # Per-request isolation
+│   │   ├── completion_signal.zig  # Cross-thread token delivery (Darwin ulock)
+│   │   └── dynamic_buffer.zig     # Growable HTTP buffer
+│   │
+│   ├── server/            # HTTP server
+│   │   ├── http.zig       # Request routing + response writing
+│   │   ├── openai.zig     # OpenAI chat completions API
+│   │   ├── streaming.zig  # SSE streaming
+│   │   ├── anthropic.zig  # Anthropic Messages API
+│   │   ├── config.zig     # Server configuration
+│   │   └── state.zig      # Server state + model loading
+│   │
+│   ├── kvcache/           # KV cache strategies
+│   │   ├── standard.zig   # Full buffer
+│   │   ├── rotating.zig   # Ring buffer for long sequences
+│   │   ├── quantized.zig  # 4/8/16-bit compressed KV
+│   │   ├── paged.zig      # 32-token pages + CoW
+│   │   ├── tiered.zig     # RAM hot + SSD cold + LRU
+│   │   └── radix.zig      # Prefix caching via radix tree
+│   │
+│   ├── tokenizer/         # Tokenizer implementations
+│   ├── diffusion/         # Flux-style diffusion (experimental)
+│   ├── vision/            # Vision encoder (LLaVA)
+│   │
+│   ├── generation.zig     # Token generation API
+│   ├── speculative.zig    # PLD + EAGLE speculative decoding
+│   ├── guided.zig         # JSON Schema / Regex constrained decoding
+│   ├── sampling.zig       # Temperature, top-k, top-p sampling
+│   ├── scheduler.zig      # Request scheduling + block management
+│   ├── memory.zig         # Memory budgeting + enforcement
+│   ├── model_registry.zig # Architecture → loader dispatch
+│   ├── moe_router.zig     # Top-k MoE routing
+│   ├── trainer.zig        # QLoRA fine-tuning + AdamW
+│   ├── lora.zig           # LoRA adapter loading
+│   ├── tool_calling.zig   # Function calling support
+│   └── distributed.zig    # Multi-node inference (MPI)
+│
+├── zig-pkg/mlx_z-*/       # mlx-zig dependency (MLX Zig bindings)
+│   └── src/
+│       ├── array.zig      # Array wrapper
+│       ├── ops.zig        # 200+ MLX operations
+│       ├── compile.zig    # mlx_compile for op fusion
+│       ├── ops/fused.zig  # Compiled SwiGLU + AdamW
+│       └── io/            # Safetensors reader + mmap
+│
+├── scripts/               # Benchmark + test scripts
+│   ├── run_benchmark.sh   # Full serve-mode benchmark → report
+│   ├── best_test.sh       # 7-prompt correctness test
+│   └── quick_benchmark.sh # Quick latency check
+│
+└── docs/                  # Documentation (EN/ZH)
+    ├── analysis/          # Performance analysis + optimization roadmap
+    └── en/               # English technical docs
 ```
 
 ---
