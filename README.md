@@ -21,7 +21,7 @@ inference stack that makes frontier LLMs practical on consumer hardware.
 
 | Capability | mlx-lm (Python) | dmlx (Zig) |
 |-----------|-----------------|-----------------|
-| DeepSeek V4 on 48GB Mac | ❌ OOM (~40GB weights needed) | ✅ ~6GB via SMELT 15% |
+| DeepSeek V4 on 48GB Mac | ❌ OOM (~40GB weights needed) | ✅ ~8GB via SMELT 20% |
 | DeepSeek V4 on 96GB+ Mac | ✅ (if RAM sufficient) | ✅ |
 | KV cache strategies | 1 (fixed) | 6 (runtime-switchable, incl. Tiered SSD) |
 | Max context on 48GB | Limited by RAM | 128K+ tokens (RAM+SSD) |
@@ -56,8 +56,9 @@ partial expert loading:
 | Mode | Experts Loaded | Memory | Latency Impact |
 |------|---------------|--------|----------------|
 | Full 4-bit | 256 (100%) | ~40 GB | Baseline |
-| SMELT 30% | ~77 | ~12 GB | +10–15% |
-| SMELT 15% | ~38 | **~6 GB** | +10–15% |
+| SMELT 30% | ~77 | ~10 GB | +10–15% |
+| **SMELT 20%** ⭐ | **~51** | **~8 GB** | **Optimal on 48GB** |
+| SMELT 15% | ~38 | ~6 GB | +10–15% |
 
 SMELT auto-detects how many experts actually exist in the model files, loads only those, and
 applies a routing bias (`smelt_mask`) to prevent selecting unloaded experts. Missing experts
@@ -120,33 +121,35 @@ Source: docs/en/technical/ttft-optimization.md
 ## Real-World Performance
 
 **Hardware**: Apple M4 Pro, 48 GB unified memory
-**Model**: DeepSeek-V4-Flash-4bit, 33 shards (~40 GB 4-bit quantized)
-**Mode**: SMELT + stream, ExpertCache 4GB, temperature=0
-**Commit**: `7e72a7` (2026-05-05) — [benchmark log](docs/en/analysis/performance-benchmark.md)
+**Model**: DeepSeek-V4-Flash-4bit, 33 shards (~141 GB on disk, ~40 GB 4-bit quantized)
+**Mode**: SMELT 20% + stream, ExpertCache 6GB, temperature=0
+**Commit**: `0243aeb` (2026-05-16) — [benchmark log](docs/en/analysis/performance-benchmark.md)
 
 | Metric | Value |
 |--------|-------|
-| Prefill (token 1) | 370.5 ms |
-| Steady-state (tokens 3-10 avg) | 82.2 ms |
-| Throughput (steady-state) | **~12.2 tok/s** |
-| Memory (SMELT 15%) | ~6 GB weights + KV cache |
+| Prefill (token 1) | 36 ms |
+| Steady-state ITL | 56 ms |
+| Throughput (server-side, warm) | **22-26 tok/s** |
+| 100-token generation (server) | 4.6s |
+| Memory (SMELT 20%) | ~8 GB weights + KV cache |
 | Max context (Paged + Tiered) | 128K+ tokens |
+| Startup time | ~46-100s (incl. warmup) |
 | 7-prompt correctness | **7/7 PASS, 0 FAIL** |
 
-| Benchmark Trend | Initial (`a024bee`) | Current (`7e72a7`) | Improvement |
+| Benchmark Trend | Initial (`a024bee`) | Current (`0243aeb`) | Improvement |
 |-----------------|---------------------|---------------------|-------------|
-| Prefill | 716ms | **370.5ms** | +48% |
-| Steady-state avg | ~125ms | **82.2ms** | +34% |
-| Throughput | ~8 tok/s | **~12.2 tok/s** | **+52%** |
+| Prefill | 716ms | **36ms** | +95% |
+| Steady-state avg | ~125ms | **56ms** | +55% |
+| Throughput | ~8 tok/s | **~22-26 tok/s** | **+175-225%** |
 
 > **Why this matters**: mlx-lm cannot run DeepSeek V4 on 48GB Macs at all — it requires loading
 > all ~40GB of 4-bit weights simultaneously, causing OOM. dmlx's SMELT system runs the same
-> model with ~6GB of weights. Raw Metal compute is similar (same `mlx-c` backend), so on larger
+> model with ~8GB of weights. Raw Metal compute is similar (same `mlx-c` backend), so on larger
 > Macs (96GB+) where mlx-lm can fit, performance is comparable.
 >
 > **dmlx's advantage is not raw speed — it's that the model runs at all on small Macs.**
 
-[→ Performance Dashboard](https://dmlx.ai/) | [→ Benchmarking Guide](docs/en/technical/benchmarks.md) | [→ Competitive Analysis](docs/en/analysis/competitive-advantages.md)
+[→ Performance Dashboard](https://dmlx.ai/) | [→ Optimization Roadmap](docs/analysis/optimization-roadmap.md) | [→ Competitive Analysis](docs/en/analysis/competitive-advantages.md)
 
 ---
 
@@ -230,7 +233,7 @@ strategies (PLD vs EAGLE).
 # Start chatting with DeepSeek V4 on your Mac
 dmlx chat --model ~/models/DeepSeek-V4-Flash-4bit \
   --prompt "Explain quantum computing in one sentence" \
-  --smelt --smelt-experts 0.15
+  --smelt --smelt-experts 0.2
 ```
 
 ### Core Library Usage
