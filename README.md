@@ -170,8 +170,8 @@ Your models, your data, your hardware — no third-party processors.
 Deploy a Mac mini as a private team inference server with OpenAI-compatible API:
 
 ```bash
-dmlx server --model ~/models/deepseek-v4-flash-4bit \
-  --port 8080 --kv-strategy paged
+dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 8080 --smelt --smelt-experts 0.2 --smelt-cache 6144
 
 # Any OpenAI client works as a drop-in replacement
 curl http://mac-mini:8080/v1/chat/completions \
