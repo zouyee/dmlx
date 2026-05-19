@@ -27,37 +27,37 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-zig-
 
-      - name: Cache Homebrew mlx-c
-        id: cache-mlx
-        uses: actions/cache@v4
-        with:
-          path: |
-            /opt/homebrew/lib/libmlx*.dylib
-            /opt/homebrew/lib/libmlxc*.dylib
-            /opt/homebrew/include/mlx
-            /opt/homebrew/lib/pkgconfig/mlx*.pc
-          key: ${{ runner.os }}-mlx-c-v2
-          restore-keys: |
-            ${{ runner.os }}-mlx-c-
-
       - name: Install mlx-c
-        if: steps.cache-mlx.outputs.cache-hit != 'true'
         run: |
           brew install --formula mlx-c
-          echo "--- Verify installation ---"
-          ls /opt/homebrew/lib/libmlxc* || ls /usr/local/lib/libmlxc* || echo "WARNING: libmlxc not found"
-          ls /opt/homebrew/include/mlx/c/ | head -5 || echo "WARNING: mlx-c headers not found"
+          # Ensure headers are linked into /opt/homebrew/include
+          brew link mlx-c 2>/dev/null || true
+          brew link mlx 2>/dev/null || true
 
-      - name: Verify mlx-c availability
+      - name: Configure mlx-c paths
         run: |
-          echo "Library check:"
-          ls -la /opt/homebrew/lib/libmlxc.dylib 2>/dev/null || \
-            ls -la /usr/local/lib/libmlxc.dylib 2>/dev/null || \
+          # Find the actual mlx-c prefix (Cellar path)
+          MLX_C_CELLAR=$(brew --prefix mlx-c)
+          echo "mlx-c installed at: $MLX_C_CELLAR"
+          echo "MLX_C_PREFIX=$MLX_C_CELLAR" >> $GITHUB_ENV
+
+          # Verify headers exist
+          if [ -f "$MLX_C_CELLAR/include/mlx/c/array.h" ]; then
+            echo "Headers found at $MLX_C_CELLAR/include/mlx/c/"
+          elif [ -f "/opt/homebrew/include/mlx/c/array.h" ]; then
+            echo "Headers found at /opt/homebrew/include/mlx/c/"
+            echo "MLX_C_PREFIX=/opt/homebrew" >> $GITHUB_ENV
+          else
+            echo "ERROR: mlx-c headers not found"
+            find "$MLX_C_CELLAR" -name "array.h" 2>/dev/null || true
+            find /opt/homebrew/include -name "array.h" -path "*/mlx*" 2>/dev/null || true
+            exit 1
+          fi
+
+          # Verify library exists
+          ls -la "$MLX_C_CELLAR/lib/libmlxc.dylib" 2>/dev/null || \
+            ls -la /opt/homebrew/lib/libmlxc.dylib 2>/dev/null || \
             { echo "ERROR: libmlxc.dylib not found"; exit 1; }
-          echo "Header check:"
-          ls /opt/homebrew/include/mlx/c/array.h 2>/dev/null || \
-            ls /usr/local/include/mlx/c/array.h 2>/dev/null || \
-            { echo "ERROR: mlx-c headers not found"; exit 1; }
 
       - name: Build
         run: zig build -Doptimize=ReleaseFast
@@ -69,11 +69,11 @@ jobs:
           OUTPUT=$(zig build test 2>&1) || true
           echo "$OUTPUT"
           if echo "$OUTPUT" | grep -q "0 failed"; then
-            echo "✅ Tests passed"
+            echo "Tests passed"
           elif echo "$OUTPUT" | grep -q "passed"; then
-            echo "✅ Tests passed"
+            echo "Tests passed"
           else
-            echo "❌ Tests failed"
+            echo "Tests failed"
             exit 1
           fi
 
