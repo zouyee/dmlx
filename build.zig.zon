@@ -6,7 +6,7 @@
     .dependencies = .{
         .mlx_z = .{
             .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.0.2.tar.gz",
-            .hash = "mlx_z-0.1.0--3FlNRUCBgAC5M0vb-WpjwEIYgilr7FRgFYafKi8ZOZ0",
+            .hash = "mlx_z-0.1.0--3FlNboJBgBdkou6nS8sfT990aZLLQ_SgLT-mp2cGgYH",
         },
         .zig_regex = .{
             .url = "https://github.com/zig-utils/zig-regex/archive/49fae00540d26fd3e7bdeda70864021c90d3e38f.tar.gz",
