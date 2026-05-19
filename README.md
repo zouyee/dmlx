@@ -147,24 +147,25 @@ Source: docs/en/technical/ttft-optimization.md
 **Hardware**: Apple M4 Pro, 48 GB unified memory
 **Model**: DeepSeek-V4-Flash-4bit, 33 shards (~141 GB on disk, ~40 GB 4-bit quantized)
 **Mode**: SMELT 20% + stream, ExpertCache 6GB, temperature=0
-**Commit**: `0243aeb` (2026-05-16) — [benchmark log](docs/en/analysis/performance-benchmark.md)
+**Commit**: `2eb821f` (2026-05-19) — [benchmark log](docs/en/analysis/performance-benchmark.md)
 
 | Metric | Value |
 |--------|-------|
-| Prefill (token 1) | 36 ms |
-| Steady-state ITL | 56 ms |
-| Throughput (server-side, warm) | **22-26 tok/s** |
-| 100-token generation (server) | 4.6s |
+| Prefill (token 1) | 80 ms |
+| Steady-state ITL | 53 ms |
+| Throughput (server-side, warm) | **18-26 tok/s** |
+| 100-token generation (server) | 3.8s |
 | Memory (SMELT 20%) | ~8 GB weights + KV cache |
 | Max context (Paged + Tiered) | 128K+ tokens |
-| Startup time | ~46-100s (incl. warmup) |
+| Startup time | ~122s (incl. warmup) |
+| Prefix cache TTFR reduction | **25-48%** (repeated prompts) |
 | 7-prompt correctness | **7/7 PASS, 0 FAIL** |
 
-| Benchmark Trend | Initial (`a024bee`) | Current (`0243aeb`) | Improvement |
+| Benchmark Trend | Initial (`a024bee`) | Current (`2eb821f`) | Improvement |
 |-----------------|---------------------|---------------------|-------------|
-| Prefill | 716ms | **36ms** | +95% |
-| Steady-state avg | ~125ms | **56ms** | +55% |
-| Throughput | ~8 tok/s | **~22-26 tok/s** | **+175-225%** |
+| Prefill | 716ms | **80ms** | +89% |
+| Steady-state avg | ~125ms | **53ms** | +58% |
+| Throughput | ~8 tok/s | **~18-26 tok/s** | **+125-225%** |
 
 > **Why this matters**: mlx-lm cannot run DeepSeek V4 on 48GB Macs at all — it requires loading
 > all ~40GB of 4-bit weights simultaneously, causing OOM. dmlx's SMELT system runs the same
@@ -232,6 +233,7 @@ strategies (PLD vs EAGLE).
 - **Speculative decoding**: PLD (Prompt Lookup Decoding) + EAGLE draft head for faster generation
 - **Guided decoding**: JSON Schema / Regex FSM for constrained, structured output
 - **6-level KV cache**: Standard, Rotating, Quantized, Paged (CoW), PagedQuantized, Tiered (RAM+SSD)
+- **Prefix cache**: LRU-based KV state caching — skip prefill on repeated prompts (25-48% TTFR reduction)
 - **Quantization**: Affine INT4/INT8, MXFP4, FP8 (E4M3), TurboQuant (Lloyd-Max + QJL)
 - **Expert streaming**: SMELT partial loading + on-demand stream mode for MoE models
 - **Training**: QLoRA fine-tuning, AdamW optimizer with compiled fusion, SFT Trainer
@@ -358,6 +360,7 @@ dmlx/
 │   │
 │   ├── engine/            # Server Engine V2
 │   │   ├── engine_loop.zig        # Main inference loop (serial processing)
+│   │   ├── prefix_cache.zig       # Prefix cache with LRU eviction
 │   │   ├── request_queue.zig      # Lock-free MPSC queue
 │   │   ├── request_state.zig      # Per-request isolation
 │   │   ├── completion_signal.zig  # Cross-thread token delivery (Darwin ulock)
