@@ -232,6 +232,7 @@ pub const DeepseekV4Cache = struct {
         .filter = null,
         .rollback = null,
         .extend = null,
+        .clone = cloneImpl,
         .deinit = deinitImpl,
     };
 
@@ -249,6 +250,82 @@ pub const DeepseekV4Cache = struct {
         const self: *DeepseekV4Cache = @ptrCast(@alignCast(ctx_ptr));
         self.local.total_tokens = 0;
         self.local.cursor = 0;
+    }
+
+    fn cloneImpl(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, stream: c.c.mlx_stream) anyerror!?KVCacheStrategy {
+        _ = stream;
+        const self: *DeepseekV4Cache = @ptrCast(@alignCast(ctx_ptr));
+
+        const new_cache = try allocator.create(DeepseekV4Cache);
+        errdefer allocator.destroy(new_cache);
+
+        // Clone local RotatingKVCache.
+        const new_local = try allocator.create(RotatingKVCache);
+        errdefer allocator.destroy(new_local);
+
+        var new_keys = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_keys, self.local.keys.inner));
+
+        var new_values = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_values, self.local.values.inner));
+
+        new_local.* = .{
+            .allocator = allocator,
+            .keys = Array.fromHandle(new_keys),
+            .values = Array.fromHandle(new_values),
+            .total_tokens = self.local.total_tokens,
+            .cursor = self.local.cursor,
+            .batch_size = self.local.batch_size,
+            .num_kv_heads = self.local.num_kv_heads,
+            .head_dim = self.local.head_dim,
+            .window_size = self.local.window_size,
+        };
+
+        // Clone BranchState.
+        var new_compressor = try cloneBranchState(self.compressor_state, allocator);
+        errdefer new_compressor.deinit();
+        var new_indexer = try cloneBranchState(self.indexer_state, allocator);
+        errdefer new_indexer.deinit();
+
+        new_cache.* = .{
+            .allocator = allocator,
+            .ctx = self.ctx,
+            .local = new_local,
+            .compressor_state = new_compressor,
+            .indexer_state = new_indexer,
+            .sliding_window = self.sliding_window,
+            .owns_local = true,
+        };
+
+        return new_cache.asStrategy();
+    }
+
+    fn cloneBranchState(state: BranchState, allocator: std.mem.Allocator) !BranchState {
+        var new_state = BranchState.init(allocator);
+
+        if (state.buffer_kv) |b| {
+            var copy = c.c.mlx_array_new();
+            try c.check(c.c.mlx_array_set(&copy, b.inner));
+            new_state.buffer_kv = Array.fromHandle(copy);
+        }
+        if (state.buffer_gate) |b| {
+            var copy = c.c.mlx_array_new();
+            try c.check(c.c.mlx_array_set(&copy, b.inner));
+            new_state.buffer_gate = Array.fromHandle(copy);
+        }
+        if (state.pooled) |p| {
+            var copy = c.c.mlx_array_new();
+            try c.check(c.c.mlx_array_set(&copy, p.inner));
+            new_state.pooled = Array.fromHandle(copy);
+        }
+        if (state.buffer_lengths) |l| {
+            new_state.buffer_lengths = try allocator.dupe(usize, l);
+        }
+        if (state.pooled_lengths) |l| {
+            new_state.pooled_lengths = try allocator.dupe(usize, l);
+        }
+
+        return new_state;
     }
 
     fn deinitImpl(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {

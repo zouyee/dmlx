@@ -35,6 +35,8 @@ const ChatCommand = struct {
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     smelt_cache_mb: usize = 2048, // Expert cache size in MB (stream mode, reduced for 48GB Mac)
+    mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
+    prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -59,6 +61,8 @@ const ServerCommand = struct {
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
     smelt_cache_mb: usize = 2048,
+    mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
+    prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     distributed: bool = false,
 };
 
@@ -191,6 +195,8 @@ pub fn main(init: std.process.Init) !void {
             .smelt_experts = cmd.smelt_experts,
             .smelt_strategy = cmd.smelt_strategy,
             .smelt_cache_mb = cmd.smelt_cache_mb,
+            .mlock_backbone = cmd.mlock_backbone,
+            .prefix_cache_entries = cmd.prefix_cache_entries,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -270,6 +276,8 @@ fn printUsage() void {
         \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
         \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
         \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
+        \\    --mlock-backbone            Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
+        \\    --prefix-cache-entries <n>  Number of prefix cache entries, 0 to disable (default: 16)
         \\    --distributed               Enable distributed tensor parallelism
         \\
         \\  dmlx benchmark [options]
@@ -336,10 +344,14 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
     };
 
     var i: usize = 0;
-    while (i < args.len) : (i += 2) {
+    while (i < args.len) {
         const flag = args[i];
-        if (i + 1 >= args.len) break;
-        const value = args[i + 1];
+        // Boolean flags don't consume a value
+        const is_bool = std.mem.eql(u8, flag, "--smelt") or
+            std.mem.eql(u8, flag, "--mlock-backbone") or
+            std.mem.eql(u8, flag, "--distributed");
+        if (!is_bool and i + 1 >= args.len) break;
+        const value = if (!is_bool) args[i + 1] else "";
 
         if (std.mem.eql(u8, flag, "--model")) {
             cmd.model_path = try allocator.dupe(u8, value);
@@ -394,18 +406,24 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.speculative_ngram = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--smelt")) {
             cmd.smelt = true;
-            // Boolean flag: don't consume a value, step back so next iteration
-            // processes the same value as a flag (or adjust loop logic)
-            i -= 1;
         } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
             cmd.smelt_strategy = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
             cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--mlock-backbone")) {
+            cmd.mlock_backbone = true;
+        } else if (std.mem.eql(u8, flag, "--prefix-cache-entries")) {
+            cmd.prefix_cache_entries = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
-            i -= 1;
+        }
+
+        if (is_bool) {
+            i += 1;
+        } else {
+            i += 2;
         }
     }
 
@@ -423,10 +441,15 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
     };
 
     var i: usize = 0;
-    while (i < args.len) : (i += 2) {
+    while (i < args.len) {
         const flag = args[i];
-        if (i + 1 >= args.len) break;
-        const value = args[i + 1];
+        // Boolean flags don't consume a value
+        const is_bool = std.mem.eql(u8, flag, "--smelt") or
+            std.mem.eql(u8, flag, "--mlock-backbone") or
+            std.mem.eql(u8, flag, "--distributed") or
+            std.mem.eql(u8, flag, "--raw");
+        if (!is_bool and i + 1 >= args.len) break;
+        const value = if (!is_bool) args[i + 1] else "";
 
         if (std.mem.eql(u8, flag, "--model")) {
             cmd.model_path = try allocator.dupe(u8, value);
@@ -446,19 +469,24 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.max_kv_size = memory.parseMaxKvSize(value) catch return error.InvalidArgument;
         } else if (std.mem.eql(u8, flag, "--smelt")) {
             cmd.smelt = true;
-            i -= 1;
         } else if (std.mem.eql(u8, flag, "--smelt-experts")) {
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
             cmd.smelt_strategy = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
             cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--mlock-backbone")) {
+            cmd.mlock_backbone = true;
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
-            i -= 1;
         } else if (std.mem.eql(u8, flag, "--raw")) {
             cmd.raw = true;
-            i -= 1;
+        }
+
+        if (is_bool) {
+            i += 1;
+        } else {
+            i += 2;
         }
     }
 
@@ -773,6 +801,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         .load_fraction = cmd.smelt_experts,
         .load_mode = smelt_strategy,
         .cache_budget_mb = cmd.smelt_cache_mb,
+        .mlock_backbone = cmd.mlock_backbone,
     };
 
     // In stream mode, use selective loading via TensorIndex + mmap.
@@ -793,6 +822,11 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             entry.value_ptr.*.deinit();
         }
         weights.deinit();
+    }
+
+    // Lock backbone weights in RAM to prevent OS eviction (eliminates cold-start page-in delay)
+    if (cmd.mlock_backbone) {
+        root.deepseek_v4_loader.mlockBackboneWeights(&weights);
     }
 
     // 4. Build model
@@ -992,7 +1026,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     std.debug.print("Starting generation...\n", .{});
-    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream);
+    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream, null);
     std.log.info("DEBUG: model.generate returned {d} tokens", .{new_tokens.len});
     defer allocator.free(new_tokens);
 

@@ -6,6 +6,7 @@ pub const request_state = @import("request_state.zig");
 pub const completion_signal = @import("completion_signal.zig");
 pub const request_queue = @import("request_queue.zig");
 pub const engine_loop = @import("engine_loop.zig");
+pub const prefix_cache = @import("prefix_cache.zig");
 
 pub const RequestState = request_state.RequestState;
 pub const RequestConfig = request_state.RequestConfig;
@@ -24,3 +25,5 @@ pub const requestShutdown = engine_loop.requestShutdown;
 pub const isShutdownRequested = engine_loop.isShutdownRequested;
 pub const threadSleepMs = engine_loop.threadSleepMs;
 pub const generateGuided = engine_loop.generateGuided;
+
+pub const PrefixCacheManager = prefix_cache.PrefixCacheManager;

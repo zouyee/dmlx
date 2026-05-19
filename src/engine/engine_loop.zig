@@ -28,6 +28,7 @@ const dsv4_mod = @import("../models/deepseek_v4.zig");
 const dsv4_loader = @import("../models/deepseek_v4_loader.zig");
 const speculative_mod = @import("../speculative.zig");
 const guided_mod = @import("../guided.zig");
+const prefix_cache_mod = @import("prefix_cache.zig");
 
 const Array = array_mod.Array;
 const ScopedArrayArena = array_arena_mod.ScopedArrayArena;
@@ -156,6 +157,8 @@ pub const EngineConfig = struct {
     max_batch_size: usize = 8,
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
     speculative_ngram: ?usize = null,
+    /// Prefix cache: max number of prompts to cache KV state for (0 = disabled).
+    prefix_cache_max_entries: usize = 16,
 };
 
 pub const EngineLoop = struct {
@@ -182,6 +185,8 @@ pub const EngineLoop = struct {
     active_requests: std.ArrayList(*RequestState),
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
     speculative_ngram: ?usize,
+    /// Prefix cache for skipping prefill on repeated prompts.
+    prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
 
     pub fn init(config: EngineConfig) !EngineLoop {
         // Note: batch_caches is lazily initialized via BatchKVCache.merge()
@@ -206,10 +211,15 @@ pub const EngineLoop = struct {
             .seq_index_counter = 0,
             .active_requests = std.ArrayList(*RequestState).empty,
             .speculative_ngram = config.speculative_ngram,
+            .prefix_cache = if (config.prefix_cache_max_entries > 0)
+                prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
+            else
+                null,
         };
     }
 
     pub fn deinit(self: *EngineLoop) void {
+        if (self.prefix_cache) |*pc| pc.deinit();
         if (self.batch_caches) |caches| {
             for (caches) |cache| cache.deinit(self.allocator);
             self.allocator.free(caches);
@@ -284,18 +294,30 @@ pub const EngineLoop = struct {
         // Record start time for request latency tracking.
         req.start_time_ns = @intCast(std.c.mach_absolute_time());
 
-        // Create per-request caches to avoid cross-request cache contamination.
-        // Shared caches are reserved for future batched decode; until the batch
-        // prefill → merge → batch decode pipeline is fully implemented, each
-        // request gets its own private caches.
-        const caches = self.createCaches() catch |err| {
-            std.log.err("EngineLoop: failed to create caches: {}", .{err});
-            req.completion.deliverError(self.io, "Failed to create KV caches");
-            return;
-        };
-        defer {
-            for (caches) |cache| cache.deinit(self.allocator);
-            self.allocator.free(caches);
+        var caches: []KVCacheStrategy = undefined;
+        var owns_caches = true;
+        var prefix_hit = false;
+
+        // Try prefix cache first.
+        if (self.prefix_cache) |*pc| {
+            if (pc.lookup(req.prompt_tokens)) |maybe_cloned| {
+                if (maybe_cloned) |cloned| {
+                    caches = cloned;
+                    prefix_hit = true;
+                    std.log.info("[Engine] Prefix cache hit for request {d}, skipping prefill", .{req.id});
+                }
+            } else |err| {
+                std.log.warn("[Engine] Prefix cache lookup failed: {}", .{err});
+            }
+        }
+
+        if (!prefix_hit) {
+            // Create per-request caches to avoid cross-request cache contamination.
+            caches = self.createCaches() catch |err| {
+                std.log.err("EngineLoop: failed to create caches: {}", .{err});
+                req.completion.deliverError(self.io, "Failed to create KV caches");
+                return;
+            };
         }
 
         const gen_config = GenerateConfig{
@@ -309,9 +331,9 @@ pub const EngineLoop = struct {
 
         if (self.dsv4_model) |model| {
             if (req.streaming) {
-                self.processDSV4StreamingRequest(req, caches, gen_config, model);
+                self.processDSV4StreamingRequest(req, caches, gen_config, model, prefix_hit);
             } else {
-                self.processDSV4NonStreamingRequest(req, caches, gen_config, model);
+                self.processDSV4NonStreamingRequest(req, caches, gen_config, model, prefix_hit);
             }
         } else {
             // Check for guided decoding constraints (non-streaming only).
@@ -325,6 +347,25 @@ pub const EngineLoop = struct {
                 self.processNonStreamingRequest(req, caches, gen_config);
             }
         }
+
+        // After generation: store caches if this was a miss.
+        if (!prefix_hit and self.prefix_cache != null) {
+            const pc = &self.prefix_cache.?;
+            if (!pc.isCached(req.prompt_tokens)) {
+                if (pc.store(req.prompt_tokens, caches)) {
+                    owns_caches = false; // Caches now owned by prefix cache.
+                } else |err| {
+                    std.log.warn("[Engine] Failed to store caches in prefix cache: {}", .{err});
+                }
+            }
+        }
+
+        // Deinit caches if we still own them.
+        if (owns_caches) {
+            for (caches) |cache| cache.deinit(self.allocator);
+            self.allocator.free(caches);
+        }
+
         logRequestCompletion(self.io, req);
     }
 
@@ -1077,6 +1118,7 @@ pub const EngineLoop = struct {
         caches: []KVCacheStrategy,
         gen_config: GenerateConfig,
         model: *dsv4_mod.DSV4Model,
+        skip_prefill: bool,
     ) void {
         var sampler = root.sampling.SamplerConfig{
             .temperature = gen_config.temperature,
@@ -1128,6 +1170,7 @@ pub const EngineLoop = struct {
         }.callback;
 
         // Generate with streaming callback - tokens are delivered immediately
+        const start_pos = if (skip_prefill) req.prompt_tokens.len else null;
         const tokens = model.generateWithCallback(
             req.prompt_tokens,
             req.max_tokens,
@@ -1136,6 +1179,7 @@ pub const EngineLoop = struct {
             self.stream,
             &stream_ctx,
             streamCallback,
+            start_pos,
         ) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
@@ -1158,6 +1202,7 @@ pub const EngineLoop = struct {
         caches: []KVCacheStrategy,
         gen_config: GenerateConfig,
         model: *dsv4_mod.DSV4Model,
+        skip_prefill: bool,
     ) void {
         var sampler = root.sampling.SamplerConfig{
             .temperature = gen_config.temperature,
@@ -1167,7 +1212,8 @@ pub const EngineLoop = struct {
             .repetition_penalty = gen_config.repetition_penalty,
         };
 
-        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream) catch |err| {
+        const start_pos = if (skip_prefill) req.prompt_tokens.len else null;
+        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream, start_pos) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
             return;
@@ -1257,7 +1303,7 @@ pub const EngineLoop = struct {
             }
 
             // Generate 1 token per prompt to trigger prefill through all layers
-            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream) catch {
+            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null) catch {
                 std.log.warn("[Engine] Warmup {d}: generate failed", .{i});
                 continue;
             };

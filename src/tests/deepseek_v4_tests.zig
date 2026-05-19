@@ -504,7 +504,7 @@ test "DSV4Model dummy build and forward+generate" {
     var caches = [_]kvcache_mod.KVCacheStrategy{cache0.asStrategy()};
     var sampler = sampling.SamplerConfig.init(42);
 
-    const generated = try model.generate(&[_]u32{ 1, 2 }, 3, &sampler, &caches, ctx.stream.inner);
+    const generated = try model.generate(&[_]u32{ 1, 2 }, 3, &sampler, &caches, ctx.stream.inner, null);
     defer allocator.free(generated);
 
     try std.testing.expectEqual(@as(usize, 3), generated.len);

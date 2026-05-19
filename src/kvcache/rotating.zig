@@ -45,6 +45,7 @@ pub const RotatingKVCache = struct {
         .filter = filterImpl,
         .rollback = rollbackImpl,
         .extend = null,
+        .clone = cloneImpl,
         .deinit = deinitImpl,
     };
 
@@ -208,6 +209,34 @@ pub const RotatingKVCache = struct {
         self.keys = Array.fromHandle(new_keys);
         self.values = Array.fromHandle(new_values);
         self.batch_size = indices.len;
+    }
+
+    fn cloneImpl(ctx: *anyopaque, allocator: std.mem.Allocator, stream: c.c.mlx_stream) anyerror!?KVCacheStrategy {
+        _ = stream;
+        const self: *RotatingKVCache = @ptrCast(@alignCast(ctx));
+
+        const new_cache = try allocator.create(RotatingKVCache);
+        errdefer allocator.destroy(new_cache);
+
+        var new_keys = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_keys, self.keys.inner));
+
+        var new_values = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_values, self.values.inner));
+
+        new_cache.* = .{
+            .allocator = allocator,
+            .keys = Array.fromHandle(new_keys),
+            .values = Array.fromHandle(new_values),
+            .total_tokens = self.total_tokens,
+            .cursor = self.cursor,
+            .batch_size = self.batch_size,
+            .num_kv_heads = self.num_kv_heads,
+            .head_dim = self.head_dim,
+            .window_size = self.window_size,
+        };
+
+        return new_cache.asStrategy();
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {

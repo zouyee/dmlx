@@ -44,4 +44,6 @@ pub const ServerConfig = struct {
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload",
     smelt_cache_mb: usize = 2048,
+    mlock_backbone: bool = false,
+    prefix_cache_entries: usize = 16,
 };

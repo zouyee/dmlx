@@ -122,6 +122,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .load_fraction = config.smelt_experts,
         .load_mode = smelt_load_mode,
         .cache_budget_mb = config.smelt_cache_mb,
+        .mlock_backbone = config.mlock_backbone,
     });
 
     // Extract DSV4 model for direct generate() — matches CLI path.

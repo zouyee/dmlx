@@ -2800,6 +2800,7 @@ pub const DSV4Model = struct {
         stream: c.c.mlx_stream,
         callback_ctx: ?*anyopaque,
         callback: ?StreamCallback,
+        start_pos_override: ?usize,
     ) ![]u32 {
         const allocator = self.allocator;
 
@@ -2812,10 +2813,10 @@ pub const DSV4Model = struct {
         @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
 
         var current_len = prompt_tokens.len;
-        var start_pos: usize = 0;
+        var start_pos: usize = start_pos_override orelse 0;
 
-        // Prefill: process all prompt tokens at once
-        if (prompt_tokens.len > 0) {
+        // Prefill: process all prompt tokens at once (skipped if start_pos_override is set)
+        if (start_pos_override == null and prompt_tokens.len > 0) {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
@@ -2864,8 +2865,11 @@ pub const DSV4Model = struct {
             }
         }
 
-        // Generate new tokens autoregressively
-        for (0..max_new_tokens - 1) |i| {
+        // Generate new tokens autoregressively.
+        // If prefill was skipped, we need to generate all max_new_tokens;
+        // otherwise prefill already produced the first token.
+        const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
+        for (0..decode_count) |i| {
             if (current_len >= tokens.len) break;
 
             var arena = ScopedArrayArena.init(allocator);
@@ -2884,7 +2888,7 @@ pub const DSV4Model = struct {
 
             // Call callback immediately after each token is generated
             if (callback) |cb| {
-                const is_final = i + 1 >= max_new_tokens - 1 or next_token == 1;
+                const is_final = i + 1 >= decode_count or next_token == 1;
                 cb(callback_ctx.?, next_token, is_final);
             }
 
@@ -2908,6 +2912,7 @@ pub const DSV4Model = struct {
         sampler_config: *@import("../sampling.zig").SamplerConfig,
         caches: []kvcache.KVCacheStrategy,
         stream: c.c.mlx_stream,
+        start_pos_override: ?usize,
     ) ![]u32 {
         const allocator = self.allocator;
 
@@ -2921,10 +2926,10 @@ pub const DSV4Model = struct {
         @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
 
         var current_len = prompt_tokens.len;
-        var start_pos: usize = 0;
+        var start_pos: usize = start_pos_override orelse 0;
 
-        // Prefill: process all prompt tokens at once
-        if (prompt_tokens.len > 0) {
+        // Prefill: process all prompt tokens at once (skipped if start_pos_override is set)
+        if (start_pos_override == null and prompt_tokens.len > 0) {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
@@ -2966,8 +2971,11 @@ pub const DSV4Model = struct {
             start_pos = prompt_tokens.len;
         }
 
-        // Generate new tokens autoregressively
-        for (0..max_new_tokens - 1) |_| {
+        // Generate new tokens autoregressively.
+        // If prefill was skipped, we need to generate all max_new_tokens;
+        // otherwise prefill already produced the first token.
+        const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
+        for (0..decode_count) |_| {
             if (current_len >= tokens.len) break;
 
             var arena = ScopedArrayArena.init(allocator);

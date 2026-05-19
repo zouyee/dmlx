@@ -77,6 +77,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
         .num_layers = mc.num_layers,
         .dsv4_model = server_state.dsv4_model,
         .speculative_ngram = server_state.speculative_ngram,
+        .prefix_cache_max_entries = server_config.prefix_cache_entries,
     };
 
     var engine_loop = try engine.EngineLoop.init(engine_config);

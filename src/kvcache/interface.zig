@@ -72,6 +72,10 @@ pub const VTable = struct {
     /// Only StandardKVCache implements this; other strategies return null.
     getState: ?*const fn (ctx: *anyopaque) ?CacheState = null,
 
+    /// Clone this cache into a new independent instance with the same state.
+    /// Returns null if the strategy does not support cloning.
+    clone: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, stream: c.c.mlx_stream) anyerror!?KVCacheStrategy = null,
+
     /// Release all resources held by this strategy.
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
 };
@@ -147,6 +151,19 @@ pub const KVCacheStrategy = struct {
     pub fn getState(self: KVCacheStrategy) ?CacheState {
         if (self.vtable.getState) |f| {
             return f(self.ptr);
+        }
+        return null;
+    }
+
+    /// Whether this strategy supports cloning.
+    pub fn supportsClone(self: KVCacheStrategy) bool {
+        return self.vtable.clone != null;
+    }
+
+    /// Clone this cache into a new independent instance.
+    pub fn clone(self: KVCacheStrategy, allocator: std.mem.Allocator, stream: c.c.mlx_stream) !?KVCacheStrategy {
+        if (self.vtable.clone) |f| {
+            return try f(self.ptr, allocator, stream);
         }
         return null;
     }

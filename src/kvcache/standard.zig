@@ -42,6 +42,7 @@ pub const StandardKVCache = struct {
         .rollback = rollbackImpl,
         .extend = extendImpl,
         .getState = getStateImpl,
+        .clone = cloneImpl,
         .deinit = deinitImpl,
     };
 
@@ -262,6 +263,34 @@ pub const StandardKVCache = struct {
         self.values = Array.fromHandle(new_values);
         self.batch_size = if (include_self) self.batch_size + sources.len else sources.len;
         self.offset = max_len;
+    }
+
+    fn cloneImpl(ctx: *anyopaque, allocator: std.mem.Allocator, stream: c.c.mlx_stream) anyerror!?KVCacheStrategy {
+        _ = stream;
+        const self: *StandardKVCache = @ptrCast(@alignCast(ctx));
+
+        const new_cache = try allocator.create(StandardKVCache);
+        errdefer allocator.destroy(new_cache);
+
+        // Deep copy keys and values via mlx_array_set.
+        var new_keys = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_keys, self.keys.inner));
+
+        var new_values = c.c.mlx_array_new();
+        try c.check(c.c.mlx_array_set(&new_values, self.values.inner));
+
+        new_cache.* = .{
+            .allocator = allocator,
+            .keys = Array.fromHandle(new_keys),
+            .values = Array.fromHandle(new_values),
+            .offset = self.offset,
+            .batch_size = self.batch_size,
+            .num_kv_heads = self.num_kv_heads,
+            .head_dim = self.head_dim,
+            .max_seq_len = self.max_seq_len,
+        };
+
+        return new_cache.asStrategy();
     }
 
     fn deinitImpl(ctx: *anyopaque, allocator: std.mem.Allocator) void {

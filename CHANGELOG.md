@@ -57,6 +57,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Prefix Cache with LRU Eviction** (`src/engine/prefix_cache.zig`)
+  - Caches pre-filled KV states for repeated prompts (skip prefill on cache hit)
+  - Proper LRU eviction via monotonic access counter (replaces naive iteration order)
+  - FNV-1a token sequence hashing with collision safety (exact match verification)
+  - Hit/miss tracking with `hitRate()` reporting
+  - Configurable capacity via `--prefix-cache-entries <n>` CLI flag (default: 16)
+  - 6 unit tests covering store/lookup, LRU eviction, hit rate, clear, duplicates
+
+- **KV Cache Clone Interface** (`src/kvcache/interface.zig`)
+  - `clone()` method on KVCacheStrategy VTable for deep-copying cache state
+  - `supportsClone()` predicate for strategy capability detection
+  - Implementations for Standard, Rotating, and DeepSeek V4 cache strategies
+
+- **mlock/munlock Backbone Weights** (`src/models/deepseek_v4_loader.zig`)
+  - `mlockBackboneWeights()`: batch-eval + POSIX mlock all backbone tensors (~4GB)
+  - `munlockBackboneWeights()`: cleanup unlock on shutdown
+  - Prevents OS paging out backbone during expert cache activity
+  - Activated via `--mlock-backbone` CLI flag
+
 - **Serve-mode benchmark pipeline** (`scripts/run_benchmark.sh`)
   - Full HTTP API testing (30-token + 100-token generation)
   - Automatic report generation with delta comparison vs previous commit
@@ -71,6 +90,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Run 5 diverse prompts before accepting connections
   - Pre-populates cache with common expert routing paths
   - Reduces first-request cache misses by ~85% (18,630 → 2,709)
+
+### Performance (Prefix Cache)
+- **Throughput**: 17.8 → 18.8 tok/s (+6%)
+- **Steady-state ITL**: 56.2ms → 53.2ms (+5%)
+- **Prefix cache TTFR reduction**: 25-48% on repeated prompts (skip prefill + expert loads)
+- **Cache hit rate**: 23.7% (71,217 hits / 229,740 misses)
+- **Tests**: 401 total (400 passed, 1 skipped), 7/7 E2E pass
 
 ### Changed
 - **Expert cache default: 4GB → 10GB** (`src/models/expert_cache.zig`)
