@@ -304,25 +304,39 @@ PERF_PLAN 的 P4（expert deduplication）已在解决这个问题（12390 → 6
 | 原文档预期 | 实测结果 | 判定 |
 |-----------|---------|------|
 | P1.1 eval skip -5% | stream 模式退化 40% | ❌ 不可用 |
-| P1.2 cache 10GB → 95% hit | 10GB 只有 42% hit，且挤占 backbone | ❌ 过于乐观 |
-| P1.2 cache 最优 | **6GB 是最优**（16.9 tok/s vs 10GB 的 10.7） | ✅ 已验证 |
+| P1.2 cache 10GB → 95% hit | 10GB 只有 42% hit，且挤占 backbone | ❌ 过于乐观（无 mlock 时） |
+| P1.2 cache 最优 | **10GB + mlock 是最优**（22 tok/s, mlock 保护 backbone） | ✅ 已验证 (05-22) |
 | P1.3 zero-copy | 已验证无效 | ❌ 跳过 |
 | Cold start warmup | 有效，cache miss -85% | ✅ 已部署 |
 | OS thread 替代 fiber | 无效（非 fiber 调度问题） | ❌ 已验证 |
 | pread 替代 mmap | tok/s -44%，不可接受 | ❌ 已验证 |
 
-### 当前状态与下一步
+### 当前状态与下一步 (2026-05-22 更新)
 
-**当前**: 16.9-24 tok/s (serve mode, 6GB cache, warmup)
-**目标**: 33-40 tok/s (Phase 2 compile fusion)
-**路径**: MLX compile spike test → PLD enable → cache strategy
+**当前**: 22 tok/s server (serve mode, SMELT 15%, 10GB cache, mlock-backbone)
+**目标**: Warm client 吞吐 6-7 tok/s（100-token < 15s）
+**路径**: DyMoE skip → Expert wave 流水线 → Hash routing 预加载
 
-详见: `docs/analysis/optimization-roadmap.md`
+**P1.1 异步预取实测结论** (2026-05-20):
+- Prefetcher 代码就绪但已禁用: 后台 pread 与主线程竞争 SSD 带宽，导致 2.5x 退化
+- mmap 连接 reader: OOM crash (zero-copy concat 在 multi-token 时 exhaust memory)
+- 正确方向: 减少 cache miss 总量 (Fate prediction) 而非并行 I/O
 
-### 行动建议（修订版）
+详见: `docs/analysis/optimization-roadmap.md`（2026-05-19 深度分析综合版）
 
-1. **立即执行** PLD speculative decoding（已实现，只需启用）— 预期 1.5-2x
-2. **第 1-2 周** MLX compile spike test — 决定后续路径
-3. **第 2-3 周** Cache 策略优化（layer-partitioned LRU）
-4. **不要投入** P1.1 eval skip / P1.3 zero-copy / pread / OS thread — 已验证无效
-5. **不要增大** cache 超过 6GB — 会挤占 OS page cache
+### 行动建议（2026-05-19 修订版）
+
+**路径修正**：原计划 "compile fusion → PLD" 路径已验证不适用于 stream 模式：
+- MLX Compile: Stream 模式 I/O-bound，compute 优化仅 +6%
+- PLD: N-gram 匹配率极低，-15% tok/s
+- eval skip: stream 模式依赖 eval() 触发 page-in，-40% ITL
+
+**新路径聚焦 I/O + Cache**：
+1. **第 1 周** P0.1 层级分区 Cache（hit rate 24% → 35%+）
+2. **第 1 周** P0.2 Routing 统计 + 精准预热（warmup 覆盖率 12% → 25%+）
+3. **第 1 周** P1.2 I/O 节流（层间 yield，极低风险）
+4. **第 2-3 周** P1.5 DyMoE — skip 低重要性 miss expert
+5. **第 2-3 周** Expert wave 流水线（I/O-compute overlap）
+6. **不要投入** eval skip / zero-copy / pread 完全替代 / OS thread / PLD / MTP — 已验证无效
+7. **不要投入** cache-aware routing bias — 已验证不可行 (P1.4, 05-22)
+8. **Cache 10GB + mlock** 是最优配置（之前 6GB 限制已被 mlock 解除）

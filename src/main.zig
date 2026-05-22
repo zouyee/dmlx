@@ -34,7 +34,7 @@ const ChatCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
-    smelt_cache_mb: usize = 2048, // Expert cache size in MB (stream mode, reduced for 48GB Mac)
+    smelt_cache_mb: usize = 10240, // Expert cache size in MB (stream mode, optimal with mlock on 48GB Mac)
     mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     distributed: bool = false,
@@ -60,7 +60,7 @@ const ServerCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
-    smelt_cache_mb: usize = 2048,
+    smelt_cache_mb: usize = 10240,
     mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     distributed: bool = false,
@@ -273,9 +273,9 @@ fn printUsage() void {
         \\    --prompt-cache-file <path>  Prompt cache file for KV state persistence
         \\    --speculative-ngram <n>     Enable speculative decoding with n-gram size
         \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
-        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
+        \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.15)
         \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
-        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
+        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 10240)
         \\    --mlock-backbone            Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
         \\    --prefix-cache-entries <n>  Number of prefix cache entries, 0 to disable (default: 16)
         \\    --distributed               Enable distributed tensor parallelism

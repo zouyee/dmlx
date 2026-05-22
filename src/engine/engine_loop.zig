@@ -330,6 +330,9 @@ pub const EngineLoop = struct {
         };
 
         if (self.dsv4_model) |model| {
+            // Hash routing prefetch: preload hash-layer experts before forward pass
+            model.prefetchHashLayerExperts(req.prompt_tokens);
+
             if (req.streaming) {
                 self.processDSV4StreamingRequest(req, caches, gen_config, model, prefix_hit);
             } else {

@@ -8,15 +8,15 @@
 #   bash scripts/run_benchmark.sh [model_path] [smelt_experts] [cache_mb]
 #
 # Examples:
-#   bash scripts/run_benchmark.sh                              # defaults
-#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.1 10240
+#   bash scripts/run_benchmark.sh                              # defaults (0.15, 10GB, mlock)
+#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.15 10240
 # ============================================================
 
 set -uo pipefail
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
-SMELT_EXPERTS="${2:-0.2}"
-CACHE_MB="${3:-6144}"
+SMELT_EXPERTS="${2:-0.15}"
+CACHE_MB="${3:-10240}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${DIR}/.." && pwd)"
@@ -60,7 +60,7 @@ echo "   $BM_UNIT ($(($(date +%s)-T_UNIT))s)"
 # ------------------------------------------------------------------
 # Phase 2: Serve Mode Performance Test
 # ------------------------------------------------------------------
-echo "📊 Serve mode perf test (smelt=${SMELT_EXPERTS}, cache=${CACHE_MB}MB)..."
+echo "📊 Serve mode perf test (smelt=${SMELT_EXPERTS}, cache=${CACHE_MB}MB, mlock)..."
 
 # Cleanup
 cleanup() {
@@ -78,7 +78,8 @@ T_PERF=$(date +%s)
     --max-tokens 256 \
     --temperature 0 \
     --smelt --smelt-strategy stream --smelt-experts "$SMELT_EXPERTS" \
-    --smelt-cache "$CACHE_MB" > /tmp/benchmark_serve.log 2>&1 &
+    --smelt-cache "$CACHE_MB" \
+    --mlock-backbone > /tmp/benchmark_serve.log 2>&1 &
 SERVER_PID=$!
 
 # Wait for server ready
@@ -205,6 +206,7 @@ echo "📝 Generating report..."
 # Export additional env vars for report
 export BM_SMELT_EXPERTS="$SMELT_EXPERTS"
 export BM_CACHE_MB="$CACHE_MB"
+export BM_MLOCK="true"
 export BM_E2E_PASS="$E2E_PASS"
 export BM_E2E_FAIL="$E2E_FAIL"
 export BM_PERF_TTFR="$PERF_TTFR"

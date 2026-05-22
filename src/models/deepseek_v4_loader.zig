@@ -765,7 +765,7 @@ pub fn loadWeightsSelective(
 /// after expert cache warmup evicts backbone pages.
 ///
 /// WARNING: Only safe when total locked memory + other allocations < physical RAM.
-/// On 48GB Mac with SMELT 20% + 6GB cache, backbone ~6GB → total ~24GB locked,
+/// On 48GB Mac with SMELT 15% + 10GB cache, backbone ~6GB → total ~22GB locked,
 /// well within limits. If mlock fails (ENOMEM), logs warning and continues.
 pub fn mlockBackboneWeights(weights: *std.StringHashMap(Array)) void {
     const sys_mman = @cImport({
@@ -1837,11 +1837,17 @@ pub fn buildDSV4Model(
         }
 
         var tid2eid: ?Array = null;
+        var tid2eid_cpu: ?[]const u32 = null;
         const tid2eid_name = try std.fmt.allocPrint(allocator, "{s}ffn.gate.tid2eid", .{idx_fmt});
         defer allocator.free(tid2eid_name);
         if (weights.get(tid2eid_name)) |te| {
             tid2eid = te;
             if (weights.fetchRemove(tid2eid_name)) |kv| allocator.free(kv.key);
+            // Eval and cache CPU-side data for hash prefetch (avoids eval per request)
+            te.eval() catch {};
+            if (te.dataSlice(u32)) |data| {
+                tid2eid_cpu = allocator.dupe(u32, data) catch null;
+            } else |_| {}
         }
 
         const is_hash = i < model_config.num_hash_layers;
@@ -1890,18 +1896,20 @@ pub fn buildDSV4Model(
         // Don't defer free - gate takes ownership of smelt_mask
         // defer if (smelt_mask_owned) allocator.free(smelt_mask);
 
+        const needs_allocator = (smelt_mask_owned and smelt.load_mode == .preload) or tid2eid_cpu != null;
         const gate = deepseek_v4.DSV4Gate{
             .ctx = ctx,
             .weight = gate_weight,
             .bias = gate_bias,
             .tid2eid = tid2eid,
+            .tid2eid_cpu = tid2eid_cpu,
             .topk = model_config.num_experts_per_tok,
             .n_routed_experts = n_routed_experts,
             .route_scale = model_config.routed_scaling_factor,
             .scoring_func = model_config.scoring_func,
             .is_hash = is_hash,
             .smelt_mask = if (smelt_mask_owned and smelt.load_mode == .preload) smelt_mask else null,
-            .allocator = if (smelt_mask_owned and smelt.load_mode == .preload) allocator else null,
+            .allocator = if (needs_allocator) allocator else null,
         };
 
         // Shared expert — keep quantized (lazy, no memory allocation)

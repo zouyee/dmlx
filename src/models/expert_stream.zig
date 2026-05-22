@@ -272,6 +272,7 @@ pub const ExpertStreamProvider = struct {
 
     /// Load a subset of experts from a fused tensor on disk.
     /// Returns a mini fused tensor [n_selected, ...] containing only the requested expert rows.
+    /// Load selected expert weight slices from disk into an Array.
     /// `expert_ids` is a sorted, deduplicated list of expert indices to load.
     ///
     /// CRITICAL: For quantized mxfp4 format, we MUST load the full tensor first, then slice it.
@@ -386,6 +387,35 @@ pub const ExpertStreamProvider = struct {
         }
 
         return result;
+    }
+
+    /// Prefetch experts into cache for hash-routing layers. Called before forward pass
+    /// to eliminate page faults on hash-routed layers where expert selection is deterministic.
+    pub fn prefetchForTokens(self: *ExpertStreamProvider, layer_idx: usize, expert_ids: []const u32) void {
+        if (self.cache == null or expert_ids.len == 0) return;
+        const meta = self.layer_meta[layer_idx];
+
+        const gate_w = self.loadExpertSlicesCached(meta.gate_proj_name, expert_ids, layer_idx, meta.expert_row_bytes) catch return;
+        gate_w.deinit();
+        const up_w = self.loadExpertSlicesCached(meta.up_proj_name, expert_ids, layer_idx, meta.expert_row_bytes) catch return;
+        up_w.deinit();
+        const down_w = self.loadExpertSlicesCached(meta.down_proj_name, expert_ids, layer_idx, meta.expert_row_bytes) catch return;
+        down_w.deinit();
+
+        if (self.is_quantized) {
+            if (meta.gate_scales_name) |n| {
+                const s = self.loadExpertSlicesCached(n, expert_ids, layer_idx, meta.expert_scale_row_bytes) catch return;
+                s.deinit();
+            }
+            if (meta.up_scales_name) |n| {
+                const s = self.loadExpertSlicesCached(n, expert_ids, layer_idx, meta.expert_scale_row_bytes) catch return;
+                s.deinit();
+            }
+            if (meta.down_scales_name) |n| {
+                const s = self.loadExpertSlicesCached(n, expert_ids, layer_idx, meta.expert_scale_row_bytes) catch return;
+                s.deinit();
+            }
+        }
     }
 
     /// Streaming forward (Option 2): Load experts on-demand from disk.

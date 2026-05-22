@@ -523,6 +523,7 @@ pub const DSV4Gate = struct {
     weight: Array, // [n_routed_experts, dim]
     bias: ?Array, // optional bias for score-based routing
     tid2eid: ?Array, // [vocab_size, topk] for hash-based routing
+    tid2eid_cpu: ?[]const u32 = null, // CPU-side flattened tid2eid [vocab_size * topk]
     topk: usize,
     n_routed_experts: usize,
     route_scale: f32,
@@ -538,6 +539,9 @@ pub const DSV4Gate = struct {
         self.weight.deinit();
         if (self.bias) |b| b.deinit();
         if (self.tid2eid) |t| t.deinit();
+        if (self.tid2eid_cpu) |data| {
+            if (self.allocator) |alloc| alloc.free(data);
+        }
         if (self.smelt_mask) |mask| {
             if (self.allocator) |alloc| alloc.free(mask);
         }
@@ -2719,6 +2723,52 @@ pub const DSV4Model = struct {
         }
     }
 
+    /// Preload hash-routed layer experts into cache based on token IDs.
+    /// Hash routing (first N layers) determines expert selection purely from token ID,
+    /// so we can prefetch before the forward pass to eliminate page faults.
+    pub fn prefetchHashLayerExperts(self: *DSV4Model, token_ids: []const u32) void {
+        const num_hash = self.config.num_hash_layers;
+        if (num_hash == 0) return;
+        const topk = self.config.num_experts_per_tok;
+
+        for (self.layers[0..num_hash], 0..) |*layer, layer_idx| {
+            const tid2eid_data = layer.ffn.gate.tid2eid_cpu orelse continue;
+            const sp = layer.ffn.stream_provider orelse continue;
+            const vocab_size = tid2eid_data.len / topk;
+
+            var expert_set = [_]bool{false} ** 256;
+            var unique_count: usize = 0;
+            for (token_ids) |tid| {
+                if (tid >= vocab_size) continue;
+                const row_start = @as(usize, tid) * topk;
+                for (0..topk) |k| {
+                    const eid = tid2eid_data[row_start + k];
+                    if (eid < 256 and !expert_set[eid]) {
+                        expert_set[eid] = true;
+                        unique_count += 1;
+                    }
+                }
+            }
+
+            var unique_ids: [256]u32 = undefined;
+            var idx: usize = 0;
+            for (0..256) |e| {
+                if (expert_set[e]) {
+                    unique_ids[idx] = @intCast(e);
+                    idx += 1;
+                }
+            }
+
+            sp.prefetchForTokens(layer_idx, unique_ids[0..idx]);
+        }
+
+        if (token_ids.len > 1) {
+            std.log.info("[HashPrefetch] Preloaded experts across {d} hash layers for {d} tokens", .{
+                num_hash, token_ids.len,
+            });
+        }
+    }
+
     pub fn forward(
         self: *DSV4Model,
         input_ids: Array,
@@ -2886,6 +2936,9 @@ pub const DSV4Model = struct {
             current_len += 1;
             start_pos += 1;
 
+            // Hash routing prefetch for next decode step
+            self.prefetchHashLayerExperts(&[_]u32{next_token});
+
             // Call callback immediately after each token is generated
             if (callback) |cb| {
                 const is_final = i + 1 >= decode_count or next_token == 1;
@@ -2991,6 +3044,9 @@ pub const DSV4Model = struct {
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
+
+            // Hash routing prefetch for next decode step
+            self.prefetchHashLayerExperts(&[_]u32{next_token});
 
             // Check for EOS token (ID 1 for DeepSeek V4)
             if (next_token == 1) {
