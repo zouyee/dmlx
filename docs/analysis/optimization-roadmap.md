@@ -11,7 +11,7 @@
 
 dmlx 是一个基于 Zig + MLX 的推理引擎，目标是在 Apple Silicon（48GB）上运行 141GB DeepSeek-V4-Flash-4bit MoE 模型。核心挑战是**内存带宽瓶颈**：模型体积是物理内存的 3 倍，必须通过智能缓存和 I/O 调度来弥补。
 
-**当前状态**：Server 端 22-26 tok/s（warm, 内部计时），Client 端 ~32s/10-token（warm, hash prefetch 后 ~0.31 tok/s）。
+**当前状态**：Server 端 16-19 tok/s（warm, 内部计时），Client 端 ~113s/30-token cold、~30s/10-token warm（SMELT 20% + 6GB）。
 **目标**：Warm client 吞吐 6-7 tok/s（100-token < 15s）。
 **路径**：减少 cache miss 总量（减轻 VM 压力）→ I/O-compute overlap → 减少 page fault。
 
@@ -834,7 +834,7 @@ for (unique_ids) |eid| {
 | **0243aeb** | **05-16** | **SMELT 20%, 6GB cache** | **17.8** | **27-30s** | **Previous best** |
 | **P1.4** | **05-22** | **SMELT 20%, 6GB** | **17.8** | **—** | **❌ Cache-Aware Routing 不可行（三种方案全部失败）** |
 | **Config C** | **05-22** | **SMELT 15%, 10GB, mlock** | **22.0** | **~190s (cold), ~54s/10tok (warm)** | **✅ 新 baseline (+24% tok/s, -46% startup)** |
-| **Hash Prefetch** | **05-22** | **Config C + hash prefetch** | **—** | **~154s (cold), ~32s/10tok (warm)** | **✅ Hash routing 预加载 -41% warm latency** |
+| **Hash Prefetch** | **05-22** | **Config C + hash prefetch** | **—** | **~154s (cold), ~32s/10tok (warm)** | **❌ Config 依赖：仅 Config C 有效，Config A 下负面** |
 
 ---
 
@@ -846,7 +846,7 @@ for (unique_ids) |eid| {
 |-----------|--------|--------|----------|--------|
 | ~~M5: Cache hit rate~~ | ~~50-60%~~ | ❌ | ~~P1.4 Cache-Aware Routing~~ 不可行 | — |
 | ~~M6: Client latency (warm)~~ | ~~< 250s/100tok~~ | ❌ | ~~P1.4~~ routing 修改导致质量退化 | — |
-| **M6.5: Hash Prefetch** | **< 40s/10tok** | ✅ | Hash Routing 确定性预加载 | — |
+| **M6.5: Hash Prefetch** | **< 40s/10tok** | ❌ | Hash Routing 确定性预加载 — 最优配置下无效 | — |
 | **M7: Client throughput** | **6-7 tok/s (15s)** | 🔄 Next | P1.5 DyMoE skip 边缘 expert | 中-高 |
 | **M8: Client throughput (stretch)** | **8-12 tok/s** | 🔄 Future | P1.5 + I/O 并行 + 更大 cache | 中 |
 | ~~M9: Fate prefetch~~ | ~~15+ tok/s~~ | ❌ | mHC 模型不适用 | — |
@@ -880,7 +880,7 @@ P1.5 skip 50% low-score miss: ~129 page faults/token
 |---------|---------|------------|---------|------|
 | **Expert Wave Pipeline** (§3.1) | GPU EP 多节点通信 | ⚠️ 需改造 | 部分（async prefetch 失败）| 见下方分析 |
 | **Communication-Computation Overlap** (§3.1) | Dispatch/Combine + Linear overlap | ⚠️ 需改造 | 是（pread async 失败）| SSD I/O ≠ 网络通信 |
-| **Hash Routing 前 3 层** (§2.1) | 确定性路由 | ✅ **直接可用** | ✅ 已验证 | **-41% warm latency** |
+| **Hash Routing 前 3 层** (§2.1) | 确定性路由 | ✅ **直接可用** | ✅ 已验证 | **❌ 最优配置下负面，已放弃** |
 | **On-Disk KV Cache** (§3.6.2) | 共享 prefix 避免重 prefill | ✅ 已实现 | ✅ Prefix Cache | 已部署 |
 | **KV Cache 压缩** (§3.6.1) | CSA/HCA 压缩 KV | ⚠️ 间接相关 | 否 | 减少 KV 内存可为 expert cache 让出空间 |
 | **FP4 QAT** (§3.4) | expert 权重 MXFP4 | ✅ 已实现 | ✅ | 模型已是 4-bit |
@@ -914,36 +914,31 @@ P1.5 skip 50% low-score miss: ~129 page faults/token
 - **结论**：在 Apple Silicon UMA 架构上，I/O 和 compute 无法真正 overlap（同一内存控制器）
 - **状态**：❌ 不适用于 Apple Silicon（GPU ↔ SSD 共享带宽）
 
-#### 2. Hash Routing 确定性预加载 — ✅ 已验证，有效
+#### 2. Hash Routing 确定性预加载 — ❌ 已验证，放弃
 
 **论文原理**（§2.1 p.7，§4.2.1 p.25）：
 - DeepSeek-V4-Flash 前 3 层使用 Hash routing（不是 learned routing）
 - Hash routing: `expert_id = tid2eid[token_id]` 查表（[129280, 6]）
 - Expert 选择 **完全由 input token ID 决定**，与 hidden state 无关
 
-**dmlx 实现**（2026-05-22）：
-- `DSV4Gate.tid2eid_cpu`: 加载时 eval tid2eid 并缓存 CPU 端 u32 数据
-- `ExpertStreamProvider.prefetchForTokens()`: 按 layer+expert IDs 预加载到 cache
-- `DSV4Model.prefetchHashLayerExperts()`: 从 token IDs 计算 hash 层 expert set，调用 prefetch
-- Prefill: `engine_loop.processRequest` 中 forward 之前调用
-- Decode: 每步 sample 后对下一 token 调用 prefetch
+**实现与测试**（2026-05-22, 已 revert）：
+- 实现了完整的 prefetch pipeline（tid2eid CPU cache → prefetchForTokens → engine 调用）
+- Config C (15%+10GB+mlock) 下看似有效：warm 10-tok 54s→32s (-41%)
+- 但切换到最优配置 Config A (20%+6GB, no mlock) 后效果为负：
 
-**实测结果**（2026-05-22, Config C + Hash Prefetch）：
+| 配置 | 无 prefetch | 有 prefetch | 变化 |
+|------|-------------|-------------|------|
+| Config A Cold 30-tok | 113s | 157s | **-39%（更差）** |
+| Config A Warm 100-tok | 149s | 185s | **-24%（更差）** |
+| Config A Warm 10-tok | 30.6s | 33.9s | -10% |
 
-| 测试 | Tokens | Client TTFB | 吞吐 |
-|------|--------|-------------|------|
-| Cold 第 1 请求 | 30 | 153.7s | 0.20 tok/s |
-| Warm 第 2 请求 | 30 | 80.8s | 0.37 tok/s |
-| Warm 第 3 请求 | 30 | 77.6s | 0.39 tok/s |
-| Warm 第 4 请求 | 10 | 32.0s | 0.31 tok/s |
+**根因分析**：
+1. Hash routing 只覆盖 3/43 层（7%），对整体 page fault 影响极小
+2. `loadExpertSlicesCached` 调用本身有开销（cache lookup + LFU 逻辑）
+3. Cold 时 prefetch 同步触发大量 page fault，加剧 VM thrashing
+4. Config A 的 25GB OS headroom 下，OS page cache 已能高效复用，手动 prefetch 画蛇添足
 
-**对比 baseline**（Config C 无 hash prefetch）：
-- Warm 10-token: **32s vs 54s → -41% 延迟改善**
-- Warm 吞吐: **0.31-0.39 tok/s vs 0.19 tok/s → +63-105% 吞吐提升**
-
-**结论**：Hash routing 预加载有效。3 层 hash routing 的 experts 被确定性预加载到 cache，
-消除了这些层的 page fault。效果显著（-41% warm latency），验证了论文 §2.1 的 hash routing
-在 memory-bound 场景下的实用价值。
+**结论**：在最优配置下收益为负，代码已 revert。仅在极端内存受限配置 (headroom < 16GB) 下可能有正向效果。
 
 #### 3. KV Cache 压缩让出内存 — ⚠️ 间接，低优先级
 
@@ -971,9 +966,13 @@ top-1，跳过它们 = 减少 page fault。这就是 P1.5 DyMoE 的思路。
 ### 优先级排序（2026-05-22 更新）
 
 ```
-✅ 已验证：Hash Routing 确定性预加载（3 层）
-  - 实测 -41% warm latency（54s → 32s/10tok）
-  - 0 质量影响（不改变 routing 逻辑，只改变加载时机）
+❌ 已验证无效：Hash Routing 确定性预加载（3 层）
+  - 仅 Config C (15%+10GB+mlock) 下看似有效（headroom 极小时）
+  - 最优配置 (20%+6GB) 下为负面（cold -39%, warm -24%）
+  - 代码已 revert
+
+❌ 已验证无效：Cross-tensor madvise prefetch
+  - A/B 测试证明 -50% 性能退化
 
 第 1 优先：P1.5 DyMoE Skip 边缘 Expert
   - 中等风险（可能影响输出质量）
@@ -988,7 +987,6 @@ top-1，跳过它们 = 减少 page fault。这就是 P1.5 DyMoE 的思路。
   - MegaMoE Kernel（CUDA only）
   - SwiGLU 替换（需重训）
   - KV 压缩（增量太小）
-  - Cross-tensor madvise prefetch（已验证 -50% 性能退化）
 ```
 
 ---

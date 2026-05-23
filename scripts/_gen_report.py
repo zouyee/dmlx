@@ -126,7 +126,7 @@ e2e_secs = env.get("BM_E2E_SECS", "?")
 total_secs = env.get("BM_TOTAL_SECS", "?")
 smelt_experts = env.get("BM_SMELT_EXPERTS", "0.15")
 cache_mb = env.get("BM_CACHE_MB", "10240")
-mlock = env.get("BM_MLOCK", "true")
+mlock = env.get("BM_MLOCK", "false")
 perf_ttfr = env.get("BM_PERF_TTFR", "?")
 perf_total = env.get("BM_PERF_TOTAL", "?")
 perf_tokens = env.get("BM_PERF_TOKENS", "30")
@@ -160,7 +160,7 @@ date: {date}
 Commit: {commit} ({branch})
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: {hw}, {mem}
-mode: serve, smelt {smelt_experts} + stream, ExpertCache {cache_mb}MB, mlock-backbone, temperature=0
+mode: serve, smelt {smelt_experts} + stream, ExpertCache {cache_mb}MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
 total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
