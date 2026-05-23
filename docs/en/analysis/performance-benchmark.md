@@ -1,12 +1,12 @@
 ---
-date: 2026-05-20
-Commit: 1f88647 (main)
+date: 2026-05-23
+Commit: f3ee19b (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
-mode: serve, smelt 0.15 + stream, ExpertCache 10240MB, mlock-backbone, temperature=0
+mode: serve, smelt 0.20 + stream, ExpertCache 6144MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 853s (perf 460s + e2e 379s)
+total_time: 771s (perf 370s + e2e 363s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 853s (perf 460s + e2e 379s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 36.5 | 0 | 1806 |
-| 2 | 189.3 | 406 | 4540 |
-| 3 | 215.3 | 279 | 6151 |
-| 4 | 522.5 | 291 | 4617 |
-| 5 | 253.1 | 279 | 7689 |
-| 6 | 363.0 | 274 | 12284 |
-| 7 | 115.5 | 617 | 1328 |
-| 8 | 297.3 | 453 | 12118 |
-| 9 | 125.7 | 1071 | 1060 |
-| 10 | 392.6 | 704 | 14932 |
-| 11 | 95.4 | 555 | 1384 |
-| 12 | 176.0 | 674 | 7312 |
-| 13 | 92.2 | 616 | 1321 |
-| 14 | 68.1 | 1445 | 770 |
-| 15 | 247.5 | 2104 | 518 |
+| 1 | 34.9 | 0 | 1806 |
+| 2 | 182.1 | 752 | 4234 |
+| 3 | 238.0 | 67 | 6329 |
+| 4 | 198.8 | 61 | 4817 |
+| 5 | 264.7 | 73 | 7829 |
+| 6 | 276.3 | 127 | 7799 |
+| 7 | 129.6 | 72 | 1758 |
+| 8 | 121.4 | 864 | 1170 |
+| 9 | 123.5 | 840 | 1170 |
+| 10 | 115.6 | 948 | 1086 |
+| 11 | 111.1 | 858 | 1164 |
+| 12 | 103.1 | 1006 | 1038 |
+| 13 | 107.6 | 534 | 1362 |
+| 14 | 70.6 | 630 | 1314 |
+| 15 | 76.4 | 488 | 1426 |
 
 **Summary**:
-- Prefill (token 1): **36.5ms**
-- Steady-state (token 3+): **34.3-522.5ms**, avg 73.2ms
-- Throughput: **~13.7 tok/s**
-- Cache hit rate: **38.4%** (126214 hits / 202728 misses)
+- Prefill (token 1): **34.9ms**
+- Steady-state (token 3+): **17.5-502.5ms**, avg 50.8ms
+- Throughput: **~19.7 tok/s**
+- Cache hit rate: **23.7%** (71217 hits / 229740 misses)
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 141.230747 | 141.230795 | — |
-| 100-token | 78 | 158.769182 | 158.769210 | — |
+| 30-token | 30 | 129.688065 | 129.688703 | — |
+| 100-token | 100 | 153.319277 | 153.319994 | — |
 
-### Comparison with Previous Version (773a552 → 1f88647)
+### Comparison with Previous Version (1f88647 → f3ee19b)
 
-| Metric | Previous (773a552) | Current (1f88647) | Change |
+| Metric | Previous (1f88647) | Current (f3ee19b) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 80.1ms | **36.5ms** | **+54%** |
-| Steady-state avg | 53.2ms | **73.2ms** | **-38%** |
-| Throughput | ~18.8 tok/s | **~13.7 tok/s** | **-27%** |
-| Perf phase | 382s | **460s** | **-20%** |
+| Prefill | 36.5ms | **34.9ms** | **+4%** |
+| Steady-state avg | 73.2ms | **50.8ms** | **+31%** |
+| Throughput | ~13.7 tok/s | **~19.7 tok/s** | **+44%** |
+| Perf phase | 460s | **370s** | **+20%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -65,12 +65,12 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 |-----------|-------|
 | Mode | serve (HTTP API) |
 | SMELT strategy | stream |
-| SMELT experts | 0.2 (preloaded) |
+| SMELT experts | 0.20 (preloaded) |
 | Expert cache | 6144 MB |
-| Cache-aware bias | 0.5 |
+| mlock backbone | false |
 | Temperature | 0 (greedy) |
-| Startup time | 158s (incl. warmup) |
-| Server RSS | 1530 MB |
+| Startup time | 86s (incl. warmup) |
+| Server RSS | 3680 MB |
 | Port | 18090 |
 
 ---
@@ -79,15 +79,15 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
 | # | Result | Model Output (truncated) |
 |---|--------|--------------------------|
-| P1 | ❌ | 's response. |
-| P2 | ✅ | in the same language. |
-| P3 | ✅ | to 'temperature' | 0 | The temperature at which water freezes is 0°C. |
-| P4 | ❌ | .</think> |
-| P5 | ❌ | (which is the correct one). The user's question is about the response to a speci |
-| P6 | ❌ | to=0.0.0.0.0.0.0.0.0.0.0.0.0.0. |
-| P7 | ❌ | to... | 0.0 | 0.0 |
+| P1 | ✅ | . The user's query is "2+2=?". The assistant's response is "4". The user's query |
+| P2 | ✅ | . The capital of France is Paris. The capital of France is Paris. The capital of |
+| P3 | ✅ | .</think> The temperature at which water freezes is 0 degrees Celsius. This is a |
+| P4 | ✅ | , but the user's question is "Is the Earth round?" The answer is yes. The user's |
+| P5 | ✅ | . The user's query is "3*3=". This is a simple multiplication problem. The answe |
+| P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
+| P7 | ✅ | to user's query. The user's query is "What is capital of France?" The correct an |
 
-**2/7 PASS, 5 FAIL**
+**7/7 PASS, 0 FAIL**
 
 ---
 
@@ -101,17 +101,17 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (773a552) | Current (1f88647) | Change |
+| Metric | Previous (1f88647) | Current (f3ee19b) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 80.1ms | **36.5ms** | **+54%** |
-| Steady-state ITL | 53.2ms | **73.2ms** | **-38%** |
-| Steady-state tok/s | ~18.8 | **~13.7** | **-27%** |
-| Cache hit rate | — | **38.4%** | — |
-| 100-token HTTP total | — | **158.769210s** | — |
-| Server RSS | — | **1530 MB** | — |
-| Startup time | — | **158s** | — |
-| 7-Prompt pass rate | 7/7 | **2/7** | — |
+| Prefill latency | 36.5ms | **34.9ms** | **+4%** |
+| Steady-state ITL | 73.2ms | **50.8ms** | **+31%** |
+| Steady-state tok/s | ~13.7 | **~19.7** | **+44%** |
+| Cache hit rate | — | **23.7%** | — |
+| 100-token HTTP total | — | **153.319994s** | — |
+| Server RSS | — | **3680 MB** | — |
+| Startup time | — | **86s** | — |
+| 7-Prompt pass rate | 7/7 | **7/7** | — |
 
 ---
 
-*Generated by `scripts/run_benchmark.sh` on 2026-05-20*
+*Generated by `scripts/run_benchmark.sh` on 2026-05-23*
