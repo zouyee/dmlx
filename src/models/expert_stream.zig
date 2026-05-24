@@ -582,9 +582,6 @@ pub const ExpertStreamProvider = struct {
         }
 
         if (!pread_ok) {
-            // Parallel pread: load gate/up/down projections concurrently.
-            // Each projection accesses independent tensor data; pread is
-            // thread-safe (no shared file offset). ~3x I/O speedup.
             try self.loadExpertProjectionsParallel(
                 meta.gate_proj_name,
                 meta.up_proj_name,
