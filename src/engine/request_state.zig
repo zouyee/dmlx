@@ -116,6 +116,8 @@ pub const RequestState = struct {
     completion: CompletionSignal,
     /// Whether cancellation has been requested (by HTTP fiber on disconnect).
     cancel_requested: std.atomic.Value(bool),
+    /// Timestamp when request was pushed to engine queue (HTTP side).
+    queued_time_ns: i128,
     /// Start timestamp (nanoseconds) for request latency tracking.
     start_time_ns: i128,
 
@@ -153,6 +155,7 @@ pub const RequestState = struct {
             .error_msg = null,
             .completion = CompletionSignal.init(allocator),
             .cancel_requested = std.atomic.Value(bool).init(false),
+            .queued_time_ns = 0,
             .start_time_ns = 0,
         };
         return self;

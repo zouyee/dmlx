@@ -60,11 +60,20 @@ def parse_previous_report(path):
 prev = parse_previous_report(report_path)
 
 # --- Parse perf (Token step logs) ---
+# Two formats:
+#   Cached:   Token step N complete: Xms, YMB read, cache hits=A misses=B
+#   Trust OS: Token step N complete: Xms
 steps = []
 for line in open(perf_file):
+    # Try cached format first (has hits/misses)
     m = re.search(r'step (\d+) complete: ([\d.]+)ms.*hits=(\d+) misses=(\d+)', line)
     if m:
         steps.append((int(m[1]), float(m[2]), int(m[3]), int(m[4])))
+        continue
+    # Try Trust OS format (bare ms, no cache fields)
+    m = re.search(r'step (\d+) complete: ([\d.]+)ms', line)
+    if m:
+        steps.append((int(m[1]), float(m[2]), 0, 0))
 
 prefill = steps[0][1] if steps else 0
 steady = [s[1] for s in steps[2:]]  # skip step 1 (prefill) and step 2 (cold)
@@ -75,7 +84,12 @@ tput = 1000 / savg if savg > 0 else 0
 
 total_hits = sum(s[2] for s in steps)
 total_misses = sum(s[3] for s in steps)
-hit_rate = total_hits / (total_hits + total_misses) * 100 if (total_hits + total_misses) > 0 else 0
+if (total_hits + total_misses) > 0:
+    hit_rate = total_hits / (total_hits + total_misses) * 100
+    hit_rate_str = f"{hit_rate:.1f}% ({total_hits} hits / {total_misses} misses)"
+else:
+    hit_rate = 0.0
+    hit_rate_str = "N/A (Trust OS, no custom cache)"
 
 # --- Parse e2e ---
 e2e_raw = open(e2e_file).read()
@@ -180,7 +194,7 @@ total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
 - Prefill (token 1): **{prefill:.1f}ms**
 - Steady-state (token 3+): **{smin:.1f}-{smax:.1f}ms**, avg {savg:.1f}ms
 - Throughput: **~{tput:.1f} tok/s**
-- Cache hit rate: **{hit_rate:.1f}%** ({total_hits} hits / {total_misses} misses)
+- Cache hit rate: **{hit_rate_str}**
 
 ### HTTP End-to-End Latency
 
@@ -243,7 +257,7 @@ zig build test → {unit}
 | Prefill latency | {PREV_PREFILL:.1f}ms | **{prefill:.1f}ms** | {delta(PREV_PREFILL, prefill)} |
 | Steady-state ITL | {PREV_STEADY:.1f}ms | **{savg:.1f}ms** | {delta(PREV_STEADY, savg)} |
 | Steady-state tok/s | ~{PREV_TPUT:.1f} | **~{tput:.1f}** | {delta(PREV_TPUT, tput, lower_better=False)} |
-| Cache hit rate | — | **{hit_rate:.1f}%** | — |
+| Cache hit rate | — | **{hit_rate_str}** | — |
 | 100-token HTTP total | — | **{long_total}s** | — |
 | Server RSS | — | **{server_rss} MB** | — |
 | Startup time | — | **{startup_secs}s** | — |
@@ -257,4 +271,5 @@ zig build test → {unit}
 with open(report_path, "w") as f:
     f.write(report)
 
-print(f"Prefill: {prefill:.1f}ms | Steady: {savg:.1f}ms | {tput:.1f} tok/s | Cache: {hit_rate:.1f}% | E2E: {e2e_pass}/7")
+cache_str = hit_rate_str if (total_hits + total_misses) > 0 else "N/A"
+print(f"Prefill: {prefill:.1f}ms | Steady: {savg:.1f}ms | {tput:.1f} tok/s | Cache: {cache_str} | E2E: {e2e_pass}/7")

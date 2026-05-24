@@ -34,9 +34,11 @@ const ChatCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
-    smelt_cache_mb: usize = 2048, // Expert cache size in MB (stream mode, reduced for 48GB Mac)
+    smelt_cache_mb: usize = 0, // Expert cache in MB (0=Trust OS, no custom cache — recommended)
     mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
+    expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
+    expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -60,9 +62,11 @@ const ServerCommand = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
-    smelt_cache_mb: usize = 2048,
+    smelt_cache_mb: usize = 0, // Expert cache in MB (0=Trust OS, no custom cache — recommended)
     mlock_backbone: bool = false, // Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
+    expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
+    expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
     distributed: bool = false,
 };
 
@@ -197,6 +201,8 @@ pub fn main(init: std.process.Init) !void {
             .smelt_cache_mb = cmd.smelt_cache_mb,
             .mlock_backbone = cmd.mlock_backbone,
             .prefix_cache_entries = cmd.prefix_cache_entries,
+            .expert_packed_dir = cmd.expert_packed_dir,
+            .expert_parallel = cmd.expert_parallel,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -275,7 +281,7 @@ fn printUsage() void {
         \\    --smelt                     Enable Smelt mode (partial expert loading for MoE)
         \\    --smelt-experts <f>         Fraction of experts to load (default: 1.0, recommend: 0.1)
         \\    --smelt-strategy <s>        Strategy: "preload" or "stream" (default: "preload")
-        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 4096)
+        \\    --smelt-cache <n>           Expert cache size in MB for stream mode (default: 0 = Trust OS)
         \\    --mlock-backbone            Lock backbone weights in RAM (prevents OS eviction, reduces cold-start latency)
         \\    --prefix-cache-entries <n>  Number of prefix cache entries, 0 to disable (default: 16)
         \\    --distributed               Enable distributed tensor parallelism
@@ -357,7 +363,7 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.model_path = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--port")) {
             cmd.port = try std.fmt.parseInt(u16, value, 10);
-        } else if (std.mem.eql(u8, flag, "--max-tokens")) {
+        } else if (std.mem.eql(u8, flag, "--max-tokens") or std.mem.eql(u8, flag, "--max_tokens")) {
             cmd.max_tokens = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--temperature")) {
             cmd.temperature = try std.fmt.parseFloat(f32, value);
@@ -410,12 +416,16 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.smelt_experts = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--smelt-strategy")) {
             cmd.smelt_strategy = try allocator.dupe(u8, value);
-        } else if (std.mem.eql(u8, flag, "--smelt-cache")) {
+        } else if (std.mem.eql(u8, flag, "--smelt-cache") or std.mem.eql(u8, flag, "--smelt-cache-mb")) {
             cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--mlock-backbone")) {
             cmd.mlock_backbone = true;
         } else if (std.mem.eql(u8, flag, "--prefix-cache-entries")) {
             cmd.prefix_cache_entries = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--expert-packed-dir")) {
+            cmd.expert_packed_dir = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--expert-parallel")) {
+            cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         }
@@ -477,6 +487,10 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.smelt_cache_mb = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--mlock-backbone")) {
             cmd.mlock_backbone = true;
+        } else if (std.mem.eql(u8, flag, "--expert-packed-dir")) {
+            cmd.expert_packed_dir = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--expert-parallel")) {
+            cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         } else if (std.mem.eql(u8, flag, "--raw")) {
@@ -802,6 +816,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
         .load_mode = smelt_strategy,
         .cache_budget_mb = cmd.smelt_cache_mb,
         .mlock_backbone = cmd.mlock_backbone,
+        .packed_dir = cmd.expert_packed_dir,
+        .max_parallel = cmd.expert_parallel,
     };
 
     // In stream mode, use selective loading via TensorIndex + mmap.
@@ -943,6 +959,8 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
             "mxfp4", // switch_mlp uses mxfp4 (no biases, uint8 scales)
             ds_config.swiglu_limit,
             cmd.smelt_cache_mb,
+            cmd.expert_packed_dir,
+            cmd.expert_parallel,
         );
         expert_sp = sp;
 

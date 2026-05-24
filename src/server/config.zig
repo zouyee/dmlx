@@ -43,7 +43,9 @@ pub const ServerConfig = struct {
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload",
-    smelt_cache_mb: usize = 2048,
+    smelt_cache_mb: usize = 0, // 0 = Trust OS (no custom cache, recommended)
     mlock_backbone: bool = false,
     prefix_cache_entries: usize = 16,
+    expert_packed_dir: ?[]const u8 = null,
+    expert_parallel: usize = 6,
 };

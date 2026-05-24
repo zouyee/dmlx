@@ -8,15 +8,15 @@
 #   bash scripts/run_benchmark.sh [model_path] [smelt_experts] [cache_mb]
 #
 # Examples:
-#   bash scripts/run_benchmark.sh                              # defaults (0.20, 6GB)
-#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.20 6144
+#   bash scripts/run_benchmark.sh                              # defaults (0.20, 0 = Trust OS)
+#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.20 0
 # ============================================================
 
 set -uo pipefail
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 SMELT_EXPERTS="${2:-0.20}"
-CACHE_MB="${3:-6144}"
+CACHE_MB="${3:-0}"
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${DIR}/.." && pwd)"

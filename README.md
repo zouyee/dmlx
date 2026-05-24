@@ -27,9 +27,9 @@ make
   --prompt "Explain quantum computing in one sentence" \
   --smelt --smelt-experts 0.2
 
-# Serve (OpenAI-compatible API)
+# Serve (OpenAI-compatible API, Trust OS mode — no custom cache)
 ./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
-  --port 8080 --smelt --smelt-experts 0.2 --smelt-cache 6144
+  --port 8080 --smelt --smelt-experts 0.2
 
 # Query the server
 curl http://localhost:8080/v1/chat/completions \
@@ -41,28 +41,28 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Performance
 
-**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: SMELT 20%
+**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: SMELT 20%, Trust OS
 
 | Metric | Value |
 |--------|-------|
-| Throughput (server-side) | **18-26 tok/s** |
-| Steady-state ITL | 53 ms |
-| Prefill (first token) | 80 ms |
-| Prefix cache hit TTFR reduction | 25-48% |
-| Memory usage | ~8 GB (SMELT 20%) |
-| 7-prompt correctness | 7/7 PASS |
+| Throughput (steady-state) | **~1.0 tok/s** (97.7s/100tok client) |
+| Server-side throughput | **44.7 tok/s** (internal, GPU-bound) |
+| Steady-state ITL | ~17 ms |
+| Memory usage | ~1.9 GB (Trust OS) |
+| 7-prompt correctness | 4/7 PASS (factual ok, math varies) |
+
+> **Trust OS (cache=0) is the recommended default.** Empirical testing shows it outperforms custom ExpertCache by 3-4x on first-request latency and uses 3.6x less memory. This mirrors flash-moe's finding: deleting custom cache → +38% tok/s. See [alignment analysis](docs/analysis/flash-moe-alignment-analysis.md).
 
 <details>
 <summary><b>Optimization history</b></summary>
 
-| Metric | Initial | Current | Improvement |
-|--------|---------|---------|-------------|
-| Prefill | 716ms | 80ms | +89% |
-| Steady-state ITL | 125ms | 53ms | +58% |
-| Throughput | 8 tok/s | 18-26 tok/s | +125-225% |
+| Metric | Initial (cached) | Current (Trust OS) | Notes |
+|--------|-----------------|-------------------|-------|
+| Client 100-token | 193s | **97.7s** | +98% faster |
+| First-request TTFR | 113s | **28s** | +304% faster |
+| Server RSS | 4.7GB | **1.9GB** | -59% memory |
+| Server tok/s (1st) | 11.1 | **44.7** | +303% (Trust OS no cache overhead) |
 
-[Full benchmark report](docs/en/analysis/performance-benchmark.md)
-</details>
 
 ---
 
@@ -96,7 +96,7 @@ Full model (568GB BF16)
 <details>
 <summary><b>Layer 1: MoE Expert Streaming (138GB → 10GB)</b></summary>
 
-DeepSeek V4 activates top-6 of 256 experts per token. dmlx loads only active experts on-demand from SSD via mmap + pread, with LRU caching and next-layer prefetching.
+DeepSeek V4 activates top-6 of 256 experts per token. dmlx loads only active experts on-demand from SSD via pread (Trust OS mode — no custom cache, relying on macOS page cache). Expert caching is available via `--smelt-cache <MB>` for larger RAM configurations.
 
 ```
 Source: src/models/expert_stream.zig | src/models/expert_cache.zig
@@ -186,7 +186,15 @@ git clone https://github.com/zouyee/dmlx.git
 cd dmlx
 make              # Build (ReleaseFast)
 make test         # Unit tests (400+)
-make benchmark    # Performance regression test
+make benchmark    # Full benchmark (build + unit tests + perf + 7-prompt e2e + report)
+make check        # Everything: build + test + verify + benchmark
+```
+
+The benchmark script is the single source of truth for performance and correctness:
+
+```bash
+bash scripts/run_benchmark.sh                          # defaults: 0.20 experts, Trust OS (cache=0)
+bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.15 0   # custom config
 ```
 
 **As a Zig dependency** (`build.zig.zon`):
@@ -210,7 +218,7 @@ src/
 ├── models/                 # DeepSeek V4, LLaMA, Qwen, Gemma, ...
 │   ├── deepseek_v4.zig    # MLA + CSA/HCA + MoE (3K lines)
 │   ├── expert_stream.zig  # On-demand expert loading from SSD
-│   └── expert_cache.zig   # LFU expert cache
+│   └── expert_cache.zig   # Expert cache (disabled by default — Trust OS)
 ├── engine/                 # Inference engine
 │   ├── engine_loop.zig    # Main loop + prefix cache integration
 │   └── prefix_cache.zig   # LRU prefix cache

@@ -1,5 +1,18 @@
 #!/bin/bash
+# DEPRECATED: This script is obsolete. Use scripts/run_benchmark.sh instead.
 # Performance regression test for DeepSeek V4 stream mode.
+#
+# ⚠️  DEPRECATED: Use scripts/run_benchmark.sh for all benchmarking and
+#    correctness verification. This script is kept for reference only.
+#    See docs/en/analysis/performance-benchmark.md for latest results.
+#
+echo "❌ ERROR: scripts/performance_regression.sh is deprecated."
+echo "   Use: bash scripts/run_benchmark.sh"
+exit 1
+
+# ------------------------------------------------------------------
+# OLD CODE (kept for reference, never executed due to exit above)
+# ------------------------------------------------------------------
 #
 # Measures TTFT (time-to-first-token) and ITL (inter-token latency),
 # saves results to a JSON baseline file, and compares against historical

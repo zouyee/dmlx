@@ -1,8 +1,21 @@
 #!/bin/bash
+# DEPRECATED: This script is obsolete. Use scripts/run_benchmark.sh instead.
 # End-to-end correctness tests using dmlx server mode.
 #
 # This avoids reloading the 141GB model for every test by starting the
 # server once and sending requests via HTTP API.
+#
+# ⚠️  DEPRECATED: Use scripts/run_benchmark.sh for all benchmarking and
+#    correctness verification. This script is kept for reference only.
+#    See docs/en/analysis/performance-benchmark.md for latest results.
+#
+echo "❌ ERROR: scripts/e2e_server.sh is deprecated."
+echo "   Use: bash scripts/run_benchmark.sh"
+exit 1
+
+# ------------------------------------------------------------------
+# OLD CODE (kept for reference, never executed due to exit above)
+# ------------------------------------------------------------------
 #
 # Server KV cache compatibility: the server now creates specialized per-layer
 # KV caches for DeepSeek V4 (DeepseekV4Cache / RotatingWithWindow) matching
@@ -74,9 +87,11 @@ start_server() {
 
     echo "   Server PID: ${SERVER_PID}"
 
-    # Wait for server to be ready (max 300s for model loading)
+    # Wait for server to be ready (max 180s for model loading + warmup)
+    # NOTE: After the mmap deadlock fix in expert_stream.zig, cached-mode
+    # startup completes in ~70-90s. 180s provides comfortable headroom.
     local retries=0
-    local max_retries=300
+    local max_retries=180
     while [ ${retries} -lt ${max_retries} ]; do
         if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
             echo -e "${GREEN}✅ Server ready${NC}"

@@ -87,10 +87,9 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     installSignalHandlers();
     std.log.info("Signal handlers installed (SIGTERM, SIGINT)", .{});
 
-    // Warmup expert cache BEFORE starting the accept loop.
-    // This pre-populates the cache so the first user request doesn't trigger
-    // massive SSD I/O that blocks the Zig IO event loop for 50+ seconds.
-    engine_loop.warmupExpertCache();
+    // Warmup: generate tokens to force backbone page-in before accepting connections.
+    // This absorbs the ~9s cold-page-in cost that would otherwise hit the first real request.
+    engine_loop.warmupBackbone();
 
     // Start the accept loop in an async fiber.
     // Note: OS threads were tested (87943c0) but provided no improvement —
@@ -137,16 +136,26 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
     std.log.info("DMLX server listening on http://0.0.0.0:{d}", .{server_config.port});
 
     while (!engine.isShutdownRequested()) {
+        const t_accept_start = std.c.mach_absolute_time();
         const connection = listener.accept(io) catch |err| {
             if (engine.isShutdownRequested()) break;
             std.log.err("Failed to accept connection: {}", .{err});
             continue;
         };
+        const t_accept_done = std.c.mach_absolute_time();
+        const accept_ms = @as(f64, @floatFromInt(t_accept_done - t_accept_start)) / 1_000_000.0;
+        std.log.info("[ACCEPT] Connection accepted (accept took {d:.1}ms)", .{accept_ms});
         // Set socket to non-blocking mode for async fiber I/O.
         const fc = @cImport(@cInclude("fcntl.h"));
         const flags = fc.fcntl(connection.socket.handle, fc.F_GETFL, @as(c_int, 0));
         _ = fc.fcntl(connection.socket.handle, fc.F_SETFL, @as(c_int, flags | fc.O_NONBLOCK));
+        const t_async_start = std.c.mach_absolute_time();
         _ = io.async(http.handleConnection, .{ allocator, io, server_state, connection, server_config });
+        const t_async_done = std.c.mach_absolute_time();
+        const async_ms = @as(f64, @floatFromInt(t_async_done - t_async_start)) / 1_000_000.0;
+        if (async_ms > 10.0) {
+            std.log.warn("[ACCEPT] io.async blocked for {d:.1}ms (thread pool full?)", .{async_ms});
+        }
     }
 
     std.log.info("Accept loop stopped, no longer accepting new connections.", .{});

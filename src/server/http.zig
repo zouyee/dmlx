@@ -27,6 +27,12 @@ fn handleRequest(
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
 ) !void {
+    const t_handler_enter = std.c.mach_absolute_time();
+    defer {
+        const t_handler_exit = std.c.mach_absolute_time();
+        const handler_ms = @as(f64, @floatFromInt(t_handler_exit - t_handler_enter)) / 1_000_000.0;
+        std.log.info("[HTTP] Handler lifetime: {d:.1}ms", .{handler_ms});
+    }
     // Use a growable DynamicBuffer instead of a fixed 64KB stack buffer.
     // Max size 16MB — requests larger than this are rejected with PayloadTooLarge.
     var dyn_buf = DynamicBuffer.init(16 * 1024 * 1024);
@@ -49,6 +55,7 @@ fn handleRequest(
     // a production-grade HTTP framework is not yet available, std.posix.read
     // + O_NONBLOCK + explicit timeout is the most robust approach.
     var expected_total: ?usize = null;
+    const t_http_enter = std.c.mach_absolute_time();
     const read_start = std.Io.Timestamp.now(io, .awake);
     const read_timeout_ns: i96 = 5_000_000_000; // 5 seconds total read timeout
     while (true) {
@@ -95,8 +102,10 @@ fn handleRequest(
     }
 
     if (dyn_buf.len() == 0) return;
+    const t_read_done = std.c.mach_absolute_time();
+    const read_ms = @as(f64, @floatFromInt(t_read_done - t_http_enter)) / 1_000_000.0;
     const request = dyn_buf.items();
-    std.log.info("[HTTP] Request received: {d} bytes", .{dyn_buf.len()});
+    std.log.info("[HTTP] Request received: {d} bytes (read={d:.1}ms)", .{ dyn_buf.len(), read_ms });
 
     const libc = @cImport(@cInclude("unistd.h"));
     const msg = "[HTTP] Request received\n";
@@ -163,9 +172,15 @@ fn handleRequest(
             if (parsed.value.stream orelse false) {
                 try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
             } else {
+                const t0 = std.c.mach_absolute_time();
                 const response = try generateChatCompletion(allocator, io, state, body, server_config);
                 defer allocator.free(response);
+                const t1 = std.c.mach_absolute_time();
                 try writeJsonResponse(connection, io, 200, response);
+                const t2 = std.c.mach_absolute_time();
+                const gen_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
+                const write_ms = @as(f64, @floatFromInt(t2 - t1)) / 1_000_000.0;
+                std.log.info("[TIMING] generateChatCompletion={d:.1}ms writeResponse={d:.1}ms", .{ gen_ms, write_ms });
             }
         } else {
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
@@ -200,7 +215,7 @@ fn handleRequest(
 // ------------------------------------------------------------------
 
 pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) !void {
-    var status_buf: [32]u8 = undefined;
+    _ = io;
     const status_text = switch (status) {
         200 => "OK",
         400 => "Bad Request",
@@ -208,20 +223,23 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
         503 => "Service Unavailable",
         else => "Error",
     };
-    const status_line = try std.fmt.bufPrint(&status_buf, "HTTP/1.1 {d} {s}\r\n", .{ status, status_text });
 
-    var cl_buf: [64]u8 = undefined;
-    const cl_line = try std.fmt.bufPrint(&cl_buf, "Content-Length: {d}\r\n", .{body.len});
-
-    try streamWriteAll(connection, io, status_line);
-    try streamWriteAll(connection, io, "Content-Type: application/json\r\n");
-    try streamWriteAll(connection, io, cl_line);
-    try streamWriteAll(connection, io, "Connection: close\r\n");
-    try streamWriteAll(connection, io, "\r\n");
-    try streamWriteAll(connection, io, body);
+    // Build entire HTTP response in a single buffer, then write once.
+    var resp_buf: [8192]u8 = undefined;
+    const resp = try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, body.len, body });
+    const unistd_c = @cImport(@cInclude("unistd.h"));
+    var remaining = resp;
+    while (remaining.len > 0) {
+        const n = unistd_c.write(connection.socket.handle, remaining.ptr, remaining.len);
+        if (n < 0) return error.WriteFailed;
+        remaining = remaining[@intCast(n)..];
+    }
+    // Flush by sync'ing the fd (no-op on socket but won't hurt)
+    _ = unistd_c.fsync(connection.socket.handle);
 }
 
 pub fn streamWriteAll(stream: std.Io.net.Stream, io: std.Io, data: []const u8) !void {
+    // Fallback: use the original buffered writer.
     var buf: [4096]u8 = undefined;
     var writer = stream.writer(io, &buf);
     try writer.interface.writeAll(data);
@@ -237,6 +255,12 @@ pub fn handleConnection(
     connection: std.Io.net.Stream,
     config: ServerConfig,
 ) void {
+    const t_conn_enter = std.c.mach_absolute_time();
+    defer {
+        const t_conn_exit = std.c.mach_absolute_time();
+        const conn_ms = @as(f64, @floatFromInt(t_conn_exit - t_conn_enter)) / 1_000_000.0;
+        std.log.info("[HTTP] Connection lifetime: {d:.1}ms", .{conn_ms});
+    }
     defer connection.close(io);
     handleRequest(allocator, io, state, connection, config) catch |err| {
         std.log.err("Request error: {}", .{err});

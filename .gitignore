@@ -1,6 +1,7 @@
 # Zig build artifacts
 zig-out/
 .zig-cache/
+docs/analysis
 
 # OS files
 .DS_Store

@@ -209,7 +209,8 @@ pub const CompletionSignal = struct {
         _ = io;
         const wait_start = std.c.mach_absolute_time();
         while (true) {
-            // Try to get a token under the spinlock.
+            const counter = self.wake_counter.load(.acquire);
+
             self.acquire();
             if (self.pending_tokens.items.len > 0) {
                 const event = self.pending_tokens.orderedRemove(0);
@@ -226,11 +227,9 @@ pub const CompletionSignal = struct {
             }
             self.release();
 
-            // Poll with short sleep instead of __ulock_wait.
-            // __ulock_wait may not correctly wake threads in Zig's io.async
-            // worker thread pool. Use nanosleep(100μs) as a reliable fallback.
-            const ts = std.c.timespec{ .sec = 0, .nsec = 100_000 }; // 100μs
-            _ = std.c.nanosleep(&ts, null);
+            // Block efficiently on Darwin ulock until the engine delivers a token.
+            // 100ms safety timeout prevents indefinite hangs if a wake is missed.
+            self.waitForWake(counter, 100_000);
         }
     }
 

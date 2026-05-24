@@ -270,6 +270,11 @@ pub const SmeltConfig = struct {
     /// Prevents OS eviction during expert cache warmup, eliminating cold-start
     /// backbone page-in delay (~30-40s on 48GB Mac with 141GB model).
     mlock_backbone: bool = false,
+    /// Path to packed_experts/ directory for Flash-MoE parallel pread mode.
+    /// If null, uses default mmap-based loading.
+    packed_dir: ?[]const u8 = null,
+    /// Number of parallel pread threads (Flash-MoE mode).
+    max_parallel: usize = 6,
 
     /// Build a per-expert residency mask for the given number of experts.
     /// Caller owns the returned slice and must free with allocator.

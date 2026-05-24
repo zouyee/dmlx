@@ -1,7 +1,20 @@
 #!/bin/bash
+# DEPRECATED: This script is obsolete. Use scripts/run_benchmark.sh instead.
 # ============================================================
 # dmlx Best Test Plan — 7-Prompt Correctness Verification
 # ============================================================
+#
+# ⚠️  DEPRECATED: Use scripts/run_benchmark.sh for all benchmarking and
+#    correctness verification. This script is kept for reference only.
+#    See docs/en/analysis/performance-benchmark.md for latest results.
+#
+echo "❌ ERROR: scripts/best_test.sh is deprecated."
+echo "   Use: bash scripts/run_benchmark.sh"
+exit 1
+
+# ------------------------------------------------------------------
+# OLD CODE (kept for reference, never executed due to exit above)
+# ------------------------------------------------------------------
 # Mode: chat (thinking OFF, </think> in prompt)
 # Strategy: smelt + stream
 # Updated: 2026-05-03

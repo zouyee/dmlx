@@ -324,6 +324,8 @@ fn deepseekV4Loader(
             "mxfp4",
             dsv4_config.swiglu_limit,
             smelt.cache_budget_mb,
+            smelt.packed_dir,
+            smelt.max_parallel,
         );
 
         model_ptr.setExpertStreamProvider(sp);

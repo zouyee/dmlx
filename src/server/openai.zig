@@ -57,6 +57,7 @@ pub const ChatCompletionRequest = struct {
 };
 
 pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *ServerState, request_json: []const u8, server_config: ServerConfig) ![]u8 {
+    const t_entry = std.c.mach_absolute_time();
     // 1. Parse request
     const parsed = try std.json.parseFromSlice(ChatCompletionRequest, allocator, request_json, .{});
     defer parsed.deinit();
@@ -152,26 +153,40 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     _ = state.active_requests.fetchAdd(1, .monotonic);
     defer _ = state.active_requests.fetchSub(1, .monotonic);
 
+    const t_queued = std.c.mach_absolute_time();
+    req_state.queued_time_ns = @intCast(t_queued);
+    const prep_ms = @as(f64, @floatFromInt(t_queued - t_entry)) / 1_000_000.0;
     var node = engine.QueueNode.init(req_state);
     state.request_queue.push(&node);
-    std.log.info("[HTTP] Request {d} submitted to queue", .{request_id});
+    std.log.info("[HTTP] Request {d} submitted to queue (prepare={d:.1}ms)", .{ request_id, prep_ms });
 
     // Wait for the engine to deliver the complete response.
     var all_text = std.ArrayList(u8).empty;
     defer all_text.deinit(allocator);
 
+    const t_wait_start = std.c.mach_absolute_time();
+    var wait_call_count: usize = 0;
     while (true) {
+        wait_call_count += 1;
+        std.log.info("[OpenAI] Waiting for token...", .{});
         const event = req_state.completion.waitForToken(io) catch break;
+        std.log.info("[OpenAI] waitForToken returned", .{});
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
             if (e.token_text.len > 0) {
                 try all_text.appendSlice(allocator, e.token_text);
             }
+            std.log.info("[OpenAI] Got token, is_final={}", .{e.is_final});
             if (e.is_final) break;
         } else {
+            std.log.info("[OpenAI] waitForToken returned null", .{});
             break;
         }
     }
+
+    const t_wait_end = std.c.mach_absolute_time();
+    const wait_ms = @as(f64, @floatFromInt(t_wait_end - t_wait_start)) / 1_000_000.0;
+    std.log.info("[OpenAI] Token loop done, all_text.len={d}, wait={d:.1}ms calls={d}", .{ all_text.items.len, wait_ms, wait_call_count });
 
     // Check if the engine signaled an error.
     if (req_state.completion.hasError(io)) {

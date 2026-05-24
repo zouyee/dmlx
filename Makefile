@@ -4,8 +4,7 @@
 #   make              — Build the CLI binary
 #   make test         — Run Zig unit tests
 #   make verify       — Run DeepSeek V4 verification suite
-#   make e2e          — Run end-to-end correctness tests
-#   make benchmark    — Run performance regression test
+#   make benchmark    — Run full benchmark (build + unit test + perf + e2e + report)
 #   make check        — Run everything (build + test + verify + benchmark)
 #
 # Environment variables:
@@ -69,28 +68,12 @@ verify: build
 	"$(PROJECT_DIR)/scripts/verify-deepseek-v4-fix.sh" "$(MODEL_PATH)"
 
 # ------------------------------------------------------------------
-# End-to-end correctness
-# ------------------------------------------------------------------
-e2e: build
-	@echo ""
-	@echo "🎯 Running end-to-end correctness tests..."
-	"$(PROJECT_DIR)/scripts/e2e_correctness.sh" "$(MODEL_PATH)"
-
-# ------------------------------------------------------------------
-# Performance regression
+# Full benchmark (build + unit tests + perf + e2e + report)
 # ------------------------------------------------------------------
 benchmark: build
 	@echo ""
-	@echo "⚡ Running performance regression test..."
-	"$(PROJECT_DIR)/scripts/performance_regression.sh" "$(MODEL_PATH)"
-
-# ------------------------------------------------------------------
-# End-to-end correctness tests (server mode — faster, model loads once)
-# ------------------------------------------------------------------
-e2e-server: build
-	@echo ""
-	@echo "🎯 Running end-to-end correctness tests (server mode)..."
-	"$(PROJECT_DIR)/scripts/e2e_server.sh" "$(MODEL_PATH)"
+	@echo "⚡ Running full benchmark suite..."
+	bash "$(PROJECT_DIR)/scripts/run_benchmark.sh" "$(MODEL_PATH)"
 
 # ------------------------------------------------------------------
 # Upload benchmark results to benchmark-results branch
@@ -111,7 +94,7 @@ setup-benchmark-branch:
 # ------------------------------------------------------------------
 # Full check — everything (local only)
 # ------------------------------------------------------------------
-check: test verify e2e benchmark
+check: test verify benchmark
 	@echo ""
 	@echo "═══════════════════════════════════════════════════════════════"
 	@echo "✅ ALL CHECKS PASSED"
@@ -120,7 +103,6 @@ check: test verify e2e benchmark
 	@echo "Completed:"
 	@echo "  • Zig unit tests"
 	@echo "  • DeepSeek V4 verification (chat template + greedy correctness)"
-	@echo "  • End-to-end correctness (math, geography, common knowledge)"
-	@echo "  • Performance regression (TTFT + ITL thresholds)"
+	@echo "  • Full benchmark suite (perf + 7-prompt e2e + report)"
 	@echo ""
 	@echo "To upload results to dashboard: make upload-benchmark"

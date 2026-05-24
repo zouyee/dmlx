@@ -292,7 +292,11 @@ pub const EngineLoop = struct {
 
     fn processRequest(self: *EngineLoop, req: *RequestState) void {
         // Record start time for request latency tracking.
-        req.start_time_ns = @intCast(std.c.mach_absolute_time());
+        const engine_start = std.c.mach_absolute_time();
+        req.start_time_ns = @intCast(engine_start);
+        // Queue wait: time from HTTP push to engine pick-up
+        const queue_wait_ms = @as(f64, @floatFromInt(engine_start - req.queued_time_ns)) / 1_000_000.0;
+        std.log.info("[Engine] Request {d} dequeued, queue_wait={d:.1}ms", .{ req.id, queue_wait_ms });
 
         var caches: []KVCacheStrategy = undefined;
         var owns_caches = true;
@@ -1243,8 +1247,10 @@ pub const EngineLoop = struct {
 
     fn logRequestCompletion(io: std.Io, req: *RequestState) void {
         _ = io;
-        const end_time_ns: i128 = @intCast(std.c.mach_absolute_time());
-        const duration_ns = end_time_ns - req.start_time_ns;
+        const end_ticks = std.c.mach_absolute_time();
+        const duration_ticks = end_ticks - req.start_time_ns; // start_time_ns is actually ticks
+        // Convert ticks to ns: timebase = 125/3 on Apple Silicon
+        const duration_ns = @as(u64, @intCast(duration_ticks)) * 125 / 3;
         const duration_ms = @as(f64, @floatFromInt(duration_ns)) / 1_000_000.0;
         const prompt_len = req.prompt_tokens.len;
         const gen_len = req.token_count;
@@ -1258,32 +1264,13 @@ pub const EngineLoop = struct {
         );
     }
 
-    /// Warmup: run multiple dummy generations to pre-populate the expert cache.
-    /// This ensures the first real user request doesn't pay the full SSD loading cost.
-    ///
-    /// Strategy (Router-Aware Preloading):
-    /// Different prompts trigger different expert routing paths. By running
-    /// multiple diverse dummy prompts, we populate the cache with a wider
-    /// variety of experts. After warmup, real requests are more likely to
-    /// hit cached experts, reducing SSD I/O.
-    ///
-    /// With 5 warmup prompts × 6 experts/layer × 43 layers = ~1290 unique
-    /// expert slots cached (out of 256 × 43 = 11008 total). This covers
-    /// the most common routing paths for typical user queries.
-    pub fn warmupExpertCache(self: *EngineLoop) void {
-        if (self.dsv4_model == null) return; // Only needed for DSV4 with smelt
+    /// Warmup: generate a few tokens to force backbone page-in before real requests.
+    /// Without this, the first real request pays a ~9s backbone cold-page-in penalty.
+    /// This replaces the old expert-cache warmup removed in P2.1.
+    pub fn warmupBackbone(self: *EngineLoop) void {
+        if (self.dsv4_model == null) return;
 
-        std.log.info("[Engine] Warming up expert cache (multi-prompt prefetch)...", .{});
-
-        // Use diverse token IDs to trigger different expert routing paths.
-        // Each prompt activates different experts via the MoE router.
-        const warmup_prompts = [_][]const u32{
-            &[_]u32{1}, // BOS token
-            &[_]u32{ 1, 2, 3 }, // short sequence
-            &[_]u32{ 100, 200, 300, 400 }, // different token range
-            &[_]u32{ 1000, 2000, 3000 }, // higher token IDs
-            &[_]u32{ 50000, 60000, 70000, 80000, 90000 }, // very high IDs
-        };
+        std.log.info("[Engine] Warming up backbone (pre-generating tokens to page-in weights)...", .{});
 
         const model = self.dsv4_model.?;
         var sampler = sampling_mod.SamplerConfig{
@@ -1292,9 +1279,15 @@ pub const EngineLoop = struct {
             .prng = std.Random.DefaultPrng.init(0),
         };
 
+        // Two short prompts to touch different backbone regions.
+        const warmup_prompts = [_][]const u32{
+            &[_]u32{1}, // BOS — triggers first-layer attention + MoE
+            &[_]u32{ 1, 100, 500 }, // multi-token — triggers cross-attention
+        };
+
         for (warmup_prompts, 0..) |prompt, i| {
             const caches = self.createCaches() catch {
-                std.log.warn("[Engine] Warmup {d}: failed to create caches", .{i});
+                std.log.warn("[Engine] Warmup {d}: createCaches failed", .{i});
                 continue;
             };
             defer {
@@ -1302,7 +1295,6 @@ pub const EngineLoop = struct {
                 self.allocator.free(caches);
             }
 
-            // Generate 1 token per prompt to trigger prefill through all layers
             const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null) catch {
                 std.log.warn("[Engine] Warmup {d}: generate failed", .{i});
                 continue;
@@ -1310,7 +1302,7 @@ pub const EngineLoop = struct {
             self.allocator.free(tokens);
         }
 
-        std.log.info("[Engine] Expert cache warmup complete ({d} prompts)", .{warmup_prompts.len});
+        std.log.info("[Engine] Backbone warmup complete ({d} prompts)", .{warmup_prompts.len});
     }
 
     /// Create per-request private KV caches (used for individual prefill).
