@@ -88,10 +88,15 @@ pub const ExpertStreamProvider = struct {
     partial_reader: ?*safetensors_reader.PartialTensorReader = null,
     pread_loader: ?*expert_pread.ExpertPreadLoader = null,
 
-    // DyMoE: skip low-score cache-miss experts to reduce I/O
-    dymoe_max_skip: usize = 0, // disabled: score-free heuristic has run-to-run variance
+    // DyMoE: warmup-learned static skip mask (no scores, no variance).
+    // During warmup, track which experts ever appear in top-5 positions.
+    // After warmup, experts never-in-top-5 are skippable.
+    dymoe_max_skip: usize = 1,
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
+    dymoe_warmup_done: bool = false,
+    dymoe_top5_count: ?[][256]u32 = null, // per-layer: how often in positions 0-4
+    dymoe_total_count: ?[][256]u32 = null, // per-layer: total selections
 
     // Diagnostic counters
     total_bytes_read: u64 = 0,
@@ -99,7 +104,27 @@ pub const ExpertStreamProvider = struct {
     token_step_start_ticks: u64 = 0,
     step_bytes_read: u64 = 0,
 
+    /// Finish warmup: compute per-layer skip masks from collected expert stats.
+    /// Experts never seen in top-5 during warmup are marked skippable.
+    pub fn finishWarmup(self: *ExpertStreamProvider) void {
+        if (self.dymoe_top5_count) |t5| {
+            const tt = self.dymoe_total_count.?;
+            var total_skippable: usize = 0;
+            for (0..self.layer_meta.len) |li| {
+                for (0..256) |ei| {
+                    if (tt[li][ei] > 0 and t5[li][ei] == 0) {
+                        total_skippable += 1;
+                    }
+                }
+            }
+            std.log.info("[DyMoE] Warmup complete: {d} skippable expert slots across {d} layers", .{ total_skippable, self.layer_meta.len });
+        }
+        self.dymoe_warmup_done = true;
+    }
+
     pub fn deinit(self: *ExpertStreamProvider) void {
+        if (self.dymoe_top5_count) |t5| self.allocator.free(t5);
+        if (self.dymoe_total_count) |tt| self.allocator.free(tt);
         if (self.preload_provider) |provider| {
             provider.deinit();
             self.allocator.destroy(provider);
@@ -239,6 +264,17 @@ pub const ExpertStreamProvider = struct {
                     std.log.info("Expert streaming: parallel pread loader initialized ({s}, {d} threads)", .{ dir, max_parallel });
                 }
             },
+        }
+
+        // Allocate warmup-learned DyMoE counters (43 layers × 256 experts)
+        if (strategy == .stream and provider.dymoe_max_skip > 0) {
+            const n_layers = provider.layer_meta.len;
+            provider.dymoe_top5_count = try allocator.alloc([256]u32, n_layers);
+            provider.dymoe_total_count = try allocator.alloc([256]u32, n_layers);
+            for (0..n_layers) |i| {
+                provider.dymoe_top5_count.?[i] = [_]u32{0} ** 256;
+                provider.dymoe_total_count.?[i] = [_]u32{0} ** 256;
+            }
         }
 
         return provider;
@@ -495,50 +531,48 @@ pub const ExpertStreamProvider = struct {
         var skip_set: [256]bool = [_]bool{false} ** 256;
         var dymoe_skipped: usize = 0;
 
-        if (self.dymoe_max_skip > 0 and unique_ids.len > 2) {
-            // Score-free DyMoE: skip expert most frequently in last router position.
-            // Router outputs top-K sorted by score descending. Last column = lowest score.
-            // Verified 7/7 benchmark at threshold 0.3 (commit fb97fba).
-            var last_count: [256]u8 = [_]u8{0} ** 256;
-            var total_count: [256]u8 = [_]u8{0} ** 256;
-            const ndims = indices_u32.ndim();
-            const shape = indices_u32.shape();
-            const topk: usize = @intCast(shape[ndims - 1]);
-            for (indices_data, 0..) |eid, i| {
-                if (eid < 256) {
-                    total_count[eid] += 1;
-                    if (i % topk == topk - 1) last_count[eid] += 1;
+        // Warmup phase: record expert positions for skip mask learning.
+        if (self.dymoe_max_skip > 0 and !self.dymoe_warmup_done) {
+            if (self.dymoe_top5_count != null and self.dymoe_total_count != null) {
+                const ndims = indices_u32.ndim();
+                const shape = indices_u32.shape();
+                const topk: usize = @intCast(shape[ndims - 1]);
+                for (indices_data, 0..) |eid, i| {
+                    if (eid < 256) {
+                        self.dymoe_total_count.?[layer_idx][eid] += 1;
+                        if (i % topk < topk - 1) { // positions 0-4 = top-5
+                            self.dymoe_top5_count.?[layer_idx][eid] += 1;
+                        }
+                    }
                 }
             }
+        }
 
-            var best_eid: ?u32 = null;
-            var best_ratio: f32 = 0.3;
-            for (unique_ids) |eid| {
-                if (total_count[eid] < 2) continue;
-                const ratio = @as(f32, @floatFromInt(last_count[eid])) / @as(f32, @floatFromInt(total_count[eid]));
-                if (ratio > best_ratio) {
-                    best_ratio = ratio;
-                    best_eid = eid;
-                }
-            }
-
-            if (best_eid) |eid| {
-                skip_set[eid] = true;
-                dymoe_skipped = 1;
-                for (unique_ids) |candidate| {
-                    if (!skip_set[candidate]) {
-                        load_ids_buf[load_ids_len] = candidate;
+        // Inference phase: skip experts never seen in top-5 during warmup.
+        if (self.dymoe_max_skip > 0 and self.dymoe_warmup_done and unique_ids.len > 2) {
+            if (self.dymoe_top5_count) |t5| {
+                const tt = self.dymoe_total_count.?[layer_idx];
+                const top5 = t5[layer_idx];
+                for (unique_ids) |eid| {
+                    // Skip if expert was seen >= 5 times AND NEVER in top-5.
+                    // ~24 warmup selections/layer → seen>=5 is top-20% frequent.
+                    const seen = tt[eid];
+                    if (dymoe_skipped < self.dymoe_max_skip and seen >= 5 and top5[eid] == 0) {
+                        skip_set[eid] = true;
+                        dymoe_skipped += 1;
+                    } else {
+                        load_ids_buf[load_ids_len] = eid;
                         load_ids_len += 1;
                     }
                 }
-                self.dymoe_total_skipped += 1;
-                self.dymoe_total_opportunities += 1;
-            } else {
-                @memcpy(load_ids_buf[0..unique_ids.len], unique_ids);
-                load_ids_len = unique_ids.len;
+                if (dymoe_skipped > 0) {
+                    self.dymoe_total_skipped += dymoe_skipped;
+                    self.dymoe_total_opportunities += 1;
+                }
             }
-        } else {
-            // No skip — load all unique experts
+        }
+
+        if (load_ids_len == 0) {
             @memcpy(load_ids_buf[0..unique_ids.len], unique_ids);
             load_ids_len = unique_ids.len;
         }

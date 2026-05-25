@@ -2688,6 +2688,7 @@ pub const DSV4Model = struct {
     norm: nn.RMSNorm,
     hc_head: ?HyperHead,
     lm_head: Array,
+    stream_provider: ?*expert_stream.ExpertStreamProvider = null,
 
     pub fn deinit(self: *DSV4Model) void {
         self.config.deinitClone(self.allocator);
@@ -2711,8 +2712,14 @@ pub const DSV4Model = struct {
         return false;
     }
 
+    /// Signal DyMoE warmup complete on the stream provider.
+    pub fn finishExpertWarmup(self: *DSV4Model) void {
+        if (self.stream_provider) |sp| sp.finishWarmup();
+    }
+
     /// Set expert stream provider on all MoE layers.
     pub fn setExpertStreamProvider(self: *DSV4Model, sp: *expert_stream.ExpertStreamProvider) void {
+        self.stream_provider = sp;
         for (self.layers, 0..) |*layer, i| {
             layer.ffn.stream_provider = sp;
             layer.ffn.layer_idx = i;

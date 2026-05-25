@@ -1279,10 +1279,10 @@ pub const EngineLoop = struct {
             .prng = std.Random.DefaultPrng.init(0),
         };
 
-        // Two short prompts to touch different backbone regions.
+        // Short prompts for backbone page-in + DyMoE expert stats.
         const warmup_prompts = [_][]const u32{
-            &[_]u32{1}, // BOS — triggers first-layer attention + MoE
-            &[_]u32{ 1, 100, 500 }, // multi-token — triggers cross-attention
+            &[_]u32{1},
+            &[_]u32{ 1, 100, 500 },
         };
 
         for (warmup_prompts, 0..) |prompt, i| {
@@ -1303,6 +1303,8 @@ pub const EngineLoop = struct {
         }
 
         std.log.info("[Engine] Backbone warmup complete ({d} prompts)", .{warmup_prompts.len});
+        // Signal DyMoE to compute skip masks from collected expert stats
+        if (self.dsv4_model) |m| m.finishExpertWarmup();
     }
 
     /// Create per-request private KV caches (used for individual prefill).
