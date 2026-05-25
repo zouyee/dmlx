@@ -204,13 +204,13 @@ pub const ExpertPreadLoader = struct {
             };
         }
 
-        // Dispatch: wake all threads, wait for completion
+        // Dispatch: wake all threads, wait for all tasks to complete.
         _ = pthread.pthread_mutex_lock(&self.pool.mutex);
         self.pool.num_tasks = n;
         self.pool.tasks_done = 0;
         self.pool.generation += 1;
         _ = pthread.pthread_cond_broadcast(&self.pool.work_ready);
-        while (self.pool.tasks_done < self.max_parallel) {
+        while (self.pool.tasks_done < n) {
             _ = pthread.pthread_cond_wait(&self.pool.work_done, &self.pool.mutex);
         }
         _ = pthread.pthread_mutex_unlock(&self.pool.mutex);
@@ -313,8 +313,14 @@ fn ioPoolWorker(loader: *ExpertPreadLoader, tid: usize) void {
         }
 
         _ = pthread.pthread_mutex_lock(&loader.pool.mutex);
-        loader.pool.tasks_done += 1;
-        if (loader.pool.tasks_done == loader.max_parallel) {
+        // Count completed tasks (not threads). Race-safe: only count
+        // if generation matches (slow worker from prev gen is ignored).
+        if (loader.pool.generation == gen) {
+            // Count each task we completed
+            var ti: usize = tid;
+            while (ti < n) : (ti += loader.max_parallel) {
+                loader.pool.tasks_done += 1;
+            }
             _ = pthread.pthread_cond_signal(&loader.pool.work_done);
         }
     }
