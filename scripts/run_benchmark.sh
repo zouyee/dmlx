@@ -5,11 +5,11 @@
 # Generates: docs/en/analysis/performance-benchmark.md
 #
 # Usage:
-#   bash scripts/run_benchmark.sh [model_path] [smelt_experts] [cache_mb]
+#   bash scripts/run_benchmark.sh [model_path] [smelt_experts] [cache_mb] [packed_dir] [expert_parallel]
 #
 # Examples:
-#   bash scripts/run_benchmark.sh                              # defaults (0.20, 0 = Trust OS)
-#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.20 0
+#   bash scripts/run_benchmark.sh                              # defaults (0.20, 0, packed experts)
+#   bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.20 0 "" 0  # no packed
 # ============================================================
 
 set -uo pipefail
@@ -17,6 +17,16 @@ set -uo pipefail
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 SMELT_EXPERTS="${2:-0.20}"
 CACHE_MB="${3:-0}"
+PACKED_DIR="${4:-${MODEL_PATH}/packed_experts}"
+EXPERT_PARALLEL="${5:-18}"
+
+# Validate packed expert directory
+if [ ! -d "$PACKED_DIR" ]; then
+    echo "⚠️  Packed expert directory not found: $PACKED_DIR"
+    echo "   Run: python3 scripts/repack_experts.py $MODEL_PATH"
+    PACKED_DIR=""  # fall back to safetensors
+    EXPERT_PARALLEL=0
+fi
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${DIR}/.." && pwd)"
@@ -72,13 +82,25 @@ sleep 2
 
 # Start server
 T_PERF=$(date +%s)
-"$CLI" serve \
-    --model "$MODEL_PATH" \
-    --port "$PORT" \
-    --max-tokens 256 \
-    --temperature 0 \
-    --smelt --smelt-strategy stream --smelt-experts "$SMELT_EXPERTS" \
-    --smelt-cache "$CACHE_MB" > /tmp/benchmark_serve.log 2>&1 &
+if [ -n "$PACKED_DIR" ] && [ -d "$PACKED_DIR" ]; then
+    "$CLI" serve \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --max-tokens 256 \
+        --temperature 0 \
+        --smelt --smelt-strategy stream --smelt-experts "$SMELT_EXPERTS" \
+        --smelt-cache "$CACHE_MB" \
+        --expert-packed-dir "$PACKED_DIR" \
+        --expert-parallel "$EXPERT_PARALLEL" > /tmp/benchmark_serve.log 2>&1 &
+else
+    "$CLI" serve \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --max-tokens 256 \
+        --temperature 0 \
+        --smelt --smelt-strategy stream --smelt-experts "$SMELT_EXPERTS" \
+        --smelt-cache "$CACHE_MB" > /tmp/benchmark_serve.log 2>&1 &
+fi
 SERVER_PID=$!
 
 # Wait for server ready
@@ -214,6 +236,8 @@ export BM_PERF_TOKENS="$PERF_TOKENS"
 export BM_LONG_TTFR="$LONG_TTFR"
 export BM_LONG_TOTAL="$LONG_TOTAL"
 export BM_LONG_TOKENS="$LONG_TOKENS"
+export BM_PACKED_DIR="$PACKED_DIR"
+export BM_PARALLEL="$EXPERT_PARALLEL"
 export BM_SERVER_RSS="$SERVER_RSS"
 export BM_STARTUP_SECS="$STARTUP_SECS"
 

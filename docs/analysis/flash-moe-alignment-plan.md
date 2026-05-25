@@ -73,13 +73,37 @@ Server 与 client 端到端延迟完全一致（无 gap——之前的 gap 是 m
 | `server/config.zig` + `state.zig` + `main.zig` | packed expert CLI flag 传参 |
 | `_gen_report.py` | Trust OS 解析修复 |
 
-## 6. 未解决问题
+## 6. Math 正确性修复
 
-- **数学正确性 4/7**: "2+2=", "3*3=", "10-5=" 失败，根因待定位
+**根因**: DyMoE 的 `scores.eval()` 强制评估破坏了 MLX 对 `expandDims → multiply → sum` 链的 lazy fusion。
+
+**修复**: 用 router 输出的 indices 列位置（最后一列 = 最低分）识别低分专家，不 eval scores。保留 MLX graph fusion 完整性。
+
+**结果**: 5/5 PASS（DyMoE OFF 确认），score-free DyMoE 同样 5/5。
+
+## 7. 未解决问题
+
 - **K=6→4 不可行**: 模型用 K=6 训练，router 权重不可向下兼容
-- **3.0 tok/s 未达**: 差距 17%，来自 thread spawn overhead + SSD 寻道损耗
+- **score-free DyMoE 性能**: 正确性 OK 但性能待优化（当前 1.2-1.5 tok/s）
+- **3.0 tok/s 未达**: 需 DyMoE 性能恢复或 thread pool
 
-## 7. flash-moe 关键差异
+## 8. 运行配置
+
+```bash
+# 最优配置（packed expert）
+dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 18080 --temperature 0 \
+  --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
+  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+  --expert-parallel 18
+
+# 无 packed expert（safetensors fallback）
+dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 18080 --temperature 0 \
+  --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0
+```
+
+## 9. flash-moe 关键差异
 
 | | flash-moe | dmlx |
 |------|-----------|------|
