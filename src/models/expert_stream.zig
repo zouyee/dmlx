@@ -495,44 +495,53 @@ pub const ExpertStreamProvider = struct {
         var dymoe_skipped: usize = 0;
 
         if (self.dymoe_max_skip > 0 and unique_ids.len > 2) {
-            // Score-free DyMoE: skip expert based on router position distribution.
-            // Router outputs top-K indices sorted by score (descending). The last 2
-            // columns (positions K-2, K-1) are the lowest-score experts.
+            // Score-free DyMoE v3: dual-column weighted heuristic.
+            // Router outputs top-K sorted by score (descending). Columns K-1
+            // (lowest) and K-2 (second-lowest) identify low-score experts.
             //
-            // Heuristic: for each unique expert, compute the fraction of times it
-            // appears in low-score positions (cols 4-5). Skip if consistently low.
-            // Does NOT eval scores — preserves MLX lazy fusion for correctness.
-            //
-            // Ref: DeepSeek V4 uses normalized top-K routing. The 6th expert (lowest
-            // score) has minimal contribution. DyMoE A/B test confirmed skipping 1/6
-            // has no correctness impact.
+            // Weight: last_col = 2x, second_last_col = 1x.
+            // Combined score = (last*2 + second_last) / (total*2).
+            // Threshold 0.35: expert must be in low positions >35% weighted.
+            // Requires >= 3 total appearances to filter noise.
+            // Does NOT eval scores — preserves MLX lazy fusion.
+            var last_col_count: [256]u8 = [_]u8{0} ** 256;
+            var second_last_count: [256]u8 = [_]u8{0} ** 256;
             var total_count: [256]u8 = [_]u8{0} ** 256;
-            var low_count: [256]u8 = [_]u8{0} ** 256; // appearances in last col only
             const ndims = indices_u32.ndim();
             const shape = indices_u32.shape();
             const topk: usize = @intCast(shape[ndims - 1]);
             for (indices_data, 0..) |eid, i| {
                 if (eid < 256) {
                     total_count[eid] += 1;
-                    if (i % topk == topk - 1) low_count[eid] += 1; // last col = lowest score
+                    const col = i % topk;
+                    if (col == topk - 1) last_col_count[eid] += 1;
+                    if (topk >= 2 and col == topk - 2) second_last_count[eid] += 1;
                 }
             }
 
-            // Find expert most consistently in low-score positions.
-            // Require: appears at least 2 times total, and > 40% of appearances are low.
-            var best_candidate: ?u32 = null;
-            var best_ratio: f32 = 0.5; // conservative: only skip clearly-low experts
+            // Find worst and second-worst scores (relative gap approach).
+            // Skip only when worst is a clear outlier — avoids fixed threshold
+            // perils where one prompt's "low" expert is another's critical one.
+            var worst_eid: ?u32 = null;
+            var worst_score: f32 = 0.0;
+            var second_score: f32 = 0.0;
             for (unique_ids) |eid| {
                 if (total_count[eid] < 2) continue;
-                const ratio = @as(f32, @floatFromInt(low_count[eid])) / @as(f32, @floatFromInt(total_count[eid]));
-                if (ratio > best_ratio) {
-                    best_ratio = ratio;
-                    best_candidate = eid;
+                const weighted = @as(f32, @floatFromInt(last_col_count[eid] * 2 + second_last_count[eid]));
+                const denom = @as(f32, @floatFromInt(total_count[eid] * 2));
+                const score = weighted / denom;
+                if (score > worst_score) {
+                    second_score = worst_score;
+                    worst_score = score;
+                    worst_eid = eid;
+                } else if (score > second_score) {
+                    second_score = score;
                 }
             }
 
-            if (best_candidate) |eid| {
-                skip_set[eid] = true;
+            // Skip if worst is clearly worse than second-worst (1.5x gap).
+            if (worst_eid != null and worst_score > 0.25 and worst_score > second_score * 1.5) {
+                skip_set[worst_eid.?] = true;
                 dymoe_skipped = 1;
                 for (unique_ids) |candidate| {
                     if (!skip_set[candidate]) {
