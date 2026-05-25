@@ -14,6 +14,12 @@
 
 set -uo pipefail
 
+# Purge page cache for clean baseline (requires sudo).
+# Without this, prior runs pollute the cache and skew results.
+if command -v purge &>/dev/null; then
+    sudo purge 2>/dev/null || echo "⚠️  sudo purge failed — results may be affected by prior runs"
+fi
+
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 SMELT_EXPERTS="${2:-0.20}"
 CACHE_MB="${3:-0}"
