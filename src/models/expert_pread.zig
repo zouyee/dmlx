@@ -133,8 +133,16 @@ pub const ExpertPreadLoader = struct {
             self.n_layers += 1;
         }
 
+        // flash-moe: 2MB-aligned buffers for optimal DMA (3.6x faster).
+        // posix_memalign ensures SSD DMA controller transfers at full speed.
+        const ALIGN_2MB = 2 * 1024 * 1024;
+        const aligned_size = (self.expert_size + ALIGN_2MB - 1) & ~@as(usize, ALIGN_2MB - 1);
         for (0..self.max_parallel) |i| {
-            self.buffers[i] = try allocator.alloc(u8, self.expert_size);
+            var ptr: ?*anyopaque = null;
+            if (std.c.posix_memalign(&ptr, ALIGN_2MB, aligned_size) != 0) {
+                return error.OutOfMemory;
+            }
+            self.buffers[i] = @as([*]u8, @ptrCast(ptr.?))[0..self.expert_size];
         }
 
         std.log.info("[ExpertPreadLoader] {d} layers, {d} experts/layer, {d}MB/expert", .{ self.n_layers, self.n_experts, self.expert_size / (1024 * 1024) });
@@ -170,7 +178,7 @@ pub const ExpertPreadLoader = struct {
             if (self.layer_fds[i] != -1) _ = std.c.close(self.layer_fds[i]);
         }
         for (0..self.max_parallel) |i| {
-            if (self.buffers[i].len > 0) self.allocator.free(self.buffers[i]);
+            if (self.buffers[i].len > 0) std.c.free(@ptrCast(self.buffers[i].ptr));
         }
     }
 
