@@ -719,6 +719,9 @@ pub const ExpertStreamProvider = struct {
         const reduce_mod = @import("mlx").reduce;
         const result = try reduce_mod.sumAxis(self.ctx, weighted_out, -2, false);
 
+        // Per-layer eval NOT feasible with MLX lazy evaluation.
+        // flash-moe uses deferred CMD3 for I/O-compute overlap; MLX
+        // graph is corrupted by mid-graph eval(). Framework limitation.
         // Prefetcher removed in P2.1 (depends on ExpertCache).
 
         // Log end-of-token-step metrics on the last layer
