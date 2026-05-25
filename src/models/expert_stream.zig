@@ -495,14 +495,14 @@ pub const ExpertStreamProvider = struct {
         var dymoe_skipped: usize = 0;
 
         if (self.dymoe_max_skip > 0 and unique_ids.len > 2) {
-            // Score-free DyMoE v3: dual-column weighted heuristic.
-            // Router outputs top-K sorted by score (descending). Columns K-1
-            // (lowest) and K-2 (second-lowest) identify low-score experts.
+            // Score-free DyMoE: dual-column weighted + relative-gap threshold.
+            // Router outputs sorted by score (descending). Columns K-1 (lowest)
+            // and K-2 (second-lowest) identify low-score experts.
             //
             // Weight: last_col = 2x, second_last_col = 1x.
-            // Combined score = (last*2 + second_last) / (total*2).
-            // Threshold 0.35: expert must be in low positions >35% weighted.
-            // Requires >= 3 total appearances to filter noise.
+            // Score = (last*2 + second_last) / (total*2).
+            // Skip only when worst expert is ≥ 1.5x the second-worst score
+            // AND > 0.25 absolute — clear outlier detection.
             // Does NOT eval scores — preserves MLX lazy fusion.
             var last_col_count: [256]u8 = [_]u8{0} ** 256;
             var second_last_count: [256]u8 = [_]u8{0} ** 256;
@@ -519,9 +519,6 @@ pub const ExpertStreamProvider = struct {
                 }
             }
 
-            // Find worst and second-worst scores (relative gap approach).
-            // Skip only when worst is a clear outlier — avoids fixed threshold
-            // perils where one prompt's "low" expert is another's critical one.
             var worst_eid: ?u32 = null;
             var worst_score: f32 = 0.0;
             var second_score: f32 = 0.0;
@@ -539,7 +536,6 @@ pub const ExpertStreamProvider = struct {
                 }
             }
 
-            // Skip if worst is clearly worse than second-worst (1.5x gap).
             if (worst_eid != null and worst_score > 0.25 and worst_score > second_score * 1.5) {
                 skip_set[worst_eid.?] = true;
                 dymoe_skipped = 1;
