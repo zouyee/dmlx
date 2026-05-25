@@ -81,11 +81,39 @@ Server 与 client 端到端延迟完全一致（无 gap——之前的 gap 是 m
 
 **结果**: 5/5 PASS（DyMoE OFF 确认），score-free DyMoE 同样 5/5。
 
-## 7. 未解决问题
+## 7. Math 正确性修复
 
-- **K=6→4 不可行**: 模型用 K=6 训练，router 权重不可向下兼容
-- **score-free DyMoE 性能**: 正确性 OK 但性能待优化（当前 1.2-1.5 tok/s）
-- **3.0 tok/s 未达**: 需 DyMoE 性能恢复或 thread pool
+**根因**: DyMoE 的 `scores.eval()` 强制评估破坏了 MLX lazy fusion。
+
+**修复**: score-free DyMoE——用 router indices 最后一列（最低分位置）识别低分专家，阈值 0.3（即专家在最后一列出现 >30% 时跳过）。
+
+**验证**: 7/7 PASS（benchmark），4-5/5（手动测试，有 run-to-run variance）。
+
+**性能**: safetensors ~1.1 tok/s（略低于 score-based DyMoE 的 1.3），packed expert + score-free DyMoE ~5 tok/s（warm 30-token，5.3-5.7 tok/s）。Packed expert 的 readAndAssembleAll 大幅减少了重复 I/O。
+
+## 8. 剩余可优化项（对齐 flash-moe）
+
+| 优化 | flash-moe 实现 | dmlx 状态 | 预期收益 | 复杂度 |
+|------|---------------|----------|----------|--------|
+| **Persistent I/O thread pool** | pthread pool + cond var | std.Thread.spawn per expert | +10-15% | 中 |
+| **Deferred GPU compute** | CMD3 delayed, overlaps next CMD1 | MLX serial eval() | +5-10% | 高（需 MLX 改动）|
+| **Fused Metal kernel** | 手写 FMA dequant + SwiGLU | MLX gather_qmm | +12% server | 极高 |
+| **F_NOCACHE per-file** | 标记 expert fd，不污染 cache | 已测试，packed path 无效 | <5% | 低 |
+| **Score-free DyMoE v2** | N/A（flash-moe 无此优化）| 当前 0.3 阈值 | +10-20% | 低 |
+
+**Priority**: Persistent I/O thread pool（ROI 最高）+ score-free DyMoE 阈值微调。
+
+## 9. 当前已对齐的 flash-moe 特性
+
+| flash-moe 特性 | dmlx 状态 |
+|---------------|----------|
+| Trust OS (no custom cache) | ✅ 默认 |
+| packed expert sequential layout | ✅ readAndAssembleAll |
+| parallel pread (multi-thread) | ✅ thread-per-expert |
+| DyMoE skip（减少 I/O） | ✅ score-free, 跳过 1/6 |
+| backbone warmup | ✅ 预生成 token 触发 page-in |
+| ulock_wait | ✅ 替换 nanosleep |
+| F_RDAHEAD kernel readahead | ✅ 所有 packed fd 已启用 |
 
 ## 8. 运行配置
 
