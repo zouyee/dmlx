@@ -89,7 +89,7 @@ pub const ExpertStreamProvider = struct {
     pread_loader: ?*expert_pread.ExpertPreadLoader = null,
 
     // DyMoE: skip low-score cache-miss experts to reduce I/O
-    dymoe_max_skip: usize = 1,
+    dymoe_max_skip: usize = 0, // disabled: score-free heuristic has run-to-run variance
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
 
@@ -495,17 +495,10 @@ pub const ExpertStreamProvider = struct {
         var dymoe_skipped: usize = 0;
 
         if (self.dymoe_max_skip > 0 and unique_ids.len > 2) {
-            // Score-free DyMoE: dual-column weighted + relative-gap threshold.
-            // Router outputs sorted by score (descending). Columns K-1 (lowest)
-            // and K-2 (second-lowest) identify low-score experts.
-            //
-            // Weight: last_col = 2x, second_last_col = 1x.
-            // Score = (last*2 + second_last) / (total*2).
-            // Skip only when worst expert is ≥ 1.5x the second-worst score
-            // AND > 0.25 absolute — clear outlier detection.
-            // Does NOT eval scores — preserves MLX lazy fusion.
-            var last_col_count: [256]u8 = [_]u8{0} ** 256;
-            var second_last_count: [256]u8 = [_]u8{0} ** 256;
+            // Score-free DyMoE: skip expert most frequently in last router position.
+            // Router outputs top-K sorted by score descending. Last column = lowest score.
+            // Verified 7/7 benchmark at threshold 0.3 (commit fb97fba).
+            var last_count: [256]u8 = [_]u8{0} ** 256;
             var total_count: [256]u8 = [_]u8{0} ** 256;
             const ndims = indices_u32.ndim();
             const shape = indices_u32.shape();
@@ -513,31 +506,23 @@ pub const ExpertStreamProvider = struct {
             for (indices_data, 0..) |eid, i| {
                 if (eid < 256) {
                     total_count[eid] += 1;
-                    const col = i % topk;
-                    if (col == topk - 1) last_col_count[eid] += 1;
-                    if (topk >= 2 and col == topk - 2) second_last_count[eid] += 1;
+                    if (i % topk == topk - 1) last_count[eid] += 1;
                 }
             }
 
-            var worst_eid: ?u32 = null;
-            var worst_score: f32 = 0.0;
-            var second_score: f32 = 0.0;
+            var best_eid: ?u32 = null;
+            var best_ratio: f32 = 0.3;
             for (unique_ids) |eid| {
                 if (total_count[eid] < 2) continue;
-                const weighted = @as(f32, @floatFromInt(last_col_count[eid] * 2 + second_last_count[eid]));
-                const denom = @as(f32, @floatFromInt(total_count[eid] * 2));
-                const score = weighted / denom;
-                if (score > worst_score) {
-                    second_score = worst_score;
-                    worst_score = score;
-                    worst_eid = eid;
-                } else if (score > second_score) {
-                    second_score = score;
+                const ratio = @as(f32, @floatFromInt(last_count[eid])) / @as(f32, @floatFromInt(total_count[eid]));
+                if (ratio > best_ratio) {
+                    best_ratio = ratio;
+                    best_eid = eid;
                 }
             }
 
-            if (worst_eid != null and worst_score > 0.25 and worst_score > second_score * 1.5) {
-                skip_set[worst_eid.?] = true;
+            if (best_eid) |eid| {
+                skip_set[eid] = true;
                 dymoe_skipped = 1;
                 for (unique_ids) |candidate| {
                     if (!skip_set[candidate]) {

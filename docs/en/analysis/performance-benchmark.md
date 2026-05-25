@@ -1,12 +1,12 @@
 ---
 date: 2026-05-25
-Commit: 3e11b3d (main)
+Commit: 166cccf (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
 mode: serve, smelt 0.20 + stream, ExpertCache 0MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 525s (perf 185s + e2e 327s)
+total_time: 633s (perf 157s + e2e 463s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 525s (perf 185s + e2e 327s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 1109.0 | 0 | 0 |
-| 2 | 1983.4 | 0 | 0 |
-| 3 | 4580.0 | 0 | 0 |
-| 4 | 2020.6 | 0 | 0 |
-| 5 | 899.4 | 0 | 0 |
-| 6 | 588.8 | 0 | 0 |
-| 7 | 561.3 | 0 | 0 |
-| 8 | 566.2 | 0 | 0 |
-| 9 | 574.4 | 0 | 0 |
-| 10 | 638.1 | 0 | 0 |
-| 11 | 561.2 | 0 | 0 |
-| 12 | 625.1 | 0 | 0 |
-| 13 | 577.8 | 0 | 0 |
-| 14 | 633.2 | 0 | 0 |
-| 15 | 490.9 | 0 | 0 |
+| 1 | 1028.4 | 0 | 0 |
+| 2 | 2067.6 | 0 | 0 |
+| 3 | 5848.2 | 0 | 0 |
+| 4 | 2942.1 | 0 | 0 |
+| 5 | 1182.8 | 0 | 0 |
+| 6 | 521.8 | 0 | 0 |
+| 7 | 534.1 | 0 | 0 |
+| 8 | 492.5 | 0 | 0 |
+| 9 | 463.8 | 0 | 0 |
+| 10 | 466.8 | 0 | 0 |
+| 11 | 438.6 | 0 | 0 |
+| 12 | 499.0 | 0 | 0 |
+| 13 | 477.0 | 0 | 0 |
+| 14 | 507.8 | 0 | 0 |
+| 15 | 489.8 | 0 | 0 |
 
 **Summary**:
-- Prefill (token 1): **1109.0ms**
-- Steady-state (token 3+): **390.0-16234.9ms**, avg 968.2ms
-- Throughput: **~1.0 tok/s**
+- Prefill (token 1): **1028.4ms**
+- Steady-state (token 3+): **432.7-22139.4ms**, avg 851.7ms
+- Throughput: **~1.2 tok/s**
 - Cache hit rate: **N/A (Trust OS, no custom cache)**
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 22.293618 | 22.293631 | — |
-| 100-token | 100 | 111.554516 | 111.554796 | — |
+| 30-token | 16 | 17.248255 | 17.248287 | — |
+| 100-token | 100 | 89.976596 | 89.978011 | — |
 
-### Comparison with Previous Version (3e11b3d → 3e11b3d)
+### Comparison with Previous Version (3e11b3d → 166cccf)
 
-| Metric | Previous (3e11b3d) | Current (3e11b3d) | Change |
+| Metric | Previous (3e11b3d) | Current (166cccf) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 1014.1ms | **1109.0ms** | **-9%** |
-| Steady-state avg | 917.9ms | **968.2ms** | **-5%** |
-| Throughput | ~1.1 tok/s | **~1.0 tok/s** | **-6%** |
-| Perf phase | 176s | **185s** | **-5%** |
+| Prefill | 1109.0ms | **1028.4ms** | **+7%** |
+| Steady-state avg | 968.2ms | **851.7ms** | **+12%** |
+| Throughput | ~1.0 tok/s | **~1.2 tok/s** | **+17%** |
+| Perf phase | 185s | **157s** | **+15%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -69,8 +69,8 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 | Expert cache | 0 MB |
 | mlock backbone | false |
 | Temperature | 0 (greedy) |
-| Startup time | 51s (incl. warmup) |
-| Server RSS | 2749 MB |
+| Startup time | 50s (incl. warmup) |
+| Server RSS | 2459 MB |
 | Port | 18090 |
 
 ---
@@ -79,15 +79,15 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
 | # | Result | Model Output (truncated) |
 |---|--------|--------------------------|
-| P1 | ✅ | . The user's query is "2+2=?" which is a simple arithmetic question. The correct |
-| P2 | ✅ | to the question of the capital of France. The capital of France is Paris. The ca |
-| P3 | ❌ | : I'm sorry, but I cannot provide the number of degrees Celsius at which water f |
-| P4 | ✅ | to "Earth is round" is "Yes, Earth is round." The response "No, Earth is flat" i |
-| P5 | ✅ | . The user's query is "3*3=". This is a simple multiplication problem. The answe |
-| P6 | ✅ | . The response is: 10-5=5. The response is: 10-5=5. The response is: 10- |
-| P7 | ✅ | . The capital of France is Paris. This is a well-known fact. The user's query is |
+| P1 | ✅ | . The user's query is "2+2=". This is a simple arithmetic problem. The answer is |
+| P2 | ✅ | 's capital of France is Paris.</think>Paris<｜end▁of▁sentence｜> |
+| P3 | ❌ | : I'm sorry, but I cannot provide the number you are looking for. My purpose is |
+| P4 | ❌ | .</think>. The Earth is round. This is a well-established scientific fact, suppo |
+| P5 | ✅ | . The user's query is "3*3=". This is a simple arithmetic multiplication problem |
+| P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
+| P7 | ❌ | a. 1. 2. 3. 4. 5. 6. 7. 8. 9. |
 
-**6/7 PASS, 1 FAIL**
+**4/7 PASS, 3 FAIL**
 
 ---
 
@@ -101,16 +101,16 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (3e11b3d) | Current (3e11b3d) | Change |
+| Metric | Previous (3e11b3d) | Current (166cccf) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 1014.1ms | **1109.0ms** | **-9%** |
-| Steady-state ITL | 917.9ms | **968.2ms** | **-5%** |
-| Steady-state tok/s | ~1.1 | **~1.0** | **-6%** |
+| Prefill latency | 1109.0ms | **1028.4ms** | **+7%** |
+| Steady-state ITL | 968.2ms | **851.7ms** | **+12%** |
+| Steady-state tok/s | ~1.0 | **~1.2** | **+17%** |
 | Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
-| 100-token HTTP total | — | **111.554796s** | — |
-| Server RSS | — | **2749 MB** | — |
-| Startup time | — | **51s** | — |
-| 7-Prompt pass rate | 7/7 | **6/7** | — |
+| 100-token HTTP total | — | **89.978011s** | — |
+| Server RSS | — | **2459 MB** | — |
+| Startup time | — | **50s** | — |
+| 7-Prompt pass rate | 7/7 | **4/7** | — |
 
 ---
 
