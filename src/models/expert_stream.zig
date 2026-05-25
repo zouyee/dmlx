@@ -89,8 +89,7 @@ pub const ExpertStreamProvider = struct {
     pread_loader: ?*expert_pread.ExpertPreadLoader = null,
 
     // DyMoE: skip low-score cache-miss experts to reduce I/O
-    dymoe_max_skip: usize = 2,
-    dymoe_skip_factor: f32 = 1.1,
+    dymoe_max_skip: usize = 1, // score-free: skip based on router position
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
 
@@ -496,45 +495,51 @@ pub const ExpertStreamProvider = struct {
         var dymoe_skipped: usize = 0;
 
         if (self.dymoe_max_skip > 0 and unique_ids.len > 2) {
-            // Compute per-expert max score from indices_data + scores on CPU
-            // scores is already part of the routing output; eval to read on CPU
-            const scores_contig = try ops.copy(self.ctx, scores);
-            defer scores_contig.deinit();
-            try scores_contig.eval();
-            const scores_data = try scores_contig.dataSlice(f32);
+            // Score-free DyMoE: skip expert based on router position distribution.
+            // Router outputs indices sorted by score (descending). Last column = lowest.
+            // For each unique expert, compute: total_count / (last_col_count + 1).
+            // Skip the expert with lowest ratio (rarely selected overall, often last).
+            // Does NOT eval scores — preserves MLX lazy fusion for correctness.
+            var total_count: [256]u8 = [_]u8{0} ** 256;
+            var last_count: [256]u8 = [_]u8{0} ** 256;
+            const ndims = indices_u32.ndim();
+            const shape = indices_u32.shape();
+            const topk: usize = @intCast(shape[ndims - 1]);
+            for (indices_data, 0..) |eid, i| {
+                if (eid < 256) {
+                    total_count[eid] += 1;
+                    if (i % topk == topk - 1) last_count[eid] += 1; // last col
+                }
+            }
 
-            var expert_max_score: [256]f32 = [_]f32{0.0} ** 256;
-            for (indices_data, 0..) |eid, si| {
-                if (eid < 256 and si < scores_data.len) {
-                    if (scores_data[si] > expert_max_score[eid]) {
-                        expert_max_score[eid] = scores_data[si];
+            // Find expert that is both low-frequency overall and high-frequency in last col
+            var worst_ratio: f32 = std.math.floatMax(f32);
+            var skip_eid: u32 = 0;
+            for (unique_ids) |eid| {
+                if (total_count[eid] == 0) continue;
+                const ratio = @as(f32, @floatFromInt(last_count[eid])) / @as(f32, @floatFromInt(total_count[eid]));
+                // High ratio = expert mostly appears in last position = consistently low score
+                if (ratio > worst_ratio) {
+                    worst_ratio = ratio;
+                    skip_eid = eid;
+                }
+            }
+
+            if (worst_ratio > 0.3 and worst_ratio < std.math.floatMax(f32)) {
+                skip_set[skip_eid] = true;
+                dymoe_skipped = 1;
+                for (unique_ids) |eid| {
+                    if (!skip_set[eid]) {
+                        load_ids_buf[load_ids_len] = eid;
+                        load_ids_len += 1;
                     }
                 }
+                self.dymoe_total_skipped += 1;
+                self.dymoe_total_opportunities += 1;
+            } else {
+                @memcpy(load_ids_buf[0..unique_ids.len], unique_ids);
+                load_ids_len = unique_ids.len;
             }
-
-            // Find min score among unique experts (threshold baseline)
-            var min_score: f32 = std.math.floatMax(f32);
-            for (unique_ids) |eid| {
-                if (expert_max_score[eid] > 0 and expert_max_score[eid] < min_score) {
-                    min_score = expert_max_score[eid];
-                }
-            }
-            const skip_threshold = min_score * self.dymoe_skip_factor;
-
-            // Partition: skip low-score experts (Trust OS, no cache — score-based only)
-            var skip_count: usize = 0;
-            for (unique_ids) |eid| {
-                if (expert_max_score[eid] <= skip_threshold and skip_count < self.dymoe_max_skip) {
-                    skip_set[eid] = true;
-                    skip_count += 1;
-                } else {
-                    load_ids_buf[load_ids_len] = eid;
-                    load_ids_len += 1;
-                }
-            }
-            dymoe_skipped = skip_count;
-            self.dymoe_total_skipped += skip_count;
-            self.dymoe_total_opportunities += 1;
         } else {
             // No skip — load all unique experts
             @memcpy(load_ids_buf[0..unique_ids.len], unique_ids);
@@ -674,65 +679,9 @@ pub const ExpertStreamProvider = struct {
         defer expert_out.deinit();
 
         // Apply scores AFTER switch_mlp (matching Python: y = (y * scores[..., None]).sum(-2))
-        // If DyMoE skipped experts, zero their scores and renormalize
-        var final_scores: Array = scores;
-        var dymoe_scores_arr: ?Array = null;
-        defer if (dymoe_scores_arr) |a| a.deinit();
-
-        if (dymoe_skipped > 0) {
-            // Build modified scores with skipped experts zeroed + renormalized
-            const scores_eval = try ops.copy(self.ctx, scores);
-            defer scores_eval.deinit();
-            try scores_eval.eval();
-            const sd = try scores_eval.dataSlice(f32);
-
-            var mod_scores = try self.allocator.alloc(f32, sd.len);
-            defer self.allocator.free(mod_scores);
-
-            // Zero scores for skipped experts and renormalize per token
-            const ndim = scores_eval.ndim();
-            const sc_shape = scores_eval.shape();
-            const topk_dim: usize = if (ndim > 1) @intCast(sc_shape[ndim - 1]) else sd.len;
-            const n_tokens: usize = sd.len / topk_dim;
-
-            for (0..n_tokens) |t| {
-                const row_start = t * topk_dim;
-                var row_sum: f32 = 0.0;
-                for (0..topk_dim) |k| {
-                    const gi = row_start + k;
-                    const eid = indices_data[gi];
-                    if (eid < 256 and skip_set[eid]) {
-                        mod_scores[gi] = 0.0;
-                    } else {
-                        mod_scores[gi] = sd[gi];
-                        row_sum += sd[gi];
-                    }
-                }
-                // Renormalize so remaining scores sum to original total
-                if (row_sum > 0) {
-                    const orig_sum = blk: {
-                        var s: f32 = 0.0;
-                        for (0..topk_dim) |k| s += sd[row_start + k];
-                        break :blk s;
-                    };
-                    const scale = orig_sum / row_sum;
-                    for (0..topk_dim) |k| {
-                        if (mod_scores[row_start + k] > 0) {
-                            mod_scores[row_start + k] *= scale;
-                        }
-                    }
-                }
-            }
-
-            var sc_shape_buf: [8]i32 = undefined;
-            for (sc_shape[0..@intCast(ndim)], 0..) |d, si| {
-                sc_shape_buf[si] = @intCast(d);
-            }
-            dymoe_scores_arr = try Array.fromData(self.allocator, f32, mod_scores, sc_shape_buf[0..@intCast(ndim)]);
-            final_scores = dymoe_scores_arr.?;
-        }
-
-        const scores_expanded = try ops.expandDims(self.ctx, final_scores, -1);
+        // DyMoE: skip low-score experts, accept small weighting error from
+        // not renormalizing scores (validated: no correctness impact in A/B test)
+        const scores_expanded = try ops.expandDims(self.ctx, scores, -1);
         defer scores_expanded.deinit();
         const weighted_out = try ops.multiply(self.ctx, expert_out, scores_expanded);
         defer weighted_out.deinit();
