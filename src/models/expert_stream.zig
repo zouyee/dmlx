@@ -235,6 +235,7 @@ pub const ExpertStreamProvider = struct {
                     const loader = try allocator.create(expert_pread.ExpertPreadLoader);
                     loader.* = try expert_pread.ExpertPreadLoader.init(allocator, dir, max_parallel);
                     provider.pread_loader = loader;
+                    try loader.startPool(); // persistent I/O threads (flash-moe pattern)
                     std.log.info("Expert streaming: parallel pread loader initialized ({s}, {d} threads)", .{ dir, max_parallel });
                 }
             },

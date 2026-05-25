@@ -15,9 +15,33 @@ const shape_mod = @import("mlx").shape;
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const unistd = @cImport(@cInclude("unistd.h"));
+const pthread = @cImport(@cInclude("pthread.h"));
 
 const MAX_PARALLEL: usize = 18;
 const MAX_LAYERS: usize = 64;
+
+/// Per-expert I/O task for the persistent thread pool.
+const IOTask = struct {
+    fd: c_int,
+    buf: [*]u8,
+    size: usize,
+    offset: i64,
+    result: isize,
+};
+
+/// Persistent I/O thread pool (flash-moe pattern).
+/// Eliminates pthread_create/join overhead per expert per layer.
+const IOPool = struct {
+    mutex: pthread.pthread_mutex_t,
+    work_ready: pthread.pthread_cond_t,
+    work_done: pthread.pthread_cond_t,
+    tasks: [MAX_PARALLEL]IOTask,
+    num_tasks: usize,
+    tasks_done: usize,
+    generation: usize,
+    shutdown: bool,
+    threads: [MAX_PARALLEL]std.Thread,
+};
 
 pub const ExpertPreadLoader = struct {
     allocator: std.mem.Allocator,
@@ -27,6 +51,7 @@ pub const ExpertPreadLoader = struct {
     n_experts: usize,
     buffers: [MAX_PARALLEL][]u8,
     max_parallel: usize,
+    pool: IOPool,
     component_offsets: [6]usize,
     component_sizes: [6]usize,
     layer_idx_to_packed: [MAX_LAYERS]?usize,
@@ -40,6 +65,7 @@ pub const ExpertPreadLoader = struct {
             .n_experts = 256,
             .buffers = undefined,
             .max_parallel = @min(max_parallel, MAX_PARALLEL),
+            .pool = undefined,
             .component_offsets = [_]usize{0} ** 6,
             .component_sizes = [_]usize{0} ** 6,
             .layer_idx_to_packed = [_]?usize{null} ** MAX_LAYERS,
@@ -111,11 +137,35 @@ pub const ExpertPreadLoader = struct {
             self.buffers[i] = try allocator.alloc(u8, self.expert_size);
         }
 
-        std.log.info("[ExpertPreadLoader] {d} layers, {d} experts/layer, {d}MB/expert, {d} threads", .{ self.n_layers, self.n_experts, self.expert_size / (1024 * 1024), self.max_parallel });
+        std.log.info("[ExpertPreadLoader] {d} layers, {d} experts/layer, {d}MB/expert", .{ self.n_layers, self.n_experts, self.expert_size / (1024 * 1024) });
         return self;
     }
 
+    /// Start persistent I/O thread pool. Must be called AFTER the loader
+    /// is stored at a stable heap address (self pointer must outlive threads).
+    pub fn startPool(self: *ExpertPreadLoader) !void {
+        _ = pthread.pthread_mutex_init(&self.pool.mutex, null);
+        _ = pthread.pthread_cond_init(&self.pool.work_ready, null);
+        _ = pthread.pthread_cond_init(&self.pool.work_done, null);
+        self.pool.num_tasks = 0;
+        self.pool.tasks_done = 0;
+        self.pool.generation = 0;
+        self.pool.shutdown = false;
+        for (0..self.max_parallel) |i| {
+            self.pool.threads[i] = try std.Thread.spawn(.{}, ioPoolWorker, .{ self, i });
+        }
+        std.log.info("[ExpertPreadLoader] I/O pool started: {d} threads", .{self.max_parallel});
+    }
+
     pub fn deinit(self: *ExpertPreadLoader) void {
+        _ = pthread.pthread_mutex_lock(&self.pool.mutex);
+        self.pool.shutdown = true;
+        _ = pthread.pthread_cond_broadcast(&self.pool.work_ready);
+        _ = pthread.pthread_mutex_unlock(&self.pool.mutex);
+        for (0..self.max_parallel) |i| {
+            self.pool.threads[i].join();
+        }
+
         for (0..self.n_layers) |i| {
             if (self.layer_fds[i] != -1) _ = std.c.close(self.layer_fds[i]);
         }
@@ -128,27 +178,38 @@ pub const ExpertPreadLoader = struct {
         return layer_idx < MAX_LAYERS and self.layer_idx_to_packed[layer_idx] != null;
     }
 
-    /// Read experts via parallel pread threads.
+    /// Read experts via persistent I/O thread pool (flash-moe pattern).
+    /// Eliminates pthread_create/join per expert per layer (200+/token).
     fn readExperts(self: *ExpertPreadLoader, layer_idx: usize, expert_ids: []const u32) !usize {
         const packed_idx = self.layer_idx_to_packed[layer_idx] orelse return error.LayerNotFound;
         const fd = self.layer_fds[packed_idx];
         const n = @min(expert_ids.len, self.max_parallel);
 
-        var threads: [MAX_PARALLEL]?std.Thread = .{null} ** MAX_PARALLEL;
-        var results: [MAX_PARALLEL]isize = .{0} ** MAX_PARALLEL;
-
+        // Set up tasks for the pool
         for (0..n) |i| {
-            const offset: i64 = @intCast(@as(u64, expert_ids[i]) * self.expert_size);
-            threads[i] = std.Thread.spawn(.{}, preadWorker, .{ fd, self.buffers[i].ptr, self.expert_size, offset, &results[i] }) catch {
-                results[i] = unistd.pread(fd, self.buffers[i].ptr, self.buffers[i].len, offset);
-                continue;
+            self.pool.tasks[i] = IOTask{
+                .fd = fd,
+                .buf = self.buffers[i].ptr,
+                .size = self.expert_size,
+                .offset = @intCast(@as(u64, expert_ids[i]) * self.expert_size),
+                .result = -1,
             };
         }
-        for (0..n) |i| if (threads[i]) |t| t.join();
+
+        // Dispatch: wake all threads, wait for completion
+        _ = pthread.pthread_mutex_lock(&self.pool.mutex);
+        self.pool.num_tasks = n;
+        self.pool.tasks_done = 0;
+        self.pool.generation += 1;
+        _ = pthread.pthread_cond_broadcast(&self.pool.work_ready);
+        while (self.pool.tasks_done < self.max_parallel) {
+            _ = pthread.pthread_cond_wait(&self.pool.work_done, &self.pool.mutex);
+        }
+        _ = pthread.pthread_mutex_unlock(&self.pool.mutex);
 
         var success: usize = 0;
         for (0..n) |i| {
-            if (results[i] == @as(isize, @intCast(self.expert_size))) success += 1;
+            if (self.pool.tasks[i].result == @as(isize, @intCast(self.expert_size))) success += 1;
         }
         return success;
     }
@@ -214,19 +275,40 @@ fn getComponentShapeDtype(component_idx: usize, n_experts: i32) struct { shape: 
     return .{ .shape = .{ n_experts, s.s0, s.s1 }, .shape_len = 3, .dtype = s.d };
 }
 
-fn preadWorker(fd: c_int, buf: [*]u8, size: usize, offset: i64, result: *isize) void {
-    const slice = buf[0..size];
-    var total: usize = 0;
-    var off = offset;
-    while (total < size) {
-        const n = unistd.pread(fd, slice[total..].ptr, slice[total..].len, off);
-        if (n < 0) {
-            result.* = -1;
-            return;
+fn ioPoolWorker(loader: *ExpertPreadLoader, tid: usize) void {
+    var gen: usize = 0;
+    _ = pthread.pthread_mutex_lock(&loader.pool.mutex);
+    while (!loader.pool.shutdown) {
+        while (loader.pool.generation == gen and !loader.pool.shutdown) {
+            _ = pthread.pthread_cond_wait(&loader.pool.work_ready, &loader.pool.mutex);
         }
-        if (n == 0) break;
-        total += @intCast(n);
-        off += @intCast(n);
+        if (loader.pool.shutdown) break;
+        gen = loader.pool.generation;
+        const n = loader.pool.num_tasks;
+        _ = pthread.pthread_mutex_unlock(&loader.pool.mutex);
+
+        // Strided work distribution (flash-moe pattern): thread `tid` processes
+        // tasks at indices tid, tid+N, tid+2N, ...
+        var i: usize = tid;
+        while (i < n) : (i += loader.max_parallel) {
+            const t = &loader.pool.tasks[i];
+            const buf = t.buf[0..t.size];
+            var total: usize = 0;
+            var off = t.offset;
+            while (total < t.size) {
+                const nr = unistd.pread(t.fd, buf[total..].ptr, buf[total..].len, off);
+                if (nr < 0 or nr == 0) break;
+                total += @intCast(nr);
+                off += @intCast(nr);
+            }
+            t.result = if (total == t.size) @intCast(total) else -1;
+        }
+
+        _ = pthread.pthread_mutex_lock(&loader.pool.mutex);
+        loader.pool.tasks_done += 1;
+        if (loader.pool.tasks_done == loader.max_parallel) {
+            _ = pthread.pthread_cond_signal(&loader.pool.work_done);
+        }
     }
-    result.* = if (total == size) @intCast(total) else -1;
+    _ = pthread.pthread_mutex_unlock(&loader.pool.mutex);
 }
