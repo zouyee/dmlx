@@ -41,27 +41,27 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Performance
 
-**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: SMELT 20%, Trust OS
+**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: SMELT 20%, Trust OS, packed experts
 
 | Metric | Value |
 |--------|-------|
-| Throughput (steady-state) | **~1.0 tok/s** (97.7s/100tok client) |
-| Server-side throughput | **44.7 tok/s** (internal, GPU-bound) |
-| Steady-state ITL | ~17 ms |
-| Memory usage | ~1.9 GB (Trust OS) |
-| 7-prompt correctness | 4/7 PASS (factual ok, math varies) |
+| Throughput (steady-state) | **~1.1 tok/s** (99.2s/100tok) |
+| 30-token latency (warm) | **~23.2s** |
+| Steady-state ITL | ~887 ms |
+| Memory usage | ~2.5 GB (Trust OS) |
+| 7-prompt correctness | **7/7 PASS** |
 
-> **Trust OS (cache=0) is the recommended default.** Empirical testing shows it outperforms custom ExpertCache by 3-4x on first-request latency and uses 3.6x less memory. This mirrors flash-moe's finding: deleting custom cache → +38% tok/s. See [alignment analysis](docs/analysis/flash-moe-alignment-analysis.md).
+> **Trust OS (cache=0) with packed experts is the recommended default.** Score-free DyMoE skips 1 expert per layer (17% I/O reduction) without breaking MLX lazy fusion. See [analysis](docs/analysis/flash-moe-alignment-plan.md).
 
 <details>
 <summary><b>Optimization history</b></summary>
 
-| Metric | Initial (cached) | Current (Trust OS) | Notes |
-|--------|-----------------|-------------------|-------|
-| Client 100-token | 193s | **97.7s** | +98% faster |
-| First-request TTFR | 113s | **28s** | +304% faster |
-| Server RSS | 4.7GB | **1.9GB** | -59% memory |
-| Server tok/s (1st) | 11.1 | **44.7** | +303% (Trust OS no cache overhead) |
+| Metric | Initial (cached) | Current (Trust OS + packed) | Notes |
+|--------|-----------------|---------------------------|-------|
+| Client 100-token | 193s | **99.2s** | +94% faster |
+| First-request TTFR | 113s | **23.2s** | +388% faster |
+| Server RSS | 4.7GB | **2.5GB** | -47% memory |
+| E2E correctness | 7/7 | **7/7** | maintained |
 
 
 ---
@@ -193,9 +193,10 @@ make check        # Everything: build + test + verify + benchmark
 The benchmark script is the single source of truth for performance and correctness:
 
 ```bash
-bash scripts/run_benchmark.sh                          # defaults: 0.20 experts, Trust OS (cache=0)
-bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.15 0   # custom config
+bash scripts/run_benchmark.sh                              # defaults: 0.20 experts, Trust OS (cache=0)
+bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.15 0  # custom smelt fraction
 ```
+Packed experts are auto-detected from `<model_path>/packed_experts/`. Generate with `scripts/repack_experts.py`.
 
 **As a Zig dependency** (`build.zig.zon`):
 
