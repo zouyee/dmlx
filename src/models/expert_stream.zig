@@ -89,7 +89,7 @@ pub const ExpertStreamProvider = struct {
     pread_loader: ?*expert_pread.ExpertPreadLoader = null,
 
     // DyMoE: skip low-score cache-miss experts to reduce I/O
-    dymoe_max_skip: usize = 1, // score-free: skip based on router position
+    dymoe_max_skip: usize = 1,
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
 
@@ -521,7 +521,7 @@ pub const ExpertStreamProvider = struct {
             // Find expert most consistently in low-score positions.
             // Require: appears at least 2 times total, and > 40% of appearances are low.
             var best_candidate: ?u32 = null;
-            var best_ratio: f32 = 0.3; // verified 7/7 PASS at this threshold
+            var best_ratio: f32 = 0.5; // conservative: only skip clearly-low experts
             for (unique_ids) |eid| {
                 if (total_count[eid] < 2) continue;
                 const ratio = @as(f32, @floatFromInt(low_count[eid])) / @as(f32, @floatFromInt(total_count[eid]));
