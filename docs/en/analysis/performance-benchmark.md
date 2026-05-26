@@ -1,12 +1,12 @@
 ---
-date: 2026-05-25
-Commit: 9f233ed (main)
+date: 2026-05-26
+Commit: 41ebe27 (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
 mode: serve, smelt 0.20 + stream, ExpertCache 0MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 758s (perf 537s + e2e 212s)
+total_time: 722s (perf 173s + e2e 511s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 758s (perf 537s + e2e 212s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 983.1 | 0 | 0 |
-| 2 | 2034.8 | 0 | 0 |
-| 3 | 5937.1 | 0 | 0 |
-| 4 | 2968.7 | 0 | 0 |
-| 5 | 1043.6 | 0 | 0 |
-| 6 | 582.4 | 0 | 0 |
-| 7 | 481.6 | 0 | 0 |
-| 8 | 509.7 | 0 | 0 |
-| 9 | 477.7 | 0 | 0 |
-| 10 | 567.2 | 0 | 0 |
-| 11 | 545.7 | 0 | 0 |
-| 12 | 556.7 | 0 | 0 |
-| 13 | 564.3 | 0 | 0 |
-| 14 | 521.5 | 0 | 0 |
-| 15 | 546.8 | 0 | 0 |
+| 1 | 992.7 | 0 | 0 |
+| 2 | 1949.0 | 0 | 0 |
+| 3 | 5592.6 | 0 | 0 |
+| 4 | 3075.3 | 0 | 0 |
+| 5 | 1315.0 | 0 | 0 |
+| 6 | 635.8 | 0 | 0 |
+| 7 | 486.5 | 0 | 0 |
+| 8 | 518.6 | 0 | 0 |
+| 9 | 478.6 | 0 | 0 |
+| 10 | 584.5 | 0 | 0 |
+| 11 | 520.5 | 0 | 0 |
+| 12 | 552.4 | 0 | 0 |
+| 13 | 575.7 | 0 | 0 |
+| 14 | 538.2 | 0 | 0 |
+| 15 | 561.2 | 0 | 0 |
 
 **Summary**:
-- Prefill (token 1): **983.1ms**
-- Steady-state (token 3+): **457.3-31745.1ms**, avg 3360.5ms
-- Throughput: **~0.3 tok/s**
+- Prefill (token 1): **992.7ms**
+- Steady-state (token 3+): **392.4-32699.6ms**, avg 885.1ms
+- Throughput: **~1.1 tok/s**
 - Cache hit rate: **N/A (Trust OS, no custom cache)**
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 25.492805 | 25.492829 | — |
-| 100-token | 100 | 458.177861 | 458.178262 | — |
+| 30-token | 30 | 25.708170 | 25.708207 | — |
+| 100-token | 100 | 94.629883 | 94.630297 | — |
 
-### Comparison with Previous Version (38482fc → 9f233ed)
+### Comparison with Previous Version (41ebe27 → 41ebe27)
 
-| Metric | Previous (38482fc) | Current (9f233ed) | Change |
+| Metric | Previous (41ebe27) | Current (41ebe27) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 980.9ms | **983.1ms** | **-0%** |
-| Steady-state avg | 886.8ms | **3360.5ms** | **-279%** |
-| Throughput | ~1.1 tok/s | **~0.3 tok/s** | **-73%** |
-| Perf phase | 174s | **537s** | **-209%** |
+| Prefill | 981.3ms | **992.7ms** | **-1%** |
+| Steady-state avg | 1595.3ms | **885.1ms** | **+45%** |
+| Throughput | ~0.6 tok/s | **~1.1 tok/s** | **+88%** |
+| Perf phase | 278s | **173s** | **+38%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -69,8 +69,8 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 | Expert cache | 0 MB |
 | mlock backbone | false |
 | Temperature | 0 (greedy) |
-| Startup time | 53s (incl. warmup) |
-| Server RSS | 0 MB |
+| Startup time | 52s (incl. warmup) |
+| Server RSS | 2362 MB |
 | Port | 18090 |
 
 ---
@@ -81,13 +81,13 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 |---|--------|--------------------------|
 | P1 | ✅ | . The user's query is "2+2=?". The assistant's response is "4". The user's query |
 | P2 | ✅ | . The capital of France is Paris. The capital of France is Paris. The capital of |
-| P3 | ❌ |  |
-| P4 | ❌ |  |
-| P5 | ❌ |  |
-| P6 | ❌ |  |
-| P7 | ❌ |  |
+| P3 | ✅ | .</think> The temperature at which water freezes is 0 degrees Celsius. This is a |
+| P4 | ✅ | , but the user's question is "Is the Earth round?" The answer is yes. The user's |
+| P5 | ✅ | . The user's query is "3*3=". This is a simple multiplication problem. The answe |
+| P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
+| P7 | ✅ | to user's query. The user's query is "What is capital of France?" The correct an |
 
-**2/7 PASS, 5 FAIL**
+**7/7 PASS, 0 FAIL**
 
 ---
 
@@ -101,17 +101,17 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (38482fc) | Current (9f233ed) | Change |
+| Metric | Previous (41ebe27) | Current (41ebe27) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 980.9ms | **983.1ms** | **-0%** |
-| Steady-state ITL | 886.8ms | **3360.5ms** | **-279%** |
-| Steady-state tok/s | ~1.1 | **~0.3** | **-73%** |
+| Prefill latency | 981.3ms | **992.7ms** | **-1%** |
+| Steady-state ITL | 1595.3ms | **885.1ms** | **+45%** |
+| Steady-state tok/s | ~0.6 | **~1.1** | **+88%** |
 | Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
-| 100-token HTTP total | — | **458.178262s** | — |
-| Server RSS | — | **0 MB** | — |
-| Startup time | — | **53s** | — |
-| 7-Prompt pass rate | 7/7 | **2/7** | — |
+| 100-token HTTP total | — | **94.630297s** | — |
+| Server RSS | — | **2362 MB** | — |
+| Startup time | — | **52s** | — |
+| 7-Prompt pass rate | 7/7 | **7/7** | — |
 
 ---
 
-*Generated by `scripts/run_benchmark.sh` on 2026-05-25*
+*Generated by `scripts/run_benchmark.sh` on 2026-05-26*

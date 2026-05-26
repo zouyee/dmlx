@@ -91,7 +91,7 @@ pub const ExpertStreamProvider = struct {
     // DyMoE: warmup-learned static skip mask (no scores, no variance).
     // During warmup, track which experts ever appear in top-5 positions.
     // After warmup, experts never-in-top-5 are skippable.
-    dymoe_max_skip: usize = 1,
+    dymoe_max_skip: usize = 0,
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
     dymoe_warmup_done: bool = false,

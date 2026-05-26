@@ -1279,7 +1279,6 @@ pub const EngineLoop = struct {
             .prng = std.Random.DefaultPrng.init(0),
         };
 
-        // Short prompts for backbone page-in + DyMoE expert stats.
         const warmup_prompts = [_][]const u32{
             &[_]u32{1},
             &[_]u32{ 1, 100, 500 },
