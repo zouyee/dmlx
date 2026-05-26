@@ -461,6 +461,27 @@ pub const ExpertStreamProvider = struct {
     /// With deduplication: ~24-34 unique experts per layer (30-50% reduction)
     /// This optimization unions routing results across all tokens before loading,
     /// significantly reducing I/O during cold start prefill.
+    /// Try Metal MoE path. Only called when metal is enabled AND packed experts loaded.
+    fn tryMetalPath(self: *ExpertStreamProvider, flat_x: Array, scores: Array, expert_ids: []const u32) ?Array {
+        const loader = self.pread_loader orelse return null;
+        const fx = ops.copy(self.ctx, flat_x) catch return null;
+        defer fx.deinit();
+        fx.eval() catch return null;
+        const hidden = fx.dataSlice(f32) catch return null;
+        const sc = ops.copy(self.ctx, scores) catch return null;
+        defer sc.deinit();
+        sc.eval() catch return null;
+        const sc_data = sc.dataSlice(f32) catch return null;
+        var ptrs: [6][*]const u8 = undefined;
+        for (0..@min(expert_ids.len, 6)) |i| ptrs[i] = loader.buffers[i].ptr;
+        var out: [4096]f32 = [_]f32{0.0} ** 4096;
+        const metal = @import("metal_moe.zig");
+        metal.forward(ptrs[0..@min(expert_ids.len, 6)], hidden, sc_data, &out) catch return null;
+        const arr = Array.fromData(self.allocator, f32, &out, &[_]i32{4096}) catch return null;
+        const result = shape_mod.reshape(self.ctx, arr, &[_]i32{ 1, 1, 4096 }) catch return null;
+        return result;
+    }
+
     fn streamingForward(
         self: *ExpertStreamProvider,
         layer_idx: usize,
@@ -686,6 +707,12 @@ pub const ExpertStreamProvider = struct {
         //   x = down_proj(activation(x_up, x_gate), idx, sorted=do_sort)
         //   if do_sort: x = _scatter_unsort(x, inv, indices.shape)
         //   return x.squeeze(-2)
+        // Metal MoE path — enabled via --metal-moe flag + packed experts
+        const metal_mod = @import("metal_moe.zig");
+        if (metal_mod.isEnabled() and use_pread and pread_ok and actual_load_ids.len <= 6) {
+            if (tryMetalPath(self, flat_x, scores, actual_load_ids)) |result| return result;
+        }
+
         const deepseek_v4 = @import("deepseek_v4.zig");
         var switch_glu = deepseek_v4.DSV4SwitchGLU{
             .ctx = self.ctx,

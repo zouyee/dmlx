@@ -87,8 +87,18 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     installSignalHandlers();
     std.log.info("Signal handlers installed (SIGTERM, SIGINT)", .{});
 
+    // Metal MoE: init and enable if flag set
+    if (server_config.metal_moe) {
+        const metal = @import("models/metal_moe.zig");
+        if (metal.init()) {
+            metal.setEnabled(true);
+            std.log.info("Metal MoE: enabled", .{});
+        } else {
+            std.log.info("Metal MoE: init failed, using MLX fallback", .{});
+        }
+    }
+
     // Warmup: generate tokens to force backbone page-in before accepting connections.
-    // This absorbs the ~9s cold-page-in cost that would otherwise hit the first real request.
     engine_loop.warmupBackbone();
 
     // Start the accept loop in an async fiber.

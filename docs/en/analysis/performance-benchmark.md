@@ -1,12 +1,12 @@
 ---
 date: 2026-05-26
-Commit: 41ebe27 (main)
+Commit: 8c670f8 (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
 mode: serve, smelt 0.20 + stream, ExpertCache 0MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 722s (perf 173s + e2e 511s)
+total_time: 653s (perf 186s + e2e 452s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 722s (perf 173s + e2e 511s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 992.7 | 0 | 0 |
-| 2 | 1949.0 | 0 | 0 |
-| 3 | 5592.6 | 0 | 0 |
-| 4 | 3075.3 | 0 | 0 |
-| 5 | 1315.0 | 0 | 0 |
-| 6 | 635.8 | 0 | 0 |
-| 7 | 486.5 | 0 | 0 |
-| 8 | 518.6 | 0 | 0 |
-| 9 | 478.6 | 0 | 0 |
-| 10 | 584.5 | 0 | 0 |
-| 11 | 520.5 | 0 | 0 |
-| 12 | 552.4 | 0 | 0 |
-| 13 | 575.7 | 0 | 0 |
-| 14 | 538.2 | 0 | 0 |
-| 15 | 561.2 | 0 | 0 |
+| 1 | 999.0 | 0 | 0 |
+| 2 | 1902.8 | 0 | 0 |
+| 3 | 5052.0 | 0 | 0 |
+| 4 | 2315.8 | 0 | 0 |
+| 5 | 798.6 | 0 | 0 |
+| 6 | 594.6 | 0 | 0 |
+| 7 | 491.0 | 0 | 0 |
+| 8 | 523.2 | 0 | 0 |
+| 9 | 467.7 | 0 | 0 |
+| 10 | 572.2 | 0 | 0 |
+| 11 | 509.0 | 0 | 0 |
+| 12 | 538.7 | 0 | 0 |
+| 13 | 555.9 | 0 | 0 |
+| 14 | 523.6 | 0 | 0 |
+| 15 | 498.4 | 0 | 0 |
 
 **Summary**:
-- Prefill (token 1): **992.7ms**
-- Steady-state (token 3+): **392.4-32699.6ms**, avg 885.1ms
-- Throughput: **~1.1 tok/s**
+- Prefill (token 1): **999.0ms**
+- Steady-state (token 3+): **412.0-35436.7ms**, avg 954.1ms
+- Throughput: **~1.0 tok/s**
 - Cache hit rate: **N/A (Trust OS, no custom cache)**
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 25.708170 | 25.708207 | — |
-| 100-token | 100 | 94.629883 | 94.630297 | — |
+| 30-token | 30 | 22.926083 | 22.926111 | — |
+| 100-token | 100 | 110.424040 | 110.425319 | — |
 
-### Comparison with Previous Version (41ebe27 → 41ebe27)
+### Comparison with Previous Version (8c670f8 → 8c670f8)
 
-| Metric | Previous (41ebe27) | Current (41ebe27) | Change |
+| Metric | Previous (8c670f8) | Current (8c670f8) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 981.3ms | **992.7ms** | **-1%** |
-| Steady-state avg | 1595.3ms | **885.1ms** | **+45%** |
-| Throughput | ~0.6 tok/s | **~1.1 tok/s** | **+88%** |
-| Perf phase | 278s | **173s** | **+38%** |
+| Prefill | 1022.1ms | **999.0ms** | **+2%** |
+| Steady-state avg | 3172.4ms | **954.1ms** | **+70%** |
+| Throughput | ~0.3 tok/s | **~1.0 tok/s** | **+249%** |
+| Perf phase | 507s | **186s** | **+63%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -69,8 +69,8 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 | Expert cache | 0 MB |
 | mlock backbone | false |
 | Temperature | 0 (greedy) |
-| Startup time | 52s (incl. warmup) |
-| Server RSS | 2362 MB |
+| Startup time | 53s (incl. warmup) |
+| Server RSS | 2766 MB |
 | Port | 18090 |
 
 ---
@@ -101,15 +101,15 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (41ebe27) | Current (41ebe27) | Change |
+| Metric | Previous (8c670f8) | Current (8c670f8) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 981.3ms | **992.7ms** | **-1%** |
-| Steady-state ITL | 1595.3ms | **885.1ms** | **+45%** |
-| Steady-state tok/s | ~0.6 | **~1.1** | **+88%** |
+| Prefill latency | 1022.1ms | **999.0ms** | **+2%** |
+| Steady-state ITL | 3172.4ms | **954.1ms** | **+70%** |
+| Steady-state tok/s | ~0.3 | **~1.0** | **+249%** |
 | Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
-| 100-token HTTP total | — | **94.630297s** | — |
-| Server RSS | — | **2362 MB** | — |
-| Startup time | — | **52s** | — |
+| 100-token HTTP total | — | **110.425319s** | — |
+| Server RSS | — | **2766 MB** | — |
+| Startup time | — | **53s** | — |
 | 7-Prompt pass rate | 7/7 | **7/7** | — |
 
 ---

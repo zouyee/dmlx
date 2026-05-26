@@ -48,4 +48,5 @@ pub const ServerConfig = struct {
     prefix_cache_entries: usize = 16,
     expert_packed_dir: ?[]const u8 = null,
     expert_parallel: usize = 6,
+    metal_moe: bool = false,
 };

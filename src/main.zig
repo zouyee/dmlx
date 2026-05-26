@@ -39,6 +39,7 @@ const ChatCommand = struct {
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
     expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
+    metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -67,6 +68,7 @@ const ServerCommand = struct {
     prefix_cache_entries: usize = 16, // Number of prefix cache entries (0 = disabled)
     expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
     expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
+    metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
     distributed: bool = false,
 };
 
@@ -203,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_entries = cmd.prefix_cache_entries,
             .expert_packed_dir = cmd.expert_packed_dir,
             .expert_parallel = cmd.expert_parallel,
+            .metal_moe = cmd.metal_moe,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -426,6 +429,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.expert_packed_dir = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--expert-parallel")) {
             cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--metal-moe")) {
+            cmd.metal_moe = true;
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         }
@@ -491,6 +496,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.expert_packed_dir = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--expert-parallel")) {
             cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--metal-moe")) {
+            cmd.metal_moe = true;
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         } else if (std.mem.eql(u8, flag, "--raw")) {
