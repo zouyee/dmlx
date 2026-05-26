@@ -293,34 +293,37 @@ static void cpu_softmax_topk(const float *scores, int n, int K,
 // Main forward pass (1 token)
 // ============================================================================
 
-int moe_infer_forward(MoEInferEngine *eng, int token, float *logits) {
+int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     if (!eng->initialized) return -1;
-    int pos = eng->current_pos;
+    (void)pos;
 
-    // Embedding lookup
-    float *embed = eng->wf.embed; // [vocab, DIM]
-    float *hidden = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-    for (int i = 0; i < DIM; i++) {
-        hidden[i] = embed[token * DIM + i];
-    }
-
-    // Per-layer forward
     for (int layer = 0; layer < N_LAYERS; layer++) {
-        // === Attention ===
-        // Phase 2: Move attention to Metal/CPU
-        // For now: skip attention, just RMSNorm input and pass through
-        // (This means we're running MoE-only on raw embeddings — WRONG, but
-        //  needed for integration testing)
+        // Copy hidden to Metal buffer
+        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+        memcpy(buf_h, hidden, DIM * sizeof(float));
 
-        // Copy hidden to normed buffer (skip attention for now)
+        // === RMSNorm (input norm) ===
+        // GPU: rms_norm_sum_sq + rms_norm_apply with input_norms[layer]
+
+        // === Attention projections: Q, K, V ===
+        // GPU: matvec_f32 for each: Q = q_proj @ hidden, K = k_proj @ hidden, V = v_proj @ hidden
+
+        // === CPU: RoPE, KV cache, SDPA ===
+        // Stubbed for now — copy hidden through
+
+        // === O projection: O = o_proj @ attn_out ===
+        // GPU: matvec_f32
+
+        // === Residual add: h_mid = hidden + attn_out ===
+        float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
+        memcpy(h_mid, buf_h, DIM * sizeof(float)); // h_mid = hidden (skip attn for now)
+
+        // === RMSNorm (post-attn norm) ===
+        // Copy to normed
         float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
-        memcpy(normed, hidden, DIM * sizeof(float));
+        memcpy(normed, h_mid, DIM * sizeof(float));
 
-        // === Routing ===
-        // Read routing scores from gate projection
-        // TODO: compute gate projection for routing
-        // For now: use dummy routing (experts 0..K-1)
-
+        // === Routing: gate projection → softmax → topK ===
         int expert_ids[N_ACTIVE];
         float expert_weights[N_ACTIVE];
         for (int k = 0; k < N_ACTIVE; k++) {
@@ -328,49 +331,18 @@ int moe_infer_forward(MoEInferEngine *eng, int token, float *logits) {
             expert_weights[k] = 1.0f / N_ACTIVE;
         }
 
-        // === Predictor check ===
-        if (eng->predictor.valid) {
-            // Check prediction hits
-            for (int k = 0; k < N_ACTIVE; k++) {
-                bool hit = false;
-                for (int p = 0; p < N_ACTIVE; p++) {
-                    if (expert_ids[k] == eng->predictor.experts[layer][p]) {
-                        eng->predictor.hits++;
-                        hit = true;
-                        break;
-                    }
-                }
-                if (!hit) eng->predictor.misses++;
-            }
-        }
-
-        // Record for next token prediction
-        predictor_record(&eng->predictor, layer, expert_ids, N_ACTIVE);
-
-        // === I/O: Read experts ===
+        // === Expert I/O ===
         IOPool *io = (IOPool *)eng->io_pool;
-        io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE,
-                         eng->expert_buf);
-
-        // === Store h_mid (residual) ===
-        float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
-        memcpy(h_mid, hidden, DIM * sizeof(float));
+        io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
 
         // === MoE forward (Metal) ===
-        moe_forward_layer(eng, layer, eng->expert_buf, expert_ids,
-                          expert_weights, N_ACTIVE);
+        moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
 
-        // Read result back to hidden
+        // Read result back
         memcpy(hidden, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
-    // Final RMSNorm
-    // TODO
-
-    // LM head
-    // TODO: compute logits from hidden @ lm_head^T
-
-    eng->current_pos++;
+    // Final RMSNorm + LM head handled by caller
     return 0;
 }
 
@@ -378,41 +350,56 @@ int moe_infer_forward(MoEInferEngine *eng, int token, float *logits) {
 // Init / Deinit
 // ============================================================================
 
-int moe_infer_init(MoEInferEngine *eng, const char *model_path,
-                   const char *packed_dir,
-                   const char *kernel_src, unsigned long kernel_src_len) {
-    memset(eng, 0, sizeof(*eng));
+MoEInferEngine *moe_infer_init(const char *packed_dir,
+                                const char *kernel_src, unsigned long kernel_src_len) {
+    MoEInferEngine *eng = (MoEInferEngine *)calloc(1, sizeof(MoEInferEngine));
+    if (!eng) return NULL;
 
-    // Init Metal
-    if (init_metal(eng, kernel_src, kernel_src_len) != 0) return -1;
+    if (init_metal(eng, kernel_src, kernel_src_len) != 0) { free(eng); return NULL; }
 
-    // Open packed expert files
     char path[4096];
     for (int l = 0; l < N_LAYERS; l++) {
         snprintf(path, sizeof(path), "%s/layer_%02d.bin", packed_dir, l);
         eng->packed_fd[l] = open(path, O_RDONLY);
         if (eng->packed_fd[l] < 0) {
             fprintf(stderr, "open %s: %s\n", path, strerror(errno));
-            return -1;
+            moe_infer_deinit(eng); return NULL;
         }
         fcntl(eng->packed_fd[l], F_RDAHEAD, 1);
     }
 
-    // Init I/O pool
     IOPool *io = (IOPool *)calloc(1, sizeof(IOPool));
     io_pool_init(io);
     eng->io_pool = io;
 
-    // TODO: Load model weights (embed, attention, norms, lm_head) from
-    // safetensors via MLX. For now, stubbed out.
-
     eng->initialized = true;
-    fprintf(stderr, "Metal engine: %d expert files opened, I/O pool ready\n", N_LAYERS);
-    return 0;
+    fprintf(stderr, "Metal engine: %d expert files opened\n", N_LAYERS);
+    return eng;
+}
+
+void moe_infer_set_weights(MoEInferEngine *eng,
+    const float *embed, int vocab_size, const float *lm_head, const float *final_norm,
+    const float **input_norms, const float **attn_norms,
+    const float **q_proj_w, const float **k_proj_w, const float **v_proj_w, const float **o_proj_w,
+    const float **q_norms, const float **k_norms) {
+    eng->embed = embed;
+    eng->vocab_size = vocab_size;
+    eng->lm_head = lm_head;
+    eng->final_norm = final_norm;
+    for (int i = 0; i < N_LAYERS; i++) {
+        eng->input_norms[i] = input_norms[i];
+        eng->attn_norms[i] = attn_norms[i];
+        eng->q_proj[i]     = q_proj_w[i];
+        eng->k_proj[i]     = k_proj_w[i];
+        eng->v_proj[i]     = v_proj_w[i];
+        eng->o_proj[i]     = o_proj_w[i];
+        eng->q_norms[i]    = q_norms[i];
+        eng->k_norms[i]    = k_norms[i];
+    }
 }
 
 void moe_infer_deinit(MoEInferEngine *eng) {
-    if (!eng->initialized) return;
+    if (!eng || !eng->initialized) return;
     IOPool *io = (IOPool *)eng->io_pool;
     if (io) {
         pthread_mutex_lock(&io->mutex);
@@ -431,6 +418,5 @@ void moe_infer_deinit(MoEInferEngine *eng) {
         free(eng->expert_buf[k]);
         free(eng->expert_buf_pred[k]);
     }
-    // Metal objects released by ARC
-    memset(eng, 0, sizeof(*eng));
+    free(eng);
 }

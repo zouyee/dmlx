@@ -54,37 +54,24 @@ typedef struct {
 } LayerConfig;
 
 // ============================================================================
-// Weight pointers (loaded from safetensors / packed experts)
+// Weight pointers (set by moe_infer_set_weights from MLX)
 // ============================================================================
 
 typedef struct {
-    // Backbone weights (CPU memory, mmap'd)
-    float *embed;                   // [vocab, DIM]
-    float *lm_head;                 // [vocab, DIM]
-    float *final_norm;              // [DIM]
-
-    // Per-layer attention weights
-    float *q_proj[N_LAYERS];        // [DIM, DIM]
-    float *k_proj[N_LAYERS];        // [DIM, KV_LORA_RANK]
-    float *v_proj[N_LAYERS];        // [DIM, KV_LORA_RANK]
-    float *o_proj[N_LAYERS];        // [DIM, DIM]
-    float *q_norm[N_LAYERS];        // [HEAD_DIM]
-    float *k_norm[N_LAYERS];        // [HEAD_DIM]
-
-    // Per-layer norm weights
-    float *input_norm[N_LAYERS];    // [DIM]
-    float *attn_norm[N_LAYERS];     // [DIM]
-
-    // Per-layer shared expert
-    float *shared_gate[N_LAYERS];   // [INTERMEDIATE, DIM]
-    float *shared_up[N_LAYERS];     // [INTERMEDIATE, DIM]
-    float *shared_down[N_LAYERS];   // [DIM, INTERMEDIATE]
-    float *shared_gate_s[N_LAYERS]; // [INTERMEDIATE, DIM/group]
-    float *shared_up_s[N_LAYERS];   // [INTERMEDIATE, DIM/group]
-    float *shared_down_s[N_LAYERS]; // [DIM, INTERMEDIATE/group]
-
-    // Expert files — fd per layer (packed .bin files)
+    const float *embed;             // [vocab, DIM]
+    int vocab_size;
+    const float *lm_head;           // [vocab, DIM]
+    const float *final_norm;        // [DIM]
+    const float *input_norms[N_LAYERS];  // [DIM]
+    const float *attn_norms[N_LAYERS];   // [DIM]
+    const float *q_proj[N_LAYERS];       // [DIM, DIM]
+    const float *k_proj[N_LAYERS];       // [DIM, KV_LORA_RANK]
+    const float *v_proj[N_LAYERS];       // [DIM, KV_LORA_RANK]
+    const float *o_proj[N_LAYERS];       // [DIM, DIM]
+    const float *q_norms[N_LAYERS];      // [HEAD_DIM]
+    const float *k_norms[N_LAYERS];      // [HEAD_DIM]
     int expert_fd[N_LAYERS];
+    bool weights_set;
 } WeightFile;
 
 // ============================================================================
@@ -168,8 +155,19 @@ typedef struct {
     // Prediction
     ExpertPredictor predictor;
 
-    // Weights
-    WeightFile wf;
+    // Weights (set via moe_infer_set_weights)
+    const float *embed;
+    int vocab_size;
+    const float *lm_head;
+    const float *final_norm;
+    const float *input_norms[N_LAYERS];
+    const float *attn_norms[N_LAYERS];
+    const float *q_proj[N_LAYERS];
+    const float *k_proj[N_LAYERS];
+    const float *v_proj[N_LAYERS];
+    const float *o_proj[N_LAYERS];
+    const float *q_norms[N_LAYERS];
+    const float *k_norms[N_LAYERS];
 
     // KV cache
     KVCache kv_cache[N_LAYERS];
@@ -186,15 +184,29 @@ typedef struct {
 // API
 // ============================================================================
 
-// Initialize engine: load model weights, setup Metal, open expert files.
-// Returns 0 on success, -1 on error.
-int moe_infer_init(MoEInferEngine *engine, const char *model_path,
-                   const char *packed_dir,
-                   const char *kernel_src, unsigned long kernel_src_len);
+// Initialize engine: Metal setup, open expert files, allocate buffers.
+// Returns engine pointer on success, NULL on error.
+MoEInferEngine *moe_infer_init(const char *packed_dir,
+                                const char *kernel_src, unsigned long kernel_src_len);
 
-// Forward pass for one token. Writes next-token logits into `logits` [vocab_size].
-// Returns 0 on success, -1 on error.
-int moe_infer_forward(MoEInferEngine *engine, int token, float *logits);
+// Set backbone weights from MLX float32 arrays. Must be called after init,
+// before forward. Pointers must remain valid for the engine's lifetime.
+void moe_infer_set_weights(MoEInferEngine *engine,
+    const float *embed, int vocab_size,
+    const float *lm_head,
+    const float *final_norm,
+    const float **input_norms,     // [N_LAYERS] pointers to [DIM] float
+    const float **attn_norms,      // [N_LAYERS] pointers to [DIM] float
+    const float **q_proj_weights,  // [N_LAYERS] pointers to [DIM, DIM]
+    const float **k_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
+    const float **v_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
+    const float **o_proj_weights,  // [N_LAYERS] pointers to [DIM, DIM]
+    const float **q_norms,         // [N_LAYERS] pointers to [HEAD_DIM]
+    const float **k_norms);        // [N_LAYERS] pointers to [HEAD_DIM]
+
+// Forward pass for one token. hidden: [DIM] input (embedding output).
+// Writes output hidden state back to hidden. Returns 0 on success.
+int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
 
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);
