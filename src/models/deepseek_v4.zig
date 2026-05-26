@@ -2780,9 +2780,10 @@ pub const DSV4Model = struct {
         const logits = try ops.matmul(self.ctx, final_hidden, lm_head_t);
 
         const forward_end = std.c.mach_absolute_time();
-        const embed_ms = @as(f64, @floatFromInt(embed_end - forward_start)) / 1_000_000.0;
-        const layers_ms = @as(f64, @floatFromInt(layer_total_ns)) / 1_000_000.0;
-        const total_ms = @as(f64, @floatFromInt(forward_end - forward_start)) / 1_000_000.0;
+        // mach_absolute_time returns ticks (1 tick = 125/3 ns on Apple Silicon).
+        const embed_ms = @as(f64, @floatFromInt(embed_end - forward_start)) * 125.0 / 3_000_000.0;
+        const layers_ms = @as(f64, @floatFromInt(layer_total_ns)) * 125.0 / 3_000_000.0;
+        const total_ms = @as(f64, @floatFromInt(forward_end - forward_start)) * 125.0 / 3_000_000.0;
         const head_ms = total_ms - layers_ms - embed_ms;
         const input_shape = input_ids.shape();
         const seq_len: usize = @intCast(input_shape[1]);

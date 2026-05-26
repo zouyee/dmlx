@@ -73,7 +73,7 @@ pub const ExpertPreadLoader = struct {
 
         // Load manifest
         var manifest_path_buf: [4096]u8 = undefined;
-        const manifest_path = try std.fmt.bufPrint(&manifest_path_buf, "{s}/manifest.json", .{packed_dir});
+        const manifest_path = try std.fmt.bufPrintZ(&manifest_path_buf, "{s}/manifest.json", .{packed_dir});
         const c_stdio = @cImport(@cInclude("stdio.h"));
         const fp = c_stdio.fopen(manifest_path.ptr, "r");
         if (fp == null) return error.FileNotFound;
@@ -119,10 +119,10 @@ pub const ExpertPreadLoader = struct {
 
             var path_buf: [4096]u8 = undefined;
             const file_name = if (layer_meta.get("file")) |f| f.string else blk: {
-                break :blk try std.fmt.bufPrint(&path_buf, "layer_{d:0>2}.bin", .{layer_idx});
+                break :blk try std.fmt.bufPrintZ(&path_buf, "layer_{d:0>2}.bin", .{layer_idx});
             };
             var full_buf: [4096]u8 = undefined;
-            const full_path = try std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ packed_dir, file_name });
+            const full_path = try std.fmt.bufPrintZ(&full_buf, "{s}/{s}", .{ packed_dir, file_name });
             const c_fcntl = @cImport(@cInclude("fcntl.h"));
             const fd = c_fcntl.open(full_path.ptr, c_fcntl.O_RDONLY);
             if (fd < 0) continue;

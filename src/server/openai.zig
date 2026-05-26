@@ -155,7 +155,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 
     const t_queued = std.c.mach_absolute_time();
     req_state.queued_time_ns = @intCast(t_queued);
-    const prep_ms = @as(f64, @floatFromInt(t_queued - t_entry)) / 1_000_000.0;
+    const prep_ms = @as(f64, @floatFromInt(t_queued - t_entry)) * 125.0 / 3_000_000.0;
     var node = engine.QueueNode.init(req_state);
     state.request_queue.push(&node);
     std.log.info("[HTTP] Request {d} submitted to queue (prepare={d:.1}ms)", .{ request_id, prep_ms });
@@ -185,7 +185,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     }
 
     const t_wait_end = std.c.mach_absolute_time();
-    const wait_ms = @as(f64, @floatFromInt(t_wait_end - t_wait_start)) / 1_000_000.0;
+    const wait_ms = @as(f64, @floatFromInt(t_wait_end - t_wait_start)) * 125.0 / 3_000_000.0;
     std.log.info("[OpenAI] Token loop done, all_text.len={d}, wait={d:.1}ms calls={d}", .{ all_text.items.len, wait_ms, wait_call_count });
 
     // Check if the engine signaled an error.

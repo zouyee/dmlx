@@ -153,7 +153,7 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
             continue;
         };
         const t_accept_done = std.c.mach_absolute_time();
-        const accept_ms = @as(f64, @floatFromInt(t_accept_done - t_accept_start)) / 1_000_000.0;
+        const accept_ms = @as(f64, @floatFromInt(t_accept_done - t_accept_start)) * 125.0 / 3_000_000.0;
         std.log.info("[ACCEPT] Connection accepted (accept took {d:.1}ms)", .{accept_ms});
         // Set socket to non-blocking mode for async fiber I/O.
         const fc = @cImport(@cInclude("fcntl.h"));
@@ -162,7 +162,7 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
         const t_async_start = std.c.mach_absolute_time();
         _ = io.async(http.handleConnection, .{ allocator, io, server_state, connection, server_config });
         const t_async_done = std.c.mach_absolute_time();
-        const async_ms = @as(f64, @floatFromInt(t_async_done - t_async_start)) / 1_000_000.0;
+        const async_ms = @as(f64, @floatFromInt(t_async_done - t_async_start)) * 125.0 / 3_000_000.0;
         if (async_ms > 10.0) {
             std.log.warn("[ACCEPT] io.async blocked for {d:.1}ms (thread pool full?)", .{async_ms});
         }

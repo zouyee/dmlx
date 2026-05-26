@@ -30,7 +30,7 @@ fn handleRequest(
     const t_handler_enter = std.c.mach_absolute_time();
     defer {
         const t_handler_exit = std.c.mach_absolute_time();
-        const handler_ms = @as(f64, @floatFromInt(t_handler_exit - t_handler_enter)) / 1_000_000.0;
+        const handler_ms = @as(f64, @floatFromInt(t_handler_exit - t_handler_enter)) * 125.0 / 3_000_000.0;
         std.log.info("[HTTP] Handler lifetime: {d:.1}ms", .{handler_ms});
     }
     // Use a growable DynamicBuffer instead of a fixed 64KB stack buffer.
@@ -103,7 +103,7 @@ fn handleRequest(
 
     if (dyn_buf.len() == 0) return;
     const t_read_done = std.c.mach_absolute_time();
-    const read_ms = @as(f64, @floatFromInt(t_read_done - t_http_enter)) / 1_000_000.0;
+    const read_ms = @as(f64, @floatFromInt(t_read_done - t_http_enter)) * 125.0 / 3_000_000.0;
     const request = dyn_buf.items();
     std.log.info("[HTTP] Request received: {d} bytes (read={d:.1}ms)", .{ dyn_buf.len(), read_ms });
 
@@ -178,8 +178,8 @@ fn handleRequest(
                 const t1 = std.c.mach_absolute_time();
                 try writeJsonResponse(connection, io, 200, response);
                 const t2 = std.c.mach_absolute_time();
-                const gen_ms = @as(f64, @floatFromInt(t1 - t0)) / 1_000_000.0;
-                const write_ms = @as(f64, @floatFromInt(t2 - t1)) / 1_000_000.0;
+                const gen_ms = @as(f64, @floatFromInt(t1 - t0)) * 125.0 / 3_000_000.0;
+                const write_ms = @as(f64, @floatFromInt(t2 - t1)) * 125.0 / 3_000_000.0;
                 std.log.info("[TIMING] generateChatCompletion={d:.1}ms writeResponse={d:.1}ms", .{ gen_ms, write_ms });
             }
         } else {
@@ -258,7 +258,7 @@ pub fn handleConnection(
     const t_conn_enter = std.c.mach_absolute_time();
     defer {
         const t_conn_exit = std.c.mach_absolute_time();
-        const conn_ms = @as(f64, @floatFromInt(t_conn_exit - t_conn_enter)) / 1_000_000.0;
+        const conn_ms = @as(f64, @floatFromInt(t_conn_exit - t_conn_enter)) * 125.0 / 3_000_000.0;
         std.log.info("[HTTP] Connection lifetime: {d:.1}ms", .{conn_ms});
     }
     defer connection.close(io);
