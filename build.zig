@@ -77,14 +77,20 @@ pub fn build(b: *std.Build) void {
     cli.root_module.addImport("regex", zig_regex.module("regex"));
     b.installArtifact(cli);
 
-    // Metal MoE: add ObjC wrapper + Metal/Foundation frameworks
+    // Metal MoE + Metal inference engine
     inline for (.{ lib, example, cli }) |target_step| {
         target_step.root_module.addCSourceFile(.{
             .file = b.path("src/models/moe_metal_wrapper.c"),
             .flags = &.{"-fobjc-arc"},
             .language = .objective_c,
         });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/metal_infer/engine.c"),
+            .flags = &.{},
+            .language = .objective_c,
+        });
         target_step.root_module.linkFramework("Metal", .{});
         target_step.root_module.linkFramework("Foundation", .{});
+        target_step.root_module.linkFramework("Accelerate", .{});
     }
 }
