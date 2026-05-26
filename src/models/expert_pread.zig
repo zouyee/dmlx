@@ -193,31 +193,20 @@ pub const ExpertPreadLoader = struct {
         const fd = self.layer_fds[packed_idx];
         const n = @min(expert_ids.len, self.max_parallel);
 
-        // Set up tasks for the pool
+        // std.Thread.spawn — stable, no race. Pool kept for future optimization.
+        var threads: [MAX_PARALLEL]?std.Thread = .{null} ** MAX_PARALLEL;
+        var results: [MAX_PARALLEL]isize = .{0} ** MAX_PARALLEL;
         for (0..n) |i| {
-            self.pool.tasks[i] = IOTask{
-                .fd = fd,
-                .buf = self.buffers[i].ptr,
-                .size = self.expert_size,
-                .offset = @intCast(@as(u64, expert_ids[i]) * self.expert_size),
-                .result = -1,
+            const offset: i64 = @intCast(@as(u64, expert_ids[i]) * self.expert_size);
+            threads[i] = std.Thread.spawn(.{}, preadWorker, .{ fd, self.buffers[i].ptr, self.expert_size, offset, &results[i] }) catch {
+                results[i] = unistd.pread(fd, self.buffers[i].ptr, self.buffers[i].len, offset);
+                continue;
             };
         }
-
-        // Dispatch: wake all threads, wait for all tasks to complete.
-        _ = pthread.pthread_mutex_lock(&self.pool.mutex);
-        self.pool.num_tasks = n;
-        self.pool.tasks_done = 0;
-        self.pool.generation += 1;
-        _ = pthread.pthread_cond_broadcast(&self.pool.work_ready);
-        while (self.pool.tasks_done < n) {
-            _ = pthread.pthread_cond_wait(&self.pool.work_done, &self.pool.mutex);
-        }
-        _ = pthread.pthread_mutex_unlock(&self.pool.mutex);
-
+        for (0..n) |i| if (threads[i]) |t| t.join();
         var success: usize = 0;
         for (0..n) |i| {
-            if (self.pool.tasks[i].result == @as(isize, @intCast(self.expert_size))) success += 1;
+            if (results[i] == @as(isize, @intCast(self.expert_size))) success += 1;
         }
         return success;
     }
@@ -231,9 +220,18 @@ pub const ExpertPreadLoader = struct {
         expert_ids: []const u32,
     ) !struct { gate: Array, up: Array, down: Array, gs: ?Array, us: ?Array, ds: ?Array } {
         if (expert_ids.len == 0) return error.EmptyBatch;
-        if (expert_ids.len > self.max_parallel) return error.TooManyExperts;
+        if (expert_ids.len > self.max_parallel) {
+            std.log.warn("[Pread] TooManyExperts layer {d}: {d} > {d}", .{ layer_idx, expert_ids.len, self.max_parallel });
+            return error.TooManyExperts;
+        }
 
-        _ = try self.readExperts(layer_idx, expert_ids);
+        const nread = self.readExperts(layer_idx, expert_ids) catch |e| {
+            std.log.warn("[Pread] readExperts error layer {d}: {}", .{ layer_idx, e });
+            return e;
+        };
+        if (nread != expert_ids.len) {
+            std.log.warn("[Pread] readExperts partial layer {d}: {d}/{d}", .{ layer_idx, nread, expert_ids.len });
+        }
         const n = expert_ids.len;
         const gate = try self.assembleComponent(ctx, 0, n);
         const up = try self.assembleComponent(ctx, 2, n);
@@ -325,4 +323,21 @@ fn ioPoolWorker(loader: *ExpertPreadLoader, tid: usize) void {
         }
     }
     _ = pthread.pthread_mutex_unlock(&loader.pool.mutex);
+}
+
+fn preadWorker(fd: c_int, buf: [*]u8, size: usize, offset: i64, result: *isize) void {
+    const slice = buf[0..size];
+    var total: usize = 0;
+    var off = offset;
+    while (total < size) {
+        const n = unistd.pread(fd, slice[total..].ptr, slice[total..].len, off);
+        if (n < 0) {
+            result.* = -1;
+            return;
+        }
+        if (n == 0) break;
+        total += @intCast(n);
+        off += @intCast(n);
+    }
+    result.* = if (total == size) @intCast(total) else -1;
 }
