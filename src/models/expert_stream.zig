@@ -98,6 +98,12 @@ pub const ExpertStreamProvider = struct {
     dymoe_top5_count: ?[][256]u32 = null, // per-layer: how often in positions 0-4
     dymoe_total_count: ?[][256]u32 = null, // per-layer: total selections
 
+    // Temporal expert prediction (flash-moe pattern)
+    pred_experts: [43][6]u32 = [_][6]u32{[_]u32{0} ** 6} ** 43,
+    pred_valid: bool = false,
+    pred_hits: u64 = 0,
+    pred_misses: u64 = 0,
+
     // Diagnostic counters
     total_bytes_read: u64 = 0,
     token_step_count: u64 = 0,
@@ -600,6 +606,25 @@ pub const ExpertStreamProvider = struct {
 
         const actual_load_ids = load_ids_buf[0..load_ids_len];
 
+        // Temporal prediction: check hit rate vs previous token's experts
+        if (self.pred_valid and actual_load_ids.len <= 6) {
+            var hits: u32 = 0;
+            for (actual_load_ids) |eid| {
+                for (self.pred_experts[layer_idx][0..6]) |pe| {
+                    if (eid == pe) {
+                        hits += 1;
+                        break;
+                    }
+                }
+            }
+            self.pred_hits += hits;
+            self.pred_misses += @as(u32, @intCast(actual_load_ids.len)) - hits;
+        }
+        // Record for next token prediction
+        for (actual_load_ids, 0..) |eid, i| {
+            if (i < 6) self.pred_experts[layer_idx][i] = eid;
+        }
+
         // Log skip info (only layer 0 to avoid spam)
         if (layer_idx == 0 and dymoe_skipped > 0) {
             std.log.info("[DyMoE] Skipped {d} low-score cache-miss experts (load {d}/{d})", .{
@@ -764,6 +789,20 @@ pub const ExpertStreamProvider = struct {
                 self.token_step_count,
                 elapsed_ms,
             });
+            // Enable temporal prediction after first token
+            if (!self.pred_valid) {
+                self.pred_valid = true;
+                std.log.info("[Predict] temporal prediction enabled after token {d}", .{self.token_step_count});
+            }
+            if (self.pred_valid and self.pred_hits + self.pred_misses > 0) {
+                const hit_rate = @as(f64, @floatFromInt(self.pred_hits)) /
+                    @as(f64, @floatFromInt(self.pred_hits + self.pred_misses)) * 100.0;
+                std.log.info("[Predict] hit_rate={d:.1}% hits={d} misses={d}", .{
+                    hit_rate, self.pred_hits, self.pred_misses,
+                });
+                self.pred_hits = 0;
+                self.pred_misses = 0;
+            }
         }
 
         return result;
