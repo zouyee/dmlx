@@ -70,6 +70,7 @@ typedef struct {
     const float *o_proj[N_LAYERS];       // [DIM, DIM]
     const float *q_norms[N_LAYERS];      // [HEAD_DIM]
     const float *k_norms[N_LAYERS];      // [HEAD_DIM]
+    const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     int expert_fd[N_LAYERS];
     bool weights_set;
 } WeightFile;
@@ -126,8 +127,7 @@ typedef struct {
     void *pipe_moe_combine;
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
-    void *pipe_residual_add;
-    void *pipe_matvec;           // generic float matvec for attention proj
+    void *pipe_matvec;
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -168,6 +168,8 @@ typedef struct {
     const float *o_proj[N_LAYERS];
     const float *q_norms[N_LAYERS];
     const float *k_norms[N_LAYERS];
+    const float *gate_proj[N_LAYERS];  // [N_EXPERTS, DIM] router weight
+    int expert_fd[N_LAYERS];
 
     // KV cache
     KVCache kv_cache[N_LAYERS];
@@ -201,8 +203,9 @@ void moe_infer_set_weights(MoEInferEngine *engine,
     const float **k_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
     const float **v_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
     const float **o_proj_weights,  // [N_LAYERS] pointers to [DIM, DIM]
-    const float **q_norms,         // [N_LAYERS] pointers to [HEAD_DIM]
-    const float **k_norms);        // [N_LAYERS] pointers to [HEAD_DIM]
+    const float **q_norms,         // [N_LAYERS]
+    const float **k_norms,         // [N_LAYERS]
+    const float **gate_projs);     // [N_LAYERS] pointers to [N_EXPERTS, DIM]
 
 // Forward pass for one token. hidden: [DIM] input (embedding output).
 // Writes output hidden state back to hidden. Returns 0 on success.

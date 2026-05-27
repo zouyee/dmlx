@@ -45,6 +45,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_moe_combine    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_combine"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
     eng->pipe_rms_norm_apply = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_apply"] error:&err]);
+    eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -293,43 +294,114 @@ static void cpu_softmax_topk(const float *scores, int n, int K,
 // Main forward pass (1 token)
 // ============================================================================
 
+// Encode a float matvec: out = W @ x. W: [out_dim, in_dim], x: [in_dim]
+static void encode_matvec(id<MTLCommandBuffer> cb, id<MTLComputePipelineState> pipe,
+                          id<MTLBuffer> W_buf, id<MTLBuffer> x_buf, id<MTLBuffer> out_buf,
+                          uint out_dim, uint in_dim) {
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipe];
+    [enc setBuffer:W_buf offset:0 atIndex:0];
+    [enc setBuffer:x_buf offset:0 atIndex:1];
+    [enc setBuffer:out_buf offset:0 atIndex:2];
+    [enc setBytes:&out_dim length:4 atIndex:3];
+    [enc setBytes:&in_dim length:4 atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [enc endEncoding];
+}
+
+// Encode RMSNorm: out = rms_norm(x, weight)
+static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
+                            id<MTLBuffer> x_buf, id<MTLBuffer> weight_buf, id<MTLBuffer> out_buf) {
+    // Step 1: sum of squares
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:eng->pipe_rms_norm_sum_sq];
+        [enc setBuffer:x_buf offset:0 atIndex:0];
+        [enc setBuffer:eng->buf_norm_sum_sq offset:0 atIndex:1];
+        uint dim = DIM;
+        [enc setBytes:&dim length:4 atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+    // Step 2: apply normalization
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:eng->pipe_rms_norm_apply];
+        [enc setBuffer:x_buf offset:0 atIndex:0];
+        [enc setBuffer:weight_buf offset:0 atIndex:1];
+        [enc setBuffer:eng->buf_norm_sum_sq offset:0 atIndex:2];
+        [enc setBuffer:out_buf offset:0 atIndex:3];
+        uint dim = DIM;
+        float eps = 1e-6f;
+        [enc setBytes:&dim length:4 atIndex:4];
+        [enc setBytes:&eps length:4 atIndex:5];
+        [enc dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+}
+
 int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     if (!eng->initialized) return -1;
-    (void)pos;
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
 
     for (int layer = 0; layer < N_LAYERS; layer++) {
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+
         // Copy hidden to Metal buffer
         float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
         memcpy(buf_h, hidden, DIM * sizeof(float));
 
         // === RMSNorm (input norm) ===
-        // GPU: rms_norm_sum_sq + rms_norm_apply with input_norms[layer]
+        id weight_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
+                                            length:DIM * sizeof(float)
+                                            options:MTLResourceStorageModeShared deallocator:nil];
+        encode_rms_norm(cb, eng, eng->buf_hidden, weight_buf, eng->buf_normed);
 
-        // === Attention projections: Q, K, V ===
-        // GPU: matvec_f32 for each: Q = q_proj @ hidden, K = k_proj @ hidden, V = v_proj @ hidden
-
-        // === CPU: RoPE, KV cache, SDPA ===
-        // Stubbed for now — copy hidden through
-
-        // === O projection: O = o_proj @ attn_out ===
-        // GPU: matvec_f32
-
-        // === Residual add: h_mid = hidden + attn_out ===
+        // === Attention: skip for now, pass normed through as h_mid ===
         float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
-        memcpy(h_mid, buf_h, DIM * sizeof(float)); // h_mid = hidden (skip attn for now)
+        [cb commit];
+        [cb waitUntilCompleted];
+        float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+        memcpy(h_mid, normed, DIM * sizeof(float));
 
         // === RMSNorm (post-attn norm) ===
-        // Copy to normed
-        float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
-        memcpy(normed, h_mid, DIM * sizeof(float));
+        // For now, normed = h_mid (no attention → no change)
+        // Copy back to normed for the MoE input:
+        float *normed2 = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+        id attn_norm_buf = [d newBufferWithBytesNoCopy:(void *)eng->attn_norms[layer]
+                                                length:DIM * sizeof(float)
+                                                options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        {
+            float *tmp = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+            memcpy(tmp, h_mid, DIM * sizeof(float));
+        }
+        encode_rms_norm(cb2, eng, eng->buf_hidden, attn_norm_buf, eng->buf_normed);
+        [cb2 commit];
+        [cb2 waitUntilCompleted];
 
         // === Routing: gate projection → softmax → topK ===
+        memcpy(normed2, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
+        float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
+        if (eng->gate_proj[layer]) {
+            // Metal: gate_proj @ normed → [N_EXPERTS] routing scores
+            id<MTLCommandBuffer> cb_r = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+            id gate_w = [d newBufferWithBytesNoCopy:(void *)eng->gate_proj[layer]
+                                            length:N_EXPERTS * DIM * sizeof(float)
+                                            options:MTLResourceStorageModeShared deallocator:nil];
+            encode_matvec(cb_r, eng->pipe_matvec, gate_w, eng->buf_normed,
+                          eng->buf_routing_scores, N_EXPERTS, DIM);
+            [cb_r commit];
+            [cb_r waitUntilCompleted];
+        } else {
+            // No gate weight — dummy routing
+            for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
+        }
+
+        // CPU: softmax + topK
         int expert_ids[N_ACTIVE];
         float expert_weights[N_ACTIVE];
-        for (int k = 0; k < N_ACTIVE; k++) {
-            expert_ids[k] = k;
-            expert_weights[k] = 1.0f / N_ACTIVE;
-        }
+        cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
 
         // === Expert I/O ===
         IOPool *io = (IOPool *)eng->io_pool;
@@ -342,7 +414,6 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
         memcpy(hidden, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
-    // Final RMSNorm + LM head handled by caller
     return 0;
 }
 
@@ -381,7 +452,8 @@ void moe_infer_set_weights(MoEInferEngine *eng,
     const float *embed, int vocab_size, const float *lm_head, const float *final_norm,
     const float **input_norms, const float **attn_norms,
     const float **q_proj_w, const float **k_proj_w, const float **v_proj_w, const float **o_proj_w,
-    const float **q_norms, const float **k_norms) {
+    const float **q_norms, const float **k_norms,
+    const float **gate_proj_w) {
     eng->embed = embed;
     eng->vocab_size = vocab_size;
     eng->lm_head = lm_head;
@@ -395,6 +467,7 @@ void moe_infer_set_weights(MoEInferEngine *eng,
         eng->o_proj[i]     = o_proj_w[i];
         eng->q_norms[i]    = q_norms[i];
         eng->k_norms[i]    = k_norms[i];
+        eng->gate_proj[i]  = gate_proj_w[i];
     }
 }
 
