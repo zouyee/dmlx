@@ -291,6 +291,51 @@ static void cpu_softmax_topk(const float *scores, int n, int K,
 }
 
 // ============================================================================
+// CPU RoPE — DeepSeek V4 partial RoPE with YaRN (mode==2, neox-style pairing).
+// Adapted from ds4/metal/dsv4_rope.metal algorithm.
+// ============================================================================
+
+#define ROPE_DIM 64         // qk_rope_head_dim
+#define ROPE_THETA 10000000.0f
+#define ROPE_N_CTX_ORIG 65536
+
+static void apply_rope_tail(float *q_or_k, int dim, int n_nope, int pos, float freq_scale) {
+    float corr_dims[2];
+    {
+        float beta_fast = 32.0f, beta_slow = 1.0f;
+        float c0 = ROPE_DIM * logf(ROPE_N_CTX_ORIG / (beta_fast * 2.0f * M_PI)) / (2.0f * logf(ROPE_THETA));
+        float c1 = ROPE_DIM * logf(ROPE_N_CTX_ORIG / (beta_slow * 2.0f * M_PI)) / (2.0f * logf(ROPE_THETA));
+        corr_dims[0] = fmaxf(0.0f, floorf(c0));
+        corr_dims[1] = fminf(ROPE_DIM - 1.0f, ceilf(c1));
+    }
+
+    float theta_base = (float)pos;
+    float inv_ndims = -1.0f / ROPE_DIM;
+    int n_half = ROPE_DIM / 2;
+
+    for (int ic = 0; ic < n_half; ic++) {
+        int rel_i0 = 2 * ic;
+        float theta = theta_base * powf(ROPE_THETA, inv_ndims * rel_i0);
+
+        // YaRN
+        float ramp_mix = 0.0f;
+        float low = corr_dims[0], high = corr_dims[1];
+        float yarn_ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, ((float)rel_i0 / 2.0f - low) / fmaxf(0.001f, high - low)));
+        theta = theta * (1.0f - yarn_ramp) + theta / freq_scale * yarn_ramp;
+
+        float cos_t = cosf(theta);
+        float sin_t = sinf(theta);
+
+        int j0 = n_nope + ic;
+        int j1 = n_nope + ic + n_half;
+        float x0 = q_or_k[j0];
+        float x1 = q_or_k[j1];
+        q_or_k[j0] = x0 * cos_t - x1 * sin_t;
+        q_or_k[j1] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
+// ============================================================================
 // Main forward pass (1 token)
 // ============================================================================
 
@@ -361,9 +406,52 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     }
     float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
 
-    // === Attention (simplified: pass-through) ===
+    // === Attention: Q/K/V projections + RoPE + simplified SDPA ===
     float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
-    memcpy(h_mid, normed, DIM * sizeof(float));
+    float *attn_out = (float *)[(id<MTLBuffer>)eng->buf_attn_out contents];
+
+    // Q projection
+    if (eng->q_proj[layer]) {
+        id<MTLCommandBuffer> cb_a = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        // Q, K, V buffers
+        id q_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
+        id k_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
+        id v_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
+
+        // Q, K, V projections
+        id q_w = [d newBufferWithBytesNoCopy:(void *)eng->q_proj[layer] length:DIM*DIM*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
+        encode_matvec(cb_a, eng->pipe_matvec, q_w, eng->buf_normed, q_buf, DIM, DIM);
+
+        if (eng->k_proj[layer]) {
+            id k_w = [d newBufferWithBytesNoCopy:(void *)eng->k_proj[layer] length:DIM*KV_LORA_RANK*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
+            encode_matvec(cb_a, eng->pipe_matvec, k_w, eng->buf_normed, k_buf, KV_LORA_RANK, DIM);
+        }
+        if (eng->v_proj[layer]) {
+            id v_w = [d newBufferWithBytesNoCopy:(void *)eng->v_proj[layer] length:DIM*KV_LORA_RANK*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
+            encode_matvec(cb_a, eng->pipe_matvec, v_w, eng->buf_normed, v_buf, KV_LORA_RANK, DIM);
+        }
+
+        [cb_a commit];
+        [cb_a waitUntilCompleted];
+
+        // CPU: Apply RoPE to Q and K (V4 partial RoPE, tail only)
+        float *q = (float *)[q_buf contents];
+        float *k = (float *)[k_buf contents];
+        int n_nope = DIM - ROPE_DIM;
+        apply_rope_tail(q, DIM, n_nope, pos, 1.0f);
+        apply_rope_tail(k, KV_LORA_RANK, KV_LORA_RANK - ROPE_DIM, pos, 1.0f);
+
+        // Simplified SDPA: single token self-attention = V (attention over one position is identity)
+        // O = o_proj @ V → but V is [KV_LORA_RANK], not [DIM]
+        // For now: use Q as attention output (simplified)
+        memcpy(attn_out, q, DIM * sizeof(float));
+    } else {
+        // No Q weights: pass normed through
+        memcpy(attn_out, normed, DIM * sizeof(float));
+    }
+
+    // Residual: h_mid = hidden + attn_out
+    for (int i = 0; i < DIM; i++) h_mid[i] = buf_h[i] + attn_out[i];
 
     // === Post-attn RMSNorm ===
     {
