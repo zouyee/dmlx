@@ -127,12 +127,57 @@ buf_multi_expert_data_B[MAX_K]   // 集 B — 预测预取
 
 | 组件 | 优先级 | 说明 |
 |------|--------|------|
-| Attention 权重接入 | P0 | 提取 Q/K/V/O proj 权重 → setWeights → 引擎 attention |
-| CPU SDPA | P0 | 单 token self-attention, 使 attention 输出非平凡 |
-| MLA attention 迁移 | P1 | 从 ds4 迁移 indexed_mixed_attention 替代简化版 |
-| GPU-side combine | P2 | moe_combine_residual + rms_norm, 消除 CPU 往返 |
-| 延迟 CMD3 | P2 | flash-moe 异步流水线, I/O-GPU 重叠 |
-| 性能优化 | P3 | SIMD kernel 修复, KV cache, prefill 优化 |
+| Attention 权重 dequant | P0 | wq_b/wo_b 量化 → dequant → float32, 当前 OOM (43层×16MB×2=1.4GB) |
+| CPU SDPA | P0 | 单 token self-attention |
+| MLA attention 迁移 | P1 | 从 ds4 迁移 indexed_mixed_attention |
+
+### ❌ 已知问题
+
+| 问题 | 现象 | 原因 |
+|------|------|------|
+| Attention dequant OOM | Server 启动 crash | 43层 attention 权重 dequant 内存超限 |
+| SIMD kernel 错误 | 87-97% 输出值为 0 | reduction bug, 已回退为 naive |
+| BOS token 重复 | 输出全是 `<｜begin▁of▁sentence｜>` | attention pass-through, 无有效 attention 计算 |
+
+### 测试方式
+
+```bash
+# 构建
+rm -rf .zig-cache zig-out && zig build -Doptimize=ReleaseFast
+
+# 启动 server (30-60s 加载)
+./zig-out/bin/dmlx serve \
+    --model ~/models/DeepSeek-V4-Flash-4bit \
+    --port 8930 --max-tokens 30 --temperature 0 \
+    --smelt --smelt-strategy stream --smelt-experts 0.20 \
+    --smelt-cache 0 \
+    --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+    --metal-moe
+
+# 测试 (另一个终端)
+curl -s http://localhost:8930/v1/chat/completions \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"default","messages":[{"role":"user","content":"2+2="}],"max_tokens":5,"temperature":0}' \
+    | python3 -c "import sys,json;d=json.load(sys.stdin);print(d['choices'][0]['message']['content'])"
+
+# Benchmark (完整测试, ~10min)
+bash scripts/run_benchmark.sh
+```
+
+### 调试方式
+
+```bash
+# 引擎 debug 输出 (stderr)
+./zig-out/bin/dmlx serve ... 2>/tmp/engine_stderr.log
+
+# Python 公式验证
+python3 -c "
+import numpy as np
+# 读取 hidden state dump 对比 Metal 输出
+hidden = np.fromfile('/tmp/metal_hidden.bin', dtype=np.float32)
+# ... NIBBLE_TO_FLOAT * exp2(scale-128) 计算 ...
+"
+```
 
 ### ❌ 已放弃
 
