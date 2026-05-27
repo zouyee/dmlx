@@ -98,15 +98,75 @@ buf_multi_expert_data_B[MAX_K]   // 集 B — 预测预取
 
 ---
 
-## 3. dmlx 改造方案
+## 3. 已完成
 
-### 核心思路
+| 组件 | 状态 | 来源 |
+|------|------|------|
+| MXFP4 公式修复 | ✅ `NIBBLE_TO_FLOAT[nibble] * exp2(scale-128)` | Python 验证与 MLX 完全一致 |
+| SIMD MoE kernel | ✅ `fused_gate_up_swiglu` + `dequant_matvec_4bit` + `moe_combine` | 适配自 flash-moe `shaders.metal` |
+| Score remap | ✅ indices order → expert_ids order | `expert_stream.zig` |
+| bufPrintZ 修复 | ✅ Zig 0.16 兼容 | `expert_pread.zig` |
+| mach_absolute_time 修复 | ✅ tick→ms 换算 | 4 文件 |
+| 时序预测测量 | ✅ 命中率 20-54%，不足以单独优化 | `expert_stream.zig` |
+| Metal 推理引擎骨架 | ⬜ `engine.{h,c}` 编译通过，attention 未完成 | `src/metal_infer/` |
+| 混合方案验证 | ⬜ Metal MoE 输出在正确范围但生成乱码 | 待调试 |
 
-**保留 MLX**：attention、RMSNorm、embedding、LM head（已优化，无需改动）
+## 4. 迁移来源对比
 
-**替换 MLX MoE**：用 flash-moe 风格的 Metal pipeline 处理 switch_mlp 的 matmul
+### flash-moe (`../flash-moe/metal_infer/`)
 
-### Phase 1: Metal Kernel 移植（SIMD 优化版）
+| 文件 | 内容 | 迁移价值 |
+|------|------|---------|
+| `shaders.metal:251` | `dequant_matvec_4bit_v3` | ✅ 已迁移（适配 MXFP4 + V4 维度） |
+| `shaders.metal:169` | `fused_gate_up_swiglu` | ✅ 已迁移 |
+| `shaders.metal:1261` | `moe_combine_residual` | ⬜ K=8 硬编码，需改为 K=6 |
+| `shaders.metal:745` | `rms_norm_sum_sq` | ✅ 已迁移 |
+| `shaders.metal:779` | `rms_norm_apply` | ✅ 已迁移 |
+| `infer.m:2124` | `full_attention_forward()` | ❌ Qwen 的 GQA attention，V4 用 MLA |
+| `infer.m:2025` | `apply_rotary_emb()` | ⬜ 标准部分 RoPE，可参考但 V4 用 YaRN tail |
+| `infer.m:3060` | `async_pread_start/wait` | ⬜ GCD async I/O 模式可迁移 |
+
+### ds4 (`../ds4/metal/`)
+
+| 文件 | 内容 | 迁移价值 |
+|------|------|---------|
+| `dsv4_rope.metal:68` | `kernel_dsv4_rope_tail_f32` | ✅ V4 YaRN tail RoPE，可直接迁移 |
+| `dsv4_misc.metal:577` | `kernel_dsv4_indexed_mixed_attention_heads8` | ✅ V4 MLA 混合注意力核心 |
+| `dsv4_kv.metal:104` | `kernel_dsv4_fp8_kv_quantize_f32` | ⬜ FP8 KV 缓存量化 |
+| `flash_attn.metal:139` | Multi-stage FlashAttention | ⬜ prefill 加速 |
+| `dsv4_hc.metal` | Head composition (HC) | ⬜ 注意力头合成 |
+| `ds4_metal.m:2697` | `ds4_gpu_encode_rope_tail_inplace()` | ✅ RoPE 调度参考 |
+
+## 5. 实施进度 (2026-05-27)
+
+### ✅ 已完成
+
+| 组件 | 状态 | 文件 |
+|------|------|------|
+| MXFP4 公式 | ✅ LUT + exp2 | `moe_kernel.metal` |
+| Naive MoE kernel | ✅ 99.9% 匹配 Python | `moe_kernel.metal` |
+| SIMD kernel | ❌ 有 bug，87-97% 错误 | 已回退为 naive |
+| RMSNorm kernel | ✅ | `moe_kernel.metal` |
+| Matvec kernel | ✅ | `moe_kernel.metal` |
+| I/O thread pool | ✅ | `engine.c` |
+| 权重提取 | ✅ MLX → float32 指针 | `deepseek_v4.zig` |
+| 混合方案 (MLX attn + Metal MoE) | ❌ 数值漂移，不可行 | 已放弃 |
+| 时序预测 | ✅ 命中率 20-54% | `expert_stream.zig` |
+
+### ⬜ 进行中
+
+| 组件 | 文件 |
+|------|------|
+| 引擎集成到 server | `state.zig`, `engine.{h,c}` |
+| Attention (简化版) | `engine.c` |
+| End-to-end 正确性验证 | 手动测试 + benchmark |
+
+### 下一步
+
+1. 将引擎集成到 server 生成循环
+2. 实现简化 attention（Metal Q/K/V/O matvec + CPU SDPA）
+3. 验证端到端正确性
+4. 渐进迁移 ds4 的 MLA attention kernel
 
 移植 flash-moe `shaders.metal` 的关键 kernel，适配 DeepSeek V4 维度：
 
