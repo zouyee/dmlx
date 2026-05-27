@@ -70,7 +70,7 @@ int moe_metal_forward(
         [enc setBuffer:mid_buf offset:k*intermediate_dim*sizeof(float) atIndex:5];
         od=intermediate_dim; id_=hidden_dim;
         [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake(intermediate_dim/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreads:MTLSizeMake(intermediate_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
     }
 
@@ -86,7 +86,7 @@ int moe_metal_forward(
         [enc setBuffer:out_buf offset:k*hidden_dim*sizeof(float) atIndex:3];
         od=hidden_dim; id_=intermediate_dim;
         [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(hidden_dim/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc dispatchThreads:MTLSizeMake(hidden_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
     }
 

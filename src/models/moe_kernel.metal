@@ -9,7 +9,7 @@ constant float NIBBLE_TO_FLOAT[16] = {
     -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
 };
 
-// fused_gate_up_swiglu: gate+up dequant matvec + SwiGLU. SIMD reduction across 256 threads.
+// fused_gate_up_swiglu NAIVE: one thread per row, no SIMD reduction. For debugging.
 kernel void fused_gate_up_swiglu(
     device const uint32_t* gate_W   [[buffer(0)]],
     device const uint8_t*  gate_s   [[buffer(1)]],
@@ -20,48 +20,41 @@ kernel void fused_gate_up_swiglu(
     constant uint&         out_dim  [[buffer(6)]],
     constant uint&         in_dim   [[buffer(7)]],
     constant uint&         group_size [[buffer(8)]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint lid  [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tid [[thread_position_in_grid]]
 ) {
-    if (tgid >= out_dim) return;
+    if (tid >= out_dim) return;
     uint num_groups = in_dim / group_size;
     uint packed_per_group = group_size / 8;
     uint packed_cols = in_dim / 8;
 
-    device const uint32_t* gr = gate_W + tgid * packed_cols;
-    device const uint8_t*  gs = gate_s + tgid * num_groups;
-    device const uint32_t* ur = up_W   + tgid * packed_cols;
-    device const uint8_t*  us = up_s   + tgid * num_groups;
+    device const uint32_t* g_row = gate_W + tid * packed_cols;
+    device const uint8_t*  g_s   = gate_s + tid * num_groups;
+    device const uint32_t* u_row = up_W   + tid * packed_cols;
+    device const uint8_t*  u_s   = up_s   + tid * num_groups;
 
-    float ga = 0.0f, ua = 0.0f;
-    for (uint g = lid; g < num_groups; g += tg_size) {
-        float gsf = exp2((float)gs[g] - 128.0f);
-        float usf = exp2((float)us[g] - 128.0f);
+    float gate_val = 0.0f, up_val = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float gsf = exp2((float)g_s[g] - 128.0f);
+        float usf = exp2((float)u_s[g] - 128.0f);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
-            uint32_t gp = gr[bp + p], up = ur[bp + p];
+            uint32_t gpw = g_row[bp + p], upw = u_row[bp + p];
+            uint x_base = bx + p * 8;
             for (uint i = 0; i < 8; i++) {
-                float xv = x[bx + p * 8 + i];
-                ga += NIBBLE_TO_FLOAT[(gp >> (i * 4)) & 0xF] * gsf * xv;
-                ua += NIBBLE_TO_FLOAT[(up >> (i * 4)) & 0xF] * usf * xv;
+                float g_w = NIBBLE_TO_FLOAT[(gpw >> (i * 4)) & 0xF] * gsf;
+                float u_w = NIBBLE_TO_FLOAT[(upw >> (i * 4)) & 0xF] * usf;
+                float xv = x[x_base + i];
+                gate_val += g_w * xv;
+                up_val   += u_w * xv;
             }
         }
     }
-
-    threadgroup float sg[32], su[32];
-    float rg = simd_sum(ga), ru = simd_sum(ua);
-    uint sl = lid % 32, si = lid / 32, ns = (tg_size + 31) / 32;
-    if (sl == 0) { sg[si] = rg; su[si] = ru; }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (si == 0 && sl < ns) {
-        float vg = simd_sum(sg[sl]), vu = simd_sum(su[sl]);
-        if (sl == 0) out[tgid] = (vg / (1.0f + exp(-vg))) * vu;
-    }
+    float act = gate_val / (1.0f + exp(-gate_val));
+    out[tid] = act * up_val;
 }
 
-// dequant_matvec_4bit: SIMD-optimized with threadgroup tiling (8 rows/TG, 256 threads).
+// dequant_matvec_4bit NAIVE: one thread per row. For correctness baseline.
 kernel void dequant_matvec_4bit(
     device const uint32_t* W_packed [[buffer(0)]],
     device const uint8_t*  scales   [[buffer(1)]],
@@ -70,48 +63,31 @@ kernel void dequant_matvec_4bit(
     constant uint&         out_dim  [[buffer(4)]],
     constant uint&         in_dim   [[buffer(5)]],
     constant uint&         group_size [[buffer(6)]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint tid  [[thread_position_in_threadgroup]],
-    uint tg_size [[threads_per_threadgroup]]
+    uint tid [[thread_position_in_grid]]
 ) {
-    const uint ROWS = 8;
-    uint start_row = tgid * ROWS;
-    uint row = start_row + tid / 32;
-    uint lane = tid % 32;
-    if (row >= out_dim) return;
-
+    if (tid >= out_dim) return;
     uint num_groups = in_dim / group_size;
     uint packed_per_group = group_size / 8;
     uint packed_cols = in_dim / 8;
 
-    device const uint32_t* wr = W_packed + row * packed_cols;
-    device const uint8_t*  sc = scales   + row * num_groups;
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const uint8_t*  sc = scales   + tid * num_groups;
 
     float acc = 0.0f;
-    uint gi = lane;
-    while (gi < num_groups) {
-        float sf = exp2((float)sc[gi] - 128.0f);
-        uint bp = gi * packed_per_group;
-        uint bx = gi * group_size;
+    for (uint g = 0; g < num_groups; g++) {
+        float sf = exp2((float)sc[g] - 128.0f);
+        uint bp = g * packed_per_group;
+        uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
             uint32_t pw = wr[bp + p];
-            float sx0 = sf * x[bx + p * 8 + 0], sx1 = sf * x[bx + p * 8 + 1];
-            float sx2 = sf * x[bx + p * 8 + 2], sx3 = sf * x[bx + p * 8 + 3];
-            float sx4 = sf * x[bx + p * 8 + 4], sx5 = sf * x[bx + p * 8 + 5];
-            float sx6 = sf * x[bx + p * 8 + 6], sx7 = sf * x[bx + p * 8 + 7];
-            acc += fma(NIBBLE_TO_FLOAT[(pw >>  0) & 0xF], sx0, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >>  4) & 0xF], sx1, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >>  8) & 0xF], sx2, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >> 12) & 0xF], sx3, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >> 16) & 0xF], sx4, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >> 20) & 0xF], sx5, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >> 24) & 0xF], sx6, 0.0f);
-            acc += fma(NIBBLE_TO_FLOAT[(pw >> 28) & 0xF], sx7, 0.0f);
+            uint x_base = bx + p * 8;
+            for (uint i = 0; i < 8; i++) {
+                float w_val = NIBBLE_TO_FLOAT[(pw >> (i * 4)) & 0xF] * sf;
+                acc += w_val * x[x_base + i];
+            }
         }
-        gi += 32;
     }
-    float rg = simd_sum(acc);
-    if (lane == 0) out[row] = rg;
+    out[tid] = acc;
 }
 
 // moe_combine: weighted sum of K expert outputs + residual.

@@ -758,6 +758,7 @@ pub const ExpertStreamProvider = struct {
         if (metal_mod.isEnabled() and use_pread and pread_ok and actual_load_ids.len <= 6) {
             if (tryMetalPath(self, flat_x, scores, indices_data, actual_load_ids)) |result| {
                 if (layer_idx == 0) {
+                    std.log.info("[Metal L0] expert_ids={any}", .{actual_load_ids});
                     const rcopy = ops.copy(self.ctx, result) catch return result;
                     rcopy.eval() catch {};
                     const d = rcopy.dataSlice(f32) catch &[_]f32{};
