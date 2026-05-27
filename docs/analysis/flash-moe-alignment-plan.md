@@ -98,20 +98,52 @@ buf_multi_expert_data_B[MAX_K]   // 集 B — 预测预取
 
 ---
 
-## 3. 已完成
+## 3. 实施进度 (2026-05-27)
 
-| 组件 | 状态 | 来源 |
+### ✅ 已完成
+
+| 组件 | 文件 | 说明 |
 |------|------|------|
-| MXFP4 公式修复 | ✅ `NIBBLE_TO_FLOAT[nibble] * exp2(scale-128)` | Python 验证与 MLX 完全一致 |
-| SIMD MoE kernel | ✅ `fused_gate_up_swiglu` + `dequant_matvec_4bit` + `moe_combine` | 适配自 flash-moe `shaders.metal` |
-| Score remap | ✅ indices order → expert_ids order | `expert_stream.zig` |
-| bufPrintZ 修复 | ✅ Zig 0.16 兼容 | `expert_pread.zig` |
-| mach_absolute_time 修复 | ✅ tick→ms 换算 | 4 文件 |
-| 时序预测测量 | ✅ 命中率 20-54%，不足以单独优化 | `expert_stream.zig` |
-| Metal 推理引擎骨架 | ⬜ `engine.{h,c}` 编译通过，attention 未完成 | `src/metal_infer/` |
-| 混合方案验证 | ⬜ Metal MoE 输出在正确范围但生成乱码 | 待调试 |
+| MXFP4 公式 | `moe_kernel.metal` | `NIBBLE_TO_FLOAT[16] * exp2(scale-128)`, Python 验证与 MLX 一致 |
+| Naive MoE kernel | `moe_kernel.metal` | gate_up_swiglu + dequant_matvec + moe_combine, 99.9% 匹配 Python |
+| SIMD kernel | 已回退 | 87-97% 结果错误，bug 在 reduction，待后续修复 |
+| bufPrintZ 修复 | `expert_pread.zig` | Zig 0.16 `bufPrint` 不再 null-terminate |
+| mach_absolute_time 修复 | 5 文件 | tick→ms 换算，之前少报 41.67x |
+| 时序预测测量 | `expert_stream.zig` | 命中率 20-54%，V4 expert 局部性低 |
+| 权重提取 | `deepseek_v4.zig` | `extractWeightsForEngine()` — embed/norm/gate_proj float32 指针 |
+| **Metal 推理引擎** | `src/metal_infer/` | |
+| ├ MoE forward | `engine.c` | gate/up/SwiGLU/down/combine, Metal GPU dispatch |
+| ├ I/O thread pool | `engine.c` | 6 持久化 pthread + cond var, flash-moe 模式 |
+| ├ RMSNorm | `engine.c` + `moe_kernel.metal` | Metal GPU rms_norm_sum_sq + rms_norm_apply |
+| ├ Routing gate | `engine.c` | Metal matvec [256, 4096] @ [4096] → CPU softmax+topK |
+| ├ Q/K/V 投影 | `engine.c` | Metal matvec_f32 kernel ready, 权重待接入 |
+| ├ CPU RoPE | `engine.c` | ds4 YaRN partial RoPE (mode=2, tail-only) |
+| ├ Per-layer forward | `engine.c` | `moe_infer_forward_layer()` 串联全部组件 |
+| └ **Server 集成** | `state.zig` + `deepseek_v4.zig` | 43 层全通无 crash, --metal-moe flag |
+| 混合方案 | 已放弃 | MLX attention + Metal MoE: 数值漂移致命 (5/5 prompt 失败) |
+| **结论** | | Metal MoE 无法替代 MLX matmul, 必须完整 Metal 引擎 |
 
-## 4. 迁移来源对比
+### ⬜ 进行中
+
+| 组件 | 优先级 | 说明 |
+|------|--------|------|
+| Attention 权重接入 | P0 | 提取 Q/K/V/O proj 权重 → setWeights → 引擎 attention |
+| CPU SDPA | P0 | 单 token self-attention, 使 attention 输出非平凡 |
+| MLA attention 迁移 | P1 | 从 ds4 迁移 indexed_mixed_attention 替代简化版 |
+| GPU-side combine | P2 | moe_combine_residual + rms_norm, 消除 CPU 往返 |
+| 延迟 CMD3 | P2 | flash-moe 异步流水线, I/O-GPU 重叠 |
+| 性能优化 | P3 | SIMD kernel 修复, KV cache, prefill 优化 |
+
+### ❌ 已放弃
+
+| 方案 | 原因 |
+|------|------|
+| Metal MoE 替换 MLX matmul | 1e-7 × 258 matmuls = token 级 logit 偏差 |
+| SIMD kernel (flash-moe v3 移植) | reduction bug, 87-97% 输出错误 |
+| 时序预测 as primary optimization | V4 expert 局部性仅 35% vs flash-moe 71% |
+| 混合 MLX+Metal 方案 | 数值无法对齐, 根本性限制 |
+
+## 4. 引擎架构
 
 ### flash-moe (`../flash-moe/metal_infer/`)
 
