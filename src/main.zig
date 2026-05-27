@@ -358,6 +358,7 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
         // Boolean flags don't consume a value
         const is_bool = std.mem.eql(u8, flag, "--smelt") or
             std.mem.eql(u8, flag, "--mlock-backbone") or
+            std.mem.eql(u8, flag, "--metal-moe") or
             std.mem.eql(u8, flag, "--distributed");
         if (!is_bool and i + 1 >= args.len) break;
         const value = if (!is_bool) args[i + 1] else "";
@@ -461,6 +462,7 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         // Boolean flags don't consume a value
         const is_bool = std.mem.eql(u8, flag, "--smelt") or
             std.mem.eql(u8, flag, "--mlock-backbone") or
+            std.mem.eql(u8, flag, "--metal-moe") or
             std.mem.eql(u8, flag, "--distributed") or
             std.mem.eql(u8, flag, "--raw");
         if (!is_bool and i + 1 >= args.len) break;

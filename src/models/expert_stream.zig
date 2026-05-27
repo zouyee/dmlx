@@ -467,8 +467,8 @@ pub const ExpertStreamProvider = struct {
     /// With deduplication: ~24-34 unique experts per layer (30-50% reduction)
     /// This optimization unions routing results across all tokens before loading,
     /// significantly reducing I/O during cold start prefill.
-    /// Try Metal MoE path. Only called when metal is enabled AND packed experts loaded.
-    fn tryMetalPath(self: *ExpertStreamProvider, flat_x: Array, scores: Array, expert_ids: []const u32) ?Array {
+    /// Try Metal MoE path. Uses SIMD-optimized Metal kernels with correct MXFP4 formula.
+    fn tryMetalPath(self: *ExpertStreamProvider, flat_x: Array, scores: Array, indices_data: []const u32, expert_ids: []const u32) ?Array {
         const loader = self.pread_loader orelse return null;
         const fx = ops.copy(self.ctx, flat_x) catch return null;
         defer fx.deinit();
@@ -478,11 +478,23 @@ pub const ExpertStreamProvider = struct {
         defer sc.deinit();
         sc.eval() catch return null;
         const sc_data = sc.dataSlice(f32) catch return null;
+
+        // Remap scores: sc_data in indices order → expert_ids (sorted unique) order
+        var remapped_scores: [6]f32 = [_]f32{0.0} ** 6;
+        for (indices_data, sc_data) |eid, score| {
+            for (expert_ids, 0..) |load_id, j| {
+                if (eid == load_id) {
+                    remapped_scores[j] += score;
+                    break;
+                }
+            }
+        }
+
         var ptrs: [6][*]const u8 = undefined;
         for (0..@min(expert_ids.len, 6)) |i| ptrs[i] = loader.buffers[i].ptr;
         var out: [4096]f32 = [_]f32{0.0} ** 4096;
         const metal = @import("metal_moe.zig");
-        metal.forward(ptrs[0..@min(expert_ids.len, 6)], hidden, sc_data, &out) catch return null;
+        metal.forward(ptrs[0..@min(expert_ids.len, 6)], hidden, &remapped_scores, &out) catch return null;
         const arr = Array.fromData(self.allocator, f32, &out, &[_]i32{4096}) catch return null;
         const result = shape_mod.reshape(self.ctx, arr, &[_]i32{ 1, 1, 4096 }) catch return null;
         return result;
@@ -734,8 +746,26 @@ pub const ExpertStreamProvider = struct {
         //   return x.squeeze(-2)
         // Metal MoE path — enabled via --metal-moe flag + packed experts
         const metal_mod = @import("metal_moe.zig");
+        if (layer_idx == 0 and metal_mod.isEnabled()) {
+            const dbg_fx = ops.copy(self.ctx, flat_x) catch null;
+            if (dbg_fx) |fx| {
+                defer fx.deinit();
+                fx.eval() catch {};
+                const d = fx.dataSlice(f32) catch &[_]f32{};
+                if (d.len >= 5) std.log.info("[MLX L0] input first5=[{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}]", .{ d[0], d[1], d[2], d[3], d[4] });
+            }
+        }
         if (metal_mod.isEnabled() and use_pread and pread_ok and actual_load_ids.len <= 6) {
-            if (tryMetalPath(self, flat_x, scores, actual_load_ids)) |result| return result;
+            if (tryMetalPath(self, flat_x, scores, indices_data, actual_load_ids)) |result| {
+                if (layer_idx == 0) {
+                    const rcopy = ops.copy(self.ctx, result) catch return result;
+                    rcopy.eval() catch {};
+                    const d = rcopy.dataSlice(f32) catch &[_]f32{};
+                    if (d.len >= 5) std.log.info("[Metal L0] output first5=[{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}]", .{ d[0], d[1], d[2], d[3], d[4] });
+                    rcopy.deinit();
+                }
+                return result;
+            }
         }
 
         const deepseek_v4 = @import("deepseek_v4.zig");
