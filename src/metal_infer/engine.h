@@ -207,8 +207,12 @@ void moe_infer_set_weights(MoEInferEngine *engine,
     const float **k_norms,         // [N_LAYERS]
     const float **gate_projs);     // [N_LAYERS] pointers to [N_EXPERTS, DIM]
 
-// Forward pass for one token. hidden: [DIM] input (embedding output).
-// Writes output hidden state back to hidden. Returns 0 on success.
+// Process one layer: RMSNorm → attention → routing → MoE → output.
+// hidden: [DIM] input, overwritten with output on return.
+// Returns 0 on success.
+int moe_infer_forward_layer(MoEInferEngine *engine, int layer, float *hidden, int pos);
+
+// Forward pass for ALL layers. hidden: [DIM] input and output.
 int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
 
 // Cleanup

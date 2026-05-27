@@ -340,106 +340,81 @@ static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
     }
 }
 
-int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
+int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int pos) {
     if (!eng->initialized) return -1;
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    (void)pos;
 
-    for (int layer = 0; layer < N_LAYERS; layer++) {
+    // Copy hidden to buf_hidden
+    float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+    memcpy(buf_h, hidden, DIM * sizeof(float));
+
+    // === RMSNorm (input norm) ===
+    {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-
-        // Copy hidden to Metal buffer
-        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-        memcpy(buf_h, hidden, DIM * sizeof(float));
-
-        // === RMSNorm (input norm) ===
-        id input_norm_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
-                                            length:DIM * sizeof(float)
-                                            options:MTLResourceStorageModeShared deallocator:nil];
-        encode_rms_norm(cb, eng, eng->buf_hidden, input_norm_buf, eng->buf_normed);
+        id w_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
+                                       length:DIM * sizeof(float)
+                                       options:MTLResourceStorageModeShared deallocator:nil];
+        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
         [cb commit];
         [cb waitUntilCompleted];
-        float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+    }
+    float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
 
-        // === Attention: Q/K/V/O projections + CPU SDPA ===
-        float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
-        float *attn_out = (float *)[(id<MTLBuffer>)eng->buf_attn_out contents];
+    // === Attention (simplified: pass-through) ===
+    float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
+    memcpy(h_mid, normed, DIM * sizeof(float));
 
-        // Q_proj: [DIM, DIM] @ [DIM] → [DIM]
-        if (eng->q_proj[layer]) {
-            id<MTLCommandBuffer> cb_a = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-            id q_w = [d newBufferWithBytesNoCopy:(void *)eng->q_proj[layer]
-                                           length:DIM * DIM * sizeof(float)
-                                           options:MTLResourceStorageModeShared deallocator:nil];
-            id q_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
-            encode_matvec(cb_a, eng->pipe_matvec, q_w, eng->buf_normed, q_buf, DIM, DIM);
-            // K_proj, V_proj similarly; O_proj after SDPA
-            [cb_a commit];
-            [cb_a waitUntilCompleted];
-            // Simplified SDPA: single-head self-attention
-            // QK^T: just compute weighted average via softmax of Q dot K
-            float *q_out = (float *)[q_buf contents];
-            // For now: skip SDPA, use Q output as attention result
-            memcpy(attn_out, q_out, DIM * sizeof(float));
-        } else {
-            // No Q weights: copy hidden through
-            memcpy(attn_out, normed, DIM * sizeof(float));
-        }
+    // === Post-attn RMSNorm ===
+    {
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id w_buf = [d newBufferWithBytesNoCopy:(void *)eng->attn_norms[layer]
+                                       length:DIM * sizeof(float)
+                                       options:MTLResourceStorageModeShared deallocator:nil];
+        memcpy(buf_h, h_mid, DIM * sizeof(float)); // buf_hidden = h_mid
+        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
+        [cb commit];
+        [cb waitUntilCompleted];
+    }
+    memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
 
-        // Residual add + O projection (simplified: attn_out already is the attention result)
-        for (int i = 0; i < DIM; i++) {
-            h_mid[i] = hidden[i] + attn_out[i];  // h_mid = hidden + attention_output
-        }
-
-        // === RMSNorm (post-attn norm) ===
-        // For now, normed = h_mid (no attention → no change)
-        // Copy back to normed for the MoE input:
-        float *normed2 = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
-        id attn_norm_buf = [d newBufferWithBytesNoCopy:(void *)eng->attn_norms[layer]
-                                                length:DIM * sizeof(float)
-                                                options:MTLResourceStorageModeShared deallocator:nil];
-        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        {
-            float *tmp = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-            memcpy(tmp, h_mid, DIM * sizeof(float));
-        }
-        encode_rms_norm(cb2, eng, eng->buf_hidden, attn_norm_buf, eng->buf_normed);
-        [cb2 commit];
-        [cb2 waitUntilCompleted];
-
-        // === Routing: gate projection → softmax → topK ===
-        memcpy(normed2, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
-        float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
-        if (eng->gate_proj[layer]) {
-            // Metal: gate_proj @ normed → [N_EXPERTS] routing scores
-            id<MTLCommandBuffer> cb_r = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-            id gate_w = [d newBufferWithBytesNoCopy:(void *)eng->gate_proj[layer]
-                                            length:N_EXPERTS * DIM * sizeof(float)
-                                            options:MTLResourceStorageModeShared deallocator:nil];
-            encode_matvec(cb_r, eng->pipe_matvec, gate_w, eng->buf_normed,
-                          eng->buf_routing_scores, N_EXPERTS, DIM);
-            [cb_r commit];
-            [cb_r waitUntilCompleted];
-        } else {
-            // No gate weight — dummy routing
-            for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
-        }
-
-        // CPU: softmax + topK
-        int expert_ids[N_ACTIVE];
-        float expert_weights[N_ACTIVE];
-        cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
-
-        // === Expert I/O ===
-        IOPool *io = (IOPool *)eng->io_pool;
-        io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
-
-        // === MoE forward (Metal) ===
-        moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
-
-        // Read result back
-        memcpy(hidden, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+    // === Routing gate ===
+    float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
+    if (eng->gate_proj[layer]) {
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id gate_w = [d newBufferWithBytesNoCopy:(void *)eng->gate_proj[layer]
+                                       length:N_EXPERTS * DIM * sizeof(float)
+                                       options:MTLResourceStorageModeShared deallocator:nil];
+        // Copy normed to buf_hidden for matvec input
+        memcpy(buf_h, normed, DIM * sizeof(float));
+        encode_matvec(cb, eng->pipe_matvec, gate_w, eng->buf_hidden, eng->buf_routing_scores, N_EXPERTS, DIM);
+        [cb commit];
+        [cb waitUntilCompleted];
+    } else {
+        for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
     }
 
+    // CPU softmax + topK
+    int expert_ids[N_ACTIVE];
+    float expert_weights[N_ACTIVE];
+    cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+
+    // === Expert I/O ===
+    IOPool *io = (IOPool *)eng->io_pool;
+    io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
+
+    // === MoE forward (Metal) ===
+    moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
+
+    // Read result back to hidden
+    memcpy(hidden, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+    return 0;
+}
+
+int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
+    }
     return 0;
 }
 
