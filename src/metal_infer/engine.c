@@ -352,16 +352,20 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
         memcpy(buf_h, hidden, DIM * sizeof(float));
 
         // === RMSNorm (input norm) ===
-        id weight_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
+        id input_norm_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
                                             length:DIM * sizeof(float)
                                             options:MTLResourceStorageModeShared deallocator:nil];
-        encode_rms_norm(cb, eng, eng->buf_hidden, weight_buf, eng->buf_normed);
-
-        // === Attention: skip for now, pass normed through as h_mid ===
-        float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
+        encode_rms_norm(cb, eng, eng->buf_hidden, input_norm_buf, eng->buf_normed);
         [cb commit];
         [cb waitUntilCompleted];
         float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+
+        // === Attention: Q/K/V projections (MLA compressed) ===
+        // Q = q_proj @ normed [DIM, DIM] @ [DIM] → [DIM]
+        // K = k_proj @ normed [DIM, KV_LORA] @ [DIM] → [KV_LORA]
+        // V = v_proj @ normed [DIM, KV_LORA] @ [DIM] → [KV_LORA]
+        // For now: skip full attention, copy normed through as h_mid
+        float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
         memcpy(h_mid, normed, DIM * sizeof(float));
 
         // === RMSNorm (post-attn norm) ===
