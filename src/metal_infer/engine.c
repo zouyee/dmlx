@@ -387,19 +387,20 @@ static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
 
 int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int pos) {
     if (!eng->initialized) return -1;
-    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+        id<MTLDevice> d = (id<MTLDevice>)eng->device;
     (void)pos;
 
     // Copy hidden to buf_hidden
     float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
     memcpy(buf_h, hidden, DIM * sizeof(float));
+    // Copy hidden to Metal buffer
 
     // === RMSNorm (input norm) ===
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytesNoCopy:(void *)eng->input_norms[layer]
-                                       length:DIM * sizeof(float)
-                                       options:MTLResourceStorageModeShared deallocator:nil];
+        id w_buf = [d newBufferWithBytes:(void *)eng->input_norms[layer]
+                                 length:DIM * sizeof(float)
+                                options:MTLResourceStorageModeShared];
         encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
         [cb commit];
         [cb waitUntilCompleted];
@@ -456,9 +457,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // === Post-attn RMSNorm ===
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytesNoCopy:(void *)eng->attn_norms[layer]
-                                       length:DIM * sizeof(float)
-                                       options:MTLResourceStorageModeShared deallocator:nil];
+        id w_buf = [d newBufferWithBytes:(void *)eng->attn_norms[layer]
+                                 length:DIM * sizeof(float)
+                                options:MTLResourceStorageModeShared];
         memcpy(buf_h, h_mid, DIM * sizeof(float)); // buf_hidden = h_mid
         encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
         [cb commit];
@@ -470,9 +471,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id gate_w = [d newBufferWithBytesNoCopy:(void *)eng->gate_proj[layer]
-                                       length:N_EXPERTS * DIM * sizeof(float)
-                                       options:MTLResourceStorageModeShared deallocator:nil];
+        id gate_w = [d newBufferWithBytes:(void *)eng->gate_proj[layer]
+                                 length:N_EXPERTS * DIM * sizeof(float)
+                                options:MTLResourceStorageModeShared];
         // Copy normed to buf_hidden for matvec input
         memcpy(buf_h, normed, DIM * sizeof(float));
         encode_matvec(cb, eng->pipe_matvec, gate_w, eng->buf_hidden, eng->buf_routing_scores, N_EXPERTS, DIM);

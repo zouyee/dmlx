@@ -133,6 +133,25 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
         const adapter: *model_registry_mod.DeepseekV4VTableAdapter = @ptrCast(@alignCast(vtable.ptr));
         dsv4_model = adapter.model;
+
+        // Init Metal inference engine if --metal-moe flag set
+        if (config.metal_moe) {
+            if (dsv4_model) |model| {
+                if (config.expert_packed_dir) |packed_dir| {
+                    const metal = @import("../metal_infer/engine.zig");
+                    const eng_ptr = metal.init(packed_dir) catch null;
+                    if (eng_ptr) |eng| {
+                        model.metal_engine = @ptrCast(eng);
+                        // Extract weights
+                        const w = model.extractWeightsForEngine() catch null;
+                        if (w) |weights| {
+                            metal.setWeights(@ptrCast(eng), weights);
+                        }
+                        std.log.info("Metal engine initialized with backbone weights", .{});
+                    }
+                }
+            }
+        }
     }
 
     // 3. Load tokenizer

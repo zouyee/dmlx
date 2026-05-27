@@ -1,12 +1,12 @@
 ---
-date: 2026-05-26
-Commit: 8c670f8 (main)
+date: 2026-05-27
+Commit: 83074d8 (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
 mode: serve, smelt 0.20 + stream, ExpertCache 0MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: 653s (perf 186s + e2e 452s)
+total_time: 634s (perf 173s + e2e 395s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -17,43 +17,43 @@ total_time: 653s (perf 186s + e2e 452s)
 
 | Token | Latency (ms) | Cache Hits | Cache Misses |
 |-------|-------------|-----------|-------------|
-| 1 | 999.0 | 0 | 0 |
-| 2 | 1902.8 | 0 | 0 |
-| 3 | 5052.0 | 0 | 0 |
-| 4 | 2315.8 | 0 | 0 |
-| 5 | 798.6 | 0 | 0 |
-| 6 | 594.6 | 0 | 0 |
-| 7 | 491.0 | 0 | 0 |
-| 8 | 523.2 | 0 | 0 |
-| 9 | 467.7 | 0 | 0 |
-| 10 | 572.2 | 0 | 0 |
-| 11 | 509.0 | 0 | 0 |
-| 12 | 538.7 | 0 | 0 |
-| 13 | 555.9 | 0 | 0 |
-| 14 | 523.6 | 0 | 0 |
-| 15 | 498.4 | 0 | 0 |
+| 1 | 970.1 | 0 | 0 |
+| 2 | 2034.3 | 0 | 0 |
+| 3 | 5772.9 | 0 | 0 |
+| 4 | 2246.5 | 0 | 0 |
+| 5 | 756.6 | 0 | 0 |
+| 6 | 577.4 | 0 | 0 |
+| 7 | 485.9 | 0 | 0 |
+| 8 | 512.4 | 0 | 0 |
+| 9 | 469.2 | 0 | 0 |
+| 10 | 575.6 | 0 | 0 |
+| 11 | 515.4 | 0 | 0 |
+| 12 | 545.4 | 0 | 0 |
+| 13 | 549.5 | 0 | 0 |
+| 14 | 507.4 | 0 | 0 |
+| 15 | 540.3 | 0 | 0 |
 
 **Summary**:
-- Prefill (token 1): **999.0ms**
-- Steady-state (token 3+): **412.0-35436.7ms**, avg 954.1ms
-- Throughput: **~1.0 tok/s**
+- Prefill (token 1): **970.1ms**
+- Steady-state (token 3+): **390.9-32457.4ms**, avg 883.2ms
+- Throughput: **~1.1 tok/s**
 - Cache hit rate: **N/A (Trust OS, no custom cache)**
 
 ### HTTP End-to-End Latency
 
 | Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
 |------|--------|----------|-----------|-----------------|
-| 30-token | 30 | 22.926083 | 22.926111 | — |
-| 100-token | 100 | 110.424040 | 110.425319 | — |
+| 30-token | 30 | 23.808745 | 23.808784 | — |
+| 100-token | 100 | 97.988072 | 97.988852 | — |
 
-### Comparison with Previous Version (8c670f8 → 8c670f8)
+### Comparison with Previous Version (7461375 → 83074d8)
 
-| Metric | Previous (8c670f8) | Current (8c670f8) | Change |
+| Metric | Previous (7461375) | Current (83074d8) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill | 1022.1ms | **999.0ms** | **+2%** |
-| Steady-state avg | 3172.4ms | **954.1ms** | **+70%** |
-| Throughput | ~0.3 tok/s | **~1.0 tok/s** | **+249%** |
-| Perf phase | 507s | **186s** | **+63%** |
+| Prefill | 995.4ms | **970.1ms** | **+3%** |
+| Steady-state avg | 2559.2ms | **883.2ms** | **+65%** |
+| Throughput | ~0.4 tok/s | **~1.1 tok/s** | **+183%** |
+| Perf phase | 417s | **173s** | **+59%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -69,8 +69,8 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 | Expert cache | 0 MB |
 | mlock backbone | false |
 | Temperature | 0 (greedy) |
-| Startup time | 53s (incl. warmup) |
-| Server RSS | 2766 MB |
+| Startup time | 52s (incl. warmup) |
+| Server RSS | 0 MB |
 | Port | 18090 |
 
 ---
@@ -82,12 +82,12 @@ Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 | P1 | ✅ | . The user's query is "2+2=?". The assistant's response is "4". The user's query |
 | P2 | ✅ | . The capital of France is Paris. The capital of France is Paris. The capital of |
 | P3 | ✅ | .</think> The temperature at which water freezes is 0 degrees Celsius. This is a |
-| P4 | ✅ | , but the user's question is "Is the Earth round?" The answer is yes. The user's |
-| P5 | ✅ | . The user's query is "3*3=". This is a simple multiplication problem. The answe |
-| P6 | ✅ | . The user's query is "10-5=". This is a simple arithmetic subtraction problem. |
-| P7 | ✅ | to user's query. The user's query is "What is capital of France?" The correct an |
+| P4 | ❌ |  |
+| P5 | ❌ |  |
+| P6 | ❌ |  |
+| P7 | ❌ |  |
 
-**7/7 PASS, 0 FAIL**
+**3/7 PASS, 4 FAIL**
 
 ---
 
@@ -101,17 +101,17 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (8c670f8) | Current (8c670f8) | Change |
+| Metric | Previous (7461375) | Current (83074d8) | Change |
 |--------|-------------------------|-------------------|--------|
-| Prefill latency | 1022.1ms | **999.0ms** | **+2%** |
-| Steady-state ITL | 3172.4ms | **954.1ms** | **+70%** |
-| Steady-state tok/s | ~0.3 | **~1.0** | **+249%** |
+| Prefill latency | 995.4ms | **970.1ms** | **+3%** |
+| Steady-state ITL | 2559.2ms | **883.2ms** | **+65%** |
+| Steady-state tok/s | ~0.4 | **~1.1** | **+183%** |
 | Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
-| 100-token HTTP total | — | **110.425319s** | — |
-| Server RSS | — | **2766 MB** | — |
-| Startup time | — | **53s** | — |
-| 7-Prompt pass rate | 7/7 | **7/7** | — |
+| 100-token HTTP total | — | **97.988852s** | — |
+| Server RSS | — | **0 MB** | — |
+| Startup time | — | **52s** | — |
+| 7-Prompt pass rate | 7/7 | **3/7** | — |
 
 ---
 
-*Generated by `scripts/run_benchmark.sh` on 2026-05-26*
+*Generated by `scripts/run_benchmark.sh` on 2026-05-27*

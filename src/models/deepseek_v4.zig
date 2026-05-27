@@ -2689,8 +2689,13 @@ pub const DSV4Model = struct {
     hc_head: ?HyperHead,
     lm_head: Array,
     stream_provider: ?*expert_stream.ExpertStreamProvider = null,
+    metal_engine: ?*anyopaque = null, // *MoEInferEngine
 
     pub fn deinit(self: *DSV4Model) void {
+        if (self.metal_engine) |eng| {
+            const metal = @import("../metal_infer/engine.zig");
+            metal.deinit(@ptrCast(@alignCast(eng)));
+        }
         self.config.deinitClone(self.allocator);
         self.embed_tokens.weight.deinit();
         for (self.layers) |*layer| {
@@ -2799,11 +2804,19 @@ pub const DSV4Model = struct {
         var layer_total_ns: u64 = 0;
         for (self.layers, 0..) |*layer, i| {
             const layer_start = std.c.mach_absolute_time();
-            const cache = if (caches) |cache_arr| cache_arr[i] else null;
-            hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
-            // Eval after each layer to materialize results and free lazy weight references
-            // This allows MLX to page weights in/out of memory for large models
-            try hidden.eval();
+            if (self.metal_engine) |eng_ptr| {
+                // Metal engine path: extract hidden → engine forward → wrap result
+                try hidden.eval();
+                const hdata = try hidden.dataSliceMut(f32);
+                const metal = @import("../metal_infer/engine.zig");
+                try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), hdata, @intCast(start_pos));
+                // hidden already updated in-place via dataSliceMut
+            } else {
+                const cache = if (caches) |cache_arr| cache_arr[i] else null;
+                hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));
+                // Eval after each layer to materialize results and free lazy weight references
+                try hidden.eval();
+            }
             const layer_end = std.c.mach_absolute_time();
             layer_total_ns += layer_end - layer_start;
         }

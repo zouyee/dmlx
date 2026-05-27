@@ -42,8 +42,10 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addImport("regex", zig_regex.module("regex"));
     // Metal MoE C wrapper — needed for test compilation
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/models/moe_metal_wrapper.c"), .flags = &.{"-fobjc-arc"}, .language = .objective_c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/engine.c"), .flags = &.{}, .language = .objective_c });
     lib_tests.root_module.linkFramework("Metal", .{});
     lib_tests.root_module.linkFramework("Foundation", .{});
+    lib_tests.root_module.linkFramework("Accelerate", .{});
     const run_lib_tests = b.addRunArtifact(lib_tests);
     if (b.args) |args| {
         run_lib_tests.addArgs(args);
