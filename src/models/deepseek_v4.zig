@@ -2704,6 +2704,52 @@ pub const DSV4Model = struct {
         self.lm_head.deinit();
     }
 
+    /// Extract backbone weight float32 pointers for Metal inference engine.
+    /// Caller must ensure model arrays remain valid (eval'd and not deinit'd).
+    pub fn extractWeightsForEngine(self: *DSV4Model) !EngineWeights {
+        const D = self.config.hidden_size;
+        var w: EngineWeights = undefined;
+
+        // Embedding
+        try self.embed_tokens.weight.eval();
+        w.embed = (try self.embed_tokens.weight.dataPtr(f32))[0..self.embed_tokens.weight.size()];
+
+        // LM head
+        try self.lm_head.eval();
+        w.lm_head = (try self.lm_head.dataPtr(f32))[0..self.lm_head.size()];
+
+        // Final norm
+        try self.norm.weight.eval();
+        w.final_norm = (try self.norm.weight.dataPtr(f32))[0..self.norm.weight.size()];
+
+        // Per-layer weights
+        const n_layers = self.layers.len;
+        w.n_layers = n_layers;
+        for (self.layers, 0..) |*layer, i| {
+            // RMSNorm weights
+            try layer.attn_norm.weight.eval();
+            w.input_norms[i] = (try layer.attn_norm.weight.dataPtr(f32))[0..D];
+            try layer.ffn_norm.weight.eval();
+            w.attn_norms[i] = (try layer.ffn_norm.weight.dataPtr(f32))[0..D];
+
+            // Router gate weight: [n_routed_experts, dim]
+            try layer.ffn.gate.weight.eval();
+            w.gate_projs[i] = (try layer.ffn.gate.weight.dataPtr(f32))[0..layer.ffn.gate.weight.size()];
+        }
+
+        return w;
+    }
+
+    pub const EngineWeights = struct {
+        embed: []const f32,
+        lm_head: []const f32,
+        final_norm: []const f32,
+        input_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        n_layers: usize = 0,
+    };
+
     /// Check if any layer has expert weights loaded in memory.
     pub fn hasExpertsLoaded(self: *DSV4Model) bool {
         for (self.layers) |*layer| {
