@@ -203,8 +203,40 @@ python3 scripts/compare_metal_mlx.py /tmp/mlx_ref /tmp/metal_out
 #### 2c. 现状
 
 - [x] metal-moe 混合路径**正确性达标**（E2E 输出匹配 MLX）
-- [ ] 性能：~4.5s/token（比 MLX 慢 8x），是 Phase 4/5 的优化目标（I/O 流水线 + kernel 优化）
+- [x] **性能瓶颈实测（2026-06-01）** —— 见 §2e，结论颠覆「I/O 是瓶颈」的旧假设
 - [ ] decode 路径逐层对拍自动化（需构造 decode-only dump，当前 dump 主要覆盖 prefill）
+
+#### 2e. 性能瓶颈实测 —— 瓶颈不是 I/O，是 MLX 同步屏障
+
+decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
+
+| 组件 | 耗时 | 占比 | 说明 |
+|------|------|------|------|
+| **other** | ~2400-2800ms | **~70%** | MLX backbone（attention/mHC/gate/shared expert）+ 每层同步 |
+| io | ~460-940ms | ~20% | `readAndAssembleAll` SSD 读 + 数组组装（warm cache，读本身仅 ~1ms） |
+| metal | ~400-760ms | ~12% | Metal MoE kernel dispatch（naive，含 6 expert 串行 + waitUntilCompleted） |
+
+**关键结论（颠覆旧假设）**：
+
+1. **I/O 不是瓶颈**（仅 ~20%，且 warm cache 下纯读 ~1ms）。归档文档「I/O 占 97%」是 cold-start 估算，
+   warm 运行下不成立。→ **时序预测预取、双缓冲等 I/O 优化对当前瓶颈收益有限。**
+2. **真正瓶颈是 "other" ~70%**：纯 MLX 路径 backbone 仅 ~0.5s/token，但混合路径 "other" 高达 ~2.6s。
+   5x 劣化的原因：`tryMetalPath` 每层强制 `eval()` + `dataSlice` + `Array.fromData` + `reshape`，
+   **把 MLX 的惰性图融合打断成 43 次同步屏障**（每层一次 materialize），丧失 MLX 的 lazy/fusion 优势。
+3. metal kernel 本身（~12%）是第三位，naive kernel + 6 expert 串行 + 每次 `waitUntilCompleted` 同步。
+
+**修正后的优化优先级（Phase 4/5）**：
+
+- **P0：消除每层 MLX 同步屏障**（收益最大，~70%）。让 metal MoE 输出**作为 MLX lazy array 回插图**，
+  而非 `eval()`+`fromData` 往返；或反过来，把整层（attn+moe）都搬出 MLX 同步点。
+  这是当前 ~3.7s → 接近纯 MLX ~0.5s 的关键。
+- **P1：metal kernel 优化**（~12%）：6 expert 并行 dispatch（单 command buffer 不 per-expert 等待）、
+  SIMD reduction、threadgroup tiling、去掉 `waitUntilCompleted` 改 deferred。
+- **P2：I/O**（~20%）：当前 warm 已不是瓶颈；cold-start 才需预取。优先级最低。
+
+> ⚠️ 这说明「metal-first 终局」的性能前提存疑：只要 backbone 还在 MLX，每层 metal↔MLX 往返的同步屏障
+> 就吃掉大部分时间。要么 **全 metal**（消除往返，回到 Phase 2d-5 的大工程），要么 **纯 MLX + MLX 量化 MoE**
+> （根本不引入 metal 往返）。当前「MLX backbone + metal MoE」混合方案**性能上是最差组合**（两边的同步代价都付）。
 
 #### 2d. 注意力搬 Metal（推迟）
 

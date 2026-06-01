@@ -109,6 +109,9 @@ pub const ExpertStreamProvider = struct {
     token_step_count: u64 = 0,
     token_step_start_ticks: u64 = 0,
     step_bytes_read: u64 = 0,
+    // Per-token-step breakdown (ticks), reset each token at layer 0.
+    step_io_ticks: u64 = 0,
+    step_metal_ticks: u64 = 0,
 
     /// Finish warmup: compute per-layer skip masks from collected expert stats.
     /// Experts never seen in top-5 during warmup are marked skippable.
@@ -515,6 +518,8 @@ pub const ExpertStreamProvider = struct {
             self.token_step_count += 1;
             self.token_step_start_ticks = std.c.mach_absolute_time();
             self.step_bytes_read = 0;
+            self.step_io_ticks = 0;
+            self.step_metal_ticks = 0;
         }
 
         // 1. Ensure indices are contiguous and uint32 before any dataSlice reads.
@@ -661,7 +666,9 @@ pub const ExpertStreamProvider = struct {
             const loader = self.pread_loader.?;
             // readAndAssembleAll: one set of pread calls, extract all 6 components.
             // Avoids reading the same expert blob 3x (once per projection).
+            const io_t0 = std.c.mach_absolute_time();
             const all = loader.readAndAssembleAll(self.ctx, layer_idx, actual_load_ids) catch null;
+            self.step_io_ticks += std.c.mach_absolute_time() - io_t0;
             if (all) |a| {
                 gate_w = a.gate;
                 up_w = a.up;
@@ -756,7 +763,10 @@ pub const ExpertStreamProvider = struct {
             }
         }
         if (metal_mod.isEnabled() and use_pread and pread_ok and actual_load_ids.len <= 6) {
-            if (tryMetalPath(self, flat_x, scores, indices_data, actual_load_ids)) |result| {
+            const metal_t0 = std.c.mach_absolute_time();
+            const metal_res = tryMetalPath(self, flat_x, scores, indices_data, actual_load_ids);
+            self.step_metal_ticks += std.c.mach_absolute_time() - metal_t0;
+            if (metal_res) |result| {
                 if (layer_idx == 0) {
                     std.log.info("[Metal L0] expert_ids={any}", .{actual_load_ids});
                     const rcopy = ops.copy(self.ctx, result) catch return result;
@@ -764,6 +774,16 @@ pub const ExpertStreamProvider = struct {
                     const d = rcopy.dataSlice(f32) catch &[_]f32{};
                     if (d.len >= 5) std.log.info("[Metal L0] output first5=[{d:.3},{d:.3},{d:.3},{d:.3},{d:.3}]", .{ d[0], d[1], d[2], d[3], d[4] });
                     rcopy.deinit();
+                }
+                // Per-token breakdown on the last layer (metal path returns early,
+                // so the end-of-function log below is unreachable in metal mode).
+                if (layer_idx == self.layer_meta.len - 1 and self.token_step_start_ticks != 0) {
+                    const e_ticks = std.c.mach_absolute_time() - self.token_step_start_ticks;
+                    const e_ms = @as(f64, @floatFromInt(e_ticks * 125 / 3)) / 1_000_000.0;
+                    const io_ms = @as(f64, @floatFromInt(self.step_io_ticks * 125 / 3)) / 1_000_000.0;
+                    const m_ms = @as(f64, @floatFromInt(self.step_metal_ticks * 125 / 3)) / 1_000_000.0;
+                    std.log.info("Token step {d} (metal): {d:.1}ms (io={d:.1}ms metal={d:.1}ms other={d:.1}ms)", .{ self.token_step_count, e_ms, io_ms, m_ms, e_ms - io_ms - m_ms });
+                    if (!self.pred_valid) self.pred_valid = true;
                 }
                 return result;
             }
@@ -816,9 +836,15 @@ pub const ExpertStreamProvider = struct {
             // On Apple Silicon: timebase = 125/3, so 1 tick = 125/3 ns ≈ 41.67 ns.
             const elapsed_ns = elapsed_ticks * 125 / 3;
             const elapsed_ms = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
-            std.log.info("Token step {d} complete: {d:.1}ms", .{
+            const io_ms = @as(f64, @floatFromInt(self.step_io_ticks * 125 / 3)) / 1_000_000.0;
+            const metal_ms = @as(f64, @floatFromInt(self.step_metal_ticks * 125 / 3)) / 1_000_000.0;
+            const other_ms = elapsed_ms - io_ms - metal_ms;
+            std.log.info("Token step {d} complete: {d:.1}ms (io={d:.1}ms metal={d:.1}ms other={d:.1}ms)", .{
                 self.token_step_count,
                 elapsed_ms,
+                io_ms,
+                metal_ms,
+                other_ms,
             });
             // Enable temporal prediction after first token
             if (!self.pred_valid) {
