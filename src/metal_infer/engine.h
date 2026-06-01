@@ -24,15 +24,49 @@ extern "C" {
 // ============================================================================
 
 #define DIM 4096           // hidden dimension
-#define INTERMEDIATE 2048  // gate/up intermediate
-#define N_LAYERS 43        // MoE layers (layer 0..42)
-#define N_EXPERTS 256      // experts per layer
+#define INTERMEDIATE 2048  // gate/up intermediate (MoE expert)
+#define N_LAYERS 43        // transformer layers
+#define N_EXPERTS 256      // routed experts per layer
 #define N_ACTIVE 6         // K = 6 active experts per token
-#define N_HEADS 32         // attention heads (full-attn layers)
-#define HEAD_DIM 128       // head dimension = DIM / N_HEADS
-#define KV_HEADS 8         // KV heads (MLA compressed)
-#define KV_LORA_RANK 512   // KV compression rank
+
+// --- MLA (Multi-head Latent Attention) dimensions — DeepSeek-V4-Flash ---
+// Verified from safetensors headers (see dsv4-first-class-support-plan.md §Phase 3-5).
+#define N_HEADS 64         // attention heads
+#define HEAD_DIM 512       // per-head dim = QK_NOPE_DIM + QK_ROPE_DIM
+#define QK_ROPE_DIM 64     // rotary portion (tail), YaRN partial RoPE
+#define QK_NOPE_DIM 448    // non-rotary portion (head front)
+#define Q_LORA_RANK 1024   // wq_a output / wq_b input
+#define KV_LORA_RANK 512   // wkv output (MQA: 1 KV head, broadcast to N_HEADS)
+#define O_GROUPS 8         // grouped output LoRA (wo_a)
+#define O_LORA_RANK 1024   // per-group wo_a output
+#define ATTN_GROUP_SIZE 64 // affine quant group size for attention weights
+#define MOE_GROUP_SIZE 32  // mxfp4 quant group size for expert weights
+#define MHC_MULT 4         // mHC HyperConnection multiplier
 #define MAX_SEQ_LEN 4096   // max sequence length
+
+// Quantized weight (affine 4-bit, gs=64): packed u32 + bf16->f32 scales & biases.
+// w = scale_g * nibble + bias_g.  Pointers are owned by the model (eval'd, not freed).
+typedef struct {
+    const uint32_t *packed;  // [out_dim, in_dim/8]
+    const float    *scales;  // [out_dim, in_dim/group_size] (converted bf16->f32)
+    const float    *biases;  // [out_dim, in_dim/group_size]
+    int out_dim;
+    int in_dim;
+    int group_size;
+} QuantWeight;
+
+// Per-layer MLA attention weights (quantized, on-the-fly dequant in Metal).
+typedef struct {
+    QuantWeight wq_a;        // [1024, 4096]
+    const float *q_norm;     // [1024] RMSNorm weight
+    QuantWeight wq_b;        // [32768, 1024]  (= N_HEADS*HEAD_DIM, Q_LORA_RANK)
+    QuantWeight wkv;         // [512, 4096]
+    const float *kv_norm;    // [512] RMSNorm weight
+    QuantWeight wo_a[O_GROUPS]; // each [1024, 4096]  (O_LORA_RANK, DIM)
+    QuantWeight wo_b;        // [4096, 8192]  (DIM, O_GROUPS*O_LORA_RANK)
+    const float *attn_sink;  // [64] per-head sink logits
+} AttnWeights;
+
 
 // Expert packed binary layout (see repack_experts.py)
 #define EXPERT_SIZE 13369344  // bytes per expert
@@ -62,26 +96,20 @@ typedef struct {
     int vocab_size;
     const float *lm_head;           // [vocab, DIM]
     const float *final_norm;        // [DIM]
-    const float *input_norms[N_LAYERS];  // [DIM]
-    const float *attn_norms[N_LAYERS];   // [DIM]
-    const float *q_proj[N_LAYERS];       // [DIM, DIM]
-    const float *k_proj[N_LAYERS];       // [DIM, KV_LORA_RANK]
-    const float *v_proj[N_LAYERS];       // [DIM, KV_LORA_RANK]
-    const float *o_proj[N_LAYERS];       // [DIM, DIM]
-    const float *q_norms[N_LAYERS];      // [HEAD_DIM]
-    const float *k_norms[N_LAYERS];      // [HEAD_DIM]
+    const float *input_norms[N_LAYERS];  // [DIM] attn_norm (pre-attention)
+    const float *attn_norms[N_LAYERS];   // [DIM] ffn_norm (pre-MoE)
+    AttnWeights  attn[N_LAYERS];         // MLA attention weights (quantized)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     int expert_fd[N_LAYERS];
     bool weights_set;
 } WeightFile;
 
 // ============================================================================
-// KV Cache
+// KV Cache — MLA stores compressed KV-latent (1 KV head, KV_LORA_RANK wide)
 // ============================================================================
 
 typedef struct {
-    float *k;   // [MAX_SEQ_LEN, KV_LORA_RANK]
-    float *v;   // [MAX_SEQ_LEN, KV_LORA_RANK]
+    float *kv;  // [MAX_SEQ_LEN, KV_LORA_RANK] post-norm, post-RoPE KV latent
     int len;
 } KVCache;
 
@@ -160,15 +188,10 @@ typedef struct {
     int vocab_size;
     const float *lm_head;
     const float *final_norm;
-    const float *input_norms[N_LAYERS];
-    const float *attn_norms[N_LAYERS];
-    const float *q_proj[N_LAYERS];
-    const float *k_proj[N_LAYERS];
-    const float *v_proj[N_LAYERS];
-    const float *o_proj[N_LAYERS];
-    const float *q_norms[N_LAYERS];
-    const float *k_norms[N_LAYERS];
-    const float *gate_proj[N_LAYERS];  // [N_EXPERTS, DIM] router weight
+    const float *input_norms[N_LAYERS];  // attn_norm (pre-attention)
+    const float *attn_norms[N_LAYERS];   // ffn_norm (pre-MoE)
+    AttnWeights  attn[N_LAYERS];         // MLA attention weights (quantized)
+    const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     int expert_fd[N_LAYERS];
 
     // KV cache
@@ -191,23 +214,23 @@ typedef struct {
 MoEInferEngine *moe_infer_init(const char *packed_dir,
                                 const char *kernel_src, unsigned long kernel_src_len);
 
-// Set backbone weights from MLX float32 arrays. Must be called after init,
-// before forward. Pointers must remain valid for the engine's lifetime.
+// Set global backbone weights (embed, lm_head, final_norm, per-layer norms, gate).
+// Pointers must remain valid for the engine's lifetime (eval'd, not freed).
 void moe_infer_set_weights(MoEInferEngine *engine,
     const float *embed, int vocab_size,
     const float *lm_head,
     const float *final_norm,
-    const float **input_norms,     // [N_LAYERS] pointers to [DIM] float
-    const float **attn_norms,      // [N_LAYERS] pointers to [DIM] float
-    const float **q_proj_weights,  // [N_LAYERS] pointers to [DIM, DIM]
-    const float **k_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
-    const float **v_proj_weights,  // [N_LAYERS] pointers to [DIM, KV_LORA]
-    const float **o_proj_weights,  // [N_LAYERS] pointers to [DIM, DIM]
-    const float **q_norms,         // [N_LAYERS]
-    const float **k_norms,         // [N_LAYERS]
-    const float **gate_projs);     // [N_LAYERS] pointers to [N_EXPERTS, DIM]
+    const float **input_norms,     // [N_LAYERS] -> [DIM] (attn_norm)
+    const float **attn_norms,      // [N_LAYERS] -> [DIM] (ffn_norm)
+    const float **gate_projs);     // [N_LAYERS] -> [N_EXPERTS, DIM]
 
-// Process one layer: RMSNorm → attention → routing → MoE → output.
+// Set one layer's MLA attention weights (quantized; on-the-fly dequant in Metal).
+// Called once per layer after moe_infer_set_weights. The AttnWeights pointers
+// (packed u32, f32 scales/biases, norms, sink) must remain valid for the
+// engine's lifetime.
+void moe_infer_set_layer_attn(MoEInferEngine *engine, int layer, AttnWeights attn);
+
+// Process one layer: RMSNorm → MLA attention → routing → MoE → output.
 // hidden: [DIM] input, overwritten with output on return.
 // Returns 0 on success.
 int moe_infer_forward_layer(MoEInferEngine *engine, int layer, float *hidden, int pos);

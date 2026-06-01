@@ -25,12 +25,6 @@ extern fn moe_infer_set_weights(
     final_norm: [*c]const f32,
     input_norms: [*c][*c]const f32,
     attn_norms: [*c][*c]const f32,
-    q_proj_w: [*c][*c]const f32,
-    k_proj_w: [*c][*c]const f32,
-    v_proj_w: [*c][*c]const f32,
-    o_proj_w: [*c][*c]const f32,
-    q_norms: [*c][*c]const f32,
-    k_norms: [*c][*c]const f32,
     gate_projs: [*c][*c]const f32,
 ) void;
 
@@ -63,14 +57,8 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         an_arr[i] = w.attn_norms[i].ptr;
         gp_arr[i] = w.gate_projs[i].ptr;
     }
-    // q/k/v/o proj + q/k norms — placeholder NULL (attention not wired yet)
-    var qp_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    var kp_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    var vp_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    var op_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    var qn_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    var kn_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
-    moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &qp_arr, &kp_arr, &vp_arr, &op_arr, &qn_arr, &kn_arr, &gp_arr);
+    // MLA attention weights are set per-layer via setLayerAttn (S2+).
+    moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr);
 }
 
 pub fn deinit(engine: *Engine) void {

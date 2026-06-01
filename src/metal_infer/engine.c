@@ -407,52 +407,18 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     }
     float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
 
-    // === Attention: Q/K/V projections + RoPE + simplified SDPA ===
+    // === MLA Attention (S2-S5: NOT YET IMPLEMENTED) ===
+    // The GQA placeholder (q/k/v_proj matvec + memcpy(q->attn_out)) has been
+    // removed. The real MLA attention (wq_a→q_norm→wq_b→per-head norm→tail RoPE,
+    // wkv→kv_norm→RoPE, MQA-broadcast SDPA + sink, grouped wo_a→wo_b) is built
+    // incrementally in S2-S5 against the MLX oracle. Until then this engine.c
+    // full-layer path is dead code (not wired by --metal-moe; see state.zig).
+    // Pass-through so the layer at least type-checks and runs end-to-end.
     float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
     float *attn_out = (float *)[(id<MTLBuffer>)eng->buf_attn_out contents];
-
-    // Q projection
-    if (eng->q_proj[layer]) {
-        id<MTLCommandBuffer> cb_a = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        // Q, K, V buffers
-        id q_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
-        id k_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
-        id v_buf = [d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
-
-        // Q, K, V projections
-        id q_w = [d newBufferWithBytesNoCopy:(void *)eng->q_proj[layer] length:DIM*DIM*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
-        encode_matvec(cb_a, eng->pipe_matvec, q_w, eng->buf_normed, q_buf, DIM, DIM);
-
-        if (eng->k_proj[layer]) {
-            id k_w = [d newBufferWithBytesNoCopy:(void *)eng->k_proj[layer] length:DIM*KV_LORA_RANK*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
-            encode_matvec(cb_a, eng->pipe_matvec, k_w, eng->buf_normed, k_buf, KV_LORA_RANK, DIM);
-        }
-        if (eng->v_proj[layer]) {
-            id v_w = [d newBufferWithBytesNoCopy:(void *)eng->v_proj[layer] length:DIM*KV_LORA_RANK*sizeof(float) options:MTLResourceStorageModeShared deallocator:nil];
-            encode_matvec(cb_a, eng->pipe_matvec, v_w, eng->buf_normed, v_buf, KV_LORA_RANK, DIM);
-        }
-
-        [cb_a commit];
-        [cb_a waitUntilCompleted];
-
-        // CPU: Apply RoPE to Q and K (V4 partial RoPE, tail only)
-        float *q = (float *)[q_buf contents];
-        float *k = (float *)[k_buf contents];
-        int n_nope = DIM - ROPE_DIM;
-        apply_rope_tail(q, DIM, n_nope, pos, 1.0f);
-        apply_rope_tail(k, KV_LORA_RANK, KV_LORA_RANK - ROPE_DIM, pos, 1.0f);
-
-        // Simplified SDPA: single token self-attention = V (attention over one position is identity)
-        // O = o_proj @ V → but V is [KV_LORA_RANK], not [DIM]
-        // For now: use Q as attention output (simplified)
-        memcpy(attn_out, q, DIM * sizeof(float));
-    } else {
-        // No Q weights: pass normed through
-        memcpy(attn_out, normed, DIM * sizeof(float));
-    }
-
-    // Residual: h_mid = hidden + attn_out
-    for (int i = 0; i < DIM; i++) h_mid[i] = buf_h[i] + attn_out[i];
+    (void)attn_out;
+    // attn_out = 0 (no attention contribution yet) → h_mid = residual only.
+    for (int i = 0; i < DIM; i++) h_mid[i] = buf_h[i];
 
     // === Post-attn RMSNorm ===
     {
@@ -541,8 +507,6 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
 void moe_infer_set_weights(MoEInferEngine *eng,
     const float *embed, int vocab_size, const float *lm_head, const float *final_norm,
     const float **input_norms, const float **attn_norms,
-    const float **q_proj_w, const float **k_proj_w, const float **v_proj_w, const float **o_proj_w,
-    const float **q_norms, const float **k_norms,
     const float **gate_proj_w) {
     eng->embed = embed;
     eng->vocab_size = vocab_size;
@@ -551,14 +515,13 @@ void moe_infer_set_weights(MoEInferEngine *eng,
     for (int i = 0; i < N_LAYERS; i++) {
         eng->input_norms[i] = input_norms[i];
         eng->attn_norms[i] = attn_norms[i];
-        eng->q_proj[i]     = q_proj_w[i];
-        eng->k_proj[i]     = k_proj_w[i];
-        eng->v_proj[i]     = v_proj_w[i];
-        eng->o_proj[i]     = o_proj_w[i];
-        eng->q_norms[i]    = q_norms[i];
-        eng->k_norms[i]    = k_norms[i];
         eng->gate_proj[i]  = gate_proj_w[i];
     }
+}
+
+void moe_infer_set_layer_attn(MoEInferEngine *eng, int layer, AttnWeights attn) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->attn[layer] = attn;
 }
 
 void moe_infer_deinit(MoEInferEngine *eng) {
