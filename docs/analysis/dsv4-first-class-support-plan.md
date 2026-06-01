@@ -313,8 +313,13 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] host 编排：`mla_attention.m`（`mla_attention_decode`）串 Q链→KV链→SDPA+sink→逆RoPE→grouped wo_a→wo_b，全程 Metal 无 MLX 往返；mHC 小算子留 CPU（S6 决定）
       - [x] **独立 host 对拍 GO**：`gen_attn_golden.py` 生成 layer-0 真实权重+golden，`mla_attention_test.m` 跑完整注意力 vs golden → **rel_L2=1.9e-6**（~2s，不必起服务）。`run_mla_attention_test.sh` 可复跑
       - [x] mHC CPU 实现（`mhc.{h,c}`）：`mhc_pre`（preNormFn + scale/base 切分 + sinkhorn）/`mhc_post`（转置 comb）/`mhc_head_compress`，对拍 golden（`gen_mhc_golden.py` + `mhc_test.c`）全部 ≤6e-8
-      - [ ] 接入 engine.c `moe_infer_forward_layer`（替换 pass-through 占位）+ KV cache 分配 + build.zig 编译 mla_attention.m / mhc.c + 4-stream `[4,4096]` residual 串联
-      - [ ] 真实逐层 dump 对拍（attn_out / 层输出 vs MLX）
+      - [x] 接入 engine.c `moe_infer_forward_layer`：完整 mHC-wrapped 全 metal layer
+            （mhc_pre→input RMSNorm→`mla_attention_decode`→mhc_post→mhc_pre→ffn RMSNorm→gate→MoE→mhc_post），
+            `hidden` 即 mHC 展开的 `[MHC_MULT,DIM]` 原地残差；KV cache 惰性分配；engine.c MoE combine 改零 residual
+            （routed-only，与 metal_moe.zig 一致）；build.zig 加 `mla_attention.m`/`mhc.c`。编译通过，隔离测试仍 GO
+      - [ ] ⚠️ **已知缺口**：(1) 全 metal MoE 缺 shared expert（模型 n_shared_experts=1）；
+            (2) 未接线运行——`state.zig` 未设 `metal_engine`、`extractWeightsForEngine` 未填 hc 权重/未调 set_layer_attn/hc
+      - [ ] 真实逐层 dump 对拍（attn_out / 层输出 vs MLX）— S7d
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
 - [ ] **S10 达标门**：≥3.0 tok/s + 7/7 + 稳定 → 改默认 flag、退役 MLX 推理路径（保留 loader + 对拍）

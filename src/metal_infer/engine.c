@@ -5,6 +5,8 @@
 //
 // See docs/analysis/flash-moe-alignment-plan.md for architecture details.
 #include "engine.h"
+#include "mla_attention.h"
+#include "mhc.h"
 #include <Metal/Metal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -46,6 +48,11 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
     eng->pipe_rms_norm_apply = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_apply"] error:&err]);
     eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
+    // S7: MLA attention pipelines
+    eng->pipe_dequant_matvec_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine"] error:&err]);
+    eng->pipe_rms_norm_rows = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows"] error:&err]);
+    eng->pipe_rope_tail = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved"] error:&err]);
+    eng->pipe_mla_sdpa = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -230,17 +237,17 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         [enc endEncoding];
     }
 
-    // Step 3: moe_combine — weighted sum of K expert outputs + residual
+    // Step 3: moe_combine — weighted sum of K routed-expert outputs ONLY.
+    // Residual is added by the mHC post step in the caller (full-metal layer),
+    // so bind a zeroed residual here (do NOT add buf_h_mid).
     {
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:eng->pipe_moe_combine];
-        // Pass expert output buffers as a flat array: all K outputs concatenated
-        // For simplicity, copy expert outputs into a temp buffer
-        // (optimization: use buffer offset trick in kernel)
         id weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
-        [enc setBuffer:eng->buf_expert_out[0] offset:0 atIndex:0]; // kernel reads all K from contiguous?
+        id zero_resid = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        [enc setBuffer:eng->buf_expert_out[0] offset:0 atIndex:0];
         [enc setBuffer:weights_buf offset:0 atIndex:1];
-        [enc setBuffer:eng->buf_h_mid offset:0 atIndex:2]; // residual (input before MoE)
+        [enc setBuffer:zero_resid offset:0 atIndex:2]; // zero residual
         [enc setBuffer:eng->buf_hidden offset:0 atIndex:3]; // output
         uint kv = K, hd = DIM;
         [enc setBytes:&kv length:4 atIndex:4];
@@ -387,82 +394,95 @@ static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
 
 int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int pos) {
     if (!eng->initialized) return -1;
-        id<MTLDevice> d = (id<MTLDevice>)eng->device;
-    (void)pos;
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
 
-    // Copy hidden to buf_hidden
-    float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-    memcpy(buf_h, hidden, DIM * sizeof(float));
-    // Copy hidden to Metal buffer
+    // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
+    float *residual = hidden;
 
-    // === RMSNorm (input norm) ===
+    // Build MlaPipes view over the engine's pipelines.
+    MlaPipes P;
+    P.dev = d;
+    P.queue = (id<MTLCommandQueue>)eng->queue;
+    P.dequant_matvec_affine = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine;
+    P.rms_norm_rows = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows;
+    P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
+    P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;
+
+    float attn_input[DIM], normed[DIM], attn_out[DIM];
+    float ffn_input[DIM], ffn_out[DIM];
+    float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
+
+    // === Attention sublayer (mHC-wrapped) ===
+    MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+    mhc_pre(&ahc, residual, attn_input, post, comb);
+
+    // input RMSNorm (attn_norm) on attn_input -> normed
     {
+        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+        memcpy(buf_h, attn_input, DIM * sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytes:(void *)eng->input_norms[layer]
-                                 length:DIM * sizeof(float)
-                                options:MTLResourceStorageModeShared];
+        id w_buf = [d newBufferWithBytes:(void *)eng->input_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
         encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
-        [cb commit];
-        [cb waitUntilCompleted];
+        [cb commit]; [cb waitUntilCompleted];
+        memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
     }
-    float *normed = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
 
-    // === MLA Attention (S2-S5: NOT YET IMPLEMENTED) ===
-    // The GQA placeholder (q/k/v_proj matvec + memcpy(q->attn_out)) has been
-    // removed. The real MLA attention (wq_a→q_norm→wq_b→per-head norm→tail RoPE,
-    // wkv→kv_norm→RoPE, MQA-broadcast SDPA + sink, grouped wo_a→wo_b) is built
-    // incrementally in S2-S5 against the MLX oracle. Until then this engine.c
-    // full-layer path is dead code (not wired by --metal-moe; see state.zig).
-    // Pass-through so the layer at least type-checks and runs end-to-end.
-    float *h_mid = (float *)[(id<MTLBuffer>)eng->buf_h_mid contents];
-    float *attn_out = (float *)[(id<MTLBuffer>)eng->buf_attn_out contents];
-    (void)attn_out;
-    // attn_out = 0 (no attention contribution yet) → h_mid = residual only.
-    for (int i = 0; i < DIM; i++) h_mid[i] = buf_h[i];
-
-    // === Post-attn RMSNorm ===
+    // MLA attention (decode, single token -> cache_len from kv_cache)
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytes:(void *)eng->attn_norms[layer]
-                                 length:DIM * sizeof(float)
-                                options:MTLResourceStorageModeShared];
-        memcpy(buf_h, h_mid, DIM * sizeof(float)); // buf_hidden = h_mid
-        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
-        [cb commit];
-        [cb waitUntilCompleted];
+        KVCache *kvc = &eng->kv_cache[layer];
+        if (!kvc->kv) { kvc->kv = (float *)calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(float)); kvc->len = 0; }
+        kvc->len += 1;
+        mla_attention_decode(&P, &eng->attn[layer], normed, kvc->kv, kvc->len, pos, attn_out);
     }
-    memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
+
+    // mHC post -> residual' (in place)
+    mhc_post(attn_out, residual, post, comb, residual);
+
+    // === MoE sublayer (mHC-wrapped) ===
+    MhcWeights fhc = { eng->ffn_hc_fn[layer], eng->ffn_hc_base[layer], eng->ffn_hc_scale[layer] };
+    mhc_pre(&fhc, residual, ffn_input, post, comb);
+
+    // ffn RMSNorm (attn_norms[] holds ffn_norm) on ffn_input -> normed
+    {
+        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+        memcpy(buf_h, ffn_input, DIM * sizeof(float));
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id w_buf = [d newBufferWithBytes:(void *)eng->attn_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
+        [cb commit]; [cb waitUntilCompleted];
+        memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
+    }
 
     // === Routing gate ===
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id gate_w = [d newBufferWithBytes:(void *)eng->gate_proj[layer]
-                                 length:N_EXPERTS * DIM * sizeof(float)
-                                options:MTLResourceStorageModeShared];
-        // Copy normed to buf_hidden for matvec input
+        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
         memcpy(buf_h, normed, DIM * sizeof(float));
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id gate_w = [d newBufferWithBytes:(void *)eng->gate_proj[layer] length:N_EXPERTS*DIM*sizeof(float) options:MTLResourceStorageModeShared];
         encode_matvec(cb, eng->pipe_matvec, gate_w, eng->buf_hidden, eng->buf_routing_scores, N_EXPERTS, DIM);
-        [cb commit];
-        [cb waitUntilCompleted];
+        [cb commit]; [cb waitUntilCompleted];
     } else {
         for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
     }
 
-    // CPU softmax + topK
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
     cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
 
-    // === Expert I/O ===
-    IOPool *io = (IOPool *)eng->io_pool;
-    io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
+    // Expert I/O + MoE. The expert kernel reads buf_normed as input, which
+    // already holds the ffn-normed vector from the RMSNorm step above. MoE
+    // combine writes the pure routed-expert sum to buf_hidden.
+    {
+        IOPool *io = (IOPool *)eng->io_pool;
+        io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
+        moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
+        memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+    }
 
-    // === MoE forward (Metal) ===
-    moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
+    // mHC post -> residual'' (in place)
+    mhc_post(ffn_out, residual, post, comb, residual);
 
-    // Read result back to hidden
-    memcpy(hidden, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     return 0;
 }
 
@@ -522,6 +542,18 @@ void moe_infer_set_weights(MoEInferEngine *eng,
 void moe_infer_set_layer_attn(MoEInferEngine *eng, int layer, AttnWeights attn) {
     if (layer < 0 || layer >= N_LAYERS) return;
     eng->attn[layer] = attn;
+}
+
+void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,
+    const float *attn_fn, const float *attn_base, const float *attn_scale,
+    const float *ffn_fn, const float *ffn_base, const float *ffn_scale) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->attn_hc_fn[layer] = attn_fn;
+    eng->attn_hc_base[layer] = attn_base;
+    eng->attn_hc_scale[layer] = attn_scale;
+    eng->ffn_hc_fn[layer] = ffn_fn;
+    eng->ffn_hc_base[layer] = ffn_base;
+    eng->ffn_hc_scale[layer] = ffn_scale;
 }
 
 void moe_infer_deinit(MoEInferEngine *eng) {

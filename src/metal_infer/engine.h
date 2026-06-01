@@ -156,6 +156,11 @@ typedef struct {
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
     void *pipe_matvec;
+    // S7: MLA attention pipelines
+    void *pipe_dequant_matvec_affine;
+    void *pipe_rms_norm_rows;
+    void *pipe_rope_tail;
+    void *pipe_mla_sdpa;
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -192,6 +197,13 @@ typedef struct {
     const float *attn_norms[N_LAYERS];   // ffn_norm (pre-MoE)
     AttnWeights  attn[N_LAYERS];         // MLA attention weights (quantized)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
+    // mHC weights per layer (f32): fn [24,16384], base [24], scale [3]
+    const float *attn_hc_fn[N_LAYERS];
+    const float *attn_hc_base[N_LAYERS];
+    const float *attn_hc_scale[N_LAYERS];
+    const float *ffn_hc_fn[N_LAYERS];
+    const float *ffn_hc_base[N_LAYERS];
+    const float *ffn_hc_scale[N_LAYERS];
     int expert_fd[N_LAYERS];
 
     // KV cache
@@ -229,6 +241,11 @@ void moe_infer_set_weights(MoEInferEngine *engine,
 // (packed u32, f32 scales/biases, norms, sink) must remain valid for the
 // engine's lifetime.
 void moe_infer_set_layer_attn(MoEInferEngine *engine, int layer, AttnWeights attn);
+
+// Set one layer's mHC weights (f32 pointers, kept alive by caller).
+void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,
+    const float *attn_fn, const float *attn_base, const float *attn_scale,
+    const float *ffn_fn, const float *ffn_base, const float *ffn_scale);
 
 // Process one layer: RMSNorm → MLA attention → routing → MoE → output.
 // hidden: [DIM] input, overwritten with output on return.
