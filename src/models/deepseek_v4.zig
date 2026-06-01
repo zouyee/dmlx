@@ -2691,12 +2691,17 @@ pub const DSV4Model = struct {
     lm_head: Array,
     stream_provider: ?*expert_stream.ExpertStreamProvider = null,
     metal_engine: ?*anyopaque = null, // *MoEInferEngine
+    /// f32 arrays materialized for the Metal engine (norms/scales/biases astype'd
+    /// from bf16). Held alive for the engine's lifetime; freed at deinit.
+    engine_f32_arrays: std.ArrayListUnmanaged(Array) = .empty,
 
     pub fn deinit(self: *DSV4Model) void {
         if (self.metal_engine) |eng| {
             const metal = @import("../metal_infer/engine.zig");
             metal.deinit(@ptrCast(@alignCast(eng)));
         }
+        for (self.engine_f32_arrays.items) |arr| arr.deinit();
+        self.engine_f32_arrays.deinit(self.allocator);
         self.config.deinitClone(self.allocator);
         self.embed_tokens.weight.deinit();
         for (self.layers) |*layer| {
@@ -2710,11 +2715,39 @@ pub const DSV4Model = struct {
         self.lm_head.deinit();
     }
 
+    /// Materialize an f32 copy of a (possibly bf16) array, keep it alive on the
+    /// model, and return its data pointer. Used for norms/scales/biases that the
+    /// Metal engine needs as f32 but are stored bf16.
+    fn keepF32(self: *DSV4Model, arr: Array) ![]const f32 {
+        const f = try ops.astype(self.ctx, arr, .float32);
+        try f.eval();
+        try self.engine_f32_arrays.append(self.allocator, f);
+        return (try f.dataPtr(f32))[0..f.size()];
+    }
+
+    /// Extract one affine-quantized weight's pointers for the Metal engine.
+    /// packed: raw u32 (no copy); scales/biases: bf16->f32 (kept alive).
+    /// in_dim/out_dim are logical (packed last dim * 8 = in_dim).
+    fn extractQuant(self: *DSV4Model, weight: Array, scales: ?Array, biases: ?Array, group_size: i32) !QuantWeightPtrs {
+        try weight.eval();
+        const wshape = weight.shape(); // [out, in/8]
+        const out_dim: i32 = wshape[0];
+        const in_dim: i32 = wshape[1] * 8;
+        return .{
+            .packed_ptr = (try weight.dataPtr(u32))[0..weight.size()],
+            .scales = if (scales) |s| try self.keepF32(s) else &[_]f32{},
+            .biases = if (biases) |b| try self.keepF32(b) else &[_]f32{},
+            .out_dim = out_dim,
+            .in_dim = in_dim,
+            .group_size = group_size,
+        };
+    }
+
     /// Extract backbone weight float32 pointers for Metal inference engine.
     /// Caller must ensure model arrays remain valid (eval'd and not deinit'd).
     pub fn extractWeightsForEngine(self: *DSV4Model) !EngineWeights {
-        const D = self.config.hidden_size;
         var w: EngineWeights = undefined;
+        w.attn = [_]?AttnWeightPtrs{null} ** 64;
 
         // Embedding
         try self.embed_tokens.weight.eval();
@@ -2724,27 +2757,65 @@ pub const DSV4Model = struct {
         try self.lm_head.eval();
         w.lm_head = (try self.lm_head.dataPtr(f32))[0..self.lm_head.size()];
 
-        // Final norm
-        try self.norm.weight.eval();
-        w.final_norm = (try self.norm.weight.dataPtr(f32))[0..self.norm.weight.size()];
+        // Final norm (bf16 -> f32)
+        w.final_norm = try self.keepF32(self.norm.weight);
 
         // Per-layer weights
         const n_layers = self.layers.len;
         w.n_layers = n_layers;
         for (self.layers, 0..) |*layer, i| {
-            // RMSNorm weights
-            try layer.attn_norm.weight.eval();
-            w.input_norms[i] = (try layer.attn_norm.weight.dataPtr(f32))[0..D];
-            try layer.ffn_norm.weight.eval();
-            w.attn_norms[i] = (try layer.ffn_norm.weight.dataPtr(f32))[0..D];
+            // RMSNorm weights (bf16 -> f32)
+            w.input_norms[i] = try self.keepF32(layer.attn_norm.weight);
+            w.attn_norms[i] = try self.keepF32(layer.ffn_norm.weight);
 
-            // Router gate weight: [n_routed_experts, dim]
+            // Router gate weight (f32 already)
             try layer.ffn.gate.weight.eval();
             w.gate_projs[i] = (try layer.ffn.gate.weight.dataPtr(f32))[0..layer.ffn.gate.weight.size()];
+
+            // MLA attention weights (quantized; on-the-fly Metal dequant).
+            const a = &layer.attn;
+            const attn_gs: i32 = a.attn_quant_group_size;
+            var ap: AttnWeightPtrs = undefined;
+            ap.wq_a = try self.extractQuant(a.wq_a, a.wq_a_scales, a.wq_a_biases, attn_gs);
+            ap.q_norm = try self.keepF32(a.q_norm.weight);
+            ap.wq_b = try self.extractQuant(a.wq_b, a.wq_b_scales, a.wq_b_biases, attn_gs);
+            ap.wkv = try self.extractQuant(a.wkv, a.wkv_scales, a.wkv_biases, attn_gs);
+            ap.kv_norm = try self.keepF32(a.kv_norm.weight);
+            // wo_a: may be 3D [n_groups, o_lora_rank, group_feat] (grouped) — extract per group.
+            ap.wo_a_grouped = (a.wo_a.ndim() == 3);
+            if (ap.wo_a_grouped) {
+                ap.wo_a = try self.extractQuant(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
+            } else {
+                ap.wo_a = try self.extractQuant(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
+            }
+            ap.wo_b = try self.extractQuant(a.wo_b, a.wo_b_scales, a.wo_b_biases, attn_gs);
+            ap.attn_sink = if (a.sink_logits) |s| try self.keepF32(s) else &[_]f32{};
+            w.attn[i] = ap;
         }
 
         return w;
     }
+
+    pub const QuantWeightPtrs = struct {
+        packed_ptr: []const u32,
+        scales: []const f32,
+        biases: []const f32,
+        out_dim: i32,
+        in_dim: i32,
+        group_size: i32,
+    };
+
+    pub const AttnWeightPtrs = struct {
+        wq_a: QuantWeightPtrs,
+        q_norm: []const f32,
+        wq_b: QuantWeightPtrs,
+        wkv: QuantWeightPtrs,
+        kv_norm: []const f32,
+        wo_a: QuantWeightPtrs,
+        wo_a_grouped: bool,
+        wo_b: QuantWeightPtrs,
+        attn_sink: []const f32,
+    };
 
     pub const EngineWeights = struct {
         embed: []const f32,
@@ -2753,6 +2824,7 @@ pub const DSV4Model = struct {
         input_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        attn: [64]?AttnWeightPtrs = [_]?AttnWeightPtrs{null} ** 64,
         n_layers: usize = 0,
     };
 

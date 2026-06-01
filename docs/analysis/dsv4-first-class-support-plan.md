@@ -288,6 +288,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] Metal kernels：`rms_norm_rows`（per-row，带/不带权重）、`rope_tail_interleaved`（交错对，YaRN tail）
       - [ ] host 编排 + 真实 Q dump 对拍（依赖 attn 权重提取，与 S3 一起接）
 - [ ] **S3 KV**：wkv → RMSNorm(kv_norm) → [1,512] → tail RoPE；KV cache（43 层 × [seq,512]）
+      - [x] 数值无新风险：wkv matvec=affine（S1 证）、kv_norm=learned RMSNorm（S2 证）、tail RoPE=交错（S2 证）；KV 单 head 512 维、无 per-head norm
+      - [x] attn 权重提取（`extractWeightsForEngine`）：每层填 `AttnWeightPtrs`（packed u32 原始指针 + scales/biases bf16→f32 + q_norm/kv_norm/attn_sink）；astype'd f32 数组挂 `model.engine_f32_arrays` 存活
+      - [ ] KV cache 分配 + host 编排（与 S4 一起接，届时 Q+KV 真实 dump 对拍）
 - [ ] **S4 SDPA + sink**：移植 `dsv4_misc.metal`，MQA 广播 1→64，含 `attn_sink`，对拍 attn_out
 - [ ] **S5 输出投影**：grouped wo_a（8 组）→ inverse tail RoPE → concat → wo_b，对拍 attn 层输出
 - [ ] **S6 mHC**：移植 `dsv4_hc.metal`（expand/compress/preNormFn），注意 `hc_eps`≠`rms_norm_eps`
