@@ -26,6 +26,58 @@
 
 ---
 
+## 1.5 诊断记录 (2026-06-01)
+
+> **结论：之前一版未提交的"注意力 / RoPE 重写"是乱码根因，已 `git stash`。当前工作区已回到 `origin/main`(`e3be289`) 基线并验证输出正确。**
+
+### 背景
+
+某一版（未提交）的工作区改动把进度文档大量条目标记为 "✅ 已完成"（正确 MQA 注意力、BOS 修复、Lazy dequant、KV Cache、多 token SDPA 等），但这些从未通过 smoke test。实测两个 prompt 均为乱码：
+
+| Prompt | 工作区(重写版) | 期望 |
+|--------|---------------|------|
+| `2+2=` | `algebraically free 2` | `4` |
+| `The capital of France is` | `mesigned geopolitical geopolitical...` | `Paris` |
+
+去掉 `--metal-moe`（纯 MLX 路径）同样乱码 → 排除 Metal MoE kernel，问题在共享 backbone。
+
+### 对照实验
+
+以 `../dm/dmlx` 为参考（经校验与本仓库 `origin/main` `e3be289` **逐字节一致**，文档记录此版本 7/7 正确）。
+
+将全部未提交改动 `git stash` 后，回到 HEAD 基线重建，纯 MLX 路径输出：
+
+| Prompt | HEAD 基线 | 判定 |
+|--------|----------|------|
+| `2+2=` | `. The user's query` | ✅ 连贯 |
+| `The capital of France is` | `. The capital of France is Paris.` | ✅ 正确 |
+
+**根因确认：污染在未提交的注意力 / RoPE 重写，不在 Metal MoE，也不在已提交历史。**
+
+### 具体污染点（已 stash 到 `stash@{0}`）
+
+`DSV4Attention.forward` 被整段改写，致命改动：
+
+1. **手写 SDPA 替换 MLX `fast_scaled_dot_product_attention`** —— 重写版**丢失 `sink_logits`**（DeepSeek-V4 attention sink），mask 处理也变更。
+2. **RoPE pair 布局翻转** —— `(half_dim, 2)` → `(2, half_dim)`，slice/stack 轴随之改变，改变了 Q/K 旋转语义。
+3. **compressKV（CSA/HCA 压缩注意力）路径被禁用**。
+
+> ⚠️ 更正：之前文档「❌ 已放弃 - 混合 MLX+Metal 方案 - 数值无法对齐」的结论属于**误判**。真正原因是 backbone 注意力被改坏，与 Metal/MLX 互操作无关。
+
+### 后续处置
+
+stash 内混合三类改动，须区分对待：
+
+| 类别 | 处置 |
+|------|------|
+| (A) 注意力 / RoPE 重写 | ❌ **丢弃**（乱码根因） |
+| (B) FP8 loader (`dequantFp8Weights`) | ⬜ 可保留，需独立验证 |
+| (C) Metal engine 脚手架 | ⬜ 可保留（已提交部分在 HEAD） |
+
+纪律：注意力如需改动，**必须保留 `sink_logits` 与原 RoPE 布局**，且每改一处立即 smoke。
+
+---
+
 ## 2. flash-moe 架构分析
 
 flash-moe 源码位于 `../flash-moe/metal_infer/infer.m` (7151 行) + `shaders.metal` (1296 行)。
