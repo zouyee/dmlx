@@ -645,6 +645,10 @@ void moe_infer_set_layer_shared(MoEInferEngine *eng, int layer, SharedExpert se)
     eng->shared[layer] = se;
 }
 
+void moe_infer_reset_kv(MoEInferEngine *eng) {
+    for (int l = 0; l < N_LAYERS; l++) eng->kv_cache[l].len = 0;
+}
+
 void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,
     const float *attn_fn, const float *attn_base, const float *attn_scale,
     const float *ffn_fn, const float *ffn_base, const float *ffn_scale) {

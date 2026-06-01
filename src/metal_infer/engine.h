@@ -255,6 +255,9 @@ void moe_infer_set_layer_attn(MoEInferEngine *engine, int layer, AttnWeights att
 // Set one layer's shared expert weights.
 void moe_infer_set_layer_shared(MoEInferEngine *engine, int layer, SharedExpert se);
 
+// Reset KV cache (call at the start of each new sequence/request).
+void moe_infer_reset_kv(MoEInferEngine *engine);
+
 // Set one layer's mHC weights (f32 pointers, kept alive by caller).
 void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,
     const float *attn_fn, const float *attn_base, const float *attn_scale,

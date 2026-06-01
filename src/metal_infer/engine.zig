@@ -69,6 +69,11 @@ const CSharedExpert = extern struct {
     down: CQuantWeight,
 };
 extern fn moe_infer_set_layer_shared(engine: *Engine, layer: c_int, se: CSharedExpert) void;
+extern fn moe_infer_reset_kv(engine: *Engine) void;
+
+pub fn resetKv(engine: *Engine) void {
+    moe_infer_reset_kv(engine);
+}
 
 pub fn init(packed_dir: []const u8) !*Engine {
     const engine = moe_infer_init(packed_dir.ptr, moe_metal_source, moe_metal_source.len);
