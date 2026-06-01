@@ -3108,42 +3108,58 @@ pub const DSV4Model = struct {
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
 
-            const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
+            // Full-metal engine processes ONE token per forward (seq_len=1); batch
+            // prefill [1,S,...] would overrun the engine's single-token buffers.
+            if (self.metal_engine != null) {
+                var next_token: u32 = undefined;
+                for (prompt_tokens) |tok| {
+                    const input_arr = try arena.track(try Array.fromData(allocator, u32, &[_]u32{tok}, &[_]i32{ 1, 1 }));
+                    const step_logits = try self.forward(input_arr, null, caches, start_pos, stream);
+                    start_pos += 1;
+                    const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, step_logits, &[_]i32{ 0, 1 }));
+                    const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
+                    next_token = (try sampler_config.sample(f32_logits, allocator)).token;
+                }
+                tokens[current_len] = next_token;
+                current_len += 1;
+            } else {
+                const prompt_arr = try arena.track(try Array.fromData(allocator, u32, prompt_tokens, &[_]i32{ 1, @intCast(prompt_tokens.len) }));
 
-            // Create explicit causal mask with sliding window for prefill
-            // Matches Python: create_attention_mask(return_array=True, window_size=sliding_window)
-            const prefill_mask = if (prompt_tokens.len > 1) blk: {
-                const sl = prompt_tokens.len;
-                const ws = self.config.sliding_window;
-                var mask_data = try allocator.alloc(f32, sl * sl);
-                defer allocator.free(mask_data);
-                @memset(mask_data, 0);
-                const neg_inf = -std.math.inf(f32);
-                for (0..sl) |i| {
-                    for (0..sl) |j| {
-                        const causal = j > i;
-                        const outside_window = ws > 0 and i >= ws and j < i + 1 - ws;
-                        if (causal or outside_window) {
-                            mask_data[i * sl + j] = neg_inf;
+                // Create explicit causal mask with sliding window for prefill
+                // Matches Python: create_attention_mask(return_array=True, window_size=sliding_window)
+                const prefill_mask = if (prompt_tokens.len > 1) blk: {
+                    const sl = prompt_tokens.len;
+                    const ws = self.config.sliding_window;
+                    var mask_data = try allocator.alloc(f32, sl * sl);
+                    defer allocator.free(mask_data);
+                    @memset(mask_data, 0);
+                    const neg_inf = -std.math.inf(f32);
+                    for (0..sl) |i| {
+                        for (0..sl) |j| {
+                            const causal = j > i;
+                            const outside_window = ws > 0 and i >= ws and j < i + 1 - ws;
+                            if (causal or outside_window) {
+                                mask_data[i * sl + j] = neg_inf;
+                            }
                         }
                     }
-                }
-                const mask_arr = try Array.fromData(allocator, f32, mask_data, &[_]i32{ 1, 1, @intCast(sl), @intCast(sl) });
-                break :blk mask_arr;
-            } else null;
-            defer if (prefill_mask) |m| m.deinit();
+                    const mask_arr = try Array.fromData(allocator, f32, mask_data, &[_]i32{ 1, 1, @intCast(sl), @intCast(sl) });
+                    break :blk mask_arr;
+                } else null;
+                defer if (prefill_mask) |m| m.deinit();
 
-            const logits = try self.forward(prompt_arr, prefill_mask, caches, start_pos, stream);
+                const logits = try self.forward(prompt_arr, prefill_mask, caches, start_pos, stream);
 
-            // Get last token logits
-            const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
-            const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
-            const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
+                // Get last token logits
+                const last_logits = try arena.track(try ops.slice(self.ctx, logits, &[_]i32{ 0, @intCast(prompt_tokens.len - 1), 0 }, &[_]i32{ 1, @intCast(prompt_tokens.len), @intCast(self.config.vocab_size) }, &[_]i32{}));
+                const squeezed = try arena.track(try shape_mod.squeezeAxes(self.ctx, last_logits, &[_]i32{0}));
+                const f32_logits = try arena.track(try ops.astype(self.ctx, squeezed, .float32));
 
-            const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
-            tokens[current_len] = next_token;
-            current_len += 1;
-            start_pos = prompt_tokens.len;
+                const next_token = (try sampler_config.sample(f32_logits, allocator)).token;
+                tokens[current_len] = next_token;
+                current_len += 1;
+                start_pos = prompt_tokens.len;
+            }
         }
 
         // Generate new tokens autoregressively.

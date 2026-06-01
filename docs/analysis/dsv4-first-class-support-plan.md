@@ -321,8 +321,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] 修复 #1：gate.weight 是 BF16，旧 `dataPtr(f32)` 2x 过读 → segfault。改 `keepF32`（astype f32）
       - [x] 修复 #2：mHC 残差 `expandToMHC` 是 broadcast view（stride-0），引擎读 16384 元素越界 → 改 host 侧 materialize 连续 f32 + 稳定 heap buffer
       - [x] **全 metal 跑通(无 crash)**：修了 4 个集成 bug — gate.weight bf16 过读、mHC broadcast 残差越界（改 mlx_contiguous 物化）、MLX↔C 指针（改稳定 host buffer）、**wo_a 是 dense bf16 不是 packed**（loader `dequantIfNeeded` 解掉了，wo_a_scales=null）→ 改 dense f32 + `matvec_f32`。warmup + 43 层全跑通
-      - [ ] ⚠️ **正确性未达**：全 metal E2E 输出乱码；逐层对拍 layer_00 即 rel_L2≈1.0（完全去相关）。已知缺口：(1) 全 metal MoE 缺 shared expert；(2) layer_00 严重发散需进一步逐段对拍（注意力输出 vs MLX attn dump）
-      - [ ] 下一步：先补 shared expert，再用 dump 逐段定位 layer_00 发散（attn_out / ffn_out 分别对拍）
+      - [ ] ⚠️ **正确性调试中(进展)**：发现并修了 3 个集成 bug — (a) `generate()` 对 metal-full 仍走 batch prefill（[1,9,...] 喂给单 token 引擎）→ 改 token-by-token；(b) MoE 读 `eng->buf_normed` 但新 RMSNorm 没写进去 → ffn_out 全 0，已修；(c) 引擎 input/ffn norm 换用已验证的 `rms_norm_rows`。MF_DBG 追踪：ffn_out 从 0 → 0.19（MoE 现在有输出）
+      - [ ] 仍未对齐：layer_00 输出 norm 远小于 MLX（metal ~0.5 vs MLX ~533），层在衰减而非放大；`post_mix=[0.032,0,0,0]` 待与 MLX 逐项核对；shared expert 仍缺
+      - [ ] 下一步：对比 MLX layer-0 的 mhc_pre 内部量（post/comb/attn_input），补 shared expert
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
 - [ ] **S10 达标门**：≥3.0 tok/s + 7/7 + 稳定 → 改默认 flag、退役 MLX 推理路径（保留 loader + 对拍）

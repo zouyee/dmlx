@@ -418,17 +418,31 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // === Attention sublayer (mHC-wrapped) ===
     MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+    if (layer == 0 && getenv("MF_DBG")) {
+        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
+        fprintf(stderr, "[mf-dbg] L0 in residual norm=%.4f\n", sqrt(rn));
+    }
     mhc_pre(&ahc, residual, attn_input, post, comb);
+    if (layer == 0 && getenv("MF_DBG")) {
+        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_input[z]*attn_input[z];
+        fprintf(stderr, "[mf-dbg] L0 attn_input norm=%.4f post=[%.3f %.3f %.3f %.3f] comb00=%.3f\n",
+            sqrt(an), post[0],post[1],post[2],post[3], comb[0]);
+    }
 
-    // input RMSNorm (attn_norm) on attn_input -> normed
+    // input RMSNorm (attn_norm) on attn_input -> normed (validated rms_norm_rows)
     {
-        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-        memcpy(buf_h, attn_input, DIM * sizeof(float));
+        id<MTLBuffer> bx = [d newBufferWithBytes:attn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->input_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytes:(void *)eng->input_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
-        [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
+        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+        [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(normed, [bo contents], DIM * sizeof(float));
     }
 
     // MLA attention (decode, single token -> cache_len from kv_cache)
@@ -441,6 +455,11 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // mHC post -> residual' (in place)
     mhc_post(attn_out, residual, post, comb, residual);
+    if (layer == 0 && getenv("MF_DBG")) {
+        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
+        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
+        fprintf(stderr, "[mf-dbg] L0 attn_out norm=%.4f, residual after attn-post norm=%.4f\n", sqrt(an), sqrt(rn));
+    }
 
     // === MoE sublayer (mHC-wrapped) ===
     MhcWeights fhc = { eng->ffn_hc_fn[layer], eng->ffn_hc_base[layer], eng->ffn_hc_scale[layer] };
@@ -448,13 +467,18 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // ffn RMSNorm (attn_norms[] holds ffn_norm) on ffn_input -> normed
     {
-        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-        memcpy(buf_h, ffn_input, DIM * sizeof(float));
+        id<MTLBuffer> bx = [d newBufferWithBytes:ffn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->attn_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id w_buf = [d newBufferWithBytes:(void *)eng->attn_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        encode_rms_norm(cb, eng, eng->buf_hidden, w_buf, eng->buf_normed);
-        [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [(id<MTLBuffer>)eng->buf_normed contents], DIM * sizeof(float));
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
+        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+        [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(normed, [bo contents], DIM * sizeof(float));
     }
 
     // === Routing gate ===
@@ -474,10 +498,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     float expert_weights[N_ACTIVE];
     cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
 
-    // Expert I/O + MoE. The expert kernel reads buf_normed as input, which
-    // already holds the ffn-normed vector from the RMSNorm step above. MoE
-    // combine writes the pure routed-expert sum to buf_hidden.
+    // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
+    // the ffn-normed vector into it. MoE combine writes the pure routed-expert
+    // sum (zero residual) to buf_hidden.
     {
+        float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+        memcpy(bn, normed, DIM * sizeof(float));
         IOPool *io = (IOPool *)eng->io_pool;
         io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
         moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
@@ -486,6 +512,11 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // mHC post -> residual'' (in place)
     mhc_post(ffn_out, residual, post, comb, residual);
+    if (layer == 0 && getenv("MF_DBG")) {
+        double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
+        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
+        fprintf(stderr, "[mf-dbg] L0 ffn_out norm=%.4f, residual after ffn-post norm=%.4f\n", sqrt(fn), sqrt(rn));
+    }
 
     return 0;
 }
