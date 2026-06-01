@@ -320,9 +320,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] 接线完成：`extractWeightsForEngine` 填 attn(含 grouped wo_a 切片)+ hc 权重；`engine.zig` setWeights 调 `set_layer_attn`/`set_layer_hc`；`--metal-full` flag + `state.zig` 设 `metal_engine`；build.zig 编译 mla_attention.m/mhc.c
       - [x] 修复 #1：gate.weight 是 BF16，旧 `dataPtr(f32)` 2x 过读 → segfault。改 `keepF32`（astype f32）
       - [x] 修复 #2：mHC 残差 `expandToMHC` 是 broadcast view（stride-0），引擎读 16384 元素越界 → 改 host 侧 materialize 连续 f32 + 稳定 heap buffer
-      - [ ] ⚠️ **仍在调试 S7d**：warmup 首次跑全 metal 仍 segfault，已定位到 MLX↔C 边界（broadcast 残差 `ops.copy`/`dataPtr` 取指针交给 C 时崩）。下一步：放弃从 MLX 取 broadcast 指针，改为引擎内部把单 stream `[4096]` 复制成 4 路初始残差（expandToMHC 本就是 4 份相同副本），绕开 MLX 物化问题
-      - [ ] shared expert（全 metal MoE 缺）
-      - [ ] 真实逐层 dump 对拍 + smoke `Paris`
+      - [x] **全 metal 跑通(无 crash)**：修了 4 个集成 bug — gate.weight bf16 过读、mHC broadcast 残差越界（改 mlx_contiguous 物化）、MLX↔C 指针（改稳定 host buffer）、**wo_a 是 dense bf16 不是 packed**（loader `dequantIfNeeded` 解掉了，wo_a_scales=null）→ 改 dense f32 + `matvec_f32`。warmup + 43 层全跑通
+      - [ ] ⚠️ **正确性未达**：全 metal E2E 输出乱码；逐层对拍 layer_00 即 rel_L2≈1.0（完全去相关）。已知缺口：(1) 全 metal MoE 缺 shared expert；(2) layer_00 严重发散需进一步逐段对拍（注意力输出 vs MLX attn dump）
+      - [ ] 下一步：先补 shared expert，再用 dump 逐段定位 layer_00 发散（attn_out / ffn_out 分别对拍）
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
 - [ ] **S10 达标门**：≥3.0 tok/s + 7/7 + 稳定 → 改默认 flag、退役 MLX 推理路径（保留 loader + 对拍）

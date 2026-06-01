@@ -41,14 +41,13 @@ const CQuantWeight = extern struct {
     in_dim: c_int,
     group_size: c_int,
 };
-const O_GROUPS = 8;
 const CAttnWeights = extern struct {
     wq_a: CQuantWeight,
     q_norm: [*c]const f32,
     wq_b: CQuantWeight,
     wkv: CQuantWeight,
     kv_norm: [*c]const f32,
-    wo_a: [O_GROUPS]CQuantWeight,
+    wo_a_dense: [*c]const f32,
     wo_b: CQuantWeight,
     attn_sink: [*c]const f32,
 };
@@ -92,8 +91,6 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
     moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr);
 
     // Per-layer MLA attention + mHC weights.
-    const O_LORA_RANK = 1024;
-    const DIM = 4096;
     for (0..@intCast(w.n_layers)) |i| {
         const ap = w.attn[i] orelse continue;
         var ca: CAttnWeights = undefined;
@@ -102,21 +99,9 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         ca.wq_b = cqw(ap.wq_b);
         ca.wkv = cqw(ap.wkv);
         ca.kv_norm = ap.kv_norm.ptr;
+        ca.wo_a_dense = ap.wo_a_dense.ptr;
         ca.wo_b = cqw(ap.wo_b);
         ca.attn_sink = ap.attn_sink.ptr;
-        // Slice the grouped wo_a [O_GROUPS, O_LORA_RANK, DIM] into 8 per-group QuantWeights.
-        const pcols = DIM / 8;
-        const ng = DIM / @as(usize, @intCast(ap.wo_a.group_size));
-        for (0..O_GROUPS) |g| {
-            ca.wo_a[g] = .{
-                .packed_ptr = ap.wo_a.packed_ptr.ptr + g * O_LORA_RANK * pcols,
-                .scales = ap.wo_a.scales.ptr + g * O_LORA_RANK * ng,
-                .biases = ap.wo_a.biases.ptr + g * O_LORA_RANK * ng,
-                .out_dim = O_LORA_RANK,
-                .in_dim = DIM,
-                .group_size = ap.wo_a.group_size,
-            };
-        }
         moe_infer_set_layer_attn(engine, @intCast(i), ca);
         moe_infer_set_layer_hc(engine, @intCast(i), w.attn_hc_fn[i].ptr, w.attn_hc_base[i].ptr, w.attn_hc_scale[i].ptr, w.ffn_hc_fn[i].ptr, w.ffn_hc_base[i].ptr, w.ffn_hc_scale[i].ptr);
     }

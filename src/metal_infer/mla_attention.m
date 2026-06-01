@@ -167,8 +167,6 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
         [e endEncoding];
         [cb commit]; [cb waitUntilCompleted];
     }
-
-    // --- inverse RoPE on attn output ---
     { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
       enc_rope(P, cb, battn, bcos, bsin, N_HEADS, 1);
       [cb commit]; [cb waitUntilCompleted]; }
@@ -185,8 +183,21 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
             memcpy(gv + hh * HEAD_DIM, attn + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(float));
         id<MTLBuffer> bgv = mkbuf(d, gv, group_feat * sizeof(float));
         id<MTLBuffer> bog = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
+        // wo_a is DENSE f32: group g weight = wo_a_dense + g*O_LORA_RANK*group_feat,
+        // shape [O_LORA_RANK, group_feat]. Plain matvec_f32 (no dequant).
+        const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
+        id<MTLBuffer> bwg = mkbuf(d, wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
         id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-        enc_dequant_matvec(P, cb, &aw->wo_a[g], bgv, bog);
+        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        [e setComputePipelineState:P->matvec_f32];
+        [e setBuffer:bwg offset:0 atIndex:0];
+        [e setBuffer:bgv offset:0 atIndex:1];
+        [e setBuffer:bog offset:0 atIndex:2];
+        uint od=O_LORA_RANK, idd=group_feat;
+        [e setBytes:&od length:4 atIndex:3];
+        [e setBytes:&idd length:4 atIndex:4];
+        [e dispatchThreads:MTLSizeMake(O_LORA_RANK,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding];
         [cb commit]; [cb waitUntilCompleted];
         memcpy(concat + (size_t)g * O_LORA_RANK, [bog contents], O_LORA_RANK * sizeof(float));
         free(gv);

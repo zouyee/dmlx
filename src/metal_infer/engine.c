@@ -408,6 +408,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.rms_norm_rows = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows;
     P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
     P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;
+    P.matvec_f32 = (id<MTLComputePipelineState>)eng->pipe_matvec;
 
     // Large scratch buffers are static (forward_layer runs serially) to avoid
     // overflowing the warmup/engine fiber's limited stack.

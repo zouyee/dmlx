@@ -62,7 +62,9 @@ typedef struct {
     QuantWeight wq_b;        // [32768, 1024]  (= N_HEADS*HEAD_DIM, Q_LORA_RANK)
     QuantWeight wkv;         // [512, 4096]
     const float *kv_norm;    // [512] RMSNorm weight
-    QuantWeight wo_a[O_GROUPS]; // each [1024, 4096]  (O_LORA_RANK, DIM)
+    // wo_a is DENSE f32 (loader dequantizes it): [O_GROUPS, O_LORA_RANK, group_feat]
+    // flattened, group_feat = (N_HEADS/O_GROUPS)*HEAD_DIM = 4096.
+    const float *wo_a_dense; // [O_GROUPS * O_LORA_RANK * 4096]
     QuantWeight wo_b;        // [4096, 8192]  (DIM, O_GROUPS*O_LORA_RANK)
     const float *attn_sink;  // [64] per-head sink logits
 } AttnWeights;

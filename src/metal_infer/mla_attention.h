@@ -14,6 +14,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_rows;
     id<MTLComputePipelineState> rope_tail_interleaved;
     id<MTLComputePipelineState> mla_sdpa_decode;
+    id<MTLComputePipelineState> matvec_f32; // dense matvec for wo_a
 } MlaPipes;
 
 // Compute one decode-step MLA attention.

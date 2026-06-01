@@ -2743,31 +2743,6 @@ pub const DSV4Model = struct {
         };
     }
 
-    /// Extract grouped wo_a. Packed may be 3D [n_groups, o_lora_rank, group_feat/8]
-    /// or 2D [n_groups*o_lora_rank, group_feat/8]. Returns logical flattened dims
-    /// out_dim=n_groups*o_lora_rank, in_dim=group_feat.
-    fn extractQuantWoA(self: *DSV4Model, weight: Array, scales: ?Array, biases: ?Array, group_size: i32) !QuantWeightPtrs {
-        try weight.eval();
-        const wshape = weight.shape();
-        var out_dim: i32 = undefined;
-        var in_dim: i32 = undefined;
-        if (wshape.len == 3) {
-            out_dim = wshape[0] * wshape[1];
-            in_dim = wshape[2] * 8;
-        } else {
-            out_dim = wshape[0];
-            in_dim = wshape[1] * 8;
-        }
-        return .{
-            .packed_ptr = (try weight.dataPtr(u32))[0..weight.size()],
-            .scales = if (scales) |s| try self.keepF32(s) else &[_]f32{},
-            .biases = if (biases) |b| try self.keepF32(b) else &[_]f32{},
-            .out_dim = out_dim,
-            .in_dim = in_dim,
-            .group_size = group_size,
-        };
-    }
-
     /// Extract backbone weight float32 pointers for Metal inference engine.
     /// Caller must ensure model arrays remain valid (eval'd and not deinit'd).
     pub fn extractWeightsForEngine(self: *DSV4Model) !EngineWeights {
@@ -2805,11 +2780,9 @@ pub const DSV4Model = struct {
             ap.wq_b = try self.extractQuant(a.wq_b, a.wq_b_scales, a.wq_b_biases, attn_gs);
             ap.wkv = try self.extractQuant(a.wkv, a.wkv_scales, a.wkv_biases, attn_gs);
             ap.kv_norm = try self.keepF32(a.kv_norm.weight);
-            // wo_a: grouped 3D [n_groups, o_lora_rank, group_feat/8] packed.
-            // Flatten to logical [n_groups*o_lora_rank, group_feat] = [8192, 4096];
-            // engine.zig slices it back into 8 per-group QuantWeights.
-            ap.wo_a_grouped = (a.wo_a.ndim() == 3);
-            ap.wo_a = try self.extractQuantWoA(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
+            // wo_a: DENSE bf16 (loader dequantizes it for the grouped reshape).
+            // Extract as f32; engine uses plain matvec (no dequant) per group.
+            ap.wo_a_dense = try self.keepF32(a.wo_a);
             ap.wo_b = try self.extractQuant(a.wo_b, a.wo_b_scales, a.wo_b_biases, attn_gs);
             ap.attn_sink = if (a.sink_logits) |s| try self.keepF32(s) else &[_]f32{};
             w.attn[i] = ap;
@@ -2847,8 +2820,9 @@ pub const DSV4Model = struct {
         wq_b: QuantWeightPtrs,
         wkv: QuantWeightPtrs,
         kv_norm: []const f32,
-        wo_a: QuantWeightPtrs,
-        wo_a_grouped: bool,
+        // wo_a is DENSE f32 (loader dequantizes it for the grouped reshape):
+        // [n_groups, o_lora_rank, group_feat] flattened. No scales/biases.
+        wo_a_dense: []const f32,
         wo_b: QuantWeightPtrs,
         attn_sink: []const f32,
     };
@@ -2920,17 +2894,21 @@ pub const DSV4Model = struct {
         for (self.layers, 0..) |*layer, i| {
             const layer_start = std.c.mach_absolute_time();
             if (self.metal_engine) |eng_ptr| {
-                // Full-metal engine path. hidden is the mHC-expanded residual
-                // (possibly a broadcast view). Materialize a contiguous f32 copy,
-                // then copy into a STABLE host buffer (MLX array data pointers can
-                // point into GPU/unified buffers that aren't safe to hand to C and
-                // hold across the call). Run the engine on the host buffer, then
-                // wrap the result back into a tracked Array.
+                // Full-metal engine path. hidden is the mHC-expanded residual,
+                // which is a BROADCAST view (stride-0 on the mHC axis): its
+                // logical size is MHC_MULT*DIM but the physical buffer is only
+                // DIM. Force a real materialization with mlx_contiguous, eval,
+                // then copy into a stable host buffer for the C engine.
                 const hshape = hidden.shape();
                 const n = hidden.size();
-                const contig = try arena.track(try ops.astype(self.ctx, try ops.copy(self.ctx, hidden), .float32));
-                try contig.eval();
-                const src = try contig.dataPtr(f32);
+                const mat = try arena.track(try shape_mod.contiguous(self.ctx, try ops.astype(self.ctx, hidden, .float32)));
+                try mat.eval();
+                // Sanity: physical bytes must cover the logical size.
+                if (mat.nbytes() < n * @sizeOf(f32)) {
+                    std.log.err("[metal-full] L{d}: contiguous buffer too small ({d} < {d} bytes)", .{ i, mat.nbytes(), n * @sizeOf(f32) });
+                    return error.MetalBufferTooSmall;
+                }
+                const src = try mat.dataPtr(f32);
                 const host = try self.allocator.alloc(f32, n);
                 defer self.allocator.free(host);
                 @memcpy(host, src[0..n]);
