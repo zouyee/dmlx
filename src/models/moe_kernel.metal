@@ -209,3 +209,78 @@ kernel void matvec_f32(
     for (uint j = 0; j < in_dim; j++) acc += W[tid * in_dim + j] * x[j];
     out[tid] = acc;
 }
+
+// ===========================================================================
+// S2: MLA Q-chain kernels
+// ===========================================================================
+
+// rms_norm_rows: per-row RMSNorm over `row_dim`, for `n_rows` rows.
+// out[r,:] = x[r,:] * rsqrt(mean(x[r,:]^2) + eps) * (weight ? weight[:] : 1)
+// One threadgroup per row; 256 threads cooperatively reduce.
+// weight may be null (pass has_weight=0) for the weightless per-head norm.
+kernel void rms_norm_rows(
+    device const float* x        [[buffer(0)]],
+    device const float* weight   [[buffer(1)]],
+    device float*       out      [[buffer(2)]],
+    constant uint&      row_dim  [[buffer(3)]],
+    constant float&     eps      [[buffer(4)]],
+    constant uint&      has_weight [[buffer(5)]],
+    uint  row [[threadgroup_position_in_grid]],
+    uint  lid [[thread_position_in_threadgroup]],
+    uint  tg  [[threads_per_threadgroup]]
+) {
+    threadgroup float shared[32];
+    device const float* xr = x + (uint64_t)row * row_dim;
+    device float*       orow = out + (uint64_t)row * row_dim;
+
+    float acc = 0.0f;
+    for (uint i = lid; i < row_dim; i += tg) { float v = xr[i]; acc += v * v; }
+    float s = simd_sum(acc);
+    uint lane = lid % 32, sg = lid / 32;
+    if (lane == 0) shared[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.0f;
+    uint n_sg = (tg + 31) / 32;
+    if (lid < n_sg) total = shared[lid];
+    total = simd_sum(total);
+    // broadcast via shared[0]
+    if (lid == 0) shared[0] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float rms = rsqrt(shared[0] / float(row_dim) + eps);
+    for (uint i = lid; i < row_dim; i += tg) {
+        float w = (has_weight != 0u) ? weight[i] : 1.0f;
+        orow[i] = xr[i] * rms * w;
+    }
+}
+
+// rope_tail_interleaved: apply YaRN tail RoPE to the last rope_dim of each head.
+// q: [n_heads, head_dim]; rotates dims [nope_dim .. head_dim) in interleaved
+// pairs (2i, 2i+1) using precomputed cos/sin (length rope_dim/2) for this pos.
+// Matches DSV4YarnRoPE (interleaved, NOT split-half). inverse negates sin.
+kernel void rope_tail_interleaved(
+    device float*       q        [[buffer(0)]],
+    device const float* cos_t    [[buffer(1)]],
+    device const float* sin_t    [[buffer(2)]],
+    constant uint&      n_heads  [[buffer(3)]],
+    constant uint&      head_dim [[buffer(4)]],
+    constant uint&      nope_dim [[buffer(5)]],
+    constant uint&      rope_dim [[buffer(6)]],
+    constant uint&      inverse  [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint half_rope = rope_dim / 2;
+    uint total = n_heads * half_rope;
+    if (tid >= total) return;
+    uint h = tid / half_rope;
+    uint i = tid % half_rope;
+    float c = cos_t[i];
+    float s = sin_t[i];
+    if (inverse != 0u) s = -s;
+    device float* row = q + (uint64_t)h * head_dim;
+    uint j0 = nope_dim + 2 * i;
+    uint j1 = nope_dim + 2 * i + 1;
+    float x0 = row[j0];
+    float x1 = row[j1];
+    row[j0] = x0 * c - x1 * s;
+    row[j1] = x0 * s + x1 * c;
+}

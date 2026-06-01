@@ -282,6 +282,11 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
 - [ ] **S1 affine-dequant matvec kernel**：写 `dequant_matvec_affine`（`w=scale*q+bias`），
       **单测对拍** vs MLX `quantizedMatmul`（固定输入向量，max diff 阈值）——这是全 metal 的成败前提，先证它
 - [ ] **S2 Q 链**：wq_a → RMSNorm(q_norm) → wq_b → reshape[64,512] → per-head RMSNorm → tail RoPE，对拍 Q
+      - [x] 算法对拍（`scripts/verify_q_chain.py`）：kernel-style 交错 RoPE == mlx-style，max_abs=0；
+            RMSNorm（带权 + weightless）vs MLX `fast.rms_norm` max_abs~1e-6；
+            sanity 确认 split-half RoPE 会差 5.8（证明旧 engine.c 的 split-half 是错的）
+      - [x] Metal kernels：`rms_norm_rows`（per-row，带/不带权重）、`rope_tail_interleaved`（交错对，YaRN tail）
+      - [ ] host 编排 + 真实 Q dump 对拍（依赖 attn 权重提取，与 S3 一起接）
 - [ ] **S3 KV**：wkv → RMSNorm(kv_norm) → [1,512] → tail RoPE；KV cache（43 层 × [seq,512]）
 - [ ] **S4 SDPA + sink**：移植 `dsv4_misc.metal`，MQA 广播 1→64，含 `attn_sink`，对拍 attn_out
 - [ ] **S5 输出投影**：grouped wo_a（8 组）→ inverse tail RoPE → concat → wo_b，对拍 attn 层输出
