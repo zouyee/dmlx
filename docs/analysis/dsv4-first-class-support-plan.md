@@ -301,6 +301,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] 无新 kernel：grouped wo_a = 8× `dequant_matvec_affine`（S1）、concat = host memcpy、wo_b = `dequant_matvec_affine`（S1）、inverse RoPE = `rope_tail_interleaved` inverse=1（S2）
       - [ ] host 编排（与 S7 整层一起接）
 - [ ] **S6 mHC**：移植 `dsv4_hc.metal`（expand/compress/preNormFn），注意 `hc_eps`≠`rms_norm_eps`
+      - [x] 算法对拍（`scripts/verify_mhc.py`）：sinkhorn（softmax→+eps→col-norm→[row,col]×19）max_abs=5e-8；mhcPost（`comb^T @ residual` + `post_mix*x`）max_abs=0；sanity 确认 sinkhorn 后行列和≈1（双随机）
+      - [x] 关键发现：mHC 维度极小（HC=4，comb 是 4×4，mixes 12 宽），compute 量可忽略 → S7 可在 host CPU 上算 mHC 小算子，不必写 Metal kernel（省复杂度，对性能无影响）
+      - [ ] host 编排（hc_fn/hc_scale/hc_base 提取 + pre/post + sinkhorn，CPU 实现，与 S7 一起接）
 - [ ] **S7 整层串联**：attn + mHC + 已有 MoE kernel 在 engine.c 内跑完单层，**层间不回 MLX**，逐层对拍
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
