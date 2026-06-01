@@ -22,6 +22,7 @@ const fast_mod = @import("mlx").fast;
 const array_arena_mod = @import("mlx").array_arena;
 const quantize_mod = @import("mlx").quantize;
 const expert_stream = @import("expert_stream.zig");
+const activation_dump = @import("activation_dump.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -2817,6 +2818,8 @@ pub const DSV4Model = struct {
                 // Eval after each layer to materialize results and free lazy weight references
                 try hidden.eval();
             }
+            // Per-layer activation dump (gated by DSV4_DUMP_DIR; no-op otherwise)
+            if (activation_dump.enabled()) activation_dump.dumpLayer(self.ctx, i, hidden);
             const layer_end = std.c.mach_absolute_time();
             layer_total_ns += layer_end - layer_start;
         }
@@ -2833,10 +2836,12 @@ pub const DSV4Model = struct {
 
         // Final norm
         const final_hidden = try arena.track(try self.norm.forward(hidden));
+        if (activation_dump.enabled()) activation_dump.dump(self.ctx, "final_norm", final_hidden);
 
         // LM head: [B, S, dim] @ [dim, vocab] -> [B, S, vocab] — final output NOT tracked
         const lm_head_t = try arena.track(try ops.transpose(self.ctx, self.lm_head));
         const logits = try ops.matmul(self.ctx, final_hidden, lm_head_t);
+        if (activation_dump.enabled()) activation_dump.dump(self.ctx, "logits", logits);
 
         const forward_end = std.c.mach_absolute_time();
         // mach_absolute_time returns ticks (1 tick = 125/3 ns on Apple Silicon).

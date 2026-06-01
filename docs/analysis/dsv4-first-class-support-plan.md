@@ -137,26 +137,34 @@ memcpy(attn_out, q, DIM * sizeof(float));   // 直接拿 Q 当注意力输出
 
 > 总思路：在 MLX forward 的逐层循环里，让每段可独立选 metal/MLX，逐段点亮、逐段对拍。MLX 作为 oracle 保留到全链路达标。
 
-### Phase 0 — 固化正确基线（本次）
+### Phase 0 — 固化正确基线（已完成）
 
 - [x] 诊断结论写入 `flash-moe-alignment-plan.md` §1.5
 - [x] 恢复 `greedy.zig`（独立安全）
 - [x] 本方案文档（metal-first）
-- [ ] commit：`fix: revert broken attention rewrite, restore correct DSV4 baseline`
-- [ ] smoke 脚本入库（§4）
+- [x] commit：`3a018f2` (tokenizer fix) + `88a86a6` (docs)
+- [x] smoke 脚本入库（`scripts/dsv4_smoke.sh`）
 
-**验收**：clean build + smoke 输出 `Paris`。
+**验收**：✅ clean build + smoke 输出 `Paris`（且 `2+2=` 续写含 `4`）。
 
-### Phase 1 — 对拍 oracle 基础设施（一切的前提）
+### Phase 1 — 对拍 oracle 基础设施（已完成）
 
 没有逐层对拍，metal 段无法判断对错。先建护栏。
 
-- [ ] `scripts/dsv4_smoke.sh`：启动 serve → prompt → 断言含 `Paris`
-- [ ] MLX 路径加 `--dump-activations`：导出每层 attn_out / ffn_out / hidden 到 `/tmp/mlx_ref/layer_NN.bin`
-- [ ] metal 路径对称 dump + 比对脚本 `scripts/compare_metal_mlx.py`（逐层 max diff / L2）
+- [x] `scripts/dsv4_smoke.sh`：启动 serve → 2 续写型 prompt → 断言含 `Paris` / `4`
+      - 注：该模型指令跟随弱但事实续写稳，故用续写 prompt + 足够 token（France=16, 2+2=64）
+- [x] 逐层 activation dump：`src/models/activation_dump.zig`，由 **`DSV4_DUMP_DIR` 环境变量**门控（默认关，零开销）
+      - 导出 `layer_00..42.npy` + `final_norm.npy` + `logits.npy`（float32 NumPy）
+      - MLX 与 metal 两条路径共用 forward 循环里的同一 hook
+- [x] 比对脚本 `scripts/compare_metal_mlx.py`：逐文件 max_abs / mean_abs / rel_L2，标出首个发散层
 - [ ] （可选）用 `../transformers` golden 再校 MLX 自身，确认 oracle 可信
 
-**验收**：一键得到「metal vs MLX 逐层偏差表」。
+**验收**：✅ 一键得到「metal vs MLX 逐层偏差表」。用法：
+```bash
+DSV4_DUMP_DIR=/tmp/mlx_ref   PORT=8935            bash scripts/dsv4_smoke.sh
+DSV4_DUMP_DIR=/tmp/metal_out PORT=8936 METAL_MOE=1 bash scripts/dsv4_smoke.sh
+python3 scripts/compare_metal_mlx.py /tmp/mlx_ref /tmp/metal_out
+```
 
 ### Phase 2 — Metal 注意力子系统（最大难点，引入 `--metal-attn`）
 
