@@ -130,6 +130,20 @@ pub const GreedyTokenizer = struct {
                     try self.vocab.put(owned_key, id);
                 }
 
+                // Set special token IDs from added_tokens (fallback when post_processor is missing)
+                const special_val = obj.get("special");
+                if (special_val) |sv| {
+                    if (sv == .bool and sv.bool) {
+                        if (std.mem.eql(u8, token_str, "<｜begin▁of▁sentence｜>")) {
+                            self.bos_id = id;
+                        } else if (std.mem.eql(u8, token_str, "<｜end▁of▁sentence｜>")) {
+                            self.eos_id = id;
+                        } else if (std.mem.eql(u8, token_str, "<｜▁pad▁｜>")) {
+                            self.pad_id = id;
+                        }
+                    }
+                }
+
                 // ids_to_tokens
                 if (self.ids_to_tokens.contains(id)) {
                     const old = self.ids_to_tokens.getPtr(id).?.*;
