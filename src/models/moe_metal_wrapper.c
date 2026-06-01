@@ -90,12 +90,16 @@ int moe_metal_forward(
         [enc endEncoding];
     }
 
-    // Step 3: moe_combine
+    // Step 3: moe_combine — weighted sum of routed experts ONLY (no residual).
+    // The MLX caller (DSV4MoE.forward) adds the shared expert and the block-level
+    // residual separately, so this must return the pure routed-expert sum.
+    // Bind a zeroed residual buffer (newBufferWithLength zero-inits shared mem).
+    id<MTLBuffer> zero_resid = [g_dev newBufferWithLength:hidden_dim*sizeof(float) options:MTLResourceStorageModeShared];
     {
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:g_moe_combine];
         [enc setBuffer:out_buf offset:0 atIndex:0]; [enc setBuffer:scores_buf offset:0 atIndex:1];
-        [enc setBuffer:hidden_buf offset:0 atIndex:2]; [enc setBuffer:output_buf offset:0 atIndex:3];
+        [enc setBuffer:zero_resid offset:0 atIndex:2]; [enc setBuffer:output_buf offset:0 atIndex:3];
         uint kv=K, hd=hidden_dim;
         [enc setBytes:&kv length:4 atIndex:4]; [enc setBytes:&hd length:4 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((hidden_dim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];

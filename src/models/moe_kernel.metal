@@ -50,8 +50,15 @@ kernel void fused_gate_up_swiglu(
             }
         }
     }
-    float act = gate_val / (1.0f + exp(-gate_val));
-    out[tid] = act * up_val;
+    // Limited SwiGLU (matches MLX DSV4SwitchGLU.limitedSwiGLU, swiglu_limit=10):
+    //   gate_clipped = min(gate, +limit)
+    //   up_clipped   = min(max(up, -limit), +limit)
+    //   out = silu(gate_clipped) * up_clipped
+    const float limit = 10.0f;
+    float g_c = min(gate_val, limit);
+    float u_c = min(max(up_val, -limit), limit);
+    float act = g_c / (1.0f + exp(-g_c));
+    out[tid] = act * u_c;
 }
 
 // dequant_matvec_4bit NAIVE: one thread per row. For correctness baseline.
