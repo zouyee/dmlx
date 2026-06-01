@@ -134,17 +134,36 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         const adapter: *model_registry_mod.DeepseekV4VTableAdapter = @ptrCast(@alignCast(vtable.ptr));
         dsv4_model = adapter.model;
 
-        // NOTE: --metal-moe uses the metal_moe.zig path (hooked into MLX's MoE
-        // via expert_stream.tryMetalPath), NOT the engine.c full-layer engine.
-        // The engine.c `moe_infer_forward_layer` path has a placeholder attention
-        // (memcpy q -> attn_out) and would short-circuit MLX's correct layer.forward,
-        // producing gibberish. For the mixed approach (MLX backbone + Metal routed
-        // experts), we must NOT set model.metal_engine.
-        //
-        // metal_moe.zig is enabled separately in server.zig (metal.setEnabled).
-        // See docs/analysis/dsv4-first-class-support-plan.md Phase 2 (plan c).
-        if (config.metal_moe) {
+        // --metal-moe : mixed path (MLX backbone + Metal routed experts) via
+        //   metal_moe.zig / expert_stream.tryMetalPath (enabled in server.zig).
+        // --metal-full: full-metal engine (attention + mHC + MoE in engine.c).
+        //   Sets model.metal_engine so forward() routes layers through the engine.
+        if (config.metal_moe and !config.metal_full) {
             std.log.info("Metal MoE: mixed path (MLX backbone + Metal routed experts)", .{});
+        }
+        if (config.metal_full) {
+            init_full: {
+                if (dsv4_model) |model| {
+                    if (config.expert_packed_dir) |packed_dir| {
+                        const metal = @import("../metal_infer/engine.zig");
+                        const eng_ptr = metal.init(packed_dir) catch null;
+                        if (eng_ptr) |eng| {
+                            const w = model.extractWeightsForEngine() catch |err| {
+                                std.log.warn("metal-full: weight extraction failed ({any}), using MLX", .{err});
+                                metal.deinit(eng);
+                                break :init_full;
+                            };
+                            metal.setWeights(eng, w);
+                            model.metal_engine = @ptrCast(eng);
+                            std.log.info("metal-full: engine initialized (attention+mHC+MoE on Metal)", .{});
+                        } else {
+                            std.log.warn("metal-full: engine init failed, using MLX", .{});
+                        }
+                    } else {
+                        std.log.warn("metal-full requires --expert-packed-dir; using MLX", .{});
+                    }
+                }
+            }
         }
     }
 

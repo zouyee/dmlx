@@ -49,4 +49,5 @@ pub const ServerConfig = struct {
     expert_packed_dir: ?[]const u8 = null,
     expert_parallel: usize = 6,
     metal_moe: bool = false,
+    metal_full: bool = false, // Full-metal engine path (attention + mHC + MoE in engine.c)
 };

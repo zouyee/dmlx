@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 #define HC      MHC_MULT          // 4
 #define MIX3    (HC * (HC + 2))   // 24

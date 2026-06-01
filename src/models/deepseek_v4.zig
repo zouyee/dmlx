@@ -2743,6 +2743,31 @@ pub const DSV4Model = struct {
         };
     }
 
+    /// Extract grouped wo_a. Packed may be 3D [n_groups, o_lora_rank, group_feat/8]
+    /// or 2D [n_groups*o_lora_rank, group_feat/8]. Returns logical flattened dims
+    /// out_dim=n_groups*o_lora_rank, in_dim=group_feat.
+    fn extractQuantWoA(self: *DSV4Model, weight: Array, scales: ?Array, biases: ?Array, group_size: i32) !QuantWeightPtrs {
+        try weight.eval();
+        const wshape = weight.shape();
+        var out_dim: i32 = undefined;
+        var in_dim: i32 = undefined;
+        if (wshape.len == 3) {
+            out_dim = wshape[0] * wshape[1];
+            in_dim = wshape[2] * 8;
+        } else {
+            out_dim = wshape[0];
+            in_dim = wshape[1] * 8;
+        }
+        return .{
+            .packed_ptr = (try weight.dataPtr(u32))[0..weight.size()],
+            .scales = if (scales) |s| try self.keepF32(s) else &[_]f32{},
+            .biases = if (biases) |b| try self.keepF32(b) else &[_]f32{},
+            .out_dim = out_dim,
+            .in_dim = in_dim,
+            .group_size = group_size,
+        };
+    }
+
     /// Extract backbone weight float32 pointers for Metal inference engine.
     /// Caller must ensure model arrays remain valid (eval'd and not deinit'd).
     pub fn extractWeightsForEngine(self: *DSV4Model) !EngineWeights {
@@ -2768,9 +2793,8 @@ pub const DSV4Model = struct {
             w.input_norms[i] = try self.keepF32(layer.attn_norm.weight);
             w.attn_norms[i] = try self.keepF32(layer.ffn_norm.weight);
 
-            // Router gate weight (f32 already)
-            try layer.ffn.gate.weight.eval();
-            w.gate_projs[i] = (try layer.ffn.gate.weight.dataPtr(f32))[0..layer.ffn.gate.weight.size()];
+            // Router gate weight -> f32 (loader keeps weights bf16)
+            w.gate_projs[i] = try self.keepF32(layer.ffn.gate.weight);
 
             // MLA attention weights (quantized; on-the-fly Metal dequant).
             const a = &layer.attn;
@@ -2781,16 +2805,28 @@ pub const DSV4Model = struct {
             ap.wq_b = try self.extractQuant(a.wq_b, a.wq_b_scales, a.wq_b_biases, attn_gs);
             ap.wkv = try self.extractQuant(a.wkv, a.wkv_scales, a.wkv_biases, attn_gs);
             ap.kv_norm = try self.keepF32(a.kv_norm.weight);
-            // wo_a: may be 3D [n_groups, o_lora_rank, group_feat] (grouped) — extract per group.
+            // wo_a: grouped 3D [n_groups, o_lora_rank, group_feat/8] packed.
+            // Flatten to logical [n_groups*o_lora_rank, group_feat] = [8192, 4096];
+            // engine.zig slices it back into 8 per-group QuantWeights.
             ap.wo_a_grouped = (a.wo_a.ndim() == 3);
-            if (ap.wo_a_grouped) {
-                ap.wo_a = try self.extractQuant(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
-            } else {
-                ap.wo_a = try self.extractQuant(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
-            }
+            ap.wo_a = try self.extractQuantWoA(a.wo_a, a.wo_a_scales, a.wo_a_biases, attn_gs);
             ap.wo_b = try self.extractQuant(a.wo_b, a.wo_b_scales, a.wo_b_biases, attn_gs);
             ap.attn_sink = if (a.sink_logits) |s| try self.keepF32(s) else &[_]f32{};
             w.attn[i] = ap;
+
+            // mHC weights (f32 already)
+            try layer.hc_attn.hc_fn.eval();
+            try layer.hc_attn.hc_base.eval();
+            try layer.hc_attn.hc_scale.eval();
+            try layer.hc_ffn.hc_fn.eval();
+            try layer.hc_ffn.hc_base.eval();
+            try layer.hc_ffn.hc_scale.eval();
+            w.attn_hc_fn[i] = (try layer.hc_attn.hc_fn.dataPtr(f32))[0..layer.hc_attn.hc_fn.size()];
+            w.attn_hc_base[i] = (try layer.hc_attn.hc_base.dataPtr(f32))[0..layer.hc_attn.hc_base.size()];
+            w.attn_hc_scale[i] = (try layer.hc_attn.hc_scale.dataPtr(f32))[0..layer.hc_attn.hc_scale.size()];
+            w.ffn_hc_fn[i] = (try layer.hc_ffn.hc_fn.dataPtr(f32))[0..layer.hc_ffn.hc_fn.size()];
+            w.ffn_hc_base[i] = (try layer.hc_ffn.hc_base.dataPtr(f32))[0..layer.hc_ffn.hc_base.size()];
+            w.ffn_hc_scale[i] = (try layer.hc_ffn.hc_scale.dataPtr(f32))[0..layer.hc_ffn.hc_scale.size()];
         }
 
         return w;
@@ -2825,6 +2861,12 @@ pub const DSV4Model = struct {
         attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn: [64]?AttnWeightPtrs = [_]?AttnWeightPtrs{null} ** 64,
+        attn_hc_fn: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        attn_hc_base: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        attn_hc_scale: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        ffn_hc_fn: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        ffn_hc_base: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        ffn_hc_scale: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         n_layers: usize = 0,
     };
 
@@ -2878,12 +2920,23 @@ pub const DSV4Model = struct {
         for (self.layers, 0..) |*layer, i| {
             const layer_start = std.c.mach_absolute_time();
             if (self.metal_engine) |eng_ptr| {
-                // Metal engine path: extract hidden → engine forward → wrap result
-                try hidden.eval();
-                const hdata = try hidden.dataSliceMut(f32);
+                // Full-metal engine path. hidden is the mHC-expanded residual
+                // (possibly a broadcast view). Materialize a contiguous f32 copy,
+                // then copy into a STABLE host buffer (MLX array data pointers can
+                // point into GPU/unified buffers that aren't safe to hand to C and
+                // hold across the call). Run the engine on the host buffer, then
+                // wrap the result back into a tracked Array.
+                const hshape = hidden.shape();
+                const n = hidden.size();
+                const contig = try arena.track(try ops.astype(self.ctx, try ops.copy(self.ctx, hidden), .float32));
+                try contig.eval();
+                const src = try contig.dataPtr(f32);
+                const host = try self.allocator.alloc(f32, n);
+                defer self.allocator.free(host);
+                @memcpy(host, src[0..n]);
                 const metal = @import("../metal_infer/engine.zig");
-                try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), hdata, @intCast(start_pos));
-                // hidden already updated in-place via dataSliceMut
+                try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), host, @intCast(start_pos));
+                hidden = try arena.track(try Array.fromData(self.allocator, f32, host, hshape));
             } else {
                 const cache = if (caches) |cache_arr| cache_arr[i] else null;
                 hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));

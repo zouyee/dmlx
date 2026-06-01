@@ -22,6 +22,7 @@
 // ============================================================================
 
 static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long kernel_src_len) {
+    setvbuf(stderr, NULL, _IONBF, 0); // unbuffered so crash diagnostics are not lost
     id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
     if (!dev) { fprintf(stderr, "Metal: no device\n"); return -1; }
     eng->device = (void *)dev;
@@ -408,8 +409,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
     P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;
 
-    float attn_input[DIM], normed[DIM], attn_out[DIM];
-    float ffn_input[DIM], ffn_out[DIM];
+    // Large scratch buffers are static (forward_layer runs serially) to avoid
+    // overflowing the warmup/engine fiber's limited stack.
+    static float attn_input[DIM], normed[DIM], attn_out[DIM];
+    static float ffn_input[DIM], ffn_out[DIM];
     float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
 
     // === Attention sublayer (mHC-wrapped) ===

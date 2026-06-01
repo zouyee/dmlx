@@ -40,6 +40,7 @@ const ChatCommand = struct {
     expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
     expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
     metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
+    metal_full: bool = false, // Full-metal engine (attention + mHC + MoE in engine.c)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -69,6 +70,7 @@ const ServerCommand = struct {
     expert_packed_dir: ?[]const u8 = null, // Path to packed_experts/ for Flash-MoE parallel pread
     expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
     metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
+    metal_full: bool = false, // Full-metal engine (attention + mHC + MoE in engine.c)
     distributed: bool = false,
 };
 
@@ -206,6 +208,7 @@ pub fn main(init: std.process.Init) !void {
             .expert_packed_dir = cmd.expert_packed_dir,
             .expert_parallel = cmd.expert_parallel,
             .metal_moe = cmd.metal_moe,
+            .metal_full = cmd.metal_full,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -359,6 +362,7 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
         const is_bool = std.mem.eql(u8, flag, "--smelt") or
             std.mem.eql(u8, flag, "--mlock-backbone") or
             std.mem.eql(u8, flag, "--metal-moe") or
+            std.mem.eql(u8, flag, "--metal-full") or
             std.mem.eql(u8, flag, "--distributed");
         if (!is_bool and i + 1 >= args.len) break;
         const value = if (!is_bool) args[i + 1] else "";
@@ -432,6 +436,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--metal-moe")) {
             cmd.metal_moe = true;
+        } else if (std.mem.eql(u8, flag, "--metal-full")) {
+            cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         }
@@ -463,6 +469,7 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         const is_bool = std.mem.eql(u8, flag, "--smelt") or
             std.mem.eql(u8, flag, "--mlock-backbone") or
             std.mem.eql(u8, flag, "--metal-moe") or
+            std.mem.eql(u8, flag, "--metal-full") or
             std.mem.eql(u8, flag, "--distributed") or
             std.mem.eql(u8, flag, "--raw");
         if (!is_bool and i + 1 >= args.len) break;
@@ -500,6 +507,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.expert_parallel = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--metal-moe")) {
             cmd.metal_moe = true;
+        } else if (std.mem.eql(u8, flag, "--metal-full")) {
+            cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         } else if (std.mem.eql(u8, flag, "--raw")) {
