@@ -305,6 +305,13 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] 关键发现：mHC 维度极小（HC=4，comb 是 4×4，mixes 12 宽），compute 量可忽略 → S7 可在 host CPU 上算 mHC 小算子，不必写 Metal kernel（省复杂度，对性能无影响）
       - [ ] host 编排（hc_fn/hc_scale/hc_base 提取 + pre/post + sinkhorn，CPU 实现，与 S7 一起接）
 - [ ] **S7 整层串联**：attn + mHC + 已有 MoE kernel 在 engine.c 内跑完单层，**层间不回 MLX**，逐层对拍
+      - [x] **Metal kernel runtime 验证**（最大 S7 风险已消除）：独立测试台 `scripts/metal_kernel_test.m`
+            + `run_kernel_tests.sh`，runtime 编译 `moe_kernel.metal` 并对拍每个 kernel（~2s 反馈，
+            不必 50s 起服务）。全部通过：`dequant_matvec_affine`=0、`rms_norm_rows`≤1e-7、
+            `rope_tail_interleaved`=1.5e-8、`mla_sdpa_decode(+sink)`=0。Metal 语法/绑定/threadgroup 归约/
+            online-softmax 全部在真实 GPU 上确认正确。
+      - [ ] host 编排：engine.c 内串 S2-S5 kernel + mHC(CPU) + MoE，分配 KV cache，处理 mHC `[1,1,4,4096]` 形状
+      - [ ] 真实逐层 dump 对拍（attn_out / 层输出 vs MLX）
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
 - [ ] **S10 达标门**：≥3.0 tok/s + 7/7 + 稳定 → 改默认 flag、退役 MLX 推理路径（保留 loader + 对拍）

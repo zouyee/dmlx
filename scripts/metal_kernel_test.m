@@ -1,0 +1,264 @@
+// Standalone Metal kernel test harness for the S2-S4 attention kernels.
+// Runtime-compiles src/models/moe_kernel.metal and exercises each new kernel
+// with small inputs, comparing against a CPU reference computed here.
+//
+// Build & run:
+//   clang -framework Metal -framework Foundation -fobjc-arc \
+//     scripts/metal_kernel_test.m -o /tmp/mkt && /tmp/mkt
+//
+// This gives a ~2s feedback loop for Metal syntax/binding/index bugs, instead
+// of the ~50s server load required to exercise kernels through engine.c.
+#import <Metal/Metal.h>
+#import <Foundation/Foundation.h>
+#import <math.h>
+#import <stdio.h>
+#import <stdlib.h>
+
+static id<MTLDevice> dev;
+static id<MTLCommandQueue> queue;
+static id<MTLLibrary> lib;
+
+static id<MTLComputePipelineState> mkpipe(const char *name) {
+    NSError *err = nil;
+    id<MTLFunction> fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name]];
+    if (!fn) { printf("FAIL: no function %s\n", name); exit(1); }
+    id<MTLComputePipelineState> p = [dev newComputePipelineStateWithFunction:fn error:&err];
+    if (!p) { printf("FAIL: pipeline %s: %s\n", name, [[err localizedDescription] UTF8String]); exit(1); }
+    return p;
+}
+
+static id<MTLBuffer> buf(void *data, size_t len) {
+    return [dev newBufferWithBytes:data length:len options:MTLResourceStorageModeShared];
+}
+static id<MTLBuffer> bufz(size_t len) {
+    return [dev newBufferWithLength:len options:MTLResourceStorageModeShared];
+}
+
+static int g_fail = 0;
+static void check(const char *what, float maxd, float tol) {
+    printf("  %-28s max_abs_diff=%.3e  %s\n", what, maxd, maxd < tol ? "OK" : "FAIL");
+    if (maxd >= tol) g_fail = 1;
+}
+
+// ---- test: rms_norm_rows (weightless + weighted) ----
+static void test_rms_norm_rows(void) {
+    const uint n_rows = 3, row_dim = 512;
+    float *x = malloc(sizeof(float) * n_rows * row_dim);
+    float *w = malloc(sizeof(float) * row_dim);
+    for (uint i = 0; i < n_rows * row_dim; i++) x[i] = ((float)(i % 17) - 8.0f) * 0.1f;
+    for (uint i = 0; i < row_dim; i++) w[i] = 1.0f + 0.01f * (float)(i % 5);
+    float eps = 1e-6f;
+
+    id<MTLComputePipelineState> p = mkpipe("rms_norm_rows");
+    id<MTLBuffer> bx = buf(x, sizeof(float) * n_rows * row_dim);
+    id<MTLBuffer> bw = buf(w, sizeof(float) * row_dim);
+    id<MTLBuffer> bo = bufz(sizeof(float) * n_rows * row_dim);
+
+    for (int weighted = 0; weighted <= 1; weighted++) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:p];
+        [e setBuffer:bx offset:0 atIndex:0];
+        [e setBuffer:bw offset:0 atIndex:1];
+        [e setBuffer:bo offset:0 atIndex:2];
+        uint rd = row_dim; uint hw = weighted;
+        [e setBytes:&rd length:4 atIndex:3];
+        [e setBytes:&eps length:4 atIndex:4];
+        [e setBytes:&hw length:4 atIndex:5];
+        [e dispatchThreadgroups:MTLSizeMake(n_rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+
+        float *out = [bo contents];
+        float maxd = 0;
+        for (uint r = 0; r < n_rows; r++) {
+            double ss = 0; for (uint i = 0; i < row_dim; i++) { float v = x[r*row_dim+i]; ss += (double)v*v; }
+            float rms = 1.0f / sqrtf((float)(ss/row_dim) + eps);
+            for (uint i = 0; i < row_dim; i++) {
+                float ref = x[r*row_dim+i] * rms * (weighted ? w[i] : 1.0f);
+                float d = fabsf(ref - out[r*row_dim+i]);
+                if (d > maxd) maxd = d;
+            }
+        }
+        check(weighted ? "rms_norm_rows (weighted)" : "rms_norm_rows (weightless)", maxd, 1e-4f);
+    }
+    free(x); free(w);
+}
+
+// ---- test: rope_tail_interleaved ----
+static void test_rope(void) {
+    const uint n_heads = 2, head_dim = 16, rope_dim = 8, nope = head_dim - rope_dim;
+    uint half = rope_dim / 2;
+    float *q = malloc(sizeof(float) * n_heads * head_dim);
+    for (uint i = 0; i < n_heads * head_dim; i++) q[i] = 0.1f * (float)((i % 11) - 5);
+    float cosv[4], sinv[4];
+    for (uint i = 0; i < half; i++) { cosv[i] = cosf(0.3f * (i+1)); sinv[i] = sinf(0.3f * (i+1)); }
+
+    float *ref = malloc(sizeof(float) * n_heads * head_dim);
+    memcpy(ref, q, sizeof(float) * n_heads * head_dim);
+    for (uint h = 0; h < n_heads; h++)
+        for (uint i = 0; i < half; i++) {
+            uint j0 = nope + 2*i, j1 = nope + 2*i + 1;
+            float x0 = q[h*head_dim+j0], x1 = q[h*head_dim+j1];
+            ref[h*head_dim+j0] = x0*cosv[i] - x1*sinv[i];
+            ref[h*head_dim+j1] = x0*sinv[i] + x1*cosv[i];
+        }
+
+    id<MTLComputePipelineState> p = mkpipe("rope_tail_interleaved");
+    id<MTLBuffer> bq = buf(q, sizeof(float) * n_heads * head_dim);
+    id<MTLBuffer> bc = buf(cosv, sizeof(float)*half);
+    id<MTLBuffer> bs = buf(sinv, sizeof(float)*half);
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bq offset:0 atIndex:0];
+    [e setBuffer:bc offset:0 atIndex:1];
+    [e setBuffer:bs offset:0 atIndex:2];
+    uint nh=n_heads, hd=head_dim, nd=nope, rd=rope_dim, inv=0;
+    [e setBytes:&nh length:4 atIndex:3];
+    [e setBytes:&hd length:4 atIndex:4];
+    [e setBytes:&nd length:4 atIndex:5];
+    [e setBytes:&rd length:4 atIndex:6];
+    [e setBytes:&inv length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(n_heads*half,1,1) threadsPerThreadgroup:MTLSizeMake(8,1,1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out = [bq contents]; float maxd = 0;
+    for (uint i = 0; i < n_heads*head_dim; i++) { float d = fabsf(ref[i]-out[i]); if (d>maxd) maxd=d; }
+    check("rope_tail_interleaved", maxd, 1e-5f);
+    free(q); free(ref);
+}
+
+// ---- test: mla_sdpa_decode (online softmax + sink, MQA) ----
+static void test_sdpa(void) {
+    const uint n_heads = 4, head_dim = 64, n_kv = 5;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float *q = malloc(sizeof(float)*n_heads*head_dim);
+    float *kv = malloc(sizeof(float)*n_kv*head_dim);
+    float *sinks = malloc(sizeof(float)*n_heads);
+    for (uint i=0;i<n_heads*head_dim;i++) q[i]=0.1f*(float)((i%13)-6);
+    for (uint i=0;i<n_kv*head_dim;i++) kv[i]=0.1f*(float)((i%7)-3);
+    for (uint h=0;h<n_heads;h++) sinks[h]=0.2f*(float)h - 0.3f;
+
+    // CPU reference: full softmax with sink folded into denominator
+    float *ref = malloc(sizeof(float)*n_heads*head_dim);
+    for (uint h=0;h<n_heads;h++) {
+        float m=-INFINITY;
+        float *sc = malloc(sizeof(float)*n_kv);
+        for (uint k=0;k<n_kv;k++){ double dot=0; for(uint d=0;d<head_dim;d++) dot+=(double)q[h*head_dim+d]*kv[k*head_dim+d]; sc[k]=(float)dot*scale; if(sc[k]>m)m=sc[k]; }
+        if (sinks[h]>m) m=sinks[h];
+        double s=0; for(uint k=0;k<n_kv;k++) s+=exp(sc[k]-m); s+=exp(sinks[h]-m);
+        for(uint d=0;d<head_dim;d++){ double acc=0; for(uint k=0;k<n_kv;k++) acc+=exp(sc[k]-m)*kv[k*head_dim+d]; ref[h*head_dim+d]=(float)(acc/s); }
+        free(sc);
+    }
+
+    id<MTLComputePipelineState> p = mkpipe("mla_sdpa_decode");
+    id<MTLBuffer> bq=buf(q,sizeof(float)*n_heads*head_dim);
+    id<MTLBuffer> bkv=buf(kv,sizeof(float)*n_kv*head_dim);
+    id<MTLBuffer> bsk=buf(sinks,sizeof(float)*n_heads);
+    id<MTLBuffer> bo=bufz(sizeof(float)*n_heads*head_dim);
+    id<MTLCommandBuffer> cb=[queue commandBuffer];
+    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bq offset:0 atIndex:0];
+    [e setBuffer:bkv offset:0 atIndex:1];
+    [e setBuffer:bsk offset:0 atIndex:2];
+    [e setBuffer:bo offset:0 atIndex:3];
+    uint nh=n_heads,hd=head_dim,nk=n_kv;
+    [e setBytes:&nh length:4 atIndex:4];
+    [e setBytes:&hd length:4 atIndex:5];
+    [e setBytes:&nk length:4 atIndex:6];
+    [e setBytes:&scale length:4 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake(n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out=[bo contents]; float maxd=0;
+    for (uint i=0;i<n_heads*head_dim;i++){ float d=fabsf(ref[i]-out[i]); if(d>maxd)maxd=d; }
+    check("mla_sdpa_decode (+sink)", maxd, 2e-4f);
+    free(q); free(kv); free(sinks); free(ref);
+}
+
+// ---- test: dequant_matvec_affine (w = scale*nibble + bias) ----
+static void test_dequant_affine(void) {
+    const uint out_dim = 5, in_dim = 128, gs = 64;
+    uint ng = in_dim / gs, pcols = in_dim / 8;
+    uint32_t *packed = malloc(sizeof(uint32_t) * out_dim * pcols);
+    float *scales = malloc(sizeof(float) * out_dim * ng);
+    float *biases = malloc(sizeof(float) * out_dim * ng);
+    float *x = malloc(sizeof(float) * in_dim);
+    for (uint i = 0; i < out_dim * pcols; i++) packed[i] = (uint32_t)(i * 2654435761u);
+    for (uint i = 0; i < out_dim * ng; i++) { scales[i] = 0.01f + 0.001f*(i%7); biases[i] = -0.05f + 0.002f*(i%5); }
+    for (uint i = 0; i < in_dim; i++) x[i] = 0.1f * (float)((i%9)-4);
+
+    // CPU reference mirroring the kernel
+    float *ref = malloc(sizeof(float)*out_dim);
+    for (uint r = 0; r < out_dim; r++) {
+        float acc = 0;
+        for (uint g = 0; g < ng; g++) {
+            float sc = scales[r*ng+g], bi = biases[r*ng+g];
+            for (uint p = 0; p < gs/8; p++) {
+                uint32_t pw = packed[r*pcols + g*(gs/8) + p];
+                uint xb = g*gs + p*8;
+                for (uint i = 0; i < 8; i++) {
+                    float nib = (float)((pw >> (i*4)) & 0xF);
+                    acc += (sc*nib + bi) * x[xb+i];
+                }
+            }
+        }
+        ref[r] = acc;
+    }
+
+    id<MTLComputePipelineState> p = mkpipe("dequant_matvec_affine");
+    id<MTLBuffer> bw=buf(packed,sizeof(uint32_t)*out_dim*pcols);
+    id<MTLBuffer> bs=buf(scales,sizeof(float)*out_dim*ng);
+    id<MTLBuffer> bb=buf(biases,sizeof(float)*out_dim*ng);
+    id<MTLBuffer> bx=buf(x,sizeof(float)*in_dim);
+    id<MTLBuffer> bo=bufz(sizeof(float)*out_dim);
+    id<MTLCommandBuffer> cb=[queue commandBuffer];
+    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bw offset:0 atIndex:0];
+    [e setBuffer:bs offset:0 atIndex:1];
+    [e setBuffer:bb offset:0 atIndex:2];
+    [e setBuffer:bx offset:0 atIndex:3];
+    [e setBuffer:bo offset:0 atIndex:4];
+    uint od=out_dim, id_=in_dim, g=gs;
+    [e setBytes:&od length:4 atIndex:5];
+    [e setBytes:&id_ length:4 atIndex:6];
+    [e setBytes:&g length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(out_dim,1,1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out=[bo contents]; float maxd=0;
+    for (uint i=0;i<out_dim;i++){ float d=fabsf(ref[i]-out[i]); if(d>maxd)maxd=d; }
+    check("dequant_matvec_affine", maxd, 1e-4f);
+    free(packed); free(scales); free(biases); free(x); free(ref);
+}
+
+int main(int argc, char **argv) {
+    const char *src_path = (argc > 1) ? argv[1] : "src/models/moe_kernel.metal";
+    dev = MTLCreateSystemDefaultDevice();
+    if (!dev) { printf("no metal device\n"); return 1; }
+    queue = [dev newCommandQueue];
+
+    NSError *err = nil;
+    NSString *src = [NSString stringWithContentsOfFile:[NSString stringWithUTF8String:src_path]
+                                              encoding:NSUTF8StringEncoding error:&err];
+    if (!src) { printf("read %s failed\n", src_path); return 1; }
+    MTLCompileOptions *opts = [MTLCompileOptions new];
+    opts.languageVersion = MTLLanguageVersion3_1;
+    lib = [dev newLibraryWithSource:src options:opts error:&err];
+    if (!lib) { printf("COMPILE FAILED:\n%s\n", [[err localizedDescription] UTF8String]); return 1; }
+    printf("moe_kernel.metal compiled OK\n");
+
+    test_rms_norm_rows();
+    test_rope();
+    test_sdpa();
+    test_dequant_affine();
+
+    printf(g_fail ? "\nRESULT: KERNEL TESTS FAILED\n" : "\nRESULT: ALL KERNEL TESTS PASSED\n");
+    return g_fail;
+}
