@@ -284,3 +284,104 @@ kernel void rope_tail_interleaved(
     row[j0] = x0 * c - x1 * s;
     row[j1] = x0 * s + x1 * c;
 }
+
+// ===========================================================================
+// S4: MLA SDPA (decode, single query token) + attention sink
+// ===========================================================================
+
+// mla_sdpa_decode: one query token attends to `n_kv` cached KV rows (MQA: a
+// single KV head shared by all N_HEADS query heads), with per-head attention
+// sink folded into the softmax denominator (matches MLX fast SDPA sinks).
+//
+//   score_k = (q_h . kv[k]) * scale         for k in [0, n_kv)
+//   denom   = sum_k exp(score_k - M) + exp(sink_h - M)   (M = running max)
+//   out_h   = sum_k softmax_k * kv[k]
+//
+// One threadgroup per head; 256 threads cooperatively reduce over head_dim.
+// q:   [n_heads, head_dim]
+// kv:  [n_kv, head_dim]   (shared single KV head)
+// out: [n_heads, head_dim]
+// sinks: [n_heads]
+kernel void mla_sdpa_decode(
+    device const float* q        [[buffer(0)]],
+    device const float* kv       [[buffer(1)]],
+    device const float* sinks    [[buffer(2)]],
+    device float*       out      [[buffer(3)]],
+    constant uint&      n_heads  [[buffer(4)]],
+    constant uint&      head_dim [[buffer(5)]],
+    constant uint&      n_kv     [[buffer(6)]],
+    constant float&     scale    [[buffer(7)]],
+    uint  head [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  tg   [[threads_per_threadgroup]]
+) {
+    if (head >= n_heads) return;
+    threadgroup float red[32];
+    device const float* qh = q + (uint64_t)head * head_dim;
+
+    // Online softmax accumulation over keys. Each thread owns a partial output
+    // slice acc[d] for d = lid, lid+tg, ...  Running max M and denom S are
+    // threadgroup-wide scalars kept in red[0]/red[1] via reduction per key.
+    // For simplicity (correctness-first), recompute the dot product cooperatively.
+    threadgroup float t_m;     // running max
+    threadgroup float t_s;     // running denom
+    threadgroup float t_score; // current key score
+    if (lid == 0) { t_m = -INFINITY; t_s = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // per-thread output accumulator over its strided dims
+    float acc[8];
+    uint n_slots = (head_dim + tg - 1) / tg;
+    for (uint i = 0; i < n_slots; i++) acc[i] = 0.0f;
+
+    for (uint k = 0; k < n_kv; k++) {
+        device const float* kvk = kv + (uint64_t)k * head_dim;
+        // cooperative dot product q_h . kv[k]
+        float partial = 0.0f;
+        for (uint d = lid; d < head_dim; d += tg) partial += qh[d] * kvk[d];
+        float dot = simd_sum(partial);
+        uint lane = lid % 32, sg = lid / 32;
+        if (lane == 0) red[sg] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            float tot = 0.0f;
+            uint n_sg = (tg + 31) / 32;
+            for (uint g = 0; g < n_sg; g++) tot += red[g];
+            t_score = tot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float score = t_score;
+        float m_old = t_m;
+        float m_new = max(m_old, score);
+        float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        float p = exp(score - m_new);
+        // rescale acc and add p * kv[k]
+        for (uint i = 0; i < n_slots; i++) {
+            uint d = lid + i * tg;
+            if (d < head_dim) acc[i] = acc[i] * corr + p * kvk[d];
+        }
+        if (lid == 0) { t_s = t_s * corr + p; t_m = m_new; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Fold per-head sink into the denominator (no output contribution).
+    if (lid == 0) {
+        float sink = sinks[head];
+        float m_old = t_m;
+        float m_new = max(m_old, sink);
+        float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        t_s = t_s * corr + exp(sink - m_new);
+        t_m = m_new;
+        red[0] = corr; // broadcast correction for acc rescale
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float corr_final = red[0];
+    float inv_s = (t_s == 0.0f) ? 0.0f : 1.0f / t_s;
+    device float* oh = out + (uint64_t)head * head_dim;
+    for (uint i = 0; i < n_slots; i++) {
+        uint d = lid + i * tg;
+        if (d < head_dim) oh[d] = (acc[i] * corr_final) * inv_s;
+    }
+}

@@ -292,6 +292,10 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] attn 权重提取（`extractWeightsForEngine`）：每层填 `AttnWeightPtrs`（packed u32 原始指针 + scales/biases bf16→f32 + q_norm/kv_norm/attn_sink）；astype'd f32 数组挂 `model.engine_f32_arrays` 存活
       - [ ] KV cache 分配 + host 编排（与 S4 一起接，届时 Q+KV 真实 dump 对拍）
 - [ ] **S4 SDPA + sink**：移植 `dsv4_misc.metal`，MQA 广播 1→64，含 `attn_sink`，对拍 attn_out
+      - [x] 算法对拍（`scripts/verify_sdpa_sink.py`）：kernel-style online-softmax + sink-fold vs MLX `fast.scaled_dot_product_attention(sinks=)`，max_abs=3e-8；sanity 确认 sink 改变输出 0.30
+      - [x] sink 精确语义（MLX `fast.cpp`）：`scores=concat([sink_h, q·k·scale])` → softmax → 切掉 sink 列 ≡ 把 `exp(sink_h)` 计入 softmax 分母、不贡献输出
+      - [x] Metal kernel `mla_sdpa_decode`：每 head 一 threadgroup，online-softmax，MQA 单 KV head 广播
+      - [ ] host 编排（KV cache + 串 S2/S3/S4）+ 真实 attn_out dump 对拍（runtime 验证 kernel 语法+数值）
 - [ ] **S5 输出投影**：grouped wo_a（8 组）→ inverse tail RoPE → concat → wo_b，对拍 attn 层输出
 - [ ] **S6 mHC**：移植 `dsv4_hc.metal`（expand/compress/preNormFn），注意 `hc_eps`≠`rms_norm_eps`
 - [ ] **S7 整层串联**：attn + mHC + 已有 MoE kernel 在 engine.c 内跑完单层，**层间不回 MLX**，逐层对拍
