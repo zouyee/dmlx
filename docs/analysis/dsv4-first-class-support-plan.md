@@ -297,6 +297,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
       - [x] Metal kernel `mla_sdpa_decode`：每 head 一 threadgroup，online-softmax，MQA 单 KV head 广播
       - [ ] host 编排（KV cache + 串 S2/S3/S4）+ 真实 attn_out dump 对拍（runtime 验证 kernel 语法+数值）
 - [ ] **S5 输出投影**：grouped wo_a（8 组）→ inverse tail RoPE → concat → wo_b，对拍 attn 层输出
+      - [x] 布局对拍（`scripts/verify_out_proj.py`）：简单标量索引（group=h//8，head-major flatten）vs MLX reshape/transpose 链，max_abs=0；完整 out-proj max_abs=0
+      - [x] 无新 kernel：grouped wo_a = 8× `dequant_matvec_affine`（S1）、concat = host memcpy、wo_b = `dequant_matvec_affine`（S1）、inverse RoPE = `rope_tail_interleaved` inverse=1（S2）
+      - [ ] host 编排（与 S7 整层一起接）
 - [ ] **S6 mHC**：移植 `dsv4_hc.metal`（expand/compress/preNormFn），注意 `hc_eps`≠`rms_norm_eps`
 - [ ] **S7 整层串联**：attn + mHC + 已有 MoE kernel 在 engine.c 内跑完单层，**层间不回 MLX**，逐层对拍
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
