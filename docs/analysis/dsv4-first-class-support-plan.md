@@ -280,3 +280,123 @@ curl -s http://localhost:8930/v1/chat/completions -H 'Content-Type: application/
 - **里程碑**：任何阶段 MLX 路径始终可用（默认或 fallback），避免「为追 metal 把可用功能弄丢」
 - **MLX 退役**：仅在 Phase 5 达标门全部满足后执行，且代码层面先改默认 flag、观察稳定后再删除
 
+---
+
+## 8. 参考实现对照（合并自 flash-moe-alignment-plan.md）
+
+> 本节汇总两个外部参考引擎，作为 Phase 2-5 的移植索引。
+> 行号为撰写时快照，移植前以实际文件为准。
+
+### 8.1 ds4（DwarfStar，`../ds4/`）— 主参考
+
+antirez 的 **DeepSeek-V4-Flash 专用自包含推理引擎**，目标模型与本项目一致，且经「官方 logits 对齐验证」。
+**关键差异**：ds4 用 GGUF + 2-bit(IQ2) 量化；本项目用 MLX 原生 4bit safetensors（mxfp4 experts gs32 + affine attn gs64）。
+→ **算法逻辑可直接对照/移植，但 dequant 必须替换为我们的 mxfp4/affine。**
+
+| 文件 / 符号 | 内容 | 用途 |
+|------------|------|------|
+| `metal/dsv4_misc.metal` `kernel_dsv4_indexed_mixed_attention_heads8` | MLA 混合注意力核心（含 sink、window、raw+compressed KV、top-k 索引） | Phase 2 SDPA 主参考 |
+| `metal/dsv4_rope.metal` `kernel_dsv4_rope_tail_f32` | V4 YaRN tail-only RoPE | Phase 2 RoPE |
+| `metal/dsv4_hc.metal` | mHC / HyperConnection | Phase 3 mHC |
+| `metal/norm.metal` | RMSNorm | Phase 2/3 |
+| `metal/dsv4_kv.metal` `kernel_dsv4_fp8_kv_quantize_f32` | KV cache 量化 | Phase 2 KV（可选） |
+| `metal/flash_attn.metal` | 多阶段 FlashAttention | prefill 加速（后期） |
+| `metal/moe.metal` | MoE（路由 + combine） | Phase 4 对照 |
+| `ds4_metal.m` `ds4_gpu_encode_rope_tail_inplace()` | RoPE 调度参考 | Phase 2 host 侧 |
+| `ds4.c` | host 侧 forward 编排（层循环、KV 状态机） | 整体架构参考 |
+
+> ds4 attention kernel 关键结构（`dsv4_attend_*`）：每 head 8 SIMD groups，threadgroup 缓存 KV 行，
+> online-softmax（运行 M/S 累加），最后用 `dsv4_attend_sink(sinks[head], M, S, ...)` 把 sink 并入分母——
+> 与我们 MLX 版 `scaledDotProductAttention(..., sink_logits)` 语义一致。**这是我们要复刻的正确算法。**
+
+### 8.2 flash-moe（`../flash-moe/metal_infer/`）— 仅 MoE/IO 流水线参考
+
+flash-moe 是 **Qwen GQA** 模型引擎，注意力与 V4 MLA 不同，**注意力部分对本项目无用**。
+仅其 MoE expert 流水线与 I/O 设计可借鉴。
+
+| 文件 / 符号 | 内容 | 价值 |
+|------------|------|------|
+| `infer.m:2124` `full_attention_forward()` | Qwen GQA 注意力 | ❌ 不适用（V4 用 MLA） |
+| `shaders.metal` `dequant_matvec_4bit_v3` | 优化版 4bit matvec（tiling/coalesce/SIMD/FMA） | ⬜ Phase 5 kernel 优化参考 |
+| `shaders.metal` `fused_gate_up_swiglu` | 融合 gate+up+SwiGLU | ⬜ Phase 4 MoE |
+| `shaders.metal` `moe_combine_residual` | expert 加权和 + residual（K 硬编码，需改 K=6） | ⬜ Phase 4 |
+| `shaders.metal` `rms_norm_sum_sq` / `rms_norm_apply_bf16` | 两段式 RMSNorm | ⬜ |
+| `infer.m:3060` `async_pread_start/wait` | GCD 异步 I/O | ⬜ Phase 5 I/O |
+
+---
+
+## 9. flash-moe MoE/IO 流水线技术点（Phase 5 性能参考）
+
+> 这些是 flash-moe 把 60 层 K=4 跑到 4.36 tok/s 的关键技术。Phase 5 性能优化时参考，
+> **但必须在 Phase 2-4 全链路数值对齐之后**才动，且每步对拍。
+
+### 9.1 三命令缓冲流水线（每层）
+
+```
+CMD3(N-1) deferred → CMD1: attention 投影
+                   → CPU: 结果刷出
+                   → CMD2: o_proj + norm + routing + shared expert
+                   → CPU: softmax + topK 路由
+                   → I/O: 并行 pread K experts
+                   → CMD3: expert forward + GPU combine + norm (DEFERRED, 不等待)
+```
+
+- **CMD3 延迟提交**：`[cmd commit]` 后不 `waitUntilCompleted`，GPU 算 CMD3 时 CPU 已进入下一层
+- **GPU-side combine**：CMD3 内 3 个 encoder 串联 —— `moe_combine_residual` + `rms_norm_sum_sq` +
+  `rms_norm_apply`（用**下一层**的 norm weight），输出直接是下一层输入，**消除 CPU 往返**
+
+### 9.2 时序 expert 预测 + 双缓冲
+
+- token N-1 完成后存下每层 routing indices → 预测表
+- token N 开始时用预测 indices 异步预取到 B 缓冲集；到该层时命中则零 I/O，未命中同步读 A 缓冲集
+- flash-moe 命中率 ~71%（OS page cache 辅助）
+- ⚠️ **V4 expert 局部性仅 ~35%**（实测），远低于 flash-moe 的 71%，故时序预测对 V4 收益有限，
+  **不作为 V4 的主优化手段**
+
+### 9.3 持久化 I/O 线程池
+
+- N 个持久 pthread（每 expert 一个）+ generation counter + condition variable
+- `io_pool_dispatch()` 填任务 → broadcast → wait
+- HEAD 的 `engine.c` 已有等价实现（6 持久 pthread）
+
+### 9.4 Metal kernel 优化要点（Phase 5）
+
+- threadgroup tiling（如 8 rows/group，256 threads，8 SIMD groups）
+- shared memory 缓存输入向量，256 线程协作加载
+- coalesced 全局内存读取（SIMD lane stride 32）
+- FMA 解量：`fma(nibble, scale*x, bias*x)` 一条指令完成解量+乘
+- SIMD reduction：`simd_sum(acc)`
+- ⚠️ 历史教训：SIMD reduction 版曾有 bug（87-97% 输出为 0），优化版必须逐 kernel 对拍
+
+---
+
+## 10. MXFP4 解量公式（已验证）
+
+MoE experts 走 mxfp4（group_size=32）。解量公式（Python 端与 MLX `quantized_matmul` 实测 max diff 0.000000）：
+
+```
+NIBBLE_TO_FLOAT[16] = {0,1,2,3,4,6,8,12, -0,-1,-2,-3,-4,-6,-8,-12}
+w = NIBBLE_TO_FLOAT[nibble] * exp2(scale - 128.0)
+```
+
+attn / embed / lm_head / shared_experts 走 affine（group_size=64），用标准 `w = q * scale + bias`。
+metal dequant kernel 必须按权重名区分这两种 mode（见 §1-P5）。
+
+---
+
+## 11. 性能预估（参考，来自 flash-moe 类比）
+
+flash-moe 实测 4.36 tok/s（60 层 K=4）。V4 43 层 K=6 的理论拆解：
+
+| 阶段 | 耗时/layer | 43 层 |
+|------|-----------|-------|
+| attention 投影 | ~1.2ms | ~52ms |
+| CPU attention | ~0.5ms | ~22ms |
+| o_proj + norm + routing | ~0.55ms | ~24ms |
+| I/O pread（预测命中时） | ~0.5ms | ~22ms |
+| expert forward (deferred) | ~0.04ms | ~2ms |
+| **合计** | ~2.8ms | **~120ms** |
+
+理论 ~8 tok/s，保守含 overhead **3-5 tok/s** → 与目标 3.0 tok/s 吻合。
+瓶颈仍是 SSD I/O：每 token ~3.35GB（43×6×13.4MB），SSD 有效带宽 ~1GB/s。
+I/O 优化关键：降低有效 I/O 量（部分加载 SMELT + 缓存），而非单纯靠时序预测（V4 局部性低）。
