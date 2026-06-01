@@ -310,7 +310,9 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
             不必 50s 起服务）。全部通过：`dequant_matvec_affine`=0、`rms_norm_rows`≤1e-7、
             `rope_tail_interleaved`=1.5e-8、`mla_sdpa_decode(+sink)`=0。Metal 语法/绑定/threadgroup 归约/
             online-softmax 全部在真实 GPU 上确认正确。
-      - [ ] host 编排：engine.c 内串 S2-S5 kernel + mHC(CPU) + MoE，分配 KV cache，处理 mHC `[1,1,4,4096]` 形状
+      - [x] host 编排：`mla_attention.m`（`mla_attention_decode`）串 Q链→KV链→SDPA+sink→逆RoPE→grouped wo_a→wo_b，全程 Metal 无 MLX 往返；mHC 小算子留 CPU（S6 决定）
+      - [x] **独立 host 对拍 GO**：`gen_attn_golden.py` 生成 layer-0 真实权重+golden，`mla_attention_test.m` 跑完整注意力 vs golden → **rel_L2=1.9e-6**（~2s，不必起服务）。`run_mla_attention_test.sh` 可复跑
+      - [ ] 接入 engine.c `moe_infer_forward_layer`（替换 pass-through 占位）+ KV cache 分配 + build.zig 编译 mla_attention.m
       - [ ] 真实逐层 dump 对拍（attn_out / 层输出 vs MLX）
 - [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
 - [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
