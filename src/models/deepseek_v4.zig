@@ -2787,6 +2787,15 @@ pub const DSV4Model = struct {
             ap.attn_sink = if (a.sink_logits) |s| try self.keepF32(s) else &[_]f32{};
             w.attn[i] = ap;
 
+            // Shared expert weights (affine 4bit, gs=64)
+            const se = &layer.ffn.shared_expert;
+            if (se.w1 != null and se.w1_scales != null) {
+                const se_gs: i32 = @intCast(layer.ffn.shared_expert.quant_group_size);
+                w.shared_gate[i] = try self.extractQuant(se.w1.?, se.w1_scales, se.w1_biases, se_gs);
+                w.shared_up[i] = try self.extractQuant(se.w3.?, se.w3_scales, se.w3_biases, se_gs);
+                w.shared_down[i] = try self.extractQuant(se.w2.?, se.w2_scales, se.w2_biases, se_gs);
+            }
+
             // mHC weights (f32 already)
             try layer.hc_attn.hc_fn.eval();
             try layer.hc_attn.hc_base.eval();
@@ -2835,6 +2844,9 @@ pub const DSV4Model = struct {
         attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn: [64]?AttnWeightPtrs = [_]?AttnWeightPtrs{null} ** 64,
+        shared_gate: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
+        shared_up: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
+        shared_down: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
         attn_hc_fn: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn_hc_base: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn_hc_scale: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,

@@ -510,6 +510,63 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
+    // Shared expert: runs on the same normed input, output added to ffn_out.
+    if (eng->shared[layer].gate.packed != NULL) {
+        const int SE_GS = 64;
+        const int SE_NG_GU = DIM / SE_GS;   // 64 groups for gate/up [2048,4096]
+        const int SE_NG_D  = INTERMEDIATE / SE_GS; // 32 groups for down [4096,2048]
+        id<MTLBuffer> bx = [d newBufferWithBytes:normed length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bgate = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bup   = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bdown = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        // gate and up projections
+        {
+            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
+            for (int proj = 0; proj < 2; proj++) {
+                const QuantWeight *qw = (proj==0) ? &eng->shared[layer].gate : &eng->shared[layer].up;
+                id<MTLBuffer> bout = (proj==0) ? bgate : bup;
+                id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+                id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+                id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+                [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
+                [e setBuffer:bx offset:0 atIndex:3]; [e setBuffer:bout offset:0 atIndex:4];
+                uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
+                [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            }
+            [cb commit]; [cb waitUntilCompleted];
+        }
+        // Limited SwiGLU on CPU
+        float *gv = (float *)[bgate contents]; float *uv = (float *)[bup contents];
+        const float limit = 10.0f;
+        for (int j = 0; j < INTERMEDIATE; j++) {
+            float g = fminf(gv[j], limit);
+            float u = fminf(fmaxf(uv[j], -limit), limit);
+            gv[j] = g / (1.0f + expf(-g)) * u;
+        }
+        // down projection
+        {
+            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
+            const QuantWeight *qw = &eng->shared[layer].down;
+            id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+            id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
+            id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+            [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
+            [e setBuffer:bgate offset:0 atIndex:3]; [e setBuffer:bdown offset:0 atIndex:4];
+            uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
+            [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        float *sv = (float *)[bdown contents];
+        for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
+    }
+
     // mHC post -> residual'' (in place)
     mhc_post(ffn_out, residual, post, comb, residual);
     if (layer == 0 && getenv("MF_DBG")) {
@@ -577,6 +634,11 @@ void moe_infer_set_weights(MoEInferEngine *eng,
 void moe_infer_set_layer_attn(MoEInferEngine *eng, int layer, AttnWeights attn) {
     if (layer < 0 || layer >= N_LAYERS) return;
     eng->attn[layer] = attn;
+}
+
+void moe_infer_set_layer_shared(MoEInferEngine *eng, int layer, SharedExpert se) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->shared[layer] = se;
 }
 
 void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,

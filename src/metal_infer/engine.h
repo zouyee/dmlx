@@ -55,6 +55,13 @@ typedef struct {
     int group_size;
 } QuantWeight;
 
+// Shared expert weights (affine 4bit, gs=64). One per layer.
+typedef struct {
+    QuantWeight gate;  // [2048, 4096]
+    QuantWeight up;    // [2048, 4096]
+    QuantWeight down;  // [4096, 2048]
+} SharedExpert;
+
 // Per-layer MLA attention weights (quantized, on-the-fly dequant in Metal).
 typedef struct {
     QuantWeight wq_a;        // [1024, 4096]
@@ -198,6 +205,7 @@ typedef struct {
     const float *input_norms[N_LAYERS];  // attn_norm (pre-attention)
     const float *attn_norms[N_LAYERS];   // ffn_norm (pre-MoE)
     AttnWeights  attn[N_LAYERS];         // MLA attention weights (quantized)
+    SharedExpert shared[N_LAYERS];       // shared expert (affine 4bit, gs=64)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     // mHC weights per layer (f32): fn [24,16384], base [24], scale [3]
     const float *attn_hc_fn[N_LAYERS];
@@ -243,6 +251,9 @@ void moe_infer_set_weights(MoEInferEngine *engine,
 // (packed u32, f32 scales/biases, norms, sink) must remain valid for the
 // engine's lifetime.
 void moe_infer_set_layer_attn(MoEInferEngine *engine, int layer, AttnWeights attn);
+
+// Set one layer's shared expert weights.
+void moe_infer_set_layer_shared(MoEInferEngine *engine, int layer, SharedExpert se);
 
 // Set one layer's mHC weights (f32 pointers, kept alive by caller).
 void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,

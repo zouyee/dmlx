@@ -63,6 +63,13 @@ extern fn moe_infer_set_layer_hc(
     ffn_scale: [*c]const f32,
 ) void;
 
+const CSharedExpert = extern struct {
+    gate: CQuantWeight,
+    up: CQuantWeight,
+    down: CQuantWeight,
+};
+extern fn moe_infer_set_layer_shared(engine: *Engine, layer: c_int, se: CSharedExpert) void;
+
 pub fn init(packed_dir: []const u8) !*Engine {
     const engine = moe_infer_init(packed_dir.ptr, moe_metal_source, moe_metal_source.len);
     if (engine == null) return error.InitFailed;
@@ -104,6 +111,14 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         ca.attn_sink = ap.attn_sink.ptr;
         moe_infer_set_layer_attn(engine, @intCast(i), ca);
         moe_infer_set_layer_hc(engine, @intCast(i), w.attn_hc_fn[i].ptr, w.attn_hc_base[i].ptr, w.attn_hc_scale[i].ptr, w.ffn_hc_fn[i].ptr, w.ffn_hc_base[i].ptr, w.ffn_hc_scale[i].ptr);
+        if (w.shared_gate[i].out_dim > 0) {
+            const cse = CSharedExpert{
+                .gate = cqw(w.shared_gate[i]),
+                .up = cqw(w.shared_up[i]),
+                .down = cqw(w.shared_down[i]),
+            };
+            moe_infer_set_layer_shared(engine, @intCast(i), cse);
+        }
     }
 }
 
