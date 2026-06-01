@@ -115,6 +115,48 @@ kernel void moe_combine(
     output[tid] = sum;
 }
 
+// dequant_matvec_affine: out = W @ x, W affine-4bit quantized (gs=64, bf16 scales+biases).
+// Matches MLX affine dequant: w = scale_g * nibble + bias_g  (nibble in [0,15], no LUT).
+// W_packed: [out_dim, in_dim/8] uint32 (8 nibbles per uint32).
+// scales/biases: [out_dim, in_dim/group_size] — passed as float (caller converts bf16->f32).
+kernel void dequant_matvec_affine(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    x        [[buffer(3)]],
+    device float*          out      [[buffer(4)]],
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const float*    sc = scales   + tid * num_groups;
+    device const float*    bi = biases   + tid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g];
+        float bias  = bi[g];
+        uint bp = g * packed_per_group;
+        uint bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            uint x_base = bx + p * 8;
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * x[x_base + i];
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
 // rms_norm_sum_sq: parallel reduction of sum(x_i^2)
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],

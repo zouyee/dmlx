@@ -247,32 +247,51 @@ decode 单 token 计时（warm cache，5 token 平均 ~3.7s/token）：
 > （N_HEADS=32/HEAD_DIM=128/KV_HEADS=8）是 GQA 占位，与 V4 MLA（64/512/1）不符，需重设计。
 
 
-### Phase 3 — Metal mHC + norm + 输出层
+### Phase 3-5 — 全 Metal Layer（已选定，full-metal 终局）
 
-- [ ] mHC：移植 `dsv4_hc.metal`，`expandToMHC`/`compressFromMHC`/`mhcPreNormFn`，注意 `hc_eps`
-- [ ] 最终 `norm` + `lm_head`（或暂留 MLX，影响小）
-- [ ] 逐层对拍
+> 决策（2026-06-01，§2e 实测后）：混合方案性能注定差（每层 MLX↔metal 同步屏障吃 ~70%）。
+> 走 **全 metal**：整层（attn + mHC + MoE）都在 C/Metal 内完成，**一个 token 一次性跑完 43 层，零 MLX 往返**。
+> MLX 仅保留为对拍 oracle，达标后退役。
 
-**验收**：注意力 + mHC 全 metal，MoE 可切 MLX，smoke `Paris`。
+#### 关键约束与已验证事实
 
-### Phase 4 — Metal MoE 数值对齐
+1. **注意力权重必须 Metal 内 on-the-fly 解量**，禁止预解量到 f32（43 层 × ~400MB = ~17GB → 旧 OOM）。
+2. **两种量化解量公式**（kernel 必须区分）：
+   - **attn / embed / lm_head / shared（affine, gs=64）**：`w = scale_g * nibble + bias_g`
+     （nibble = `(packed >> 4*i) & 0xF`，scale/bias 为 bf16 per-group）。MLX 源：`cpu/quantized.cpp:131`
+   - **MoE experts（mxfp4, gs=32）**：`w = NIBBLE_TO_FLOAT[nibble] * exp2(scale_e8m0 - 128)`，无 bias（§10）
+3. **真实 MLA 维度（layer 0，与 engine.h 现有 GQA 占位常量完全不符，需重写）**：
 
-- [ ] expert dequant 是 **mxfp4/gs32**，对拍 `dequant_matvec_4bit` vs MLX `gather_qmm`
-- [ ] `moe_combine_residual` 改 K=6（flash-moe 移植为 K=8 硬编码）+ shared expert 接入
-- [ ] 路由 gate 对拍（softmax + topK + `e_score_correction_bias`）
-- [ ] 逐层对拍
+   | 权重 | 逻辑 shape | 量化 | 作用 |
+   |------|-----------|------|------|
+   | wq_a | [1024, 4096] | affine gs64 | hidden → q_lora(1024) |
+   | q_norm | [1024] | bf16 | RMSNorm |
+   | wq_b | [32768, 1024] | affine gs64 | q_lora → 64 head × 512 |
+   | wkv | [512, 4096] | affine gs64 | hidden → kv_lora(512) |
+   | kv_norm | [512] | bf16 | RMSNorm |
+   | wo_a | [8, 1024, 4096] | affine gs64 | grouped：8 组，每组 4096→1024 |
+   | wo_b | [4096, 8192] | affine gs64 | concat(8×1024)=8192 → hidden(4096) |
+   | attn_sink | [64] | f32 | 每 head 一个 sink logit |
 
-**验收**：`--metal-moe` 全链路 smoke `Paris`，逐层达标。
+   配置：64 heads，head_dim=512（nope 448 + rope 64），1 KV head（MQA 广播），mHC mult=4。
 
-### Phase 5 — 全 Metal E2E + 性能 + 废弃 MLX
+#### 构建顺序（逐 kernel 对拍，每步 smoke 必须仍 `Paris`）
 
-- [ ] 全段 metal，关闭 MLX forward，E2E benchmark 7/7
-- [ ] kernel 优化：SIMD reduction / threadgroup tiling / coalesced 读 / FMA dequant
-- [ ] I/O：时序预测预取（双缓冲 A/B）、CMD3 延迟提交流水线
-- [ ] **达标门**：≥3.0 tok/s + 7/7 + 连续稳定
-- [ ] **达标后**：移除 MLX 推理路径（保留 loader + 对拍脚本），metal 成为默认 flag，更新 README
+- [ ] **S0 脚手架**：重写 `engine.h` 权重模型为 MLA（删 GQA 占位常量），扩展 `extractWeightsForEngine`
+      提取 attn 权重的**量化原始指针**（packed u32 + bf16 scales + bf16 biases，不解量）
+- [ ] **S1 affine-dequant matvec kernel**：写 `dequant_matvec_affine`（`w=scale*q+bias`），
+      **单测对拍** vs MLX `quantizedMatmul`（固定输入向量，max diff 阈值）——这是全 metal 的成败前提，先证它
+- [ ] **S2 Q 链**：wq_a → RMSNorm(q_norm) → wq_b → reshape[64,512] → per-head RMSNorm → tail RoPE，对拍 Q
+- [ ] **S3 KV**：wkv → RMSNorm(kv_norm) → [1,512] → tail RoPE；KV cache（43 层 × [seq,512]）
+- [ ] **S4 SDPA + sink**：移植 `dsv4_misc.metal`，MQA 广播 1→64，含 `attn_sink`，对拍 attn_out
+- [ ] **S5 输出投影**：grouped wo_a（8 组）→ inverse tail RoPE → concat → wo_b，对拍 attn 层输出
+- [ ] **S6 mHC**：移植 `dsv4_hc.metal`（expand/compress/preNormFn），注意 `hc_eps`≠`rms_norm_eps`
+- [ ] **S7 整层串联**：attn + mHC + 已有 MoE kernel 在 engine.c 内跑完单层，**层间不回 MLX**，逐层对拍
+- [ ] **S8 全 43 层 + final norm + lm_head**：engine 内跑完整 forward，E2E 对拍 logits → smoke `Paris`
+- [ ] **S9 性能**：去同步屏障后测 tok/s；再做 kernel 优化（SIMD/tiling/coalesce）+ 6-expert 并行 dispatch
+- [ ] **S10 达标门**：≥3.0 tok/s + 7/7 + 稳定 → 改默认 flag、退役 MLX 推理路径（保留 loader + 对拍）
 
-**验收**：默认即 metal，3.0 tok/s，7/7。
+**里程碑验收**：S1 对拍通过（affine dequant 可行）是 go/no-go 关卡；S8 smoke `Paris` 是正确性终点；S10 是性能终点。
 
 ---
 
