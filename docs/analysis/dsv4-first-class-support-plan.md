@@ -166,19 +166,51 @@ DSV4_DUMP_DIR=/tmp/metal_out PORT=8936 METAL_MOE=1 bash scripts/dsv4_smoke.sh
 python3 scripts/compare_metal_mlx.py /tmp/mlx_ref /tmp/metal_out
 ```
 
-### Phase 2 — Metal 注意力子系统（最大难点，引入 `--metal-attn`）
+### Phase 2 — 混合方案先行（plan c，已部分执行 2026-06-01）
 
-按 §0「可行性」移植 ds4 kernel，逐 kernel 对拍。
+> 决策：先做「MLX backbone + Metal 路由 expert」的混合方案，用最小改动拿真实性能/正确性数据，
+> 再决定注意力是否值得搬到 Metal。理由：归档文档实测 **I/O 占每 token ~97%，GPU 计算仅 ~30%**，
+> 注意力投影仅 ~1.2ms/层 —— 把注意力搬 Metal 对性能几乎无收益，瓶颈在 MoE expert I/O。
 
-- [ ] 权重接入：扩展 `extractWeightsForEngine` 提取 `wq_a/q_norm/wq_b/wkv/wo_a(grouped)/wo_b/attn_sink` 的 f32 指针
-- [ ] Q 投影链 `wq_a → RMSNorm(q_norm) → wq_b`，对拍 Q
-- [ ] `wkv` 联合投影 + 拆分；KV cache 分配（43 层）
-- [ ] RoPE：接 `dsv4_rope.metal` tail-only，对拍 roped Q/K
-- [ ] SDPA：移植 `dsv4_misc.metal` MLA 混合注意力，**含 attn_sink**，对拍 attn_out
-- [ ] 输出：grouped `wo_a`(8 组) → `wo_b`，对拍 attn 层输出
-- [ ] 逐层 max diff 达标后，`--metal-attn` 随 `--metal-moe` 默认开启
+#### 2a. 接线修正（已完成）
 
-**验收**：`--metal-attn`（MoE 仍 MLX）smoke 输出 `Paris`，逐层达标。
+- [x] 发现 `--metal-moe` 同时启用了**两条冲突路径**：
+  - `server.zig`：`metal_moe.setEnabled(true)` → 正确的混合路径（`expert_stream.tryMetalPath`，
+    MLX 跑 attention/mHC/shared/gate，Metal 只跑路由 expert）
+  - `state.zig`：设 `model.metal_engine` → **engine.c 全层引擎**（占位注意力 `memcpy(q→attn_out)`），
+    会短路 MLX `layer.forward`，导致 `tryMetalPath` 永不执行 + 注意力失效 → 乱码
+- [x] 移除 `state.zig` 设 `metal_engine` 的代码块。`--metal-moe` 现在 = 纯混合路径（engine.c 全层引擎不再使用）
+
+#### 2b. 混合方案实测（2026-06-01）
+
+| 项 | 结果 |
+|----|------|
+| 正确性 | ❌ **乱码**（France→`ChatGPT对话...referred referred`，MLX 同 prompt→`Paris`） |
+| 逐层对拍 | ❌ **layer_00 即发散**（rel_L2≈1.9），逐层累积放大 |
+| 性能 | ❌ **~4.5s/token**（layer loop ~4043ms），比纯 MLX (~0.5s/token) **慢 ~8x** |
+
+**结论**：metal_moe.zig 的 MoE kernel **数值错误**（layer 0 expert 输出就偏），且 **慢 8x**
+（每 token 同步 SSD 读 + 无流水线 Metal dispatch）。当前混合方案**不可用**，需先修 MoE kernel 正确性。
+
+#### 2c. 下一步（修 Metal MoE kernel）
+
+- [ ] 单 expert 对拍：固定一个 expert，Metal `gate_up_swiglu`+`dequant_matvec`+`combine` vs MLX `gather_qmm`，
+      用同一输入向量，定位是 dequant 公式 / group_size / combine 加权 哪一步错
+- [ ] mxfp4 expert 解量公式核对（§10）：gate/up/down 都是 mxfp4 gs32
+- [ ] `moe_combine` 加权和 + 是否漏了 shared expert / 路由权重归一化
+- [ ] 修正后逐层对拍 rel_L2 达标 → smoke 输出 `Paris`
+- [ ] 性能单列 Phase 4 处理（先对，再快）
+
+**验收**：`--metal-moe`（混合）smoke 输出 `Paris`，逐层 rel_L2 达标。
+
+#### 2d. 注意力搬 Metal（推迟）
+
+> 仅当混合方案正确 + MoE 提速后仍需更快时再做。届时按下述移植 ds4 kernel：
+> 权重接入（`wq_a/q_norm/wq_b/wkv/wo_a/wo_b/attn_sink`）→ Q 链 → wkv → tail RoPE →
+> 含 sink 的 SDPA（`dsv4_misc.metal`）→ grouped `wo_a`→`wo_b`，逐层对拍。
+> ⚠️ 注意 metal 路径收到的 hidden 是 mHC 展开后的 `[1,1,4,4096]`，engine.h 的注意力常量
+> （N_HEADS=32/HEAD_DIM=128/KV_HEADS=8）是 GQA 占位，与 V4 MLA（64/512/1）不符，需重设计。
+
 
 ### Phase 3 — Metal mHC + norm + 输出层
 
