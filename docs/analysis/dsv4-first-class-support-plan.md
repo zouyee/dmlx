@@ -181,27 +181,30 @@ python3 scripts/compare_metal_mlx.py /tmp/mlx_ref /tmp/metal_out
     会短路 MLX `layer.forward`，导致 `tryMetalPath` 永不执行 + 注意力失效 → 乱码
 - [x] 移除 `state.zig` 设 `metal_engine` 的代码块。`--metal-moe` 现在 = 纯混合路径（engine.c 全层引擎不再使用）
 
-#### 2b. 混合方案实测（2026-06-01）
+#### 2b. 混合方案实测与修复（2026-06-01）
 
-| 项 | 结果 |
-|----|------|
-| 正确性 | ❌ **乱码**（France→`ChatGPT对话...referred referred`，MLX 同 prompt→`Paris`） |
-| 逐层对拍 | ❌ **layer_00 即发散**（rel_L2≈1.9），逐层累积放大 |
-| 性能 | ❌ **~4.5s/token**（layer loop ~4043ms），比纯 MLX (~0.5s/token) **慢 ~8x** |
+初测乱码，逐层对拍定位到 **metal_moe.zig MoE kernel 两处 bug**，已修复：
 
-**结论**：metal_moe.zig 的 MoE kernel **数值错误**（layer 0 expert 输出就偏），且 **慢 8x**
-（每 token 同步 SSD 读 + 无流水线 Metal dispatch）。当前混合方案**不可用**，需先修 MoE kernel 正确性。
+1. **moe_combine 多加了 residual** —— `moe_metal_wrapper.c` 把 `hidden_buf`（MoE 输入）当 residual 加进
+   combine 输出。但 `DSV4MoE.forward` 返回的是路由 expert 和 `y`，之后才 `+ shared_out` + block residual，
+   导致输入被重复计入。改为绑定**零 residual buffer**，combine 只返回纯路由 expert 加权和。
+2. **fused_gate_up_swiglu 缺 limited-SwiGLU 截断** —— MLX 用 `gate=min(g,10)`、`up=clamp(u,-10,10)`
+   （swiglu_limit=10）后再 silu。kernel 原为无截断的 `silu(g)*u`。已加匹配截断。
 
-#### 2c. 下一步（修 Metal MoE kernel）
+| 项 | 修复前 | 修复后 |
+|----|--------|--------|
+| 正确性 | ❌ 乱码 | ✅ **France→`The capital of France is Paris.`**（匹配 MLX oracle），2+2= 连贯 |
+| 性能 | ~4.5s/token | ~4.5s/token（未变，见 §Phase 4/5） |
 
-- [ ] 单 expert 对拍：固定一个 expert，Metal `gate_up_swiglu`+`dequant_matvec`+`combine` vs MLX `gather_qmm`，
-      用同一输入向量，定位是 dequant 公式 / group_size / combine 加权 哪一步错
-- [ ] mxfp4 expert 解量公式核对（§10）：gate/up/down 都是 mxfp4 gs32
-- [ ] `moe_combine` 加权和 + 是否漏了 shared expert / 路由权重归一化
-- [ ] 修正后逐层对拍 rel_L2 达标 → smoke 输出 `Paris`
-- [ ] 性能单列 Phase 4 处理（先对，再快）
+> ⚠️ 对拍说明：metal-moe 模式下 **prefill 走 MLX batch**（每层 expert 数 >6，`tryMetalPath` 跳过回落 MLX），
+> 仅 **decode 单 token** 才走 metal MoE kernel。故 `--max-tokens 1` 的逐层 dump 对拍显示全 0 偏差（都是 MLX prefill），
+> 真正验证 metal kernel 正确性的是 **E2E decode 输出**（已匹配 `Paris`）。
 
-**验收**：`--metal-moe`（混合）smoke 输出 `Paris`，逐层 rel_L2 达标。
+#### 2c. 现状
+
+- [x] metal-moe 混合路径**正确性达标**（E2E 输出匹配 MLX）
+- [ ] 性能：~4.5s/token（比 MLX 慢 8x），是 Phase 4/5 的优化目标（I/O 流水线 + kernel 优化）
+- [ ] decode 路径逐层对拍自动化（需构造 decode-only dump，当前 dump 主要覆盖 prefill）
 
 #### 2d. 注意力搬 Metal（推迟）
 
