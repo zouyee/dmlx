@@ -523,3 +523,87 @@ flash-moe 实测 4.36 tok/s（60 层 K=4）。V4 43 层 K=6 的理论拆解：
 理论 ~8 tok/s，保守含 overhead **3-5 tok/s** → 与目标 3.0 tok/s 吻合。
 瓶颈仍是 SSD I/O：每 token ~3.35GB（43×6×13.4MB），SSD 有效带宽 ~1GB/s。
 I/O 优化关键：降低有效 I/O 量（部分加载 SMELT + 缓存），而非单纯靠时序预测（V4 局部性低）。
+
+---
+
+## 12. 阶段性总结（2026-06-01）
+
+> 本节记录从「混合方案乱码」到「全 metal 43 层跑通」的完整过程，作为后续调试的参考基线。
+
+### 12.1 起点与战略转向
+
+**起点**：`--metal-moe`（MLX backbone + Metal 路由 expert）输出乱码，逐层对拍 layer_00 rel_L2≈1.9。
+
+**根因**（2026-06-01 诊断）：两个 MoE kernel bug——combine 多加了 residual（double-count）+ fused_gate_up_swiglu 缺 limited-SwiGLU 截断。修复后混合方案输出 `Paris`，但性能 ~4.5s/token（比纯 MLX 慢 8x）。
+
+**性能测量**（decode 单 token 分解）：
+- other（MLX backbone + 每层同步屏障）~70%
+- io（expert SSD 读）~20%
+- metal kernel ~12%
+
+**战略转向**：混合方案每层 MLX↔Metal 往返是最差组合。选择**全 metal**（消除往返）。
+
+### 12.2 S0-S6：算法验证阶段（全部 GO）
+
+| 步骤 | 验证内容 | 误差 | 关键发现 |
+|------|---------|------|---------|
+| S0 | engine.h MLA 权重模型重写 | — | 旧 GQA 占位(N_HEADS=32/HEAD_DIM=128)全错 |
+| S1 | affine 4bit dequant `w=scale*q+bias` | **0** | 可行，绕开 17GB 预解量 OOM |
+| S2 | Q 链：交错 RoPE + 两种 RMSNorm | ≤1e-6 | split-half RoPE 差 5.8（旧 engine.c 是错的）|
+| S3 | KV 链 + attn 权重提取 | 复用 S1/S2 | wo_a 是 dense bf16（loader 解量），不是 packed |
+| S4 | SDPA + sink | 3e-8 | sink 精确语义：`exp(sink_h)` 计入分母不贡献输出 |
+| S5 | grouped wo_a 布局 | **0** | 简单 head-major flatten == MLX 复杂 transpose |
+| S6 | mHC sinkhorn + post | ≤6e-8 | HC=4 compute 可忽略，CPU 实现即可 |
+
+**方法论**：每步用真实 layer-0 权重 + numpy/MLX 对拍，sanity check 证明"做错会差多少"。
+
+### 12.3 S7：系统集成阶段（进行中）
+
+**S7a** kernel runtime 验证（~2s 测试台）：全部 GPU 上通过，Metal 语法/绑定/threadgroup 归约确认正确。
+
+**S7b** 完整注意力 host 编排（`mla_attention_decode`）：独立对拍 rel_L2=1.9e-6，~2s 验证。
+
+**S7c** engine.c 全层串联：mhc_pre→attn→mhc_post→mhc_pre→MoE→mhc_post，编译通过。
+
+**S7d** 真服务集成——修了 **7 个集成 bug**（按发现顺序）：
+
+| # | Bug | 现象 | 修复 |
+|---|-----|------|------|
+| 1 | gate.weight 是 BF16 | segfault（2x 过读） | `keepF32` |
+| 2 | mHC broadcast view（stride-0） | segfault（16384 越界） | `mlx_contiguous` + size 断言 |
+| 3 | MLX buffer 指针不能交给 C | segfault（GPU 地址 CPU 读） | 稳定 host buffer + memcpy |
+| 4 | wo_a 是 dense bf16（loader 解量） | segfault（scale ptr=0x4） | dense f32 + `matvec_f32` |
+| 5 | `generate()` batch prefill | 9 token 喂单 token 引擎 → 全乱 | metal-full 时 token-by-token |
+| 6 | MoE 读 `buf_normed` 但未写入 | ffn_out 恒为 0 | 写入 `buf_normed` 再 dispatch |
+| 7 | 引擎 input/ffn norm 未验证 | 潜在精度问题 | 换用已验证 `rms_norm_rows` |
+
+**当前状态（2026-06-01）**：
+
+| 指标 | 值 |
+|------|-----|
+| 全 metal 43 层 | ✅ 跑通，无 crash |
+| MoE 有输出 | ✅ ffn_out norm=0.19（修 bug#6 后） |
+| E2E 正确性 | ❌ 乱码；layer_00 norm ~0.5 vs MLX ~533 |
+| 性能 | ~1.7s/token（比混合方案快 2x，但仍慢） |
+| 护栏 | ✅ 隔离测试全 GO；纯 MLX smoke `Paris` |
+
+### 12.4 剩余工作（S7d 继续 → S8-S10）
+
+**S7d 正确性（当前阻塞）**：
+
+1. **layer_00 严重衰减**（norm 0.5 vs 533）：`MF_DBG` 追踪显示 `post_mix=[0.032,0,0,0]`，需与 MLX layer-0 mhc_pre 内部量逐项对比，定位是 mhc_pre 计算错还是权重传递错。
+2. **shared expert 缺失**：每层 MoE 少了共享专家的贡献（`n_shared_experts=1`）。
+3. **generateWithCallback 未加 token-by-token 保护**（HTTP 服务路径）。
+
+**S8-S10**：全 43 层 E2E 对齐 → smoke `Paris` → 性能优化 → 退役 MLX。
+
+### 12.5 调试工具清单
+
+| 工具 | 用途 |
+|------|------|
+| `bash scripts/run_kernel_tests.sh` | ~2s Metal kernel 正确性（每次改 kernel 必跑） |
+| `bash scripts/run_mla_attention_test.sh` | ~2s 完整注意力 host 对拍 |
+| `python3 scripts/compare_metal_mlx.py ref/ cmp/` | 逐层 max_abs/rel_L2，标出首个发散层 |
+| `DSV4_DUMP_DIR=/tmp/x bash scripts/dsv4_smoke.sh` | 生成逐层激活 dump |
+| `MF_DBG=1 --metal-full` | 引擎内部逐段 norm 追踪（layer 0） |
+| `bash scripts/dsv4_smoke.sh` | 端到端正确性门（Paris + 4） |
