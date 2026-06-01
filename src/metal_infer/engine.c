@@ -565,6 +565,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         float *sv = (float *)[bdown contents];
         for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
+        if (layer == 0 && getenv("MF_DBG")) {
+            double sn=0; for(int z=0;z<DIM;z++) sn+=(double)sv[z]*sv[z];
+            fprintf(stderr, "[mf-dbg] L0 shared_out norm=%.4f\n", sqrt(sn));
+        }
     }
 
     // mHC post -> residual'' (in place)

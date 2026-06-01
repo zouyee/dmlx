@@ -90,9 +90,10 @@ void mhc_pre(const MhcWeights *w, const float *residual,
 
 void mhc_post(const float *x, const float *residual,
               const float *post, const float *comb, float *out_residual) {
-    // out[m,:] = post[m]*x + sum_k comb[k][m]*residual[k,:]   (comb transposed)
+    // Use a temp buffer to avoid aliasing when out_residual == residual.
+    static float tmp[MHC_MULT * DIM];
     for (int m = 0; m < HC; m++) {
-        float *om = out_residual + m*DIM;
+        float *om = tmp + m*DIM;
         for (int d = 0; d < DIM; d++) om[d] = post[m] * x[d];
         for (int k = 0; k < HC; k++) {
             float ckm = comb[k*HC + m];
@@ -100,6 +101,7 @@ void mhc_post(const float *x, const float *residual,
             for (int d = 0; d < DIM; d++) om[d] += ckm * rk[d];
         }
     }
+    memcpy(out_residual, tmp, (size_t)HC * DIM * sizeof(float));
 }
 
 void mhc_head_compress(const MhcWeights *w, const float *residual, float *out) {
