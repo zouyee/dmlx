@@ -503,6 +503,16 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         memcpy(normed, [bo contents], DIM * sizeof(float));
     }
 
+    if (layer == 0 && getenv("MF_DBG")) {
+        double nn=0; for(int z=0;z<DIM;z++) nn+=(double)normed[z]*normed[z];
+        fprintf(stderr, "[mf-dbg] L0 normed(ffn input) norm=%.4f\n", sqrt(nn));
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        if (dd) {
+            char path[1024]; snprintf(path, sizeof(path), "%s/L0_normed_ffn_in.bin", dd);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(normed, sizeof(float), DIM, f); fclose(f); }
+        }
+    }
+
     // === Routing gate ===
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
@@ -519,9 +529,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
     // Hash routing for layers 0-2: look up experts by token ID.
-    // NOTE: Disabled until attention quality is confirmed correct
-    // (score-based routing gives better output under current attention errors).
-    // Re-enable once E2E correctness improves.
+    // NOTE: Even with correct hash-selected experts, the MoE output is worse
+    // than score-based because the attention errors (~0.67% per token) cause
+    // borderline expert swaps in later score-based layers, amplifying the error.
+    // TODO: re-enable after attention precision is improved to <0.1%.
     const bool use_hash_routing = false;
     if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
@@ -558,6 +569,17 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
         moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+    }
+
+    if (layer == 0 && getenv("MF_DBG")) {
+        double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        fprintf(stderr, "[mf-dbg] L0 ffn_out(moe only) norm=%.4f\n", sqrt(fn));
+        // Dump pre-shared-expert MoE output for debugging
+        if (dd) {
+            char path[1024]; snprintf(path, sizeof(path), "%s/L0_moe_only_out.bin", dd);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(ffn_out, sizeof(float), DIM, f); fclose(f); }
+        }
     }
 
     // Shared expert: runs on the same normed input, output added to ffn_out.
