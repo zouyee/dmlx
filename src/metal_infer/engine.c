@@ -277,34 +277,40 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
 
 // MLX routing: sqrtsoftplus scoring, topK selection, L1-normalize, scale by route_scale.
 // Matches DSV4Gate.forward (scoring_func=sqrtsoftplus, norm_topk_prob=true, route_scale=1.5).
-static void cpu_moe_route(const float *logits, int n, int K,
+// bias: optional [N_EXPERTS] e_score_correction_bias (NULL for hash layers 0-2).
+static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
                           int *out_indices, float *out_weights) {
     // 1. sqrtsoftplus: scores[i] = sqrt(log(1 + exp(logits[i])))
     float *scores = (float *)alloca(n * sizeof(float));
     for (int i = 0; i < n; i++) {
         float l = logits[i];
-        // numerically stable: log1p(exp(l)) = l + log1p(exp(-l)) for l>0
         float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
         scores[i] = sqrtf(sp);
     }
-    // 2. topK selection by score value
+    // 2. Add e_score_correction_bias for topK selection (not for weight computation)
+    float *scores_for_choice = scores;
+    float *biased = NULL;
+    if (bias != NULL) {
+        biased = (float *)alloca(n * sizeof(float));
+        for (int i = 0; i < n; i++) biased[i] = scores[i] + bias[i];
+        scores_for_choice = biased;
+    }
+    // 3. topK selection by biased scores
     int *taken = (int *)calloc(n, sizeof(int));
     for (int k = 0; k < K; k++) {
         int best = -1; float bv = -1e30f;
         for (int i = 0; i < n; i++) {
-            if (!taken[i] && scores[i] > bv) { bv = scores[i]; best = i; }
+            if (!taken[i] && scores_for_choice[i] > bv) { bv = scores_for_choice[i]; best = i; }
         }
         out_indices[k] = best;
-        out_weights[k] = scores[best];
+        out_weights[k] = scores[best]; // gather ORIGINAL scores (not biased)
         taken[best] = 1;
     }
     free(taken);
-    // 3. L1-normalize: weights / sum(weights)
+    // 4. L1-normalize + scale by 1.5
     float wsum = 0; for (int k = 0; k < K; k++) wsum += out_weights[k];
     wsum += 1e-20f;
-    for (int k = 0; k < K; k++) out_weights[k] /= wsum;
-    // 4. Scale by routed_scaling_factor = 1.5
-    for (int k = 0; k < K; k++) out_weights[k] *= 1.5f;
+    for (int k = 0; k < K; k++) out_weights[k] = out_weights[k] / wsum * 1.5f;
 }
 
 // ============================================================================
@@ -512,7 +518,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    cpu_moe_route(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+    cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
     if (layer == 0 && getenv("MF_DBG")) {
         fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f]\n",
             expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],expert_ids[4],expert_ids[5],
@@ -650,7 +656,7 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
 void moe_infer_set_weights(MoEInferEngine *eng,
     const float *embed, int vocab_size, const float *lm_head, const float *final_norm,
     const float **input_norms, const float **attn_norms,
-    const float **gate_proj_w) {
+    const float **gate_proj_w, const float **gate_bias_w) {
     eng->embed = embed;
     eng->vocab_size = vocab_size;
     eng->lm_head = lm_head;
@@ -659,6 +665,7 @@ void moe_infer_set_weights(MoEInferEngine *eng,
         eng->input_norms[i] = input_norms[i];
         eng->attn_norms[i] = attn_norms[i];
         eng->gate_proj[i]  = gate_proj_w[i];
+        eng->gate_bias[i]  = gate_bias_w[i];
     }
 }
 

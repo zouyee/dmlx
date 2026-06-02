@@ -2774,6 +2774,11 @@ pub const DSV4Model = struct {
             // Router gate weight -> f32 (loader keeps weights bf16)
             w.gate_projs[i] = try self.keepF32(layer.ffn.gate.weight);
 
+            // e_score_correction_bias (present for non-hash layers)
+            if (layer.ffn.gate.bias) |b| {
+                w.gate_biases[i] = try self.keepF32(b);
+            }
+
             // MLA attention weights (quantized; on-the-fly Metal dequant).
             const a = &layer.attn;
             const attn_gs: i32 = a.attn_quant_group_size;
@@ -2846,6 +2851,7 @@ pub const DSV4Model = struct {
         input_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
+        gate_biases: [64]?[]const f32 = [_]?[]const f32{null} ** 64,
         attn: [64]?AttnWeightPtrs = [_]?AttnWeightPtrs{null} ** 64,
         shared_gate: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
         shared_up: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,

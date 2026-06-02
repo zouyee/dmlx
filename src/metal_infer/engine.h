@@ -207,6 +207,7 @@ typedef struct {
     AttnWeights  attn[N_LAYERS];         // MLA attention weights (quantized)
     SharedExpert shared[N_LAYERS];       // shared expert (affine 4bit, gs=64)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
+    const float *gate_bias[N_LAYERS];    // [N_EXPERTS] e_score_correction_bias (NULL if absent)
     // mHC weights per layer (f32): fn [24,16384], base [24], scale [3]
     const float *attn_hc_fn[N_LAYERS];
     const float *attn_hc_base[N_LAYERS];
@@ -244,7 +245,8 @@ void moe_infer_set_weights(MoEInferEngine *engine,
     const float *final_norm,
     const float **input_norms,     // [N_LAYERS] -> [DIM] (attn_norm)
     const float **attn_norms,      // [N_LAYERS] -> [DIM] (ffn_norm)
-    const float **gate_projs);     // [N_LAYERS] -> [N_EXPERTS, DIM]
+    const float **gate_projs,      // [N_LAYERS] -> [N_EXPERTS, DIM]
+    const float **gate_biases);    // [N_LAYERS] -> [N_EXPERTS] (or NULL per layer)
 
 // Set one layer's MLA attention weights (quantized; on-the-fly dequant in Metal).
 // Called once per layer after moe_infer_set_weights. The AttnWeights pointers

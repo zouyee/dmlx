@@ -26,6 +26,7 @@ extern fn moe_infer_set_weights(
     input_norms: [*c][*c]const f32,
     attn_norms: [*c][*c]const f32,
     gate_projs: [*c][*c]const f32,
+    gate_biases: [*c][*c]const f32,
 ) void;
 
 extern fn moe_infer_forward(engine: *Engine, hidden: [*c]f32, pos: c_int) c_int;
@@ -95,12 +96,14 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
     var in_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
     var an_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
     var gp_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
+    var gb_arr: [64][*c]const f32 = [_][*c]const f32{null} ** 64;
     for (0..@intCast(w.n_layers)) |i| {
         in_arr[i] = w.input_norms[i].ptr;
         an_arr[i] = w.attn_norms[i].ptr;
         gp_arr[i] = w.gate_projs[i].ptr;
+        if (w.gate_biases[i]) |b| gb_arr[i] = b.ptr;
     }
-    moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr);
+    moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr, &gb_arr);
 
     // Per-layer MLA attention + mHC weights.
     for (0..@intCast(w.n_layers)) |i| {
