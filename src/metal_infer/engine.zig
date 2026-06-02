@@ -71,9 +71,14 @@ const CSharedExpert = extern struct {
 };
 extern fn moe_infer_set_layer_shared(engine: *Engine, layer: c_int, se: CSharedExpert) void;
 extern fn moe_infer_reset_kv(engine: *Engine) void;
+extern fn moe_infer_set_layer_tid2eid(engine: *Engine, layer: c_int, tid2eid: [*c]const i64) void;
+extern fn moe_infer_set_token_id(engine: *Engine, token_id: c_int) void;
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
+}
+pub fn setTokenId(engine: *Engine, token_id: i32) void {
+    moe_infer_set_token_id(engine, @intCast(token_id));
 }
 
 pub fn init(packed_dir: []const u8) !*Engine {
@@ -119,6 +124,7 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         ca.attn_sink = ap.attn_sink.ptr;
         moe_infer_set_layer_attn(engine, @intCast(i), ca);
         moe_infer_set_layer_hc(engine, @intCast(i), w.attn_hc_fn[i].ptr, w.attn_hc_base[i].ptr, w.attn_hc_scale[i].ptr, w.ffn_hc_fn[i].ptr, w.ffn_hc_base[i].ptr, w.ffn_hc_scale[i].ptr);
+        if (w.tid2eid[i]) |t| moe_infer_set_layer_tid2eid(engine, @intCast(i), t.ptr);
         if (w.shared_gate[i].out_dim > 0) {
             const cse = CSharedExpert{
                 .gate = cqw(w.shared_gate[i]),

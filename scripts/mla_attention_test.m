@@ -66,6 +66,7 @@ int main(void) {
     P.rms_norm_rows = mkpipe(d, lib, "rms_norm_rows");
     P.rope_tail_interleaved = mkpipe(d, lib, "rope_tail_interleaved");
     P.mla_sdpa_decode = mkpipe(d, lib, "mla_sdpa_decode");
+    P.matvec_f32 = mkpipe(d, lib, "matvec_f32");
 
     AttnWeights aw;
     aw.wq_a = load_qw("wq_a", Q_LORA_RANK, DIM);            // [1024,4096]
@@ -76,18 +77,13 @@ int main(void) {
     aw.kv_norm = readf("kv_norm.bin", NULL);
     aw.attn_sink = readf("attn_sink.bin", NULL);
 
-    // wo_a is grouped: packed file is [8192,512] = [8*1024, 512]; slice per group.
-    uint32_t *woa_packed = readu("wo_a.packed");   // [8192, 512]
-    float *woa_sc = readf("wo_a.sc", NULL);        // [8192, 64]
-    float *woa_bi = readf("wo_a.bi", NULL);        // [8192, 64]
-    int pcols = DIM / 8;        // 512
-    int ng = DIM / ATTN_GROUP_SIZE; // 64
-    for (int g = 0; g < O_GROUPS; g++) {
-        aw.wo_a[g].out_dim = O_LORA_RANK; aw.wo_a[g].in_dim = DIM; aw.wo_a[g].group_size = ATTN_GROUP_SIZE;
-        aw.wo_a[g].packed = woa_packed + (size_t)g * O_LORA_RANK * pcols;
-        aw.wo_a[g].scales = woa_sc + (size_t)g * O_LORA_RANK * ng;
-        aw.wo_a[g].biases = woa_bi + (size_t)g * O_LORA_RANK * ng;
-    }
+    // wo_a is DENSE f32 (loader already dequantized it).
+    // Layout: [O_GROUPS, O_LORA_RANK, group_feat] flattened = [8*1024, 4096] f32.
+    // gen_attn_golden.py writes wo_a_dense.bin = f32 array of that shape.
+    size_t woa_n;
+    float *woa_dense = readf("wo_a_dense.bin", &woa_n);
+    aw.wo_a_dense = woa_dense;
+    (void)woa_n;
 
     float *x = readf("hidden.bin", NULL);
     size_t gn; float *golden = readf("golden.bin", &gn);

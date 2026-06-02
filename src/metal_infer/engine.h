@@ -208,6 +208,7 @@ typedef struct {
     SharedExpert shared[N_LAYERS];       // shared expert (affine 4bit, gs=64)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     const float *gate_bias[N_LAYERS];    // [N_EXPERTS] e_score_correction_bias (NULL if absent)
+    const int64_t *tid2eid[N_LAYERS];    // [vocab_size, N_ACTIVE] hash routing table (NULL = score-based)
     // mHC weights per layer (f32): fn [24,16384], base [24], scale [3]
     const float *attn_hc_fn[N_LAYERS];
     const float *attn_hc_base[N_LAYERS];
@@ -225,6 +226,7 @@ typedef struct {
 
     // State
     int current_pos;       // current sequence position
+    int current_token_id;  // current input token ID (needed for hash routing in layers 0-2)
     bool initialized;
 } MoEInferEngine;
 
@@ -264,6 +266,14 @@ void moe_infer_reset_kv(MoEInferEngine *engine);
 void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,
     const float *attn_fn, const float *attn_base, const float *attn_scale,
     const float *ffn_fn, const float *ffn_base, const float *ffn_scale);
+
+// Set hash routing table for a layer (layers 0-2 in this model).
+// tid2eid: [vocab_size, N_ACTIVE] int64 — for each token, the N_ACTIVE expert IDs.
+void moe_infer_set_layer_tid2eid(MoEInferEngine *engine, int layer,
+                                  const int64_t *tid2eid);
+
+// Set the current token ID (call before each forwardLayer for hash routing).
+void moe_infer_set_token_id(MoEInferEngine *engine, int token_id);
 
 // Process one layer: RMSNorm → MLA attention → routing → MoE → output.
 // hidden: [DIM] input, overwritten with output on return.

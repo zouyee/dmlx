@@ -157,8 +157,11 @@ def main():
 
     # dump
     hidden.tofile(os.path.join(OUT, "hidden.bin"))
-    for nm in ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]:
+    for nm in ["wq_a", "wq_b", "wkv", "wo_b"]:
         dump_quant(OUT, P + nm)
+    # wo_a: export as DENSE f32 (loader pre-dequantizes it).
+    # Layout: [O_GROUPS*O_LORA_RANK, group_feat] = [8192, 4096] f32.
+    wo_a.astype(np.float32).tofile(os.path.join(OUT, "wo_a_dense.bin"))
     q_norm.tofile(os.path.join(OUT, "q_norm.bin"))
     kv_norm.tofile(os.path.join(OUT, "kv_norm.bin"))
     attn_sink.tofile(os.path.join(OUT, "attn_sink.bin"))

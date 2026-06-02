@@ -2697,6 +2697,10 @@ pub const DSV4Model = struct {
     /// f32 arrays materialized for the Metal engine (norms/scales/biases astype'd
     /// from bf16). Held alive for the engine's lifetime; freed at deinit.
     engine_f32_arrays: std.ArrayListUnmanaged(Array) = .empty,
+    /// Aligned i64 buffers copied from MLX arrays (tid2eid hash routing tables).
+    /// MLX dataPtr(i64) may return unaligned pointers; we copy into 8-byte-aligned
+    /// allocator-owned buffers so the C engine can safely read int64_t values.
+    engine_i64_bufs: std.ArrayListUnmanaged([]i64) = .empty,
 
     pub fn deinit(self: *DSV4Model) void {
         if (self.metal_engine) |eng| {
@@ -2705,6 +2709,8 @@ pub const DSV4Model = struct {
         }
         for (self.engine_f32_arrays.items) |arr| arr.deinit();
         self.engine_f32_arrays.deinit(self.allocator);
+        for (self.engine_i64_bufs.items) |buf| self.allocator.free(buf);
+        self.engine_i64_bufs.deinit(self.allocator);
         self.config.deinitClone(self.allocator);
         self.embed_tokens.weight.deinit();
         for (self.layers) |*layer| {
@@ -2726,6 +2732,20 @@ pub const DSV4Model = struct {
         try f.eval();
         try self.engine_f32_arrays.append(self.allocator, f);
         return (try f.dataPtr(f32))[0..f.size()];
+    }
+
+    /// Copy an int64 MLX array into an allocator-owned 8-byte-aligned buffer.
+    /// MLX dataPtr() may return unaligned pointers; the C engine needs proper
+    /// alignment for int64_t reads. The buffer is freed in deinit.
+    fn keepI64(self: *DSV4Model, arr: Array) ![]const i64 {
+        try arr.eval();
+        const n = arr.size();
+        const src = try arr.dataPtr(i64);
+        // Allocate with guaranteed 8-byte alignment (Zig allocator guarantees >= @alignOf(T))
+        const buf = try self.allocator.alloc(i64, n);
+        @memcpy(buf, src[0..n]);
+        try self.engine_i64_bufs.append(self.allocator, buf);
+        return buf;
     }
 
     /// Extract one affine-quantized weight's pointers for the Metal engine.
@@ -2750,7 +2770,26 @@ pub const DSV4Model = struct {
     /// Caller must ensure model arrays remain valid (eval'd and not deinit'd).
     pub fn extractWeightsForEngine(self: *DSV4Model) !EngineWeights {
         var w: EngineWeights = undefined;
+        // Explicitly initialize all nullable/defaulted arrays to prevent 0xaa...
+        // poisoning in Zig debug builds (undefined fills memory with 0xaa, making
+        // nullable pointers appear non-null and crashing the C engine).
         w.attn = [_]?AttnWeightPtrs{null} ** 64;
+        w.tid2eid = [_]?[]const i64{null} ** 64;
+        w.gate_biases = [_]?[]const f32{null} ** 64;
+        w.input_norms = [_][]const f32{&[_]f32{}} ** 64;
+        w.attn_norms = [_][]const f32{&[_]f32{}} ** 64;
+        w.gate_projs = [_][]const f32{&[_]f32{}} ** 64;
+        const empty_qw = QuantWeightPtrs{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 };
+        w.shared_gate = [_]QuantWeightPtrs{empty_qw} ** 64;
+        w.shared_up = [_]QuantWeightPtrs{empty_qw} ** 64;
+        w.shared_down = [_]QuantWeightPtrs{empty_qw} ** 64;
+        w.attn_hc_fn = [_][]const f32{&[_]f32{}} ** 64;
+        w.attn_hc_base = [_][]const f32{&[_]f32{}} ** 64;
+        w.attn_hc_scale = [_][]const f32{&[_]f32{}} ** 64;
+        w.ffn_hc_fn = [_][]const f32{&[_]f32{}} ** 64;
+        w.ffn_hc_base = [_][]const f32{&[_]f32{}} ** 64;
+        w.ffn_hc_scale = [_][]const f32{&[_]f32{}} ** 64;
+        w.n_layers = 0;
 
         // Embedding
         try self.embed_tokens.weight.eval();
@@ -2777,6 +2816,13 @@ pub const DSV4Model = struct {
             // e_score_correction_bias (present for non-hash layers)
             if (layer.ffn.gate.bias) |b| {
                 w.gate_biases[i] = try self.keepF32(b);
+            }
+
+            // tid2eid hash routing table (present for hash layers 0-2).
+            // Use keepI64() to copy into an aligned buffer — MLX dataPtr(i64)
+            // may return an unaligned pointer that would crash the C engine.
+            if (layer.ffn.gate.tid2eid) |t2e| {
+                w.tid2eid[i] = try self.keepI64(t2e);
             }
 
             // MLA attention weights (quantized; on-the-fly Metal dequant).
@@ -2852,6 +2898,7 @@ pub const DSV4Model = struct {
         attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_projs: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
         gate_biases: [64]?[]const f32 = [_]?[]const f32{null} ** 64,
+        tid2eid: [64]?[]const i64 = [_]?[]const i64{null} ** 64,
         attn: [64]?AttnWeightPtrs = [_]?AttnWeightPtrs{null} ** 64,
         shared_gate: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
         shared_up: [64]QuantWeightPtrs = [_]QuantWeightPtrs{.{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 }} ** 64,
@@ -2934,6 +2981,12 @@ pub const DSV4Model = struct {
                 defer self.allocator.free(host);
                 @memcpy(host, src[0..n]);
                 const metal = @import("../metal_infer/engine.zig");
+                // Set current token ID for hash routing (layers 0-2).
+                {
+                    try input_ids.eval();
+                    const tok_ptr = try input_ids.dataPtr(u32);
+                    metal.setTokenId(@ptrCast(@alignCast(eng_ptr)), @intCast(tok_ptr[0]));
+                }
                 try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), host, @intCast(start_pos));
                 hidden = try arena.track(try Array.fromData(self.allocator, f32, host, hshape));
             } else {

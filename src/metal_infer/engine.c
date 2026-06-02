@@ -518,11 +518,34 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+    // Hash routing for layers 0-2: look up experts by token ID.
+    // NOTE: Disabled until attention quality is confirmed correct
+    // (score-based routing gives better output under current attention errors).
+    // Re-enable once E2E correctness improves.
+    const bool use_hash_routing = false;
+    if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
+        const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
+        for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
+        // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.
+        // First compute sqrtsoftplus on the current gate scores.
+        float wsum = 0;
+        for (int k = 0; k < N_ACTIVE; k++) {
+            float l = scores[expert_ids[k]];
+            float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
+            expert_weights[k] = sqrtf(sp);
+            wsum += expert_weights[k];
+        }
+        wsum += 1e-20f;
+        for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+    } else {
+        cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+    }
     if (layer == 0 && getenv("MF_DBG")) {
-        fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f]\n",
+        fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f] hash=%s tok=%d\n",
             expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],expert_ids[4],expert_ids[5],
-            expert_weights[0],expert_weights[1],expert_weights[2]);
+            expert_weights[0],expert_weights[1],expert_weights[2],
+            eng->tid2eid[layer] != NULL ? "yes" : "no",
+            eng->current_token_id);
     }
 
     // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
@@ -679,8 +702,25 @@ void moe_infer_set_layer_shared(MoEInferEngine *eng, int layer, SharedExpert se)
     eng->shared[layer] = se;
 }
 
+void moe_infer_set_layer_tid2eid(MoEInferEngine *eng, int layer, const int64_t *tid2eid) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->tid2eid[layer] = tid2eid;
+}
+
+void moe_infer_set_token_id(MoEInferEngine *eng, int token_id) {
+    eng->current_token_id = token_id;
+}
+
 void moe_infer_reset_kv(MoEInferEngine *eng) {
-    for (int l = 0; l < N_LAYERS; l++) eng->kv_cache[l].len = 0;
+    for (int l = 0; l < N_LAYERS; l++) {
+        eng->kv_cache[l].len = 0;
+        // Clear KV buffer so stale entries from the previous request
+        // cannot bleed into the new sequence when cache_len is small.
+        if (eng->kv_cache[l].kv) {
+            memset(eng->kv_cache[l].kv, 0,
+                   (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(float));
+        }
+    }
 }
 
 void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,
