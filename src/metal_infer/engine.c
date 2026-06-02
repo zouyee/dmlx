@@ -266,36 +266,36 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
 // Top-K routing on CPU (softmax + topK)
 // ============================================================================
 
-static void cpu_softmax_topk(const float *scores, int n, int K,
-                              int *out_indices, float *out_weights) {
-    // Find max for numerical stability
-    float max_val = scores[0];
-    for (int i = 1; i < n; i++) if (scores[i] > max_val) max_val = scores[i];
-
-    // Compute exp and sum
-    float sum = 0.0f;
-    float *probs = (float *)alloca(n * sizeof(float));
+// MLX routing: sqrtsoftplus scoring, topK selection, L1-normalize, scale by route_scale.
+// Matches DSV4Gate.forward (scoring_func=sqrtsoftplus, norm_topk_prob=true, route_scale=1.5).
+static void cpu_moe_route(const float *logits, int n, int K,
+                          int *out_indices, float *out_weights) {
+    // 1. sqrtsoftplus: scores[i] = sqrt(log(1 + exp(logits[i])))
+    float *scores = (float *)alloca(n * sizeof(float));
     for (int i = 0; i < n; i++) {
-        probs[i] = expf(scores[i] - max_val);
-        sum += probs[i];
+        float l = logits[i];
+        // numerically stable: log1p(exp(l)) = l + log1p(exp(-l)) for l>0
+        float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
+        scores[i] = sqrtf(sp);
     }
-
-    // Select top-K
+    // 2. topK selection by score value
     int *taken = (int *)calloc(n, sizeof(int));
     for (int k = 0; k < K; k++) {
-        int best = -1;
-        float best_val = -1.0f;
+        int best = -1; float bv = -1e30f;
         for (int i = 0; i < n; i++) {
-            if (!taken[i] && probs[i] > best_val) {
-                best_val = probs[i];
-                best = i;
-            }
+            if (!taken[i] && scores[i] > bv) { bv = scores[i]; best = i; }
         }
         out_indices[k] = best;
-        out_weights[k] = probs[best] / sum;
+        out_weights[k] = scores[best];
         taken[best] = 1;
     }
     free(taken);
+    // 3. L1-normalize: weights / sum(weights)
+    float wsum = 0; for (int k = 0; k < K; k++) wsum += out_weights[k];
+    wsum += 1e-20f;
+    for (int k = 0; k < K; k++) out_weights[k] /= wsum;
+    // 4. Scale by routed_scaling_factor = 1.5
+    for (int k = 0; k < K; k++) out_weights[k] *= 1.5f;
 }
 
 // ============================================================================
@@ -459,6 +459,13 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
         fprintf(stderr, "[mf-dbg] L0 attn_out norm=%.4f, residual after attn-post norm=%.4f\n", sqrt(an), sqrt(rn));
+        // Dump attn_out for comparison
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        if (dd) {
+            char path[1024]; snprintf(path, sizeof(path), "%s/L0_attn_out_metal.bin", dd);
+            FILE *f = fopen(path, "wb");
+            if (f) { fwrite(attn_out, sizeof(float), DIM, f); fclose(f); }
+        }
     }
 
     // === MoE sublayer (mHC-wrapped) ===
@@ -496,7 +503,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    cpu_softmax_topk(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+    cpu_moe_route(scores, N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+    if (layer == 0 && getenv("MF_DBG")) {
+        fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f]\n",
+            expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],expert_ids[4],expert_ids[5],
+            expert_weights[0],expert_weights[1],expert_weights[2]);
+    }
 
     // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
     // the ffn-normed vector into it. MoE combine writes the pure routed-expert
@@ -577,6 +589,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
         fprintf(stderr, "[mf-dbg] L0 ffn_out norm=%.4f, residual after ffn-post norm=%.4f\n", sqrt(fn), sqrt(rn));
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        if (dd) {
+            char path[1024]; snprintf(path, sizeof(path), "%s/L0_ffn_out_metal.bin", dd);
+            FILE *ff = fopen(path, "wb");
+            if (ff) { fwrite(ffn_out, sizeof(float), DIM, ff); fclose(ff); }
+        }
     }
 
     return 0;

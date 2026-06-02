@@ -2632,8 +2632,10 @@ pub const DSV4TransformerBlock = struct {
             defer attn_normed.deinit();
             const attn_out = try self.attn.forward(attn_normed, mask, cache, start_pos, stream);
             defer attn_out.deinit();
+            if (self.layer_idx == 0) activation_dump.dump(self.ctx, "L0_attn_out", attn_out);
             const after_attn = try self.hc_attn.post(self.ctx, attn_out, hidden_states, attn_post_mix, attn_comb_mix, stream);
             defer after_attn.deinit();
+            if (self.layer_idx == 0) activation_dump.dump(self.ctx, "L0_after_attn", after_attn);
 
             const ffn_input, const ffn_post_mix, const ffn_comb_mix = try self.hc_ffn.pre(self.ctx, after_attn, stream);
             defer ffn_post_mix.deinit();
@@ -2650,6 +2652,7 @@ pub const DSV4TransformerBlock = struct {
             defer if (input_ids == null) input_ids_actual.deinit();
             const ffn_out = try self.ffn.forward(ffn_normed, input_ids_actual, stream);
             defer ffn_out.deinit();
+            if (self.layer_idx == 0) activation_dump.dump(self.ctx, "L0_ffn_out", ffn_out);
             const after_ffn = try self.hc_ffn.post(self.ctx, ffn_out, after_attn, ffn_post_mix, ffn_comb_mix, stream);
 
             return after_ffn;
