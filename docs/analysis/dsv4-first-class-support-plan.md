@@ -607,3 +607,65 @@ I/O 优化关键：降低有效 I/O 量（部分加载 SMELT + 缓存），而�
 | `DSV4_DUMP_DIR=/tmp/x bash scripts/dsv4_smoke.sh` | 生成逐层激活 dump |
 | `MF_DBG=1 --metal-full` | 引擎内部逐段 norm 追踪（layer 0） |
 | `bash scripts/dsv4_smoke.sh` | 端到端正确性门（Paris + 4） |
+
+---
+
+## 13. 阶段性总结（2026-06-02，commit 5639f94）
+
+### 13.1 本轮调查目标
+
+解决 hash routing 崩溃 + 验证 attention 正确性 + 定位真实误差来源。
+
+### 13.2 修复项（全部已提交）
+
+| # | Bug | 现象 | 修复 |
+|---|-----|------|------|
+| 8 | `tid2eid` 指针未对齐 | SIGBUS（MLX `dataPtr(i64)` 返回非 8 字节对齐指针） | 新增 `keepI64()`，将数据 copy 到 Zig allocator 分配的对齐 buffer |
+| 9 | `EngineWeights` 未初始化 nullable 数组 | Debug 构建下 `tid2eid/gate_biases/attn` 等字段为 `0xaa`，被 C engine 误判为非 null | `extractWeightsForEngine` 显式初始化所有 nullable 数组 |
+| 10 | `moe_infer_reset_kv` 只清 `len` 不清数据 | 多请求间旧 KV 数据可能污染（当前未必触发，防御性修复） | `memset(kv_cache, 0, ...)` |
+| 11 | Hash routing 时 Zig debug 构建 `tid2eid` 为 `0xaa` | E2E 输出乱码（非 hash 路由时偶然正确是因为 0xaa 作 float 是极小负数，等效于不加 bias） | bug #9 修复 |
+
+### 13.3 关键发现：误差归因
+
+通过精确的逐步对比（同一 token、同一 position）确认：
+
+| 组件 | 误差 | 状态 |
+|------|------|------|
+| `mla_attention_decode` 单步 | rel_L2=1.9e-6 | ✅ 正确 |
+| `mla_attention_decode` 多步（8 prefill + decode） | rel_L2=2.2e-6 | ✅ 正确 |
+| attn_normed（attention RMSNorm 输入）| rel_L2=0.26%, cosine=0.9999 | ✅ 正确 |
+| attn_out（attention 输出）| rel_L2=0.67%, cosine=0.9999 | ✅ 正确 |
+| mhc_post residual（attn 后 mHC 残差）| norm 8.895 vs 8.894 | ✅ 正确 |
+| **MoE ffn_out**（MoE layer 输出）| norm 29.3 vs 30.1（~3% 差） | ⚠️ **误差来源** |
+| layer_00 hidden state（整层后） | rel_L2=17%, cosine=0.986 | ⚠️ 累积中 |
+
+**结论**：注意力（mla_attention_decode）、mHC（mhc_pre/post）均已正确。  
+**唯一误差来源：MoE 子层（~3% per layer），43 层累积后 → 最终输出严重偏差**。
+
+### 13.4 Hash routing 状态
+
+- 数据正确性：已验证（C engine 查找结果与 safetensors 表完全一致）
+- 当前状态：**暂时禁用**（`use_hash_routing = false`）
+- 原因：在 MoE 误差未修复前，hash routing 使结果更差（正确的 expert 选择 + 错误的注意力 = 更坏的组合）
+- 重启条件：待 MoE 对齐后再开启，预期能进一步改善正确性
+
+### 13.5 下一步：MoE 误差根因
+
+MoE 子层的 ~3% per-layer 误差来自哪里？候选：
+
+1. **fused_gate_up_swiglu 截断（SwiGLU limit）**：MLX 用 `gate=min(g,10)`, `up=clamp(u,-10,10)` 后再 silu，而 Metal kernel 的截断逻辑是否完全一致？需对拍 `L0_ffn_input`（MoE 的 normed 输入）→ `swiglu output` → `down_proj output`。
+2. **shared expert 的 SwiGLU limit**：shared expert 的 gate/up 截断是否与路由 expert 一致？
+3. **moe_combine 权重精度**：`expert_weights` 的归一化 + scale 是否与 MLX 完全一致（sqrtsoftplus + L1-norm + ×1.5）？
+4. **mxfp4 dequant 精度**：routed expert 用 mxfp4（`NIBBLE_TO_FLOAT * exp2(scale-128)`），是否与 MLX 的 `quantizedMatmul` 完全一致？
+
+**优先动作**：在 `engine.c` 里 dump layer-0 MoE 的 `normed`（ffn input）、`ffn_out`（before mhc_post），与 MLX 的 `L0_ffn_out.npy` 对比，缩小范围。
+
+### 13.6 调试工具更新
+
+| 工具 | 用途 | 状态 |
+|------|------|------|
+| `bash scripts/run_mla_attention_test.sh` | 单步注意力对拍（rel_L2=1.9e-6） | ✅ 已更新（wo_a_dense 接口） |
+| `python3 scripts/gen_multistep_golden.py` | 多步 KV cache golden 生成 | ✅ 新增 |
+| `/tmp/mat_ms` | 多步 KV cache 对拍（rel_L2=2.2e-6） | ✅ 新增 |
+| `MF_DBG=1 --metal-full` | 各段 norm 追踪；需仔细区分 dump 是哪次 forward | ✅ 可用 |
+| `DSV4_DUMP_DIR` 逐层 dump | 注意：需用**同一 token 同一 position** 对比才有效 | ✅ 可用（方法确立）|
