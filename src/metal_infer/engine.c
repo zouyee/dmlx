@@ -239,26 +239,35 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     }
 
     // Step 3: moe_combine — weighted sum of K routed-expert outputs ONLY.
-    // Residual is added by the mHC post step in the caller (full-metal layer),
-    // so bind a zeroed residual here (do NOT add buf_h_mid).
+    // Commit the gate+up+down work first, then copy into a contiguous buffer.
+    [cb commit]; [cb waitUntilCompleted];
+    // Copy each expert's output (now ready on CPU-accessible shared memory) into
+    // a contiguous [K*DIM] buffer for the combine kernel.
+    id<MTLBuffer> contiguous_out = [d newBufferWithLength:(size_t)K*DIM*sizeof(float) options:MTLResourceStorageModeShared];
     {
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        float *dst_all = (float *)[contiguous_out contents];
+        for (int k = 0; k < K; k++) {
+            float *src = (float *)[(id<MTLBuffer>)eng->buf_expert_out[k] contents];
+            memcpy(dst_all + (size_t)k * DIM, src, DIM * sizeof(float));
+        }
+    }
+    {
+        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb2 computeCommandEncoder];
         [enc setComputePipelineState:eng->pipe_moe_combine];
         id weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
         id zero_resid = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        [enc setBuffer:eng->buf_expert_out[0] offset:0 atIndex:0];
+        [enc setBuffer:contiguous_out offset:0 atIndex:0];
         [enc setBuffer:weights_buf offset:0 atIndex:1];
-        [enc setBuffer:zero_resid offset:0 atIndex:2]; // zero residual
-        [enc setBuffer:eng->buf_hidden offset:0 atIndex:3]; // output
+        [enc setBuffer:zero_resid offset:0 atIndex:2];
+        [enc setBuffer:eng->buf_hidden offset:0 atIndex:3];
         uint kv = K, hd = DIM;
         [enc setBytes:&kv length:4 atIndex:4];
         [enc setBytes:&hd length:4 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
+        [cb2 commit]; [cb2 waitUntilCompleted];
     }
-
-    [cb commit];
-    [cb waitUntilCompleted];
     return 0;
 }
 
