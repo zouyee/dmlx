@@ -669,3 +669,93 @@ MoE 子层的 ~3% per-layer 误差来自哪里？候选：
 | `/tmp/mat_ms` | 多步 KV cache 对拍（rel_L2=2.2e-6） | ✅ 新增 |
 | `MF_DBG=1 --metal-full` | 各段 norm 追踪；需仔细区分 dump 是哪次 forward | ✅ 可用 |
 | `DSV4_DUMP_DIR` 逐层 dump | 注意：需用**同一 token 同一 position** 对比才有效 | ✅ 可用（方法确立）|
+
+---
+
+## 14. 深度精度对齐调查（2026-06-02，commit 47345a8）
+
+### 14.1 调查目标
+
+从 commit `1c1af0b` 已知 metal-full 有 76% logits 误差，根因是 f32 vs bf16 精度路径不同。本次调查尝试了多种精度对齐方案，全部失败，但得出了系统性结论。
+
+### 14.2 每层误差分析
+
+通过 `DSV4_DUMP_DIR` 逐层对比（metal vs MLX，同一 token 同一 position）：
+
+| 层 | rel_L2 | 说明 |
+|----|--------|------|
+| L00 | 0.17 | MoE expert swap 贡献 17% |
+| L01 | 0.21 | 累积 |
+| L02 | 0.27 | 累积 |
+| **L03** | **0.44** | **暴增！score-based routing 首层放大误差** |
+| L10 | 0.99 | 接近随机 |
+| L12+ | ~1.0 | 完全发散，方向随机 |
+
+**关键发现**：L02→L03 误差从 0.27 跳到 0.44（+63%）。L03 是第一个 score-based routing 层，验证了 score-based routing 是主要误差放大器。
+
+### 14.3 Layer-0 误差链
+
+精确定位每个子步骤的误差：
+
+| 步骤 | 相对于 MLX 的误差 |
+|------|---------------|
+| 输入残差（来自 embedding） | **0%**（bf16→f32 精确转换）|
+| attn_input（mhc_pre 输出） | ~0.5% |
+| attn normed（RMSNorm 后） | ~0.26% |
+| attn_out（attention 输出） | **0.67%** |
+| ffn_input（第二次 mhc_pre） | ~0.5% |
+| ffn_normed（RMSNorm 后） | **0.51%** |
+| **expert selection** | **5/6 匹配**（expert 90 vs 130，差值 0.001） |
+| MoE ffn_out | **18%**（expert swap + 权重差异） |
+| layer-0 output | 17% |
+
+### 14.4 尝试的修复方案（全部失败）
+
+| 方案 | 结果 | 原因 |
+|------|------|------|
+| bf16 truncation of `residual` after mhc_post | 更差 | 扰乱后续 mhc_pre |
+| bf16 truncation of `attn_out` | 无效 | 误差源不在此 |
+| bf16 truncation of `attn_input` (mhc_pre output) | 更差 | 引入额外截断误差 |
+| bf16 truncation of KV cache | 更差 | 破坏 KV 精度 |
+| bf16 Q chain（wq_a/wq_b/q_norm → bf16 output） | **无效（1.00x）** | attn_input 本身是 f32，不匹配 |
+| hash routing enabled | L0-1 改善，L4+ 更差 | 混沌系统路径依赖 |
+| normed bf16 truncation before gate | 无效 | normed 差异 0.51% 导致 expert swap 不论是否截断 |
+
+### 14.5 根本原因（最终定论）
+
+f32 Metal 路径与 bf16 MLX 训练路径在 43 层后的完全发散，是**系统性问题，非简单 bug**：
+
+1. **每个 bf16 操作在不同时刻截断**（matmul 后、激活后、写入 tensor 时），这些截断是确定性的但顺序相关的，无法通过简单的"在某点截断"来重现。
+2. **0.51% ffn_normed 误差**导致 expert 90（Metal）vs 130（MLX）的选择 flip，两者分数差仅 0.001。
+3. **18% MoE 误差 = expert swap（~7.6%）+ 5个共同 expert 的权重差异（~10.4%）**。
+4. 每层 ~17% 的误差在 43 层后通过非线性（SwiGLU、softmax）放大成完全随机。
+
+### 14.6 新增基础设施
+
+在 `moe_kernel.metal` 里新增三个 bf16-output kernel（Metal 3.1+ `bfloat` 类型）：
+- `dequant_matvec_affine_bf16out`：affine matmul → bf16 输出
+- `rms_norm_rows_bf16out`：RMSNorm → bf16 输出
+- `bf16_to_f32`：bfloat → float 转换
+
+这些 kernel 已通过 runtime 编译验证，可用于未来完整 bf16 计算链实现。
+
+### 14.7 正确修复路径
+
+要使 metal-full 输出与 MLX 对齐，必须**全链路使用 bf16**：
+
+1. **`mhc.c` 改为 bf16 运算**：`mhc_pre` 的 `fn @ residual_flat` 计算输出 bf16，`attn_input` 以 bf16 传给 attention kernel
+2. **attention kernel 全程 bf16**：Q/KV chain 的所有中间结果 → bf16
+3. **KV cache 以 bf16 存储**：每个 token 写入 KV cache 时截断为 bf16
+4. **MoE normed bf16**：ffn_normed 传给 gate matmul 时以 bf16，确保 expert selection 匹配
+
+完整 bf16 对齐预期能使 expert selection 6/6 匹配，每层误差从 17% 降到 ~0.1%，43 层不再发散。
+
+**这是正确的 S7d 修复路径**，工作量约 2-3 天（主要是 mhc.c + mla_attention.m 的 bf16 数据流）。
+
+### 14.8 现实评估
+
+如果不做 bf16 对齐：
+- metal-full 输出在 12 层后完全发散，无法通过 smoke test
+- 但 --metal-moe（混合路径）仍然正确（Paris ✓）
+
+优先级建议：先完成 bf16 mhc + attention 数据流，再重测 metal-full。
