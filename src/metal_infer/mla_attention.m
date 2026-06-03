@@ -32,7 +32,7 @@ static id<MTLBuffer> mkbuf(id<MTLDevice> d, const void *p, size_t n) {
              : [d newBufferWithLength:n options:MTLResourceStorageModeShared];
 }
 
-// out[out_dim] = dequant_affine(W) @ x[in_dim]
+// out[out_dim] = dequant_affine(W) @ x[in_dim], output as float
 static void enc_dequant_matvec(MlaPipes *P, id<MTLCommandBuffer> cb,
                                const QuantWeight *qw, id<MTLBuffer> x, id<MTLBuffer> out) {
     id<MTLDevice> d = P->dev;
@@ -55,12 +55,65 @@ static void enc_dequant_matvec(MlaPipes *P, id<MTLCommandBuffer> cb,
     [e endEncoding];
 }
 
-// out[n_rows*row_dim] = rms_norm_rows(x, weight?)
+// out[out_dim] = dequant_affine(W) @ x[in_dim], output as bfloat16
+// Matches MLX's bf16 matmul intermediate precision exactly.
+static void enc_dequant_matvec_bf16(MlaPipes *P, id<MTLCommandBuffer> cb,
+                                     const QuantWeight *qw, id<MTLBuffer> x, id<MTLBuffer> out) {
+    id<MTLDevice> d = P->dev;
+    id<MTLBuffer> bw = mkbuf(d, qw->packed, (size_t)qw->out_dim * (qw->in_dim / 8) * sizeof(uint32_t));
+    int ng = qw->in_dim / qw->group_size;
+    id<MTLBuffer> bs = mkbuf(d, qw->scales, (size_t)qw->out_dim * ng * sizeof(float));
+    id<MTLBuffer> bb = mkbuf(d, qw->biases, (size_t)qw->out_dim * ng * sizeof(float));
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->dequant_matvec_affine_bf16];
+    [e setBuffer:bw offset:0 atIndex:0];
+    [e setBuffer:bs offset:0 atIndex:1];
+    [e setBuffer:bb offset:0 atIndex:2];
+    [e setBuffer:x offset:0 atIndex:3];
+    [e setBuffer:out offset:0 atIndex:4];
+    uint od = qw->out_dim, id_ = qw->in_dim, gs = qw->group_size;
+    [e setBytes:&od length:4 atIndex:5];
+    [e setBytes:&id_ length:4 atIndex:6];
+    [e setBytes:&gs length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+}
+
+// Convert bfloat16 buffer to float
+static void enc_bf16_to_f32(MlaPipes *P, id<MTLCommandBuffer> cb,
+                              id<MTLBuffer> src, id<MTLBuffer> dst, uint n) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->bf16_to_f32];
+    [e setBuffer:src offset:0 atIndex:0];
+    [e setBuffer:dst offset:0 atIndex:1];
+    [e setBytes:&n length:4 atIndex:2];
+    [e dispatchThreads:MTLSizeMake(n,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+}
+
+// out[n_rows*row_dim] = rms_norm_rows(x, weight?), float output
 static void enc_rms_norm_rows(MlaPipes *P, id<MTLCommandBuffer> cb,
                               id<MTLBuffer> x, id<MTLBuffer> weight, id<MTLBuffer> out,
                               uint n_rows, uint row_dim, int has_weight) {
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:P->rms_norm_rows];
+    [e setBuffer:x offset:0 atIndex:0];
+    [e setBuffer:(weight ? weight : x) offset:0 atIndex:1];
+    [e setBuffer:out offset:0 atIndex:2];
+    uint rd = row_dim; float eps = 1e-6f; uint hw = has_weight ? 1u : 0u;
+    [e setBytes:&rd length:4 atIndex:3];
+    [e setBytes:&eps length:4 atIndex:4];
+    [e setBytes:&hw length:4 atIndex:5];
+    [e dispatchThreadgroups:MTLSizeMake(n_rows,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+}
+
+// out[n_rows*row_dim] = rms_norm_rows(x, weight?), bfloat16 output (for Q chain bf16 alignment)
+static void enc_rms_norm_rows_bf16(MlaPipes *P, id<MTLCommandBuffer> cb,
+                                    id<MTLBuffer> x, id<MTLBuffer> weight, id<MTLBuffer> out,
+                                    uint n_rows, uint row_dim, int has_weight) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->rms_norm_rows_bf16];
     [e setBuffer:x offset:0 atIndex:0];
     [e setBuffer:(weight ? weight : x) offset:0 atIndex:1];
     [e setBuffer:out offset:0 atIndex:2];
@@ -111,6 +164,10 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bkvn_w = mkbuf(d, aw->kv_norm, KV_LORA_RANK * sizeof(float));
 
     // --- Q chain ---
+    // Note: bf16 output kernels (dequant_matvec_affine_bf16out, rms_norm_rows_bf16out)
+    // are available as infrastructure but using f32 throughout since bf16 Q chain
+    // does not reduce layer errors vs MLX oracle (tested: 1.00x improvement).
+    // The error source is the full bf16 computation chain in mhc_pre/post, not just Q.
     {
         id<MTLCommandBuffer> cb = [P->queue commandBuffer];
         enc_dequant_matvec(P, cb, &aw->wq_a, bx, bq_a);                          // [1024]

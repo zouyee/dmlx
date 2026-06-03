@@ -54,6 +54,10 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_rows = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows"] error:&err]);
     eng->pipe_rope_tail = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved"] error:&err]);
     eng->pipe_mla_sdpa = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode"] error:&err]);
+    // bf16-output variants for Q chain (matches MLX bf16 intermediate precision)
+    eng->pipe_dequant_matvec_affine_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16out"] error:&err]);
+    eng->pipe_rms_norm_rows_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16out"] error:&err]);
+    eng->pipe_bf16_to_f32 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -424,6 +428,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
     P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;
     P.matvec_f32 = (id<MTLComputePipelineState>)eng->pipe_matvec;
+    P.dequant_matvec_affine_bf16 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16;
+    P.rms_norm_rows_bf16 = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16;
+    P.bf16_to_f32 = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f32;
 
     // Large scratch buffers are static (forward_layer runs serially) to avoid
     // overflowing the warmup/engine fiber's limited stack.
@@ -529,10 +536,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
     // Hash routing for layers 0-2: look up experts by token ID.
-    // NOTE: Even with correct hash-selected experts, the MoE output is worse
-    // than score-based because the attention errors (~0.67% per token) cause
-    // borderline expert swaps in later score-based layers, amplifying the error.
-    // TODO: re-enable after attention precision is improved to <0.1%.
+    // NOTE: Hash routing is correct data-wise but does not improve E2E output
+    // because the f32 vs bf16 precision difference causes chaos divergence
+    // in score-based layers (3+) regardless. Left disabled pending bf16 alignment.
     const bool use_hash_routing = false;
     if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;

@@ -157,7 +157,90 @@ kernel void dequant_matvec_affine(
     out[tid] = acc;
 }
 
-// rms_norm_sum_sq: parallel reduction of sum(x_i^2)
+// dequant_matvec_affine_bf16out: same as dequant_matvec_affine but output is bfloat.
+// This matches MLX's behavior: affine matmul result is stored as bfloat16, which is
+// the critical precision alignment needed for exact expert selection match.
+kernel void dequant_matvec_affine_bf16out(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    x        [[buffer(3)]],
+    device bfloat*         out      [[buffer(4)]],
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const float*    sc = scales   + tid * num_groups;
+    device const float*    bi = biases   + tid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g];
+        float bias  = bi[g];
+        uint bp = g * packed_per_group;
+        uint bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            uint x_base = bx + p * 8;
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * x[x_base + i];
+            }
+        }
+    }
+    out[tid] = (bfloat)acc;
+}
+
+// rms_norm_rows_bf16out: rms_norm_rows but output is bfloat16 (matching MLX's bf16 intermediate).
+// Used for Q chain (wq_a output, q_norm output, wq_b output) to match MLX bf16 attention.
+kernel void rms_norm_rows_bf16out(
+    device const float*  x          [[buffer(0)]],
+    device const float*  weight     [[buffer(1)]],
+    device bfloat*       out        [[buffer(2)]],
+    constant uint&       row_dim    [[buffer(3)]],
+    constant float&      eps        [[buffer(4)]],
+    constant uint&       has_weight [[buffer(5)]],
+    uint row     [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    float ss = 0.0f;
+    for (uint i = lid; i < row_dim; i += tg_size) {
+        float v = x[row * row_dim + i]; ss += v * v;
+    }
+    shared_sum[lid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) shared_sum[lid] += shared_sum[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms_inv = rsqrt(shared_sum[0] / float(row_dim) + eps);
+    for (uint i = lid; i < row_dim; i += tg_size) {
+        float v = x[row * row_dim + i] * rms_inv;
+        out[row * row_dim + i] = (bfloat)(has_weight ? v * weight[i] : v);
+    }
+}
+
+// bf16_to_f32: convert a bfloat buffer to float (element-wise copy with widening).
+kernel void bf16_to_f32(
+    device const bfloat* src [[buffer(0)]],
+    device float*        dst [[buffer(1)]],
+    constant uint&       n   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = float(src[tid]);
+}
+
+
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],
     device float*       sum_sq  [[buffer(1)]],

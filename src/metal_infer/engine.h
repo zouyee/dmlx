@@ -170,6 +170,10 @@ typedef struct {
     void *pipe_rms_norm_rows;
     void *pipe_rope_tail;
     void *pipe_mla_sdpa;
+    // bf16-output variants for Q chain alignment with MLX bf16 precision
+    void *pipe_dequant_matvec_affine_bf16;
+    void *pipe_rms_norm_rows_bf16;
+    void *pipe_bf16_to_f32;
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state

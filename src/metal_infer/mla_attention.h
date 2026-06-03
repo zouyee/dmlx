@@ -15,6 +15,10 @@ typedef struct {
     id<MTLComputePipelineState> rope_tail_interleaved;
     id<MTLComputePipelineState> mla_sdpa_decode;
     id<MTLComputePipelineState> matvec_f32; // dense matvec for wo_a
+    // bf16-output variants for Q chain (matches MLX bf16 intermediate precision)
+    id<MTLComputePipelineState> dequant_matvec_affine_bf16;
+    id<MTLComputePipelineState> rms_norm_rows_bf16;
+    id<MTLComputePipelineState> bf16_to_f32;
 } MlaPipes;
 
 // Compute one decode-step MLA attention.
