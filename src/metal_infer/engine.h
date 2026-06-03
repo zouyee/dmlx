@@ -176,6 +176,13 @@ typedef struct {
     void *pipe_bf16_to_f32;
     // mhc_pre_gpu: full mhc_pre on GPU with bfloat out_input (matches MLX .astype(bf16))
     void *pipe_mhc_pre_gpu;
+    // Full bf16 chain kernels (bfloat input + bfloat output throughout)
+    void *pipe_f32_to_bf16;
+    void *pipe_dequant_matvec_affine_bf16in_f32out;
+    void *pipe_dequant_matvec_affine_bf16in_bf16out;
+    void *pipe_rms_norm_rows_bf16in_bf16out;
+    void *pipe_rope_tail_bf16;
+    void *pipe_matvec_f32_bf16in;
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state

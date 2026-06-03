@@ -59,6 +59,12 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_rows_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16out"] error:&err]);
     eng->pipe_bf16_to_f32 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32"] error:&err]);
     eng->pipe_mhc_pre_gpu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_gpu"] error:&err]);
+    eng->pipe_f32_to_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"f32_to_bf16"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_bf16out"] error:&err]);
+    eng->pipe_rms_norm_rows_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16in_bf16out"] error:&err]);
+    eng->pipe_rope_tail_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_bf16"] error:&err]);
+    eng->pipe_matvec_f32_bf16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_bf16in"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -432,6 +438,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.dequant_matvec_affine_bf16 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16;
     P.rms_norm_rows_bf16 = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16;
     P.bf16_to_f32 = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f32;
+    P.f32_to_bf16 = (id<MTLComputePipelineState>)eng->pipe_f32_to_bf16;
+    P.dequant_matvec_affine_bf16in_f32out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out;
+    P.dequant_matvec_affine_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out;
+    P.rms_norm_rows_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16in_bf16out;
+    P.rope_tail_bf16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_bf16;
+    P.matvec_f32_bf16in = (id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in;
 
     // Large scratch buffers are static (forward_layer runs serially) to avoid
     // overflowing the warmup/engine fiber's limited stack.
@@ -478,9 +490,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // mHC post -> residual' (in place)
     mhc_post(attn_out, residual, post, comb, residual);
-    // NOTE: Do NOT truncate to bf16 here — this residual feeds into the same layer's
-    // FFN mhc_pre. Truncating between attn and FFN within the same layer disrupts
-    // the FFN input computation.
     if (layer == 0 && getenv("MF_DBG")) {
         double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];

@@ -240,6 +240,160 @@ kernel void bf16_to_f32(
     dst[tid] = float(src[tid]);
 }
 
+// f32_to_bf16: convert float buffer to bfloat (truncation).
+kernel void f32_to_bf16(
+    device const float*  src [[buffer(0)]],
+    device bfloat*       dst [[buffer(1)]],
+    constant uint&       n   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = (bfloat)src[tid];
+}
+
+// dequant_matvec_affine_bf16in_f32out: affine 4bit matmul with bfloat input, float output.
+// Needed for the first step of the bf16 Q chain where attn_input is bfloat.
+kernel void dequant_matvec_affine_bf16in_f32out(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // bfloat input
+    device float*          out      [[buffer(4)]],  // float output
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const float*    sc = scales   + tid * num_groups;
+    device const float*    bi = biases   + tid * num_groups;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(x[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
+// dequant_matvec_affine_bf16in_bf16out: affine 4bit matmul with bfloat input AND output.
+// Used for wq_b, wkv, wo_b in the full bf16 attention chain.
+kernel void dequant_matvec_affine_bf16in_bf16out(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // bfloat input
+    device bfloat*         out      [[buffer(4)]],  // bfloat output
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const float*    sc = scales   + tid * num_groups;
+    device const float*    bi = biases   + tid * num_groups;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(x[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = (bfloat)acc;
+}
+
+// rms_norm_rows_bf16in_bf16out: RMSNorm with bfloat input AND bfloat output.
+// Used for q_norm and per-head norm in the full bf16 attention chain.
+kernel void rms_norm_rows_bf16in_bf16out(
+    device const bfloat* x          [[buffer(0)]],
+    device const float*  weight     [[buffer(1)]],
+    device bfloat*       out        [[buffer(2)]],
+    constant uint&       row_dim    [[buffer(3)]],
+    constant float&      eps        [[buffer(4)]],
+    constant uint&       has_weight [[buffer(5)]],
+    uint row     [[threadgroup_position_in_grid]],
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    threadgroup float shared_sum[256];
+    float ss = 0.0f;
+    for (uint i = lid; i < row_dim; i += tg_size) {
+        float v = float(x[row * row_dim + i]); ss += v * v;
+    }
+    shared_sum[lid] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) shared_sum[lid] += shared_sum[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float rms_inv = rsqrt(shared_sum[0] / float(row_dim) + eps);
+    for (uint i = lid; i < row_dim; i += tg_size) {
+        float v = float(x[row * row_dim + i]) * rms_inv;
+        out[row * row_dim + i] = (bfloat)(has_weight ? v * weight[i] : v);
+    }
+}
+
+// rope_tail_interleaved_bf16: RoPE with bfloat input AND bfloat output.
+// Used in the full bf16 attention chain for Q (and optionally K) RoPE.
+kernel void rope_tail_interleaved_bf16(
+    device bfloat*         q          [[buffer(0)]],  // in-place [n_heads, head_dim]
+    device const float*    cos_vals   [[buffer(1)]],  // [half_rope]
+    device const float*    sin_vals   [[buffer(2)]],  // [half_rope]
+    constant uint&         n_heads    [[buffer(3)]],
+    constant uint&         head_dim   [[buffer(4)]],
+    constant uint&         n_nope     [[buffer(5)]],
+    constant uint&         n_rope     [[buffer(6)]],
+    constant uint&         inverse    [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint half_rope = n_rope / 2;
+    if (tid >= n_heads * half_rope) return;
+    uint head = tid / half_rope, ic = tid % half_rope;
+    uint j0 = head * head_dim + n_nope + 2 * ic;
+    uint j1 = j0 + 1;
+    float cos_v = cos_vals[ic];
+    float sin_v = inverse ? -sin_vals[ic] : sin_vals[ic];
+    float x0 = float(q[j0]);
+    float x1 = float(q[j1]);
+    q[j0] = (bfloat)(x0 * cos_v - x1 * sin_v);
+    q[j1] = (bfloat)(x0 * sin_v + x1 * cos_v);
+}
+
+// matvec_f32_bf16in: dense f32 matmul with bfloat input.
+// Used for wo_a (dense) with bfloat attn output.
+kernel void matvec_f32_bf16in(
+    device const float*  W   [[buffer(0)]],
+    device const bfloat* x   [[buffer(1)]],
+    device float*        out [[buffer(2)]],
+    constant uint&       out_dim [[buffer(3)]],
+    constant uint&       in_dim  [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= out_dim) return;
+    float acc = 0.0f;
+    for (uint i = 0; i < in_dim; i++) acc += W[tid * in_dim + i] * float(x[i]);
+    out[tid] = acc;
+}
+
 // mhc_pre_gpu: full mhc_pre computation on GPU with bfloat output for out_input.
 // This matches MLX's HyperHead.forward() which computes in f32 internally but
 // returns .astype(x.dtype) = bfloat16. The bfloat output is critical for

@@ -19,6 +19,13 @@ typedef struct {
     id<MTLComputePipelineState> dequant_matvec_affine_bf16;
     id<MTLComputePipelineState> rms_norm_rows_bf16;
     id<MTLComputePipelineState> bf16_to_f32;
+    // Full bf16 chain: bfloat input + bfloat output kernels
+    id<MTLComputePipelineState> f32_to_bf16;
+    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out;
+    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_bf16out;
+    id<MTLComputePipelineState> rms_norm_rows_bf16in_bf16out;
+    id<MTLComputePipelineState> rope_tail_bf16;        // in-place bfloat RoPE
+    id<MTLComputePipelineState> matvec_f32_bf16in;     // dense matmul with bfloat input
 } MlaPipes;
 
 // Compute one decode-step MLA attention.
