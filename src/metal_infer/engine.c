@@ -478,6 +478,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     // mHC post -> residual' (in place)
     mhc_post(attn_out, residual, post, comb, residual);
+    // NOTE: Do NOT truncate to bf16 here — this residual feeds into the same layer's
+    // FFN mhc_pre. Truncating between attn and FFN within the same layer disrupts
+    // the FFN input computation.
     if (layer == 0 && getenv("MF_DBG")) {
         double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
