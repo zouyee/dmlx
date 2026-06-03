@@ -29,8 +29,8 @@ extern fn moe_infer_set_weights(
     gate_biases: [*c][*c]const f32,
 ) void;
 
-extern fn moe_infer_forward(engine: *Engine, hidden: [*c]f32, pos: c_int) c_int;
-extern fn moe_infer_forward_layer(engine: *Engine, layer: c_int, hidden: [*c]f32, pos: c_int) c_int;
+extern fn moe_infer_forward(engine: *Engine, hidden: [*c]u16, pos: c_int) c_int;
+extern fn moe_infer_forward_layer(engine: *Engine, layer: c_int, hidden: [*c]u16, pos: c_int) c_int;
 extern fn moe_infer_deinit(engine: *Engine) void;
 
 // C-compatible structs (must match engine.h layout exactly).
@@ -87,12 +87,12 @@ pub fn init(packed_dir: []const u8) !*Engine {
     return engine.?;
 }
 
-pub fn forward(engine: *Engine, hidden: []f32, pos: u32) !void {
+pub fn forward(engine: *Engine, hidden: []u16, pos: u32) !void {
     const rc = moe_infer_forward(engine, hidden.ptr, @intCast(pos));
     if (rc != 0) return error.ForwardFailed;
 }
 
-pub fn forwardLayer(engine: *Engine, layer: usize, hidden: []f32, pos: usize) !void {
+pub fn forwardLayer(engine: *Engine, layer: usize, hidden: []u16, pos: usize) !void {
     const rc = moe_infer_forward_layer(engine, @intCast(layer), hidden.ptr, @intCast(pos));
     if (rc != 0) return error.ForwardFailed;
 }

@@ -183,6 +183,9 @@ typedef struct {
     void *pipe_rms_norm_rows_bf16in_bf16out;
     void *pipe_rope_tail_bf16;
     void *pipe_matvec_f32_bf16in;
+    // bfloat hidden state kernels (for full bf16 forward pass)
+    void *pipe_mhc_pre_bfloat;    // mhc_pre with bfloat residual I/O
+    void *pipe_mhc_post_bfloat;   // mhc_post with bfloat residual I/O
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -288,13 +291,13 @@ void moe_infer_set_layer_tid2eid(MoEInferEngine *engine, int layer,
 // Set the current token ID (call before each forwardLayer for hash routing).
 void moe_infer_set_token_id(MoEInferEngine *engine, int token_id);
 
-// Process one layer: RMSNorm → MLA attention → routing → MoE → output.
-// hidden: [DIM] input, overwritten with output on return.
+// Process one layer with full bfloat16 data flow.
+// hidden: [MHC_MULT, DIM] bfloat16 (uint16_t) input and output (in-place).
 // Returns 0 on success.
-int moe_infer_forward_layer(MoEInferEngine *engine, int layer, float *hidden, int pos);
+int moe_infer_forward_layer(MoEInferEngine *engine, int layer, uint16_t *hidden, int pos);
 
-// Forward pass for ALL layers. hidden: [DIM] input and output.
-int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
+// Forward pass for ALL layers. hidden: [MHC_MULT, DIM] bfloat16 input and output.
+int moe_infer_forward(MoEInferEngine *engine, uint16_t *hidden, int pos);
 
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);

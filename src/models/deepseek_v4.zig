@@ -2977,18 +2977,33 @@ pub const DSV4Model = struct {
                     return error.MetalBufferTooSmall;
                 }
                 const src = try mat.dataPtr(f32);
-                const host = try self.allocator.alloc(f32, n);
-                defer self.allocator.free(host);
-                @memcpy(host, src[0..n]);
+                // Convert f32 hidden → bfloat16 (u16) for bfloat engine.
+                // The hidden is bf16-valued (from embed bf16 on Layer 0, and from
+                // bf16 mhc_post on Layer 1+), so f32→bf16 is exact for early tokens
+                // and close (within bf16 precision) for later tokens.
+                const host_bf16 = try self.allocator.alloc(u16, n);
+                defer self.allocator.free(host_bf16);
+                for (src[0..n], 0..) |val, idx| {
+                    const bits: u32 = @bitCast(val);
+                    const rb: u32 = (bits >> 16) & 1;
+                    const rounded: u32 = (bits + 0x7FFF + rb) & 0xFFFF0000;
+                    host_bf16[idx] = @intCast(rounded >> 16);
+                }
                 const metal = @import("../metal_infer/engine.zig");
-                // Set current token ID for hash routing (layers 0-2).
                 {
                     try input_ids.eval();
                     const tok_ptr = try input_ids.dataPtr(u32);
                     metal.setTokenId(@ptrCast(@alignCast(eng_ptr)), @intCast(tok_ptr[0]));
                 }
-                try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), host, @intCast(start_pos));
-                hidden = try arena.track(try Array.fromData(self.allocator, f32, host, hshape));
+                try metal.forwardLayer(@ptrCast(@alignCast(eng_ptr)), @intCast(i), host_bf16, @intCast(start_pos));
+                // Convert bf16 output → f32 for MLX compatibility
+                const host_f32 = try self.allocator.alloc(f32, n);
+                defer self.allocator.free(host_f32);
+                for (host_bf16, 0..) |bf16_val, idx| {
+                    const expanded: u32 = @as(u32, bf16_val) << 16;
+                    host_f32[idx] = @bitCast(expanded);
+                }
+                hidden = try arena.track(try Array.fromData(self.allocator, f32, host_f32, hshape));
             } else {
                 const cache = if (caches) |cache_arr| cache_arr[i] else null;
                 hidden = try arena.track(try layer.forward(hidden, input_ids, mask, cache, start_pos, stream));

@@ -65,6 +65,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_rows_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16in_bf16out"] error:&err]);
     eng->pipe_rope_tail_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_bf16"] error:&err]);
     eng->pipe_matvec_f32_bf16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_bf16in"] error:&err]);
+    eng->pipe_mhc_pre_bfloat  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_bfloat"] error:&err]);
+    eng->pipe_mhc_post_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_bfloat"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -419,14 +421,13 @@ static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
     }
 }
 
-int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int pos) {
+int moe_infer_forward_layer(MoEInferEngine *eng, int layer, uint16_t *hidden, int pos) {
     if (!eng->initialized) return -1;
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
 
-    // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
-    float *residual = hidden;
+    // `hidden` is [MHC_MULT, DIM] bfloat16 (uint16_t), in-place update.
 
-    // Build MlaPipes view over the engine's pipelines.
+    // Build MlaPipes
     MlaPipes P;
     P.dev = d;
     P.queue = (id<MTLCommandQueue>)eng->queue;
@@ -445,246 +446,288 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.rope_tail_bf16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_bf16;
     P.matvec_f32_bf16in = (id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in;
 
-    // Large scratch buffers are static (forward_layer runs serially) to avoid
-    // overflowing the warmup/engine fiber's limited stack.
-    static float attn_input[DIM], normed[DIM], attn_out[DIM];
-    static float ffn_input[DIM], ffn_out[DIM];
+    // Shared scratch (f32 only for normed/scores/weights — small)
+    static float normed[DIM], ffn_normed[DIM];
     float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
 
-    // === Attention sublayer (mHC-wrapped) ===
-    MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
-    if (layer == 0 && getenv("MF_DBG")) {
-        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 in residual norm=%.4f\n", sqrt(rn));
-    }
-    mhc_pre(&ahc, residual, attn_input, post, comb);
-    if (layer == 0 && getenv("MF_DBG")) {
-        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_input[z]*attn_input[z];
-        fprintf(stderr, "[mf-dbg] L0 attn_input norm=%.4f post=[%.3f %.3f %.3f %.3f] comb00=%.3f\n",
-            sqrt(an), post[0],post[1],post[2],post[3], comb[0]);
+    // Bfloat residual buffer on GPU (Metal Shared memory)
+    id<MTLBuffer> bresidual = [d newBufferWithBytes:hidden
+                                             length:(size_t)MHC_MULT*DIM*sizeof(uint16_t)
+                                            options:MTLResourceStorageModeShared];
+
+    // Helper macros for dispatching mhc_pre_bfloat and mhc_post_bfloat
+    // mhc_pre_bfloat: bfloat residual → bfloat out_input, f32 post/comb
+    // out_input stored in bfloat_input_buf (DIM * uint16_t)
+    id<MTLBuffer> battn_input_b16 = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bpost_buf = [d newBufferWithLength:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> bcomb_buf = [d newBufferWithLength:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+
+    // Dispatch mhc_pre_bfloat for attention sublayer
+    {
+        MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+        id<MTLBuffer> bfn  = [d newBufferWithBytes:(void*)ahc.fn    length:24*MHC_MULT*DIM*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bba  = [d newBufferWithBytes:(void*)ahc.base  length:24*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bsc  = [d newBufferWithBytes:(void*)ahc.scale length:3*4  options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+        [e setBuffer:bfn offset:0 atIndex:0]; [e setBuffer:bba offset:0 atIndex:1];
+        [e setBuffer:bsc offset:0 atIndex:2]; [e setBuffer:bresidual offset:0 atIndex:3];
+        [e setBuffer:battn_input_b16 offset:0 atIndex:4];
+        [e setBuffer:bpost_buf offset:0 atIndex:5]; [e setBuffer:bcomb_buf offset:0 atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(post, [bpost_buf contents], MHC_MULT*sizeof(float));
+        memcpy(comb, [bcomb_buf contents], MHC_MULT*MHC_MULT*sizeof(float));
     }
 
-    // input RMSNorm (attn_norm) on attn_input -> normed (validated rms_norm_rows)
+    // RMSNorm (attn_norm) on bfloat attn_input → f32 normed
     {
-        id<MTLBuffer> bx = [d newBufferWithBytes:attn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->input_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        // Convert bfloat16 attn_input → f32
+        id<MTLBuffer> battn_f32 = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        {
+            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32];
+            [e setBuffer:battn_input_b16 offset:0 atIndex:0]; [e setBuffer:battn_f32 offset:0 atIndex:1];
+            uint n=DIM; [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        id<MTLBuffer> bw = [d newBufferWithBytes:(void*)eng->input_norms[layer] length:DIM*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [d newBufferWithLength:DIM*4 options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
-        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
-        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+        [e setBuffer:battn_f32 offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        uint rd=DIM; float eps=1e-6f; uint hw=1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [bo contents], DIM * sizeof(float));
+        memcpy(normed, [bo contents], DIM*sizeof(float));
     }
 
-    // MLA attention (decode, single token -> cache_len from kv_cache)
+    // MLA attention: f32 normed → bfloat16 attn_out (as float shell)
+    // Note: mla_attention_decode now takes bfloat input (float shell format)
+    // and returns bfloat output (float shell format).
+    // We pass f32 normed but mla_attention_decode expects bfloat shell.
+    // Convert normed f32 → bfloat shell:
+    static float normed_bf16_shell[DIM];  // bfloat values in float32 upper 16 bits
+    for (int j = 0; j < DIM; j++) {
+        uint32_t bits; memcpy(&bits, &normed[j], 4);
+        uint32_t rb = (bits >> 16) & 1;
+        bits = (bits + 0x7FFF + rb) & 0xFFFF0000u;
+        memcpy(&normed_bf16_shell[j], &bits, 4);
+    }
+
+    static float attn_out_bf16_shell[DIM];  // bfloat attn_out in float shell
     {
         KVCache *kvc = &eng->kv_cache[layer];
-        if (!kvc->kv) { kvc->kv = (float *)calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(float)); kvc->len = 0; }
+        if (!kvc->kv) { kvc->kv = (float*)calloc((size_t)MAX_SEQ_LEN*KV_LORA_RANK, sizeof(float)); kvc->len = 0; }
         kvc->len += 1;
-        mla_attention_decode(&P, &eng->attn[layer], normed, kvc->kv, kvc->len, pos, attn_out);
+        mla_attention_decode(&P, &eng->attn[layer], normed_bf16_shell, kvc->kv, kvc->len, pos, attn_out_bf16_shell);
     }
 
-    // mHC post -> residual' (in place)
-    mhc_post(attn_out, residual, post, comb, residual);
-    if (layer == 0 && getenv("MF_DBG")) {
-        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
-        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 attn_out norm=%.4f, residual after attn-post norm=%.4f\n", sqrt(an), sqrt(rn));
-        // Dump attn_out for comparison
-        const char *dd = getenv("DSV4_DUMP_DIR");
-        if (dd) {
-            char path[1024]; snprintf(path, sizeof(path), "%s/L0_attn_out_metal.bin", dd);
-            FILE *f = fopen(path, "wb");
-            if (f) { fwrite(attn_out, sizeof(float), DIM, f); fclose(f); }
+    // mhc_post_bfloat: bfloat attn_out + bfloat residual → bfloat residual'
+    {
+        // attn_out_bf16_shell → uint16_t bfloat buffer
+        static uint16_t attn_out_b16[DIM];
+        for (int j = 0; j < DIM; j++) {
+            uint32_t bits; memcpy(&bits, &attn_out_bf16_shell[j], 4);
+            attn_out_b16[j] = (uint16_t)(bits >> 16);
         }
+        id<MTLBuffer> battn_b16 = [d newBufferWithBytes:attn_out_b16 length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bpost_tmp = [d newBufferWithBytes:post length:MHC_MULT*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bcomb_tmp = [d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*4 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+        [e setBuffer:battn_b16 offset:0 atIndex:0]; [e setBuffer:bresidual offset:0 atIndex:1];
+        [e setBuffer:bpost_tmp offset:0 atIndex:2]; [e setBuffer:bcomb_tmp offset:0 atIndex:3];
+        [e setBuffer:bresidual offset:0 atIndex:4];  // in-place
+        uint hc=MHC_MULT, dim=DIM;
+        [e setBytes:&hc length:4 atIndex:5]; [e setBytes:&dim length:4 atIndex:6];
+        [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     }
 
     // === MoE sublayer (mHC-wrapped) ===
-    MhcWeights fhc = { eng->ffn_hc_fn[layer], eng->ffn_hc_base[layer], eng->ffn_hc_scale[layer] };
-    mhc_pre(&fhc, residual, ffn_input, post, comb);
-
-    // ffn RMSNorm (attn_norms[] holds ffn_norm) on ffn_input -> normed
+    // mhc_pre_bfloat for FFN
+    id<MTLBuffer> bffn_input_b16 = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
     {
-        id<MTLBuffer> bx = [d newBufferWithBytes:ffn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->attn_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        MhcWeights fhc = { eng->ffn_hc_fn[layer], eng->ffn_hc_base[layer], eng->ffn_hc_scale[layer] };
+        id<MTLBuffer> bfn  = [d newBufferWithBytes:(void*)fhc.fn    length:24*MHC_MULT*DIM*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bba  = [d newBufferWithBytes:(void*)fhc.base  length:24*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bsc  = [d newBufferWithBytes:(void*)fhc.scale length:3*4  options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+        [e setBuffer:bfn offset:0 atIndex:0]; [e setBuffer:bba offset:0 atIndex:1];
+        [e setBuffer:bsc offset:0 atIndex:2]; [e setBuffer:bresidual offset:0 atIndex:3];
+        [e setBuffer:bffn_input_b16 offset:0 atIndex:4];
+        [e setBuffer:bpost_buf offset:0 atIndex:5]; [e setBuffer:bcomb_buf offset:0 atIndex:6];
+        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(post, [bpost_buf contents], MHC_MULT*sizeof(float));
+        memcpy(comb, [bcomb_buf contents], MHC_MULT*MHC_MULT*sizeof(float));
+    }
+
+    // RMSNorm (ffn_norm) on bfloat ffn_input → f32 ffn_normed
+    {
+        id<MTLBuffer> bffn_f32 = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        {
+            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32];
+            [e setBuffer:bffn_input_b16 offset:0 atIndex:0]; [e setBuffer:bffn_f32 offset:0 atIndex:1];
+            uint n=DIM; [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        }
+        id<MTLBuffer> bw = [d newBufferWithBytes:(void*)eng->attn_norms[layer] length:DIM*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [d newBufferWithLength:DIM*4 options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
-        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
-        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+        [e setBuffer:bffn_f32 offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        uint rd=DIM; float eps=1e-6f; uint hw=1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [bo contents], DIM * sizeof(float));
+        memcpy(ffn_normed, [bo contents], DIM*sizeof(float));
     }
 
-    if (layer == 0 && getenv("MF_DBG")) {
-        double nn=0; for(int z=0;z<DIM;z++) nn+=(double)normed[z]*normed[z];
-        fprintf(stderr, "[mf-dbg] L0 normed(ffn input) norm=%.4f\n", sqrt(nn));
-        const char *dd = getenv("DSV4_DUMP_DIR");
-        if (dd) {
-            char path[1024]; snprintf(path, sizeof(path), "%s/L0_normed_ffn_in.bin", dd);
-            FILE *f = fopen(path, "wb"); if (f) { fwrite(normed, sizeof(float), DIM, f); fclose(f); }
-        }
-    }
-
-    // === Routing gate ===
+    // MoE routing + expert forward (f32 normed)
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
         float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-        memcpy(buf_h, normed, DIM * sizeof(float));
+        memcpy(buf_h, ffn_normed, DIM * sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id gate_w = [d newBufferWithBytes:(void *)eng->gate_proj[layer] length:N_EXPERTS*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id gate_w = [d newBufferWithBytes:(void*)eng->gate_proj[layer] length:N_EXPERTS*DIM*sizeof(float) options:MTLResourceStorageModeShared];
         encode_matvec(cb, eng->pipe_matvec, gate_w, eng->buf_hidden, eng->buf_routing_scores, N_EXPERTS, DIM);
         [cb commit]; [cb waitUntilCompleted];
     } else {
-        for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
+        for (int i=0;i<N_EXPERTS;i++) scores[i]=(float)(N_EXPERTS-i);
     }
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    // Hash routing for layers 0-2: look up experts by token ID.
-    // NOTE: Hash routing is correct data-wise but does not improve E2E output
-    // because the f32 vs bf16 precision difference causes chaos divergence
-    // in score-based layers (3+) regardless. Left disabled pending bf16 alignment.
-    const bool use_hash_routing = false;
+    // Enable hash routing for layers 0-2 now that we have correct bfloat chain
+    const bool use_hash_routing = true;
     if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
-        for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
-        // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.
-        // First compute sqrtsoftplus on the current gate scores.
-        float wsum = 0;
-        for (int k = 0; k < N_ACTIVE; k++) {
-            float l = scores[expert_ids[k]];
-            float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
-            expert_weights[k] = sqrtf(sp);
-            wsum += expert_weights[k];
+        for (int k=0;k<N_ACTIVE;k++) expert_ids[k]=(int)row[k];
+        float wsum=0;
+        for (int k=0;k<N_ACTIVE;k++) {
+            float l=scores[expert_ids[k]];
+            float sp = l>0 ? l+log1pf(expf(-l)) : log1pf(expf(l));
+            expert_weights[k]=sqrtf(sp); wsum+=expert_weights[k];
         }
-        wsum += 1e-20f;
-        for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+        wsum+=1e-20f;
+        for (int k=0;k<N_ACTIVE;k++) expert_weights[k]=expert_weights[k]/wsum*1.5f;
     } else {
         cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
     }
-    if (layer == 0 && getenv("MF_DBG")) {
-        fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f] hash=%s tok=%d\n",
-            expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],expert_ids[4],expert_ids[5],
-            expert_weights[0],expert_weights[1],expert_weights[2],
-            eng->tid2eid[layer] != NULL ? "yes" : "no",
-            eng->current_token_id);
-    }
 
-    // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
-    // the ffn-normed vector into it. MoE combine writes the pure routed-expert
-    // sum (zero residual) to buf_hidden.
+    // Expert I/O + MoE (f32 ffn_normed as input)
+    static float ffn_out_f32[DIM];
     {
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
-        memcpy(bn, normed, DIM * sizeof(float));
+        memcpy(bn, ffn_normed, DIM * sizeof(float));
         IOPool *io = (IOPool *)eng->io_pool;
         io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
         moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
-        memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+        memcpy(ffn_out_f32, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
-    if (layer == 0 && getenv("MF_DBG")) {
-        double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
-        const char *dd = getenv("DSV4_DUMP_DIR");
-        fprintf(stderr, "[mf-dbg] L0 ffn_out(moe only) norm=%.4f\n", sqrt(fn));
-        // Dump pre-shared-expert MoE output for debugging
-        if (dd) {
-            char path[1024]; snprintf(path, sizeof(path), "%s/L0_moe_only_out.bin", dd);
-            FILE *f = fopen(path, "wb"); if (f) { fwrite(ffn_out, sizeof(float), DIM, f); fclose(f); }
-        }
-    }
-
-    // Shared expert: runs on the same normed input, output added to ffn_out.
+    // Shared expert (f32)
     if (eng->shared[layer].gate.packed != NULL) {
-        const int SE_GS = 64;
-        const int SE_NG_GU = DIM / SE_GS;   // 64 groups for gate/up [2048,4096]
-        const int SE_NG_D  = INTERMEDIATE / SE_GS; // 32 groups for down [4096,2048]
-        id<MTLBuffer> bx = [d newBufferWithBytes:normed length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bgate = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bup   = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bdown = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        // gate and up projections
+        const int SE_GS=64, SE_NG_GU=DIM/SE_GS, SE_NG_D=INTERMEDIATE/SE_GS;
+        id<MTLBuffer> bx=[d newBufferWithBytes:ffn_normed length:DIM*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bgate=[d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bup  =[d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bdown=[d newBufferWithLength:DIM*4 options:MTLResourceStorageModeShared];
         {
-            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
-            for (int proj = 0; proj < 2; proj++) {
-                const QuantWeight *qw = (proj==0) ? &eng->shared[layer].gate : &eng->shared[layer].up;
-                id<MTLBuffer> bout = (proj==0) ? bgate : bup;
-                id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            id<MTLCommandBuffer> cb=[P.queue commandBuffer];
+            for (int proj=0;proj<2;proj++) {
+                const QuantWeight *qw=(proj==0)?&eng->shared[layer].gate:&eng->shared[layer].up;
+                id<MTLBuffer> bout=(proj==0)?bgate:bup;
+                id bw=[d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*4 options:MTLResourceStorageModeShared deallocator:nil];
+                id bs=[d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*4 options:MTLResourceStorageModeShared];
+                id bb=[d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*4 options:MTLResourceStorageModeShared];
+                id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
                 [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
-                [e setBuffer:bx offset:0 atIndex:3]; [e setBuffer:bout offset:0 atIndex:4];
-                uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
-                [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                [e setBuffer:bw offset:0 atIndex:0];[e setBuffer:bs offset:0 atIndex:1];[e setBuffer:bb offset:0 atIndex:2];
+                [e setBuffer:bx offset:0 atIndex:3];[e setBuffer:bout offset:0 atIndex:4];
+                uint od=qw->out_dim,id_=qw->in_dim,gs=SE_GS;
+                [e setBytes:&od length:4 atIndex:5];[e setBytes:&id_ length:4 atIndex:6];[e setBytes:&gs length:4 atIndex:7];
                 [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [e endEncoding];
             }
-            [cb commit]; [cb waitUntilCompleted];
+            [cb commit];[cb waitUntilCompleted];
         }
-        // Limited SwiGLU on CPU
-        float *gv = (float *)[bgate contents]; float *uv = (float *)[bup contents];
-        const float limit = 10.0f;
-        for (int j = 0; j < INTERMEDIATE; j++) {
-            float g = fminf(gv[j], limit);
-            float u = fminf(fmaxf(uv[j], -limit), limit);
-            gv[j] = g / (1.0f + expf(-g)) * u;
-        }
-        // down projection
+        float *gv=(float*)[bgate contents]; float *uv=(float*)[bup contents];
+        const float lim=10.0f;
+        for (int j=0;j<INTERMEDIATE;j++) { float g=fminf(gv[j],lim),u=fminf(fmaxf(uv[j],-lim),lim); gv[j]=g/(1.0f+expf(-g))*u; }
         {
-            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
-            const QuantWeight *qw = &eng->shared[layer].down;
-            id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-            id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-            id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            id<MTLCommandBuffer> cb=[P.queue commandBuffer];
+            const QuantWeight *qw=&eng->shared[layer].down;
+            id bw=[d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*4 options:MTLResourceStorageModeShared deallocator:nil];
+            id bs=[d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_D*4 options:MTLResourceStorageModeShared];
+            id bb=[d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_D*4 options:MTLResourceStorageModeShared];
+            id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
             [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-            [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
-            [e setBuffer:bgate offset:0 atIndex:3]; [e setBuffer:bdown offset:0 atIndex:4];
-            uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
-            [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+            [e setBuffer:bw offset:0 atIndex:0];[e setBuffer:bs offset:0 atIndex:1];[e setBuffer:bb offset:0 atIndex:2];
+            [e setBuffer:bgate offset:0 atIndex:3];[e setBuffer:bdown offset:0 atIndex:4];
+            uint od=qw->out_dim,id_=qw->in_dim,gs=SE_GS;
+            [e setBytes:&od length:4 atIndex:5];[e setBytes:&id_ length:4 atIndex:6];[e setBytes:&gs length:4 atIndex:7];
             [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
+            [e endEncoding];[cb commit];[cb waitUntilCompleted];
         }
-        float *sv = (float *)[bdown contents];
-        for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
-        if (layer == 0 && getenv("MF_DBG")) {
-            double sn=0; for(int z=0;z<DIM;z++) sn+=(double)sv[z]*sv[z];
-            fprintf(stderr, "[mf-dbg] L0 shared_out norm=%.4f\n", sqrt(sn));
-        }
+        float *sv=(float*)[bdown contents];
+        for (int j=0;j<DIM;j++) ffn_out_f32[j]+=sv[j];
     }
 
-    // mHC post -> residual'' (in place)
-    mhc_post(ffn_out, residual, post, comb, residual);
-    if (layer == 0 && getenv("MF_DBG")) {
-        double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
-        double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 ffn_out norm=%.4f, residual after ffn-post norm=%.4f\n", sqrt(fn), sqrt(rn));
-        const char *dd = getenv("DSV4_DUMP_DIR");
-        if (dd) {
-            char path[1024]; snprintf(path, sizeof(path), "%s/L0_ffn_out_metal.bin", dd);
-            FILE *ff = fopen(path, "wb");
-            if (ff) { fwrite(ffn_out, sizeof(float), DIM, ff); fclose(ff); }
+    // mhc_post_bfloat for FFN: bfloat ffn_out + bfloat residual → bfloat residual''
+    {
+        // Convert f32 ffn_out → bfloat16 uint16_t
+        static uint16_t ffn_out_b16[DIM];
+        for (int j=0;j<DIM;j++) {
+            uint32_t bits; memcpy(&bits,&ffn_out_f32[j],4);
+            uint32_t rb=(bits>>16)&1; bits=(bits+0x7FFF+rb)&0xFFFF0000u;
+            ffn_out_b16[j]=(uint16_t)(bits>>16);
         }
+        id<MTLBuffer> bffn_b16=[d newBufferWithBytes:ffn_out_b16 length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bpost_t=[d newBufferWithBytes:post length:MHC_MULT*4 options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bcomb_t=[d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*4 options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb=[(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+        [e setBuffer:bffn_b16 offset:0 atIndex:0]; [e setBuffer:bresidual offset:0 atIndex:1];
+        [e setBuffer:bpost_t offset:0 atIndex:2];  [e setBuffer:bcomb_t offset:0 atIndex:3];
+        [e setBuffer:bresidual offset:0 atIndex:4];  // in-place
+        uint hc=MHC_MULT, dim=DIM;
+        [e setBytes:&hc length:4 atIndex:5]; [e setBytes:&dim length:4 atIndex:6];
+        [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
     }
 
+    // Write updated bfloat residual back to hidden
+    memcpy(hidden, [bresidual contents], (size_t)MHC_MULT * DIM * sizeof(uint16_t));
     return 0;
 }
 
-int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
+int moe_infer_forward(MoEInferEngine *eng, uint16_t *hidden, int pos) {
     for (int layer = 0; layer < N_LAYERS; layer++) {
         if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
     }
     return 0;
 }
+
+// ============================================================================
+// Init / Deinit
+// ============================================================================
+
 
 // ============================================================================
 // Init / Deinit
