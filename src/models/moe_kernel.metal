@@ -516,6 +516,123 @@ kernel void mhc_pre_gpu(
     }
 }
 
+// mhc_pre_bfloat: mhc_pre with bfloat residual input and bfloat output.
+// residual: [HC, DIM] bfloat
+// out_input: [DIM] bfloat (the sublayer input)
+// out_post, out_comb: f32 (same as mhc_pre_gpu)
+// All computation in f32, bfloat only at input/output boundaries.
+kernel void mhc_pre_bfloat(
+    device const float*  fn_weight [[buffer(0)]],  // [24, 16384] f32
+    device const float*  base      [[buffer(1)]],  // [24] f32
+    device const float*  scale_v   [[buffer(2)]],  // [3] f32
+    device const bfloat* residual  [[buffer(3)]],  // [HC, DIM] bfloat
+    device bfloat*       out_input [[buffer(4)]],  // [DIM] bfloat
+    device float*        out_post  [[buffer(5)]],  // [HC] f32
+    device float*        out_comb  [[buffer(6)]],  // [HC*HC] f32
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    const uint HC = 4, DIM = 4096, MHC_H = HC * DIM, MIX3 = 24;
+    const float EPS = 1e-6f, POST_MULT = 2.0f;
+
+    threadgroup float mixes[24];
+    threadgroup float pre_mix[4];
+    threadgroup float comb_mat[16];
+    threadgroup float ss_buf[256];
+
+    // Step 1: compute mean(residual^2) using bfloat values (cast to float for accumulation)
+    float local_ss = 0.0f;
+    for (uint i = lid; i < MHC_H; i += tg_size) {
+        float v = float(residual[i]); local_ss += v * v;
+    }
+    ss_buf[lid] = local_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) ss_buf[lid] += ss_buf[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float norm = rsqrt(ss_buf[0] / float(MHC_H) + EPS);
+
+    // Step 2: mixes = (fn @ float(residual)) * norm
+    for (uint r = lid; r < MIX3; r += tg_size) {
+        device const float* fn_r = fn_weight + r * MHC_H;
+        float acc = 0.0f;
+        for (uint i = 0; i < MHC_H; i++) acc += fn_r[i] * float(residual[i]);
+        mixes[r] = acc * norm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: pre_mix, post, comb (single-threaded, same as mhc_pre_gpu)
+    if (lid == 0) {
+        float s0 = scale_v[0], s1 = scale_v[1], s2 = scale_v[2];
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[m] * s0 + base[m];
+            pre_mix[m] = 1.0f / (1.0f + exp(-biased)) + EPS;
+        }
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[HC + m] * s1 + base[HC + m];
+            out_post[m] = (1.0f / (1.0f + exp(-biased))) * POST_MULT;
+        }
+        for (uint c = 0; c < HC * HC; c++)
+            comb_mat[c] = mixes[2 * HC + c] * s2 + base[2 * HC + c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Sinkhorn (single-threaded)
+    if (lid == 0) {
+        for (uint i = 0; i < HC; i++) {
+            float m_val = comb_mat[i*HC]; for (uint j=1;j<HC;j++) if (comb_mat[i*HC+j]>m_val) m_val=comb_mat[i*HC+j];
+            float s_val = 0.0f; for (uint j=0;j<HC;j++) { comb_mat[i*HC+j]=exp(comb_mat[i*HC+j]-m_val); s_val+=comb_mat[i*HC+j]; }
+            for (uint j=0;j<HC;j++) comb_mat[i*HC+j]=comb_mat[i*HC+j]/s_val+EPS;
+        }
+        for (uint j=0;j<HC;j++) { float cs=0.0f; for (uint i=0;i<HC;i++) cs+=comb_mat[i*HC+j]; cs+=EPS; for (uint i=0;i<HC;i++) comb_mat[i*HC+j]/=cs; }
+        for (uint it=0;it<19;it++) {
+            for (uint i=0;i<HC;i++) { float rs=0.0f; for(uint j=0;j<HC;j++) rs+=comb_mat[i*HC+j]; rs+=EPS; for(uint j=0;j<HC;j++) comb_mat[i*HC+j]/=rs; }
+            for (uint j=0;j<HC;j++) { float cs=0.0f; for(uint i=0;i<HC;i++) cs+=comb_mat[i*HC+j]; cs+=EPS; for(uint i=0;i<HC;i++) comb_mat[i*HC+j]/=cs; }
+        }
+        for (uint c=0;c<HC*HC;c++) out_comb[c]=comb_mat[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 5: out_input[d] = bfloat( sum_m pre_mix[m] * float(residual[m,d]) )
+    for (uint d = lid; d < DIM; d += tg_size) {
+        float acc = 0.0f;
+        for (uint m = 0; m < HC; m++) acc += pre_mix[m] * float(residual[m * DIM + d]);
+        out_input[d] = (bfloat)acc;
+    }
+}
+
+// mhc_post_bfloat: mhc_post with bfloat residual I/O and bfloat sublayer output.
+// out[m,d] = post[m] * float(x[d]) + sum_k comb[k,m] * float(residual[k,d])
+// Result stored as bfloat → matches MLX's .astype(x.dtype) = bfloat16
+// x: [DIM] bfloat (sublayer output: attn_out or ffn_out)
+// residual: [HC, DIM] bfloat
+// post: [HC] f32
+// comb: [HC*HC] f32
+// out_residual: [HC, DIM] bfloat (can alias residual for in-place)
+kernel void mhc_post_bfloat(
+    device const bfloat* x            [[buffer(0)]],  // [DIM] bfloat
+    device const bfloat* residual     [[buffer(1)]],  // [HC, DIM] bfloat
+    device const float*  post         [[buffer(2)]],  // [HC] f32
+    device const float*  comb         [[buffer(3)]],  // [HC*HC] f32 (row-major [k][m])
+    device bfloat*       out_residual [[buffer(4)]],  // [HC, DIM] bfloat
+    constant uint&       hc           [[buffer(5)]],
+    constant uint&       dim          [[buffer(6)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    uint d = tid;
+    float xv = float(x[d]);
+    for (uint m = 0; m < hc; m++) {
+        float acc = post[m] * xv;
+        for (uint k = 0; k < hc; k++) {
+            // comb[k][m] = comb[k*hc + m]
+            acc += comb[k * hc + m] * float(residual[k * dim + d]);
+        }
+        out_residual[m * dim + d] = (bfloat)acc;
+    }
+}
+
 
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],
