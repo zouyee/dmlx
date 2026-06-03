@@ -240,24 +240,126 @@ kernel void bf16_to_f32(
     dst[tid] = float(src[tid]);
 }
 
-// mhc_blend_bf16: out[DIM] = (sum_m pre_mix[m] * residual[m, :]).astype(bf16→f32)
-// This is the final step of mhc_pre, matching MLX's .astype(x.dtype) behavior.
-// residual: [HC, DIM] f32 (or bf16-compatible values stored as f32)
-// pre_mix: [HC] f32 mixing weights
-// out: [DIM] f32 (bf16-truncated, matching MLX output)
-kernel void mhc_blend_bf16(
-    device const float* residual  [[buffer(0)]],  // [HC, DIM] f32
-    device const float* pre_mix   [[buffer(1)]],  // [HC] f32
-    device float*       out       [[buffer(2)]],  // [DIM] f32 (bf16-truncated)
-    constant uint&      hc        [[buffer(3)]],
-    constant uint&      dim       [[buffer(4)]],
-    uint tid [[thread_position_in_grid]]
+// mhc_pre_gpu: full mhc_pre computation on GPU with bfloat output for out_input.
+// This matches MLX's HyperHead.forward() which computes in f32 internally but
+// returns .astype(x.dtype) = bfloat16. The bfloat output is critical for
+// matching MLX's precision in the attention chain.
+//
+// Dispatch: one threadgroup of 256 threads. Uses threadgroup memory for all
+// intermediate results. Inputs:
+//   fn_weight: [MIX3, HC*DIM] = [24, 16384] f32
+//   base: [MIX3] = [24] f32
+//   scale: [3] f32
+//   residual: [HC, DIM] f32 (= [4, 4096])
+// Outputs:
+//   out_input: [DIM] f32 (bf16-truncated)
+//   out_post: [HC] f32
+//   out_comb: [HC*HC] f32 (sinkhorn-normalized)
+//
+// Constants: HC=4, DIM=4096, MIX3=24, EPS=1e-6
+kernel void mhc_pre_gpu(
+    device const float* fn_weight [[buffer(0)]],  // [24, 16384]
+    device const float* base      [[buffer(1)]],  // [24]
+    device const float* scale_v   [[buffer(2)]],  // [3]
+    device const float* residual  [[buffer(3)]],  // [4, 4096]
+    device float*       out_input [[buffer(4)]],  // [4096] bfloat-truncated f32
+    device float*       out_post  [[buffer(5)]],  // [4]
+    device float*       out_comb  [[buffer(6)]],  // [16]
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
 ) {
-    if (tid >= dim) return;
-    float acc = 0.0f;
-    for (uint m = 0; m < hc; m++) acc += pre_mix[m] * residual[m * dim + tid];
-    // Truncate to bf16 to match MLX's .astype(x.dtype) where x is bf16 hidden state
-    out[tid] = float((bfloat)acc);
+    const uint HC = 4, DIM = 4096, MHC_H = HC * DIM, MIX3 = 24;
+    const float EPS = 1e-6f, POST_MULT = 2.0f;
+
+    // Threadgroup scratch: mixes[24], pre_mix[4], comb[16]
+    threadgroup float mixes[24];
+    threadgroup float pre_mix[4];
+    threadgroup float comb_mat[16];  // [4][4]
+    threadgroup float sum_sq;
+    threadgroup float rms_norm_factor;
+
+    // Step 1: compute sum(residual^2) / MHC_H
+    float local_ss = 0.0f;
+    for (uint i = lid; i < MHC_H; i += tg_size) local_ss += residual[i] * residual[i];
+    threadgroup float ss_buf[256];
+    ss_buf[lid] = local_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) ss_buf[lid] += ss_buf[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (lid == 0) {
+        sum_sq = ss_buf[0];
+        rms_norm_factor = rsqrt(sum_sq / float(MHC_H) + EPS);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float norm = rms_norm_factor;
+
+    // Step 2: compute mixes[r] = (fn[r,:] @ residual) * norm, for r in 0..23
+    for (uint r = lid; r < MIX3; r += tg_size) {
+        device const float* fn_r = fn_weight + r * MHC_H;
+        float acc = 0.0f;
+        for (uint i = 0; i < MHC_H; i++) acc += fn_r[i] * residual[i];
+        mixes[r] = acc * norm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: compute pre_mix, post, comb from mixes
+    if (lid == 0) {
+        float s0 = scale_v[0], s1 = scale_v[1], s2 = scale_v[2];
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[m] * s0 + base[m];
+            pre_mix[m] = 1.0f / (1.0f + exp(-biased)) + EPS;
+        }
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[HC + m] * s1 + base[HC + m];
+            out_post[m] = (1.0f / (1.0f + exp(-biased))) * POST_MULT;
+        }
+        for (uint c = 0; c < HC * HC; c++) {
+            comb_mat[c] = mixes[2 * HC + c] * s2 + base[2 * HC + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Sinkhorn normalization on comb_mat[4][4]
+    // (Single-threaded, tiny compute — 4x4 matrix, 20 iterations)
+    if (lid == 0) {
+        // Initial softmax per row + eps
+        for (uint i = 0; i < HC; i++) {
+            float m_val = comb_mat[i * HC];
+            for (uint j = 1; j < HC; j++) if (comb_mat[i*HC+j] > m_val) m_val = comb_mat[i*HC+j];
+            float s_val = 0.0f;
+            for (uint j = 0; j < HC; j++) { comb_mat[i*HC+j] = exp(comb_mat[i*HC+j] - m_val); s_val += comb_mat[i*HC+j]; }
+            for (uint j = 0; j < HC; j++) comb_mat[i*HC+j] = comb_mat[i*HC+j] / s_val + EPS;
+        }
+        // Initial col-norm
+        for (uint j = 0; j < HC; j++) {
+            float cs = 0.0f; for (uint i = 0; i < HC; i++) cs += comb_mat[i*HC+j];
+            cs += EPS; for (uint i = 0; i < HC; i++) comb_mat[i*HC+j] /= cs;
+        }
+        // 19 more row/col-norm iterations
+        for (uint it = 0; it < 19; it++) {
+            for (uint i = 0; i < HC; i++) {
+                float rs = 0.0f; for (uint j = 0; j < HC; j++) rs += comb_mat[i*HC+j];
+                rs += EPS; for (uint j = 0; j < HC; j++) comb_mat[i*HC+j] /= rs;
+            }
+            for (uint j = 0; j < HC; j++) {
+                float cs = 0.0f; for (uint i = 0; i < HC; i++) cs += comb_mat[i*HC+j];
+                cs += EPS; for (uint i = 0; i < HC; i++) comb_mat[i*HC+j] /= cs;
+            }
+        }
+        // Write sinkhorn result to out_comb
+        for (uint c = 0; c < HC * HC; c++) out_comb[c] = comb_mat[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 5: out_input[d] = sum_m pre_mix[m] * residual[m,d], truncated to bfloat
+    for (uint d = lid; d < DIM; d += tg_size) {
+        float acc = 0.0f;
+        for (uint m = 0; m < HC; m++) acc += pre_mix[m] * residual[m * DIM + d];
+        // Truncate to bfloat and back to f32 (matches MLX's .astype(x.dtype) = bfloat16)
+        out_input[d] = float((bfloat)acc);
+    }
 }
 
 

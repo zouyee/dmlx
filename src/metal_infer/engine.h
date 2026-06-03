@@ -174,8 +174,8 @@ typedef struct {
     void *pipe_dequant_matvec_affine_bf16;
     void *pipe_rms_norm_rows_bf16;
     void *pipe_bf16_to_f32;
-    // mhc_blend_bf16: final step of mhc_pre with bf16 output (matches MLX .astype(bf16))
-    void *pipe_mhc_blend_bf16;
+    // mhc_pre_gpu: full mhc_pre on GPU with bfloat out_input (matches MLX .astype(bf16))
+    void *pipe_mhc_pre_gpu;
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state

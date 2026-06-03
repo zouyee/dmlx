@@ -58,7 +58,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_dequant_matvec_affine_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16out"] error:&err]);
     eng->pipe_rms_norm_rows_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16out"] error:&err]);
     eng->pipe_bf16_to_f32 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32"] error:&err]);
-    eng->pipe_mhc_blend_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_blend_bf16"] error:&err]);
+    eng->pipe_mhc_pre_gpu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_gpu"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
