@@ -182,7 +182,6 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bcos    = mkbuf(d, cosv, half_rope * sizeof(float));
     id<MTLBuffer> bsin    = mkbuf(d, sinv, half_rope * sizeof(float));
     id<MTLBuffer> bqn_w   = mkbuf(d, aw->q_norm,  Q_LORA_RANK  * sizeof(float));
-    id<MTLBuffer> bkvn_w  = mkbuf(d, aw->kv_norm, KV_LORA_RANK * sizeof(float));
 
     // --- Q chain: bfloat16 throughout ---
     // wq_a: [Q_LORA_RANK=1024, DIM=4096], bf16_in → bf16_out
@@ -213,19 +212,21 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
       enc_bf16_to_f32(P, cb, bq_n_b16, bq_n_f32, (uint)N_HEADS * HEAD_DIM);
       [cb commit]; [cb waitUntilCompleted]; }
 
-    // --- KV chain: f32 (KV cache is f32) ---
-    // wkv uses bfloat input but f32 intermediate — use the bfloat→f32 input variant
+    // --- KV chain: f32 (keeping f32 KV matches attention quality better) ---
+    // Note: bfloat KV was tested and made things worse (1.07+ layer errors)
+    // f32 KV with bfloat Q chain gives the best results so far (L00: 0.165)
     id<MTLBuffer> bx_f32 = mkbuf(d, NULL, DIM * sizeof(float));
     { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
       enc_bf16_to_f32(P, cb, bx_bf16, bx_f32, DIM);
       [cb commit]; [cb waitUntilCompleted]; }
     id<MTLBuffer> bkv    = mkbuf(d, NULL, KV_LORA_RANK * sizeof(float));
     id<MTLBuffer> bkv_n  = mkbuf(d, NULL, KV_LORA_RANK * sizeof(float));
+    id<MTLBuffer> bkvn_w_f32 = mkbuf(d, aw->kv_norm, KV_LORA_RANK * sizeof(float));
     { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
       enc_dq_f32_f32(P, cb, &aw->wkv, bx_f32, bkv);
       [cb commit]; [cb waitUntilCompleted]; }
     { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rms_f32_f32(P, cb, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
+      enc_rms_f32_f32(P, cb, bkv, bkvn_w_f32, bkv_n, 1, KV_LORA_RANK, 1);
       [cb commit]; [cb waitUntilCompleted]; }
     id<MTLBuffer> bcos_kv = mkbuf(d, cosv, half_rope * sizeof(float));
     id<MTLBuffer> bsin_kv = mkbuf(d, sinv, half_rope * sizeof(float));
