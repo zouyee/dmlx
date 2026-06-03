@@ -240,6 +240,26 @@ kernel void bf16_to_f32(
     dst[tid] = float(src[tid]);
 }
 
+// mhc_blend_bf16: out[DIM] = (sum_m pre_mix[m] * residual[m, :]).astype(bf16→f32)
+// This is the final step of mhc_pre, matching MLX's .astype(x.dtype) behavior.
+// residual: [HC, DIM] f32 (or bf16-compatible values stored as f32)
+// pre_mix: [HC] f32 mixing weights
+// out: [DIM] f32 (bf16-truncated, matching MLX output)
+kernel void mhc_blend_bf16(
+    device const float* residual  [[buffer(0)]],  // [HC, DIM] f32
+    device const float* pre_mix   [[buffer(1)]],  // [HC] f32
+    device float*       out       [[buffer(2)]],  // [DIM] f32 (bf16-truncated)
+    constant uint&      hc        [[buffer(3)]],
+    constant uint&      dim       [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= dim) return;
+    float acc = 0.0f;
+    for (uint m = 0; m < hc; m++) acc += pre_mix[m] * residual[m * dim + tid];
+    // Truncate to bf16 to match MLX's .astype(x.dtype) where x is bf16 hidden state
+    out[tid] = float((bfloat)acc);
+}
+
 
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],

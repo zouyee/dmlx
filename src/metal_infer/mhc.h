@@ -20,6 +20,12 @@ typedef struct {
 void mhc_pre(const MhcWeights *w, const float *residual,
              float *out_input, float *out_post, float *out_comb);
 
+// Same as mhc_pre but also returns pre_mix[MHC_MULT] so the caller can
+// re-run the blend step on GPU (for bf16 precision matching MLX).
+void mhc_pre_with_premix(const MhcWeights *w, const float *residual,
+                          float *out_input, float *out_post, float *out_comb,
+                          float *out_premix);
+
 // hc.post: combine sublayer output x[DIM] with residual streams using post/comb.
 //   out_residual[m,:] = post[m]*x + sum_k comb[k][m]*residual[k,:]
 //   x        : [DIM]

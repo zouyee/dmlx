@@ -88,6 +88,37 @@ void mhc_pre(const MhcWeights *w, const float *residual,
     }
 }
 
+// mhc_pre_with_premix: same as mhc_pre but also returns the pre_mix weights.
+// Used by engine.c to perform the final blend step on GPU (bf16 precision).
+void mhc_pre_with_premix(const MhcWeights *w, const float *residual,
+                          float *out_input, float *out_post, float *out_comb,
+                          float *out_premix) {
+    float mixes[MIX3];
+    pre_norm_fn(w, residual, mixes);
+    float pre_mix[HC], comb[HC*HC];
+    for (int m = 0; m < HC; m++) {
+        float biased = mixes[m] * w->scale[0] + w->base[m];
+        pre_mix[m] = 1.0f / (1.0f + expf(-biased)) + HC_EPS;
+    }
+    for (int m = 0; m < HC; m++) {
+        float biased = mixes[HC + m] * w->scale[1] + w->base[HC + m];
+        out_post[m] = (1.0f / (1.0f + expf(-biased))) * POST_MULT;
+    }
+    for (int c = 0; c < HC*HC; c++) {
+        comb[c] = mixes[2*HC + c] * w->scale[2] + w->base[2*HC + c];
+    }
+    sinkhorn(comb);
+    memcpy(out_comb, comb, sizeof(comb));
+    memcpy(out_premix, pre_mix, HC * sizeof(float));
+
+    // out_input (f32 version) — will be overridden by GPU bf16 blend in engine.c
+    for (int d = 0; d < DIM; d++) {
+        float acc = 0;
+        for (int m = 0; m < HC; m++) acc += pre_mix[m] * residual[m*DIM + d];
+        out_input[d] = acc;
+    }
+}
+
 void mhc_post(const float *x, const float *residual,
               const float *post, const float *comb, float *out_residual) {
     // Use a temp buffer to avoid aliasing when out_residual == residual.
