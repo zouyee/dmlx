@@ -759,3 +759,66 @@ f32 Metal 路径与 bf16 MLX 训练路径在 43 层后的完全发散，是**系
 - 但 --metal-moe（混合路径）仍然正确（Paris ✓）
 
 优先级建议：先完成 bf16 mhc + attention 数据流，再重测 metal-full。
+
+---
+
+## 15. 最终结论：metal-full 精度对齐（2026-06-02，commit bc21ec3）
+
+### 15.1 尝试了什么（全部失败）
+
+经过系统性的尝试，所有精度对齐方案均失败：
+
+| 方案 | 结果 | 失败原因 |
+|------|------|---------|
+| bf16 Q chain（wq_a/wq_b/q_norm 输出 bf16） | 无效（1.00x） | attn_input 本身是 f32，Q chain 输入不匹配 |
+| attn_input bf16 截断 | **灾难性（1.0+）** | attention 对输入极度敏感，微小截断导致 Q/K 完全错误 |
+| ffn_input bf16 截断 | 更差（~20%+） | 同上 |
+| mhc_pre 输出 bf16 截断 | **灾难性（1.0+）** | 同 attn_input（因为就是 mhc_pre 输出） |
+| KV cache bf16 存储 | 更差 | KV 精度破坏 |
+| residual bf16 截断（mhc_post 后） | 更差 | 影响下一层 mhc_pre |
+| mhc_pre f32→float32 累加改变 | 无效（1.00x） | f32/f64 差异远小于 0.51% 误差 |
+| hash routing（layers 0-2） | L0-1 改善，L3+ 更差 | 混沌路径依赖 |
+| GPU mhc_blend_bf16 kernel | **灾难性（1.0+）** | 与 CPU bf16 截断等效，同样灾难性 |
+
+### 15.2 关键认识：attn_input 是混沌系统的敏感点
+
+`attn_input`（从 mhc_pre 输出，norm ~16）经过 `wq_a`（[1024, 4096]）后变成 Q_LORA（norm ~10），再经过 `wq_b`（[32768, 1024]）变成 Q（64×512）。
+
+0.03 的 attn_input 变化（bf16 最大截断量）通过 wq_b 的 32768 维放大后导致每个 head 的 Q 向量偏差约 0.5-1.0（相对于 norm ~2 的 Q 向量），这使 SDPA 的 attention pattern 完全改变。
+
+**这就是为什么 attn_input bf16 截断是灾难性的**：它改变了 64 个 attention head 的每一个，导致 attention output 完全错误（rel_L2 从 0.67% 跳到 >100%）。
+
+### 15.3 技术结论（定论）
+
+**metal-full 的正确性只能通过以下方式实现：**
+将整个 mhc_pre 运算搬到 Metal GPU kernel，使用 native `bfloat` 类型，让 `fn @ residual_flat` 的内部计算精度与 MLX 一致。
+
+**不行的方案**：在任何步骤截断 f32 中间值到 bf16（会破坏后续计算的稳定性）。
+
+**唯一可行的方案**：GPU kernel 内部全程 bfloat，不做截断，让 Metal 驱动原生地处理 bfloat 算术（包括 SIMD 累加精度）。
+
+### 15.4 已有基础设施
+
+以下 Metal kernel 已实现（metal 3.1 bfloat 类型，runtime 编译通过）：
+- `dequant_matvec_affine_bf16out`：affine matmul → bfloat 输出
+- `rms_norm_rows_bf16out`：RMSNorm → bfloat 输出
+- `bf16_to_f32`：bfloat → float 转换
+- `mhc_blend_bf16`：mhc_pre 最终 blend 步骤 → bfloat 输出
+
+以及 `mhc_pre_with_premix()`（暴露 pre_mix 供 GPU 调用）。
+
+### 15.5 下一步工作
+
+要完成 metal-full 正确性，需要写一个 **mhc_pre_gpu** Metal kernel，实现：
+1. RMSNorm（f32 accumulation within kernel）→ mixes[24]，bfloat 存储
+2. sigmoid → pre_mix[4]，bfloat 存储
+3. `out_input = sum_m pre_mix[m] * residual[m,:]` → bfloat 输出（即 `mhc_blend_bf16` 的扩展版）
+
+关键：kernel 内部使用 `bfloat` 做中间存储，使计算路径与 MLX 完全匹配。
+
+**估计工作量**：1天（实现 + 验证单层 mhc_pre 输出与 MLX 一致），然后端到端测试。
+
+**当前状态**：
+- metal-full: 17% layer-0 误差，输出"Let's think step by step"（语义相关但错）
+- mlx oracle: Paris ✓, 4 ✓（smoke PASS）
+- 工具链完整，可快速迭代
