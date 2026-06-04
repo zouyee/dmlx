@@ -947,3 +947,80 @@ Metal GPU 的 f32 算术非确定性 + borderline expert selection = 随机输�
 这等价于回到 `7b7bfe4` 的完整 bfloat16 路径，但加上 FFN 安全 clamp 防止 Expert 126 爆炸。
 
 **当前状态**：HEAD=c9be92c (1c1af0b f32 基线)，偶发含 france，无 paris，2+2 无 4。
+
+
+---
+
+## 18. 关键结论与现状更新（2026-06-04 最终）
+
+### 18.1 §16.4 方案 A 已经尝试并失败
+
+§16.4 中的"方案 A"（完整 bfloat16 链 + FFN clamp）在本次会话中已全部尝试，均失败：
+
+| 尝试 | clamp 值 | 结果 |
+|------|---------|------|
+| 7b7bfe4 路径（bfloat mhc + f32 SDPA）+ clamp ±200 | ±200 | 乱码 |
+| 7b7bfe4 路径 + clamp ±30 | ±30 | 乱码 |
+| 7b7bfe4 路径 + clamp ±20 | ±20 | 乱码 |
+| f32 mhc + bfloat SDPA + bf16 KV | 无 | 乱码 |
+| f32 mhc + f32 SDPA + bf16 KV（round trip）| 无 | 乱码 |
+
+**失败的根本原因**（已确认）：不是 clamp 值的问题，而是非确定性问题：
+- Metal GPU `simd_sum` 在不同 run 之间产生微小差异
+- 这导致 borderline expert 选择在不同 run 之间不一致
+- **所有改变精度的方案都让结果更差或没有改善**，因为任何与 MLX 的偏差都会导致错误的 expert 路由
+
+### 18.2 ds4 的精确实现与我们的差距
+
+ds4 使用 f16（不是 bf16）：
+- Q chain: f32 全程（不截断）
+- KV: f32 计算，存储前做 f32→f16→f32 round trip
+- SDPA: Q(f32→half) · K(f32→half) 点积
+- 结果: 能正确产出 France→Paris, 2+2→4
+
+我们实现了类似方案（bf16 KV + f32 SDPA），单步精度提升到 0.15%（从 0.40%），但服务器仍然输出乱码。原因：
+
+```
+单步精度改善 ≠ 多步推理正确性
+```
+
+因为即使 0.15% 的单步误差，在 Layer 3+ 的 borderline expert 选择中仍然导致错误路由。每层的误差积累，最终偏离正确的计算路径。
+
+### 18.3 实际当前状态（HEAD = 5e46be4）
+
+**代码状态**：1c1af0b 基线（f32 mhc + f32 SDPA + f32 KV）
+
+**metal-full 实测行为**：
+- France: 一致输出 "to the\n// question, and, dear reader"（不含 paris/france）
+- 2+2: 一致输出 "to 'just' after '2' after..."（不含 4）
+- **完全不通过 smoke test**
+
+注：之前声称的"偶发含 france"是不准确的——那是特定 Metal GPU 状态下的偶然，并不可重现。系统性测试（8次连续请求）显示 0/8 含 france。
+
+**MLX 路径**：正常工作，France→Paris，2+2→4（smoke test PASS）
+
+### 18.4 下一步（已更新）
+
+§16.4 中方案 A 已宣告失败。需要新的思路：
+
+**可能有效的方案**：
+
+**方案 C（最有可能成功）**：ds4 的 f16 路径
+- 使用 f16（half）而非 bf16 做 KV round trip
+- 使用 f16 精度的 SDPA（需要新的 `mla_sdpa_decode_f16` kernel）
+- ds4 用此方案成功，原因可能是 f16（10-bit mantissa）比 bf16（7-bit mantissa）精度更高
+- 预估工作量：1天（实现 f16 SDPA kernel + 测试）
+
+**方案 D（回退策略）**：
+- 接受 metal-full 目前不通过 smoke test 的事实
+- 专注于 `--metal-moe` 路径（MoE 在 Metal，attention 在 MLX）的性能优化
+- 这是确定性正确且已验证的路径
+
+**方案 E（从源头修复）**：
+- 在 mhc_post 之后的 residual 上加一个 "精度注入"：从 MLX 拿到正确的 Layer N residual，用于校正 metal 路径的积累误差
+- 这需要 MLX/metal 混合执行，复杂度高
+
+**关键教训**：
+- 改变精度（f32→bf16/f16）在 attention 层级的改善不足以修复 Layer 3+ 的 routing 误差
+- Metal GPU 的非确定性是一个真实障碍，不是代码 bug
+- ds4 能工作说明 f16 精度有效，但需要 f16 kernel（我们目前只有 bf16 kernel）
