@@ -67,18 +67,8 @@ int main(void) {
     P.rope_tail_interleaved = mkpipe(d, lib, "rope_tail_interleaved");
     P.mla_sdpa_decode = mkpipe(d, lib, "mla_sdpa_decode");
     P.matvec_f32 = mkpipe(d, lib, "matvec_f32");
-    P.dequant_matvec_affine_bf16 = mkpipe(d, lib, "dequant_matvec_affine_bf16out");
-    P.rms_norm_rows_bf16 = mkpipe(d, lib, "rms_norm_rows_bf16out");
-    P.bf16_to_f32 = mkpipe(d, lib, "bf16_to_f32");
-    P.dequant_matvec_affine_bf16 = mkpipe(d, lib, "dequant_matvec_affine_bf16out");
-    P.rms_norm_rows_bf16 = mkpipe(d, lib, "rms_norm_rows_bf16out");
     P.bf16_to_f32 = mkpipe(d, lib, "bf16_to_f32");
     P.f32_to_bf16 = mkpipe(d, lib, "f32_to_bf16");
-    P.dequant_matvec_affine_bf16in_f32out = mkpipe(d, lib, "dequant_matvec_affine_bf16in_f32out");
-    P.dequant_matvec_affine_bf16in_bf16out = mkpipe(d, lib, "dequant_matvec_affine_bf16in_bf16out");
-    P.rms_norm_rows_bf16in_bf16out = mkpipe(d, lib, "rms_norm_rows_bf16in_bf16out");
-    P.rope_tail_bf16 = mkpipe(d, lib, "rope_tail_interleaved_bf16");
-    P.matvec_f32_bf16in = mkpipe(d, lib, "matvec_f32_bf16in");
     P.mla_sdpa_bfloat = mkpipe(d, lib, "mla_sdpa_decode_bfloat");
 
     AttnWeights aw;
