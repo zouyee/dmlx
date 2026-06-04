@@ -170,22 +170,6 @@ typedef struct {
     void *pipe_rms_norm_rows;
     void *pipe_rope_tail;
     void *pipe_mla_sdpa;
-    // bf16-output variants for Q chain alignment with MLX bf16 precision
-    void *pipe_dequant_matvec_affine_bf16;
-    void *pipe_rms_norm_rows_bf16;
-    void *pipe_bf16_to_f32;
-    // mhc_pre_gpu: full mhc_pre on GPU with bfloat out_input (matches MLX .astype(bf16))
-    void *pipe_mhc_pre_gpu;
-    // Full bf16 chain kernels (bfloat input + bfloat output throughout)
-    void *pipe_f32_to_bf16;
-    void *pipe_dequant_matvec_affine_bf16in_f32out;
-    void *pipe_dequant_matvec_affine_bf16in_bf16out;
-    void *pipe_rms_norm_rows_bf16in_bf16out;
-    void *pipe_rope_tail_bf16;
-    void *pipe_matvec_f32_bf16in;
-    // bfloat hidden state kernels (for full bf16 forward pass)
-    void *pipe_mhc_pre_bfloat;    // mhc_pre with bfloat residual I/O
-    void *pipe_mhc_post_bfloat;   // mhc_post with bfloat residual I/O
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -291,13 +275,13 @@ void moe_infer_set_layer_tid2eid(MoEInferEngine *engine, int layer,
 // Set the current token ID (call before each forwardLayer for hash routing).
 void moe_infer_set_token_id(MoEInferEngine *engine, int token_id);
 
-// Process one layer with full bfloat16 data flow.
-// hidden: [MHC_MULT, DIM] bfloat16 (uint16_t) input and output (in-place).
+// Process one layer: RMSNorm → MLA attention → routing → MoE → output.
+// hidden: [DIM] input, overwritten with output on return.
 // Returns 0 on success.
-int moe_infer_forward_layer(MoEInferEngine *engine, int layer, uint16_t *hidden, int pos);
+int moe_infer_forward_layer(MoEInferEngine *engine, int layer, float *hidden, int pos);
 
-// Forward pass for ALL layers. hidden: [MHC_MULT, DIM] bfloat16 input and output.
-int moe_infer_forward(MoEInferEngine *engine, uint16_t *hidden, int pos);
+// Forward pass for ALL layers. hidden: [DIM] input and output.
+int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
 
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);

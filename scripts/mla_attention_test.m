@@ -79,6 +79,7 @@ int main(void) {
     P.rms_norm_rows_bf16in_bf16out = mkpipe(d, lib, "rms_norm_rows_bf16in_bf16out");
     P.rope_tail_bf16 = mkpipe(d, lib, "rope_tail_interleaved_bf16");
     P.matvec_f32_bf16in = mkpipe(d, lib, "matvec_f32_bf16in");
+    P.mla_sdpa_bfloat = mkpipe(d, lib, "mla_sdpa_decode_bfloat");
 
     AttnWeights aw;
     aw.wq_a = load_qw("wq_a", Q_LORA_RANK, DIM);            // [1024,4096]

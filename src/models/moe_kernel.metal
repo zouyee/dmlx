@@ -634,6 +634,90 @@ kernel void mhc_post_bfloat(
 }
 
 
+// mla_sdpa_decode_bfloat: same as mla_sdpa_decode but Q, KV, and output are bfloat16.
+// This matches MLX's bf16 SDPA computation: bf16 Q · bf16 K = bf16 scores.
+// Accumulation is in f32 for numerical stability, but outputs are bf16.
+// q:   [n_heads, head_dim] bfloat
+// kv:  [n_kv, head_dim] bfloat (shared single KV head)
+// out: [n_heads, head_dim] bfloat
+// sinks: [n_heads] f32
+kernel void mla_sdpa_decode_bfloat(
+    device const bfloat* q        [[buffer(0)]],
+    device const bfloat* kv       [[buffer(1)]],
+    device const float*  sinks    [[buffer(2)]],
+    device bfloat*       out      [[buffer(3)]],
+    constant uint&       n_heads  [[buffer(4)]],
+    constant uint&       head_dim [[buffer(5)]],
+    constant uint&       n_kv     [[buffer(6)]],
+    constant float&      scale    [[buffer(7)]],
+    uint  head [[threadgroup_position_in_grid]],
+    uint  lid  [[thread_position_in_threadgroup]],
+    uint  tg   [[threads_per_threadgroup]]
+) {
+    if (head >= n_heads) return;
+    threadgroup float red[32];
+    device const bfloat* qh = q + (uint64_t)head * head_dim;
+
+    threadgroup float t_m;
+    threadgroup float t_s;
+    threadgroup float t_score;
+    if (lid == 0) { t_m = -INFINITY; t_s = 0.0f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc[8];
+    uint n_slots = (head_dim + tg - 1) / tg;
+    for (uint i = 0; i < n_slots; i++) acc[i] = 0.0f;
+
+    for (uint k = 0; k < n_kv; k++) {
+        device const bfloat* kvk = kv + (uint64_t)k * head_dim;
+        float partial = 0.0f;
+        for (uint d = lid; d < head_dim; d += tg) partial += float(qh[d]) * float(kvk[d]);
+        float dot = simd_sum(partial);
+        uint lane = lid % 32, sg = lid / 32;
+        if (lane == 0) red[sg] = dot;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid == 0) {
+            float tot = 0.0f;
+            uint n_sg = (tg + 31) / 32;
+            for (uint g = 0; g < n_sg; g++) tot += red[g];
+            t_score = tot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float score = t_score;
+        float m_old = t_m;
+        float m_new = max(m_old, score);
+        float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        float p = exp(score - m_new);
+        for (uint i = 0; i < n_slots; i++) {
+            uint d = lid + i * tg;
+            if (d < head_dim) acc[i] = acc[i] * corr + p * float(kvk[d]);
+        }
+        if (lid == 0) { t_s = t_s * corr + p; t_m = m_new; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Sink
+    if (lid == 0) {
+        float sink = sinks[head];
+        float m_old = t_m;
+        float m_new = max(m_old, sink);
+        float corr = (m_old == -INFINITY) ? 0.0f : exp(m_old - m_new);
+        t_s = t_s * corr + exp(sink - m_new);
+        t_m = m_new;
+        red[0] = corr;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float corr_final = red[0];
+    float inv_s = (t_s == 0.0f) ? 0.0f : 1.0f / t_s;
+    device bfloat* oh = out + (uint64_t)head * head_dim;
+    for (uint i = 0; i < n_slots; i++) {
+        uint d = lid + i * tg;
+        if (d < head_dim) oh[d] = (bfloat)((acc[i] * corr_final) * inv_s);
+    }
+}
+
 kernel void rms_norm_sum_sq(
     device const float* x       [[buffer(0)]],
     device float*       sum_sq  [[buffer(1)]],
