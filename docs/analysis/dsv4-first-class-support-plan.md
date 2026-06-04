@@ -900,3 +900,50 @@ f32 mhc 路径之所以优于所有 bfloat 路径：
 - `mhc_pre_bfloat` / `mhc_post_bfloat` GPU kernel（已实现）
 
 只需要把这些 kernel 正确串联，并在合适位置加安全 clamp。
+
+
+---
+
+## 17. 2026-06-04 会话追加：非确定性分析 + ds4 精度对比
+
+### 17.1 关键发现：Metal GPU 计算非确定性
+
+server 的输出**在不同 run 之间不确定**：
+- Run 1: "of France is... Let's think step by step"（含 france）
+- Run 2-3: "to the // question, and, dear reader"
+
+这不是 KV cache 污染（`resetKv` 每次请求前调用，清零 KV）。**根本原因**：Metal GPU 的 `simd_sum` 等归约操作在不同执行中因执行顺序不同而产生微小差异（FP 不确定性），在 expert 选择的边界区域导致不同的 topK 结果。
+
+### 17.2 ds4 精度分析
+
+从代码分析得出 ds4 的精度链：
+1. **Q chain**: 全程 f32（`matvec_q8_0`, `rms_norm_weight`, `head_rms_norm_inplace`）
+2. **KV 存储**: f32 → f16 → f32 round trip（`ds4_gpu_encode_f16_round_copy_for_raw_store`）
+3. **SDPA**: `half4` Q·K（f16 精度），f32 累加
+4. **SwiGLU clamp**: ±10（`DS4_SWIGLU_CLAMP_EXP = 10.0f`）
+
+ds4 用 **f16（half）** 精度，不是 bf16。但 ds4 可以正确产生 France→Paris, 2+2→4。
+
+### 17.3 单步精度测试结果
+
+| 方案 | rel_L2 vs f64 | 备注 |
+|------|--------------|------|
+| f32 SDPA (1c1af0b) | 0.40% | 当前基线 |
+| bf16 KV + bfloat SDPA | 0.23% | 服务器输出乱码 |
+| bf16 KV + f32 SDPA | 0.15% | **最佳单步精度**，服务器输出仍乱码 |
+
+bf16 KV round trip + f32 SDPA 的单步精度最好（0.15%），但服务器仍输出乱码。这说明单步精度改善不足以解决多步推理的发散问题。
+
+### 17.4 真正的根本原因
+
+Metal GPU 的 f32 算术非确定性 + borderline expert selection = 随机输出
+
+解决路径只有一个：**完全复制 MLX 的 bf16 计算链**，使 expert 选择结果确定且与训练时一致。具体需要：
+1. Q chain 每步截断到 bf16（wq_a → bf16 → q_norm → bf16 → wq_b → bf16 → head_norm → bf16）
+2. KV chain 每步截断到 bf16
+3. bfloat SDPA
+4. mhc_pre/post 全部用 GPU bf16 kernel
+
+这等价于回到 `7b7bfe4` 的完整 bfloat16 路径，但加上 FFN 安全 clamp 防止 Expert 126 爆炸。
+
+**当前状态**：HEAD=c9be92c (1c1af0b f32 基线)，偶发含 france，无 paris，2+2 无 4。
