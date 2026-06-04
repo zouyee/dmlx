@@ -822,3 +822,81 @@ f32 Metal 路径与 bf16 MLX 训练路径在 43 层后的完全发散，是**系
 - metal-full: 17% layer-0 误差，输出"Let's think step by step"（语义相关但错）
 - mlx oracle: Paris ✓, 4 ✓（smoke PASS）
 - 工具链完整，可快速迭代
+
+
+---
+
+## 16. 2026-06-04 会话：bfloat16 全链路尝试与根本原因分析
+
+### 16.1 本次会话工作
+
+本次会话尝试了以下方案（均以失败告终）：
+
+| 方案 | 结果 | 原因 |
+|------|------|------|
+| bfloat mhc_pre/post (GPU) + f32 SDPA | **Layer 29 爆炸**，ffn_out rms=505 | BOS token 的 bfloat residual 与 Expert 126 的 gate 方向高度对齐，权重=1.493，输出爆炸 |
+| bfloat mhc + f32 SDPA + clamp(±200) | 仍输出乱码 | clamp 只阻止了爆炸传播，但 bfloat mhc 的 residual 本身就是错的 |
+| f32 mhc + bfloat SDPA | 比基线更差 | Q 链仍是 f32，转换到 bf16 后与 MLX 的 bf16 Q 不同，导致更差的注意力输出 |
+| f32 mhc + bf16 attn_out 截断 | 更差 | 截断到错误的 bf16 bin，与 MLX 不一致 |
+
+### 16.2 关键发现
+
+**Layer 29 爆炸的精确机制**：
+- Expert 126 在 Layer 29 有一个特殊的 gate weight 方向（norm=3.52，高于平均 3.1）
+- bfloat mhc 路径下的 BOS token (token_id=0) 经过 29 层后，ffn_normed 恰好高度对齐 gate_w[126]
+- 这导致 Expert 126 的路由权重=1.493（理论最大值 1.5），其 down_proj 产生 rms=505 的输出
+- f32 mhc 路径下，BOS token 的残差方向不同，不触发此对齐
+
+**残差量级系统性漂移**：
+- L00: metal/MLX 比值=1.02（几乎完全一致）
+- L03: 比值=1.29（metal 比 MLX 大）
+- L17: 比值=0.97（开始比 MLX 小）
+- L29: 比值=0.63，L42: 比值=0.54
+
+L03 的突然跳变说明 Layer 3 的 expert 选择错误（borderline expert swap 导致选了不同的 expert，其输出恰好更大）。这个错误在后续层持续传播和放大。
+
+**bfloat SDPA 无效的原因**：
+我们的 Q 链是 f32，转换为 bf16 后得到的是 `bf16(f32_Q)`，而 MLX 的 Q 是 `bf16_chain(bf16_x, bf16_wqa, ...)` - 这两个 bf16 值不同。仅改变 SDPA 计算精度而不改变整个 Q 链的精度，会适得其反。
+
+### 16.3 为什么 f32 mhc (1c1af0b 状态) 是目前最好的
+
+f32 mhc 路径之所以优于所有 bfloat 路径：
+1. mhc_pre/post 用 f32，比 bf16 更精确（接近 f64 参考值）
+2. Layer 0 残差几乎完全正确（ratio=1.02）
+3. 注意力输出 rel_L2=0.67%（非常接近 MLX f64 参考）
+4. Layer 3+ 的 routing 误差来自 0.67% 的注意力误差积累
+
+当前状态（c9be92c commit）：
+- metal-full France: "of France is... Let's think step by step"（含 france，不含 paris）
+- metal-full 2+2: 错误（routing 在 L3 开始偏离）
+- MLX oracle: 全部正确
+
+### 16.4 真正的解决方案
+
+要让 metal-full 通过 smoke test，需要满足以下条件之一：
+
+**方案 A（推荐）：完整 bfloat16 注意力链**
+- wq_a 输出截断到 bf16
+- q_norm 在 bf16 上操作
+- wq_b 输出截断到 bf16
+- per-head norm 在 bf16 上操作
+- **关键**：Q 链和 KV 链都在 bf16 操作
+- SDPA 用 mla_sdpa_decode_bfloat（已实现）
+- mhc_pre/post 继续用 GPU bf16 kernel（已实现）
+- 添加 FFN 输出安全 clamp（防 Expert 126 爆炸）
+
+**方案 B（更保守）：数值校正**
+- 分析 L0-L2 的 expert 选择差异
+- 在 metal 路径中加入 routing score 的系统性校正
+- 工作量较大，效果不确定
+
+**方案 A 的预估工作量**：2-3天（实现完整 bf16 Q/KV 链 + 安全 clamp 调试）
+
+已有基础设施：
+- `mla_sdpa_decode_bfloat` kernel（已实现）
+- `dequant_matvec_affine_bf16in_bf16out` kernel（已实现）
+- `rms_norm_rows_bf16in_bf16out` kernel（已实现）
+- `rope_tail_interleaved_bf16` kernel（已实现）
+- `mhc_pre_bfloat` / `mhc_post_bfloat` GPU kernel（已实现）
+
+只需要把这些 kernel 正确串联，并在合适位置加安全 clamp。
