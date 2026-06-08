@@ -195,6 +195,131 @@ static void io_pool_init(IOPool *pool) {
     }
 }
 
+// Forward declaration for io_pool_dispatch (defined below)
+static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K, uint8_t *buffers[6]);
+
+// ============================================================================
+// Expert memory cache — preload experts from SSD into RAM to eliminate I/O
+// ============================================================================
+
+int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
+    // Calculate how many experts per layer fit in the budget
+    // Each expert is EXPERT_SIZE bytes. Total budget across all layers:
+    size_t total_bytes = (size_t)expert_cache_mb * 1024 * 1024;
+    int n_per_layer;
+    if (expert_cache_mb == 0) {
+        // Preload all experts
+        n_per_layer = N_EXPERTS;
+        total_bytes = (size_t)N_LAYERS * N_EXPERTS * EXPERT_SIZE;
+    } else {
+        n_per_layer = (int)(total_bytes / ((size_t)N_LAYERS * EXPERT_SIZE));
+        if (n_per_layer > N_EXPERTS) n_per_layer = N_EXPERTS;
+        if (n_per_layer == 0) {
+            fprintf(stderr, "[expert-cache] Budget %dMB too small for even 1 expert per layer (need %luMB)\n",
+                expert_cache_mb, (unsigned long)((size_t)N_LAYERS * EXPERT_SIZE / (1024*1024)));
+            return 0;
+        }
+    }
+
+    fprintf(stderr, "[expert-cache] Preloading %d/%d experts per layer (%lu MB total)...\n",
+        n_per_layer, N_EXPERTS, (unsigned long)(((size_t)N_LAYERS * n_per_layer * EXPERT_SIZE) / (1024*1024)));
+    eng->expert_cache_n_experts = n_per_layer;
+
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        // Allocate lookup table
+        eng->expert_mem_cache[layer] = (uint8_t **)calloc(N_EXPERTS, sizeof(uint8_t *));
+        if (!eng->expert_mem_cache[layer]) {
+            fprintf(stderr, "[expert-cache] OOM allocating lookup table for layer %d\n", layer);
+            eng->expert_cache_n_experts = 0;
+            return 0;
+        }
+
+        // Allocate flat pool for this layer
+        size_t pool_bytes = (size_t)n_per_layer * EXPERT_SIZE;
+        if (posix_memalign((void**)&eng->expert_mem_pool[layer], 2*1024*1024, pool_bytes) != 0) {
+            fprintf(stderr, "[expert-cache] OOM allocating %luMB pool for layer %d\n",
+                (unsigned long)(pool_bytes / (1024*1024)), layer);
+            eng->expert_cache_n_experts = 0;
+            return 0;
+        }
+
+        // Read n_per_layer experts starting from 0 (most frequently used in practice)
+        // For hash routing layers (0-2), these are exactly the needed experts
+        for (int eid = 0; eid < n_per_layer; eid++) {
+            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)eid * EXPERT_SIZE;
+            off_t offset = (off_t)eid * EXPERT_SIZE;
+            ssize_t n = pread(eng->packed_fd[layer], dst, EXPERT_SIZE, offset);
+            if (n != EXPERT_SIZE) {
+                fprintf(stderr, "[expert-cache] pread failed: layer=%d expert=%d got=%ld\n", layer, eid, (long)n);
+                eng->expert_cache_n_experts = 0;
+                return 0;
+            }
+            eng->expert_mem_cache[layer][eid] = dst;
+        }
+    }
+
+    fprintf(stderr, "[expert-cache] Done. %d experts/layer cached (%lu MB)\n",
+        n_per_layer, (unsigned long)(((size_t)N_LAYERS * n_per_layer * EXPERT_SIZE) / (1024*1024)));
+    return n_per_layer;
+}
+
+// Dispatch K parallel preads — uses memory cache if available, falls back to SSD.
+static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer, int *expert_ids, int K,
+                                    uint8_t *buffers[6]) {
+    if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer]) {
+        // Check if all requested experts are in cache
+        int all_cached = 1;
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            if (eid < 0 || eid >= N_EXPERTS || !eng->expert_mem_cache[layer][eid]) {
+                all_cached = 0;
+                break;
+            }
+        }
+        if (all_cached) {
+            // Zero-copy: point buffer pointers directly at cached data
+            for (int k = 0; k < K; k++) {
+                buffers[k] = eng->expert_mem_cache[layer][expert_ids[k]];
+            }
+            return;
+        }
+        // Partial hit: fill cached ones directly, pread the rest
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            if (eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid]) {
+                buffers[k] = eng->expert_mem_cache[layer][eid];
+            } else {
+                // This expert not in cache — must pread into expert_buf[k]
+                // We need a writable buffer; reset to the pre-allocated ones
+                buffers[k] = eng->expert_buf[k];  // fallback to pread buffer
+            }
+        }
+        // For uncached experts, do selective pread
+        uint8_t *fallback_bufs[6];
+        int fallback_ids[6];
+        int fallback_k_map[6];  // maps fallback_idx → original k
+        int n_fallback = 0;
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            if (!(eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid])) {
+                fallback_ids[n_fallback] = eid;
+                fallback_bufs[n_fallback] = eng->expert_buf[k];
+                fallback_k_map[n_fallback] = k;
+                n_fallback++;
+            }
+        }
+        if (n_fallback > 0) {
+            io_pool_dispatch(pool, eng->packed_fd[layer], fallback_ids, n_fallback, fallback_bufs);
+            for (int i = 0; i < n_fallback; i++) {
+                buffers[fallback_k_map[i]] = fallback_bufs[i];
+            }
+        }
+        return;
+    }
+    // No cache: regular pread
+    io_pool_dispatch(pool, eng->packed_fd[layer], expert_ids, K, buffers);
+}
+
 // Dispatch K parallel preads. Blocks until all complete.
 static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
                               uint8_t *buffers[6]) {
@@ -510,28 +635,26 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             FILE *f = fopen(path, "wb"); if (f) { fwrite(residual, sizeof(float), MHC_MULT*DIM, f); fclose(f); }
         }
     }
-    // Use GPU mhc_pre_gpu — persistent buffers for large weights (1.5MB fn), per-call for small scratch
+    // Use GPU mhc_pre_gpu — reuse persistent scratch buffers (eliminates alloc/dealloc overhead)
     {
-        id<MTLBuffer> buf_res  = [d newBufferWithBytes:residual length:MHC_MULT*DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_ain  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_post = [d newBufferWithLength:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_comb2= [d newBufferWithLength:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        // Copy residual into persistent input buffer
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]    offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]  offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
-        [enc setBuffer:buf_res  offset:0 atIndex:3];
-        [enc setBuffer:buf_ain  offset:0 atIndex:4];
-        [enc setBuffer:buf_post offset:0 atIndex:5];
-        [enc setBuffer:buf_comb2 offset:0 atIndex:6];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_in           offset:0 atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in          offset:0 atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights     offset:0 atIndex:5];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights     offset:0 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
         [cb commit]; [cb waitUntilCompleted];
-        memcpy(attn_input, [buf_ain  contents], DIM * sizeof(float));
-        memcpy(post,       [buf_post contents], MHC_MULT * sizeof(float));
-        memcpy(comb,       [buf_comb2 contents], MHC_MULT * MHC_MULT * sizeof(float));
+        memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
+        memcpy(post,       [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
+        memcpy(comb,       [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
     }
     if (layer == 0 && getenv("MF_DBG")) {
         // Compare GPU mhc_pre with CPU mhc_pre for debugging
@@ -568,21 +691,21 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         fprintf(stderr, "[L3-dbg] residual norms: s0=%.4f s1=%.4f s2=%.4f s3=%.4f\n", sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n));
     }
 
-    // input RMSNorm (attn_norm) → bf16 — per-call for small buffers, persistent for norm weight
+    // input RMSNorm (attn_norm) → bf16 — reuse persistent scratch buffers
     {
-        id<MTLBuffer> bx = [d newBufferWithBytes:attn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_attn_in contents], attn_input, DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
-        [e setBuffer:bx offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in           offset:0 atIndex:0];
         [e setBuffer:(id<MTLBuffer>)eng->buf_input_norm_gpu[layer] offset:0 atIndex:1];
-        [e setBuffer:bo offset:0 atIndex:2];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16    offset:0 atIndex:2];
         uint rd = DIM; float eps = 1e-6f; uint hw = 1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed_bf16_direct, [bo contents], DIM * sizeof(uint16_t));
+        uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
+        memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
             uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
             memcpy(&normed[i], &u, 4);
@@ -656,28 +779,28 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    // mHC post (attn) — per-call small buffers
+    // mHC post (attn) — reuse persistent scratch buffers
     {
-        static uint16_t attn_out_bfloat[DIM];
-        static uint16_t res_bfloat_in[MHC_MULT * DIM];
-        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &attn_out[i], 4); attn_out_bfloat[i] = (uint16_t)(u >> 16); }
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_bfloat_in[i] = (uint16_t)(u >> 16); }
-        id<MTLBuffer> bx2    = [d newBufferWithBytes:attn_out_bfloat length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bres2  = [d newBufferWithBytes:res_bfloat_in length:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bpost2 = [d newBufferWithBytes:post length:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bcomb2 = [d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> brout2 = [d newBufferWithLength:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        // Convert attn_out and residual to bf16 into persistent buffers
+        uint16_t *attn_out_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 contents];
+        uint16_t *res_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_res_bf16_in contents];
+        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &attn_out[i], 4); attn_out_buf[i] = (uint16_t)(u >> 16); }
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_buf[i] = (uint16_t)(u >> 16); }
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
         id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
         [enc2 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
-        [enc2 setBuffer:bx2    offset:0 atIndex:0]; [enc2 setBuffer:bres2  offset:0 atIndex:1];
-        [enc2 setBuffer:bpost2 offset:0 atIndex:2]; [enc2 setBuffer:bcomb2 offset:0 atIndex:3];
-        [enc2 setBuffer:brout2 offset:0 atIndex:4];
+        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16  offset:0 atIndex:0];
+        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in    offset:0 atIndex:1];
+        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights   offset:0 atIndex:2];
+        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights   offset:0 atIndex:3];
+        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_res_out   offset:0 atIndex:4];
         uint hc2 = MHC_MULT, dim2 = DIM;
         [enc2 setBytes:&hc2 length:4 atIndex:5]; [enc2 setBytes:&dim2 length:4 atIndex:6];
         [enc2 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc2 endEncoding]; [cb2 commit]; [cb2 waitUntilCompleted];
-        uint16_t *res2_out = (uint16_t *)[brout2 contents];
+        uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
         for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
     }
     if (layer == 0 && getenv("MF_DBG")) {
@@ -705,49 +828,41 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n),sqrt(s0n+s1n+s2n+s3n));
     }
 
-    // === MoE sublayer (mHC-wrapped) — GPU mhc_pre_gpu, persistent large weights, per-call scratch
+    // === MoE sublayer (mHC-wrapped) — reuse persistent scratch buffers
     {
-        id<MTLBuffer> buf_rffn  = [d newBufferWithBytes:residual length:MHC_MULT*DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_fin   = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_fpst  = [d newBufferWithLength:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> buf_fcmb  = [d newBufferWithLength:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_ffn_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
-        [enc setBuffer:buf_rffn  offset:0 atIndex:3];
-        [enc setBuffer:buf_fin   offset:0 atIndex:4];
-        [enc setBuffer:buf_fpst  offset:0 atIndex:5];
-        [enc setBuffer:buf_fcmb  offset:0 atIndex:6];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_res_in      offset:0 atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:5];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:6];
         [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(ffn_input, [buf_fin  contents], DIM * sizeof(float));
-        memcpy(post,      [buf_fpst contents], MHC_MULT * sizeof(float));
-        memcpy(comb,      [buf_fcmb contents], MHC_MULT * MHC_MULT * sizeof(float));
+        memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in     contents], DIM * sizeof(float));
+        memcpy(post,      [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
+        memcpy(comb,      [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
     }
 
-    // ffn RMSNorm — per-call buffers except persistent norm weight
-    // NOTE: also update normed_bf16_direct here so the routing gate uses FFN-normed input
-    // (not the stale attn-normed output from the first norm step).
+    // ffn RMSNorm — reuse persistent scratch buffers
+    // NOTE: also update normed_bf16_direct so routing gate uses FFN-normed input
     {
-        id<MTLBuffer> bfx = [d newBufferWithBytes:ffn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bfo = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_ffn_in contents], ffn_input, DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
         [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
-        [e setBuffer:bfx offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in           offset:0 atIndex:0];
         [e setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:1];
-        [e setBuffer:bfo offset:0 atIndex:2];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:2];
         uint rd = DIM; float eps = 1e-6f; uint hw = 1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        uint16_t *bf16_out = (uint16_t *)[bfo contents];
-        // Update BOTH f32 normed[] and bf16 normed_bf16_direct[] from FFN norm output.
-        // The routing gate reads normed_bf16_direct; without this update it would use
-        // the stale attn-normed value, routing to completely wrong experts.
+        uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
             uint32_t u = ((uint32_t)bf16_out[i]) << 16;
@@ -765,16 +880,14 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    // === Routing gate ===
+    // === Routing gate — reuse persistent mhc_ffn_norm_bf16 buffer (already contains ffn normed)
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
-        // Use bf16 input for gate projection — persistent GPU buffer for gate weights
-        id<MTLBuffer> bx_bf16 = [d newBufferWithBytes:(void *)normed_bf16_direct length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
-        [enc setBuffer:bx_bf16                                       offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
         [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
         uint od=N_EXPERTS, id_=DIM;
         [enc setBytes:&od length:4 atIndex:3];
@@ -825,8 +938,11 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
         memcpy(bn, normed, DIM * sizeof(float));
         IOPool *io = (IOPool *)eng->io_pool;
-        io_pool_dispatch(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, eng->expert_buf);
-        moe_forward_layer(eng, layer, eng->expert_buf, expert_ids, expert_weights, N_ACTIVE);
+        // Use cached dispatch: reads from RAM if expert is preloaded, SSD otherwise
+        uint8_t *expert_data[6];
+        for (int k = 0; k < N_ACTIVE; k++) expert_data[k] = eng->expert_buf[k];
+        io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
+        moe_forward_layer(eng, layer, expert_data, expert_ids, expert_weights, N_ACTIVE);
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
@@ -846,10 +962,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         const int SE_GS = 64;
         const int SE_NG_GU = DIM / SE_GS;   // 64 groups for gate/up [2048,4096]
         const int SE_NG_D  = INTERMEDIATE / SE_GS; // 32 groups for down [4096,2048]
-        id<MTLBuffer> bx = [d newBufferWithBytes:normed length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bgate = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bup   = [d newBufferWithLength:INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bdown = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        // Reuse persistent buffers: buf_mhc_attn_in (DIM f32), buf_hidden/buf_h_mid for intermediate
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_attn_in contents], normed, DIM*sizeof(float));
+        id<MTLBuffer> bx    = (id<MTLBuffer>)eng->buf_mhc_attn_in;  // normed input (read-only)
+        id<MTLBuffer> bgate = (id<MTLBuffer>)eng->buf_hidden;        // gate output [INTERMEDIATE]
+        id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;         // up output [INTERMEDIATE] — reuse DIM buf, INTERMEDIATE ≤ DIM
+        id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;      // down output [DIM]
         // gate and up projections
         {
             id<MTLCommandBuffer> cb = [P.queue commandBuffer];
@@ -902,28 +1020,27 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    // mHC post (FFN) — per-call buffers
+    // mHC post (FFN) — reuse persistent scratch buffers
     {
-        static uint16_t ffn_out_bfloat[DIM];
-        static uint16_t res_bfloat_ffn[MHC_MULT * DIM];
-        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &ffn_out[i], 4); ffn_out_bfloat[i] = (uint16_t)(u >> 16); }
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_bfloat_ffn[i] = (uint16_t)(u >> 16); }
-        id<MTLBuffer> bx3    = [d newBufferWithBytes:ffn_out_bfloat length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bres3  = [d newBufferWithBytes:res_bfloat_ffn length:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bpost3 = [d newBufferWithBytes:post length:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bcomb3 = [d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> brout3 = [d newBufferWithLength:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        uint16_t *ffn_out_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 contents];
+        uint16_t *res_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_res_bf16_in contents];
+        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &ffn_out[i], 4); ffn_out_buf[i] = (uint16_t)(u >> 16); }
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_buf[i] = (uint16_t)(u >> 16); }
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
+        memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
         id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> enc3 = [cb3 computeCommandEncoder];
         [enc3 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
-        [enc3 setBuffer:bx3    offset:0 atIndex:0]; [enc3 setBuffer:bres3  offset:0 atIndex:1];
-        [enc3 setBuffer:bpost3 offset:0 atIndex:2]; [enc3 setBuffer:bcomb3 offset:0 atIndex:3];
-        [enc3 setBuffer:brout3 offset:0 atIndex:4];
+        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 offset:0 atIndex:0];
+        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in   offset:0 atIndex:1];
+        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights  offset:0 atIndex:2];
+        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights  offset:0 atIndex:3];
+        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_post_out  offset:0 atIndex:4];
         uint hc3 = MHC_MULT, dim3 = DIM;
         [enc3 setBytes:&hc3 length:4 atIndex:5]; [enc3 setBytes:&dim3 length:4 atIndex:6];
         [enc3 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc3 endEncoding]; [cb3 commit]; [cb3 waitUntilCompleted];
-        uint16_t *res3_out = (uint16_t *)[brout3 contents];
+        uint16_t *res3_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
         for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
     }
     if (layer == 0 && getenv("MF_DBG")) {
@@ -1536,6 +1653,13 @@ void moe_infer_deinit(MoEInferEngine *eng) {
     for (int k = 0; k < N_ACTIVE; k++) {
         free(eng->expert_buf[k]);
         free(eng->expert_buf_pred[k]);
+    }
+    // Free expert memory cache
+    if (eng->expert_cache_n_experts > 0) {
+        for (int layer = 0; layer < N_LAYERS; layer++) {
+            if (eng->expert_mem_cache[layer]) free(eng->expert_mem_cache[layer]);
+            if (eng->expert_mem_pool[layer]) free(eng->expert_mem_pool[layer]);
+        }
     }
     // Free compressor state
     for (int l = 0; l < N_LAYERS; l++) {

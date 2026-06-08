@@ -86,8 +86,14 @@ extern fn moe_infer_set_layer_indexer(engine: *Engine, layer: c_int,
     idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight,
     idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void;
 
+extern fn moe_infer_preload_experts(engine: *Engine, expert_cache_mb: c_int) c_int;
+
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
+}
+
+pub fn preloadExperts(engine: *Engine, expert_cache_mb: i32) i32 {
+    return moe_infer_preload_experts(engine, @intCast(expert_cache_mb));
 }
 pub fn setTokenId(engine: *Engine, token_id: i32) void {
     moe_infer_set_token_id(engine, @intCast(token_id));

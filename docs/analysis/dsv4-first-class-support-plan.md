@@ -2211,3 +2211,285 @@ NATIVE=0 bash scripts/dsv4_smoke.sh
 ### 31.4 诊断参考
 
 完整诊断方法论见 §30，skill 文件见 `.kiro/steering/native-engine-debug.md`。
+
+---
+
+## §32 Native Engine 性能优化计划（2026-06-08）
+
+### 32.1 当前性能基准
+
+| 指标 | 值 |
+|------|-----|
+| 实测吞吐 | ~0.13-0.15 tok/s（5 token 请求约 33-40s）|
+| 上一版 MLX 路径 | ~1.0 tok/s（warm，Trust OS）|
+| 目标 | ≥3.0 tok/s |
+| 差距 | 20-23×（vs 目标），6-7×（vs 旧 MLX）|
+
+### 32.2 性能瓶颈分析
+
+通过代码计数，每个 decode token 需要：
+
+| 开销来源 | 数量 | 估计时间 | 原因 |
+|---------|------|---------|------|
+| `waitUntilCompleted` | **387 次**（9/层 × 43 层）| ~0.4s | 每次 Metal dispatch 同步等待 |
+| `newBufferWithBytes*` MTLBuffer 分配 | **1419 次**（33/层 × 43 层）| ~0.7s | 每次 kernel 都临时分配 buffer |
+| SSD I/O（6 experts × 13.4MB × 43 层）| 3.46 GB/tok | ~2.3s | expert 权重读取 |
+| Metal compute | 43 层 × ~6ms | ~0.26s | 实际 GPU 计算 |
+| 其他（memcpy、autorelease）| — | ~0.5s | 内存复制、ObjC 开销 |
+
+**核心问题**：
+1. **1419 次 MTLBuffer 临时分配/释放** — 每个 kernel 调用都重新分配缓冲区
+2. **387 次 GPU 同步屏障** — 每次 dispatch 后立即 `waitUntilCompleted`，GPU 空转等待 CPU
+3. **6 个 expert 串行 dispatch** — 可并行却串行执行
+
+### 32.3 优化路线图（参考 flash-moe + ds4）
+
+#### P0：持久化 MTLBuffer（最大收益，最简单）
+
+**原理**：把所有固定大小的临时 buffer 改为持久化分配，消除 1419 次 alloc/dealloc。
+
+**当前代码（每次调用都分配）**：
+```objc
+// 在 moe_infer_forward_layer 里，每层每次：
+id<MTLBuffer> bx = [d newBufferWithBytes:attn_input length:DIM*sizeof(float) ...];
+// ...用完就释放
+```
+
+**目标代码（持久化）**：
+```objc
+// 初始化时一次性分配，存在 eng->buf_* 里
+eng->buf_attn_input = [d newBufferWithLength:DIM*sizeof(float) ...];
+// 每次使用时直接 memcpy 进去
+memcpy([eng->buf_attn_input contents], attn_input, DIM*sizeof(float));
+```
+
+已有的持久化 buffer 示范：`eng->buf_attn_hc_fn[layer]`（大权重已经持久化了），但小的 scratch buffer 还没有。
+
+**预期收益**：~0.7s/tok → ~0.4 tok/s（+2.5×）
+
+**工作量**：2 天（主要是 engine.c 里的 `moe_infer_forward_layer` 函数）
+
+#### P1：6 Expert 并行 Dispatch
+
+**原理**：把 6 个 expert 的 gate/up/swiglu/down 从串行改为单个 command buffer 内并行。
+
+**当前（`moe_forward_layer`）**：
+```objc
+id<MTLCommandBuffer> cb = [...commandBuffer];
+for (int k = 0; k < K; k++) {
+    // gate+up+swiglu kernel for expert k
+    [enc endEncoding];
+}
+[cb commit]; [cb waitUntilCompleted];  // 等待所有 expert 完成
+```
+
+**目标**：已经是单 cb 里 6 个 encoder，只需一次 `waitUntilCompleted` — 这部分其实已经做了！真正的问题是 **每个 encoder 前还要分配 buffer**。
+
+**工作量**：与 P0 合并
+
+#### P2：合并 Command Buffers（减少 GPU 同步）
+
+**原理**：每层当前有 9 个独立的 command buffer + wait。应该合并成 2-3 个：
+1. **CB-ATT**：mhc_pre_attn + attn_norm + attention + mhc_post_attn（可以串联，无中间 CPU 依赖）
+2. **CB-FFN**：mhc_pre_ffn + ffn_norm + routing_gate（可以串联）
+3. **CB-MOE**：expert forward（已有，等 I/O 完成后 dispatch）
+
+**当前 9 次 wait**：
+1. mhc_pre_gpu (attn)
+2. input_RMSNorm
+3. mhc_post (attn)
+4. mhc_pre_gpu (ffn)
+5. ffn_RMSNorm
+6. routing_gate
+7. moe_forward (expert kernels)
+8. shared_expert (gate+up)
+9. shared_expert (down)
+
+**目标 3 次 wait**：CB1（mhc_pre+norm）→ 等 I/O →CB2（moe+shared）→ CB3（mhc_post_ffn）
+
+**预期收益**：减少 6 次不必要的 wait（~6ms/层 × 43 = ~0.26s/tok）
+
+**工作量**：3-4 天
+
+#### P3：Deferred Expert Forward（flash-moe CMD3 技术）
+
+**原理**：expert forward（最重的 GPU 计算）不 `waitUntilCompleted`，让 GPU 异步执行，CPU 立即处理下一层。下一层开始前只需同步。
+
+```
+Layer N:
+  CPU: routing → I/O pread experts → dispatch CMD3 (no wait!)
+  GPU: (running CMD3 for layer N)
+  CPU: immediately starts layer N+1 routing
+  ...
+  CPU: before dispatching layer N+1 CMD3 → wait for layer N CMD3
+```
+
+这是 flash-moe 的核心性能技术之一。
+
+**注意**：V4 expert 局部性只有 35%，时序预测预取对 V4 收益有限（flash-moe 文档已证明）。但 deferred 本身不依赖预测，只是让 GPU 和 CPU 并行工作。
+
+**预期收益**：GPU 计算（~0.26s/tok）几乎完全 overlap
+
+**工作量**：3 天（需要修改 `moe_forward_layer` 和层循环结构）
+
+#### P4：Expert I/O 优化
+
+**现状**：`io_pool_dispatch` 每层 6 个 expert 并行 pread，有线程池。但：
+1. pread 后数据在 CPU 内存 → `newBufferWithBytesNoCopy` 避免复制（已有）
+2. OS page cache 是主要手段
+
+**潜在优化**：
+- 预分配 `Metal shared memory` 用于 expert data（当前是 `posix_memalign`，已是对齐的）
+- 使用 `F_NOCACHE` flag 避免 page cache 污染（flash-moe 文档提到，但对 V4 效果不确定）
+
+**工作量**：1-2 天试验
+
+### 32.4 实施优先级
+
+```
+P0 持久化 MTLBuffer        → +2.5×  (0.13 → ~0.33 tok/s)  ★★★★★
+P1+P2 合并 CommandBuffer   → +1.5×  (0.33 → ~0.50 tok/s)  ★★★★
+P3 Deferred CMD3           → +1.3×  (0.50 → ~0.65 tok/s)  ★★★
+P4 I/O 优化                → +1.1×  (0.65 → ~0.72 tok/s)  ★★
+```
+
+**综合预期**：0.13 → ~0.7-0.8 tok/s（5-6× 提升）
+
+### 32.5 与 flash-moe / ds4 对比的结构性差距
+
+即使做完所有优化，native 仍与 flash-moe 4.36 tok/s 有差距：
+
+| 差距来源 | flash-moe | native (目标) | 说明 |
+|---------|-----------|--------------|------|
+| Expert I/O 量 | 43×K=4×~11MB ≈ 1.9GB/tok | 43×K=6×13.4MB ≈ 3.46GB/tok | V4 更多 expert，更大权重 |
+| SSD 速度 | M3 Max ~5GB/s | M4 Pro ~3-4GB/s | 硬件差异 |
+| 模型大小 | 60 层（Qwen GQA） | 43 层（V4 MLA）| 层数不同，但单层更重 |
+| Expert 局部性 | 71% hit rate | ~35% hit rate | V4 路由更分散 |
+
+**理论最大值**（I/O 限制）：3.46 GB × 1/(3.5 GB/s SSD) = ~1s/tok = ~1 tok/s
+
+**3 tok/s 的路径**：需要提升 expert 局部性（缓存 hot experts）或降低每 token I/O 量（SMELT 更激进预加载 + OS page cache 预热）
+
+### 32.6 近期可执行的最快修复
+
+**立即可做（1 天工作量，预计 2-3× 提升）**：
+
+在 `moe_infer_forward_layer` 里，把所有 `[d newBufferWithBytes:... length:N*sizeof(float) options:MTLResourceStorageModeShared]` 改为使用预分配的持久化 buffer。
+
+主要改动点（engine.c）：
+1. `buf_ain`（attn_input, DIM float） → 已有 `eng->buf_mhc_attn_in` 未使用
+2. `buf_post`, `buf_comb2`（mhc output） → 已有 `eng->buf_mhc_post_weights`, `eng->buf_mhc_comb_weights`
+3. `bx`（attn_input for RMSNorm）→ 复用 `buf_ain`
+4. `bfx`（ffn_input for RMSNorm）→ 已有 `eng->buf_mhc_ffn_in`
+5. `bx_bf16`（gate routing input）→ 可用 `eng->buf_mhc_attn_norm_bf16`
+
+这些 buffer 在 `init_metal` 里已经分配了，但 `moe_infer_forward_layer` 里没有使用！
+
+### 32.7 实测更新（2026-06-08）
+
+P0 优化（持久化 MTLBuffer）实施后，**性能无明显变化**：仍约 0.14 tok/s。
+
+**原因**：真正的瓶颈是 **SSD I/O**，而非 GPU 内存管理。
+
+| 指标 | 值 |
+|------|-----|
+| 每 token I/O 量 | 3.46 GB（43×6×13.4MB） |
+| 实测有效 SSD 带宽 | ~0.54 GB/s（远低于额定 5-6 GB/s）|
+| 理论每 token 时间 | 3.46/0.54 ≈ 6.4s |
+| 实测每 token 时间 | ~6.2s（吻合！）|
+| 8 次预热后变化 | 无改善（page cache 无法保存 3.46GB × N）|
+
+**根本原因**：native 引擎每层 pread 6 个 expert，每 token 读 258 次，共 3.46GB。OS page cache 在 48GB 系统中无法长期保留，每次都是冷读取。
+
+### 32.8 正确的优化方向
+
+**最高优先级：Expert 内存缓存（对应 MLX 的 SMELT）**
+
+MLX 路径之所以能达到 ~1 tok/s，核心原因是 `--smelt-experts 0.20` 预加载了 20% 的 expert（~51 个）到内存，极大减少了 SSD 读取次数（只在 cache miss 时才读 SSD）。
+
+native 引擎当前完全没有 expert 缓存！需要添加：
+
+1. **Expert 内存池**（最小版本）：启动时预分配 N GB RAM，预读取最常用的 experts（可以用 hash routing 的固定 expert 列表作为种子）
+2. **LFU/LRU 缓存**：复用已有的 `expert_cache.zig` 逻辑，在 native engine 层面接入
+3. **Hash routing 层（0-2）expert 预固定**：这 3 层用 hash routing，expert 完全确定，可以永久缓存（每层只需 6 × 13.4MB = 80MB × 3 = 240MB）
+
+**具体实施路径**：
+
+```
+A. 最小改动（1-2 天）：
+   - 在 moe_infer_init 时，对 hash routing layers 0-2 直接 preload 所有选中的 experts 到内存
+   - 对 decode 时频繁出现的 experts 建立简单 LRU（16GB 可缓存 ~1200 个 expert）
+   
+B. 完整优化（1 周）：
+   - 移植 expert_stream.zig 的 IOPool + LFU cache 到 native engine
+   - 支持 --smelt-cache N 参数
+   - Expert 预测：上一个 token 的 routing 结果用于异步 pread 下一层
+```
+
+**预期收益**：
+- hash routing 3 层完全缓存：节省 3/43 ≈ 7% I/O
+- 20% expert 缓存：cache hit ~60-70%（类似 MLX SMELT）→ 约 3× I/O 减少 → ~0.4 tok/s
+- 60% expert 缓存：大部分命中 → ~1 tok/s（接近旧 MLX）
+
+**关键数字**：
+- 48GB RAM - ~8GB 模型 = ~40GB 可用
+- 256 experts × 13.4MB = 3.43GB 可以全量缓存！
+- 全量缓存所有 expert：每 token 从 RAM 读 3.46GB @100 GB/s = 35ms/tok = ~29 tok/s
+
+### 32.9 缓存策略分析与修正（2026-06-08）
+
+#### 尝试结果
+
+1. **P0：持久化 MTLBuffer** — 无明显收益（~0.14 tok/s，与之前相同）
+   - 原因：I/O 才是瓶颈，不是 GPU 内存分配
+
+2. **10GB Expert 缓存（random 18 experts/layer）** — 无明显收益
+   - 原因：18/256 = 7% cache hit rate，score-based routing 路由到这 18 个的概率极低
+
+#### 性能约束数学
+
+```
+每 token I/O = 43 层 × 6 experts × 13.4 MB = 3.46 GB
+实测有效带宽 ≈ 0.54 GB/s（OS page cache 无法保持，SSD 冷读）
+理论时间 = 3.46 / 0.54 = 6.4 s/tok → 0.16 tok/s ← 与实测吻合！
+```
+
+这是**硬件/模型结构约束**，不是软件 bug。
+
+#### 为什么 MLX 路径能达到 1.02 tok/s？
+
+MLX 用 `--smelt-experts 0.20`（预加载 20% expert = 51个）+ streaming 模式：
+- 51 个常用 expert 在内存（~680MB），每次访问这些时**零 I/O**
+- 只有 cache miss 才读 SSD
+- 实测 hit rate ~23-27% → 有效 I/O 减少到 ~2.5 GB/tok → ~0.54/2.5 × 0.16 ≈ 不对...
+
+实际上：MLX SMELT 加速来自**只加载了 20% 的 expert + 路由 bias 让它避开未加载的 expert**。这使得每层实际参与的 expert 变少，减少了 I/O。
+
+#### 正确的优化方案
+
+**方案 A：All-expert 内存缓存（全量，理论最优）**
+- 256 experts × 43 layers × 13.4MB = **147 GB** — 无法在 48GB 机器上实现
+
+**方案 B：全量缓存单层（最实用的完整优化）**
+- 每层的 256 experts = 256 × 13.4MB = 3.43 GB
+- 40GB 可用 → 可以完整缓存 **11-12 层**
+- 这 12 层的 I/O 为 0，其他 31 层仍读 SSD
+- 预期收益：时间 = (31/43 × 6.4s) + 0 = 4.6s/tok ≈ 0.22 tok/s（+40%）
+
+**方案 C：SMELT 等价——只缓存 top-K 最常用的 expert（最优性价比）**
+- 目标：每层缓存 N 个，使 routing 命中率 > 60%
+- 需要统计：做若干次推理，记录每层被选中的 expert 频率，缓存最热的 N 个
+- 预期：10GB 缓存 18 个/层，如果是热门 expert 则 hit rate ~60% → 有效 I/O 降到 ~40% → 速度翻 2.5×
+
+**方案 D：ds4 的方案——时序预测 + 双缓冲**
+- 用上一个 token 的 expert 选择来预测下一个 token 的 expert
+- V4 命中率约 35%（历史记录），比随机好 35/7% ≈ 5× 对于 18 个缓存
+- 但 ds4 文档指出 V4 局部性很低，对 V4 效果有限
+
+**立即可实施的最优方案（2 天工作量）**：
+
+1. 收集 token routing 统计（在 forward 循环中记录每层最常用的 expert）
+2. 按频率预加载最热的 N 个 expert 到每层缓存
+3. 在后续 token 中命中缓存时直接使用 RAM 数据
+
+预期能从 0.14 tok/s → 0.5-1.0 tok/s（3-7× 提升）。

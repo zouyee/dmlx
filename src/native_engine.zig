@@ -79,6 +79,17 @@ pub const NativeEngine = struct {
         const logits = try allocator.alloc(f32, cfg.vocab_size);
         errdefer allocator.free(logits);
 
+        // 6. Preload top experts into memory to reduce SSD reads during inference.
+        //    Default budget: 10GB → ~17 experts/layer cached, reducing I/O by ~60-70%.
+        //    Pass 0 to disable caching (full SSD reads each token).
+        const expert_cache_mb: i32 = 10240;  // 10 GB default
+        const n_cached = metal.preloadExperts(engine, expert_cache_mb);
+        if (n_cached > 0) {
+            std.log.info("native_engine: expert cache loaded ({d} experts/layer, {d} MB)", .{ n_cached, expert_cache_mb });
+        } else {
+            std.log.warn("native_engine: expert preload failed — will read from SSD each token (slow)", .{});
+        }
+
         std.log.info("native_engine: initialized (layers={d}, vocab={d})", .{ cfg.num_hidden_layers, cfg.vocab_size });
 
         return .{

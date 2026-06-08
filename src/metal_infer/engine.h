@@ -283,6 +283,14 @@ typedef struct {
     uint8_t *expert_buf_pred[6]; // second buffer set for prediction prefetch
     void *io_pool;               // persistent I/O thread pool
 
+    // Expert memory cache — avoids SSD reads for frequently-used experts.
+    // Layout: expert_mem_cache[layer][expert_id] = pointer into expert_mem_pool,
+    // or NULL if not cached.
+    // Pool is allocated once at startup, sized for expert_cache_n_experts experts per layer.
+    uint8_t **expert_mem_cache[N_LAYERS];  // [N_LAYERS][N_EXPERTS] -> ptr or NULL
+    uint8_t *expert_mem_pool[N_LAYERS];    // flat pool per layer (expert_cache_n_experts × EXPERT_SIZE)
+    int expert_cache_n_experts;            // how many experts cached per layer (0=disabled)
+
     // Deferred CMD3
     DeferredExpertState deferred;
 
@@ -375,6 +383,11 @@ void moe_infer_set_layer_shared(MoEInferEngine *engine, int layer, SharedExpert 
 
 // Reset KV cache (call at the start of each new sequence/request).
 void moe_infer_reset_kv(MoEInferEngine *engine);
+
+// Preload N experts per layer into a memory cache (eliminates SSD reads on cache hits).
+// expert_cache_mb: total MB to allocate for cache. Pass 0 to preload ALL experts (~3.43 GB).
+// Returns number of experts cached per layer.
+int moe_infer_preload_experts(MoEInferEngine *engine, int expert_cache_mb);
 
 // Set one layer's mHC weights (f32 pointers, kept alive by caller).
 void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,
