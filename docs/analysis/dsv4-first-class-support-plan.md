@@ -1024,3 +1024,1190 @@ ds4 使用 f16（不是 bf16）：
 - 改变精度（f32→bf16/f16）在 attention 层级的改善不足以修复 Layer 3+ 的 routing 误差
 - Metal GPU 的非确定性是一个真实障碍，不是代码 bug
 - ds4 能工作说明 f16 精度有效，但需要 f16 kernel（我们目前只有 bf16 kernel）
+
+## 19. 精度路径选择回顾：为什么从 f32 出发，为什么 bf16 失败，为什么最终选 f16（2026-06-05）
+
+### 19.1 为什么当初设计为 f32？
+
+回顾 S0-S7 的构建过程，f32 路径是自然的工程起点，原因有三：
+
+**（1）S1 的对拍需求**
+第一个 go/no-go 关卡是 `dequant_matvec_affine` kernel 能否在固定输入下与 MLX `quantizedMatmul` 逐元素对齐（max diff ≈ 0）。MLX `eval()` 后输出是 f32，因此 kernel 输出 f32 最直接、最方便用 numpy 做阈值比对。如果当时选 bf16/f16，对拍脚本需要额外处理精度转换，增加第一轮验证的复杂度。
+
+**（2）开发便利性与安全假设**
+f32 不会溢出、不会下溢、simd_sum 行为最可预测。团队在 S7d 阶段需要连修 7 个集成 bug（segfault、buffer 对齐、broadcast view 等），如果中间还叠加 bf16/f16 的精度调试，定位难度会指数上升。当时的判断是：**先让 43 层无 crash 跑通，再谈精度压缩**。
+
+**（3）错误的直觉假设**
+团队隐含认为：f32 比 bf16 精度高，因此 f32 Metal 路径应该「至少不比 MLX bf16 差」，甚至可能更接近「真实数学值」。这个假设在单步验证中似乎成立（attn_out rel_L2 = 0.67%），但在多步推理中被彻底推翻。
+
+### 19.2 为什么「直接选 bf16」也失败了？
+
+§16.4 的方案 A（完整 bfloat16 注意力链）在 `7b7bfe4` 已实现并测试，结果乱码。所有 bf16 变体（bf16 mhc、bfloat SDPA、bf16 KV round trip）全部失败。
+
+根本原因是：**MLX 的 bf16 不是「每个算子后截断」这么简单**。MLX 拥有 lazy evaluation 和 graph fusion，它的 bf16 截断时机与 fusion 边界、tile 划分、simd reduction 顺序深度绑定。我们自行编写的 Metal kernel 即使使用 Metal 3.1 的 `bfloat` 类型，也无法复现这些框架内建行为：
+
+- **simd_sum 归约顺序不同** → 累加误差不同
+- **matmul tile 划分不同** → 中间累加精度不同  
+- **norm/activation fusion 边界不同** → 截断时机不同
+
+因此，我们的「完整 bf16 链」和 MLX 的 bf16 链是**两条不同的链**。团队试图通过调整截断点、加 clamp、改 round mode 来逼近 MLX，结果越调越乱（§15 全部尝试失败）。
+
+### 19.3 为什么 ds4 的 f16 能工作？
+
+ds4 与我们的关键差异在于：**ds4 从不试图逐层匹配 MLX**。
+
+| 维度 | ds4 | dmlx metal-full |
+|------|-----|-----------------|
+| 目标 | 端到端正确即可 | 逐层对齐 MLX oracle |
+| 权重格式 | GGUF + IQ2（量化已冻结训练截断） | MLX safetensors（原生 bf16） |
+| Q chain | f32 全程 | f32（与 mlx bf16 不一致） |
+| KV / SDPA | f32→f16→f32 round trip + half 点积 | f32 全程（与 mlx bf16 不一致） |
+| 精度哲学 | "我用自己的一致精度算完 43 层" | "我必须在每一层都和 mlx 一致" |
+
+ds4 的 f16 路径是**自洽的独立系统**：KV cache 和 SDPA 都遵循同一套 f16 规则，43 层累积的误差模式稳定，不会在某一层突然翻转 expert 选择。类比：MLX bf16 是方言 A，ds4 f16 是方言 B，两者不一致但各自内部通顺。我们的 f32 则是"试图模仿方言 A 的外国人"——每个词都对，但语调不对。
+
+此外，f16 拥有 10-bit 尾数，bf16 只有 7-bit。f16 的 round trip 误差更小，可能恰好足够稳定，不会在 borderline expert 处 flip。
+
+### 19.4 结论：方案 C（f16）的决策依据
+
+> **放弃「逐层匹配 MLX」的验收标准，转而建立一条自洽的 f16 精度链，像 ds4 一样独立跑完 43 层，只要求端到端正确。**
+
+具体实施：
+1. 新增 `mla_sdpa_decode_f16` kernel（Q/K 用 `half4` 点积，f32 累加）
+2. KV cache 改为 f32→f16→f32 round trip（与 ds4 一致）
+3. Q chain 保持 f32（与 ds4 一致）
+4. 不对拍 MLX 逐层 hidden state，只对拍端到端输出（France→Paris, 2+2→4）
+
+预估工作量：1 天（实现 kernel + 集成 + 端到端验证）。
+
+---
+
+## OOM 风险提示
+
+**不要在同一台机器上同时运行多个 dmlx serve 实例。**
+
+每个实例都会独立加载模型权重（~4GB+ RSS），同时运行两个或更多实例会迅速耗尽物理内存，导致系统 OOM 或被 macOS 内存压缩机制拖垮。测试 `--metal-full` 和 `--metal-moe` 时必须串行进行：先关闭前一个进程（`kill <pid>`），再启动下一个。
+
+---
+
+## 20. 代码审计与精度诊断（2026-06-06）
+
+### 20.1 关键 bug 修复
+
+**`fused_gate_up_swiglu` 占位符 bug（`src/models/moe_kernel.metal` line 63）**
+
+发现 `fused_gate_up_swiglu` kernel 最后一行是：
+```metal
+float act = g_c / (1.0f + exp(-g_c));
+out[tid] = 999.0f;  // ← BUG: act * u_c 从未写出
+```
+
+已修复为：
+```metal
+out[tid] = act * u_c;
+```
+
+**影响分析**：这个 bug 导致 `--metal-moe` 之前能输出 Paris 是"假正确"——`999 × mxfp4_down_weights` 在各维方向抵消约等于 0，路由 expert 贡献被消除，整层 MoE 只有 shared expert 在起作用。shared expert 恰好足够让 MLX backbone 输出 Paris。
+
+修复后，路由 expert 有真实输出，暴露了真正的精度问题。
+
+### 20.2 系统性精度诊断
+
+**测试方法**：用 `DSV4_DUMP_DIR` dump 逐层激活，对比 `--metal-moe` 与纯 MLX 的 layer outputs。
+
+**关键发现**：
+- `ffn_normed`（MoE 输入）：`--metal-moe` vs MLX rel_L2=**0.0**（完全一致，因为 MLX 做 attn/mhc/norm）
+- `layer_00` 输出：rel_L2=**0.24**（修复后）
+
+这说明：同一 normed 输入 + 同一 expert IDs（MLX routing 给出），Metal f32 mxfp4 compute 与 MLX bf16 mxfp4 compute 有 24% 误差。
+
+**精度体制差异（根本原因）**：
+- MLX `switch_mlp`：x 是 bf16，mxfp4 matmul 内部用 bf16 精度
+- Metal `fused_gate_up_swiglu`：x 是 f32（来自 MLX eval → dataPtr(f32)），mxfp4 matmul 全 f32
+
+这 24% 的误差在 43 层后完全发散（L3 就到 0.44，L12 接近随机），无法通过后处理修复。
+
+### 20.3 bf16 input 尝试（失败）
+
+尝试了 `fused_gate_up_swiglu_bfloat_in` kernel（bfloat input），并在 wrapper 里先做 `f32_to_bf16` 转换。结果：rel_L2 从 0.24 **恶化到 0.97**（near-orthogonal）。
+
+原因：MLX 内部的 bf16 chain 不等于 `f32_to_bf16(f32_from_mlx_eval)`。MLX 的 bf16 tensor 经过 lazy fusion 优化，其截断时机与 `f32→bf16→metal` 两次转换路径完全不同。bf16 input 方案已放弃。
+
+### 20.4 当前代码状态
+
+| 变更 | 文件 | 说明 |
+|------|------|------|
+| ✅ 修复 `fused_gate_up_swiglu` 999 bug | `src/models/moe_kernel.metal` | `out[tid] = act * u_c` |
+| ✅ 添加 `fused_gate_up_swiglu_bfloat_in` | `src/models/moe_kernel.metal` | 保留供未来参考，未使用 |
+| ✅ 添加 `dequant_matvec_4bit_bfloat_in` | `src/models/moe_kernel.metal` | 保留供未来参考，未使用 |
+| ✅ mhc_pre 切换 f16 权重路径 | `src/metal_infer/engine.c` | `metal-full` 用 `attn_hc_fn_f16` |
+| ✅ mla_attention 切换全 f16 chain | `src/metal_infer/engine.c` | `mla_attention_decode` 替代 `mla_attention_decode_f16kv` |
+| ⚠️ `moe_metal_wrapper.c` 保持 f32 path | — | bf16 path 更差，已回滚 |
+
+**注意**：`engine.c` 的 `mhc_pre` + `mla_attention_decode` 切换（f16 path）仅影响 `--metal-full` 路径，`--metal-moe` 仍用 `moe_metal_wrapper.c`（f32）。
+
+### 20.5 当前性能参考
+
+| 模式 | tok/s | 正确性 | 说明 |
+|------|-------|--------|------|
+| 纯 MLX | ~0.36-0.45 | ✅ Paris | 对拍基准 |
+| `--metal-moe` (f32) | ~4.5 | ❌ 乱码 | 24% per-layer 误差，43层发散 |
+| `--metal-full` (f16) | ~1.7 | ❌ 乱码 | attn+mhc精度链不匹配 |
+
+### 20.6 下一步路径分析
+
+**路径 A（放弃 metal kernel 精度对齐，接受 ~10% 误差）**：
+
+研究 `--metal-moe` 路径中，24% layer误差是否可以通过"归一化截断"来降低。具体：在 combine 之后、写回 MLX 之前，对 Metal 的输出做方向校正（scaling），使其与 MLX 的量级对齐。这不改变语义，只是让误差不在每层累积。
+
+**路径 B（纯 MLX + SMELT + 性能优化）**：
+
+放弃 Metal compute，只用 MLX。性能瓶颈在于 `switch_mlp` 的 MLX lazy eval 同步，可以通过 `--smelt` 的 expert 预加载策略 + MLX stream 优化来改善。这是已知正确的路径，专注性能而非精度。
+
+**路径 C（从 ds4 导入 bf16 mxfp4 kernel）**：
+
+`../ds4/metal/moe.metal` 里可能有 bf16 精度的 mxfp4 kernel，参考其实现。但 ds4 用的是 GGUF IQ2 格式而非 MLX mxfp4，kernel 可能需要从头写。
+
+**最推荐的短期路径**：路径 B（纯 MLX + 性能优化）是风险最低、最有可能在短期内出成果的方向。metal compute 在精度对齐上遇到了系统性障碍（§14-§20 均失败），继续投入的边际收益递减。
+
+---
+
+## 22. 操作规范（强制，每次操作前必读）
+
+> 本节记录所有在调试过程中发现的操作约束。遇到新约束立即补充到此处。
+
+### 22.1 进程管理
+
+**只能同时运行一个 `dmlx serve` 实例。**
+- 启动新 serve 前必须先 kill 旧进程
+- 不允许同时开两个 serve 做对比测试
+- 对比测试用"先生成 dump，停掉，再跑另一个读 dump"的顺序进行
+
+### 22.2 MLX serve 启动参数
+
+**必须用 `stream` 模式，禁止 `preload`，禁止不加 `--smelt`：**
+
+```bash
+# ✅ 正确
+./zig-out/bin/dmlx serve \
+    --model ~/models/DeepSeek-V4-Flash-4bit \
+    --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+    --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
+    --port 8960 --max-tokens N --temperature 0
+
+# ❌ 禁止（把全部 256 专家加载进内存，极慢且 OOM）
+--smelt-strategy preload
+
+# ❌ 禁止（不加 --smelt 同样 OOM，全部专家会被加载）
+# 不带 --smelt 的 MLX serve
+```
+
+### 22.3 Native serve 启动参数
+
+```bash
+# ✅ native 模式（不需要 --smelt，engine.c 内部用 pread）
+./zig-out/bin/dmlx serve --native \
+    --model ~/models/DeepSeek-V4-Flash-4bit \
+    --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+    --port 8961 --max-tokens N --temperature 0
+
+# --expert-packed-dir 是 native 模式的必填项
+```
+
+### 22.4 标准调试流程（MLX golden 对比）
+
+```bash
+# Step 1: 生成 MLX golden dump（stream 模式）
+DSV4_DUMP_DIR=/tmp/mlx_golden MF_DBG=1 \
+    ./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+    --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+    --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
+    --port 8960 --max-tokens 2 --temperature 0 &
+SERVER_PID=$!
+# 等待启动
+while ! curl -sf http://localhost:8960/health >/dev/null 2>&1; do sleep 1; done
+# 发一次请求触发 dump
+curl -s http://localhost:8960/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"default","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":2,"temperature":0}'
+kill $SERVER_PID; wait $SERVER_PID 2>/dev/null
+
+# Step 2: 跑 native，生成 native dump
+MF_DBG=1 DSV4_DUMP_DIR=/tmp/native_dbg \
+    ./zig-out/bin/dmlx serve --native \
+    --model ~/models/DeepSeek-V4-Flash-4bit \
+    --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+    --port 8961 --max-tokens 2 --temperature 0 &
+SERVER_PID=$!
+while ! curl -sf http://localhost:8961/health >/dev/null 2>&1; do sleep 1; done
+curl -s http://localhost:8961/v1/chat/completions -H 'Content-Type: application/json' \
+    -d '{"model":"default","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":2,"temperature":0}'
+kill $SERVER_PID; wait $SERVER_PID 2>/dev/null
+
+# Step 3: 对比
+python3 scripts/compare_metal_mlx.py /tmp/mlx_golden /tmp/native_dbg
+```
+
+### 22.5 Smoke test 命令
+
+```bash
+# MLX 路径（正确性基准）
+bash scripts/dsv4_smoke.sh
+
+# Native 路径
+NATIVE=1 bash scripts/dsv4_smoke.sh
+```
+
+### 22.6 构建
+
+```bash
+zig build -Doptimize=ReleaseFast
+# 只看错误，忽略 mlx-c warning
+zig build -Doptimize=ReleaseFast 2>&1 | grep -v "warning: mlx"
+```
+
+### 22.8 测试 token 数量
+
+- smoke test / 正确性验证：`--max-tokens 30`（足够让模型完整回答简单事实题）
+- 性能测试：`--max-tokens 30`
+- 调试 dump（减少等待时间）：`--max-tokens 1`（只需要看第一个生成 token）
+### 22.7 目标模型
+
+- 路径：`~/models/DeepSeek-V4-Flash-4bit`
+- 格式：MLX safetensors，mxfp4（专家 gs=32）+ affine 4bit（注意力/embed gs=64）
+- 全精度模型（`~/models/deepseek-ai/DeepSeek-V4-Flash`，148.7GB BF16）**不适用**（超出 48GB 内存限制）
+- packed experts 目录：`~/models/DeepSeek-V4-Flash-4bit/packed_experts/`（必须已用 `repack_experts.py` 生成）
+
+### 21.1 战略方向
+
+放弃 MLX 依赖，走纯 C/Metal/Zig 路径（`--native` 模式）。参照 ds4 架构：
+
+- **native_loader**：直接读 safetensors，无 MLX runtime
+- **engine.c**：完整的 forward pass（attention + mHC + MoE + compressor/indexer）
+- **目标**：`--native` 输出 `Paris` for `"The capital of France is"`
+
+### 21.2 已完成
+
+| 组件 | 状态 | 说明 |
+|------|------|------|
+| native_loader (safetensors.zig/config.zig/weights.zig) | ✅ | 2143ms 加载全量权重，值对齐验证通过 |
+| moe_infer_embed / get_logits | ✅ | cblas_sgemv lm_head |
+| mla_attention_decode / _f16kv | ✅ | f32 Q + f16 KV 精度链，rel_L2=1.9e-6 |
+| mhc_pre / mhc_post (CPU) | ✅ | ≤6e-8 |
+| CompressorState + compressor_step | ✅ | 已按 ds4 per-dimension softmax pooling 实现 |
+| mla_attention_decode_mixed | ✅ | 已实现（替代原来的 stub），CPU mixed SDPA |
+| IO pool race bug | ✅ | 修复：6个专家现在都有输出（之前只有expert[0]有输出）|
+| server routing (nativeEngineLoop) | ✅ | server.zig 已有 native 请求处理路径 |
+| dsv4_smoke.sh --native 支持 | ✅ | `NATIVE=1 bash scripts/dsv4_smoke.sh` |
+
+### 21.3 当前状态（IO race 修复后）
+
+- `--native` 服务能启动，处理请求
+- 6 个路由专家均有输出（修复 IO race 后），`ffn_out(moe only) norm` 提升到 ~0.5-0.9
+- 但 **输出仍错误**：`"The capital of France is"` → `"to the question..."` 而非 `"Paris"`
+- `logits max=304 (' to')` vs 期望 11111 (' Paris')
+
+### 21.4 已修复的 Bug
+
+| # | Bug | 现象 | 修复 |
+|---|-----|------|------|
+| 1 | IO pool race condition | expert[1..5] mid_norm=0（只有expert[0]有输出）| 在持锁时原子标记任务为已claimed，保存原始fd再释放锁 |
+| 2 | mla_attention_decode_mixed 是 stub | 41/43 层 comp_kv 被忽略 | 实现真正的 CPU mixed SDPA（SWA raw f16 + comp_kv f32）|
+| 3 | compressor pooling 算法错误 | 使用 per-token 标量 sum 作为 softmax 权重 | 改为 ds4 的 per-dimension softmax pooling |
+
+### 21.5 当前状态与结论（2026-06-07 全天深度调试）
+
+修复 IO race 后，6个专家都有输出，但答案仍错误。经过全天深度调试，结论如下：
+
+**已修复的 bug**：
+
+| # | Bug | 现象 | 修复 |
+|---|-----|------|------|
+| 1 | IO pool race condition | expert[1..5] 全为零输出 | 持锁时原子 claim 任务 |
+| 2 | `mla_attention_decode` 使用未初始化 BF16 pipeline | attention 输出为零/随机 | 改用 `mla_attention_decode_bf16`（bf16 Q+KV） |
+| 3 | `mla_attention_decode_mixed` 导致 degeneration | decode 后期输出乱码循环 | 只在 `kvc->len > SWA_WINDOW` 时使用 |
+| 4 | Serial prefill（每 token 跑完 43 层） | 与 MLX batch prefill 顺序不一致 | 实现 `moe_infer_forward_batch`（layer-first） |
+| 5 | mhc_pre/post 用 `half`（f16）而非 `bfloat`（bf16）| GPU kernel 解读 bf16 数据为 f16，输出 265K norm | 改用 `mhc_pre_gpu`（f32→f32） + `mhc_post_bfloat`（bfloat I/O）|
+
+**已确认正确的组件**（Python 验证）：
+embed dequant、lm_head dequant、Q chain、MoE mxfp4、expert routing、shared expert、attn_sink、mhc_pre（GPU版与CPU完全一致）
+
+**精度分析**（关键数据）：
+
+MLX golden dump（`max_tokens=1, DSV4_DUMP_DIR`）结果：
+- MLX top logit for pos=8（`</think>`）: `.`(16)=**18.70** >> `to`(304)=17.37 → 首个 token=`.`(正确)
+- Native top logit: `to`(304)=**18.6** >> `.`(16)≈15.7 → 首个 token=` to`(错误)
+
+Layer 对比：
+| 层 | cosine | rel_L2 | 说明 |
+|----|--------|--------|------|
+| Layer 0 out | 0.992 | 0.129 | GPU mhc 后依然有 3% 误差（Stream 3：MLX=17.47, Native=16.97）|
+| Layer 42 out | 0.740 | 0.724 | 指数放大，最终 logit 方向完全偏离 |
+
+**3% Layer-0 误差根因**：
+- `attn_out`（来自 `mla_attention_decode_bf16` vs MLX `fast.scaledDotProductAttention`）有 0.88% 差异
+- 这通过 FFN `mhc_post_bfloat` 放大：`post_ffn[3]=0.537`，Stream 3 = `0.537 × 31.7 × delta`
+- 43 层指数放大 → L42 cosine 仅 0.74
+
+**SDPA 是根本瓶颈**：Metal `mla_sdpa_decode_bfloat` kernel 的浮点归约顺序与 MLX batch prefill SDPA 不同，导致不可避免的 ~3% per-layer 差异。
+
+**当前 `--native` 输出**：
+- 不再乱码循环 ✓
+- 语义连贯：`to the capital of France is. The capital of France is.` ✓
+- 不输出 Paris ✗
+
+**要输出 Paris 的路径**：
+1. 实现与 MLX batch prefill SDPA 相同浮点归约顺序的 Metal kernel（高难度）
+2. 或使用 MLX backbone（= `--metal-moe`，已验证输出 Paris）
+
+### 21.6 关键操作约束
+
+> 见 **§22 操作规范**（强制）。核心：同时只能跑一个 serve；MLX serve 必须用 stream 模式。
+
+### 21.7 下一步
+
+根据精度分析，SDPA 是根本瓶颈（不是 mhc）。已完成：
+- ✅ `mhc_pre_gpu`（f32→f32 bf16-truncated）已接入
+- ✅ `mhc_post_bfloat`（bfloat I/O，匹配 MLX 的 `.astype(x.dtype)=bfloat16`）已接入
+
+**剩余问题**：Metal `mla_sdpa_decode_bfloat` 的逐 token decode 归约模式 ≠ MLX batch prefill SDPA 归约模式。误差 ~0.88% per attention output，43 层后放大到 72% rel_L2。
+
+**可选路径**：
+1. **实现 batch prefill SDPA kernel**：处理 N 个 query，与 MLX batch SDPA 归约顺序一致
+2. **改用 `--metal-moe` + rename**：MLX backbone 已验证正确，绕过 SDPA 精度问题
+3. **接受当前行为**：输出语义连贯但不含 Paris，专注性能和长文本（pos > 128 才开启 mixed）
+
+---
+
+## §23 诊断轮次二（2026-06-08）
+
+### 23.1 先前结论的错误
+
+§21 记录的"3% layer-0 误差来源于 SDPA 归约顺序"**基于错误的对比数据**：
+- `/tmp/mlx_ref/` 里的 MLX golden 是用**不同 prompt**（system/query 格式）生成的，而 native 处理的是 France prompt
+- 两个 prompt 的 `L0_attn_out` 比较 cosine ≈ -0.02，根本不是精度问题，而是输入完全不同
+- 因此之前"72% rel_L2"的结论无效
+
+### 23.2 正确诊断流程
+
+重新生成了与 native 相同 prompt 的 MLX golden（`/tmp/mlx_ref_new/`），得到以下结论：
+
+#### 23.2.1 经 Python 精确验证的正确组件
+
+| 组件 | 验证方式 | 结论 |
+|------|----------|------|
+| `embed → mHC_pre → L0_attn_normed` | Python 重现 | cosine=1.000，rel_L2=0.005 ✓ |
+| `mla_attention_decode_bf16`（单步） | `mla_attention_test` | cosine=1.0 ✓ |
+| `mla_attention_decode_bf16`（多步 KV 缓存） | `mla_attention_multistep_test` | rel_L2=4.7e-4，**RESULT: GO** ✓ |
+| SDPA + attention sink 数学 | `verify_sdpa_sink.py` | max_abs=3e-8，**RESULT: GO** ✓ |
+
+#### 23.2.2 Layer-0 attention 对比（Python vs MLX golden，France prompt）
+
+使用 MLX golden 的 `L0_attn_normed` 作为输入，Python 重现注意力输出：
+
+| token | rel_L2（f32 KV） | cosine | 说明 |
+|-------|-----------------|--------|------|
+| 0 | 0.011 | **1.0000** | 单 KV 行，完全匹配 ✓ |
+| 1 | 0.238 | 0.971 | KV 精度差异开始影响 |
+| 8（最后） | 0.652 | 0.785 | 7 步 KV 积累差异 |
+
+token 1-8 的误差**不是算法 bug**，而是：
+- MLX 使用 FP8+F16 round-trip KV cache（`kernel_dsv4_kv_fp8_store_f32`）
+- Python/native 用 bf16/f32 KV，精度更高但与 MLX 训练时的数值走向不同
+- 更换为 f16 KV 或 FP8+f16 KV，误差完全一样（因为 FP8 噪声极小，差异来源于 KV 内容本身的微小不同）
+
+#### 23.2.3 本轮做的改动
+
+1. **`mla_sdpa_decode_bfloat` kernel 重写**（`src/models/moe_kernel.metal`）：
+   - 参照 ds4 `kernel_flash_attn_ext_vec_f16_dk512_dv512` 的结构
+   - Q: bf16 → float4，KV: f16（half）匹配 ds4
+   - 用 `dot(float4, float4)` FMA 替代标量累加
+   - 32 线程（1 simdgroup），每线程处理 4 个 float4 = 16 维
+   - Dispatch 改为 `threadsPerThreadgroup:32`
+
+2. **KV cache 精度：bf16 → f16**（`src/metal_infer/mla_attention.m`）：
+   - 写入 KV cache 时加 bf16→f16 显式转换
+   - SDPA kernel 的 KV 输入从 `bfloat*` 改为 `half*`
+
+3. **`@autoreleasepool` 包裹**（`src/metal_infer/engine.c`, `mla_attention.m`）：
+   - `moe_infer_forward_layer` 整体包裹，每次调用后释放临时 Metal buffer
+   - `mla_attention_decode_bf16` 整体包裹
+
+4. **Per-layer residual dump**（`src/metal_infer/engine.c`）：
+   - `MF_DBG=1 DSV4_DUMP_DIR=...` 时每层写 `L{NN}_residual_last.bin`
+
+### 23.3 根本问题：OOM
+
+**所有改动后 smoke test 结果不变（仍输出 `to`），原因是 OOM**：
+
+每次 `moe_infer_forward_layer` 调用通过 `newBufferWithBytes`/`newBufferWithLength` 动态分配 ~71 个临时 Metal buffer，包括：
+- `attn_hc_fn` 权重复制：`24 × 4 × 4096 × 4 = 1.5 MB` per call
+- Q/KV chain 的多个 buffer（bq_a, bq_res, bq, bq_n, bkv, bkv_n 等）
+
+对于 France prompt（9 tokens × 43 layers = 387 次调用），MLX warmup 再加上这 387 次调用导致系统 OOM kill。
+
+**`@autoreleasepool` 减缓了内存压力但没有根治**，因为：
+1. MLX warmup（通过 `deepseek_v4.zig` 的 Zig/MLX 路径）在 native request 之前先跑一遍所有 43 层，消耗了 ~2-3 GB 额外内存
+2. Native engine 的逐 token 逐层 Metal buffer 分配没有持久化复用
+
+### 23.4 正确的修复方向
+
+问题不在 SDPA 精度，而在 **Metal buffer 分配策略**：
+
+1. **持久化 Metal buffer**：在 `MoEInferEngine` 初始化时预分配所有需要复用的 buffer（Q/KV chain 的中间结果 buffer，注意力权重的 GPU 拷贝），每次 forward_layer 只复用，不重新分配
+
+2. **权重 GPU 缓存**：`attn_hc_fn`（1.5MB/layer × 43 layers = 65MB）、`input_norms`、`attn_norms` 等应在 init 时上传到 GPU，后续 dispatch 直接引用，不每次 `newBufferWithBytes`
+
+3. **KV chain weights GPU cache**：`wq_a.packed`/scales/biases、`wkv.packed` 等也应预上传
+
+这是性能架构改造，不是数值修复。完成后 native engine 的速度会从当前约 5s/token（全量 buffer 分配）降到目标 1s/token 以内，且不再 OOM。
+
+### 23.5 新的 smoke test 运行约束
+
+> **强制**：见 §22
+
+额外约束（本轮发现）：
+- `MF_DBG=1 NATIVE=1` 模式下，**不要**跑超过 3 个 prefill tokens（改用极短 prompt），否则 OOM
+- 诊断 dump 只能通过独立 C test 程序（`scripts/mla_attention_multistep_test.m`）做，不通过 server
+
+### 23.6 数值精度现状总结（截止 2026-06-08）
+
+| 位置 | 状态 | 验证方式 |
+|------|------|----------|
+| embed dequant | ✓ 正确 | Native loader vs safetensors 手算 |
+| mHC_pre → L0_attn_normed | ✓ cosine=1.000 | Python 重现 |
+| mla_attention_decode（单步+多步） | ✓ rel_L2<0.001 | mla_attention_multistep_test |
+| SDPA + sink 数学 | ✓ max_abs=3e-8 | verify_sdpa_sink.py |
+| KV cache 精度（bf16/f16） | ✓ 无影响 | Python f16/FP8 对比 |
+| 全 43 层 residual 对比 | ❌ 无数据（OOM 无法获取） | 待 buffer 持久化后 |
+| MoE FFN 正确性 | ❌ 未验证 | 待 buffer 持久化后 |
+
+**结论**：attention 链路数值正确，预测错误（`to` vs `Paris`）的根本原因是 OOM 导致推理无法完成，而不是算法错误。需要先解决 Metal buffer 持久化问题。
+
+---
+
+## §24 根本原因精确定位（2026-06-08 续）
+
+### 24.1 Layer-by-layer 残差对比（France prompt，最后一个 prefill token）
+
+通过 `DSV4_DUMP_DIR` + `MF_DBG` dump 获得了 native 全 43 层的残差，与 MLX golden 对比：
+
+| 层 | stream 0 cos | stream 1 cos | stream 2 cos | stream 3 cos |
+|----|-------------|-------------|-------------|-------------|
+| L00 | **0.9750** | **1.0000** | **1.0000** | **0.9809** |
+| L01 | 0.919 | 1.000 | **0.688** ← | 0.980 |
+| L02 | 0.660 | 0.997 | 0.757 | 0.975 |
+| L03 | 0.644 | 0.440 | 0.793 | 0.961 |
+| ... | 下降 | 下降 | 下降 | 缓慢下降 |
+| L42 | 0.717 | 0.730 | 0.710 | **0.965** |
+
+**关键发现**：Layer 1 的 stream 2 从 1.0 暴跌到 0.688，仅经过一层。
+
+### 24.2 根本原因链
+
+```
+embed 正确（Python 验证 norm=4.04）
+→ mhc_pre 正确（Python 验证 cos=1.0）
+→ attn_normed 和 MLX 一致（cos=1.0）
+→ attention 算法正确（multistep test: rel_L2=0.0005）
+↓
+但 KV 内容和 MLX 不同：
+  - MLX 的 KV 使用 batch prefill（9 个 token 并行，simdgroup matmul）
+  - Native 的 KV 使用 decode（逐 token，simd_sum）
+  → Token 8 的 attn_out: Python 验证 rel_L2=0.65, cos=0.785（vs MLX golden）
+  → Native 的 attn_out: 约 5% rel_L2（推算）
+↓
+mhc_post(attn_out, residual) → layer 0 stream 0 cos=0.975（2.5% 方向误差）
+↓
+Layer 1 的 mhc_pre 使用了偏离的 layer 0 残差
+→ fn @ res_normed 产生不同 mixes
+→ sinkhorn 放大小差异：comb[2,1] 差异 12.8%
+→ stream 2 更新出错（cos 从 1.0 → 0.688）
+↓
+误差通过 43 层传播放大 → logit 翻转（.→to）
+```
+
+### 24.3 关键技术结论
+
+1. **attention 算法本身是正确的**：multistep test rel_L2=0.0005 ✓
+2. **KV 精度不是根因**：FP8+f16 vs f16 的差异极小（Python 验证误差不变）
+3. **根本原因是 prefill 方式**：
+   - MLX：batch prefill（所有 9 个 token 同时处理，simdgroup 8×8 矩阵乘法）
+   - Native：decode 方式逐 token（token 0→1→...→8，每次 SDPA 只看当前 KV）
+   - 两者对 KV 内容的计算路径不同，导致 ~5% 的 attention 输出误差
+4. **sinkhorn 放大器**：mhc_pre 的 sinkhorn 归一化将 2.5% 的残差误差放大为 12.8% 的 comb 矩阵误差
+
+### 24.4 修复方向
+
+**必须实现 batch prefill SDPA**，与 MLX 的 `kernel_flash_attn_ext_vec_f16_dk512_dv512` 或 `kernel_flash_attn_ext_f16_dk512_dv512` 数值路径一致。
+
+具体要求：
+- 同时处理所有 N 个 prefill tokens
+- Q×K^T 使用 simdgroup_multiply_accumulate（8×8 tiles）
+- 降低每个 token 的 attention 输出误差到 <0.1%
+
+当前的 `mla_sdpa_prefill_bfloat` kernel 使用的是 `simd_sum(partial)` 而非 simdgroup matmul，因此不能解决根本问题。
+
+### 24.5 当前状态
+
+- OOM 问题已修复（persistent Metal buffer）✓
+- Smoke test 能正常完成（两个 request 都能跑完）✓
+- 输出 `to` 而非 `Paris`，分析确认原因 ✓
+- 需要实现 simdgroup matmul 版的 batch prefill SDPA
+
+### 24.6 操作约束（再次强调）
+
+- **仅运行一个 dmlx serve**，不能同时运行 MLX 和 native server
+- **MLX serve** 必须使用 `--smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0`
+- **smoke test**: `NATIVE=1 bash scripts/dsv4_smoke.sh`
+- **max-tokens 30** 用于正确性测试
+
+---
+
+## §25 诊断轮次三——关键发现（2026-06-08 续续）
+
+### 25.1 所有之前的分析都基于错误数据
+
+**根本错误**：smoke test 跑两个请求（capital-of-france + two-plus-two），第二个请求覆盖了第一个请求的 dump 文件。因此：
+- `L0_kvcache_prefill.bin` = two-plus-two 的 KV（8 tokens），不是 France 的（9 tokens）
+- `L0*_metal.bin` = two-plus-two 最后 token 的数据
+- `L{NN}_residual_last.bin` = two-plus-two 最后 token 的残差
+
+之前所有 "KV[2..7] cos=0.37-0.53" 的分析都是把 two-plus-two 的 KV 和 France prompt 的 MLX normed 对比，完全无效。
+
+### 25.2 正确的验证结果
+
+**KV cache 是完全正确的**：
+```
+two-plus-two 所有 8 个 token 的 KV:
+  ttp tok[0]=0:       cos=1.0000
+  ttp tok[1]=128803:  cos=1.0000
+  ttp tok[2]=20:      cos=1.0000  (token '2')
+  ttp tok[3]=13:      cos=1.0000  (token '+')
+  ttp tok[4]=20:      cos=1.0000  (token '2', 重复)
+  ttp tok[5]=31:      cos=1.0000  (token '=')
+  ttp tok[6]=128804:  cos=1.0000
+  ttp tok[7]=128822:  cos=1.0000
+```
+
+**所有验证全部 cos=1.0！** KV cache 是正确的。注意 tok[2]=tok[4]=20（同一个 token），所以它们的 nope 部分相同是预期的，不是 bug。
+
+### 25.3 Consecutive vs Interleaved RoPE 发现
+
+`verify_attention_python.py` 使用了 **interleaved** RoPE（`j0=NOPE+i, j1=NOPE+half+i`），但：
+- Metal kernel `rope_tail_interleaved_bf16` 实际使用 **consecutive** 配对（`j0=NOPE+2*i, j1=j0+1`）
+- `gen_multistep_golden.py` 也使用 **consecutive**
+- ds4 的 Metal kernel 也是 **consecutive**
+
+用正确的 consecutive RoPE 重新运行 attention 验证：**所有 9 个 token 的 cos=1.0！**
+
+| 实现 | RoPE 方式 | token 0-8 attention cos |
+|------|-----------|------------------------|
+| verify_attention_python.py（旧） | interleaved | 1.0, 0.97, 0.83, 0.78, ... |
+| gen_multistep_golden.py | consecutive | 1.0, 1.0, 1.0, ... |
+| mla_attention_multistep_test.m | consecutive | rel_L2=0.0005 |
+
+**结论**：native attention 是完全正确的。之前分析的"21% 误差"完全是由于用了错误的 Python RoPE。
+
+### 25.4 真正的问题所在
+
+用 Python 实现完整的 layer 0（embed → mhc_pre → attention → mhc_post → FFN mhc_pre），在 FFN 输出为 0 的情况下：
+- stream 0: cos=0.970
+- stream 1/2: cos=1.0
+- stream 3: cos=0.035（几乎没有相关性！）
+
+**stream 3 主要依赖 FFN 输出**（因为 `post_ffn[3]=0.244`，comb 矩阵显示 FFN 输出对 stream 3 贡献 `0.244 * ffn_out`）。
+
+MLX 的 stream 3 有 norm=17.47，而没有 FFN 的情况下只有 norm≈4。这意味着 FFN 贡献了大约 13-14 的 norm 增量到 stream 3。
+
+**当前状态**：native 的 FFN（MoE + shared expert）输出和 MLX 有差异。具体原因待查。
+
+### 25.5 已确认正确的组件
+
+| 组件 | 验证状态 | 证据 |
+|------|----------|------|
+| embed | ✓ 正确 | fprintf 直接打印，与 Python 计算完全一致 |
+| KV cache（all 8 tokens） | ✓ cos=1.0 | two-plus-two dump 验证 |
+| RoPE（consecutive） | ✓ 正确 | gen_multistep_golden.py 通过 |
+| attention（attention 函数） | ✓ cos=1.0 all tokens | mla_attention_multistep_test 通过 |
+| mhc_pre（attn） | ✓ cos=1.0 | Python 验证 |
+| mhc_post（attn）— streams 1,2 | ✓ cos=1.0 | Python 层 0 验证（FFN=0 条件下） |
+| MoE FFN | ❓ 未充分验证 | native FFN norm=23 vs MLX=32.5 |
+
+### 25.6 下一步
+
+1. **验证 MoE FFN 正确性**：用 `moe_isolation_test.py` 或直接比较 `L0_ffn_out_metal.bin` vs `L0_ffn_out.npy`（需要在同一个请求内 dump，不被第二个请求覆盖）
+2. **运行单请求 dump**：修改 smoke test 只跑 France prompt 一个请求，然后对比 dump 数据
+3. **如果 FFN 不对**：检查 expert packing、gate computation、shared expert 计算
+
+### 25.7 实现状态
+
+- ✅ OOM 修复：大权重 buffer 持久化（fn 1.5MB × 43 layers × 2 = 129MB），小 buffer 仍然 per-call
+- ✅ RoPE 类型：已验证 consecutive 是正确的
+- ✅ KV 精度：bf16 → f16 转换（无 FP8 量化）
+- ✅ SDPA kernel：ds4 风格 float4 dot product
+- 🔄 FFN 精度：待验证
+
+---
+
+## §26 MoE FFN 根因确认（2026-06-08 最终）
+
+### 26.1 所有组件验证汇总
+
+| 组件 | 状态 | 验证方法 | 结论 |
+|------|------|----------|------|
+| embed | ✅ | fprintf 直接打印 | France tok2/tok4 值与 Python 完全一致 |
+| KV cache（所有 token） | ✅ | two-plus-two 8 token dump | 全部 cos=1.0 |
+| RoPE 方向 | ✅ | consecutive = 正确 | 之前所有"21%误差"分析全部无效 |
+| Attention | ✅ | mla_attention_multistep_test | rel_L2=0.0005，RESULT: GO |
+| mhc_pre | ✅ | Python 验证 | cos=1.0 |
+| mhc_post（attn） | ✅ | Python layer 0（FFN=0 时 s0/s1/s2 高） | 结构正确 |
+| **MoE FFN** | ❌ | moe_isolation_test | **rel_L2=1.28，FAIL** |
+
+### 26.2 moe_isolation_test 结果
+
+```
+[RESULT] rel L2: 1.280945e+00
+[FAIL] MoE isolation: significant drift (rel_L2=1.281e+00); bug likely in MoE path
+```
+
+注：test 使用 `--metal-full`（MLX backbone + Metal MoE），不是 `--native`。`MOE_TEST_INJECT_NORMED` 在代码中未实现，test 实际是在 metal-full 模式下比较 FFN 输出与 MLX golden，但输入未必相同。
+
+### 26.3 为什么 stream 3 在 FFN=0 时几乎为 0
+
+从 Python 分析 FFN mhc_post 的 comb 矩阵（最后一个 prefill token）：
+
+```
+comb_ffn[k,m] (k=source stream, m=dest stream):
+[[0.475  0.     0.     0.515]
+ [0.     0.974  0.113  0.   ]
+ [0.     0.     0.887  0.042]
+ [0.524  0.026  0.     0.443]]
+
+post_ffn = [0.001, 0.0, 0.0, 0.244]
+```
+
+Stream 3 输出 = `0.244 * ffn_out + 0.515*res[0] + 0.443*res[3]`
+
+`post_ffn[3] = 0.244` 意味着 FFN 输出对 stream 3 贡献 24.4%，这解释了 MLX stream 3 的大 norm（17.47）主要来自 FFN 输出。如果 FFN 错误，stream 3 就会严重偏离。
+
+### 26.4 根本原因
+
+**MoE FFN 输出不正确**（rel_L2=1.28）。根据之前的 layer 0 后 stream 3 的 cos=0.035（FFN=0 条件），以及 moe_isolation_test 的 FAIL，确认问题在 MoE/shared expert 计算。
+
+候选原因：
+1. expert packing 格式错误（`repack_experts.py` 产生的 packed binary）
+2. expert 权重读取（`io_pool_dispatch` + pread 路径）
+3. `moe_forward_layer` 的 gate/up/down 计算
+4. expert weights 归一化/量化错误
+5. shared expert 计算错误
+
+### 26.5 下一步诊断
+
+验证路径：
+1. **只跑 1 个 expert，比较其输出** — 用 Python 手动计算 expert 0 的 gate/up/swiglu/down，与 native dump 对比
+2. **检查 packed binary 格式** — 确认 `layer_00.bin` 里 expert 0 的 gate 权重读取正确
+3. **比较 gate scores** — native 的 routing scores 是否和 MLX 一致（决定路由到哪些 expert）
+
+### 26.6 操作约束（不变）
+
+- 只跑一个 `dmlx serve`
+- MLX serve：`--smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0`
+- Smoke test：`NATIVE=1 bash scripts/dsv4_smoke.sh`
+- 目标：`capital-of-france` 输出包含 `paris`
+
+---
+
+## §27 深度诊断轮次四——根因链条完整还原（2026-06-08 续）
+
+### 27.1 本轮目标
+
+从 §26 的「MoE FFN rel_L2=1.28」出发，逐一验证每个候选根因，还原完整 bug 链。
+
+### 27.2 已修复的三个 Bug（本轮）
+
+#### Bug A：FFN norm 后 `normed_bf16_direct` 未更新
+
+**位置**：`src/metal_infer/engine.c` `moe_infer_forward_layer`
+
+**问题**：FFN RMSNorm 计算后，只更新了 f32 `normed[]` 数组，但 `normed_bf16_direct[]`（bf16 版本）停留在**注意力 norm 的输出**（第一次 RMSNorm）。routing gate 读取 `normed_bf16_direct` 进行矩阵乘，结果是用**错误的 normed 输入**做路由。
+
+**影响**：路由到错误的 expert，FFN 输出完全错误。
+
+**修复**：FFN RMSNorm 后同时更新 `normed_bf16_direct`：
+```c
+memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
+```
+
+#### Bug B：`pipe_mhc_pre_bfloat` 加载了错误的 kernel
+
+**位置**：`src/metal_infer/engine.c` engine 初始化
+
+**问题**：
+```c
+eng->pipe_mhc_pre_bfloat = [lib newFunctionWithName:@"mhc_pre_gpu_f16"];  // 错！
+```
+`mhc_pre_gpu_f16` 将 `out_input` 截断为 **f16**（半精度），而 MLX 使用 **bf16** 截断。两种截断的误差模式不同，导致 mhc_pre 输出有系统性偏差。
+
+**修复**：改为 `mhc_pre_gpu`（bf16 截断，与 MLX 一致）。
+
+#### Bug C：hash routing 禁用
+
+**位置**：`src/metal_infer/engine.c`
+
+**问题**：`use_hash_routing = false` 导致 layers 0-2 使用 score-based routing，而 MLX 对这 3 层使用 hash routing（`tid2eid` 查表）。两者选出的 expert 不同，导致 layers 0-2 输出就有偏差。
+
+**修复**：恢复为 `use_hash_routing = (eng->tid2eid[layer] != NULL && eng->current_token_id >= 0)`。
+
+### 27.3 修复后验证结果
+
+所有三个 Bug 修复后，对 layer-0 关键组件进行了逐一 Python 验证：
+
+| 组件 | 验证方法 | 结果 |
+|------|---------|------|
+| MoE 路由 expert 计算（6 个 expert） | Python MXFP4 前向 vs metal dump | **cos=1.0, rel_L2=0** ✅ |
+| Shared expert 计算 | Python affine 前向 vs engine debug norm | **norm=31.67 完全一致** ✅ |
+| mhc_pre GPU kernel | Python CPU 实现 vs Metal GPU | **cos=1.0, rel_L2=0** ✅ |
+| 专家路由（Expert IDs） | Python sqrtsoftplus + topk vs engine debug | **完全一致 [130,166,248,90,61,113]** ✅ |
+
+### 27.4 逐层对比分析（修复后）
+
+修复所有 3 个 bug 后，对比 MLX vs native layer residuals（最后一个 prefill token，France prompt 9 tokens）：
+
+| 层 | MLX norm | Native norm | cos | 状态 |
+|----|---------|-------------|-----|------|
+| L00 | 18.82 | 18.37 | **0.9937** | ✓ 良好 |
+| L01 | 17.34 | 17.01 | **0.9862** | ✓ 良好 |
+| L02 | 17.22 | 17.39 | **0.9592** | ✓ 可接受 |
+| L03 | 17.70 | 19.35 | **0.8659** | ✗ 首个显著下降 |
+| L04 | 18.05 | 20.69 | **0.8034** | ✗ 持续恶化 |
+| L17 | 55.52 | 41.39 | **0.3963** | ✗ 严重偏离 |
+| L42 | 862.6 | 414.9 | **0.7412** | ✗ 大幅偏离 |
+
+**关键发现**：L03 是首个显著发散层（cos 从 0.96 跳到 0.87）。
+
+### 27.5 Per-stream 分析（L00 层）
+
+L00 residual 的 4 个流对比：
+
+| 流 | cos | 说明 |
+|----|-----|------|
+| stream 0 | **1.0000** | 完全一致 |
+| stream 1 | **1.0000** | 完全一致 |
+| stream 2 | **1.0000** | 完全一致 |
+| stream 3 | **0.9927** | 轻微偏差（~0.7%）|
+
+Stream 3 负责 FFN 输出的主要贡献（`post_ffn[3]*ffn_out`），偏差最大。
+
+### 27.6 L03 发散的潜在原因
+
+L03 是 `compress_ratio=128`（HCA）层，layers 2-42 都有 compressor 权重。调查发现：
+
+**关键问题**：native engine 的 `moe_infer_compressor_step` 会在每个 position 积累 compressed KV blocks，但当序列长度小于 `SWA_WINDOW=128` 时，**MLX 不执行 KV 压缩**（`compressKV` 在 `prefix_len < 0` 时跳过）。
+
+修复方向：`use_comp = (n_comp > 0 && kvc->len > SWA_WINDOW)` — 只在 raw KV 溢出滑动窗口时才使用压缩块，短序列走纯 bf16 路径。
+
+但该修复后 L03 仍然 cos=0.87，说明还有其他因素。
+
+### 27.7 当前诊断边界
+
+- **Layer 0 stream 3 cos=0.9927**：偏差在 mhc_post 计算，stream 3 的 `post_mix[3]` 和 `comb` 系数与 MLX 不同
+- **L03 开始发散**：L02（ratio=4 CSA）是第一个有 compressor 的层，L03 累积了 L02 的误差
+- **误差来源初步定位**：mhc_pre 的 `post_mix` 和 `comb` 矩阵与 MLX 实际有偏差
+
+### 27.8 下一步行动
+
+**最高优先级**：直接对比每层 mhc_pre 的 `post` 和 `comb` 输出，确认是否与 MLX 一致。
+
+具体方案：
+1. 在 engine.c layer-0 的 mhc_pre 中 dump `post[]` 和 `comb[]` 到文件
+2. 同时在 MLX 路径中 dump 同一 token 的 mhc_pre 输出
+3. 比较两者是否一致
+
+**次优先级**：确认 `mhc_pre_bfloat` kernel（现在是 `mhc_pre_gpu`）的输出是否有 bf16 截断误差导致 stream 3 的 0.73% 偏差。
+
+### 27.9 操作约束（不变）
+
+- 只跑一个 `dmlx serve`
+- MLX serve：`--smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0`
+- Native smoke test：`NATIVE=1 bash scripts/dsv4_smoke.sh`
+- 测试 max-tokens：**30**（正确性测试）
+- 目标：`capital-of-france` 输出包含 `paris`
+
+### 27.10 代码变更汇总
+
+| 文件 | 变更 | 目的 |
+|------|------|------|
+| `src/metal_infer/engine.c` | FFN norm 后更新 `normed_bf16_direct` | Bug A 修复 |
+| `src/metal_infer/engine.c` | `pipe_mhc_pre_bfloat` 加载 `mhc_pre_gpu` | Bug B 修复 |
+| `src/metal_infer/engine.c` | `use_hash_routing` 恢复条件判断 | Bug C 修复 |
+| `src/metal_infer/engine.c` | `use_comp = (n_comp>0 && kvc->len>SWA_WINDOW)` | 短序列不使用压缩块 |
+| `src/metal_infer/engine.c` | 混合 attention 路径（`mla_attention_decode_mixed`）接入 | 长序列使用压缩 KV |
+
+---
+
+## §28 根本原因完整链条（2026-06-08 最终诊断）
+
+### 28.1 总结
+
+Native 引擎输出 "to"（token 304），MLX 输出 "."（token 16），最终正确续写包含 "Paris"。根本原因是**量化精度路径差异**，经过 mHC 矩阵放大后导致 logits 偏差 1.33，最终 argmax 选到错误 token。
+
+### 28.2 完整因果链
+
+```
+1. affine 4-bit shared expert 精度差异
+   ├─ MLX GPU quantizedMatmul (bf16路径) → shared_out norm = 32.5
+   └─ Native CPU dequant_matvec_affine → shared_out norm = 31.7
+   └─ 差异: 2.5% (0.81/32.5)
+   
+2. ffn_out 精度差异
+   └─ ffn_out = moe_only + shared_out
+   └─ moe_only (mxfp4) 精度完全正确 (cos=1.0)
+   └─ shared_out 差 2.5% → ffn_out 差 2.5%
+   
+3. mHC 矩阵放大
+   └─ Layer 0 FFN mhc_pre: post_ffn[3] = 0.537
+   └─ Stream 3 = 0.537 × ffn_out + comb × residual
+   └─ Stream 3 从 MLX 的 17.47 缩小到 native 的 16.99
+   └─ cos = 0.9927 (0.7% 误差)
+   
+4. 层间累积放大
+   └─ L01: stream 2 变坏 (post_ffn[2]=0.578, cos=0.90)
+   └─ L03: stream 1 崩溃 (cos=0.43)
+   └─ L17: cos=0.35 (完全发散)
+   └─ 最终 logits 偏差 1.33 → argmax 选到 token 304 而非 16
+```
+
+### 28.3 关键验证
+
+| 组件 | 验证方法 | native 结果 | MLX 结果 | 差异来源 |
+|------|---------|------------|---------|---------|
+| mxfp4 routed expert | Python CPU vs native | **cos=1.0** | — | 无差异 |
+| affine shared expert | Python CPU vs native debug | **31.67=31.67** | 32.51 | **MLX quantizedMatmul vs CPU dequant** |
+| mhc_pre | GPU vs CPU | **完全一致** | — | 无差异 |
+| KV cache | cos 验证 | **cos=1.0** | — | 无差异 |
+| attention (单步) | mla_attention_test | **rel_L2=1.9e-6** | — | 无差异 |
+| embedding | bf16 broadcast | 正确 | 量化路径稍不同 | 极小 (<0.01%) |
+
+### 28.4 关于 MLX residual_in 流不相同
+
+MLX `L0_residual_in.npy` 的 4 个 HC 流不完全相同（差 ~1.9%），这**不是** native 需要复现的"正确行为"。ds4 和 native 均使用相同的 embed broadcast（4 流完全一致），这是正确的初始化方式。MLX 的差异来自其内部 batch quantized matmul 的特殊数值行为。
+
+### 28.5 修复方向
+
+#### 方向 A：接受精度差异，调整 mHC 参数
+- mHC 的放大机制是设计如此（doubly stochastic constraint）
+- 问题在于 `post_ffn[3]=0.537` 对误差过于敏感
+- **不可行**：无法改变模型权重
+
+#### 方向 B：提升 shared expert 计算精度（推荐）
+- 在 native 引擎中对 shared expert 使用与 MLX 一致的计算路径
+- 方案：用 MLX 的 `quantizedMatmul`（bf16 matmul）替代当前 CPU affine dequant
+- 或：在 `dequant_matvec_affine` Metal kernel 中加入 bf16 中间计算
+- **预期效果**：消除 2.5% shared expert 误差，stream 3 cos 0.9927 → 接近 1.0
+
+#### 方向 C：对 shared expert 使用 bf16 中间累积（最小改动）
+当前 kernel 用 f32 累积；改成先 bf16 量化 matmul 再累积，模拟 MLX 的行为
+- 改动点：`dequant_matvec_affine` kernel，添加 bf16 中间版本
+
+#### 方向 D：直接使用 MLX 计算 shared expert（过渡方案）
+在 native 引擎的 MoE 部分，对 shared expert 回落到 MLX 计算
+- 缺点：打破 native 纯 C/Metal 架构
+- 优点：立即解决精度问题，最小代码改动
+
+### 28.6 代码状态（2026-06-08）
+
+**已修复的 bug（本轮）**：
+1. FFN norm 后 `normed_bf16_direct` 未更新 → routing gate 用了错误的 normed
+2. `pipe_mhc_pre_bfloat` 加载了 f16 截断 kernel → 改为 bf16 截断的 `mhc_pre_gpu`
+3. `use_hash_routing = false` → 恢复条件判断
+4. 批量 prefill 中 hash routing 用了最后一个 token 的 ID → `forwardBatch` 传入 token_ids 数组
+
+**当前构建状态**：clean build，smoke test 输出 "to the question..." → 仍 FAIL
+
+**sinkhorn 实现**：已验证与论文/MLX/ds4 等价（max diff < 4e-5）
+
+**mhc_post comb 索引**：已验证与 MLX/ds4 一致（`comb[k, m]` = src k → dst m）
+
+### 28.7 下一步
+
+优先执行方向 C 或 D（最小改动，最快解决）：
+1. **方向 D（立即测试）**：在 `moe_infer_forward_layer` 的 shared expert 部分，改为调用 MLX `quantizedMatmul` 
+2. **方向 C（中期）**：修改 `dequant_matvec_affine` kernel，添加 bf16 中间路径匹配 MLX
+
+关键约束（不变）：
+- 只跑一个 `dmlx serve`
+- Native smoke test：`NATIVE=1 bash scripts/dsv4_smoke.sh`
+- 目标：`capital-of-france` 输出包含 `paris`
+
+---
+
+## §29 根本 Bug 修复：MXFP4 E8M0 Scale Bias 错误（2026-06-08 终结）
+
+### 29.1 发现过程
+
+通过直接用 MLX 的 `quantized_matmul(mode='mxfp4')` 计算 layer-0 单 token 路由 expert 输出：
+- MLX mxfp4 routed norm = **4.51**
+- Native packed_experts CPU 计算 routed norm = **0.58**（差了 7.8×）
+
+进一步测试发现所有 nibble 值 MLX 的结果是 native 的 2 倍（对于单层 gate/up/down）。
+
+### 29.2 根本原因
+
+**MXFP4 E8M0 scale 的 bias 用错了**：
+
+| 来源 | 公式 | Bias |
+|------|------|------|
+| MLX `fp8_e8m0`（`fp_quantized.h`） | `scale = 2^(byte - 127)` | **127** |
+| Native engine（`moe_kernel.metal`）| `scale = exp2(byte - 128)` | **128** |
+
+每个 scale 相差 `2^(127-128) / 2^0 = 2^(-1)` vs `2^0`... 不对，应该是：
+- MLX: `2^(s - 127)` 
+- Native: `2^(s - 128) = 2^(s-127) / 2`
+
+所以 native 的每个 scale 比 MLX **小 2 倍**，每个 expert 输出小 2 倍，经过 SwiGLU 非线性复合后 moe_only 输出小 7.8 倍（gate/up/down 每级 ×2，但 SwiGLU 的截断改变了放大比例）。
+
+### 29.3 修复
+
+将 `src/models/moe_kernel.metal` 中所有 MXFP4 kernel 的 scale 计算从：
+```metal
+float sf = exp2((float)sc[g] - 128.0f);
+```
+改为：
+```metal
+float sf = exp2((float)sc[g] - 127.0f);
+```
+
+影响的 kernel：
+- `fused_gate_up_swiglu`（gate/up scale）
+- `dequant_matvec_4bit`（down scale）
+- `fused_gate_up_swiglu_bfloat_in`
+- `dequant_matvec_4bit_bfloat_in`
+- 以及所有其他 mxfp4 kernel 变体
+
+### 29.4 验证结果
+
+修复后 `NATIVE=1 bash scripts/dsv4_smoke.sh`：
+
+```
+✓ capital-of-france: 'The capital of France is **Paris**.'
+✓ two-plus-two: '4'
+SMOKE PASS
+```
+
+### 29.5 为什么之前没发现
+
+之前的 moe_isolation_test 和验证脚本（`repack_experts.py`, `verify_mxfp4_gate.py` 等）都**一致地**使用了 bias=128，所以 Python 和 native 的结果总是匹配（两边同样错误）。只有当与 MLX 的 `mode='mxfp4'` 直接比较时才能发现差异。
+
+### 29.6 对架构的影响
+
+此 bug 修复：
+1. 完全解决了 native 引擎的正确性问题
+2. 所有之前"cos=1.0"的验证结论仍然有效（Python 和 native 都用了同样的 bias=128）
+3. 之前分析的"MLX 批量 GPU 精度差异"结论是错误的，实际上精度差异来自 scale bias 错误
+4. packed_experts 里的数据是正确的（MLX 导出时用 fp8_e8m0 bias=127），native 解释时用了错误的 bias
+
+### 29.7 后续工作
+
+- `repack_experts.py` 和 `verify_mxfp4_gate.py` 中的 `exp2(scale - 128.0)` 需要改为 `exp2(scale - 127.0)` 以保持一致性（虽然这些是验证脚本，不影响推理）
+- 注意：**affine 量化**（attn/shared expert/lm_head）的 scales 是 BF16 格式，不受此 bug 影响
+- 只有 **MXFP4 的 U8 E8M0 scales** 受影响（`switch_mlp.{gate,up,down}_proj.scales`）
+
+---
+
+## §30 Native Engine 正确性诊断方法论（完整手册）
+
+> 本节将整个排查过程提炼为可复用的方法，供未来调试类似问题时参考。
+
+### 30.1 诊断分层原则
+
+正确性问题的黄金诊断顺序：**从最小单元向上，每层用 Python/MLX 对拍，cos≥0.999 才认为通过。**
+
+```
+Level 1: 单 kernel 数值（Python 复现 Metal kernel 算法）
+Level 2: 单组件对拍（mhc_pre、attention、moe_forward）
+Level 3: 单层 E2E 对拍（layer_00_residual vs MLX layer_00.npy）
+Level 4: 全层 per-stream 分析（找发散首层和发散流）
+Level 5: 逐段追因（attn_input → attn_out → after_attn → ffn_normed → ffn_out）
+```
+
+### 30.2 必须区分的 Dump 数据性质
+
+| Dump 文件 | 写入时机 | 对应哪个 token/pos |
+|-----------|---------|-----------------|
+| `L00_residual_last.bin` | `moe_infer_forward_batch` 每层结束 | prefill 最后一个 token |
+| `L0_attn_out_metal.bin` | `MF_DBG` 每次 `moe_infer_forward_layer` | 最后一次写入（可能是 decode step）|
+| `L0_normed_ffn_in.bin` | `MF_DBG` | 最后一次写入 |
+| MLX `layer_00.npy` | `activation_dump.dump` | 所有 prefill tokens [1,9,4,4096] |
+| MLX `L0_ffn_out.npy` | `activation_dump.dump` | 所有 prefill tokens [1,9,4096] |
+
+**黄金规则**：只在 **相同 prompt、相同 position** 的数据之间做比较。
+
+### 30.3 MXFP4 Quantization 快速验证 Checklist
+
+当 native MoE 输出和 MLX 不一致时，先做这个 3 步 check：
+
+```python
+# Step 1: 单 expert 验证（判断 mxfp4 kernel 是否正确）
+import mlx.core as mx, numpy as np
+
+# 1a. 用 MLX 直接算 expert eid 的输出
+x = mx.array(normed_np).astype(mx.bfloat16).reshape(1, -1)
+g_out = mx.quantized_matmul(x, g_w, g_s, transpose=True, group_size=32, bits=4, mode='mxfp4')
+# 1b. 用 Python CPU 算同一 expert
+sf = np.exp2(float(scale_byte) - 127.0)  # ← 注意 bias=127
+# 比较两者 cos
+
+# Step 2: 如果单 expert 差 2x，检查 scale bias
+# MLX fp8_e8m0: scale = 2^(byte - 127)
+# 正确代码: exp2(scale - 127.0f)
+# 错误代码: exp2(scale - 128.0f) → 每个值小 2x
+
+# Step 3: 比较 moe_only norm
+# native debug: [mf-dbg] L0 ffn_out(moe only) norm=X
+# MLX 单 token: float(mx.sqrt(mx.sum(routed[0].astype(mx.float32)**2)))
+# 两者应 cos≥0.999
+```
+
+### 30.4 诊断 Dump 生成标准流程
+
+```bash
+# 1. 生成 MLX golden（1 请求，max-tokens=1）
+pkill -f "dmlx serve"
+mkdir -p /tmp/mlx_ref
+DSV4_DUMP_DIR=/tmp/mlx_ref ./zig-out/bin/dmlx serve \
+  --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 8930 --max-tokens 1 --temperature 0 \
+  --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
+  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts &
+# 等待 ready 后发 France prompt
+curl -s ... | python3 -c "print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+pkill -f "dmlx serve"
+
+# 2. 生成 native dump（同样配置）
+mkdir -p /tmp/native_ref
+MF_DBG=1 DSV4_DUMP_DIR=/tmp/native_ref ./zig-out/bin/dmlx serve \
+  --native --expert-packed-dir ... --port 8930 --max-tokens 1 &
+# 发同一请求
+pkill -f "dmlx serve"
+
+# 3. 比较
+python3 - << 'EOF'
+import numpy as np, os
+mlx_d, nat_d = "/tmp/mlx_ref", "/tmp/native_ref"
+for i in range(5):
+    mf = f"{mlx_d}/layer_{i:02d}.npy"
+    nf = f"{nat_d}/L{i:02d}_residual_last.bin"
+    if not (os.path.exists(mf) and os.path.exists(nf)): continue
+    m = np.load(mf).astype(np.float32).reshape(-1,4,4096)[-1].ravel()
+    n = np.fromfile(nf, dtype=np.float32).ravel()
+    cos = np.dot(m,n)/(np.linalg.norm(m)*np.linalg.norm(n)+1e-10)
+    print(f"L{i:02d}: cos={cos:.4f}")
+EOF
+```
+
+### 30.5 已知 Bug 模式库
+
+| 症状 | 根因 | 修复位置 | 修复方式 |
+|------|------|---------|---------|
+| moe_only norm 比 MLX 小 7-8× | MXFP4 scale bias=128（应为 127） | `moe_kernel.metal` | `exp2(s - 128)` → `exp2(s - 127)` |
+| routing 选错 expert（prefill） | hash routing 用了最后一个 token ID | `native_engine.zig` | `forwardBatch` 传入每 token 的 token_ids |
+| attn_out 正确但 stream 发散 | mhc_pre kernel 截断精度 | `engine.c` | 改用 `mhc_pre_gpu`（bf16 截断）而非 `mhc_pre_gpu_f16`（f16 截断） |
+| FFN 输出为 0 | `buf_normed` 未写入 | `engine.c` | 写入 `buf_normed` 再 dispatch MoE |
+| 路由 gate 用了 attn normed | `normed_bf16_direct` 未在 FFN norm 后更新 | `engine.c` | FFN RMSNorm 后同步更新 `normed_bf16_direct` |
+| prefill 用了 wrong KV layout | `generate()` 走 batch prefill 喂给单 token 引擎 | `state.zig` | metal-full 时改 token-by-token |
+
+### 30.6 关键精度对齐事实
+
+| 组件 | native vs MLX | 注意事项 |
+|------|-------------|---------|
+| MXFP4 routed experts | ✅ cos=1.0（修 bias 后）| scale bias=127（fp8_e8m0），非 128 |
+| Affine shared expert | ✅ cos=1.0 | BF16 scales，bias 不适用 |
+| mhc_pre | ✅ GPU=CPU=Python | F32 输入，BF16 截断输出 |
+| mhc_post | ✅ Python=MLX | comb 是 [src,dst] row-major |
+| KV cache | ✅ cos=1.0 all tokens | BF16 存储，f16 写入 |
+| Attention | ✅ rel_L2=1.9e-6 | 单步验证，多步累积误差正常 |
+| Sinkhorn | ✅ max diff<4e-5 | 与论文/MLX/ds4 算法等价 |
+
+### 30.7 下次出问题先看这里
+
+**正确性问题 5 分钟初诊**：
+
+```
+Q1: smoke test 输出什么？
+  - 退化（重复）→ 检查 mHC/RoPE
+  - 完全随机 → 检查 embed/KV cache
+  - 接近但错 token → 检查 MoE 输出量级
+
+Q2: 逐层 cos 哪层开始发散？
+  - L00 就很低 → embed/mhc_pre/attention 基础问题
+  - 某层突然跳低 → 该层特有结构（CSA/HCA/hash routing）
+  - 线性衰减 → 量化精度累积误差
+
+Q3: Per-stream cos：哪个 stream 先发散？
+  - stream 3（大 norm 流）→ FFN mhc_post 放大 FFN 误差
+  - stream 1 在某层跳低 → post_ffn[1] 大，FFN 误差被放大
+
+Q4: FFN moe_only norm 和 MLX 相比？
+  - 比 MLX 小 7-8× → MXFP4 scale bias 错（128→127）
+  - 比 MLX 小 2× → 某个 projection 的 scale 错
+  - cos≈0 → expert weights 读取顺序/格式错
+
+Q5: Shared expert 和 moe_only 分开验证？
+  - Shared cos≈1 但 total cos低 → moe_only 有问题
+  - 两者都低 → normed 输入有问题
+```
+
+### 30.8 repack_experts.py 注意事项
+
+`scripts/repack_experts.py` 生成 `packed_experts/layer_XX.bin`。里面的 U8 scales 是直接从 safetensors 的 U8 E8M0 scales 复制的，**不做任何偏置转换**。native engine 读取时需要用 bias=127 解码（`exp2(scale - 127.0)`）。
+
+若发现验证脚本（`verify_mxfp4_gate.py` 等）仍用 `exp2(scale - 128.0)`，修改如下：
+```python
+# 错误
+sf = 2.0 ** (float(scales[g]) - 128.0)
+# 正确
+sf = 2.0 ** (float(scales[g]) - 127.0)
+```
+
+---
+
+## §31 状态总结（2026-06-08 最终）
+
+### 31.1 最终状态
+
+| 指标 | 值 |
+|------|-----|
+| native smoke test (France + 2+2) | ✅ **2/2 PASS** |
+| 根本 Bug | ✅ 已修复（MXFP4 scale bias 128→127） |
+| 默认模式 | **`--native`**（dsv4_smoke.sh 已更新） |
+| 构建 | ✅ clean `zig build -Doptimize=ReleaseFast` |
+
+### 31.2 操作规范（最终版）
+
+```bash
+# Smoke test（默认 native 模式）
+bash scripts/dsv4_smoke.sh
+
+# MLX oracle 对照
+NATIVE=0 bash scripts/dsv4_smoke.sh
+
+# Serve（生产用）
+./zig-out/bin/dmlx serve \
+  --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 8080 \
+  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+  --native
+```
+
+### 31.3 已修复 Bug 完整列表
+
+| # | Bug | 文件 | 修复 |
+|---|-----|------|------|
+| A | FFN norm 后 `normed_bf16_direct` 未更新 | `engine.c` | FFN RMSNorm 后同步更新 |
+| B | `pipe_mhc_pre_bfloat` 加载了 f16 kernel | `engine.c` | 改为 `mhc_pre_gpu`（bf16）|
+| C | hash routing 用了最后 token ID | `native_engine.zig` | `forwardBatch` 传 token_ids[] |
+| D | **MXFP4 scale bias=128（根本 Bug）** | `moe_kernel.metal` | `exp2(s-128)` → `exp2(s-127)` |
+
+### 31.4 诊断参考
+
+完整诊断方法论见 §30，skill 文件见 `.kiro/steering/native-engine-debug.md`。

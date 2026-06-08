@@ -16,6 +16,31 @@ pub fn build(b: *std.Build) void {
     });
     const mlx_z_module = mlx_z_dep.module("mlx");
 
+    // --- native_loader load bench (run standalone) ---
+    const load_bench = b.addExecutable(.{
+        .name = "load-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_loader/load_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_load_bench = b.addRunArtifact(load_bench);
+    const run_load_bench_step = b.step("run-load-bench", "Run native loader weight benchmark");
+    run_load_bench_step.dependOn(&run_load_bench.step);
+
+
+    const native_loader_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/native_loader/test_loader.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_native_loader_test = b.addRunArtifact(native_loader_test);
+    const native_loader_test_step = b.step("test-native-loader", "Test native safetensors loader");
+    native_loader_test_step.dependOn(&run_native_loader_test.step);
+
     // --- Library ---
     const lib = b.addLibrary(.{
         .name = "dmlx_lib",

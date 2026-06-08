@@ -2630,6 +2630,10 @@ pub const DSV4TransformerBlock = struct {
 
             const attn_normed = try self.attn_norm.forward(attn_input);
             defer attn_normed.deinit();
+            if (self.layer_idx == 0) {
+                activation_dump.dump(self.ctx, "L0_attn_input", attn_input);
+                activation_dump.dump(self.ctx, "L0_attn_normed", attn_normed);
+            }
             const attn_out = try self.attn.forward(attn_normed, mask, cache, start_pos, stream);
             defer attn_out.deinit();
             if (self.layer_idx == 0) activation_dump.dump(self.ctx, "L0_attn_out", attn_out);
@@ -2644,6 +2648,7 @@ pub const DSV4TransformerBlock = struct {
 
             const ffn_normed = try self.ffn_norm.forward(ffn_input);
             defer ffn_normed.deinit();
+            if (self.layer_idx == 0) activation_dump.dump(self.ctx, "L0_ffn_normed", ffn_normed);
             const input_ids_actual = if (input_ids) |ids| ids else blk: {
                 const shape = ffn_normed.shape();
                 const ids_arr = try array_mod.zeros(self.ctx.allocator, &[_]i32{ shape[0], shape[1] }, .int32);
@@ -2956,6 +2961,7 @@ pub const DSV4Model = struct {
         if (self.config.use_mhc) {
             hidden = try arena.track(try expandToMHC(self.ctx, hidden, self.config.hc_mult, stream));
         }
+        if (activation_dump.enabled()) activation_dump.dump(self.ctx, "L0_residual_in", hidden);
 
         // Pass through layers (eval after each to allow memory paging)
         var layer_total_ns: u64 = 0;
@@ -3189,6 +3195,7 @@ pub const DSV4Model = struct {
         start_pos_override: ?usize,
     ) ![]u32 {
         const allocator = self.allocator;
+        std.log.info("dsv4_model: prompt_tokens={any}", .{prompt_tokens});
 
         // Guard against max_new_tokens=0 underflow (usize 0-1 wraps to maxInt)
         if (max_new_tokens == 0) {

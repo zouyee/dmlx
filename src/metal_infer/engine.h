@@ -44,6 +44,31 @@ extern "C" {
 #define MHC_MULT 4         // mHC HyperConnection multiplier
 #define MAX_SEQ_LEN 4096   // max sequence length
 
+// Compressor configuration constants
+#define COMP_HEAD_DIM    512   // main compressor output head_dim = HEAD_DIM
+#define IDX_HEAD_DIM     128   // indexer compressor output head_dim
+#define CSA_OUT_DIM     1024   // ratio=4 CSA: out_dim = head_dim * 2
+#define HCA_OUT_DIM      512   // ratio=128 HCA: out_dim = head_dim
+#define MAX_COMP_BLOCKS 8192   // max compressed blocks per layer per sequence
+#define SWA_WINDOW       128   // sliding window size (sliding_window in config)
+
+// Per-layer streaming compressor runtime state.
+typedef struct {
+    // Main compressor rolling state [2*ratio, out_dim]
+    float *state_kv;    // [2*ratio, out_dim]  (ratio=4: [8,1024], ratio=128: [128,512])
+    float *state_score; // same shape
+    uint32_t ratio;     // compress_ratio for this layer (0 = not initialized)
+    uint32_t out_dim;   // 1024 for CSA, 512 for HCA
+    // Main compressor output blocks
+    float *comp_kv;     // [MAX_COMP_BLOCKS, COMP_HEAD_DIM] f32
+    uint32_t n_comp;    // current number of emitted comp blocks
+    // Indexer's own compressor state (only ratio=4 layers)
+    float *idx_state_kv;    // [8, 256] (ratio=4, out_dim=128*2=256)
+    float *idx_state_score; // same
+    float *idx_comp_kv;     // [MAX_COMP_BLOCKS, IDX_HEAD_DIM]
+    uint32_t n_idx_comp;
+} CompressorState;
+
 // Quantized weight (affine 4-bit, gs=64): packed u32 + bf16->f32 scales & biases.
 // w = scale_g * nibble + bias_g.  Pointers are owned by the model (eval'd, not freed).
 typedef struct {
@@ -118,7 +143,7 @@ typedef struct {
 // ============================================================================
 
 typedef struct {
-    float *kv;  // [MAX_SEQ_LEN, KV_LORA_RANK] post-norm, post-RoPE KV latent
+    uint16_t *kv;  // [MAX_SEQ_LEN, KV_LORA_RANK] post-norm, post-RoPE KV latent (bf16)
     int len;
 } KVCache;
 
@@ -165,11 +190,40 @@ typedef struct {
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
     void *pipe_matvec;
-    // S7: MLA attention pipelines
+    // S7: MLA attention pipelines (f32 baseline)
     void *pipe_dequant_matvec_affine;
     void *pipe_rms_norm_rows;
     void *pipe_rope_tail;
     void *pipe_mla_sdpa;
+    void *pipe_mla_sdpa_f16;     // KV cache f16 precision (ds4 path)
+    // S8: Full f16 precision chain (ds4-style end-to-end)
+    void *pipe_dequant_matvec_affine_f16out;
+    void *pipe_rms_norm_rows_f16out;
+    void *pipe_dequant_matvec_affine_f16in_f16out;
+    void *pipe_rms_norm_rows_f16in_f16out;
+    void *pipe_rope_tail_f16;
+    void *pipe_matvec_f32_f16in;
+    void *pipe_mla_sdpa_f16in_f16out;
+    void *pipe_mhc_pre_f16;
+    void *pipe_mhc_post_f16;
+    // MoE f16 precision chain
+    void *pipe_gate_up_swiglu_f32in_f16out;
+    void *pipe_dequant_matvec_4bit_f16in_f32out;
+
+    // BF16 precision chain (S8b — MLX alignment)
+    void *pipe_dequant_matvec_affine_bf16out;
+    void *pipe_rms_norm_rows_bf16out;
+    void *pipe_dequant_matvec_affine_bf16in_bf16out;
+    void *pipe_rms_norm_rows_bf16in_bf16out;
+    void *pipe_rope_tail_bf16;
+    void *pipe_matvec_f32_bf16in;
+    void *pipe_mla_sdpa_bfloat;
+    void *pipe_mhc_pre_bfloat;
+    void *pipe_mhc_post_bfloat;
+    void *pipe_f32_to_bf16;
+    void *pipe_bf16_to_f32;
+    void *pipe_dequant_matvec_affine_bf16in_f32out;
+    void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -184,6 +238,44 @@ typedef struct {
     void *buf_shared_down;       // [DIM] shared expert down
     void *buf_norm_sum_sq;       // [1] sum of squares for RMS
     void *buf_input_norm;        // [DIM] next layer input norm weight (GPU)
+
+    // BF16 buffers (S8b — MLX alignment)
+    void *buf_residual_bf16;     // [MHC_MULT, DIM] current residual (bf16)
+    void *buf_attn_input_bf16;   // [DIM] attn sublayer input (bf16)
+    void *buf_ffn_input_bf16;    // [DIM] ffn sublayer input (bf16)
+    void *buf_ffn_normed_bf16;   // [DIM] ffn normed for gate (bf16)
+    void *buf_attn_out_bf16;     // [DIM] attention output (bf16)
+    void *buf_ffn_out_bf16;      // [DIM] ffn output (bf16)
+
+    // Persistent scratch buffers for mhc_pre / mhc_post (reused every forward_layer call)
+    // Eliminates repeated large allocations that caused OOM at scale.
+    void *buf_mhc_res_in;        // [MHC_MULT*DIM] f32  — residual input to mhc_pre (attn)
+    void *buf_mhc_attn_in;       // [DIM] f32           — mhc_pre attn output
+    void *buf_mhc_attn_norm_bf16;// [DIM] u16           — attn normed (bf16)
+    void *buf_mhc_post_weights;  // [MHC_MULT] f32      — post weights from mhc_pre
+    void *buf_mhc_comb_weights;  // [MHC_MULT*MHC_MULT] f32 — comb weights from mhc_pre
+    void *buf_mhc_res_out;       // [MHC_MULT*DIM] u16  — mhc_post output (bf16)
+    void *buf_mhc_ffn_in;        // [DIM] f32           — mhc_pre ffn output
+    void *buf_mhc_ffn_norm_bf16; // [DIM] u16           — ffn normed (bf16)
+    void *buf_mhc_ffn_res_in;    // [MHC_MULT*DIM] f32  — residual copy for ffn mhc_pre
+    // Extra dedicated scratch buffers for mhc_post (avoids buffer aliasing bugs)
+    void *buf_mhc_attn_out_bf16; // [DIM] u16           — attn_out converted to bf16 for mhc_post
+    void *buf_mhc_res_bf16_in;   // [MHC_MULT*DIM] u16  — residual in bf16 for mhc_post input
+    void *buf_mhc_post_res_out;  // [MHC_MULT*DIM] u16  — mhc_post result (bf16)
+    void *buf_mhc_ffn_post_out;  // [MHC_MULT*DIM] u16  — mhc_post result for FFN sublayer (bf16)
+
+    // Persistent GPU buffers for per-layer mHC weights (uploaded once at set_layer_hc)
+    // Avoids 1.5MB newBufferWithBytes per forward_layer call (was main OOM source)
+    void *buf_attn_hc_fn[N_LAYERS];    // id<MTLBuffer> [MIX3*MHC_MULT*DIM] f32
+    void *buf_attn_hc_base[N_LAYERS];  // id<MTLBuffer> [MIX3] f32
+    void *buf_attn_hc_scale[N_LAYERS]; // id<MTLBuffer> [3] f32
+    void *buf_ffn_hc_fn[N_LAYERS];     // id<MTLBuffer> [MIX3*MHC_MULT*DIM] f32
+    void *buf_ffn_hc_base[N_LAYERS];   // id<MTLBuffer> [MIX3] f32
+    void *buf_ffn_hc_scale[N_LAYERS];  // id<MTLBuffer> [3] f32
+    // Persistent per-layer norm weight GPU buffers (uploaded once at set_weights)
+    void *buf_input_norm_gpu[N_LAYERS]; // id<MTLBuffer> [DIM] f32  (attn pre-norm)
+    void *buf_attn_norm_gpu[N_LAYERS];  // id<MTLBuffer> [DIM] f32  (ffn pre-norm)
+    void *buf_gate_proj_gpu[N_LAYERS];  // id<MTLBuffer> [N_EXPERTS*DIM] f32  (router weights)
 
     // Expert I/O
     int packed_fd[N_LAYERS];     // per-layer packed expert file descriptors
@@ -216,10 +308,32 @@ typedef struct {
     const float *ffn_hc_fn[N_LAYERS];
     const float *ffn_hc_base[N_LAYERS];
     const float *ffn_hc_scale[N_LAYERS];
+    // ds4-style f16 copies of fn weights (allocated in set_layer_hc, freed in deinit)
+    const uint16_t *attn_hc_fn_f16[N_LAYERS];
+    const uint16_t *ffn_hc_fn_f16[N_LAYERS];
+    // bf16 copies for MLX alignment
+    const uint16_t *attn_hc_fn_bf16[N_LAYERS];
+    const uint16_t *ffn_hc_fn_bf16[N_LAYERS];
     int expert_fd[N_LAYERS];
 
     // KV cache
     KVCache kv_cache[N_LAYERS];
+
+    // Compressor/Indexer weights and state (set by moe_infer_set_layer_compressor)
+    uint32_t compress_ratio[N_LAYERS];   // 0=none, 4=CSA, 128=HCA
+    QuantWeight comp_wkv[N_LAYERS];
+    QuantWeight comp_wgate[N_LAYERS];
+    const float *comp_ape[N_LAYERS];     // [compress_ratio, out_dim] f32
+    const float *comp_norm[N_LAYERS];    // [COMP_HEAD_DIM] f32
+    // Indexer weights (only ratio=4 layers)
+    QuantWeight idx_wq_b[N_LAYERS];
+    QuantWeight idx_weights_proj[N_LAYERS];
+    QuantWeight idx_comp_wkv[N_LAYERS];
+    QuantWeight idx_comp_wgate[N_LAYERS];
+    const float *idx_comp_ape[N_LAYERS]; // [4, 256] f32
+    const float *idx_comp_norm[N_LAYERS];// [IDX_HEAD_DIM] f32
+    // Runtime compressor state
+    CompressorState comp_state[N_LAYERS];
 
     // Layer config
     LayerConfig layers[N_LAYERS];
@@ -283,8 +397,49 @@ int moe_infer_forward_layer(MoEInferEngine *engine, int layer, float *hidden, in
 // Forward pass for ALL layers. hidden: [DIM] input and output.
 int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
 
+// Batch forward pass for N tokens (proper transformer order: layer-first, then tokens).
+// hidden_batch: [n_tokens, MHC_MULT*DIM] — each token's residual is updated in-place.
+// After return, KV caches for all layers contain all n_tokens entries.
+// token_ids: optional [n_tokens] token IDs for per-token hash routing (NULL = use current_token_id).
+int moe_infer_forward_batch(MoEInferEngine *engine, float *hidden_batch, int n_tokens, int start_pos, const int *token_ids);
+
+// Embed token_id into hidden state.
+// hidden_out: [MHC_MULT * DIM] — all MHC streams set to embed[token_id].
+void moe_infer_embed(MoEInferEngine *engine, int token_id, float *hidden_out);
+
+// Compress mHC residual [MHC_MULT, DIM] → [DIM] using simple mean.
+void moe_infer_compress_hc(MoEInferEngine *engine, const float *residual, float *out);
+
+// Apply final RMSNorm + lm_head matmul.
+// hidden: [DIM] (after moe_infer_compress_hc)
+// logits_out: [vocab_size] (caller allocates)
+// Returns 0 on success.
+int moe_infer_get_logits(MoEInferEngine *engine, const float *hidden, float *logits_out);
+
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);
+
+// Set one layer's compressor weights. Call after moe_infer_set_layer_attn.
+void moe_infer_set_layer_compressor(MoEInferEngine *engine, int layer,
+    uint32_t compress_ratio,
+    QuantWeight comp_wkv, QuantWeight comp_wgate,
+    const float *comp_ape, const float *comp_norm);
+
+// Set one layer's indexer weights (only for compress_ratio==4 layers).
+void moe_infer_set_layer_indexer(MoEInferEngine *engine, int layer,
+    QuantWeight idx_wq_b, QuantWeight idx_weights_proj,
+    QuantWeight idx_comp_wkv, QuantWeight idx_comp_wgate,
+    const float *idx_comp_ape, const float *idx_comp_norm);
+
+// Run one token through the compressor. Emits a comp_kv block every `ratio` tokens.
+void moe_infer_compressor_step(MoEInferEngine *engine, int layer, int pos,
+                                const float *attn_normed);
+
+// (Private helper exposed for testing) Run indexer to get allowed comp block mask.
+// Returns false if no selection needed (n_comp <= index_topk).
+bool moe_infer_indexer_step(MoEInferEngine *engine, int layer, int pos,
+                             const float *attn_normed, const float *q_a_out,
+                             bool *allowed_out);
 
 #ifdef __cplusplus
 }

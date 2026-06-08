@@ -180,6 +180,131 @@ static void test_sdpa(void) {
     free(q); free(kv); free(sinks); free(ref);
 }
 
+// ---- test: mla_sdpa_decode_f16 (f16 KV cache, f32 Q, f32 output) ----
+static void test_sdpa_f16(void) {
+    const uint n_heads = 4, head_dim = 64, n_kv = 5;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float *q = malloc(sizeof(float)*n_heads*head_dim);
+    float *kv_f = malloc(sizeof(float)*n_kv*head_dim);
+    uint16_t *kv = malloc(sizeof(uint16_t)*n_kv*head_dim);
+    float *sinks = malloc(sizeof(float)*n_heads);
+    for (uint i=0;i<n_heads*head_dim;i++) q[i]=0.1f*(float)((i%13)-6);
+    for (uint i=0;i<n_kv*head_dim;i++) kv_f[i]=0.1f*(float)((i%7)-3);
+    for (uint i=0;i<n_kv*head_dim;i++) {
+        _Float16 h = (_Float16)kv_f[i];
+        kv[i] = *(uint16_t *)&h;
+    }
+    for (uint h=0;h<n_heads;h++) sinks[h]=0.2f*(float)h - 0.3f;
+
+    // CPU reference: full softmax with sink folded into denominator
+    float *ref = malloc(sizeof(float)*n_heads*head_dim);
+    for (uint h=0;h<n_heads;h++) {
+        float m=-INFINITY;
+        float *sc = malloc(sizeof(float)*n_kv);
+        for (uint k=0;k<n_kv;k++){ double dot=0; for(uint d=0;d<head_dim;d++) dot+=(double)q[h*head_dim+d]*kv_f[k*head_dim+d]; sc[k]=(float)dot*scale; if(sc[k]>m)m=sc[k]; }
+        if (sinks[h]>m) m=sinks[h];
+        double s=0; for(uint k=0;k<n_kv;k++) s+=exp(sc[k]-m); s+=exp(sinks[h]-m);
+        for(uint d=0;d<head_dim;d++){ double acc=0; for(uint k=0;k<n_kv;k++) acc+=exp(sc[k]-m)*kv_f[k*head_dim+d]; ref[h*head_dim+d]=(float)(acc/s); }
+        free(sc);
+    }
+
+    id<MTLComputePipelineState> p = mkpipe("mla_sdpa_decode_f16");
+    id<MTLBuffer> bq=buf(q,sizeof(float)*n_heads*head_dim);
+    id<MTLBuffer> bkv=buf(kv,sizeof(uint16_t)*n_kv*head_dim);
+    id<MTLBuffer> bsk=buf(sinks,sizeof(float)*n_heads);
+    id<MTLBuffer> bo=bufz(sizeof(float)*n_heads*head_dim);
+    id<MTLCommandBuffer> cb=[queue commandBuffer];
+    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bq offset:0 atIndex:0];
+    [e setBuffer:bkv offset:0 atIndex:1];
+    [e setBuffer:bsk offset:0 atIndex:2];
+    [e setBuffer:bo offset:0 atIndex:3];
+    uint nh=n_heads,hd=head_dim,nk=n_kv;
+    [e setBytes:&nh length:4 atIndex:4];
+    [e setBytes:&hd length:4 atIndex:5];
+    [e setBytes:&nk length:4 atIndex:6];
+    [e setBytes:&scale length:4 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake(n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out=[bo contents]; float maxd=0;
+    for (uint i=0;i<n_heads*head_dim;i++){ float d=fabsf(ref[i]-out[i]); if(d>maxd)maxd=d; }
+    check("mla_sdpa_decode_f16 (+sink)", maxd, 2e-4f);
+    free(q); free(kv_f); free(kv); free(sinks); free(ref);
+}
+
+// ---- test: mla_sdpa_decode_f16in_f16out with multi-kv (n_kv=5) ----
+static void test_sdpa_f16in_f16out_multi_kv(void) {
+    const uint n_heads = 4, head_dim = 64, n_kv = 5;
+    float scale = 1.0f / sqrtf((float)head_dim);
+    float *q = malloc(sizeof(float)*n_heads*head_dim);
+    float *kv_f = malloc(sizeof(float)*n_kv*head_dim);
+    float *sinks = malloc(sizeof(float)*n_heads);
+    for (uint i=0;i<n_heads*head_dim;i++) q[i]=0.1f*(float)((i%13)-6);
+    for (uint i=0;i<n_kv*head_dim;i++) kv_f[i]=0.1f*(float)((i%7)-3);
+    for (uint h=0;h<n_heads;h++) sinks[h]=0.2f*(float)h - 0.3f;
+
+    uint16_t *q_h = malloc(sizeof(uint16_t)*n_heads*head_dim);
+    uint16_t *kv_h = malloc(sizeof(uint16_t)*n_kv*head_dim);
+    for (uint i=0;i<n_heads*head_dim;i++) { _Float16 h = (_Float16)q[i]; q_h[i] = *(uint16_t *)&h; }
+    for (uint i=0;i<n_kv*head_dim;i++) { _Float16 h = (_Float16)kv_f[i]; kv_h[i] = *(uint16_t *)&h; }
+
+    // CPU reference: online softmax with sink (using last KV as sink KV)
+    float *ref = malloc(sizeof(float)*n_heads*head_dim);
+    for (uint h=0;h<n_heads;h++) {
+        float m=-INFINITY; float s=0.0f;
+        float acc[64]; memset(acc,0,sizeof(float)*head_dim);
+        for (uint k=0;k<n_kv;k++) {
+            double dot=0; for(uint d=0;d<head_dim;d++) dot+=(double)q[h*head_dim+d]*kv_f[k*head_dim+d];
+            float score=(float)dot*scale;
+            float m_new=fmaxf(m,score);
+            float corr=(m==-INFINITY)?0.0f:expf(m-m_new);
+            float p=expf(score-m_new);
+            for(uint d=0;d<head_dim;d++) acc[d]=acc[d]*corr+p*kv_f[k*head_dim+d];
+            s=s*corr+p; m=m_new;
+        }
+        // Sink
+        float sink=sinks[h];
+        float m_new=fmaxf(m,sink);
+        float corr=(m==-INFINITY)?0.0f:expf(m-m_new);
+        float p=expf(sink-m_new);
+        for(uint d=0;d<head_dim;d++) acc[d]=acc[d]*corr+p*kv_f[(n_kv-1)*head_dim+d];
+        s=s*corr+p;
+        for(uint d=0;d<head_dim;d++) ref[h*head_dim+d]=acc[d]/s;
+    }
+
+    id<MTLComputePipelineState> p = mkpipe("mla_sdpa_decode_f16in_f16out");
+    id<MTLBuffer> bq=buf(q_h,sizeof(uint16_t)*n_heads*head_dim);
+    id<MTLBuffer> bkv=buf(kv_h,sizeof(uint16_t)*n_kv*head_dim);
+    id<MTLBuffer> bsk=buf(sinks,sizeof(float)*n_heads);
+    id<MTLBuffer> bo=bufz(sizeof(uint16_t)*n_heads*head_dim);
+    id<MTLCommandBuffer> cb=[queue commandBuffer];
+    id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bq offset:0 atIndex:0];
+    [e setBuffer:bkv offset:0 atIndex:1];
+    [e setBuffer:bsk offset:0 atIndex:2];
+    [e setBuffer:bo offset:0 atIndex:3];
+    uint nh=n_heads,hd=head_dim,nk=n_kv;
+    [e setBytes:&nh length:4 atIndex:4];
+    [e setBytes:&hd length:4 atIndex:5];
+    [e setBytes:&nk length:4 atIndex:6];
+    [e setBytes:&scale length:4 atIndex:7];
+    [e dispatchThreadgroups:MTLSizeMake(n_heads,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    uint16_t *out_h=(uint16_t *)[bo contents]; float maxd=0;
+    for (uint i=0;i<n_heads*head_dim;i++){
+        _Float16 h = *(_Float16 *)&out_h[i];
+        float d=fabsf(ref[i]-(float)h); if(d>maxd)maxd=d;
+    }
+    check("mla_sdpa_decode_f16in_f16out (multi-kv)", maxd, 2e-4f);
+    free(q); free(kv_f); free(sinks); free(q_h); free(kv_h); free(ref);
+}
+
 // ---- test: dequant_matvec_affine (w = scale*nibble + bias) ----
 static void test_dequant_affine(void) {
     const uint out_dim = 5, in_dim = 128, gs = 64;
@@ -257,6 +382,8 @@ int main(int argc, char **argv) {
     test_rms_norm_rows();
     test_rope();
     test_sdpa();
+    test_sdpa_f16();
+    test_sdpa_f16in_f16out_multi_kv();
     test_dequant_affine();
 
     printf(g_fail ? "\nRESULT: KERNEL TESTS FAILED\n" : "\nRESULT: ALL KERNEL TESTS PASSED\n");

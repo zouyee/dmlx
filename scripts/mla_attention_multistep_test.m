@@ -77,10 +77,16 @@ int main(void) {
     P.rms_norm_rows = mkpipe(d, lib, "rms_norm_rows");
     P.rope_tail_interleaved = mkpipe(d, lib, "rope_tail_interleaved");
     P.mla_sdpa_decode = mkpipe(d, lib, "mla_sdpa_decode");
+    P.mla_sdpa_decode_f16 = mkpipe(d, lib, "mla_sdpa_decode_f16");
     P.matvec_f32 = mkpipe(d, lib, "matvec_f32");
-    P.dequant_matvec_affine_bf16 = mkpipe(d, lib, "dequant_matvec_affine_bf16out");
-    P.rms_norm_rows_bf16 = mkpipe(d, lib, "rms_norm_rows_bf16out");
-    P.bf16_to_f32 = mkpipe(d, lib, "bf16_to_f32");
+    // F16 precision chain
+    P.dequant_matvec_affine_f16out = mkpipe(d, lib, "dequant_matvec_affine_f16out");
+    P.rms_norm_rows_f16out = mkpipe(d, lib, "rms_norm_rows_f16out");
+    P.dequant_matvec_affine_f16in_f16out = mkpipe(d, lib, "dequant_matvec_affine_f16in_f16out");
+    P.rms_norm_rows_f16in_f16out = mkpipe(d, lib, "rms_norm_rows_f16in_f16out");
+    P.rope_tail_interleaved_f16 = mkpipe(d, lib, "rope_tail_interleaved_f16");
+    P.matvec_f32_f16in = mkpipe(d, lib, "matvec_f32_f16in");
+    P.mla_sdpa_decode_f16in_f16out = mkpipe(d, lib, "mla_sdpa_decode_f16in_f16out");
 
     // Load weights (from single-step golden dir, same layer-0 weights)
     AttnWeights aw;
@@ -94,7 +100,7 @@ int main(void) {
     aw.wo_a_dense = readf(GD_SINGLE, "wo_a_dense.bin", NULL);
 
     // KV cache (engine-style: [MAX_SEQ_LEN, KV_LORA_RANK])
-    float *kv_cache = calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(float));
+    uint16_t *kv_cache = calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(uint16_t));
     float *out = malloc(DIM * sizeof(float));
 
     // Prefill: N_PREFILL steps
@@ -127,12 +133,15 @@ int main(void) {
     printf("max_abs_diff=%.3e  rel_L2=%.3e\n", maxd, rel);
 
     // Also compare KV cache at each position vs golden KV cache
+    // Our kv_cache is f16; convert back to f32 for comparison.
     float *ref_kv = readf(GD, "kv_cache.bin", NULL);
     float kv_maxd = 0; double kv_ss = 0, kv_ref_ss = 0;
     for (int i = 0; i <= decode_pos; i++) {
         for (int j = 0; j < KV_LORA_RANK; j++) {
             float ref = ref_kv[(size_t)i * KV_LORA_RANK + j];
-            float cmp = kv_cache[(size_t)i * KV_LORA_RANK + j];
+            uint16_t h = kv_cache[(size_t)i * KV_LORA_RANK + j];
+            _Float16 hf = *(_Float16 *)&h;
+            float cmp = (float)hf;
             float dd = fabsf(ref - cmp);
             if (dd > kv_maxd) kv_maxd = dd;
             kv_ss += (double)dd * dd;

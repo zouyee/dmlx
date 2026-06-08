@@ -57,7 +57,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **Prefix Cache with LRU Eviction** (`src/engine/prefix_cache.zig`)
+- **Native MLX-free Engine for DeepSeek V4 Flash** (`src/native_engine.zig`, `src/metal_infer/`)
+  - Full attention + mHC + MoE pipeline in C/Metal without MLX runtime
+  - `--native` flag as new recommended default for DSV4-Flash-4bit
+  - Requires pre-packed experts: `python3 scripts/repack_experts.py <model_dir>`
+  - Smoke test: `NATIVE=1 bash scripts/dsv4_smoke.sh` → 2/2 PASS
+  - Correctness diagnostic skill: `.kiro/steering/native-engine-debug.md`
+
+### Fixed
+- **MXFP4 E8M0 scale bias correction** (`src/models/moe_kernel.metal`)
+  - Root cause: `exp2(scale - 128)` should be `exp2(scale - 127)` per MLX `fp8_e8m0` spec
+  - Impact: routed expert outputs were 7.8× too small, causing completely wrong logits
+  - Fix: change bias from 128 → 127 in all MXFP4 Metal kernels
+  - Same fix applied to `scripts/verify_mxfp4_gate.py` and `scripts/verify_mxfp4_lut.py`
+
+- **Hash routing per-token fix** (`src/native_engine.zig`)
+  - Hash routing (layers 0-2) was using last prompt token's ID for all tokens
+  - Fix: pass `token_ids[]` array to `forwardBatch` so each token uses its own expert table row
+
+- **`pipe_mhc_pre_bfloat` kernel fix** (`src/metal_infer/engine.c`)
+  - Was loading `mhc_pre_gpu_f16` (f16 truncation) instead of `mhc_pre_gpu` (bf16 truncation)
+  - Fix: load correct `mhc_pre_gpu` kernel matching MLX's bf16 precision
+
+- **FFN normed_bf16_direct stale bug** (`src/metal_infer/engine.c`)
+  - Routing gate was using attn-norm's output instead of FFN-norm's output
+  - Fix: update `normed_bf16_direct` after FFN RMSNorm step
+
+
   - Caches pre-filled KV states for repeated prompts (skip prefill on cache hit)
   - Proper LRU eviction via monotonic access counter (replaces naive iteration order)
   - FNV-1a token sequence hashing with collision safety (exact match verification)

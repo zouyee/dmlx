@@ -1,21 +1,23 @@
 #!/bin/bash
-# DeepSeek-V4-Flash-4bit smoke test — Phase 1 correctness gate.
+# DeepSeek-V4-Flash-4bit smoke test — correctness gate.
 #
 # Starts the dmlx server, sends 2 well-known greedy prompts, and asserts the
 # output is coherent (not gibberish / BOS repetition). This is the mandatory
 # gate before any benchmark or before lighting up a new metal segment.
 #
-# See docs/analysis/dsv4-first-class-support-plan.md §4.
+# See docs/analysis/dsv4-first-class-support-plan.md §4 and §29.
 #
 # Usage:
-#   bash scripts/dsv4_smoke.sh                 # pure MLX path (oracle)
+#   bash scripts/dsv4_smoke.sh                 # native MLX-free engine (DEFAULT)
+#   NATIVE=0 bash scripts/dsv4_smoke.sh        # pure MLX path (oracle)
 #   METAL_MOE=1 bash scripts/dsv4_smoke.sh     # add --metal-moe
 #   DSV4_DUMP_DIR=/tmp/mlx_ref bash scripts/dsv4_smoke.sh   # also dump activations
 #
 # Env:
 #   MODEL_PATH   (default: ~/models/DeepSeek-V4-Flash-4bit)
 #   PORT         (default: 8930)
-#   METAL_MOE    (default: unset → pure MLX)
+#   NATIVE       (default: 1 → native MLX-free engine; set to 0 for pure MLX)
+#   METAL_MOE    (default: unset → ignored unless NATIVE=0)
 #   DSV4_DUMP_DIR(default: unset → no dump)
 
 set -uo pipefail
@@ -35,7 +37,10 @@ if [[ ! -x "${CLI}" ]]; then
 fi
 
 EXTRA_FLAGS=()
-if [[ "${METAL_MOE:-0}" == "1" ]]; then
+if [[ "${NATIVE:-1}" == "1" ]]; then
+    EXTRA_FLAGS+=(--native --expert-packed-dir "${PACKED_DIR}")
+    echo -e "${YELLOW}mode: native (MLX-free) — default${NC}"
+elif [[ "${METAL_MOE:-0}" == "1" ]]; then
     EXTRA_FLAGS+=(--metal-moe)
     echo -e "${YELLOW}mode: metal-moe${NC}"
 else
@@ -46,13 +51,21 @@ LOG="$(mktemp -t dsv4_smoke.XXXXXX.log)"
 echo "server log: ${LOG}"
 
 # Start server in background.
-"${CLI}" serve \
-    --model "${MODEL_PATH}" \
-    --port "${PORT}" --max-tokens 64 --temperature 0 \
-    --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
-    --expert-packed-dir "${PACKED_DIR}" \
-    ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
-    > "${LOG}" 2>&1 &
+if [[ "${NATIVE:-1}" == "1" ]]; then
+    "${CLI}" serve \
+        --model "${MODEL_PATH}" \
+        --port "${PORT}" --max-tokens 64 --temperature 0 \
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+        > "${LOG}" 2>&1 &
+else
+    "${CLI}" serve \
+        --model "${MODEL_PATH}" \
+        --port "${PORT}" --max-tokens 64 --temperature 0 \
+        --smelt --smelt-strategy stream --smelt-experts 0.20 --smelt-cache 0 \
+        --expert-packed-dir "${PACKED_DIR}" \
+        ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
+        > "${LOG}" 2>&1 &
+fi
 SERVER_PID=$!
 
 cleanup() {

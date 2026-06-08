@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <Accelerate/Accelerate.h>
 
 // ============================================================================
 // Metal setup
@@ -54,6 +55,30 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_rows = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows"] error:&err]);
     eng->pipe_rope_tail = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved"] error:&err]);
     eng->pipe_mla_sdpa = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode"] error:&err]);
+    eng->pipe_mla_sdpa_f16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_f16"] error:&err]);
+    // F16 precision chain (validated correct, see docs/analysis/dsv4-first-class-support-plan.md)
+    eng->pipe_dequant_matvec_affine_f16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_f16out"] error:&err]);
+    eng->pipe_rms_norm_rows_f16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_f16out"] error:&err]);
+    eng->pipe_dequant_matvec_affine_f16in_f16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_f16in_f16out"] error:&err]);
+    eng->pipe_rms_norm_rows_f16in_f16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_f16in_f16out"] error:&err]);
+    eng->pipe_rope_tail_f16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_f16"] error:&err]);
+    eng->pipe_matvec_f32_f16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_f16in"] error:&err]);
+    eng->pipe_mla_sdpa_f16in_f16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_f16in_f16out"] error:&err]);
+    // BF16 precision chain — matches MLX training precision
+    eng->pipe_dequant_matvec_affine_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16out"] error:&err]);
+    eng->pipe_rms_norm_rows_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16out"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_bf16out"] error:&err]);
+    eng->pipe_rms_norm_rows_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16in_bf16out"] error:&err]);
+    eng->pipe_rope_tail_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_bf16"] error:&err]);
+    eng->pipe_matvec_f32_bf16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_bf16in"] error:&err]);
+    eng->pipe_mla_sdpa_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_bfloat"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
+    eng->pipe_mla_sdpa_prefill_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_prefill_bfloat"] error:&err]);
+    // mHC GPU kernels (f16/bfloat)
+    eng->pipe_mhc_pre_f16   = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_f16"] error:&err]);
+    eng->pipe_mhc_post_f16  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_f16"] error:&err]);
+    eng->pipe_mhc_pre_bfloat  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_gpu"] error:&err]);
+    eng->pipe_mhc_post_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_bfloat"] error:&err]);
     if (!eng->pipe_gate_up_swiglu || !eng->pipe_dequant_matvec || !eng->pipe_moe_combine) {
         fprintf(stderr, "Metal: pipeline state failed\n");
         return -1;
@@ -72,6 +97,23 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
         eng->buf_expert_mid[k] = (void *)[d newBufferWithLength:mid_size options:MTLResourceStorageModeShared];
         eng->buf_expert_out[k] = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     }
+
+    // Persistent scratch buffers for mhc_pre / mhc_post — eliminates per-call allocation
+    const int MIX3_size = MHC_MULT * (MHC_MULT + 2);  // 24
+    eng->buf_mhc_res_in        = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(float)         options:MTLResourceStorageModeShared];
+    eng->buf_mhc_attn_in       = (void *)[d newBufferWithLength:DIM * sizeof(float)                    options:MTLResourceStorageModeShared];
+    eng->buf_mhc_attn_norm_bf16= (void *)[d newBufferWithLength:DIM * sizeof(uint16_t)                 options:MTLResourceStorageModeShared];
+    eng->buf_mhc_post_weights  = (void *)[d newBufferWithLength:MHC_MULT * sizeof(float)               options:MTLResourceStorageModeShared];
+    eng->buf_mhc_comb_weights  = (void *)[d newBufferWithLength:MHC_MULT * MHC_MULT * sizeof(float)    options:MTLResourceStorageModeShared];
+    eng->buf_mhc_res_out       = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
+    eng->buf_mhc_ffn_in        = (void *)[d newBufferWithLength:DIM * sizeof(float)                    options:MTLResourceStorageModeShared];
+    eng->buf_mhc_ffn_norm_bf16 = (void *)[d newBufferWithLength:DIM * sizeof(uint16_t)                 options:MTLResourceStorageModeShared];
+    eng->buf_mhc_ffn_res_in    = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(float)         options:MTLResourceStorageModeShared];
+    eng->buf_mhc_attn_out_bf16 = (void *)[d newBufferWithLength:DIM * sizeof(uint16_t)                 options:MTLResourceStorageModeShared];
+    eng->buf_mhc_res_bf16_in   = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
+    eng->buf_mhc_post_res_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
+    eng->buf_mhc_ffn_post_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
+    (void)MIX3_size;
 
     // 2MB-aligned expert I/O buffers
     for (int k = 0; k < N_ACTIVE; k++) {
@@ -92,7 +134,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
 typedef struct {
     pthread_mutex_t mutex;
     pthread_cond_t work_ready, work_done;
-    int fd[NUM_IO_THREADS];
+    int fd[NUM_IO_THREADS];       // original fd per task (set by dispatcher)
+    int claimed_fd[NUM_IO_THREADS]; // fd saved when task is claimed (to preserve original)
     void *buf[NUM_IO_THREADS];
     size_t size;
     off_t offset[NUM_IO_THREADS];
@@ -114,17 +157,22 @@ static void *io_worker(void *arg) {
         if (pool->shutdown) { pthread_mutex_unlock(&pool->mutex); break; }
         last_gen = pool->generation;
         int tid = -1;
-        // Find an unclaimed task
+        // Find and claim an unclaimed task atomically while mutex is held
         for (int i = 0; i < pool->num_tasks; i++) {
-            if (pool->fd[i] >= 0) { tid = i; break; }
+            if (pool->fd[i] >= 0) {
+                tid = i;
+                pool->claimed_fd[i] = pool->fd[i]; // save fd before claiming
+                pool->fd[i] = -1;  // mark as claimed immediately
+                break;
+            }
         }
         pthread_mutex_unlock(&pool->mutex);
         if (tid < 0) continue;
 
-        ssize_t n = pread(pool->fd[tid], pool->buf[tid], pool->size, pool->offset[tid]);
+        ssize_t n = pread(pool->claimed_fd[tid], pool->buf[tid], pool->size, pool->offset[tid]);
+        (void)n;
 
         pthread_mutex_lock(&pool->mutex);
-        pool->fd[tid] = -1;  // mark done
         pool->tasks_done++;
         if (pool->tasks_done == pool->num_tasks) {
             pthread_cond_signal(&pool->work_done);
@@ -241,8 +289,8 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     // Step 3: moe_combine — weighted sum of K routed-expert outputs ONLY.
     // Commit the gate+up+down work first, then copy into a contiguous buffer.
     [cb commit]; [cb waitUntilCompleted];
-    // Copy each expert's output (now ready on CPU-accessible shared memory) into
-    // a contiguous [K*DIM] buffer for the combine kernel.
+
+    // Copy each expert's output into a contiguous [K*DIM] buffer for the combine kernel.
     id<MTLBuffer> contiguous_out = [d newBufferWithLength:(size_t)K*DIM*sizeof(float) options:MTLResourceStorageModeShared];
     {
         float *dst_all = (float *)[contiguous_out contents];
@@ -415,7 +463,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
 
-    // Build MlaPipes view over the engine's pipelines.
+    @autoreleasepool {    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
     P.queue = (id<MTLCommandQueue>)eng->queue;
@@ -423,57 +471,220 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.rms_norm_rows = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows;
     P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
     P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;
+    P.mla_sdpa_decode_f16 = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_f16;
     P.matvec_f32 = (id<MTLComputePipelineState>)eng->pipe_matvec;
+    // F16 precision chain (validated correct)
+    P.dequant_matvec_affine_f16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_f16out;
+    P.rms_norm_rows_f16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_f16out;
+    P.dequant_matvec_affine_f16in_f16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_f16in_f16out;
+    P.rms_norm_rows_f16in_f16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_f16in_f16out;
+    P.rope_tail_interleaved_f16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_f16;
+    P.matvec_f32_f16in = (id<MTLComputePipelineState>)eng->pipe_matvec_f32_f16in;
+    P.mla_sdpa_decode_f16in_f16out = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_f16in_f16out;
+    // BF16 precision chain — matches MLX training precision
+    P.dequant_matvec_affine_bf16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16out;
+    P.rms_norm_rows_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out;
+    P.dequant_matvec_affine_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out;
+    P.rms_norm_rows_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16in_bf16out;
+    P.rope_tail_interleaved_bf16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_bf16;
+    P.matvec_f32_bf16in = (id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in;
+    P.mla_sdpa_decode_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_bfloat;
+    P.dequant_matvec_affine_bf16in_f32out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out;
+    P.mla_sdpa_prefill_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_prefill_bfloat;
 
-    // Large scratch buffers are static (forward_layer runs serially) to avoid
-    // overflowing the warmup/engine fiber's limited stack.
+    // Large scratch buffers are static (forward_layer runs serially).
     static float attn_input[DIM], normed[DIM], attn_out[DIM];
     static float ffn_input[DIM], ffn_out[DIM];
+    static uint16_t normed_bf16_direct[DIM];
     float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
 
-    // === Attention sublayer (mHC-wrapped) ===
+    // === Attention sublayer — GPU mhc_pre_f16 (matches MLX bf16 computation) ===
     MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
     if (layer == 0 && getenv("MF_DBG")) {
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 in residual norm=%.4f\n", sqrt(rn));
+        fprintf(stderr, "[mf-dbg] L0 pos=%d in residual norm=%.4f res[0]=%.6f res[DIM]=%.6f\n", pos, sqrt(rn), residual[0], residual[DIM]);
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/L0_residual_metal.bin", dd);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(residual, sizeof(float), MHC_MULT*DIM, f); fclose(f); }
+        }
     }
-    mhc_pre(&ahc, residual, attn_input, post, comb);
+    // Use GPU mhc_pre_gpu — persistent buffers for large weights (1.5MB fn), per-call for small scratch
+    {
+        id<MTLBuffer> buf_res  = [d newBufferWithBytes:residual length:MHC_MULT*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_ain  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_post = [d newBufferWithLength:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_comb2= [d newBufferWithLength:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]    offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]  offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
+        [enc setBuffer:buf_res  offset:0 atIndex:3];
+        [enc setBuffer:buf_ain  offset:0 atIndex:4];
+        [enc setBuffer:buf_post offset:0 atIndex:5];
+        [enc setBuffer:buf_comb2 offset:0 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        memcpy(attn_input, [buf_ain  contents], DIM * sizeof(float));
+        memcpy(post,       [buf_post contents], MHC_MULT * sizeof(float));
+        memcpy(comb,       [buf_comb2 contents], MHC_MULT * MHC_MULT * sizeof(float));
+    }
     if (layer == 0 && getenv("MF_DBG")) {
-        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_input[z]*attn_input[z];
-        fprintf(stderr, "[mf-dbg] L0 attn_input norm=%.4f post=[%.3f %.3f %.3f %.3f] comb00=%.3f\n",
-            sqrt(an), post[0],post[1],post[2],post[3], comb[0]);
+        // Compare GPU mhc_pre with CPU mhc_pre for debugging
+        static float attn_input_cpu[DIM];
+        float post_cpu[MHC_MULT], comb_cpu[MHC_MULT * MHC_MULT];
+        MhcWeights ahc_cpu = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+        mhc_pre(&ahc_cpu, residual, attn_input_cpu, post_cpu, comb_cpu);
+        double an_gpu=0, an_cpu=0;
+        for(int z=0;z<DIM;z++) { an_gpu+=(double)attn_input[z]*attn_input[z]; an_cpu+=(double)attn_input_cpu[z]*attn_input_cpu[z]; }
+        fprintf(stderr, "[mf-dbg] L0 attn_input GPU norm=%.4f CPU norm=%.4f post_GPU=[%.3f %.3f %.3f %.3f] post_CPU=[%.3f %.3f %.3f %.3f]\n",
+            sqrt(an_gpu), sqrt(an_cpu), post[0],post[1],post[2],post[3], post_cpu[0],post_cpu[1],post_cpu[2],post_cpu[3]);
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        if (dd) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/L0_attn_input_metal.bin", dd);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(attn_input, sizeof(float), DIM, f); fclose(f); }
+        }
+    }
+    // Layer 3 debug: check mhc_pre post/comb
+    if (layer == 3 && pos == 8 && getenv("MF_DBG")) {
+        float post_cpu3[MHC_MULT], comb_cpu3[MHC_MULT * MHC_MULT];
+        float attn_in3[DIM];
+        MhcWeights ahc3 = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+        mhc_pre(&ahc3, residual, attn_in3, post_cpu3, comb_cpu3);
+        double ag=0; for(int z=0;z<DIM;z++) ag+=(double)attn_input[z]*attn_input[z];
+        double ac=0; for(int z=0;z<DIM;z++) ac+=(double)attn_in3[z]*attn_in3[z];
+        fprintf(stderr, "[L3-dbg] attn_input GPU norm=%.4f CPU norm=%.4f\n", sqrt(ag), sqrt(ac));
+        fprintf(stderr, "[L3-dbg] GPU post=[%.4f %.4f %.4f %.4f] CPU post=[%.4f %.4f %.4f %.4f]\n",
+            post[0],post[1],post[2],post[3], post_cpu3[0],post_cpu3[1],post_cpu3[2],post_cpu3[3]);
+        // Check residual streams
+        double s0n=0,s1n=0,s2n=0,s3n=0;
+        for(int z=0;z<DIM;z++) { s0n+=(double)residual[z]*residual[z]; s1n+=(double)residual[DIM+z]*residual[DIM+z]; }
+        for(int z=0;z<DIM;z++) { s2n+=(double)residual[2*DIM+z]*residual[2*DIM+z]; s3n+=(double)residual[3*DIM+z]*residual[3*DIM+z]; }
+        fprintf(stderr, "[L3-dbg] residual norms: s0=%.4f s1=%.4f s2=%.4f s3=%.4f\n", sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n));
     }
 
-    // input RMSNorm (attn_norm) on attn_input -> normed (validated rms_norm_rows)
+    // input RMSNorm (attn_norm) → bf16 — per-call for small buffers, persistent for norm weight
     {
         id<MTLBuffer> bx = [d newBufferWithBytes:attn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->input_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
-        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
+        [e setBuffer:bx offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_input_norm_gpu[layer] offset:0 atIndex:1];
+        [e setBuffer:bo offset:0 atIndex:2];
         uint rd = DIM; float eps = 1e-6f; uint hw = 1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [bo contents], DIM * sizeof(float));
+        memcpy(normed_bf16_direct, [bo contents], DIM * sizeof(uint16_t));
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
+            memcpy(&normed[i], &u, 4);
+        }
+        if (layer == 0 && getenv("MF_DBG")) {
+            // Print normed first 3 values for each pos to verify uniqueness
+            float v0, v1, v2;
+            uint32_t u0 = ((uint32_t)normed_bf16_direct[0]) << 16; memcpy(&v0, &u0, 4);
+            uint32_t u1 = ((uint32_t)normed_bf16_direct[1]) << 16; memcpy(&v1, &u1, 4);
+            uint32_t u2 = ((uint32_t)normed_bf16_direct[2]) << 16; memcpy(&v2, &u2, 4);
+            fprintf(stderr, "[norm-dbg] L0 pos=%d normed[0..2]=[%.4f %.4f %.4f]\n", pos, v0, v1, v2);
+            const char *dd = getenv("DSV4_DUMP_DIR");
+            if (dd) {
+                char path[1024];
+                snprintf(path, sizeof(path), "%s/L0_attn_normed_metal.bin", dd);
+                FILE *f = fopen(path, "wb"); if (f) { fwrite(normed, sizeof(float), DIM, f); fclose(f); }
+            }
+        }
+    }
+
+    // Compressor step (before attention, for layers with compress_ratio > 0)
+    if (eng->compress_ratio[layer] > 0) {
+        moe_infer_compressor_step(eng, layer, pos, normed);
+    }
+
+    // Indexer step (ratio=4 layers only — select which comp blocks to attend)
+    static bool comp_allowed[MAX_COMP_BLOCKS];
+    bool has_comp_selection = false;
+    if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
+        has_comp_selection = moe_infer_indexer_step(eng, layer, pos, normed, NULL, comp_allowed);
     }
 
     // MLA attention (decode, single token -> cache_len from kv_cache)
     {
         KVCache *kvc = &eng->kv_cache[layer];
-        if (!kvc->kv) { kvc->kv = (float *)calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(float)); kvc->len = 0; }
+        if (!kvc->kv) { kvc->kv = (uint16_t *)calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(uint16_t)); kvc->len = 0; }
         kvc->len += 1;
-        mla_attention_decode(&P, &eng->attn[layer], normed, kvc->kv, kvc->len, pos, attn_out);
+
+        // Convert normed (f32) to bf16 for the attention call
+        uint16_t normed_bf16[DIM];
+        for (int i = 0; i < DIM; i++) {
+            // f32 -> bf16: take upper 16 bits of float32
+            uint32_t u; memcpy(&u, &normed[i], 4);
+            normed_bf16[i] = (uint16_t)(u >> 16);
+        }
+
+        const uint32_t n_comp = eng->comp_state[layer].n_comp;
+        // Use mixed attention (raw SWA KV + compressed KV blocks) only when the
+        // raw KV cache exceeds the sliding window. For short sequences (all tokens
+        // fit in SWA_WINDOW), MLX does not compress and uses plain attention — we
+        // must do the same to match numerics.
+        const int use_comp = (n_comp > 0 && kvc->len > SWA_WINDOW);
+        if (use_comp) {
+            // Decode x to f32 for the mixed attention path
+            float x_f32[DIM];
+            for (int i = 0; i < DIM; i++) {
+                uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
+                memcpy(&x_f32[i], &u, 4);
+            }
+            const bool *allowed = has_comp_selection ? comp_allowed : NULL;
+            mla_attention_decode_mixed(&P, &eng->attn[layer], x_f32, kvc->kv, kvc->len,
+                                       pos, eng->comp_state[layer].comp_kv, (int)n_comp,
+                                       allowed, attn_out);
+        } else {
+            // BF16 attention using directly-computed bf16 normed
+            mla_attention_decode_bf16(&P, &eng->attn[layer], normed_bf16_direct, kvc->kv, kvc->len, pos, attn_out);
+        }
+        // Truncate attn_out to bf16
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
+        }
     }
 
-    // mHC post -> residual' (in place)
-    mhc_post(attn_out, residual, post, comb, residual);
+    // mHC post (attn) — per-call small buffers
+    {
+        static uint16_t attn_out_bfloat[DIM];
+        static uint16_t res_bfloat_in[MHC_MULT * DIM];
+        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &attn_out[i], 4); attn_out_bfloat[i] = (uint16_t)(u >> 16); }
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_bfloat_in[i] = (uint16_t)(u >> 16); }
+        id<MTLBuffer> bx2    = [d newBufferWithBytes:attn_out_bfloat length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bres2  = [d newBufferWithBytes:res_bfloat_in length:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bpost2 = [d newBufferWithBytes:post length:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bcomb2 = [d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> brout2 = [d newBufferWithLength:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
+        [enc2 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+        [enc2 setBuffer:bx2    offset:0 atIndex:0]; [enc2 setBuffer:bres2  offset:0 atIndex:1];
+        [enc2 setBuffer:bpost2 offset:0 atIndex:2]; [enc2 setBuffer:bcomb2 offset:0 atIndex:3];
+        [enc2 setBuffer:brout2 offset:0 atIndex:4];
+        uint hc2 = MHC_MULT, dim2 = DIM;
+        [enc2 setBytes:&hc2 length:4 atIndex:5]; [enc2 setBytes:&dim2 length:4 atIndex:6];
+        [enc2 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc2 endEncoding]; [cb2 commit]; [cb2 waitUntilCompleted];
+        uint16_t *res2_out = (uint16_t *)[brout2 contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+    }
     if (layer == 0 && getenv("MF_DBG")) {
         double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 attn_out norm=%.4f, residual after attn-post norm=%.4f\n", sqrt(an), sqrt(rn));
+        fprintf(stderr, "[mf-dbg] L0 pos=%d attn_out norm=%.4f first3=[%.4f %.4f %.4f], residual after attn-post norm=%.4f\n",
+            pos, sqrt(an), attn_out[0], attn_out[1], attn_out[2], sqrt(rn));
         // Dump attn_out for comparison
         const char *dd = getenv("DSV4_DUMP_DIR");
         if (dd) {
@@ -482,25 +693,66 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             if (f) { fwrite(attn_out, sizeof(float), DIM, f); fclose(f); }
         }
     }
+    // Layer 3 debug: check after-attn-mhc_post stream norms
+    if (layer == 3 && pos == 8 && getenv("MF_DBG")) {
+        double an=0; for(int z=0;z<DIM;z++) an+=(double)attn_out[z]*attn_out[z];
+        fprintf(stderr, "[L3-dbg] attn_out norm=%.4f first3=[%.4f %.4f %.4f]\n",
+            sqrt(an), attn_out[0], attn_out[1], attn_out[2]);
+        double s0n=0,s1n=0,s2n=0,s3n=0;
+        for(int z=0;z<DIM;z++) { s0n+=(double)residual[z]*residual[z]; s1n+=(double)residual[DIM+z]*residual[DIM+z]; }
+        for(int z=0;z<DIM;z++) { s2n+=(double)residual[2*DIM+z]*residual[2*DIM+z]; s3n+=(double)residual[3*DIM+z]*residual[3*DIM+z]; }
+        fprintf(stderr, "[L3-dbg] after attn mhc_post: s0=%.4f s1=%.4f s2=%.4f s3=%.4f total=%.4f\n",
+            sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n),sqrt(s0n+s1n+s2n+s3n));
+    }
 
-    // === MoE sublayer (mHC-wrapped) ===
-    MhcWeights fhc = { eng->ffn_hc_fn[layer], eng->ffn_hc_base[layer], eng->ffn_hc_scale[layer] };
-    mhc_pre(&fhc, residual, ffn_input, post, comb);
-
-    // ffn RMSNorm (attn_norms[] holds ffn_norm) on ffn_input -> normed
+    // === MoE sublayer (mHC-wrapped) — GPU mhc_pre_gpu, persistent large weights, per-call scratch
     {
-        id<MTLBuffer> bx = [d newBufferWithBytes:ffn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bw = [d newBufferWithBytes:(void *)eng->attn_norms[layer] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> bo = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_rffn  = [d newBufferWithBytes:residual length:MHC_MULT*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_fin   = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_fpst  = [d newBufferWithLength:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> buf_fcmb  = [d newBufferWithLength:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
+        [enc setBuffer:buf_rffn  offset:0 atIndex:3];
+        [enc setBuffer:buf_fin   offset:0 atIndex:4];
+        [enc setBuffer:buf_fpst  offset:0 atIndex:5];
+        [enc setBuffer:buf_fcmb  offset:0 atIndex:6];
+        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
+        memcpy(ffn_input, [buf_fin  contents], DIM * sizeof(float));
+        memcpy(post,      [buf_fpst contents], MHC_MULT * sizeof(float));
+        memcpy(comb,      [buf_fcmb contents], MHC_MULT * MHC_MULT * sizeof(float));
+    }
+
+    // ffn RMSNorm — per-call buffers except persistent norm weight
+    // NOTE: also update normed_bf16_direct here so the routing gate uses FFN-normed input
+    // (not the stale attn-normed output from the first norm step).
+    {
+        id<MTLBuffer> bfx = [d newBufferWithBytes:ffn_input length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bfo = [d newBufferWithLength:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows];
-        [e setBuffer:bx offset:0 atIndex:0]; [e setBuffer:bw offset:0 atIndex:1]; [e setBuffer:bo offset:0 atIndex:2];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
+        [e setBuffer:bfx offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:1];
+        [e setBuffer:bfo offset:0 atIndex:2];
         uint rd = DIM; float eps = 1e-6f; uint hw = 1;
         [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
         [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(normed, [bo contents], DIM * sizeof(float));
+        uint16_t *bf16_out = (uint16_t *)[bfo contents];
+        // Update BOTH f32 normed[] and bf16 normed_bf16_direct[] from FFN norm output.
+        // The routing gate reads normed_bf16_direct; without this update it would use
+        // the stale attn-normed value, routing to completely wrong experts.
+        memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u = ((uint32_t)bf16_out[i]) << 16;
+            memcpy(&normed[i], &u, 4);
+        }
     }
 
     if (layer == 0 && getenv("MF_DBG")) {
@@ -516,24 +768,31 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // === Routing gate ===
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
     if (eng->gate_proj[layer]) {
-        float *buf_h = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
-        memcpy(buf_h, normed, DIM * sizeof(float));
+        // Use bf16 input for gate projection — persistent GPU buffer for gate weights
+        id<MTLBuffer> bx_bf16 = [d newBufferWithBytes:(void *)normed_bf16_direct length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id gate_w = [d newBufferWithBytes:(void *)eng->gate_proj[layer] length:N_EXPERTS*DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        encode_matvec(cb, eng->pipe_matvec, gate_w, eng->buf_hidden, eng->buf_routing_scores, N_EXPERTS, DIM);
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
+        [enc setBuffer:bx_bf16                                       offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
+        uint od=N_EXPERTS, id_=DIM;
+        [enc setBytes:&od length:4 atIndex:3];
+        [enc setBytes:&id_ length:4 atIndex:4];
+        [enc dispatchThreads:MTLSizeMake(N_EXPERTS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
         [cb commit]; [cb waitUntilCompleted];
+        // Truncate gate scores to bf16 to match MLX's bf16 gate computation
+        for (int i = 0; i < N_EXPERTS; i++) {
+            uint32_t u; memcpy(&u, &scores[i], 4); u &= 0xFFFF0000U; memcpy(&scores[i], &u, 4);
+        }
     } else {
         for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
     }
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    // Hash routing for layers 0-2: look up experts by token ID.
-    // NOTE: Even with correct hash-selected experts, the MoE output is worse
-    // than score-based because the attention errors (~0.67% per token) cause
-    // borderline expert swaps in later score-based layers, amplifying the error.
-    // TODO: re-enable after attention precision is improved to <0.1%.
-    const bool use_hash_routing = false;
+    const bool use_hash_routing = (eng->tid2eid[layer] != NULL && eng->current_token_id >= 0);
     if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
         for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
@@ -643,26 +902,134 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    // mHC post -> residual'' (in place)
-    mhc_post(ffn_out, residual, post, comb, residual);
+    // mHC post (FFN) — per-call buffers
+    {
+        static uint16_t ffn_out_bfloat[DIM];
+        static uint16_t res_bfloat_ffn[MHC_MULT * DIM];
+        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &ffn_out[i], 4); ffn_out_bfloat[i] = (uint16_t)(u >> 16); }
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_bfloat_ffn[i] = (uint16_t)(u >> 16); }
+        id<MTLBuffer> bx3    = [d newBufferWithBytes:ffn_out_bfloat length:DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bres3  = [d newBufferWithBytes:res_bfloat_ffn length:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bpost3 = [d newBufferWithBytes:post length:MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> bcomb3 = [d newBufferWithBytes:comb length:MHC_MULT*MHC_MULT*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> brout3 = [d newBufferWithLength:MHC_MULT*DIM*sizeof(uint16_t) options:MTLResourceStorageModeShared];
+        id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc3 = [cb3 computeCommandEncoder];
+        [enc3 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+        [enc3 setBuffer:bx3    offset:0 atIndex:0]; [enc3 setBuffer:bres3  offset:0 atIndex:1];
+        [enc3 setBuffer:bpost3 offset:0 atIndex:2]; [enc3 setBuffer:bcomb3 offset:0 atIndex:3];
+        [enc3 setBuffer:brout3 offset:0 atIndex:4];
+        uint hc3 = MHC_MULT, dim3 = DIM;
+        [enc3 setBytes:&hc3 length:4 atIndex:5]; [enc3 setBytes:&dim3 length:4 atIndex:6];
+        [enc3 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc3 endEncoding]; [cb3 commit]; [cb3 waitUntilCompleted];
+        uint16_t *res3_out = (uint16_t *)[brout3 contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+    }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
-        fprintf(stderr, "[mf-dbg] L0 ffn_out norm=%.4f, residual after ffn-post norm=%.4f\n", sqrt(fn), sqrt(rn));
-        const char *dd = getenv("DSV4_DUMP_DIR");
+        fprintf(stderr, "[mf-dbg] L0 ffn_out norm=%.4f, residual after ffn-post norm=%.4f\n", sqrt(fn), sqrt(rn));        const char *dd = getenv("DSV4_DUMP_DIR");
         if (dd) {
             char path[1024]; snprintf(path, sizeof(path), "%s/L0_ffn_out_metal.bin", dd);
             FILE *ff = fopen(path, "wb");
             if (ff) { fwrite(ffn_out, sizeof(float), DIM, ff); fclose(ff); }
+            // Also dump the full post-layer-0 residual [MHC_MULT, DIM] for pos=8
+            if (pos == 8) {
+                snprintf(path, sizeof(path), "%s/L0_residual_out_pos8.bin", dd);
+                FILE *fp = fopen(path, "wb");
+                if (fp) { fwrite(residual, sizeof(float), MHC_MULT * DIM, fp); fclose(fp); }
+            }
         }
     }
 
+    } // end @autoreleasepool
     return 0;
 }
 
 int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
-    for (int layer = 0; layer < N_LAYERS; layer++) {
+    int max_layers = N_LAYERS;
+    const char *nl = getenv("NATIVE_MAX_LAYERS");
+    if (nl) max_layers = atoi(nl);
+    for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
+    }    return 0;
+}
+
+// Batch forward pass for N tokens (proper transformer order: all tokens per layer).
+// Each token starts from its embed in hidden_batch[t * MHC_MULT * DIM].
+// After this call, hidden_batch[t] contains the post-layer-42 residual for token t.
+// KV caches are built up correctly for each layer: token 0 first, then token 1, etc.
+// token_ids: optional [n_tokens] array of token IDs for per-token hash routing.
+//            If NULL, uses eng->current_token_id (set by caller) for all tokens.
+int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_tokens, int start_pos, const int *token_ids) {
+    int max_layers = N_LAYERS;
+    const char *nl = getenv("NATIVE_MAX_LAYERS");
+    if (nl) max_layers = atoi(nl);
+
+    // Dump all token embed outputs (before any layer processing) for diagnostics
+    if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/embed_all_tokens.bin", dd);
+        FILE *fe = fopen(path, "wb");
+        if (fe) {
+            // Write [n_tokens, MHC_MULT, DIM] f32
+            fwrite(hidden_batch, sizeof(float), (size_t)n_tokens * MHC_MULT * DIM, fe);
+            fclose(fe);
+        }
+        // Also print first token residual details
+        fprintf(stderr, "[embed-dump] n_tokens=%d tok0[0..3]=[%.4f %.4f %.4f %.4f]\n",
+            n_tokens, hidden_batch[0], hidden_batch[1], hidden_batch[2], hidden_batch[3]);
+        fprintf(stderr, "[embed-dump] tok2[0..3]=[%.4f %.4f %.4f %.4f]\n",
+            hidden_batch[2*MHC_MULT*DIM+0], hidden_batch[2*MHC_MULT*DIM+1],
+            hidden_batch[2*MHC_MULT*DIM+2], hidden_batch[2*MHC_MULT*DIM+3]);
+        fprintf(stderr, "[embed-dump] tok4[0..3]=[%.4f %.4f %.4f %.4f]\n",
+            hidden_batch[4*MHC_MULT*DIM+0], hidden_batch[4*MHC_MULT*DIM+1],
+            hidden_batch[4*MHC_MULT*DIM+2], hidden_batch[4*MHC_MULT*DIM+3]);
+    }
+
+    for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
+        for (int t = 0; t < n_tokens; t++) {
+            float *hidden_t = hidden_batch + (size_t)t * (MHC_MULT * DIM);
+            // Set token ID per-token so hash routing uses the correct expert table row
+            if (token_ids != NULL) eng->current_token_id = (int)token_ids[t];
+            if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) return -1;
+        }
+        // Per-layer residual dump: write last token's residual as raw f32 bin
+        if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
+            const char *dd = getenv("DSV4_DUMP_DIR");
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/L%02d_residual_last.bin", dd, layer);
+            FILE *fl = fopen(path, "wb");
+            if (fl) {
+                float *last = hidden_batch + (size_t)(n_tokens-1) * (MHC_MULT * DIM);
+                fwrite(last, sizeof(float), MHC_MULT * DIM, fl);
+                fclose(fl);
+            }
+        }
+    }
+
+    // Dump last token's final residual for diagnostics
+    if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
+        const char *dd = getenv("DSV4_DUMP_DIR");
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/L42_residual_last.bin", dd);
+        FILE *f = fopen(path, "wb");
+        if (f) {
+            float *last = hidden_batch + (size_t)(n_tokens-1) * (MHC_MULT * DIM);
+            fwrite(last, sizeof(float), MHC_MULT * DIM, f);
+            fclose(f);
+        }
+        KVCache *kvc0 = &eng->kv_cache[0];
+        if (kvc0->kv && kvc0->len > 0) {
+            snprintf(path, sizeof(path), "%s/L0_kvcache_prefill.bin", dd);
+            FILE *fkv = fopen(path, "wb");
+            if (fkv) {
+                fwrite(kvc0->kv, sizeof(uint16_t), (size_t)kvc0->len * KV_LORA_RANK, fkv);
+                fclose(fkv);
+            }
+        }
     }
     return 0;
 }
@@ -706,11 +1073,22 @@ void moe_infer_set_weights(MoEInferEngine *eng,
     eng->vocab_size = vocab_size;
     eng->lm_head = lm_head;
     eng->final_norm = final_norm;
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
     for (int i = 0; i < N_LAYERS; i++) {
         eng->input_norms[i] = input_norms[i];
         eng->attn_norms[i] = attn_norms[i];
         eng->gate_proj[i]  = gate_proj_w[i];
         eng->gate_bias[i]  = gate_bias_w[i];
+        // Upload per-layer norm weights to persistent GPU buffers
+        if (input_norms[i] && !eng->buf_input_norm_gpu[i]) {
+            eng->buf_input_norm_gpu[i] = (void *)[d newBufferWithBytes:(void*)input_norms[i] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        }
+        if (attn_norms[i] && !eng->buf_attn_norm_gpu[i]) {
+            eng->buf_attn_norm_gpu[i] = (void *)[d newBufferWithBytes:(void*)attn_norms[i] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        }
+        if (gate_proj_w[i] && !eng->buf_gate_proj_gpu[i]) {
+            eng->buf_gate_proj_gpu[i] = (void *)[d newBufferWithBytes:(void*)gate_proj_w[i] length:(size_t)N_EXPERTS*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        }
     }
 }
 
@@ -740,8 +1118,22 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
         // cannot bleed into the new sequence when cache_len is small.
         if (eng->kv_cache[l].kv) {
             memset(eng->kv_cache[l].kv, 0,
-                   (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(float));
+                   (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
         }
+        // Reset compressor state
+        CompressorState *cs = &eng->comp_state[l];
+        cs->n_comp = 0;
+        cs->n_idx_comp = 0;
+        if (cs->state_kv && cs->ratio > 0 && cs->out_dim > 0)
+            memset(cs->state_kv, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
+        if (cs->state_score && cs->ratio > 0 && cs->out_dim > 0)
+            memset(cs->state_score, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
+        if (cs->comp_kv)
+            memset(cs->comp_kv, 0, (size_t)MAX_COMP_BLOCKS * COMP_HEAD_DIM * sizeof(float));
+        if (cs->idx_state_kv)  memset(cs->idx_state_kv, 0, 8 * 256 * sizeof(float));
+        if (cs->idx_state_score) memset(cs->idx_state_score, 0, 8 * 256 * sizeof(float));
+        if (cs->idx_comp_kv)
+            memset(cs->idx_comp_kv, 0, (size_t)MAX_COMP_BLOCKS * IDX_HEAD_DIM * sizeof(float));
     }
 }
 
@@ -755,6 +1147,374 @@ void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,
     eng->ffn_hc_fn[layer] = ffn_fn;
     eng->ffn_hc_base[layer] = ffn_base;
     eng->ffn_hc_scale[layer] = ffn_scale;
+
+    // Upload mHC weights to persistent GPU buffers immediately (avoids per-call allocation)
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    const int MIX3 = MHC_MULT * (MHC_MULT + 2);  // 24
+    const size_t fn_bytes    = (size_t)MIX3 * MHC_MULT * DIM * sizeof(float);
+    const size_t base_bytes  = (size_t)MIX3 * sizeof(float);
+    const size_t scale_bytes = 3 * sizeof(float);
+
+    if (attn_fn && !eng->buf_attn_hc_fn[layer]) {
+        eng->buf_attn_hc_fn[layer]    = (void *)[d newBufferWithBytes:(void*)attn_fn    length:fn_bytes    options:MTLResourceStorageModeShared];
+        eng->buf_attn_hc_base[layer]  = (void *)[d newBufferWithBytes:(void*)attn_base  length:base_bytes  options:MTLResourceStorageModeShared];
+        eng->buf_attn_hc_scale[layer] = (void *)[d newBufferWithBytes:(void*)attn_scale length:scale_bytes options:MTLResourceStorageModeShared];
+    }
+    if (ffn_fn && !eng->buf_ffn_hc_fn[layer]) {
+        eng->buf_ffn_hc_fn[layer]    = (void *)[d newBufferWithBytes:(void*)ffn_fn    length:fn_bytes    options:MTLResourceStorageModeShared];
+        eng->buf_ffn_hc_base[layer]  = (void *)[d newBufferWithBytes:(void*)ffn_base  length:base_bytes  options:MTLResourceStorageModeShared];
+        eng->buf_ffn_hc_scale[layer] = (void *)[d newBufferWithBytes:(void*)ffn_scale length:scale_bytes options:MTLResourceStorageModeShared];
+    }
+}
+
+
+// ============================================================================
+// Embed / compress / logits helpers (needed by native engine, no MLX)
+// ============================================================================
+
+void moe_infer_embed(MoEInferEngine *eng, int token_id, float *hidden_out) {
+    const float *row = eng->embed + (size_t)token_id * DIM;
+    if (getenv("MF_DBG") && token_id == 128822) {
+        fprintf(stderr, "[embed-dbg] tok=128822 embed[0..3]=[%.6f %.6f %.6f %.6f] norm_estimate=%.4f\n",
+            row[0], row[1], row[2], row[3],
+            sqrtf(row[0]*row[0] + row[1]*row[1] + row[2]*row[2]));
+    }
+    for (int m = 0; m < MHC_MULT; m++) {
+        for (int d = 0; d < DIM; d++) {
+            // Truncate embed to bf16 to match MLX embedding lookup precision
+            uint32_t u; memcpy(&u, &row[d], 4); u &= 0xFFFF0000U;
+            memcpy(&hidden_out[m * DIM + d], &u, 4);
+        }
+    }
+}
+
+static void cpu_rms_norm(const float *x, const float *w, float *out, int dim, float eps) {
+    double ss = 0.0;
+    for (int i = 0; i < dim; i++) ss += (double)x[i] * x[i];
+    float inv = 1.0f / sqrtf((float)(ss / dim) + eps);
+    for (int i = 0; i < dim; i++) out[i] = x[i] * inv * w[i];
+}
+
+int moe_infer_get_logits(MoEInferEngine *eng, const float *hidden, float *logits_out) {
+    if (!eng->final_norm || !eng->lm_head || !logits_out) return -1;
+    static float normed[DIM];
+    cpu_rms_norm(hidden, eng->final_norm, normed, DIM, 1e-6f);
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                eng->vocab_size, DIM,
+                1.0f, eng->lm_head, DIM,
+                normed, 1,
+                0.0f, logits_out, 1);
+    if (getenv("MF_DBG")) {
+        int max_i = 0;
+        for (int i=1;i<eng->vocab_size;i++) if (logits_out[i]>logits_out[max_i]) max_i=i;
+        fprintf(stderr, "[mf-dbg] logits max=%d val=%.3f\n", max_i, logits_out[max_i]);
+    }
+    return 0;
+}
+
+void moe_infer_compress_hc(MoEInferEngine *eng, const float *residual, float *out) {
+    (void)eng;
+    for (int d = 0; d < DIM; d++) {
+        float sum = 0.0f;
+        for (int m = 0; m < MHC_MULT; m++) sum += residual[m * DIM + d];
+        out[d] = sum / MHC_MULT;
+    }
+}
+
+// ============================================================================
+// Compressor/Indexer implementation (T2C.2/T2C.3)
+// ============================================================================
+
+void moe_infer_set_layer_compressor(MoEInferEngine *eng, int layer,
+    uint32_t compress_ratio,
+    QuantWeight comp_wkv, QuantWeight comp_wgate,
+    const float *comp_ape, const float *comp_norm) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->compress_ratio[layer] = compress_ratio;
+    eng->comp_wkv[layer] = comp_wkv;
+    eng->comp_wgate[layer] = comp_wgate;
+    eng->comp_ape[layer] = comp_ape;
+    eng->comp_norm[layer] = comp_norm;
+}
+
+void moe_infer_set_layer_indexer(MoEInferEngine *eng, int layer,
+    QuantWeight idx_wq_b, QuantWeight idx_weights_proj,
+    QuantWeight idx_comp_wkv, QuantWeight idx_comp_wgate,
+    const float *idx_comp_ape, const float *idx_comp_norm) {
+    if (layer < 0 || layer >= N_LAYERS) return;
+    eng->idx_wq_b[layer] = idx_wq_b;
+    eng->idx_weights_proj[layer] = idx_weights_proj;
+    eng->idx_comp_wkv[layer] = idx_comp_wkv;
+    eng->idx_comp_wgate[layer] = idx_comp_wgate;
+    eng->idx_comp_ape[layer] = idx_comp_ape;
+    eng->idx_comp_norm[layer] = idx_comp_norm;
+}
+
+// CPU affine-4bit matvec (safe version): out[out_dim] = W[out_dim, in_dim] @ x[in_dim]
+static void cpu_affine_matvec_safe(float *out, const QuantWeight *w, const float *x) {
+    if (w->out_dim == 0 || w->in_dim == 0 || w->packed == NULL) return;
+    const int num_groups = w->in_dim / w->group_size;
+    const int ppg = w->group_size / 8;
+    const int packed_cols = w->in_dim / 8;
+    for (int row = 0; row < w->out_dim; row++) {
+        const uint32_t *wr = w->packed + (size_t)row * packed_cols;
+        const float *sc = w->scales + (size_t)row * num_groups;
+        const float *bi = (w->biases) ? w->biases + (size_t)row * num_groups : NULL;
+        float acc = 0.0f;
+        for (int g = 0; g < num_groups; g++) {
+            float scale = sc[g];
+            float bias = bi ? bi[g] : 0.0f;
+            for (int p = 0; p < ppg; p++) {
+                uint32_t pw = wr[g * ppg + p];
+                for (int k = 0; k < 8; k++) {
+                    float nib = (float)((pw >> (k * 4)) & 0xF);
+                    acc += (scale * nib + bias) * x[g * w->group_size + p * 8 + k];
+                }
+            }
+        }
+        out[row] = acc;
+    }
+}
+
+// Softmax in-place over x[n]
+static void cpu_softmax_inplace(float *x, int n) {
+    float m = x[0];
+    for (int i = 1; i < n; i++) if (x[i] > m) m = x[i];
+    float s = 0.0f;
+    for (int i = 0; i < n; i++) { x[i] = expf(x[i] - m); s += x[i]; }
+    for (int i = 0; i < n; i++) x[i] /= s;
+}
+
+void moe_infer_compressor_step(MoEInferEngine *eng, int layer, int pos,
+                                const float *attn_normed) {
+    const uint32_t ratio = eng->compress_ratio[layer];
+    if (ratio == 0) return;
+
+    CompressorState *cs = &eng->comp_state[layer];
+
+    // Lazy initialize state buffers
+    if (cs->state_kv == NULL) {
+        const uint32_t out_dim = (ratio == 4) ? CSA_OUT_DIM : HCA_OUT_DIM;
+        cs->ratio = ratio;
+        cs->out_dim = out_dim;
+        cs->state_kv    = (float*)calloc((size_t)2 * ratio * out_dim, sizeof(float));
+        cs->state_score = (float*)calloc((size_t)2 * ratio * out_dim, sizeof(float));
+        cs->comp_kv     = (float*)calloc((size_t)MAX_COMP_BLOCKS * COMP_HEAD_DIM, sizeof(float));
+        cs->n_comp      = 0;
+        if (ratio == 4) {
+            cs->idx_state_kv    = (float*)calloc((size_t)8 * 256, sizeof(float));
+            cs->idx_state_score = (float*)calloc((size_t)8 * 256, sizeof(float));
+            cs->idx_comp_kv     = (float*)calloc((size_t)MAX_COMP_BLOCKS * IDX_HEAD_DIM, sizeof(float));
+            cs->n_idx_comp      = 0;
+        }
+    }
+
+    const uint32_t out_dim = cs->out_dim;
+    const uint32_t pos_mod = (uint32_t)pos % ratio;
+    // For CSA (ratio=4): store in upper half [ratio+pos_mod]; for HCA: at [pos_mod]
+    const uint32_t row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
+
+    float *kv_cur   = (float*)alloca(out_dim * sizeof(float));
+    float *gate_cur = (float*)alloca(out_dim * sizeof(float));
+
+    // 1. Project
+    cpu_affine_matvec_safe(kv_cur,   &eng->comp_wkv[layer],   attn_normed);
+    cpu_affine_matvec_safe(gate_cur, &eng->comp_wgate[layer], attn_normed);
+
+    // 2. Add positional bias
+    if (eng->comp_ape[layer]) {
+        const float *ape_row = eng->comp_ape[layer] + (size_t)pos_mod * out_dim;
+        for (uint32_t j = 0; j < out_dim; j++) gate_cur[j] += ape_row[j];
+    }
+
+    // 3. Store in rolling state
+    memcpy(cs->state_kv    + (size_t)row * out_dim, kv_cur,   out_dim * sizeof(float));
+    memcpy(cs->state_score + (size_t)row * out_dim, gate_cur, out_dim * sizeof(float));
+
+    // 4. Check if we should emit a block
+    if (((uint32_t)pos + 1) % ratio != 0) return;
+    if (cs->n_comp >= MAX_COMP_BLOCKS) return;
+
+    const uint32_t head_dim = COMP_HEAD_DIM; // 512
+
+    // 5 & 6. Per-dimension softmax pooling (matches ds4 compressor_pool_decode_state).
+    // For each dimension j: softmax across the ratio token scores, weighted sum of kv values.
+    // For CSA (ratio=4): state is [2*ratio, out_dim] where front half [0..ratio) is the
+    // overlap buffer and upper half [ratio..2*ratio) is current window.
+    // The score gate for each token-slot r is state_score[r * out_dim + j] for HCA,
+    // or state_score[(ratio+r) * out_dim + j] for the current CSA window.
+    // width = out_dim for HCA; out_dim = 2*head_dim for CSA (front and back halves
+    // per token: state_score[r*out_dim+j] is front-half score, +head_dim is back-half).
+    float *pooled = (float*)alloca(head_dim * sizeof(float));
+    for (uint32_t j = 0; j < head_dim; j++) {
+        float max_score = -1e30f;
+        if (ratio == 4) {
+            // CSA: per-slot two half-scores (j and j+head_dim)
+            for (uint32_t r = 0; r < ratio; r++) {
+                float sp = cs->state_score[(size_t)r * out_dim + j];
+                float sc = cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j];
+                if (sp > max_score) max_score = sp;
+                if (sc > max_score) max_score = sc;
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float s = cs->state_score[(size_t)r * out_dim + j];
+                if (s > max_score) max_score = s;
+            }
+        }
+        float denom = 0.0f, sum = 0.0f;
+        if (ratio == 4) {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float wp = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
+                float wc = expf(cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * cs->state_kv[(size_t)r * out_dim + j];
+                sum += wc * cs->state_kv[(size_t)(ratio + r) * out_dim + head_dim + j];
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float w = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
+                denom += w;
+                sum += w * cs->state_kv[(size_t)r * out_dim + j];
+            }
+        }
+        pooled[j] = denom > 0.0f ? sum / denom : 0.0f;
+    }
+
+    // 7. RMSNorm
+    if (eng->comp_norm[layer]) {
+        cpu_rms_norm(pooled, eng->comp_norm[layer], pooled, (int)head_dim, 1e-6f);
+    }
+
+    // 8. Apply YaRN tail RoPE at compressed position
+    const int comp_pos = (int)(((uint32_t)pos + 1) - ratio);
+    apply_rope_tail(pooled, (int)head_dim, QK_NOPE_DIM, comp_pos, 16.0f);
+
+    // 9. Append to comp_kv
+    memcpy(cs->comp_kv + (size_t)cs->n_comp * head_dim, pooled, head_dim * sizeof(float));
+    cs->n_comp++;
+
+    // 10. For CSA: shift overlap buffer
+    if (ratio == 4) {
+        for (uint32_t t = 0; t < ratio; t++) {
+            memcpy(cs->state_kv    + (size_t)t * out_dim,
+                   cs->state_kv    + (size_t)(ratio + t) * out_dim,
+                   out_dim * sizeof(float));
+            memcpy(cs->state_score + (size_t)t * out_dim,
+                   cs->state_score + (size_t)(ratio + t) * out_dim,
+                   out_dim * sizeof(float));
+        }
+    }
+}
+
+bool moe_infer_indexer_step(MoEInferEngine *eng, int layer, int pos,
+                              const float *attn_normed, const float *q_a_out,
+                              bool *allowed_out) {
+    CompressorState *cs = &eng->comp_state[layer];
+    const uint32_t n_comp = cs->n_comp;
+
+    if (n_comp == 0) return false;
+
+    uint32_t top_k = 512;
+    if (n_comp <= top_k) {
+        for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+        return true;
+    }
+
+    // Run indexer's own compressor step (ratio=4, idx_out_dim=256)
+    if (eng->idx_comp_wkv[layer].packed != NULL && cs->idx_state_kv != NULL) {
+        const uint32_t idx_out_dim = 256;
+        const uint32_t idx_pos_mod = (uint32_t)pos % 4;
+        const uint32_t idx_row = 4 + idx_pos_mod;
+
+        float *kv_cur   = (float*)alloca(idx_out_dim * sizeof(float));
+        float *gate_cur = (float*)alloca(idx_out_dim * sizeof(float));
+
+        cpu_affine_matvec_safe(kv_cur,   &eng->idx_comp_wkv[layer],   attn_normed);
+        cpu_affine_matvec_safe(gate_cur, &eng->idx_comp_wgate[layer], attn_normed);
+
+        if (eng->idx_comp_ape[layer]) {
+            const float *ape_row = eng->idx_comp_ape[layer] + (size_t)idx_pos_mod * idx_out_dim;
+            for (uint32_t j = 0; j < idx_out_dim; j++) gate_cur[j] += ape_row[j];
+        }
+
+        memcpy(cs->idx_state_kv    + (size_t)idx_row * idx_out_dim, kv_cur,   idx_out_dim * sizeof(float));
+        memcpy(cs->idx_state_score + (size_t)idx_row * idx_out_dim, gate_cur, idx_out_dim * sizeof(float));
+
+        if (((uint32_t)pos + 1) % 4 == 0 && cs->n_idx_comp < MAX_COMP_BLOCKS) {
+            float weights_arr[4];
+            for (int t = 0; t < 4; t++) {
+                float s = 0.0f;
+                for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
+                    s += cs->idx_state_score[(size_t)t * idx_out_dim + d];
+                weights_arr[t] = s;
+            }
+            cpu_softmax_inplace(weights_arr, 4);
+            float pooled[IDX_HEAD_DIM];
+            memset(pooled, 0, sizeof(pooled));
+            for (int t = 0; t < 4; t++) {
+                for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
+                    pooled[d] += weights_arr[t] * cs->idx_state_kv[(size_t)t * idx_out_dim + d];
+            }
+            if (eng->idx_comp_norm[layer])
+                cpu_rms_norm(pooled, eng->idx_comp_norm[layer], pooled, IDX_HEAD_DIM, 1e-6f);
+            memcpy(cs->idx_comp_kv + (size_t)cs->n_idx_comp * IDX_HEAD_DIM, pooled, IDX_HEAD_DIM * sizeof(float));
+            cs->n_idx_comp++;
+            // Shift CSA overlap buffer for indexer
+            for (int t = 0; t < 4; t++) {
+                memcpy(cs->idx_state_kv    + (size_t)t * idx_out_dim,
+                       cs->idx_state_kv    + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
+                memcpy(cs->idx_state_score + (size_t)t * idx_out_dim,
+                       cs->idx_state_score + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
+            }
+        }
+    }
+
+    const uint32_t n_idx = cs->n_idx_comp;
+    if (n_idx == 0 || q_a_out == NULL) {
+        for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+        return true;
+    }
+
+    // Score each idx_comp block using q
+    const int n_idx_heads = 64;
+    const int idx_head_dim = 128;
+    float *q = (float*)alloca((size_t)n_idx_heads * idx_head_dim * sizeof(float));
+    cpu_affine_matvec_safe(q, &eng->idx_wq_b[layer], q_a_out);
+
+    float *head_w = (float*)alloca((size_t)n_idx_heads * sizeof(float));
+    cpu_affine_matvec_safe(head_w, &eng->idx_weights_proj[layer], attn_normed);
+    float scale = 1.0f / sqrtf((float)(n_idx_heads * idx_head_dim));
+    for (int h = 0; h < n_idx_heads; h++) head_w[h] *= scale;
+
+    float *scores = (float*)calloc(n_idx, sizeof(float));
+    for (uint32_t c = 0; c < n_idx; c++) {
+        const float *kv_c = cs->idx_comp_kv + (size_t)c * idx_head_dim;
+        float s = 0.0f;
+        for (int h = 0; h < n_idx_heads; h++) {
+            const float *q_h = q + (size_t)h * idx_head_dim;
+            float dot = 0.0f;
+            for (int d = 0; d < idx_head_dim; d++) dot += q_h[d] * kv_c[d];
+            if (dot > 0.0f) s += dot * head_w[h];
+        }
+        scores[c] = s;
+    }
+
+    memset(allowed_out, 0, n_comp * sizeof(bool));
+    uint32_t actual_k = (top_k < n_idx) ? top_k : n_idx;
+    for (uint32_t k = 0; k < actual_k; k++) {
+        uint32_t best = 0;
+        float best_score = -1e30f;
+        for (uint32_t c = 0; c < n_idx; c++) {
+            if (!allowed_out[c] && scores[c] > best_score) {
+                best_score = scores[c];
+                best = c;
+            }
+        }
+        if (best < n_comp) allowed_out[best] = true;
+    }
+    free(scores);
+    return true;
 }
 
 void moe_infer_deinit(MoEInferEngine *eng) {
@@ -776,6 +1536,16 @@ void moe_infer_deinit(MoEInferEngine *eng) {
     for (int k = 0; k < N_ACTIVE; k++) {
         free(eng->expert_buf[k]);
         free(eng->expert_buf_pred[k]);
+    }
+    // Free compressor state
+    for (int l = 0; l < N_LAYERS; l++) {
+        CompressorState *cs = &eng->comp_state[l];
+        free(cs->state_kv);
+        free(cs->state_score);
+        free(cs->comp_kv);
+        free(cs->idx_state_kv);
+        free(cs->idx_state_score);
+        free(cs->idx_comp_kv);
     }
     free(eng);
 }

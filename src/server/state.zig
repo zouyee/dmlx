@@ -14,6 +14,7 @@ const prefix_disk_mod = @import("../kvcache/prefix_disk.zig");
 const dsv4_mod = @import("../models/deepseek_v4.zig");
 const dsv4_loader = @import("../models/deepseek_v4_loader.zig");
 const engine = @import("../engine/root.zig");
+const native_engine_mod = @import("../native_engine.zig");
 const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const detectArchitecture = utils_mod.detectArchitecture;
@@ -22,6 +23,7 @@ const EagerContext = ops.EagerContext;
 const ModelVTable = generation_mod.ModelVTable;
 const ModelPool = model_pool_mod.ModelPool;
 const ServerConfig = config_mod.ServerConfig;
+const Array = @import("mlx").array.Array;
 
 // ------------------------------------------------------------------
 // Model state (loaded via ModelRegistry at startup)
@@ -46,6 +48,8 @@ pub const ServerState = struct {
     prefix_disk_cache: ?prefix_disk_mod.PrefixDiskCache,
     running: bool,
     dsv4_model: ?*dsv4_mod.DSV4Model = null,
+    native_engine: ?*native_engine_mod.NativeEngine = null,
+    is_native: bool = false,
 
     // Server V2: engine loop and request queue
     request_queue: engine.RequestQueue,
@@ -58,10 +62,12 @@ pub const ServerState = struct {
         self.running = false;
         self.engine_running.store(false, .release);
         // Save prompt cache to disk on shutdown if configured.
-        if (self.prompt_cache_file) |cache_path| {
-            prompt_cache_mod.savePromptCache(self.allocator, self.caches, cache_path) catch |err| {
-                std.log.warn("Failed to save prompt cache to {s}: {}", .{ cache_path, err });
-            };
+        if (!self.is_native) {
+            if (self.prompt_cache_file) |cache_path| {
+                prompt_cache_mod.savePromptCache(self.allocator, self.caches, cache_path) catch |err| {
+                    std.log.warn("Failed to save prompt cache to {s}: {}", .{ cache_path, err });
+                };
+            }
         }
         if (self.prefix_disk_cache) |*pdc| {
             var mutable_pdc = pdc.*;
@@ -70,30 +76,46 @@ pub const ServerState = struct {
         if (self.scheduler) |*sched| {
             sched.deinit();
         }
-        self.vtable.deinit(self.vtable.ptr, self.allocator);
+        if (self.native_engine) |ne| {
+            ne.deinit();
+            self.allocator.destroy(ne);
+            // Free dummy vtable pointer allocated in native branch.
+            self.allocator.destroy(@as(*u8, @ptrCast(self.vtable.ptr)));
+        }
+        if (!self.is_native) {
+            self.vtable.deinit(self.vtable.ptr, self.allocator);
+        }
         self.tokenizer_backend.deinit();
         self.allocator.destroy(self.tokenizer_backend);
         self.allocator.free(self.model_name);
-        for (self.caches) |cache_item| {
-            cache_item.deinit(self.allocator);
+        if (!self.is_native) {
+            for (self.caches) |cache_item| {
+                cache_item.deinit(self.allocator);
+            }
+            self.allocator.free(self.caches);
         }
-        self.allocator.free(self.caches);
         if (self.model_pool) |*pool| {
             pool.deinit();
         }
-        const cpu_stream = c.c.mlx_default_cpu_stream_new();
-        _ = c.c.mlx_set_default_stream(cpu_stream);
-        _ = c.c.mlx_stream_free(cpu_stream);
-        self.ctx.deinit();
-        // stream freed by ctx.deinit (initWithStream shares the handle).
+        if (!self.is_native) {
+            const cpu_stream = c.c.mlx_default_cpu_stream_new();
+            _ = c.c.mlx_set_default_stream(cpu_stream);
+            _ = c.c.mlx_stream_free(cpu_stream);
+            self.ctx.deinit();
+            // stream freed by ctx.deinit (initWithStream shares the handle).
+        }
     }
 };
 
-pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !ServerState {
-    const stream = c.c.mlx_default_gpu_stream_new();
-    _ = c.c.mlx_set_default_stream(stream);
-    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
+fn dummyForward(ctx: *anyopaque, input: Array, mask: ?Array, caches: ?[]kvcache.KVCacheStrategy) anyerror!Array {
+    _ = ctx; _ = input; _ = mask; _ = caches;
+    return error.NotImplemented;
+}
+fn dummyDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
+    allocator.destroy(@as(*u8, @ptrCast(ctx)));
+}
 
+pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !ServerState {
     // 1. Read config.json
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "config.json" });
     defer allocator.free(config_path);
@@ -101,10 +123,101 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     const config_content = try std.Io.Dir.cwd().readFileAlloc(io, config_path, allocator, .limited(1024 * 1024));
     defer allocator.free(config_content);
 
-    // 2. Detect architecture and load via ModelRegistry
+    // 2. Detect architecture
     const arch_name = detectArchitecture(config_content);
     std.log.info("Detected architecture: {s}", .{arch_name});
     const model_name = try allocator.dupe(u8, arch_name);
+
+    // 3. Load tokenizer (shared between native and MLX paths)
+    const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "tokenizer.json" });
+    defer allocator.free(tokenizer_path);
+
+    const tokenizer_backend = try allocator.create(root.tokenizer.BpeTokenizer);
+    errdefer allocator.destroy(tokenizer_backend);
+    tokenizer_backend.* = root.tokenizer.BpeTokenizer.init(allocator);
+    try tokenizer_backend.loadFromFile(io, tokenizer_path);
+
+    // 4. Chat template
+    const chat_template = if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM"))
+        root.tokenizer.ChatTemplate.initDeepSeek(allocator)
+    else
+        root.tokenizer.ChatTemplate.initDeepSeek(allocator);
+
+    // ------------------------------------------------------------------
+    // Native path (MLX-free)
+    // ------------------------------------------------------------------
+    if (config.native) {
+        if (!std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
+            return error.UnsupportedArchitectureForNative;
+        }
+        const packed_dir = config.expert_packed_dir orelse return error.MissingExpertPackedDir;
+        if (config.metal_moe) {
+            std.log.warn("Native mode: --metal-moe is ignored (native uses engine.c internal MoE)", .{});
+        }
+
+        std.log.info("Native mode: initializing MLX-free engine...", .{});
+        const ne = try allocator.create(native_engine_mod.NativeEngine);
+        errdefer allocator.destroy(ne);
+        ne.* = try native_engine_mod.NativeEngine.init(allocator, config.model_path, packed_dir);
+
+        // Dummy vtable for API compatibility (server.zig reads vtable.config)
+        const dummy_ptr = try allocator.create(u8);
+        dummy_ptr.* = 0;
+        const vtable = ModelVTable{
+            .forward = dummyForward,
+            .forwardWithHidden = null,
+            .deinit = dummyDeinit,
+            .config = .{
+                .num_layers = ne.config.num_hidden_layers,
+                .num_kv_heads = 1,
+                .head_dim = 512,
+                .vocab_size = ne.config.vocab_size,
+                .hidden_size = ne.config.hidden_size,
+            },
+            .ptr = dummy_ptr,
+        };
+
+        // Dummy ctx/stream — never used in native mode (deinit skips them)
+        const dummy_stream = c.c.mlx_stream{ .ctx = null };
+        const dummy_ctx = EagerContext.initWithStream(allocator, .{ .inner = dummy_stream });
+
+        var server_state = ServerState{
+            .allocator = allocator,
+            .io = io,
+            .ctx = dummy_ctx,
+            .stream = dummy_stream,
+            .vtable = vtable,
+            .tokenizer_strategy = undefined,
+            .tokenizer_backend = tokenizer_backend,
+            .model_name = model_name,
+            .chat_template = chat_template,
+            .caches = &[_]kvcache.KVCacheStrategy{},
+            .model_pool = null,
+            .block_manager = scheduler_mod.BlockManager.init(0),
+            .scheduler = null,
+            .speculative_ngram = config.speculative_ngram,
+            .prompt_cache_file = null,
+            .prefix_disk_cache = null,
+            .native_engine = ne,
+            .is_native = true,
+            .running = true,
+            .request_queue = undefined,
+            .engine_loop = null,
+            .engine_running = std.atomic.Value(bool).init(false),
+            .active_requests = std.atomic.Value(u32).init(0),
+            .next_request_id = std.atomic.Value(u64).init(0),
+        };
+        server_state.tokenizer_strategy = server_state.tokenizer_backend.asStrategy();
+        std.log.info("Native mode: engine ready (vocab={d}, layers={d})", .{ ne.config.vocab_size, ne.config.num_hidden_layers });
+        return server_state;
+    }
+
+    // ------------------------------------------------------------------
+    // MLX path (original)
+    // ------------------------------------------------------------------
+    const stream = c.c.mlx_default_gpu_stream_new();
+    _ = c.c.mlx_set_default_stream(stream);
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
 
     const loader = model_registry_mod.getLoader(arch_name) catch {
         std.log.err("Unsupported architecture: {s}", .{arch_name});
@@ -128,16 +241,11 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     });
 
     // Extract DSV4 model for direct generate() — matches CLI path.
-    // Extract dsv4_model for direct native generate path.
     var dsv4_model: ?*dsv4_mod.DSV4Model = null;
     if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
         const adapter: *model_registry_mod.DeepseekV4VTableAdapter = @ptrCast(@alignCast(vtable.ptr));
         dsv4_model = adapter.model;
 
-        // --metal-moe : mixed path (MLX backbone + Metal routed experts) via
-        //   metal_moe.zig / expert_stream.tryMetalPath (enabled in server.zig).
-        // --metal-full: full-metal engine (attention + mHC + MoE in engine.c).
-        //   Sets model.metal_engine so forward() routes layers through the engine.
         if (config.metal_moe and !config.metal_full) {
             std.log.info("Metal MoE: mixed path (MLX backbone + Metal routed experts)", .{});
         }
@@ -167,49 +275,25 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         }
     }
 
-    // 3. Load tokenizer
-    // Load tokenizer.
-    const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "tokenizer.json" });
-    defer allocator.free(tokenizer_path);
-
-    const tokenizer_backend = try allocator.create(root.tokenizer.BpeTokenizer);
-    errdefer allocator.destroy(tokenizer_backend);
-    tokenizer_backend.* = root.tokenizer.BpeTokenizer.init(allocator);
-    try tokenizer_backend.loadFromFile(io, tokenizer_path);
-
-    // 4. Detect chat template based on architecture
-    // Create chat template.
-    const chat_template = if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM"))
-        root.tokenizer.ChatTemplate.initDeepSeek(allocator)
-    else
-        root.tokenizer.ChatTemplate.initDeepSeek(allocator); // Default template
-
     // 5. Create KV caches using model config + auto max_kv_size
-    // Create KV caches.
     const mc = vtable.config;
     _ = memory_mod.autoMaxKvSize;
     const effective_max_seq = 8192;
 
     var caches: []kvcache.KVCacheStrategy = undefined;
 
-    // DeepSeek V4: use specialized heterogeneous caches (DeepseekV4Cache / RotatingWithWindow)
-    // that match the CLI path. StandardKVCache buffers are too large and cause GPU stalls.
     if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
-        // Parse DSV4 config and create heterogeneous caches.
         var dsv4_config = try dsv4_loader.parseDSV4Config(allocator, config_content);
         defer {
             var cfg = dsv4_config;
             cfg.deinitClone(allocator);
         }
-        // Create V4 caches via makeV4Caches.
         caches = try dsv4_loader.makeV4Caches(allocator, &dsv4_config, stream);
     } else {
         caches = try allocator.alloc(kvcache.KVCacheStrategy, mc.num_layers);
         errdefer allocator.free(caches);
 
         for (0..mc.num_layers) |i| {
-            // Heterogeneous KV cache: compressed layers (CSA/HCA) store fewer
-            // effective tokens because KV is compressed before caching.
             const compress_ratio = if (i < mc.compress_ratios.len) mc.compress_ratios[i] else 0;
             const layer_max_seq = if (compress_ratio > 1)
                 effective_max_seq / compress_ratio
@@ -229,7 +313,6 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
                 .dtype = .float32,
             };
 
-            // Select base KV cache strategy (standard/paged/quantized/paged_quantized)
             const base_cache = if (config.kv_strategy == .paged_quantized)
                 try kvcache.createPagedQuantized(allocator, layer_config, config.kv_bits, 64, stream)
             else if (config.kv_bits < 16 and config.kv_strategy == .quantized)
@@ -239,18 +322,11 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             else
                 try kvcache.createStandard(allocator, layer_config, stream);
 
-            // When kv_tier == .ssd and a cold directory is configured, wrap the
-            // base strategy with TieredKVCache. The base paged cache becomes the
-            // hot tier; evicted blocks spill to SSD as safetensors files.
-            // NOTE: TieredKVCache currently wraps a PagedKVCache internally, so
-            // when tiered mode is requested we create a dedicated paged hot tier
-            // and the base_cache selection above is unused (freed immediately).
             if (config.kv_tier == .ssd) {
                 if (config.kv_cold_dir) |cold_dir| {
-                    // Free the base cache — tiered creates its own paged hot tier
                     base_cache.deinit(allocator);
                     const default_page_size = kvcache.default_page_size;
-                    const hot_capacity: usize = 16; // default hot tier capacity in blocks
+                    const hot_capacity: usize = 16;
                     caches[i] = try kvcache.createTieredWithConfig(
                         allocator,
                         layer_config,
@@ -267,7 +343,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         }
     }
 
-    // 6. Optionally load prompt cache from disk (skips prefill for cached prompts)
+    // 6. Optionally load prompt cache from disk
     if (config.prompt_cache_file) |cache_path| {
         const file_exists = blk: {
             const dir = std.Io.Dir.cwd();
@@ -277,7 +353,6 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         };
         if (file_exists) {
             if (prompt_cache_mod.loadPromptCache(allocator, cache_path, mc)) |loaded_caches| {
-                // Replace the freshly-created empty caches with the loaded ones
                 for (caches) |cache_item| {
                     cache_item.deinit(allocator);
                 }
@@ -292,25 +367,14 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         }
     }
 
-    // 7. Initialize ModelPool for multi-model management.
-    //    The pool is seeded with the model loaded above so that request-time
-    //    lookups via getOrLoad can return it without a redundant load.
-    //    Additional models requested via the `model` field in chat completion
-    //    requests will be loaded on demand (see handleRequest routing comment).
+    // 7. Initialize ModelPool
     const system_mem = memory_mod.getSystemMemoryBytes();
-    const pool_budget = if (system_mem > 0) system_mem / 2 else 16 * 1024 * 1024 * 1024; // 50% of RAM or 16GB
+    const pool_budget = if (system_mem > 0) system_mem / 2 else 16 * 1024 * 1024 * 1024;
     var model_pool = ModelPool.init(allocator, pool_budget);
-    _ = &model_pool; // mutable: future getOrLoad calls will mutate the pool
+    _ = &model_pool;
 
-    // 8. Initialize Scheduler with BlockManager for continuous batching.
-    //    The BlockManager tracks KV cache block allocation; the Scheduler
-    //    manages waiting/running request queues and orchestrates engine steps.
-    //    Currently the server is single-threaded, so true concurrent batching
-    //    requires async I/O (future enhancement). The Scheduler is wired here
-    //    so it is available when the request loop is upgraded.
-    //    NOTE: The Scheduler's block_manager pointer is fixed up in start()
-    //    after ModelState is placed at its final address.
-    const total_kv_blocks = effective_max_seq / 16; // 16 tokens per block (default block size)
+    // 8. Initialize Scheduler with BlockManager
+    const total_kv_blocks = effective_max_seq / 16;
     const block_manager = scheduler_mod.BlockManager.init(total_kv_blocks);
 
     std.log.info("Model loaded: {s} ({d} layers, {d} kv_heads, {d} head_dim, max_seq={d})", .{
@@ -330,7 +394,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .caches = caches,
         .model_pool = model_pool,
         .block_manager = block_manager,
-        .scheduler = null, // initialized in start() after state has a stable address
+        .scheduler = null,
         .speculative_ngram = config.speculative_ngram,
         .prompt_cache_file = config.prompt_cache_file,
         .prefix_disk_cache = if (config.kv_cold_dir) |cold_dir|
@@ -339,7 +403,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             null,
         .dsv4_model = dsv4_model,
         .running = true,
-        .request_queue = undefined, // initialized in start()
+        .request_queue = undefined,
         .engine_loop = null,
         .engine_running = std.atomic.Value(bool).init(false),
         .active_requests = std.atomic.Value(u32).init(0),

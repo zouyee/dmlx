@@ -66,10 +66,16 @@ int main(void) {
     P.rms_norm_rows = mkpipe(d, lib, "rms_norm_rows");
     P.rope_tail_interleaved = mkpipe(d, lib, "rope_tail_interleaved");
     P.mla_sdpa_decode = mkpipe(d, lib, "mla_sdpa_decode");
+    P.mla_sdpa_decode_f16 = mkpipe(d, lib, "mla_sdpa_decode_f16");
     P.matvec_f32 = mkpipe(d, lib, "matvec_f32");
-    P.bf16_to_f32 = mkpipe(d, lib, "bf16_to_f32");
-    P.f32_to_bf16 = mkpipe(d, lib, "f32_to_bf16");
-    P.mla_sdpa_bfloat = mkpipe(d, lib, "mla_sdpa_decode_bfloat");
+    // F16 precision chain
+    P.dequant_matvec_affine_f16out = mkpipe(d, lib, "dequant_matvec_affine_f16out");
+    P.rms_norm_rows_f16out = mkpipe(d, lib, "rms_norm_rows_f16out");
+    P.dequant_matvec_affine_f16in_f16out = mkpipe(d, lib, "dequant_matvec_affine_f16in_f16out");
+    P.rms_norm_rows_f16in_f16out = mkpipe(d, lib, "rms_norm_rows_f16in_f16out");
+    P.rope_tail_interleaved_f16 = mkpipe(d, lib, "rope_tail_interleaved_f16");
+    P.matvec_f32_f16in = mkpipe(d, lib, "matvec_f32_f16in");
+    P.mla_sdpa_decode_f16in_f16out = mkpipe(d, lib, "mla_sdpa_decode_f16in_f16out");
 
     AttnWeights aw;
     aw.wq_a = load_qw("wq_a", Q_LORA_RANK, DIM);            // [1024,4096]
@@ -95,7 +101,7 @@ int main(void) {
     int pos = 7;
     FILE *mf = fopen(GD "meta.txt", "r"); if (mf) { fscanf(mf, "pos=%d", &pos); fclose(mf); }
 
-    float *kv_cache = calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(float));
+    uint16_t *kv_cache = calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(uint16_t));
     float *out = malloc(DIM * sizeof(float));
     // single token at position pos: cache_len = 1 (only current token)
     mla_attention_decode(&P, &aw, x, kv_cache, 1, pos, out);

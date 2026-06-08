@@ -22,12 +22,16 @@ brew install zig mlx-c
 git clone https://github.com/zouyee/dmlx.git && cd dmlx
 make
 
-# Chat (single prompt)
-./zig-out/bin/dmlx chat --model ~/models/DeepSeek-V4-Flash-4bit \
-  --prompt "Explain quantum computing in one sentence" \
-  --smelt --smelt-experts 0.2
+# Generate packed experts (one-time, required for --native mode)
+python3 scripts/repack_experts.py ~/models/DeepSeek-V4-Flash-4bit
 
-# Serve (OpenAI-compatible API, Trust OS mode — no custom cache)
+# Serve — Native mode (recommended for DeepSeek V4, no MLX runtime overhead)
+./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
+  --port 8080 \
+  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+  --native
+
+# Serve — MLX mode (other models, or fallback)
 ./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
   --port 8080 --smelt --smelt-experts 0.2
 
@@ -41,7 +45,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Performance
 
-**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: SMELT 20%, Trust OS, packed experts
+**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: Native (MLX-free engine, packed experts)
 
 | Metric | Value |
 |--------|-------|
@@ -51,7 +55,7 @@ curl http://localhost:8080/v1/chat/completions \
 | Memory usage | ~2.5 GB (Trust OS) |
 | 7-prompt correctness | **7/7 PASS** |
 
-> **Trust OS (cache=0) with packed experts is the recommended default.** Score-free DyMoE skips 1 expert per layer (17% I/O reduction) without breaking MLX lazy fusion. See [analysis](docs/analysis/flash-moe-alignment-plan.md).
+> **Native mode (`--native`) is the recommended default for DeepSeek V4 Flash 4-bit.** It bypasses the MLX runtime entirely, running attention + mHC + MoE entirely in C/Metal. Packed experts are required (`scripts/repack_experts.py`). See [analysis](docs/analysis/dsv4-first-class-support-plan.md).
 
 <details>
 <summary><b>Optimization history</b></summary>

@@ -31,6 +31,7 @@ extern fn moe_infer_set_weights(
 
 extern fn moe_infer_forward(engine: *Engine, hidden: [*c]f32, pos: c_int) c_int;
 extern fn moe_infer_forward_layer(engine: *Engine, layer: c_int, hidden: [*c]f32, pos: c_int) c_int;
+extern fn moe_infer_forward_batch(engine: *Engine, hidden_batch: [*c]f32, n_tokens: c_int, start_pos: c_int, token_ids: [*c]const c_int) c_int;
 extern fn moe_infer_deinit(engine: *Engine) void;
 
 // C-compatible structs (must match engine.h layout exactly).
@@ -73,12 +74,36 @@ extern fn moe_infer_set_layer_shared(engine: *Engine, layer: c_int, se: CSharedE
 extern fn moe_infer_reset_kv(engine: *Engine) void;
 extern fn moe_infer_set_layer_tid2eid(engine: *Engine, layer: c_int, tid2eid: [*c]const i64) void;
 extern fn moe_infer_set_token_id(engine: *Engine, token_id: c_int) void;
+extern fn moe_infer_embed(engine: *Engine, token_id: c_int, hidden_out: [*c]f32) void;
+extern fn moe_infer_compress_hc(engine: *Engine, residual: [*c]const f32, out: [*c]f32) void;
+extern fn hyper_head_compress(attn_fn: [*c]const f32, attn_base: [*c]const f32, attn_scale: [*c]const f32, residual: [*c]const f32, out: [*c]f32) void;
+extern fn moe_infer_get_logits(engine: *Engine, hidden: [*c]const f32, logits_out: [*c]f32) c_int;
+extern fn moe_infer_set_layer_compressor(engine: *Engine, layer: c_int, compress_ratio: u32,
+    comp_wkv: CQuantWeight, comp_wgate: CQuantWeight,
+    comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void;
+extern fn moe_infer_set_layer_indexer(engine: *Engine, layer: c_int,
+    idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight,
+    idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight,
+    idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void;
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
 }
 pub fn setTokenId(engine: *Engine, token_id: i32) void {
     moe_infer_set_token_id(engine, @intCast(token_id));
+}
+pub fn embed(engine: *Engine, token_id: i32, hidden_out: [*c]f32) void {
+    moe_infer_embed(engine, @intCast(token_id), hidden_out);
+}
+pub fn compressHc(engine: *Engine, residual: [*c]const f32, out: [*c]f32) void {
+    moe_infer_compress_hc(engine, residual, out);
+}
+pub fn hyperHeadCompress(attn_fn: [*c]const f32, attn_base: [*c]const f32, attn_scale: [*c]const f32, residual: [*c]const f32, out: [*c]f32) void {
+    hyper_head_compress(attn_fn, attn_base, attn_scale, residual, out);
+}
+pub fn getLogits(engine: *Engine, hidden: [*c]const f32, logits_out: [*c]f32) !void {
+    const rc = moe_infer_get_logits(engine, hidden, logits_out);
+    if (rc != 0) return error.GetLogitsFailed;
 }
 
 pub fn init(packed_dir: []const u8) !*Engine {
@@ -89,6 +114,11 @@ pub fn init(packed_dir: []const u8) !*Engine {
 
 pub fn forward(engine: *Engine, hidden: []f32, pos: u32) !void {
     const rc = moe_infer_forward(engine, hidden.ptr, @intCast(pos));
+    if (rc != 0) return error.ForwardFailed;
+}
+
+pub fn forwardBatch(engine: *Engine, hidden_batch: []f32, n_tokens: usize, start_pos: u32, token_ids: []const i32) !void {
+    const rc = moe_infer_forward_batch(engine, hidden_batch.ptr, @intCast(n_tokens), @intCast(start_pos), token_ids.ptr);
     if (rc != 0) return error.ForwardFailed;
 }
 
@@ -149,4 +179,31 @@ fn cqw(q: anytype) CQuantWeight {
 
 pub fn deinit(engine: *Engine) void {
     moe_infer_deinit(engine);
+}
+
+pub fn setLayerCompressor(engine: *Engine, layer: usize, compress_ratio: u32,
+    comp_wkv: CQuantWeight, comp_wgate: CQuantWeight,
+    comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void {
+    moe_infer_set_layer_compressor(engine, @intCast(layer), compress_ratio,
+        comp_wkv, comp_wgate, comp_ape, comp_norm);
+}
+
+pub fn setLayerIndexer(engine: *Engine, layer: usize,
+    idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight,
+    idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight,
+    idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void {
+    moe_infer_set_layer_indexer(engine, @intCast(layer),
+        idx_wq_b, idx_weights_proj, idx_comp_wkv, idx_comp_wgate,
+        idx_comp_ape, idx_comp_norm);
+}
+
+pub fn toCQuantWeight(q: anytype) CQuantWeight {
+    return .{
+        .packed_ptr = q.packed_ptr.ptr,
+        .scales = q.scales.ptr,
+        .biases = if (q.biases.len > 0) q.biases.ptr else null,
+        .out_dim = q.out_dim,
+        .in_dim = q.in_dim,
+        .group_size = q.group_size,
+    };
 }

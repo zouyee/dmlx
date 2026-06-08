@@ -28,6 +28,28 @@ static void pre_norm_fn(const MhcWeights *w, const float *residual, float *mixes
     }
 }
 
+// F16-weight variant (ds4-style): fn stored as uint16_t half-precision.
+// Dot product uses f16-cast operands with f32 accumulation, matching
+// ds4's matvec_f16 behaviour.
+static inline float f16_to_f32(uint16_t h) {
+    union { uint16_t u; _Float16 f; } conv;
+    conv.u = h;
+    return (float)conv.f;
+}
+
+static void pre_norm_fn_f16(const MhcWeightsF16 *w, const float *residual, float *mixes) {
+    const float *res = residual;
+    double ss = 0.0;
+    for (int i = 0; i < MHC_H; i++) ss += (double)res[i] * res[i];
+    float norm = 1.0f / sqrtf((float)(ss / MHC_H) + HC_EPS);
+    for (int r = 0; r < MIX3; r++) {
+        const uint16_t *fr = w->fn + (size_t)r * MHC_H;
+        float acc = 0.0f;
+        for (int i = 0; i < MHC_H; i++) acc += f16_to_f32(fr[i]) * res[i];
+        mixes[r] = acc * norm;
+    }
+}
+
 // sinkhorn on comb[HC*HC] (row-major [i][j]): softmax over j, +eps,
 // col-norm, then (iters-1) x (row-norm, col-norm).
 static void sinkhorn(float *comb) {
@@ -64,11 +86,10 @@ void mhc_pre(const MhcWeights *w, const float *residual,
              float *out_input, float *out_post, float *out_comb) {
     float mixes[MIX3];
     pre_norm_fn(w, residual, mixes);
-    // scale_expanded: [HC * scale[0], HC * scale[1], HC*HC * scale[2]] then +base
     float pre_mix[HC], comb[HC*HC];
     for (int m = 0; m < HC; m++) {
         float biased = mixes[m] * w->scale[0] + w->base[m];
-        pre_mix[m] = 1.0f / (1.0f + expf(-biased)) + HC_EPS;   // sigmoid + pre_eps
+        pre_mix[m] = 1.0f / (1.0f + expf(-biased)) + HC_EPS;
     }
     for (int m = 0; m < HC; m++) {
         float biased = mixes[HC + m] * w->scale[1] + w->base[HC + m];
@@ -80,9 +101,34 @@ void mhc_pre(const MhcWeights *w, const float *residual,
     sinkhorn(comb);
     memcpy(out_comb, comb, sizeof(comb));
 
-    // sublayer input = sum_m pre_mix[m] * residual[m, :]
     for (int d = 0; d < DIM; d++) {
-        float acc = 0;
+        float acc = 0.0f;
+        for (int m = 0; m < HC; m++) acc += pre_mix[m] * residual[m*DIM + d];
+        out_input[d] = acc;
+    }
+}
+
+void mhc_pre_f16(const MhcWeightsF16 *w, const float *residual,
+                 float *out_input, float *out_post, float *out_comb) {
+    float mixes[MIX3];
+    pre_norm_fn_f16(w, residual, mixes);
+    float pre_mix[HC], comb[HC*HC];
+    for (int m = 0; m < HC; m++) {
+        float biased = mixes[m] * w->scale[0] + w->base[m];
+        pre_mix[m] = 1.0f / (1.0f + expf(-biased)) + HC_EPS;
+    }
+    for (int m = 0; m < HC; m++) {
+        float biased = mixes[HC + m] * w->scale[1] + w->base[HC + m];
+        out_post[m] = (1.0f / (1.0f + expf(-biased))) * POST_MULT;
+    }
+    for (int c = 0; c < HC*HC; c++) {
+        comb[c] = mixes[2*HC + c] * w->scale[2] + w->base[2*HC + c];
+    }
+    sinkhorn(comb);
+    memcpy(out_comb, comb, sizeof(comb));
+
+    for (int d = 0; d < DIM; d++) {
+        float acc = 0.0f;
         for (int m = 0; m < HC; m++) acc += pre_mix[m] * residual[m*DIM + d];
         out_input[d] = acc;
     }
@@ -148,6 +194,36 @@ void mhc_head_compress(const MhcWeights *w, const float *residual, float *out) {
     }
     for (int d = 0; d < DIM; d++) {
         float acc = 0;
+        for (int m = 0; m < HC; m++) acc += mix[m] * residual[m*DIM + d];
+        out[d] = acc;
+    }
+}
+
+// HyperHead: compress mHC residual [HC, DIM] -> [DIM] using learned mixing.
+// Matches DSV4Model.hcHead.forward: mixes = (flat @ fn^T) * rsqrt(mean(flat^2)+eps)
+// pre = sigmoid(mixes * scale[0] + base) + eps, out = sum_m pre[m] * residual[m,:]
+void hyper_head_compress(const float *fn, const float *base, const float *scale,
+                         const float *residual, float *out) {
+    double ss = 0.0;
+    for (int i = 0; i < MHC_H; i++) ss += (double)residual[i] * residual[i];
+    float norm = 1.0f / sqrtf((float)(ss / MHC_H) + HC_EPS);
+
+    float mixes[HC];
+    for (int m = 0; m < HC; m++) {
+        double acc = 0.0;
+        const float *fr = fn + (size_t)m * MHC_H;
+        for (int i = 0; i < MHC_H; i++) acc += (double)fr[i] * residual[i];
+        mixes[m] = (float)acc * norm;
+    }
+
+    float mix[HC];
+    for (int m = 0; m < HC; m++) {
+        float biased = mixes[m] * scale[0] + base[m];
+        mix[m] = 1.0f / (1.0f + expf(-biased)) + HC_EPS;
+    }
+
+    for (int d = 0; d < DIM; d++) {
+        float acc = 0.0f;
         for (int m = 0; m < HC; m++) acc += mix[m] * residual[m*DIM + d];
         out[d] = acc;
     }

@@ -50,4 +50,5 @@ pub const ServerConfig = struct {
     expert_parallel: usize = 6,
     metal_moe: bool = false,
     metal_full: bool = false, // Full-metal engine path (attention + mHC + MoE in engine.c)
+    native: bool = false, // MLX-free native engine (native_loader + engine.c/Metal, no MLX runtime)
 };
