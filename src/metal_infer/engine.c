@@ -263,6 +263,137 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
     return n_per_layer;
 }
 
+// ============================================================================
+// SMELT: warmup-based hot expert preloading with routing bias
+// ============================================================================
+
+void moe_infer_smelt_init(MoEInferEngine *eng, int warmup_tokens, int n_per_layer, float penalty) {
+    memset(eng->routing_counts, 0, sizeof(eng->routing_counts));
+    eng->smelt_warmup_tokens = warmup_tokens;
+    eng->smelt_n_per_layer   = n_per_layer;
+    eng->smelt_tokens_seen   = 0;
+    eng->smelt_warmup_done   = false;
+    eng->smelt_enabled       = true;
+    eng->smelt_penalty       = penalty;
+    fprintf(stderr, "[smelt] Init: warmup=%d tokens, cache=%d experts/layer, penalty=%.0f\n",
+        warmup_tokens, n_per_layer, penalty);
+}
+
+int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
+    if (!eng->smelt_enabled || eng->smelt_warmup_done) return eng->expert_cache_n_experts;
+
+    const int n = eng->smelt_n_per_layer;
+    if (n <= 0 || n > N_EXPERTS) {
+        eng->smelt_warmup_done = true;
+        return 0;
+    }
+
+    fprintf(stderr, "[smelt] Warmup complete (%d tokens). Preloading top-%d experts/layer...\n",
+        eng->smelt_tokens_seen, n);
+
+    // Allocate lookup tables if not already allocated
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        if (!eng->expert_mem_cache[layer]) {
+            eng->expert_mem_cache[layer] = (uint8_t **)calloc(N_EXPERTS, sizeof(uint8_t *));
+            if (!eng->expert_mem_cache[layer]) {
+                fprintf(stderr, "[smelt] OOM: lookup table for layer %d\n", layer);
+                return 0;
+            }
+        } else {
+            // Clear any old cache pointers
+            memset(eng->expert_mem_cache[layer], 0, N_EXPERTS * sizeof(uint8_t *));
+        }
+    }
+
+    // Sort experts by frequency and pick top-n for each layer
+    // We reuse/reallocate expert_mem_pool per layer
+    int sorted[N_EXPERTS];
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        // Sort expert IDs by descending count
+        for (int i = 0; i < N_EXPERTS; i++) sorted[i] = i;
+        // Simple insertion sort — N_EXPERTS=256 is small enough
+        for (int i = 1; i < N_EXPERTS; i++) {
+            int key = sorted[i];
+            uint32_t kc = eng->routing_counts[layer][key];
+            int j = i - 1;
+            while (j >= 0 && eng->routing_counts[layer][sorted[j]] < kc) {
+                sorted[j+1] = sorted[j]; j--;
+            }
+            sorted[j+1] = key;
+        }
+
+        // Allocate pool for this layer (free old pool if exists)
+        if (eng->expert_mem_pool[layer]) {
+            free(eng->expert_mem_pool[layer]);
+            eng->expert_mem_pool[layer] = NULL;
+        }
+        size_t pool_bytes = (size_t)n * EXPERT_SIZE;
+        if (posix_memalign((void**)&eng->expert_mem_pool[layer], 2*1024*1024, pool_bytes) != 0) {
+            fprintf(stderr, "[smelt] OOM: pool for layer %d (%lu MB)\n", layer,
+                (unsigned long)(pool_bytes / (1024*1024)));
+            return 0;
+        }
+
+        // Preload top-n experts
+        int loaded = 0;
+        for (int i = 0; i < n && i < N_EXPERTS; i++) {
+            int eid = sorted[i];
+            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)loaded * EXPERT_SIZE;
+            off_t offset = (off_t)eid * EXPERT_SIZE;
+            ssize_t bytes = pread(eng->packed_fd[layer], dst, EXPERT_SIZE, offset);
+            if (bytes == EXPERT_SIZE) {
+                eng->expert_mem_cache[layer][eid] = dst;
+                loaded++;
+            } else {
+                fprintf(stderr, "[smelt] pread failed layer=%d eid=%d got=%ld\n", layer, eid, (long)bytes);
+            }
+        }
+
+        if (layer == 0) {
+            fprintf(stderr, "[smelt] L0 top-%d experts: [", loaded);
+            for (int i = 0; i < (loaded < 8 ? loaded : 8); i++)
+                fprintf(stderr, "%d(×%u)%s", sorted[i], eng->routing_counts[layer][sorted[i]], i+1<8?",":"");
+            fprintf(stderr, "...]\n");
+        }
+    }
+
+    eng->expert_cache_n_experts = n;
+    eng->smelt_warmup_done = true;
+    fprintf(stderr, "[smelt] Done. %d experts/layer cached, routing bias penalty=%.0f\n",
+        n, eng->smelt_penalty);
+    return n;
+}
+
+// Background preload thread state
+typedef struct {
+    MoEInferEngine *eng;
+} SmeltPreloadArgs;
+
+static void *smelt_preload_thread(void *arg) {
+    SmeltPreloadArgs *a = (SmeltPreloadArgs *)arg;
+    moe_infer_smelt_finish_warmup(a->eng);
+    free(a);
+    return NULL;
+}
+
+// Async version: spawn background thread for preloading, return immediately.
+// The routing bias will only be active once smelt_warmup_done becomes true.
+// Meanwhile, all SSD reads proceed normally (no penalty applied yet).
+void moe_infer_smelt_preload_async(MoEInferEngine *eng) {
+    if (!eng->smelt_enabled || eng->smelt_warmup_done) return;
+    SmeltPreloadArgs *a = (SmeltPreloadArgs *)malloc(sizeof(SmeltPreloadArgs));
+    if (!a) { moe_infer_smelt_finish_warmup(eng); return; }
+    a->eng = eng;
+    pthread_t t;
+    if (pthread_create(&t, NULL, smelt_preload_thread, a) != 0) {
+        free(a);
+        moe_infer_smelt_finish_warmup(eng);
+        return;
+    }
+    pthread_detach(t);
+    fprintf(stderr, "[smelt] Async preload started (routing bias inactive until complete)\n");
+}
+
 // Dispatch K parallel preads — uses memory cache if available, falls back to SSD.
 static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer, int *expert_ids, int K,
                                     uint8_t *buffers[6]) {
@@ -451,8 +582,11 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
 // MLX routing: sqrtsoftplus scoring, topK selection, L1-normalize, scale by route_scale.
 // Matches DSV4Gate.forward (scoring_func=sqrtsoftplus, norm_topk_prob=true, route_scale=1.5).
 // bias: optional [N_EXPERTS] e_score_correction_bias (NULL for hash layers 0-2).
+// cache_mask: optional [N_EXPERTS] bool — if non-NULL and smelt_warmup_done, adds penalty
+//             to uncached experts to steer routing toward cached ones (SMELT).
 static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
-                          int *out_indices, float *out_weights) {
+                          int *out_indices, float *out_weights,
+                          const uint8_t *const *cache_ptr, float smelt_penalty) {
     // 1. sqrtsoftplus: scores[i] = sqrt(log(1 + exp(logits[i])))
     float *scores = (float *)alloca(n * sizeof(float));
     for (int i = 0; i < n; i++) {
@@ -463,9 +597,14 @@ static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
     // 2. Add e_score_correction_bias for topK selection (not for weight computation)
     float *scores_for_choice = scores;
     float *biased = NULL;
-    if (bias != NULL) {
+    if (bias != NULL || cache_ptr != NULL) {
         biased = (float *)alloca(n * sizeof(float));
-        for (int i = 0; i < n; i++) biased[i] = scores[i] + bias[i];
+        for (int i = 0; i < n; i++) {
+            biased[i] = scores[i];
+            if (bias) biased[i] += bias[i];
+            // SMELT: penalize uncached experts to steer routing toward cached ones
+            if (cache_ptr && !cache_ptr[i]) biased[i] -= smelt_penalty;
+        }
         scores_for_choice = biased;
     }
     // 3. topK selection by biased scores
@@ -921,7 +1060,22 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         wsum += 1e-20f;
         for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
     } else {
-        cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights);
+        // Determine SMELT cache mask: only apply penalty after warmup
+        const uint8_t *const *smelt_cache = NULL;
+        if (eng->smelt_enabled && eng->smelt_warmup_done && eng->expert_mem_cache[layer]) {
+            smelt_cache = (const uint8_t *const *)eng->expert_mem_cache[layer];
+        }
+        cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights,
+                      smelt_cache, eng->smelt_penalty);
+    }
+    // SMELT warmup: accumulate routing statistics (only for score-based routing, not hash)
+    if (eng->smelt_enabled && !eng->smelt_warmup_done && !use_hash_routing) {
+        for (int k = 0; k < N_ACTIVE; k++) {
+            int eid = expert_ids[k];
+            if (eid >= 0 && eid < N_EXPERTS) {
+                eng->routing_counts[layer][eid]++;
+            }
+        }
     }
     if (layer == 0 && getenv("MF_DBG")) {
         fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f] hash=%s tok=%d\n",
@@ -1070,7 +1224,15 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     if (nl) max_layers = atoi(nl);
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
-    }    return 0;
+    }
+    // SMELT: count this decode token, trigger warmup completion if threshold reached
+    if (eng->smelt_enabled && !eng->smelt_warmup_done) {
+        eng->smelt_tokens_seen++;
+        if (eng->smelt_tokens_seen >= eng->smelt_warmup_tokens) {
+            moe_infer_smelt_finish_warmup(eng);
+        }
+    }
+    return 0;
 }
 
 // Batch forward pass for N tokens (proper transformer order: all tokens per layer).
@@ -1127,6 +1289,12 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         }
     }
 
+    // SMELT: do NOT count prefill tokens for warmup statistics.
+    // Prefill uses hash-routing for layers 0-2 (routing_counts all 0), so
+    // triggering warmup here would preload the wrong experts.
+    // Warmup is counted only in moe_infer_forward (decode path).
+    (void)0; // prefill path intentionally skips smelt_tokens_seen
+
     // Dump last token's final residual for diagnostics
     if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
         const char *dd = getenv("DSV4_DUMP_DIR");
@@ -1178,6 +1346,14 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
     eng->io_pool = io;
 
     eng->initialized = true;
+    // Initialize SMELT fields (disabled by default)
+    memset(eng->routing_counts, 0, sizeof(eng->routing_counts));
+    eng->smelt_warmup_tokens = 0;
+    eng->smelt_n_per_layer   = 0;
+    eng->smelt_tokens_seen   = 0;
+    eng->smelt_warmup_done   = false;
+    eng->smelt_enabled       = false;
+    eng->smelt_penalty       = 1e9f;
     fprintf(stderr, "Metal engine: %d expert files opened\n", N_LAYERS);
     return eng;
 }
@@ -1229,6 +1405,16 @@ void moe_infer_set_token_id(MoEInferEngine *eng, int token_id) {
 }
 
 void moe_infer_reset_kv(MoEInferEngine *eng) {
+    // If a deferred CMD3 is in-flight from the previous request, wait and release it
+    // before clearing state. This prevents use-after-free on GPU buffers.
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+    }
+    eng->deferred.active = false;
+    eng->deferred.gpu_combined = false;
+
     for (int l = 0; l < N_LAYERS; l++) {
         eng->kv_cache[l].len = 0;
         // Clear KV buffer so stale entries from the previous request
