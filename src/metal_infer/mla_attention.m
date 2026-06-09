@@ -115,13 +115,26 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
             }
         }
     } else {
-        // SMELT mode: memory tight (35GB + backbone ~3GB = ~38GB, near M4 Pro limit)
-        // Only cache tiny norms/sink. Skip wo_a_dense NoCopy to avoid OOM from Metal metadata.
+        // SMELT mode: memory tight (35GB + backbone ~3GB ≈ 38GB).
+        // wo_a_dense NoCopy: data is ALREADY in memory (backbone weights), Metal wrapper is tiny.
+        // Enable for SMELT too — test if OOM is real or coincidental.
         c->wq_a_pack = nil; c->wq_a_sc = nil; c->wq_a_bi = nil;
         c->wq_b_pack = nil; c->wq_b_sc = nil; c->wq_b_bi = nil;
         c->wkv_pack  = nil; c->wkv_sc  = nil; c->wkv_bi  = nil;
         c->wo_b_pack = nil; c->wo_b_sc = nil; c->wo_b_bi = nil;
-        for (int g = 0; g < O_GROUPS; g++) c->wo_a_grp[g] = nil;
+        // wo_a_dense NoCopy: zero extra RAM (already loaded in backbone), saves 128MB copy/layer
+        {
+            int heads_per_group = N_HEADS / O_GROUPS;
+            int group_feat = heads_per_group * HEAD_DIM;
+            size_t grp_sz = (size_t)O_LORA_RANK * group_feat * sizeof(float);
+            for (int g = 0; g < O_GROUPS; g++) {
+                const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
+                c->wo_a_grp[g] = [d newBufferWithBytesNoCopy:(void*)wg
+                                     length:grp_sz
+                                     options:MTLResourceStorageModeShared
+                                     deallocator:nil];
+            }
+        }
     }
     // q_norm, kv_norm, attn_sink (tiny — always cached)
     c->q_norm_buf    = MKGPU(aw->q_norm,    Q_LORA_RANK * sizeof(float));
