@@ -12,59 +12,112 @@ constant float NIBBLE_TO_FLOAT[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
-// fused_gate_up_swiglu NAIVE: one thread per row, no SIMD reduction. For debugging.
+// fused_gate_up_swiglu — SIMD-optimized MXFP4 fused gate+up+SwiGLU.
+//
+// Strategy (matches flash-moe dequant_matvec_4bit_fast pattern):
+//   - One threadgroup of 256 threads = 8 SIMD groups of 32.
+//   - Each SIMD group handles ONE output row.
+//   - 32 threads in a SIMD group stripe across num_groups (128 groups for gs=32, in=4096).
+//   - Input vector x (4096 floats = 16KB) is cached in threadgroup shared memory.
+//   - simd_sum reduction: single instruction, no explicit barrier.
+//
+// Dispatch: MTLSizeMake(out_dim/8, 1, 1) threadgroups × 256 threads.
+// (For out_dim=2048: 256 threadgroups × 256 threads = 65536 threads)
+//
+// Memory savings vs naive: x read ONCE per threadgroup (16KB) vs 256× per row.
+// Speedup vs naive: ~20-40× from combined bandwidth + parallelism improvements.
 kernel void fused_gate_up_swiglu(
-    device const uint32_t* gate_W   [[buffer(0)]],
-    device const uint8_t*  gate_s   [[buffer(1)]],
-    device const uint32_t* up_W     [[buffer(2)]],
-    device const uint8_t*  up_s     [[buffer(3)]],
-    device const float*    x        [[buffer(4)]],
-    device float*          out      [[buffer(5)]],
-    constant uint&         out_dim  [[buffer(6)]],
-    constant uint&         in_dim   [[buffer(7)]],
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint8_t*  gate_s    [[buffer(1)]],
+    device const uint32_t* up_W      [[buffer(2)]],
+    device const uint8_t*  up_s      [[buffer(3)]],
+    device const float*    x         [[buffer(4)]],
+    device float*          out       [[buffer(5)]],
+    constant uint&         out_dim   [[buffer(6)]],
+    constant uint&         in_dim    [[buffer(7)]],
     constant uint&         group_size [[buffer(8)]],
-    uint tid [[thread_position_in_grid]]
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    if (tid >= out_dim) return;
-    uint num_groups = in_dim / group_size;
-    uint packed_per_group = group_size / 8;
+    // Each threadgroup handles ROWS_PER_TG=8 output rows (one per SIMD group).
+    const uint ROWS_PER_TG = 8;
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
     uint packed_cols = in_dim / 8;
+    uint num_groups  = in_dim / group_size;
 
-    device const uint32_t* g_row = gate_W + tid * packed_cols;
-    device const uint8_t*  g_s   = gate_s + tid * num_groups;
-    device const uint32_t* u_row = up_W   + tid * packed_cols;
-    device const uint8_t*  u_s   = up_s   + tid * num_groups;
+    // Cache input x in threadgroup shared memory (4096 floats = 16KB).
+    // ALL 256 threads cooperate — mandatory before any early return.
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    float gate_val = 0.0f, up_val = 0.0f;
-    for (uint g = 0; g < num_groups; g++) {
+    if (row >= out_dim) return;
+
+    device const uint32_t* g_row = gate_W + row * packed_cols;
+    device const uint8_t*  g_s   = gate_s + row * num_groups;
+    device const uint32_t* u_row = up_W   + row * packed_cols;
+    device const uint8_t*  u_s   = up_s   + row * num_groups;
+
+    float gate_acc = 0.0f, up_acc = 0.0f;
+    uint packed_per_group = group_size / 8;
+
+    // Stripe across groups: lane k processes groups k, k+32, k+64, ...
+    for (uint g = simd_lane; g < num_groups; g += 32) {
         float gsf = exp2((float)g_s[g] - 127.0f);
         float usf = exp2((float)u_s[g] - 127.0f);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
-            uint32_t gpw = g_row[bp + p], upw = u_row[bp + p];
-            uint x_base = bx + p * 8;
-            for (uint i = 0; i < 8; i++) {
-                float g_w = NIBBLE_TO_FLOAT[(gpw >> (i * 4)) & 0xF] * gsf;
-                float u_w = NIBBLE_TO_FLOAT[(upw >> (i * 4)) & 0xF] * usf;
-                float xv = x[x_base + i];
-                gate_val += g_w * xv;
-                up_val   += u_w * xv;
-            }
+            uint32_t gpw = g_row[bp + p];
+            uint32_t upw = u_row[bp + p];
+            uint x_base  = bx + p * 8;
+            // Unroll 8 nibbles per packed word
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  0) & 0xF] * gsf * x_shared[x_base + 0];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  4) & 0xF] * gsf * x_shared[x_base + 1];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  8) & 0xF] * gsf * x_shared[x_base + 2];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 12) & 0xF] * gsf * x_shared[x_base + 3];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 16) & 0xF] * gsf * x_shared[x_base + 4];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 20) & 0xF] * gsf * x_shared[x_base + 5];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 24) & 0xF] * gsf * x_shared[x_base + 6];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 28) & 0xF] * gsf * x_shared[x_base + 7];
+
+            up_acc += NIBBLE_TO_FLOAT[(upw >>  0) & 0xF] * usf * x_shared[x_base + 0];
+            up_acc += NIBBLE_TO_FLOAT[(upw >>  4) & 0xF] * usf * x_shared[x_base + 1];
+            up_acc += NIBBLE_TO_FLOAT[(upw >>  8) & 0xF] * usf * x_shared[x_base + 2];
+            up_acc += NIBBLE_TO_FLOAT[(upw >> 12) & 0xF] * usf * x_shared[x_base + 3];
+            up_acc += NIBBLE_TO_FLOAT[(upw >> 16) & 0xF] * usf * x_shared[x_base + 4];
+            up_acc += NIBBLE_TO_FLOAT[(upw >> 20) & 0xF] * usf * x_shared[x_base + 5];
+            up_acc += NIBBLE_TO_FLOAT[(upw >> 24) & 0xF] * usf * x_shared[x_base + 6];
+            up_acc += NIBBLE_TO_FLOAT[(upw >> 28) & 0xF] * usf * x_shared[x_base + 7];
         }
     }
-    // Limited SwiGLU (matches MLX DSV4SwitchGLU.limitedSwiGLU, swiglu_limit=10):
-    //   gate_clipped = min(gate, +limit)
-    //   up_clipped   = min(max(up, -limit), +limit)
-    //   out = silu(gate_clipped) * up_clipped
-    const float limit = 10.0f;
-    float g_c = min(gate_val, limit);
-    float u_c = min(max(up_val, -limit), limit);
-    float act = g_c / (1.0f + exp(-g_c));
-    out[tid] = act * u_c;
+
+    // SIMD reduction: sum 32 lanes → lane 0 holds the final value.
+    float gate_val = simd_sum(gate_acc);
+    float up_val   = simd_sum(up_acc);
+
+    if (simd_lane == 0) {
+        // Limited SwiGLU (swiglu_limit=10, matches MLX DSV4SwitchGLU.limitedSwiGLU)
+        const float limit = 10.0f;
+        float g_c = min(gate_val, limit);
+        float u_c = min(max(up_val, -limit), limit);
+        out[row] = (g_c / (1.0f + exp(-g_c))) * u_c;
+    }
 }
 
-// dequant_matvec_4bit NAIVE: one thread per row. For correctness baseline.
+// dequant_matvec_4bit — SIMD-optimized MXFP4 matvec (down_proj: [4096, 2048]).
+//
+// Same strategy as fused_gate_up_swiglu: 8 SIMD groups per threadgroup,
+// each SIMD group handles one output row with simd_sum reduction.
+// x (2048 floats = 8KB) cached in threadgroup shared memory.
+//
+// Dispatch: MTLSizeMake(out_dim/8, 1, 1) threadgroups × 256 threads.
+// (For out_dim=4096: 512 threadgroups × 256 threads)
 kernel void dequant_matvec_4bit(
     device const uint32_t* W_packed [[buffer(0)]],
     device const uint8_t*  scales   [[buffer(1)]],
@@ -73,31 +126,53 @@ kernel void dequant_matvec_4bit(
     constant uint&         out_dim  [[buffer(4)]],
     constant uint&         in_dim   [[buffer(5)]],
     constant uint&         group_size [[buffer(6)]],
-    uint tid [[thread_position_in_grid]]
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    if (tid >= out_dim) return;
-    uint num_groups = in_dim / group_size;
-    uint packed_per_group = group_size / 8;
-    uint packed_cols = in_dim / 8;
+    const uint ROWS_PER_TG = 8;
+    uint row = tgid * ROWS_PER_TG + simd_group;
 
-    device const uint32_t* wr = W_packed + tid * packed_cols;
-    device const uint8_t*  sc = scales   + tid * num_groups;
+    uint packed_cols    = in_dim / 8;
+    uint num_groups     = in_dim / group_size;
+    uint packed_per_grp = group_size / 8;
+
+    // Cache x in threadgroup shared memory (up to 4096 floats = 16KB).
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const uint32_t* wr = W_packed + row * packed_cols;
+    device const uint8_t*  sc = scales   + row * num_groups;
 
     float acc = 0.0f;
-    for (uint g = 0; g < num_groups; g++) {
+    for (uint g = simd_lane; g < num_groups; g += 32) {
         float sf = exp2((float)sc[g] - 127.0f);
-        uint bp = g * packed_per_group;
+        uint bp = g * packed_per_grp;
         uint bx = g * group_size;
-        for (uint p = 0; p < packed_per_group; p++) {
-            uint32_t pw = wr[bp + p];
-            uint x_base = bx + p * 8;
-            for (uint i = 0; i < 8; i++) {
-                float w_val = NIBBLE_TO_FLOAT[(pw >> (i * 4)) & 0xF] * sf;
-                acc += w_val * x[x_base + i];
-            }
+        for (uint p = 0; p < packed_per_grp; p++) {
+            uint32_t pw  = wr[bp + p];
+            uint x_base  = bx + p * 8;
+            acc += NIBBLE_TO_FLOAT[(pw >>  0) & 0xF] * sf * x_shared[x_base + 0];
+            acc += NIBBLE_TO_FLOAT[(pw >>  4) & 0xF] * sf * x_shared[x_base + 1];
+            acc += NIBBLE_TO_FLOAT[(pw >>  8) & 0xF] * sf * x_shared[x_base + 2];
+            acc += NIBBLE_TO_FLOAT[(pw >> 12) & 0xF] * sf * x_shared[x_base + 3];
+            acc += NIBBLE_TO_FLOAT[(pw >> 16) & 0xF] * sf * x_shared[x_base + 4];
+            acc += NIBBLE_TO_FLOAT[(pw >> 20) & 0xF] * sf * x_shared[x_base + 5];
+            acc += NIBBLE_TO_FLOAT[(pw >> 24) & 0xF] * sf * x_shared[x_base + 6];
+            acc += NIBBLE_TO_FLOAT[(pw >> 28) & 0xF] * sf * x_shared[x_base + 7];
         }
     }
-    out[tid] = acc;
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
 }
 
 // fused_gate_up_swiglu_bfloat_in: bfloat input, f32 output.

@@ -122,6 +122,9 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
         posix_memalign((void**)&eng->expert_buf_pred[k], 2*1024*1024, EXPERT_SIZE);
     }
 
+    // Initialize expert GPU buffer cache to NULL (populated after SMELT warmup)
+    memset(eng->expert_gpu_buf, 0, sizeof(eng->expert_gpu_buf));
+
     fprintf(stderr, "Metal engine: initialized\n");
     return 0;
 }
@@ -379,6 +382,29 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
     eng->smelt_warmup_done = true;
     fprintf(stderr, "[smelt] Done. %.1f GB preloaded, routing bias penalty=%.0f\n",
         (double)total_bytes / (1024.0*1024.0*1024.0), eng->smelt_penalty);
+
+    // === Create persistent GPU MTLBuffer wrappers for all cached experts ===
+    // This eliminates the per-call newBufferWithBytesNoCopy overhead (was ~150ms/layer).
+    // Each cached expert gets 6 persistent MTLBuffers (gate_w, gate_s, up_w, up_s, down_w, down_s).
+    {
+        id<MTLDevice> d = (id<MTLDevice>)eng->device;
+        int n_created = 0;
+        for (int layer = 0; layer < N_LAYERS; layer++) {
+            if (!eng->expert_mem_cache[layer]) continue;
+            for (int eid = 0; eid < N_EXPERTS; eid++) {
+                uint8_t *base = eng->expert_mem_cache[layer][eid];
+                if (!base) continue;
+                eng->expert_gpu_buf[layer][eid][0] = (void *)[d newBufferWithBytesNoCopy:base+GATE_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][1] = (void *)[d newBufferWithBytesNoCopy:base+GATE_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                n_created++;
+            }
+        }
+        fprintf(stderr, "[smelt] Created %d persistent GPU buffers for cached experts\n", n_created * 6);
+    }
     return n;
 }
 
@@ -527,14 +553,26 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     const int gw_off = GATE_W_OFF, gs_off = GATE_S_OFF;
     const int uw_off = UP_W_OFF, us_off = UP_S_OFF;
     const int dw_off = DOWN_W_OFF, ds_off = DOWN_S_OFF;
+    const int time_en = (getenv("NATIVE_TIME_LAYERS") != NULL);
+    double t0=0, t1=0, t2=0, t3=0;
+    if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec*1e9+ts.tv_nsec; }
+
+    // Helper: get or create MTLBuffer for a given expert slot.
+    // Uses persistent GPU buffer if available (post-SMELT), else creates on-the-fly.
+    #define EXPERT_BUF(layer, eid, slot, ptr, len) \
+        (eng->expert_gpu_buf[layer][eid][slot] ? \
+            (id<MTLBuffer>)eng->expert_gpu_buf[layer][eid][slot] : \
+            [d newBufferWithBytesNoCopy:(ptr) length:(len) options:MTLResourceStorageModeShared deallocator:nil])
 
     // Step 1: fused_gate_up_swiglu per expert [2048, 4096], group_size=32
+    // SIMD-optimized: 256 threadgroups × 256 threads (8 rows/tg, 32 lanes/row)
     for (int k = 0; k < K; k++) {
+        int eid = expert_ids[k];
         char *base = (char *)expert_bufs[k];
-        id gw   = [d newBufferWithBytesNoCopy:base+gw_off length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-        id gs_b = [d newBufferWithBytesNoCopy:base+gs_off length:262144 options:MTLResourceStorageModeShared deallocator:nil];
-        id uw   = [d newBufferWithBytesNoCopy:base+uw_off length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-        id us_b = [d newBufferWithBytesNoCopy:base+us_off length:262144 options:MTLResourceStorageModeShared deallocator:nil];
+        id gw  = EXPERT_BUF(layer_idx, eid, 0, base+gw_off, 4194304);
+        id gs_b= EXPERT_BUF(layer_idx, eid, 1, base+gs_off, 262144);
+        id uw  = EXPERT_BUF(layer_idx, eid, 2, base+uw_off, 4194304);
+        id us_b= EXPERT_BUF(layer_idx, eid, 3, base+us_off, 262144);
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
         [enc setBuffer:gw offset:0 atIndex:0];   [enc setBuffer:gs_b offset:0 atIndex:1];
@@ -545,15 +583,18 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         [enc setBytes:&od length:4 atIndex:6];
         [enc setBytes:&id_ length:4 atIndex:7];
         [enc setBytes:&gs length:4 atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        // 8 rows per threadgroup → INTERMEDIATE/8 threadgroups
+        [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
     }
 
     // Step 2: dequant_matvec_4bit (down_proj) per expert [4096, 2048], group_size=32
+    // SIMD-optimized: 512 threadgroups × 256 threads (8 rows/tg, 32 lanes/row)
     for (int k = 0; k < K; k++) {
+        int eid = expert_ids[k];
         char *base = (char *)expert_bufs[k];
-        id dw   = [d newBufferWithBytesNoCopy:base+dw_off length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-        id ds_b = [d newBufferWithBytesNoCopy:base+ds_off length:262144 options:MTLResourceStorageModeShared deallocator:nil];
+        id dw  = EXPERT_BUF(layer_idx, eid, 4, base+dw_off, 4194304);
+        id ds_b= EXPERT_BUF(layer_idx, eid, 5, base+ds_off, 262144);
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:eng->pipe_dequant_matvec];
         [enc setBuffer:dw offset:0 atIndex:0];    [enc setBuffer:ds_b offset:0 atIndex:1];
@@ -563,9 +604,12 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         [enc setBytes:&od length:4 atIndex:4];
         [enc setBytes:&id_ length:4 atIndex:5];
         [enc setBytes:&gs length:4 atIndex:6];
+        // 8 rows per threadgroup → DIM/8 = 512 threadgroups
         [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
     }
+
+    #undef EXPERT_BUF
 
     // Step 3: blit each expert output into persistent contiguous buffer (same CB).
     // Uses blit encoder instead of CPU memcpy — no CB boundary, no extra wait.
@@ -600,7 +644,10 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     }
 
     // Single commit + wait for gate+up+SwiGLU, down, blit, combine (was 2 CBs, 2 waits)
+    if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec*1e9+ts.tv_nsec; }
     [cb commit]; [cb waitUntilCompleted];
+    if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t2 = ts.tv_sec*1e9+ts.tv_nsec;
+        fprintf(stderr, "[MOE-TIME] encode=%.2fms gpu=%.2fms\n", (t1-t0)/1e6, (t2-t1)/1e6); }
     return 0;
 }
 
@@ -884,6 +931,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         // fit in SWA_WINDOW), MLX does not compress and uses plain attention — we
         // must do the same to match numerics.
         const int use_comp = (n_comp > 0 && kvc->len > SWA_WINDOW);
+        const int tl_attn = (getenv("NATIVE_TIME_LAYERS") != NULL);
+        double ta0=0, ta1=0;
+        if (tl_attn) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ta0 = ts.tv_sec*1e9+ts.tv_nsec; }
         if (use_comp) {
             // Decode x to f32 for the mixed attention path
             float x_f32[DIM];
@@ -903,6 +953,8 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         for (int i = 0; i < DIM; i++) {
             uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
         }
+        if (tl_attn) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ta1 = ts.tv_sec*1e9+ts.tv_nsec;
+            if (layer == 0) fprintf(stderr, "[ATTN-TIME] L0 pos=%d attn=%.1fms\n", pos, (ta1-ta0)/1e6); }
     }
 
     // mHC post (attn) — reuse persistent scratch buffers
@@ -1090,11 +1142,17 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
         memcpy(bn, normed, DIM * sizeof(float));
         IOPool *io = (IOPool *)eng->io_pool;
+        const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
+        double ti0=0, ti1=0, ti2=0;
+        if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti0 = ts.tv_sec*1e9+ts.tv_nsec; }
         // Use cached dispatch: reads from RAM if expert is preloaded, SSD otherwise
         uint8_t *expert_data[6];
         for (int k = 0; k < N_ACTIVE; k++) expert_data[k] = eng->expert_buf[k];
         io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
+        if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti1 = ts.tv_sec*1e9+ts.tv_nsec; }
         moe_forward_layer(eng, layer, expert_data, expert_ids, expert_weights, N_ACTIVE);
+        if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti2 = ts.tv_sec*1e9+ts.tv_nsec;
+            fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
@@ -1216,8 +1274,19 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     int max_layers = N_LAYERS;
     const char *nl = getenv("NATIVE_MAX_LAYERS");
     if (nl) max_layers = atoi(nl);
+    const char *time_layers = getenv("NATIVE_TIME_LAYERS");
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
+        double t0 = 0;
+        if (time_layers) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            t0 = ts.tv_sec * 1e9 + ts.tv_nsec;
+        }
         if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
+        if (time_layers) {
+            struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+            double t1 = ts.tv_sec * 1e9 + ts.tv_nsec;
+            fprintf(stderr, "[TIME] pos=%d layer=%d: %.1fms\n", pos, layer, (t1-t0)/1e6);
+        }
     }
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also

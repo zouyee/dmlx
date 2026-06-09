@@ -292,6 +292,12 @@ typedef struct {
     uint8_t *expert_mem_pool[N_LAYERS];    // flat pool per layer (expert_cache_n_experts × EXPERT_SIZE)
     int expert_cache_n_experts;            // how many experts cached per layer (0=disabled)
 
+    // Persistent GPU MTLBuffer wrappers for SMELT-cached experts.
+    // Created once after SMELT warmup; reused every forward call.
+    // expert_gpu_buf[layer][eid][slot]: slot 0=gate_w, 1=gate_s, 2=up_w, 3=up_s, 4=down_w, 5=down_s
+    // NULL if expert not cached.
+    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][6];
+
     // SMELT-style hot-expert preloading.
     // Phase 1 (warmup): count routing selections per expert per layer.
     // Phase 2 (post-warmup): preload top-N most-used experts, apply routing bias
