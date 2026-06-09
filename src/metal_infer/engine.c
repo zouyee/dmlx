@@ -567,46 +567,36 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             (id<MTLBuffer>)eng->expert_gpu_buf[layer][eid][slot] : \
             [d newBufferWithBytesNoCopy:(ptr) length:(len) options:MTLResourceStorageModeShared deallocator:nil])
 
-    // Step 1 + 2: use separate per-expert kernels temporarily for debugging
-    // (fused kernel has output correctness issue — reverted to original 6-separate approach)
+    // Step 1 + 2: expert gate+up+SwiGLU and down_proj (6 separate per-expert kernels)
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
         for (int k = 0; k < K; k++) {
-            int eid = expert_ids[k];
-            char *base = (char *)expert_bufs[k];
-            id gw  = EXPERT_BUF(layer_idx, eid, 0, base+gw_off, 4194304);
-            id gs_b= EXPERT_BUF(layer_idx, eid, 1, base+gs_off, 262144);
-            id uw  = EXPERT_BUF(layer_idx, eid, 2, base+uw_off, 4194304);
-            id us_b= EXPERT_BUF(layer_idx, eid, 3, base+us_off, 262144);
+            char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
-            [enc setBuffer:gw offset:0 atIndex:0];   [enc setBuffer:gs_b offset:0 atIndex:1];
-            [enc setBuffer:uw offset:0 atIndex:2];   [enc setBuffer:us_b offset:0 atIndex:3];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144)  offset:0 atIndex:3];
             [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
             [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-            uint od = INTERMEDIATE; uint id_ = DIM; uint gs = 32;
-            [enc setBytes:&od length:4 atIndex:6];
-            [enc setBytes:&id_ length:4 atIndex:7];
-            [enc setBytes:&gs length:4 atIndex:8];
+            uint od=INTERMEDIATE,id_=DIM,gs=32;
+            [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [enc endEncoding];
         }
 
         for (int k = 0; k < K; k++) {
-            int eid = expert_ids[k];
-            char *base = (char *)expert_bufs[k];
-            id dw  = EXPERT_BUF(layer_idx, eid, 4, base+dw_off, 4194304);
-            id ds_b= EXPERT_BUF(layer_idx, eid, 5, base+ds_off, 262144);
+            char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:eng->pipe_dequant_matvec];
-            [enc setBuffer:dw offset:0 atIndex:0];    [enc setBuffer:ds_b offset:0 atIndex:1];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+dw_off,4194304) offset:0 atIndex:0];
+            [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+ds_off,262144)  offset:0 atIndex:1];
             [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
             [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-            uint od = DIM; uint id_ = INTERMEDIATE; uint gs = 32;
-            [enc setBytes:&od length:4 atIndex:4];
-            [enc setBytes:&id_ length:4 atIndex:5];
-            [enc setBytes:&gs length:4 atIndex:6];
+            uint od=DIM,id_=INTERMEDIATE,gs=32;
+            [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
             [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [enc endEncoding];
         }
