@@ -384,8 +384,9 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         (double)total_bytes / (1024.0*1024.0*1024.0), eng->smelt_penalty);
 
     // === Create persistent GPU MTLBuffer wrappers for all cached experts ===
-    // This eliminates the per-call newBufferWithBytesNoCopy overhead (was ~150ms/layer).
-    // Each cached expert gets 6 persistent MTLBuffers (gate_w, gate_s, up_w, up_s, down_w, down_s).
+    // Use MTLResourceStorageModeShared (zero-copy from RAM pool, no extra memory).
+    // Private mode would require double the memory (35GB×2 = 70GB > 38GB limit).
+    // Shared persistent buffers still eliminate per-call newBufferWithBytesNoCopy overhead.
     {
         id<MTLDevice> d = (id<MTLDevice>)eng->device;
         int n_created = 0;
@@ -403,7 +404,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
                 n_created++;
             }
         }
-        fprintf(stderr, "[smelt] Created %d persistent GPU buffers for cached experts\n", n_created * 6);
+        fprintf(stderr, "[smelt] Created %d persistent Shared GPU buffers for cached experts\n", n_created * 6);
     }
     return n;
 }
