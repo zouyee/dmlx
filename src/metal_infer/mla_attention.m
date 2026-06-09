@@ -5,6 +5,131 @@
 #import <stdlib.h>
 #import <string.h>
 
+// ============================================================================
+// Persistent attention weight GPU buffers — eliminates 120+ mkbuf calls/layer
+// ============================================================================
+//
+// Each call to mla_attention_decode_bf16 previously created ~120 MTLBuffer objects
+// for the attention weights (wq_a, wq_b, wkv, wo_a×8, wo_b, q_norm, kv_norm, attn_sink).
+// These weights are fixed per layer — we cache them once after first use.
+//
+// Key sizes (per layer):
+//   wq_b packed:   32768×(1024/8)×4B = 16MB
+//   wq_a packed:   1024×(4096/8)×4B  = 2MB
+//   wkv packed:    512×(4096/8)×4B   = 1MB
+//   wo_b packed:   4096×(8192/8)×4B  = 16MB
+//   wo_a_dense:    8×1024×4096×4B    = 128MB  ← largest!
+//   q_norm, kv_norm, attn_sink: < 10KB each
+
+#define ATTN_BUF_CACHE_SIZE 64  // max layers
+
+typedef struct {
+    // Quantized weight buffers (packed, scales, biases)
+    id<MTLBuffer> wq_a_pack, wq_a_sc, wq_a_bi;
+    id<MTLBuffer> wq_b_pack, wq_b_sc, wq_b_bi;
+    id<MTLBuffer> wkv_pack,  wkv_sc,  wkv_bi;
+    id<MTLBuffer> wo_b_pack, wo_b_sc, wo_b_bi;
+    // Norm/sink (small, < 10KB each)
+    id<MTLBuffer> q_norm_buf, kv_norm_buf, attn_sink_buf;
+    // wo_a_dense: 8 groups × [O_LORA_RANK, group_feat] f32
+    id<MTLBuffer> wo_a_grp[8];   // 8 × 16MB = 128MB total per layer
+    // Validated: points to the AttnWeights that seeded this entry (pointer identity)
+    const void *owner;
+} AttnBufCache;
+
+static AttnBufCache g_attn_cache[ATTN_BUF_CACHE_SIZE];
+static int g_attn_cache_n = 0;
+
+// Look up or create the persistent GPU buffers for a given AttnWeights pointer.
+static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) {
+    // Fast path: check existing entries
+    for (int i = 0; i < g_attn_cache_n; i++) {
+        if (g_attn_cache[i].owner == (const void *)aw) return &g_attn_cache[i];
+    }
+    // New entry
+    if (g_attn_cache_n >= ATTN_BUF_CACHE_SIZE) return NULL;  // overflow — fall back to mkbuf
+    AttnBufCache *c = &g_attn_cache[g_attn_cache_n++];
+    memset(c, 0, sizeof(*c));
+    c->owner = (const void *)aw;
+
+    // Helper: create Shared buffer from pointer+size
+    #define MKGPU(ptr, sz) [d newBufferWithBytes:(ptr) length:(sz) options:MTLResourceStorageModeShared]
+    #define MKGPU_QW(qw) do { \
+        size_t pw_sz = (size_t)(qw).out_dim * ((qw).in_dim / 8) * sizeof(uint32_t); \
+        int ng = (qw).in_dim / (qw).group_size; \
+        size_t sc_sz = (size_t)(qw).out_dim * ng * sizeof(float); \
+        c->qw##_pack = MKGPU((qw).packed, pw_sz); \
+        c->qw##_sc   = MKGPU((qw).scales,  sc_sz); \
+        c->qw##_bi   = MKGPU((qw).biases,  sc_sz); \
+    } while(0)
+
+    // wq_a, wq_b, wkv, wo_b
+    {
+        size_t pw; int ng; size_t sc;
+        // wq_a
+        pw = (size_t)aw->wq_a.out_dim * (aw->wq_a.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wq_a.in_dim / aw->wq_a.group_size; sc = (size_t)aw->wq_a.out_dim * ng * sizeof(float);
+        c->wq_a_pack = MKGPU(aw->wq_a.packed, pw);
+        c->wq_a_sc   = MKGPU(aw->wq_a.scales, sc);
+        c->wq_a_bi   = MKGPU(aw->wq_a.biases, sc);
+        // wq_b
+        pw = (size_t)aw->wq_b.out_dim * (aw->wq_b.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wq_b.in_dim / aw->wq_b.group_size; sc = (size_t)aw->wq_b.out_dim * ng * sizeof(float);
+        c->wq_b_pack = MKGPU(aw->wq_b.packed, pw);
+        c->wq_b_sc   = MKGPU(aw->wq_b.scales, sc);
+        c->wq_b_bi   = MKGPU(aw->wq_b.biases, sc);
+        // wkv
+        pw = (size_t)aw->wkv.out_dim * (aw->wkv.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wkv.in_dim / aw->wkv.group_size; sc = (size_t)aw->wkv.out_dim * ng * sizeof(float);
+        c->wkv_pack = MKGPU(aw->wkv.packed, pw);
+        c->wkv_sc   = MKGPU(aw->wkv.scales,  sc);
+        c->wkv_bi   = MKGPU(aw->wkv.biases,  sc);
+        // wo_b
+        pw = (size_t)aw->wo_b.out_dim * (aw->wo_b.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wo_b.in_dim / aw->wo_b.group_size; sc = (size_t)aw->wo_b.out_dim * ng * sizeof(float);
+        c->wo_b_pack = MKGPU(aw->wo_b.packed, pw);
+        c->wo_b_sc   = MKGPU(aw->wo_b.scales, sc);
+        c->wo_b_bi   = MKGPU(aw->wo_b.biases, sc);
+    }
+    // q_norm, kv_norm, attn_sink
+    c->q_norm_buf    = MKGPU(aw->q_norm,    Q_LORA_RANK * sizeof(float));
+    c->kv_norm_buf   = MKGPU(aw->kv_norm,   KV_LORA_RANK * sizeof(float));
+    c->attn_sink_buf = MKGPU(aw->attn_sink, N_HEADS * sizeof(float));
+    // wo_a_dense: 8 groups
+    {
+        int heads_per_group = N_HEADS / O_GROUPS;
+        int group_feat = heads_per_group * HEAD_DIM;  // 4096
+        for (int g = 0; g < O_GROUPS; g++) {
+            const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
+            c->wo_a_grp[g] = MKGPU(wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
+        }
+    }
+    #undef MKGPU
+    return c;
+}
+
+// Thin wrapper for enc_dequant_matvec_* using pre-cached buffers.
+// These shadow the helpers below so the bf16 function can use cached buffers.
+static void enc_dq_bf16_cached(MlaPipes *P, id<MTLCommandBuffer> cb,
+                               id<MTLBuffer> bw, id<MTLBuffer> bs, id<MTLBuffer> bb,
+                               int out_dim, int in_dim, int group_size,
+                               id<MTLBuffer> x, id<MTLBuffer> out,
+                               id<MTLComputePipelineState> pipe) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:pipe];
+    [e setBuffer:bw offset:0 atIndex:0];
+    [e setBuffer:bs offset:0 atIndex:1];
+    [e setBuffer:bb offset:0 atIndex:2];
+    [e setBuffer:x  offset:0 atIndex:3];
+    [e setBuffer:out offset:0 atIndex:4];
+    uint od = out_dim, id_ = in_dim, gs = group_size;
+    [e setBytes:&od length:4 atIndex:5];
+    [e setBytes:&id_ length:4 atIndex:6];
+    [e setBytes:&gs  length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+}
+
 // --- YaRN tail RoPE cos/sin for a given position (matches DSV4YarnRoPE) ---
 static void yarn_cos_sin(int pos, float *cos_out, float *sin_out) {
     const float base = 10000.0f, factor = 16.0f, beta_fast = 32.0f, beta_slow = 1.0f;
@@ -456,6 +581,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     float cosv[QK_ROPE_DIM / 2], sinv[QK_ROPE_DIM / 2];
     yarn_cos_sin(pos, cosv, sinv);
 
+    // === Get (or create) persistent GPU buffers for fixed attention weights ===
+    AttnBufCache *abc = attn_buf_cache_get(d, aw);
+
     id<MTLBuffer> bx     = mkbuf(d, x, DIM * sizeof(uint16_t));
     id<MTLBuffer> bcos   = mkbuf(d, cosv, half * sizeof(float));
     id<MTLBuffer> bsin   = mkbuf(d, sinv, half * sizeof(float));
@@ -465,21 +593,41 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bq_n   = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
     id<MTLBuffer> bkv    = mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
     id<MTLBuffer> bkv_n  = mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> bqn_w  = mkbuf(d, aw->q_norm, Q_LORA_RANK * sizeof(float));
-    id<MTLBuffer> bkvn_w = mkbuf(d, aw->kv_norm, KV_LORA_RANK * sizeof(float));
+
+    // Use persistent norm/sink buffers if available, else fall back to mkbuf
+    id<MTLBuffer> bqn_w  = abc ? abc->q_norm_buf    : mkbuf(d, aw->q_norm,    Q_LORA_RANK * sizeof(float));
+    id<MTLBuffer> bkvn_w = abc ? abc->kv_norm_buf   : mkbuf(d, aw->kv_norm,   KV_LORA_RANK * sizeof(float));
+    id<MTLBuffer> bsink  = abc ? abc->attn_sink_buf : mkbuf(d, aw->attn_sink, N_HEADS * sizeof(float));
 
     // === CB1: Q chain + KV chain merged into ONE command buffer (8 encoders, 1 wait) ===
-    // Metal guarantees sequential encoder execution within a single CB.
     {
         id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
-        // Q chain
-        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_a, bx, bq_a);
+        // Q chain — use cached weight buffers when available
+        if (abc) {
+            enc_dq_bf16_cached(P, cb1, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
+                               aw->wq_a.out_dim, aw->wq_a.in_dim, aw->wq_a.group_size, bx, bq_a,
+                               P->dequant_matvec_affine_bf16in_bf16out);
+        } else {
+            enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_a, bx, bq_a);
+        }
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
-        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_b, bq_res, bq);
+        if (abc) {
+            enc_dq_bf16_cached(P, cb1, abc->wq_b_pack, abc->wq_b_sc, abc->wq_b_bi,
+                               aw->wq_b.out_dim, aw->wq_b.in_dim, aw->wq_b.group_size, bq_res, bq,
+                               P->dequant_matvec_affine_bf16in_bf16out);
+        } else {
+            enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_b, bq_res, bq);
+        }
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
         enc_rope_bf16(P, cb1, bq_n, bcos, bsin, N_HEADS, 0);
         // KV chain
-        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wkv, bx, bkv);
+        if (abc) {
+            enc_dq_bf16_cached(P, cb1, abc->wkv_pack, abc->wkv_sc, abc->wkv_bi,
+                               aw->wkv.out_dim, aw->wkv.in_dim, aw->wkv.group_size, bx, bkv,
+                               P->dequant_matvec_affine_bf16in_bf16out);
+        } else {
+            enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wkv, bx, bkv);
+        }
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
         enc_rope_bf16(P, cb1, bkv_n, bcos, bsin, 1, 0);
         [cb1 commit]; [cb1 waitUntilCompleted];
@@ -499,7 +647,6 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
     // === CB2: SDPA + inverse RoPE (2 encoders, 1 wait) ===
     id<MTLBuffer> bkvcache = mkbuf(d, kv_cache, (size_t)cache_len * KV_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> bsink    = mkbuf(d, aw->attn_sink, N_HEADS * sizeof(float));
     id<MTLBuffer> battn    = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
     {
         id<MTLCommandBuffer> cb2 = [P->queue commandBuffer];
@@ -522,14 +669,13 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         [cb2 commit]; [cb2 waitUntilCompleted];
     }
 
-    // === CB3: wo_a (8 groups) + wo_b merged into ONE command buffer (9 encoders, 1 wait) ===
+    // === CB3: wo_a (8 groups) — use cached wo_a_dense buffers ===
     uint16_t *attn_bf16 = (uint16_t *)[battn contents];
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
     float *concat = malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
     if (!concat) return -1;
 
-    // Allocate per-group output buffers
     id<MTLBuffer> bog_arr[O_GROUPS];
     {
         id<MTLCommandBuffer> cb3 = [P->queue commandBuffer];
@@ -540,25 +686,42 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 memcpy(gv_bf16 + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
             id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
             bog_arr[g] = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
-            id<MTLBuffer> bwg = mkbuf(d, wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
+            // Use persistent wo_a group buffer if available, else mkbuf
+            id<MTLBuffer> bwg = abc ? abc->wo_a_grp[g]
+                                    : mkbuf(d, aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat,
+                                             (size_t)O_LORA_RANK * group_feat * sizeof(float));
             enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
             free(gv_bf16);
         }
-        // wo_b also in this CB — but needs concat input which isn't ready until after CPU memcpy.
-        // Split: wo_a groups in cb3, then CPU assemble, then wo_b in cb4.
         [cb3 commit]; [cb3 waitUntilCompleted];
     }
-    // CPU: assemble concat from wo_a outputs
     for (int g = 0; g < O_GROUPS; g++)
         memcpy(concat + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
 
     // === CB4: wo_b (1 encoder, 1 wait) ===
     id<MTLBuffer> bconcat = mkbuf(d, concat, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
     id<MTLBuffer> bout    = mkbuf(d, NULL, DIM * sizeof(float));
-    { id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
-      enc_dequant_matvec(P, cb4, &aw->wo_b, bconcat, bout);
-      [cb4 commit]; [cb4 waitUntilCompleted]; }
+    {
+        id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
+        if (abc) {
+            id<MTLComputeCommandEncoder> e = [cb4 computeCommandEncoder];
+            [e setComputePipelineState:P->dequant_matvec_affine];
+            [e setBuffer:abc->wo_b_pack offset:0 atIndex:0];
+            [e setBuffer:abc->wo_b_sc   offset:0 atIndex:1];
+            [e setBuffer:abc->wo_b_bi   offset:0 atIndex:2];
+            [e setBuffer:bconcat offset:0 atIndex:3];
+            [e setBuffer:bout    offset:0 atIndex:4];
+            uint od=aw->wo_b.out_dim, id_=aw->wo_b.in_dim, gs=aw->wo_b.group_size;
+            [e setBytes:&od length:4 atIndex:5];
+            [e setBytes:&id_ length:4 atIndex:6];
+            [e setBytes:&gs  length:4 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(aw->wo_b.out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        } else {
+            enc_dequant_matvec(P, cb4, &aw->wo_b, bconcat, bout);
+        }
+        [cb4 commit]; [cb4 waitUntilCompleted];
+    }
     memcpy(out, [bout contents], DIM * sizeof(float));
     free(concat);
     } // end @autoreleasepool
