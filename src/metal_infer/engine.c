@@ -97,6 +97,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
         eng->buf_expert_mid[k] = (void *)[d newBufferWithLength:mid_size options:MTLResourceStorageModeShared];
         eng->buf_expert_out[k] = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     }
+    eng->buf_expert_contiguous = (void *)[d newBufferWithLength:(size_t)N_ACTIVE*DIM*sizeof(float) options:MTLResourceStorageModeShared];
 
     // Persistent scratch buffers for mhc_pre / mhc_post — eliminates per-call allocation
     const int MIX3_size = MHC_MULT * (MHC_MULT + 2);  // 24
@@ -566,36 +567,40 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         [enc endEncoding];
     }
 
-    // Step 3: moe_combine — weighted sum of K routed-expert outputs ONLY.
-    // Commit the gate+up+down work first, then copy into a contiguous buffer.
-    [cb commit]; [cb waitUntilCompleted];
-
-    // Copy each expert's output into a contiguous [K*DIM] buffer for the combine kernel.
-    id<MTLBuffer> contiguous_out = [d newBufferWithLength:(size_t)K*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+    // Step 3: blit each expert output into persistent contiguous buffer (same CB).
+    // Uses blit encoder instead of CPU memcpy — no CB boundary, no extra wait.
     {
-        float *dst_all = (float *)[contiguous_out contents];
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        id<MTLBuffer> contiguous = (id<MTLBuffer>)eng->buf_expert_contiguous;
         for (int k = 0; k < K; k++) {
-            float *src = (float *)[(id<MTLBuffer>)eng->buf_expert_out[k] contents];
-            memcpy(dst_all + (size_t)k * DIM, src, DIM * sizeof(float));
+            [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_expert_out[k]
+                   sourceOffset:0
+                       toBuffer:contiguous
+              destinationOffset:(size_t)k * DIM * sizeof(float)
+                           size:(size_t)DIM * sizeof(float)];
         }
+        [blit endEncoding];
     }
+
+    // Step 4: moe_combine in the SAME CB — eliminates a second waitUntilCompleted.
     {
-        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb2 computeCommandEncoder];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
         [enc setComputePipelineState:eng->pipe_moe_combine];
-        id weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
-        id zero_resid = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        [enc setBuffer:contiguous_out offset:0 atIndex:0];
+        id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:0];
         [enc setBuffer:weights_buf offset:0 atIndex:1];
-        [enc setBuffer:zero_resid offset:0 atIndex:2];
+        [enc setBuffer:zero_resid  offset:0 atIndex:2];
         [enc setBuffer:eng->buf_hidden offset:0 atIndex:3];
         uint kv = K, hd = DIM;
         [enc setBytes:&kv length:4 atIndex:4];
         [enc setBytes:&hd length:4 atIndex:5];
         [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
         [enc endEncoding];
-        [cb2 commit]; [cb2 waitUntilCompleted];
     }
+
+    // Single commit + wait for gate+up+SwiGLU, down, blit, combine (was 2 CBs, 2 waits)
+    [cb commit]; [cb waitUntilCompleted];
     return 0;
 }
 
@@ -799,93 +804,51 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
     // Use GPU mhc_pre_gpu — reuse persistent scratch buffers (eliminates alloc/dealloc overhead)
+    // === CB-A: mhc_pre(attn) + input_RMSNorm merged into ONE command buffer (2 encoders, 1 wait) ===
+    // Eliminates 2→1 waits (was: mhc_pre CB + separate RMSNorm CB).
     {
         // Copy residual into persistent input buffer
         memcpy([(id<MTLBuffer>)eng->buf_mhc_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]    offset:0 atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]  offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_in           offset:0 atIndex:3];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in          offset:0 atIndex:4];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights     offset:0 atIndex:5];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights     offset:0 atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding];
+
+        // Encoder 1: mhc_pre(attn)
+        {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]    offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]  offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_in           offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in          offset:0 atIndex:4];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights     offset:0 atIndex:5];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights     offset:0 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        // Encoder 2: input_RMSNorm (reads buf_mhc_attn_in written by encoder 1)
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in           offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_input_norm_gpu[layer] offset:0 atIndex:1];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16    offset:0 atIndex:2];
+            uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+            [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
+            [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
         [cb commit]; [cb waitUntilCompleted];
+
         memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
         memcpy(post,       [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
         memcpy(comb,       [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
-    }
-    if (layer == 0 && getenv("MF_DBG")) {
-        // Compare GPU mhc_pre with CPU mhc_pre for debugging
-        static float attn_input_cpu[DIM];
-        float post_cpu[MHC_MULT], comb_cpu[MHC_MULT * MHC_MULT];
-        MhcWeights ahc_cpu = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
-        mhc_pre(&ahc_cpu, residual, attn_input_cpu, post_cpu, comb_cpu);
-        double an_gpu=0, an_cpu=0;
-        for(int z=0;z<DIM;z++) { an_gpu+=(double)attn_input[z]*attn_input[z]; an_cpu+=(double)attn_input_cpu[z]*attn_input_cpu[z]; }
-        fprintf(stderr, "[mf-dbg] L0 attn_input GPU norm=%.4f CPU norm=%.4f post_GPU=[%.3f %.3f %.3f %.3f] post_CPU=[%.3f %.3f %.3f %.3f]\n",
-            sqrt(an_gpu), sqrt(an_cpu), post[0],post[1],post[2],post[3], post_cpu[0],post_cpu[1],post_cpu[2],post_cpu[3]);
-        const char *dd = getenv("DSV4_DUMP_DIR");
-        if (dd) {
-            char path[1024];
-            snprintf(path, sizeof(path), "%s/L0_attn_input_metal.bin", dd);
-            FILE *f = fopen(path, "wb"); if (f) { fwrite(attn_input, sizeof(float), DIM, f); fclose(f); }
-        }
-    }
-    // Layer 3 debug: check mhc_pre post/comb
-    if (layer == 3 && pos == 8 && getenv("MF_DBG")) {
-        float post_cpu3[MHC_MULT], comb_cpu3[MHC_MULT * MHC_MULT];
-        float attn_in3[DIM];
-        MhcWeights ahc3 = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
-        mhc_pre(&ahc3, residual, attn_in3, post_cpu3, comb_cpu3);
-        double ag=0; for(int z=0;z<DIM;z++) ag+=(double)attn_input[z]*attn_input[z];
-        double ac=0; for(int z=0;z<DIM;z++) ac+=(double)attn_in3[z]*attn_in3[z];
-        fprintf(stderr, "[L3-dbg] attn_input GPU norm=%.4f CPU norm=%.4f\n", sqrt(ag), sqrt(ac));
-        fprintf(stderr, "[L3-dbg] GPU post=[%.4f %.4f %.4f %.4f] CPU post=[%.4f %.4f %.4f %.4f]\n",
-            post[0],post[1],post[2],post[3], post_cpu3[0],post_cpu3[1],post_cpu3[2],post_cpu3[3]);
-        // Check residual streams
-        double s0n=0,s1n=0,s2n=0,s3n=0;
-        for(int z=0;z<DIM;z++) { s0n+=(double)residual[z]*residual[z]; s1n+=(double)residual[DIM+z]*residual[DIM+z]; }
-        for(int z=0;z<DIM;z++) { s2n+=(double)residual[2*DIM+z]*residual[2*DIM+z]; s3n+=(double)residual[3*DIM+z]*residual[3*DIM+z]; }
-        fprintf(stderr, "[L3-dbg] residual norms: s0=%.4f s1=%.4f s2=%.4f s3=%.4f\n", sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n));
-    }
-
-    // input RMSNorm (attn_norm) → bf16 — reuse persistent scratch buffers
-    {
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_attn_in contents], attn_input, DIM*sizeof(float));
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in           offset:0 atIndex:0];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_input_norm_gpu[layer] offset:0 atIndex:1];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16    offset:0 atIndex:2];
-        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
-        [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
-        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
             uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
             memcpy(&normed[i], &u, 4);
-        }
-        if (layer == 0 && getenv("MF_DBG")) {
-            // Print normed first 3 values for each pos to verify uniqueness
-            float v0, v1, v2;
-            uint32_t u0 = ((uint32_t)normed_bf16_direct[0]) << 16; memcpy(&v0, &u0, 4);
-            uint32_t u1 = ((uint32_t)normed_bf16_direct[1]) << 16; memcpy(&v1, &u1, 4);
-            uint32_t u2 = ((uint32_t)normed_bf16_direct[2]) << 16; memcpy(&v2, &u2, 4);
-            fprintf(stderr, "[norm-dbg] L0 pos=%d normed[0..2]=[%.4f %.4f %.4f]\n", pos, v0, v1, v2);
-            const char *dd = getenv("DSV4_DUMP_DIR");
-            if (dd) {
-                char path[1024];
-                snprintf(path, sizeof(path), "%s/L0_attn_normed_metal.bin", dd);
-                FILE *f = fopen(path, "wb"); if (f) { fwrite(normed, sizeof(float), DIM, f); fclose(f); }
-            }
         }
     }
 
@@ -1157,7 +1120,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         id<MTLBuffer> bgate = (id<MTLBuffer>)eng->buf_hidden;        // gate output [INTERMEDIATE]
         id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;         // up output [INTERMEDIATE] — reuse DIM buf, INTERMEDIATE ≤ DIM
         id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;      // down output [DIM]
-        // gate and up projections
+        // === All 3 shared expert projections in a single CB (gate + up + down), 1 wait ===
         {
             id<MTLCommandBuffer> cb = [P.queue commandBuffer];
             for (int proj = 0; proj < 2; proj++) {
@@ -1177,7 +1140,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             }
             [cb commit]; [cb waitUntilCompleted];
         }
-        // Limited SwiGLU on CPU
+        // Limited SwiGLU on CPU (gate/up in bgate/bup)
         float *gv = (float *)[bgate contents]; float *uv = (float *)[bup contents];
         const float limit = 10.0f;
         for (int j = 0; j < INTERMEDIATE; j++) {
@@ -1185,7 +1148,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             float u = fminf(fmaxf(uv[j], -limit), limit);
             gv[j] = g / (1.0f + expf(-g)) * u;
         }
-        // down projection
+        // down projection (reads SwiGLU result already in bgate)
         {
             id<MTLCommandBuffer> cb = [P.queue commandBuffer];
             const QuantWeight *qw = &eng->shared[layer].down;
@@ -1203,11 +1166,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         float *sv = (float *)[bdown contents];
         for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
-        if (layer == 0 && getenv("MF_DBG")) {
-            double sn=0; for(int z=0;z<DIM;z++) sn+=(double)sv[z]*sv[z];
-            fprintf(stderr, "[mf-dbg] L0 shared_out norm=%.4f\n", sqrt(sn));
-        }
-    }
+    } // end if shared expert
 
     // mHC post (FFN) — reuse persistent scratch buffers
     {

@@ -468,38 +468,24 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bqn_w  = mkbuf(d, aw->q_norm, Q_LORA_RANK * sizeof(float));
     id<MTLBuffer> bkvn_w = mkbuf(d, aw->kv_norm, KV_LORA_RANK * sizeof(float));
 
-    // --- Q chain (bf16 precision) ---
+    // === CB1: Q chain + KV chain merged into ONE command buffer (8 encoders, 1 wait) ===
+    // Metal guarantees sequential encoder execution within a single CB.
     {
-        id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-        enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wq_a, bx, bq_a);
-        [cb commit]; [cb waitUntilCompleted];
+        id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
+        // Q chain
+        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_a, bx, bq_a);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
+        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_b, bq_res, bq);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
+        enc_rope_bf16(P, cb1, bq_n, bcos, bsin, N_HEADS, 0);
+        // KV chain
+        enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wkv, bx, bkv);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
+        enc_rope_bf16(P, cb1, bkv_n, bcos, bsin, 1, 0);
+        [cb1 commit]; [cb1 waitUntilCompleted];
     }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rms_norm_rows_bf16in_bf16out(P, cb, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
-      [cb commit]; [cb waitUntilCompleted]; }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wq_b, bq_res, bq);
-      [cb commit]; [cb waitUntilCompleted]; }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rms_norm_rows_bf16in_bf16out(P, cb, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
-      [cb commit]; [cb waitUntilCompleted]; }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rope_bf16(P, cb, bq_n, bcos, bsin, N_HEADS, 0);
-      [cb commit]; [cb waitUntilCompleted]; }
 
-    // --- KV chain (single head, bf16 precision) ---
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wkv, bx, bkv);
-      [cb commit]; [cb waitUntilCompleted]; }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rms_norm_rows_bf16in_bf16out(P, cb, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
-      [cb commit]; [cb waitUntilCompleted]; }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rope_bf16(P, cb, bkv_n, bcos, bsin, 1, 0);
-      [cb commit]; [cb waitUntilCompleted]; }
-
-    // Write current KV into cache at row (cache_len-1).
-    // bf16 → f16 conversion to match ds4/MLX KV-cache precision.
+    // CPU: write KV to cache (must happen before SDPA reads cache)
     {
         uint16_t *kvn_bf16 = (uint16_t *)[bkv_n contents];
         uint16_t *dst = kv_cache + (size_t)(cache_len - 1) * KV_LORA_RANK;
@@ -511,57 +497,68 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         }
     }
 
-    // --- SDPA + sink over cache_len cached KV rows (MQA broadcast, all bf16) ---
+    // === CB2: SDPA + inverse RoPE (2 encoders, 1 wait) ===
     id<MTLBuffer> bkvcache = mkbuf(d, kv_cache, (size_t)cache_len * KV_LORA_RANK * sizeof(uint16_t));
     id<MTLBuffer> bsink    = mkbuf(d, aw->attn_sink, N_HEADS * sizeof(float));
     id<MTLBuffer> battn    = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
     {
-        id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
-        [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
-        [e setBuffer:bq_n offset:0 atIndex:0];
-        [e setBuffer:bkvcache offset:0 atIndex:1];
-        [e setBuffer:bsink offset:0 atIndex:2];
-        [e setBuffer:battn offset:0 atIndex:3];
-        uint nh=N_HEADS, hd=HEAD_DIM, nk=cache_len; float scale=1.0f/sqrtf((float)HEAD_DIM);
-        [e setBytes:&nh length:4 atIndex:4];
-        [e setBytes:&hd length:4 atIndex:5];
-        [e setBytes:&nk length:4 atIndex:6];
-        [e setBytes:&scale length:4 atIndex:7];
-        [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-        [e endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
+        id<MTLCommandBuffer> cb2 = [P->queue commandBuffer];
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
+            [e setBuffer:bq_n offset:0 atIndex:0];
+            [e setBuffer:bkvcache offset:0 atIndex:1];
+            [e setBuffer:bsink offset:0 atIndex:2];
+            [e setBuffer:battn offset:0 atIndex:3];
+            uint nh=N_HEADS, hd=HEAD_DIM, nk=cache_len; float scale=1.0f/sqrtf((float)HEAD_DIM);
+            [e setBytes:&nh length:4 atIndex:4];
+            [e setBytes:&hd length:4 atIndex:5];
+            [e setBytes:&nk length:4 atIndex:6];
+            [e setBytes:&scale length:4 atIndex:7];
+            [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+            [e endEncoding];
+        }
+        enc_rope_bf16(P, cb2, battn, bcos, bsin, N_HEADS, 1);
+        [cb2 commit]; [cb2 waitUntilCompleted];
     }
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_rope_bf16(P, cb, battn, bcos, bsin, N_HEADS, 1);
-      [cb commit]; [cb waitUntilCompleted]; }
 
-    // --- grouped wo_a -> concat -> wo_b (host assembles group vecs from bf16) ---
+    // === CB3: wo_a (8 groups) + wo_b merged into ONE command buffer (9 encoders, 1 wait) ===
     uint16_t *attn_bf16 = (uint16_t *)[battn contents];
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
     float *concat = malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
     if (!concat) return -1;
-    for (int g = 0; g < O_GROUPS; g++) {
-        uint16_t *gv_bf16 = malloc((size_t)group_feat * sizeof(uint16_t));
-        if (!gv_bf16) { free(concat); return -1; }
-        for (int hh = 0; hh < heads_per_group; hh++)
-            memcpy(gv_bf16 + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
-        id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
-        id<MTLBuffer> bog = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-        const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
-        id<MTLBuffer> bwg = mkbuf(d, wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
-        id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-        enc_matvec_f32_bf16in(P, cb, bwg, bgv, bog, O_LORA_RANK, group_feat);
-        [cb commit]; [cb waitUntilCompleted];
-        memcpy(concat + (size_t)g * O_LORA_RANK, [bog contents], O_LORA_RANK * sizeof(float));
-        free(gv_bf16);
+
+    // Allocate per-group output buffers
+    id<MTLBuffer> bog_arr[O_GROUPS];
+    {
+        id<MTLCommandBuffer> cb3 = [P->queue commandBuffer];
+        for (int g = 0; g < O_GROUPS; g++) {
+            uint16_t *gv_bf16 = malloc((size_t)group_feat * sizeof(uint16_t));
+            if (!gv_bf16) { free(concat); return -1; }
+            for (int hh = 0; hh < heads_per_group; hh++)
+                memcpy(gv_bf16 + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
+            id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
+            bog_arr[g] = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
+            const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
+            id<MTLBuffer> bwg = mkbuf(d, wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
+            enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
+            free(gv_bf16);
+        }
+        // wo_b also in this CB — but needs concat input which isn't ready until after CPU memcpy.
+        // Split: wo_a groups in cb3, then CPU assemble, then wo_b in cb4.
+        [cb3 commit]; [cb3 waitUntilCompleted];
     }
+    // CPU: assemble concat from wo_a outputs
+    for (int g = 0; g < O_GROUPS; g++)
+        memcpy(concat + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
+
+    // === CB4: wo_b (1 encoder, 1 wait) ===
     id<MTLBuffer> bconcat = mkbuf(d, concat, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
     id<MTLBuffer> bout    = mkbuf(d, NULL, DIM * sizeof(float));
-    { id<MTLCommandBuffer> cb=[P->queue commandBuffer];
-      enc_dequant_matvec(P, cb, &aw->wo_b, bconcat, bout);
-      [cb commit]; [cb waitUntilCompleted]; }
+    { id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
+      enc_dequant_matvec(P, cb4, &aw->wo_b, bconcat, bout);
+      [cb4 commit]; [cb4 waitUntilCompleted]; }
     memcpy(out, [bout contents], DIM * sizeof(float));
     free(concat);
     } // end @autoreleasepool

@@ -231,11 +231,12 @@ typedef struct {
     void *buf_normed;            // [DIM] after RMSNorm
     void *buf_attn_out;          // [DIM] o_proj output
     void *buf_routing_scores;    // [N_EXPERTS] gate logits
-    void *buf_expert_mid[6];     // [INTERMEDIATE] gate+up output per expert
-    void *buf_expert_out[6];     // [DIM] down output per expert
-    void *buf_shared_gate;       // [INTERMEDIATE] shared expert gate
-    void *buf_shared_up;         // [INTERMEDIATE] shared expert up
-    void *buf_shared_down;       // [DIM] shared expert down
+    void *buf_expert_mid[6];         // [INTERMEDIATE] gate+up output per expert
+    void *buf_expert_out[6];         // [DIM] down output per expert
+    void *buf_expert_contiguous;     // [N_ACTIVE*DIM] contiguous expert outputs for combine
+    void *buf_shared_gate;           // [INTERMEDIATE] shared expert gate
+    void *buf_shared_up;             // [INTERMEDIATE] shared expert up
+    void *buf_shared_down;           // [DIM] shared expert down
     void *buf_norm_sum_sq;       // [1] sum of squares for RMS
     void *buf_input_norm;        // [DIM] next layer input norm weight (GPU)
 

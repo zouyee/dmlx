@@ -2493,3 +2493,193 @@ MLX 用 `--smelt-experts 0.20`（预加载 20% expert = 51个）+ streaming 模�
 3. 在后续 token 中命中缓存时直接使用 RAM 数据
 
 预期能从 0.14 tok/s → 0.5-1.0 tok/s（3-7× 提升）。
+
+---
+
+## §33 Native Engine 性能差距根因完整分析（2026-06-08）
+
+### 33.1 性能对比
+
+| 路径 | tok/s | 方案 |
+|------|-------|------|
+| 旧 MLX 路径（最优配置） | **~1.02** | `--smelt --smelt-experts 0.20 --smelt-cache 0` |
+| Native engine（当前） | **~0.14** | `--native` |
+| flash-moe 参考 | **4.36** | Trust OS，手写 Metal kernel |
+| **目标** | **≥3.0** | — |
+
+**差距**：native vs MLX = 7×；native vs 目标 = 21×。
+
+### 33.2 旧 MLX 路径为什么能到 1 tok/s
+
+来自 `flash-moe-alignment-analysis.md` 实测（commit f9b3cd8，Trust OS + packed experts）：
+
+1. **SMELT 0.20**：预加载 51/256 个最常用 expert 到内存，命中时**零 I/O**
+2. **Trust OS（cache=0）**：不用自定义 LFU cache，依赖 OS page cache，避免 VM 抖动
+3. **DyMoE Skip**：每步 skip 1/6 低分 expert，减少 ~17% I/O，实测 +19-57% client 延迟改善
+4. **结果**：有效 I/O 从 3.46 GB/tok 降到约 1-2 GB/tok，配合 OS page cache → ~1 tok/s
+
+### 33.3 Native Engine 为什么只有 0.14 tok/s
+
+**完全没有任何 I/O 优化**：
+- 没有 SMELT：每层每次 pread 全部 6 个 expert（3.46 GB/tok）
+- 没有 DyMoE Skip：不跳过低分 expert
+- 没有 OS page cache 利用：每次请求都是冷读
+
+**还有 GPU 同步串行问题**：
+- 每层有 9 次 `waitUntilCompleted`（9 个 command buffer 全部同步等待）
+- flash-moe 的 Deferred CMD3 完全没有实现
+- GPU 和 CPU 完全串行，没有任何 overlap
+
+### 33.4 flash-moe 的三个核心技术（文档 §9 + flash-moe-alignment-plan.md §2）
+
+#### 技术 A：Deferred CMD3（GPU/CPU 并行）
+
+```
+layer N:
+  CPU: pread 6 experts → dispatch CMD3(expert forward) → 不等待！
+       → 立即开始处理 layer N+1 (mhc_pre, attention, routing...)
+  GPU: (同时在跑 layer N 的 CMD3 expert 计算)
+  ...等到 layer N+1 需要 GPU 输出时 → waitUntilCompleted
+```
+
+**当前代码**：每个 CB 都立即 `waitUntilCompleted`，没有任何重叠。
+
+#### 技术 B：GPU-side Combine + 下一层 RMSNorm（消除 CPU 往返）
+
+flash-moe CMD3 内有 3 个 encoder 串联：
+1. `moe_combine_residual`：expert 加权和 + residual
+2. `rms_norm_sum_sq`：计算平方和
+3. `rms_norm_apply`：用**下一层**的 norm weight 做归一化
+
+输出直接就是下一层的输入，GPU 内完成，不需要 CPU 读回再写入。
+
+**当前代码**：combine 在单独 CB 里，之后还要 CPU memcpy，完全串行。
+
+#### 技术 C：时序预测 + 双缓冲（减少 I/O 等待）
+
+- Token N-1 结束后记录每层 routing indices
+- Token N 开始时，用预测 indices 异步 pread 到 B 缓冲区
+- 如果命中：零 I/O；未命中：同步 pread 到 A 缓冲区
+
+flash-moe 命中率 ~71%。**V4 局部性仅 ~35%**，效益有限——文档已经验证过不作为 V4 主优化手段。
+
+### 33.5 代码实现状态对比
+
+| 优化 | flash-moe | engine.c 当前 |
+|------|-----------|--------------|
+| Deferred CMD3（不等待 GPU） | ✅ `[cmd commit]` only | ❌ 全部 `waitUntilCompleted` |
+| GPU-side combine + next-layer norm | ✅ 3 encoders in CMD3 | ❌ 单独 CB + CPU memcpy |
+| 时序预测 + 双缓冲 | ✅ ~71% hit | ❌ 只有 TODO 注释 |
+| 并行 pread 线程池 | ✅ 4 pthreads | ✅ 6 pthreads（已实现） |
+| Packed per-layer bin | ✅ | ✅（已实现） |
+| Expert RAM 缓存 | ❌（Trust OS） | ✅ `moe_infer_preload_experts`（框架已有但 hit rate 低）|
+| DyMoE Skip | N/A | ❌ 没有移植到 native |
+| SMELT（选择性预加载热门 expert）| ❌（Trust OS）| ❌ 没有实现 |
+
+### 33.6 达到 1 tok/s 的最短路径
+
+根据旧 MLX 路径的实测经验，从 0.14 → 1.0 tok/s 最快路径是**移植 SMELT 到 native engine**：
+
+#### 步骤 1：SMELT-style 热门 expert 预加载（预期 +4-5×）
+
+原理：预加载最常用的 N 个 expert 到内存，并在 routing 时通过 bias 惩罚未预加载的 expert（让它们得分更低，避免被选中）。
+
+```c
+// 在 cpu_moe_route 里，对未缓存的 expert 加 -1e9 的 bias
+if (eng->expert_mem_cache[layer][expert_ids[k]] == NULL) {
+    biased_scores[k] -= 1e9f;  // 强制不选未缓存 expert
+}
+```
+
+配合 `moe_infer_preload_experts`（已有框架），只需：
+1. 统计首 20 个 token 的 routing indices（热身）
+2. 按频率排序，预加载 top-51（相当于 20%）expert 到内存
+3. 在 `cpu_moe_route` 里对未缓存 expert 加大惩罚
+
+预期命中率 ~60-70%（类似 MLX SMELT），有效 I/O 降到 ~1 GB/tok → 约 1 tok/s。
+
+**工作量**：2-3 天（统计收集 + bias 接入 + 测试）
+
+#### 步骤 2：DyMoE Skip 移植（预期额外 +20%）
+
+把 `expert_stream.zig` 里的 DyMoE 逻辑移植到 `engine.c`：
+- 热身阶段统计每层 expert 被选中频率
+- skip mask：对从未在 top-5 中出现的 expert，在 routing 时直接 skip（减少 pread 次数）
+
+**工作量**：1 天
+
+### 33.7 达到 3 tok/s 的完整路径
+
+在 1 tok/s 基础上继续：
+
+#### 步骤 3：Deferred CMD3（预期 +1.3-1.5×）
+
+```c
+// 当前（错误）：串行等待
+[cb_expert commit]; [cb_expert waitUntilCompleted];  // 阻塞 CPU ~6ms/layer
+
+// 目标（deferred）：
+[cb_expert commit];  // 不等待，立即返回
+// CPU 继续处理下一层 attention/mhc/routing
+// 在需要 expert 输出时才等待
+```
+
+需要跨层保存 in-flight command buffer，在下一层开始前 wait。
+
+**工作量**：3-4 天（需要重构 `moe_infer_forward_layer` 的层循环结构）
+
+#### 步骤 4：GPU-side Combine（预期额外 +20%）
+
+把 combine + next-layer RMSNorm 放进同一个 CMD3 里，消除 CPU memcpy 往返。
+
+**工作量**：2 天
+
+#### 步骤 5：SIMD 优化 dequant kernel（预期 +10-15%）
+
+参考 `flash-moe/shaders.metal: dequant_matvec_4bit_v3`：
+- threadgroup tiling：8 rows/group
+- 共享内存缓存 input vector
+- SIMD reduction：`simd_sum(acc)`
+- FMA 解量
+
+⚠️ 历史教训：SIMD reduction 版本曾有 87-97% 输出为 0 的 bug，必须逐 kernel 对拍验证。
+
+**工作量**：2-3 天（含对拍）
+
+### 33.8 理论性能预估（完整优化后）
+
+基于 flash-moe 类比（§11 的理论拆解）：
+
+| 阶段 | 耗时/layer | 43 层 |
+|------|-----------|-------|
+| attention 投影 | ~1.2ms | ~52ms |
+| mhc + attn | ~0.5ms | ~22ms |
+| o_proj + norm + routing | ~0.55ms | ~24ms |
+| I/O pread（SMELT 命中时 ~0.5ms，miss ~4ms×miss_rate） | ~0.8ms | ~34ms |
+| expert forward（deferred overlap） | ~0.04ms | ~2ms |
+| **合计** | ~3.1ms | **~133ms** |
+
+理论 ~7.5 tok/s，保守含 overhead → **3-5 tok/s**。
+
+### 33.9 优先级排序（按 ROI）
+
+| 优先级 | 优化 | 预期收益 | 工作量 | 依赖 |
+|--------|------|---------|--------|------|
+| **P0** | SMELT-style expert 预加载 + routing bias | **0.14→1.0 tok/s (7×)** | 2-3天 | 无 |
+| **P1** | DyMoE Skip 移植 | +20% | 1天 | P0 |
+| **P2** | Deferred CMD3 | +30-50% | 3-4天 | P0 |
+| **P3** | GPU-side combine | +20% | 2天 | P2 |
+| **P4** | SIMD dequant kernel | +10-15% | 2-3天 | P0，需逐 kernel 对拍 |
+
+**核心结论**：Native engine 现在 0.14 tok/s 主要是因为**没有 SMELT**（没有 expert I/O 缓存/筛选机制），其次是 **GPU 串行**（deferred CMD3 未实现）。这两者在旧 MLX 路径里都已实现，但迁移到 native engine 时没有同步。
+
+### 33.10 参考资料
+
+- `docs/analysis/flash-moe-alignment-analysis.md` — 所有实测数据和 A/B 对比结论
+- `docs/analysis/flash-moe-alignment-plan.md §2` — flash-moe 架构详细分析
+- `docs/analysis/flash-moe-plan.md` — P1/P2/P3 实现状态
+- `docs/analysis/pread-expert-loading.md` — mmap vs pread 实验记录
+- `docs/analysis/dsv4-first-class-support-plan.md §9, §11` — flash-moe 技术点摘录
+- `src/models/expert_stream.zig` — DyMoE 和 SMELT 的 Zig 实现（待移植）
+- `../flash-moe/metal_infer/infer.m:5354-5434` — Deferred CMD3 原始实现
+- `../flash-moe/metal_infer/shaders.metal:251` — SIMD dequant_matvec_4bit_v3
