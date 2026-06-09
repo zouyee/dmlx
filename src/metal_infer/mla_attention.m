@@ -64,46 +64,20 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
     } while(0)
 
     // wq_a, wq_b, wkv, wo_b
-    {
-        size_t pw; int ng; size_t sc;
-        // wq_a
-        pw = (size_t)aw->wq_a.out_dim * (aw->wq_a.in_dim / 8) * sizeof(uint32_t);
-        ng = aw->wq_a.in_dim / aw->wq_a.group_size; sc = (size_t)aw->wq_a.out_dim * ng * sizeof(float);
-        c->wq_a_pack = MKGPU(aw->wq_a.packed, pw);
-        c->wq_a_sc   = MKGPU(aw->wq_a.scales, sc);
-        c->wq_a_bi   = MKGPU(aw->wq_a.biases, sc);
-        // wq_b
-        pw = (size_t)aw->wq_b.out_dim * (aw->wq_b.in_dim / 8) * sizeof(uint32_t);
-        ng = aw->wq_b.in_dim / aw->wq_b.group_size; sc = (size_t)aw->wq_b.out_dim * ng * sizeof(float);
-        c->wq_b_pack = MKGPU(aw->wq_b.packed, pw);
-        c->wq_b_sc   = MKGPU(aw->wq_b.scales, sc);
-        c->wq_b_bi   = MKGPU(aw->wq_b.biases, sc);
-        // wkv
-        pw = (size_t)aw->wkv.out_dim * (aw->wkv.in_dim / 8) * sizeof(uint32_t);
-        ng = aw->wkv.in_dim / aw->wkv.group_size; sc = (size_t)aw->wkv.out_dim * ng * sizeof(float);
-        c->wkv_pack = MKGPU(aw->wkv.packed, pw);
-        c->wkv_sc   = MKGPU(aw->wkv.scales,  sc);
-        c->wkv_bi   = MKGPU(aw->wkv.biases,  sc);
-        // wo_b
-        pw = (size_t)aw->wo_b.out_dim * (aw->wo_b.in_dim / 8) * sizeof(uint32_t);
-        ng = aw->wo_b.in_dim / aw->wo_b.group_size; sc = (size_t)aw->wo_b.out_dim * ng * sizeof(float);
-        c->wo_b_pack = MKGPU(aw->wo_b.packed, pw);
-        c->wo_b_sc   = MKGPU(aw->wo_b.scales, sc);
-        c->wo_b_bi   = MKGPU(aw->wo_b.biases, sc);
-    }
-    // q_norm, kv_norm, attn_sink
+    // DISABLED: too large with SMELT (wq_b=16MB×43=688MB, wo_b=16MB×43=688MB)
+    // Only cache small buffers (norms/sink < 10KB per layer)
+    c->wq_a_pack = nil; c->wq_a_sc = nil; c->wq_a_bi = nil;
+    c->wq_b_pack = nil; c->wq_b_sc = nil; c->wq_b_bi = nil;
+    c->wkv_pack = nil;  c->wkv_sc = nil;  c->wkv_bi = nil;
+    c->wo_b_pack = nil; c->wo_b_sc = nil; c->wo_b_bi = nil;
+    // q_norm, kv_norm, attn_sink (tiny — only these are cached)
     c->q_norm_buf    = MKGPU(aw->q_norm,    Q_LORA_RANK * sizeof(float));
     c->kv_norm_buf   = MKGPU(aw->kv_norm,   KV_LORA_RANK * sizeof(float));
     c->attn_sink_buf = MKGPU(aw->attn_sink, N_HEADS * sizeof(float));
-    // wo_a_dense: 8 groups
-    {
-        int heads_per_group = N_HEADS / O_GROUPS;
-        int group_feat = heads_per_group * HEAD_DIM;  // 4096
-        for (int g = 0; g < O_GROUPS; g++) {
-            const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
-            c->wo_a_grp[g] = MKGPU(wg, (size_t)O_LORA_RANK * group_feat * sizeof(float));
-        }
-    }
+    // wo_a_dense: 8 groups × 16MB = 128MB per layer × 43 layers = 5.5GB total
+    // DISABLED: too large with SMELT (35GB + 5.5GB > 38GB M4 Pro limit → causes swap)
+    // Instead cache only the small norms/sink (< 4KB total per layer).
+    for (int g = 0; g < O_GROUPS; g++) c->wo_a_grp[g] = nil;
     #undef MKGPU
     return c;
 }
@@ -602,8 +576,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     // === CB1: Q chain + KV chain merged into ONE command buffer (8 encoders, 1 wait) ===
     {
         id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
-        // Q chain — use cached weight buffers when available
-        if (abc) {
+        // Q chain — use cached weight buffers when available (wq_a, wq_b, wkv may be nil if memory-limited)
+        if (abc && abc->wq_a_pack) {
             enc_dq_bf16_cached(P, cb1, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
                                aw->wq_a.out_dim, aw->wq_a.in_dim, aw->wq_a.group_size, bx, bq_a,
                                P->dequant_matvec_affine_bf16in_bf16out);
@@ -611,7 +585,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_a, bx, bq_a);
         }
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
-        if (abc) {
+        if (abc && abc->wq_b_pack) {
             enc_dq_bf16_cached(P, cb1, abc->wq_b_pack, abc->wq_b_sc, abc->wq_b_bi,
                                aw->wq_b.out_dim, aw->wq_b.in_dim, aw->wq_b.group_size, bq_res, bq,
                                P->dequant_matvec_affine_bf16in_bf16out);
@@ -621,7 +595,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
         enc_rope_bf16(P, cb1, bq_n, bcos, bsin, N_HEADS, 0);
         // KV chain
-        if (abc) {
+        if (abc && abc->wkv_pack) {
             enc_dq_bf16_cached(P, cb1, abc->wkv_pack, abc->wkv_sc, abc->wkv_bi,
                                aw->wkv.out_dim, aw->wkv.in_dim, aw->wkv.group_size, bx, bkv,
                                P->dequant_matvec_affine_bf16in_bf16out);
@@ -687,7 +661,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
             bog_arr[g] = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
             // Use persistent wo_a group buffer if available, else mkbuf
-            id<MTLBuffer> bwg = abc ? abc->wo_a_grp[g]
+            id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
+                                    ? abc->wo_a_grp[g]
                                     : mkbuf(d, aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat,
                                              (size_t)O_LORA_RANK * group_feat * sizeof(float));
             enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
@@ -703,7 +678,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bout    = mkbuf(d, NULL, DIM * sizeof(float));
     {
         id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
-        if (abc) {
+        if (abc && abc->wo_b_pack) {
             id<MTLComputeCommandEncoder> e = [cb4 computeCommandEncoder];
             [e setComputePipelineState:P->dequant_matvec_affine];
             [e setBuffer:abc->wo_b_pack offset:0 atIndex:0];
