@@ -275,6 +275,7 @@ void moe_infer_smelt_init(MoEInferEngine *eng, int warmup_tokens, int n_per_laye
     eng->smelt_warmup_done   = false;
     eng->smelt_enabled       = true;
     eng->smelt_penalty       = penalty;
+    eng->smelt_in_decode_phase = false;
     fprintf(stderr, "[smelt] Init: warmup=%d tokens, cache=%d experts/layer, penalty=%.0f\n",
         warmup_tokens, n_per_layer, penalty);
 }
@@ -350,7 +351,13 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         }
 
         if (layer == 0) {
-            fprintf(stderr, "[smelt] L0 top-%d experts: [", loaded);
+            fprintf(stderr, "[smelt] L0 top-%d experts (hash routing, counts=0 expected): [", loaded);
+            for (int i = 0; i < (loaded < 8 ? loaded : 8); i++)
+                fprintf(stderr, "%d(×%u)%s", sorted[i], eng->routing_counts[layer][sorted[i]], i+1<8?",":"");
+            fprintf(stderr, "...]\n");
+        } else if (layer == 5) {
+            // Log a score-based layer to verify routing_counts are non-zero
+            fprintf(stderr, "[smelt] L5 top-%d experts: [", loaded);
             for (int i = 0; i < (loaded < 8 ? loaded : 8); i++)
                 fprintf(stderr, "%d(×%u)%s", sorted[i], eng->routing_counts[layer][sorted[i]], i+1<8?",":"");
             fprintf(stderr, "...]\n");
@@ -362,6 +369,13 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
     fprintf(stderr, "[smelt] Done. %d experts/layer cached, routing bias penalty=%.0f\n",
         n, eng->smelt_penalty);
     return n;
+}
+
+void moe_infer_smelt_set_decode_phase(MoEInferEngine *eng) {
+    if (eng && eng->smelt_enabled && !eng->smelt_in_decode_phase) {
+        eng->smelt_in_decode_phase = true;
+        fprintf(stderr, "[smelt] Decode phase started — SMELT token counting enabled\n");
+    }
 }
 
 // Background preload thread state
@@ -1236,11 +1250,18 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         if (moe_infer_forward_layer(eng, layer, hidden, pos) != 0) return -1;
     }
-    // SMELT: count this decode token, trigger warmup completion if threshold reached
-    if (eng->smelt_enabled && !eng->smelt_warmup_done) {
+    // SMELT: count this decode token, trigger warmup completion if threshold reached.
+    // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
+    // calls forward token-by-token). We detect decode mode by checking the engine's
+    // current_pos which is managed by the caller (native_engine.zig sets it after prefill).
+    // Use a dedicated flag: smelt_in_decode_phase (set by moe_infer_set_decode_mode).
+    if (eng->smelt_enabled && !eng->smelt_warmup_done && eng->smelt_in_decode_phase) {
         eng->smelt_tokens_seen++;
         if (eng->smelt_tokens_seen >= eng->smelt_warmup_tokens) {
-            moe_infer_smelt_finish_warmup(eng);
+            // Async: spawn background thread to pread top-N experts per layer.
+            // Routing bias activates once smelt_warmup_done becomes true (after preload).
+            // Decode continues at full (un-cached) speed until preload completes.
+            moe_infer_smelt_preload_async(eng);
         }
     }
     return 0;
@@ -1364,6 +1385,7 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
     eng->smelt_tokens_seen   = 0;
     eng->smelt_warmup_done   = false;
     eng->smelt_enabled       = false;
+    eng->smelt_in_decode_phase = false;
     eng->smelt_penalty       = 1e9f;
     fprintf(stderr, "Metal engine: %d expert files opened\n", N_LAYERS);
     return eng;
@@ -1425,6 +1447,14 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
     }
     eng->deferred.active = false;
     eng->deferred.gpu_combined = false;
+
+    // Reset SMELT decode phase flag so next request's prefill doesn't count for warmup.
+    // But preserve routing_counts (accumulate across requests for better hot-expert detection)
+    // and smelt_tokens_seen (counts total decode tokens seen, not per-request).
+    if (eng->smelt_enabled && !eng->smelt_warmup_done) {
+        eng->smelt_in_decode_phase = false;
+        // NOTE: smelt_tokens_seen and routing_counts are NOT reset — they accumulate across requests
+    }
 
     for (int l = 0; l < N_LAYERS; l++) {
         eng->kv_cache[l].len = 0;

@@ -291,6 +291,19 @@ typedef struct {
     uint8_t *expert_mem_pool[N_LAYERS];    // flat pool per layer (expert_cache_n_experts × EXPERT_SIZE)
     int expert_cache_n_experts;            // how many experts cached per layer (0=disabled)
 
+    // SMELT-style hot-expert preloading.
+    // Phase 1 (warmup): count routing selections per expert per layer.
+    // Phase 2 (post-warmup): preload top-N most-used experts, apply routing bias
+    //          to steer future routing away from uncached experts.
+    uint32_t routing_counts[N_LAYERS][N_EXPERTS]; // selection frequency (accumulated)
+    int smelt_warmup_tokens;      // how many decode tokens to collect stats over (0=off)
+    int smelt_n_per_layer;        // how many experts to cache per layer after warmup
+    int smelt_tokens_seen;        // decode tokens processed so far (for warmup countdown)
+    bool smelt_warmup_done;       // true once warmup is complete and cache is populated
+    bool smelt_enabled;           // true if SMELT is active
+    bool smelt_in_decode_phase;   // true after prefill completes (set by moe_infer_set_decode_phase)
+    float smelt_penalty;          // routing score penalty for uncached experts (default -1e9)
+
     // Deferred CMD3
     DeferredExpertState deferred;
 
@@ -388,6 +401,24 @@ void moe_infer_reset_kv(MoEInferEngine *engine);
 // expert_cache_mb: total MB to allocate for cache. Pass 0 to preload ALL experts (~3.43 GB).
 // Returns number of experts cached per layer.
 int moe_infer_preload_experts(MoEInferEngine *engine, int expert_cache_mb);
+
+// Initialize SMELT hot-expert preloading.
+// warmup_tokens: number of decode tokens to collect routing stats over (e.g. 20).
+// n_per_layer: how many experts to cache per layer after warmup (e.g. 51 for 20%).
+// penalty: routing score subtracted from uncached experts during inference (e.g. 1e9).
+// Call this INSTEAD of moe_infer_preload_experts when using SMELT.
+void moe_infer_smelt_init(MoEInferEngine *engine, int warmup_tokens, int n_per_layer, float penalty);
+
+// Signal that prefill is complete and decode phase begins.
+// SMELT token counting (for warmup) only runs after this is called, ensuring
+// routing_counts reflect actual decode routing rather than prefill (which uses
+// hash routing for layers 0-2 and has all-zero counts).
+void moe_infer_smelt_set_decode_phase(MoEInferEngine *engine);
+
+// Called after warmup tokens are processed. Reads routing_counts, preloads top-N
+// experts per layer, sets smelt_warmup_done=true.
+// Returns number of experts cached per layer (0 on failure).
+int moe_infer_smelt_finish_warmup(MoEInferEngine *engine);
 
 // Set one layer's mHC weights (f32 pointers, kept alive by caller).
 void moe_infer_set_layer_hc(MoEInferEngine *engine, int layer,

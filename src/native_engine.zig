@@ -52,7 +52,9 @@ pub const NativeEngine = struct {
                 if (store.weights.comp_wkv[i]) |wkv| {
                     const wgate = store.weights.comp_wgate[i].?;
                     metal.setLayerCompressor(
-                        engine, i, ratio,
+                        engine,
+                        i,
+                        ratio,
                         metal.toCQuantWeight(wkv),
                         metal.toCQuantWeight(wgate),
                         if (store.weights.comp_ape[i].len > 0) store.weights.comp_ape[i].ptr else null,
@@ -62,7 +64,8 @@ pub const NativeEngine = struct {
                 if (ratio == 4) {
                     if (store.weights.idx_wq_b[i]) |wqb| {
                         metal.setLayerIndexer(
-                            engine, i,
+                            engine,
+                            i,
                             metal.toCQuantWeight(wqb),
                             metal.toCQuantWeight(store.weights.idx_weights_proj[i].?),
                             metal.toCQuantWeight(store.weights.idx_comp_wkv[i].?),
@@ -79,15 +82,22 @@ pub const NativeEngine = struct {
         const logits = try allocator.alloc(f32, cfg.vocab_size);
         errdefer allocator.free(logits);
 
-        // 6. Preload top experts into memory to reduce SSD reads during inference.
-        //    Default budget: 10GB → ~17 experts/layer cached, reducing I/O by ~60-70%.
-        //    Pass 0 to disable caching (full SSD reads each token).
-        const expert_cache_mb: i32 = 10240;  // 10 GB default
-        const n_cached = metal.preloadExperts(engine, expert_cache_mb);
-        if (n_cached > 0) {
-            std.log.info("native_engine: expert cache loaded ({d} experts/layer, {d} MB)", .{ n_cached, expert_cache_mb });
+        // 6. Enable SMELT hot-expert preloading.
+        //    Warm up over first 20 decode tokens, then cache top-51 experts per layer (~20%).
+        //    After warmup, routing is biased to prefer cached experts → eliminates most SSD reads.
+        //    51 experts/layer × 43 layers × 13.4MB ≈ 29GB — fits in 48GB machine.
+        //    Use env NATIVE_SMELT_N (default 51) to tune, NATIVE_SMELT_WARMUP (default 20) for tokens.
+        const smelt_n_str = std.c.getenv("NATIVE_SMELT_N");
+        const smelt_n: i32 = if (smelt_n_str) |s| std.fmt.parseInt(i32, std.mem.span(s), 10) catch 51 else 51;
+        if (smelt_n > 0) {
+            // Collect routing stats from first few decode tokens.
+            // warmup_tokens=3: fires after 3 decode tokens across all requests.
+            // After warmup, async background preload starts (29GB → ~54s background I/O).
+            // Routing bias activates once preload completes, steering toward cached experts.
+            metal.smeltInit(engine, 3, smelt_n, 1e9);
+            std.log.info("native_engine: SMELT enabled (warmup=3 decode tokens, cache={d} experts/layer)", .{smelt_n});
         } else {
-            std.log.warn("native_engine: expert preload failed — will read from SSD each token (slow)", .{});
+            std.log.warn("native_engine: SMELT disabled (NATIVE_SMELT_N=0) — SSD reads each token (slow)", .{});
         }
 
         std.log.info("native_engine: initialized (layers={d}, vocab={d})", .{ cfg.num_hidden_layers, cfg.vocab_size });
@@ -182,7 +192,8 @@ pub const NativeEngine = struct {
             }
         }
 
-        // Decode loop
+        // Decode loop — signal SMELT that prefill is done (enables decode token counting for warmup)
+        metal.smeltSetDecodePhase(self.engine);
         const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
         for (0..decode_count) |_| {
             if (current_len >= tokens.len) break;
@@ -286,7 +297,8 @@ pub const NativeEngine = struct {
             }
         }
 
-        // Decode loop
+        // Decode loop — signal SMELT that prefill is done (enables decode token counting for warmup)
+        metal.smeltSetDecodePhase(self.engine);
         const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
         for (0..decode_count) |i| {
             if (current_len >= tokens.len) break;

@@ -78,15 +78,14 @@ extern fn moe_infer_embed(engine: *Engine, token_id: c_int, hidden_out: [*c]f32)
 extern fn moe_infer_compress_hc(engine: *Engine, residual: [*c]const f32, out: [*c]f32) void;
 extern fn hyper_head_compress(attn_fn: [*c]const f32, attn_base: [*c]const f32, attn_scale: [*c]const f32, residual: [*c]const f32, out: [*c]f32) void;
 extern fn moe_infer_get_logits(engine: *Engine, hidden: [*c]const f32, logits_out: [*c]f32) c_int;
-extern fn moe_infer_set_layer_compressor(engine: *Engine, layer: c_int, compress_ratio: u32,
-    comp_wkv: CQuantWeight, comp_wgate: CQuantWeight,
-    comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void;
-extern fn moe_infer_set_layer_indexer(engine: *Engine, layer: c_int,
-    idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight,
-    idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight,
-    idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void;
+extern fn moe_infer_set_layer_compressor(engine: *Engine, layer: c_int, compress_ratio: u32, comp_wkv: CQuantWeight, comp_wgate: CQuantWeight, comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void;
+extern fn moe_infer_set_layer_indexer(engine: *Engine, layer: c_int, idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight, idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight, idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void;
 
 extern fn moe_infer_preload_experts(engine: *Engine, expert_cache_mb: c_int) c_int;
+extern fn moe_infer_smelt_init(engine: *Engine, warmup_tokens: c_int, n_per_layer: c_int, penalty: f32) void;
+extern fn moe_infer_smelt_finish_warmup(engine: *Engine) c_int;
+extern fn moe_infer_smelt_preload_async(engine: *Engine) void;
+extern fn moe_infer_smelt_set_decode_phase(engine: *Engine) void;
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
@@ -94,6 +93,22 @@ pub fn resetKv(engine: *Engine) void {
 
 pub fn preloadExperts(engine: *Engine, expert_cache_mb: i32) i32 {
     return moe_infer_preload_experts(engine, @intCast(expert_cache_mb));
+}
+
+pub fn smeltInit(engine: *Engine, warmup_tokens: i32, n_per_layer: i32, penalty: f32) void {
+    moe_infer_smelt_init(engine, @intCast(warmup_tokens), @intCast(n_per_layer), penalty);
+}
+
+pub fn smeltFinishWarmup(engine: *Engine) i32 {
+    return moe_infer_smelt_finish_warmup(engine);
+}
+
+pub fn smeltPreloadAsync(engine: *Engine) void {
+    moe_infer_smelt_preload_async(engine);
+}
+
+pub fn smeltSetDecodePhase(engine: *Engine) void {
+    moe_infer_smelt_set_decode_phase(engine);
 }
 pub fn setTokenId(engine: *Engine, token_id: i32) void {
     moe_infer_set_token_id(engine, @intCast(token_id));
@@ -187,20 +202,12 @@ pub fn deinit(engine: *Engine) void {
     moe_infer_deinit(engine);
 }
 
-pub fn setLayerCompressor(engine: *Engine, layer: usize, compress_ratio: u32,
-    comp_wkv: CQuantWeight, comp_wgate: CQuantWeight,
-    comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void {
-    moe_infer_set_layer_compressor(engine, @intCast(layer), compress_ratio,
-        comp_wkv, comp_wgate, comp_ape, comp_norm);
+pub fn setLayerCompressor(engine: *Engine, layer: usize, compress_ratio: u32, comp_wkv: CQuantWeight, comp_wgate: CQuantWeight, comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void {
+    moe_infer_set_layer_compressor(engine, @intCast(layer), compress_ratio, comp_wkv, comp_wgate, comp_ape, comp_norm);
 }
 
-pub fn setLayerIndexer(engine: *Engine, layer: usize,
-    idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight,
-    idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight,
-    idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void {
-    moe_infer_set_layer_indexer(engine, @intCast(layer),
-        idx_wq_b, idx_weights_proj, idx_comp_wkv, idx_comp_wgate,
-        idx_comp_ape, idx_comp_norm);
+pub fn setLayerIndexer(engine: *Engine, layer: usize, idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight, idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight, idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void {
+    moe_infer_set_layer_indexer(engine, @intCast(layer), idx_wq_b, idx_weights_proj, idx_comp_wkv, idx_comp_wgate, idx_comp_ape, idx_comp_norm);
 }
 
 pub fn toCQuantWeight(q: anytype) CQuantWeight {
