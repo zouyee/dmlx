@@ -63,14 +63,67 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
         c->qw##_bi   = MKGPU((qw).biases,  sc_sz); \
     } while(0)
 
-    // wq_a, wq_b, wkv, wo_b
-    // DISABLED: too large with SMELT (wq_b=16MB×43=688MB, wo_b=16MB×43=688MB)
-    // Only cache small buffers (norms/sink < 10KB per layer)
-    c->wq_a_pack = nil; c->wq_a_sc = nil; c->wq_a_bi = nil;
-    c->wq_b_pack = nil; c->wq_b_sc = nil; c->wq_b_bi = nil;
-    c->wkv_pack = nil;  c->wkv_sc = nil;  c->wkv_bi = nil;
-    c->wo_b_pack = nil; c->wo_b_sc = nil; c->wo_b_bi = nil;
-    // q_norm, kv_norm, attn_sink (tiny — only these are cached)
+    // wq_a, wq_b, wkv, wo_b: cache only when memory allows (SMELT=disabled).
+    // With SMELT 35GB + these buffers 1.5GB = too much for 38GB M4 Pro.
+    // Without SMELT: backbone (~5GB) + these buffers (~1.5GB per layer × 43 = 64GB total?) 
+    // Actually: wq_b(16MB)+wo_b(16MB)+wkv(1MB)+wq_a(2MB) = 35MB/layer × 43 = 1.5GB — safe!
+    // wo_a_dense: 128MB/layer × 43 = 5.5GB — too large.
+    const char *smelt_n_env = getenv("NATIVE_SMELT_N");
+    const int smelt_disabled = (smelt_n_env && atoi(smelt_n_env) == 0);
+    if (smelt_disabled) {
+        // SSD mode: memory available, cache medium-sized weight buffers
+        size_t pw; int ng; size_t sc;
+        pw = (size_t)aw->wq_a.out_dim * (aw->wq_a.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wq_a.in_dim / aw->wq_a.group_size; sc = (size_t)aw->wq_a.out_dim * ng * sizeof(float);
+        c->wq_a_pack = MKGPU(aw->wq_a.packed, pw);
+        c->wq_a_sc   = MKGPU(aw->wq_a.scales, sc);
+        c->wq_a_bi   = MKGPU(aw->wq_a.biases, sc);
+
+        pw = (size_t)aw->wq_b.out_dim * (aw->wq_b.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wq_b.in_dim / aw->wq_b.group_size; sc = (size_t)aw->wq_b.out_dim * ng * sizeof(float);
+        c->wq_b_pack = MKGPU(aw->wq_b.packed, pw);
+        c->wq_b_sc   = MKGPU(aw->wq_b.scales, sc);
+        c->wq_b_bi   = MKGPU(aw->wq_b.biases, sc);
+
+        pw = (size_t)aw->wkv.out_dim * (aw->wkv.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wkv.in_dim / aw->wkv.group_size; sc = (size_t)aw->wkv.out_dim * ng * sizeof(float);
+        c->wkv_pack = MKGPU(aw->wkv.packed, pw);
+        c->wkv_sc   = MKGPU(aw->wkv.scales, sc);
+        c->wkv_bi   = MKGPU(aw->wkv.biases, sc);
+
+        pw = (size_t)aw->wo_b.out_dim * (aw->wo_b.in_dim / 8) * sizeof(uint32_t);
+        ng = aw->wo_b.in_dim / aw->wo_b.group_size; sc = (size_t)aw->wo_b.out_dim * ng * sizeof(float);
+        c->wo_b_pack = MKGPU(aw->wo_b.packed, pw);
+        c->wo_b_sc   = MKGPU(aw->wo_b.scales, sc);
+        c->wo_b_bi   = MKGPU(aw->wo_b.biases, sc);
+
+        // wo_a_dense: 128MB/layer × 43 = 5.5GB — too large to copy (newBufferWithBytes)!
+        // Use newBufferWithBytesNoCopy (zero-copy) and CACHE it.
+        // Total: 8 × 16MB × 43 = 5.5GB of Metal buffer objects, but zero extra RAM.
+        // (wo_a_dense is already in process memory from NativeLoader)
+        {
+            int heads_per_group = N_HEADS / O_GROUPS;
+            int group_feat = heads_per_group * HEAD_DIM;  // 4096
+            size_t grp_sz = (size_t)O_LORA_RANK * group_feat * sizeof(float);  // 16MB
+            for (int g = 0; g < O_GROUPS; g++) {
+                const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
+                // NoCopy: zero-copy wrapper, data stays in wo_a_dense memory
+                c->wo_a_grp[g] = [d newBufferWithBytesNoCopy:(void*)wg
+                                     length:grp_sz
+                                     options:MTLResourceStorageModeShared
+                                     deallocator:nil];
+            }
+        }
+    } else {
+        // SMELT mode: memory tight (35GB + backbone ~3GB = ~38GB, near M4 Pro limit)
+        // Only cache tiny norms/sink. Skip wo_a_dense NoCopy to avoid OOM from Metal metadata.
+        c->wq_a_pack = nil; c->wq_a_sc = nil; c->wq_a_bi = nil;
+        c->wq_b_pack = nil; c->wq_b_sc = nil; c->wq_b_bi = nil;
+        c->wkv_pack  = nil; c->wkv_sc  = nil; c->wkv_bi  = nil;
+        c->wo_b_pack = nil; c->wo_b_sc = nil; c->wo_b_bi = nil;
+        for (int g = 0; g < O_GROUPS; g++) c->wo_a_grp[g] = nil;
+    }
+    // q_norm, kv_norm, attn_sink (tiny — always cached)
     c->q_norm_buf    = MKGPU(aw->q_norm,    Q_LORA_RANK * sizeof(float));
     c->kv_norm_buf   = MKGPU(aw->kv_norm,   KV_LORA_RANK * sizeof(float));
     c->attn_sink_buf = MKGPU(aw->attn_sink, N_HEADS * sizeof(float));
@@ -660,11 +713,13 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 memcpy(gv_bf16 + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
             id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
             bog_arr[g] = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            // Use persistent wo_a group buffer if available, else mkbuf
+            // Use persistent wo_a group buffer if available, else NoCopy zero-copy
             id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
                                     ? abc->wo_a_grp[g]
-                                    : mkbuf(d, aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat,
-                                             (size_t)O_LORA_RANK * group_feat * sizeof(float));
+                                    : [d newBufferWithBytesNoCopy:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
+                                          length:(size_t)O_LORA_RANK * group_feat * sizeof(float)
+                                          options:MTLResourceStorageModeShared
+                                          deallocator:nil];
             enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
             free(gv_bf16);
         }
