@@ -567,26 +567,43 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             (id<MTLBuffer>)eng->expert_gpu_buf[layer][eid][slot] : \
             [d newBufferWithBytesNoCopy:(ptr) length:(len) options:MTLResourceStorageModeShared deallocator:nil])
 
-    // Step 1 + 2: expert gate+up+SwiGLU and down_proj (6 separate per-expert kernels)
+    // Step 1 + 2: expert gate+up+SwiGLU and down_proj
+    // Fused 6-expert kernels: all 6 experts' gate+up in 1 encoder (shares x_shared),
+    // all 6 experts' down in 1 encoder — 2 encoders vs 12 previously.
+    // NOTE: Split into two CBs with explicit wait to ensure gate+up results are visible to down.
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-
-        for (int k = 0; k < K; k++) {
-            char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144)  offset:0 atIndex:3];
-            [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-            [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-            uint od=INTERMEDIATE,id_=DIM,gs=32;
-            [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
+        // CB-A: fused gate+up+SwiGLU for all 6 experts (x_shared loaded once)
+        {
+            id<MTLCommandBuffer> cba = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+            id<MTLComputeCommandEncoder> enc = [cba computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_fused_6expert_gate_up];
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:k];
+            }
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:6+k];
+            }
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144) offset:0 atIndex:12+k];
+            }
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144) offset:0 atIndex:18+k];
+            }
+            [enc setBuffer:eng->buf_normed offset:0 atIndex:24];
+            for (int k = 0; k < K; k++) {
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:25+k];
+            }
             [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [enc endEncoding];
+            [cba commit]; [cba waitUntilCompleted];
         }
 
+        // CB-B: separate down_proj (testing if fused_6expert_gate_up alone is correct)
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
         for (int k = 0; k < K; k++) {
             char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -636,7 +653,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         [cb commit]; [cb waitUntilCompleted];
         if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t2 = ts.tv_sec*1e9+ts.tv_nsec;
             fprintf(stderr, "[MOE-TIME] encode=%.2fms gpu=%.2fms\n", (t1-t0)/1e6, (t2-t1)/1e6); }
-    } // end fused expert block
+    } // end expert block
 
     #undef EXPERT_BUF
     return 0;
