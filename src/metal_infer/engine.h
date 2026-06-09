@@ -187,6 +187,9 @@ typedef struct {
     void *pipe_gate_up_swiglu;
     void *pipe_dequant_matvec;
     void *pipe_moe_combine;
+    // Fused 6-expert kernels: process K=6 experts in one dispatch
+    void *pipe_fused_6expert_gate_up;   // fused_6expert_gate_up_swiglu
+    void *pipe_fused_6expert_down;      // fused_6expert_down
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
     void *pipe_matvec;

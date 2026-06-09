@@ -257,7 +257,166 @@ kernel void dequant_matvec_4bit_bfloat_in(
     out[tid] = acc;
 }
 
-// moe_combine: weighted sum of K expert outputs + residual.
+// fused_6expert_gate_up_swiglu — processes 6 experts sharing one x_shared load.
+// Hardcoded for DSV4-Flash: out_dim=2048, in_dim=4096, group_size=32 (no constant params needed).
+// Saves 5 × 4MB redundant x reads vs 6 separate dispatches (x is identical for all experts).
+// Buffers 0-5: gate_W[0..5], 6-11: up_W[0..5], 12-17: gate_s[0..5], 18-23: up_s[0..5]
+// Buffer 24: x, Buffers 25-30: out[0..5]
+// Dispatch: MTLSizeMake(256, 1, 1) × 256 threads (256 = INTERMEDIATE/8)
+kernel void fused_6expert_gate_up_swiglu(
+    device const uint32_t* gW0 [[buffer(0)]], device const uint32_t* gW1 [[buffer(1)]],
+    device const uint32_t* gW2 [[buffer(2)]], device const uint32_t* gW3 [[buffer(3)]],
+    device const uint32_t* gW4 [[buffer(4)]], device const uint32_t* gW5 [[buffer(5)]],
+    device const uint32_t* uW0 [[buffer(6)]], device const uint32_t* uW1 [[buffer(7)]],
+    device const uint32_t* uW2 [[buffer(8)]], device const uint32_t* uW3 [[buffer(9)]],
+    device const uint32_t* uW4 [[buffer(10)]], device const uint32_t* uW5 [[buffer(11)]],
+    device const uint8_t*  gS0 [[buffer(12)]], device const uint8_t* gS1 [[buffer(13)]],
+    device const uint8_t*  gS2 [[buffer(14)]], device const uint8_t* gS3 [[buffer(15)]],
+    device const uint8_t*  gS4 [[buffer(16)]], device const uint8_t* gS5 [[buffer(17)]],
+    device const uint8_t*  uS0 [[buffer(18)]], device const uint8_t* uS1 [[buffer(19)]],
+    device const uint8_t*  uS2 [[buffer(20)]], device const uint8_t* uS3 [[buffer(21)]],
+    device const uint8_t*  uS4 [[buffer(22)]], device const uint8_t* uS5 [[buffer(23)]],
+    device const float*    x   [[buffer(24)]],
+    device float* out0 [[buffer(25)]], device float* out1 [[buffer(26)]],
+    device float* out2 [[buffer(27)]], device float* out3 [[buffer(28)]],
+    device float* out4 [[buffer(29)]], device float* out5 [[buffer(30)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Hardcoded DSV4-Flash dimensions: gate/up [2048, 4096], group_size=32
+    const uint OUT_DIM = 2048, IN_DIM = 4096, GS = 32;
+    const uint ROWS_PER_TG = 8;
+    const uint packed_cols = IN_DIM / 8;   // 512
+    const uint num_groups  = IN_DIM / GS;  // 128
+    const uint ppg         = GS / 8;       // 4
+
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    // Load x ONCE — shared across all 6 experts in this threadgroup
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < IN_DIM; i += 256) x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= OUT_DIM) return;
+
+    device const uint32_t* const gWs[6] = {gW0, gW1, gW2, gW3, gW4, gW5};
+    device const uint32_t* const uWs[6] = {uW0, uW1, uW2, uW3, uW4, uW5};
+    device const uint8_t*  const gSs[6] = {gS0, gS1, gS2, gS3, gS4, gS5};
+    device const uint8_t*  const uSs[6] = {uS0, uS1, uS2, uS3, uS4, uS5};
+    device float* const outs[6] = {out0, out1, out2, out3, out4, out5};
+
+    for (int ei = 0; ei < 6; ei++) {
+        device const uint32_t* g_row = gWs[ei] + row * packed_cols;
+        device const uint8_t*  g_s   = gSs[ei] + row * num_groups;
+        device const uint32_t* u_row = uWs[ei] + row * packed_cols;
+        device const uint8_t*  u_s   = uSs[ei] + row * num_groups;
+
+        float ga = 0.0f, ua = 0.0f;
+        for (uint g = simd_lane; g < num_groups; g += 32) {
+            float gsf = exp2((float)g_s[g] - 127.0f);
+            float usf = exp2((float)u_s[g] - 127.0f);
+            uint bp = g * ppg, bx = g * GS;
+            for (uint p = 0; p < ppg; p++) {
+                uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
+                uint xb = bx + p*8;
+                ga += NIBBLE_TO_FLOAT[(gpw>> 0)&0xF]*gsf*x_shared[xb+0];
+                ga += NIBBLE_TO_FLOAT[(gpw>> 4)&0xF]*gsf*x_shared[xb+1];
+                ga += NIBBLE_TO_FLOAT[(gpw>> 8)&0xF]*gsf*x_shared[xb+2];
+                ga += NIBBLE_TO_FLOAT[(gpw>>12)&0xF]*gsf*x_shared[xb+3];
+                ga += NIBBLE_TO_FLOAT[(gpw>>16)&0xF]*gsf*x_shared[xb+4];
+                ga += NIBBLE_TO_FLOAT[(gpw>>20)&0xF]*gsf*x_shared[xb+5];
+                ga += NIBBLE_TO_FLOAT[(gpw>>24)&0xF]*gsf*x_shared[xb+6];
+                ga += NIBBLE_TO_FLOAT[(gpw>>28)&0xF]*gsf*x_shared[xb+7];
+                ua += NIBBLE_TO_FLOAT[(upw>> 0)&0xF]*usf*x_shared[xb+0];
+                ua += NIBBLE_TO_FLOAT[(upw>> 4)&0xF]*usf*x_shared[xb+1];
+                ua += NIBBLE_TO_FLOAT[(upw>> 8)&0xF]*usf*x_shared[xb+2];
+                ua += NIBBLE_TO_FLOAT[(upw>>12)&0xF]*usf*x_shared[xb+3];
+                ua += NIBBLE_TO_FLOAT[(upw>>16)&0xF]*usf*x_shared[xb+4];
+                ua += NIBBLE_TO_FLOAT[(upw>>20)&0xF]*usf*x_shared[xb+5];
+                ua += NIBBLE_TO_FLOAT[(upw>>24)&0xF]*usf*x_shared[xb+6];
+                ua += NIBBLE_TO_FLOAT[(upw>>28)&0xF]*usf*x_shared[xb+7];
+            }
+        }
+        float gv = simd_sum(ga), uv = simd_sum(ua);
+        if (simd_lane == 0) {
+            const float lim = 10.0f;
+            float gc = min(gv, lim), uc = min(max(uv, -lim), lim);
+            outs[ei][row] = (gc / (1.0f + exp(-gc))) * uc;
+        }
+    }
+}
+
+// fused_6expert_down — 6 expert down_proj in one dispatch (hardcoded DSV4-Flash dims).
+// Each expert has its own intermediate input. Dispatch: MTLSizeMake(512*6, 1, 1) × 256 threads.
+// Buffers 0-5: W[0..5], 6-11: s[0..5], 12-17: x_mid[0..5], 18-23: out[0..5]
+kernel void fused_6expert_down(
+    device const uint32_t* W0 [[buffer(0)]], device const uint32_t* W1 [[buffer(1)]],
+    device const uint32_t* W2 [[buffer(2)]], device const uint32_t* W3 [[buffer(3)]],
+    device const uint32_t* W4 [[buffer(4)]], device const uint32_t* W5 [[buffer(5)]],
+    device const uint8_t*  S0 [[buffer(6)]], device const uint8_t*  S1 [[buffer(7)]],
+    device const uint8_t*  S2 [[buffer(8)]], device const uint8_t*  S3 [[buffer(9)]],
+    device const uint8_t*  S4 [[buffer(10)]], device const uint8_t* S5 [[buffer(11)]],
+    device const float* x0 [[buffer(12)]], device const float* x1 [[buffer(13)]],
+    device const float* x2 [[buffer(14)]], device const float* x3 [[buffer(15)]],
+    device const float* x4 [[buffer(16)]], device const float* x5 [[buffer(17)]],
+    device float* out0 [[buffer(18)]], device float* out1 [[buffer(19)]],
+    device float* out2 [[buffer(20)]], device float* out3 [[buffer(21)]],
+    device float* out4 [[buffer(22)]], device float* out5 [[buffer(23)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Hardcoded DSV4-Flash: down [4096, 2048], group_size=32
+    const uint OUT_DIM = 4096, IN_DIM = 2048, GS = 32;
+    const uint ROWS_PER_TG  = 8;
+    const uint TG_PER_EXPERT = OUT_DIM / ROWS_PER_TG;  // 512
+
+    uint ei  = tgid / TG_PER_EXPERT;
+    uint rtg = tgid % TG_PER_EXPERT;
+    uint row = rtg * ROWS_PER_TG + simd_group;
+
+    if (ei >= 6 || row >= OUT_DIM) return;
+
+    device const uint32_t* const Ws[6] = {W0, W1, W2, W3, W4, W5};
+    device const uint8_t*  const Ss[6] = {S0, S1, S2, S3, S4, S5};
+    device const float*    const xs[6] = {x0, x1, x2, x3, x4, x5};
+    device float* const outs[6] = {out0, out1, out2, out3, out4, out5};
+
+    threadgroup float x_shared[2048];
+    for (uint i = lid; i < IN_DIM; i += 256) x_shared[i] = xs[ei][i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint packed_cols = IN_DIM / 8;   // 256
+    const uint num_groups  = IN_DIM / GS;  // 64
+    const uint ppg         = GS / 8;       // 4
+
+    device const uint32_t* w_row = Ws[ei] + row * packed_cols;
+    device const uint8_t*  s_row = Ss[ei] + row * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = simd_lane; g < num_groups; g += 32) {
+        float sf = exp2((float)s_row[g] - 127.0f);
+        uint bp = g * ppg, bx = g * GS;
+        for (uint p = 0; p < ppg; p++) {
+            uint32_t pw = w_row[bp+p];
+            uint xb = bx + p*8;
+            acc += NIBBLE_TO_FLOAT[(pw>> 0)&0xF]*sf*x_shared[xb+0];
+            acc += NIBBLE_TO_FLOAT[(pw>> 4)&0xF]*sf*x_shared[xb+1];
+            acc += NIBBLE_TO_FLOAT[(pw>> 8)&0xF]*sf*x_shared[xb+2];
+            acc += NIBBLE_TO_FLOAT[(pw>>12)&0xF]*sf*x_shared[xb+3];
+            acc += NIBBLE_TO_FLOAT[(pw>>16)&0xF]*sf*x_shared[xb+4];
+            acc += NIBBLE_TO_FLOAT[(pw>>20)&0xF]*sf*x_shared[xb+5];
+            acc += NIBBLE_TO_FLOAT[(pw>>24)&0xF]*sf*x_shared[xb+6];
+            acc += NIBBLE_TO_FLOAT[(pw>>28)&0xF]*sf*x_shared[xb+7];
+        }
+    }
+    if (simd_lane == 0) outs[ei][row] = simd_sum(acc);
+}
+
+
 kernel void moe_combine(
     device const float* expert_outs [[buffer(0)]],
     device const float* weights     [[buffer(1)]],

@@ -47,6 +47,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu"] error:&err]);
     eng->pipe_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit"] error:&err]);
     eng->pipe_moe_combine    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_combine"] error:&err]);
+    eng->pipe_fused_6expert_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_gate_up_swiglu"] error:&err]);
+    eng->pipe_fused_6expert_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_down"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
     eng->pipe_rms_norm_apply = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_apply"] error:&err]);
     eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
@@ -550,13 +552,13 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                               float *expert_weights, int K) {
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
     id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-    uint od, id_, gs = 32;
     const int gw_off = GATE_W_OFF, gs_off = GATE_S_OFF;
     const int uw_off = UP_W_OFF, us_off = UP_S_OFF;
     const int dw_off = DOWN_W_OFF, ds_off = DOWN_S_OFF;
     const int time_en = (getenv("NATIVE_TIME_LAYERS") != NULL);
     double t0=0, t1=0, t2=0, t3=0;
     if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t0 = ts.tv_sec*1e9+ts.tv_nsec; }
+    (void)t3;
 
     // Helper: get or create MTLBuffer for a given expert slot.
     // Uses persistent GPU buffer if available (post-SMELT), else creates on-the-fly.
@@ -565,90 +567,88 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             (id<MTLBuffer>)eng->expert_gpu_buf[layer][eid][slot] : \
             [d newBufferWithBytesNoCopy:(ptr) length:(len) options:MTLResourceStorageModeShared deallocator:nil])
 
-    // Step 1: fused_gate_up_swiglu per expert [2048, 4096], group_size=32
-    // SIMD-optimized: 256 threadgroups × 256 threads (8 rows/tg, 32 lanes/row)
-    for (int k = 0; k < K; k++) {
-        int eid = expert_ids[k];
-        char *base = (char *)expert_bufs[k];
-        id gw  = EXPERT_BUF(layer_idx, eid, 0, base+gw_off, 4194304);
-        id gs_b= EXPERT_BUF(layer_idx, eid, 1, base+gs_off, 262144);
-        id uw  = EXPERT_BUF(layer_idx, eid, 2, base+uw_off, 4194304);
-        id us_b= EXPERT_BUF(layer_idx, eid, 3, base+us_off, 262144);
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
-        [enc setBuffer:gw offset:0 atIndex:0];   [enc setBuffer:gs_b offset:0 atIndex:1];
-        [enc setBuffer:uw offset:0 atIndex:2];   [enc setBuffer:us_b offset:0 atIndex:3];
-        [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-        [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-        od = INTERMEDIATE; id_ = DIM;
-        [enc setBytes:&od length:4 atIndex:6];
-        [enc setBytes:&id_ length:4 atIndex:7];
-        [enc setBytes:&gs length:4 atIndex:8];
-        // 8 rows per threadgroup → INTERMEDIATE/8 threadgroups
-        [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding];
-    }
+    // Step 1 + 2: use separate per-expert kernels temporarily for debugging
+    // (fused kernel has output correctness issue — reverted to original 6-separate approach)
+    {
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
-    // Step 2: dequant_matvec_4bit (down_proj) per expert [4096, 2048], group_size=32
-    // SIMD-optimized: 512 threadgroups × 256 threads (8 rows/tg, 32 lanes/row)
-    for (int k = 0; k < K; k++) {
-        int eid = expert_ids[k];
-        char *base = (char *)expert_bufs[k];
-        id dw  = EXPERT_BUF(layer_idx, eid, 4, base+dw_off, 4194304);
-        id ds_b= EXPERT_BUF(layer_idx, eid, 5, base+ds_off, 262144);
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:eng->pipe_dequant_matvec];
-        [enc setBuffer:dw offset:0 atIndex:0];    [enc setBuffer:ds_b offset:0 atIndex:1];
-        [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
-        [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-        od = DIM; id_ = INTERMEDIATE;
-        [enc setBytes:&od length:4 atIndex:4];
-        [enc setBytes:&id_ length:4 atIndex:5];
-        [enc setBytes:&gs length:4 atIndex:6];
-        // 8 rows per threadgroup → DIM/8 = 512 threadgroups
-        [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding];
-    }
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            char *base = (char *)expert_bufs[k];
+            id gw  = EXPERT_BUF(layer_idx, eid, 0, base+gw_off, 4194304);
+            id gs_b= EXPERT_BUF(layer_idx, eid, 1, base+gs_off, 262144);
+            id uw  = EXPERT_BUF(layer_idx, eid, 2, base+uw_off, 4194304);
+            id us_b= EXPERT_BUF(layer_idx, eid, 3, base+us_off, 262144);
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
+            [enc setBuffer:gw offset:0 atIndex:0];   [enc setBuffer:gs_b offset:0 atIndex:1];
+            [enc setBuffer:uw offset:0 atIndex:2];   [enc setBuffer:us_b offset:0 atIndex:3];
+            [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
+            [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
+            uint od = INTERMEDIATE; uint id_ = DIM; uint gs = 32;
+            [enc setBytes:&od length:4 atIndex:6];
+            [enc setBytes:&id_ length:4 atIndex:7];
+            [enc setBytes:&gs length:4 atIndex:8];
+            [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        for (int k = 0; k < K; k++) {
+            int eid = expert_ids[k];
+            char *base = (char *)expert_bufs[k];
+            id dw  = EXPERT_BUF(layer_idx, eid, 4, base+dw_off, 4194304);
+            id ds_b= EXPERT_BUF(layer_idx, eid, 5, base+ds_off, 262144);
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:eng->pipe_dequant_matvec];
+            [enc setBuffer:dw offset:0 atIndex:0];    [enc setBuffer:ds_b offset:0 atIndex:1];
+            [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
+            [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
+            uint od = DIM; uint id_ = INTERMEDIATE; uint gs = 32;
+            [enc setBytes:&od length:4 atIndex:4];
+            [enc setBytes:&id_ length:4 atIndex:5];
+            [enc setBytes:&gs length:4 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        // Step 3: blit each expert output into persistent contiguous buffer (same CB)
+        {
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            id<MTLBuffer> contiguous = (id<MTLBuffer>)eng->buf_expert_contiguous;
+            for (int k = 0; k < K; k++) {
+                [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_expert_out[k]
+                       sourceOffset:0
+                           toBuffer:contiguous
+                  destinationOffset:(size_t)k * DIM * sizeof(float)
+                               size:(size_t)DIM * sizeof(float)];
+            }
+            [blit endEncoding];
+        }
+
+        // Step 4: moe_combine in the SAME CB
+        {
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:eng->pipe_moe_combine];
+            id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
+            id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:0];
+            [enc setBuffer:weights_buf offset:0 atIndex:1];
+            [enc setBuffer:zero_resid  offset:0 atIndex:2];
+            [enc setBuffer:eng->buf_hidden offset:0 atIndex:3];
+            uint kv = K, hd = DIM;
+            [enc setBytes:&kv length:4 atIndex:4];
+            [enc setBytes:&hd length:4 atIndex:5];
+            [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec*1e9+ts.tv_nsec; }
+        [cb commit]; [cb waitUntilCompleted];
+        if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t2 = ts.tv_sec*1e9+ts.tv_nsec;
+            fprintf(stderr, "[MOE-TIME] encode=%.2fms gpu=%.2fms\n", (t1-t0)/1e6, (t2-t1)/1e6); }
+    } // end fused expert block
 
     #undef EXPERT_BUF
-
-    // Step 3: blit each expert output into persistent contiguous buffer (same CB).
-    // Uses blit encoder instead of CPU memcpy — no CB boundary, no extra wait.
-    {
-        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-        id<MTLBuffer> contiguous = (id<MTLBuffer>)eng->buf_expert_contiguous;
-        for (int k = 0; k < K; k++) {
-            [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_expert_out[k]
-                   sourceOffset:0
-                       toBuffer:contiguous
-              destinationOffset:(size_t)k * DIM * sizeof(float)
-                           size:(size_t)DIM * sizeof(float)];
-        }
-        [blit endEncoding];
-    }
-
-    // Step 4: moe_combine in the SAME CB — eliminates a second waitUntilCompleted.
-    {
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:eng->pipe_moe_combine];
-        id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
-        id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:0];
-        [enc setBuffer:weights_buf offset:0 atIndex:1];
-        [enc setBuffer:zero_resid  offset:0 atIndex:2];
-        [enc setBuffer:eng->buf_hidden offset:0 atIndex:3];
-        uint kv = K, hd = DIM;
-        [enc setBytes:&kv length:4 atIndex:4];
-        [enc setBytes:&hd length:4 atIndex:5];
-        [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding];
-    }
-
-    // Single commit + wait for gate+up+SwiGLU, down, blit, combine (was 2 CBs, 2 waits)
-    if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t1 = ts.tv_sec*1e9+ts.tv_nsec; }
-    [cb commit]; [cb waitUntilCompleted];
-    if (time_en) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); t2 = ts.tv_sec*1e9+ts.tv_nsec;
-        fprintf(stderr, "[MOE-TIME] encode=%.2fms gpu=%.2fms\n", (t1-t0)/1e6, (t2-t1)/1e6); }
     return 0;
 }
 
