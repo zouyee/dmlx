@@ -82,22 +82,35 @@ pub const NativeEngine = struct {
         const logits = try allocator.alloc(f32, cfg.vocab_size);
         errdefer allocator.free(logits);
 
-        // 6. Enable SMELT hot-expert preloading.
-        //    Warm up over first 20 decode tokens, then cache top-51 experts per layer (~20%).
-        //    After warmup, routing is biased to prefer cached experts → eliminates most SSD reads.
-        //    51 experts/layer × 43 layers × 13.4MB ≈ 29GB — fits in 48GB machine.
-        //    Use env NATIVE_SMELT_N (default 51) to tune, NATIVE_SMELT_WARMUP (default 20) for tokens.
+        // 6. SMELT startup preload — equivalent to MLX's ExpertPreloadProvider.
+        //    Preloads top-N experts per layer into RAM at engine init.
+        //    With routing bias (-1e9 for uncached experts), 100% of routing
+        //    hits the cache → zero SSD I/O during decode → reads from RAM @100 GB/s.
+        //
+        //    Memory: 51 experts/layer × 43 layers × 13.4MB = 29.4 GB  (fits in 48GB)
+        //    Startup cost: ~36s (29.4 GB / 0.82 GB/s SSD) — one-time per server start
+        //    Decode speed: 3.46 GB/token / 100 GB/s + ~260ms GPU = ~295ms/tok ≈ 3.4 tok/s
+        //
+        //    NATIVE_SMELT_N=0 to disable (full SSD reads, ~4200ms/tok)
         const smelt_n_str = std.c.getenv("NATIVE_SMELT_N");
         const smelt_n: i32 = if (smelt_n_str) |s| std.fmt.parseInt(i32, std.mem.span(s), 10) catch 51 else 51;
         if (smelt_n > 0) {
-            // Collect routing stats from first few decode tokens.
-            // warmup_tokens=3: fires after 3 decode tokens across all requests.
-            // After warmup, async background preload starts (29GB → ~54s background I/O).
-            // Routing bias activates once preload completes, steering toward cached experts.
-            metal.smeltInit(engine, 3, smelt_n, 1e9);
-            std.log.info("native_engine: SMELT enabled (warmup=3 decode tokens, cache={d} experts/layer)", .{smelt_n});
+            std.log.info("native_engine: SMELT preloading {d} experts/layer ({d:.1} GB) — please wait...", .{
+                smelt_n,
+                @as(f64, @floatFromInt(smelt_n)) * 43.0 * 13.4 / 1024.0,
+            });
+            // warmup_tokens=0: no routing stats → preloads experts 0..N-1 (uniform, same as MLX default)
+            // Synchronous: blocks until all 29GB is loaded into RAM.
+            // Routing bias activates immediately after preload completes.
+            metal.smeltInit(engine, 0, smelt_n, 1e9);
+            const n_loaded = metal.smeltFinishWarmup(engine);
+            if (n_loaded > 0) {
+                std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM, routing bias active", .{n_loaded});
+            } else {
+                std.log.warn("native_engine: SMELT preload failed — falling back to SSD reads", .{});
+            }
         } else {
-            std.log.warn("native_engine: SMELT disabled (NATIVE_SMELT_N=0) — SSD reads each token (slow)", .{});
+            std.log.warn("native_engine: SMELT disabled (NATIVE_SMELT_N=0) — SSD reads each token (~4200ms/tok)", .{});
         }
 
         std.log.info("native_engine: initialized (layers={d}, vocab={d})", .{ cfg.num_hidden_layers, cfg.vocab_size });

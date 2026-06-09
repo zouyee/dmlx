@@ -289,8 +289,17 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         return 0;
     }
 
-    fprintf(stderr, "[smelt] Warmup complete (%d tokens). Preloading top-%d experts/layer...\n",
-        eng->smelt_tokens_seen, n);
+    fprintf(stderr, "[smelt] Warmup complete (%d tokens). Preloading experts per layer...\n",
+        eng->smelt_tokens_seen);
+
+    // Total memory: hash layers (0-2) cache ALL 256 experts, score layers cache top-N
+    size_t total_bytes = 0;
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        int n_this_layer = (eng->tid2eid[layer] != NULL) ? N_EXPERTS : n;
+        total_bytes += (size_t)n_this_layer * EXPERT_SIZE;
+    }
+    fprintf(stderr, "[smelt] Total preload: %.1f GB (hash layers: all 256, score layers: top-%d)\n",
+        (double)total_bytes / (1024.0*1024.0*1024.0), n);
 
     // Allocate lookup tables if not already allocated
     for (int layer = 0; layer < N_LAYERS; layer++) {
@@ -301,43 +310,48 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
                 return 0;
             }
         } else {
-            // Clear any old cache pointers
             memset(eng->expert_mem_cache[layer], 0, N_EXPERTS * sizeof(uint8_t *));
         }
     }
 
-    // Sort experts by frequency and pick top-n for each layer
-    // We reuse/reallocate expert_mem_pool per layer
     int sorted[N_EXPERTS];
     for (int layer = 0; layer < N_LAYERS; layer++) {
-        // Sort expert IDs by descending count
+        // For hash routing layers (0-2): cache ALL experts (no bias can be applied,
+        // so we must ensure every expert that hash routing might select is in RAM).
+        // For score-based layers (3-42): cache top-N by routing frequency.
+        const bool is_hash_layer = (eng->tid2eid[layer] != NULL);
+        const int n_this_layer = is_hash_layer ? N_EXPERTS : n;
+
+        // Build sorted list: for hash layers all experts, for score layers sort by frequency
         for (int i = 0; i < N_EXPERTS; i++) sorted[i] = i;
-        // Simple insertion sort — N_EXPERTS=256 is small enough
-        for (int i = 1; i < N_EXPERTS; i++) {
-            int key = sorted[i];
-            uint32_t kc = eng->routing_counts[layer][key];
-            int j = i - 1;
-            while (j >= 0 && eng->routing_counts[layer][sorted[j]] < kc) {
-                sorted[j+1] = sorted[j]; j--;
+        if (!is_hash_layer) {
+            // Sort by descending routing_counts (simple insertion sort, N=256 is fine)
+            for (int i = 1; i < N_EXPERTS; i++) {
+                int key = sorted[i];
+                uint32_t kc = eng->routing_counts[layer][key];
+                int j = i - 1;
+                while (j >= 0 && eng->routing_counts[layer][sorted[j]] < kc) {
+                    sorted[j+1] = sorted[j]; j--;
+                }
+                sorted[j+1] = key;
             }
-            sorted[j+1] = key;
         }
 
-        // Allocate pool for this layer (free old pool if exists)
+        // Allocate pool for this layer
         if (eng->expert_mem_pool[layer]) {
             free(eng->expert_mem_pool[layer]);
             eng->expert_mem_pool[layer] = NULL;
         }
-        size_t pool_bytes = (size_t)n * EXPERT_SIZE;
+        size_t pool_bytes = (size_t)n_this_layer * EXPERT_SIZE;
         if (posix_memalign((void**)&eng->expert_mem_pool[layer], 2*1024*1024, pool_bytes) != 0) {
             fprintf(stderr, "[smelt] OOM: pool for layer %d (%lu MB)\n", layer,
                 (unsigned long)(pool_bytes / (1024*1024)));
             return 0;
         }
 
-        // Preload top-n experts
+        // Preload experts
         int loaded = 0;
-        for (int i = 0; i < n && i < N_EXPERTS; i++) {
+        for (int i = 0; i < n_this_layer && i < N_EXPERTS; i++) {
             int eid = sorted[i];
             uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)loaded * EXPERT_SIZE;
             off_t offset = (off_t)eid * EXPERT_SIZE;
@@ -351,23 +365,19 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         }
 
         if (layer == 0) {
-            fprintf(stderr, "[smelt] L0 top-%d experts (hash routing, counts=0 expected): [", loaded);
-            for (int i = 0; i < (loaded < 8 ? loaded : 8); i++)
-                fprintf(stderr, "%d(×%u)%s", sorted[i], eng->routing_counts[layer][sorted[i]], i+1<8?",":"");
-            fprintf(stderr, "...]\n");
+            fprintf(stderr, "[smelt] L0 (hash): loaded %d/%d experts\n", loaded, n_this_layer);
         } else if (layer == 5) {
-            // Log a score-based layer to verify routing_counts are non-zero
-            fprintf(stderr, "[smelt] L5 top-%d experts: [", loaded);
+            fprintf(stderr, "[smelt] L5 (score) top-%d experts: [", loaded);
             for (int i = 0; i < (loaded < 8 ? loaded : 8); i++)
                 fprintf(stderr, "%d(×%u)%s", sorted[i], eng->routing_counts[layer][sorted[i]], i+1<8?",":"");
             fprintf(stderr, "...]\n");
         }
     }
 
-    eng->expert_cache_n_experts = n;
+    eng->expert_cache_n_experts = n;  // used as guard in io_pool_dispatch_cached
     eng->smelt_warmup_done = true;
-    fprintf(stderr, "[smelt] Done. %d experts/layer cached, routing bias penalty=%.0f\n",
-        n, eng->smelt_penalty);
+    fprintf(stderr, "[smelt] Done. %.1f GB preloaded, routing bias penalty=%.0f\n",
+        (double)total_bytes / (1024.0*1024.0*1024.0), eng->smelt_penalty);
     return n;
 }
 
