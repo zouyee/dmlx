@@ -967,40 +967,63 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             sqrt(s0n),sqrt(s1n),sqrt(s2n),sqrt(s3n),sqrt(s0n+s1n+s2n+s3n));
     }
 
-    // === MoE sublayer (mHC-wrapped) — reuse persistent scratch buffers
+    // === P0: CMD2 — merge mhc_pre(ffn) + ffn_RMSNorm + routing_gate into single CB
+    // Eliminates 2 redundant waitUntilCompleted per layer (43×2 = 86 fewer GPU syncs/token).
+    // These 3 encoders have pure sequential data dependencies and no type-conversion gaps.
     {
         memcpy([(id<MTLBuffer>)eng->buf_mhc_ffn_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_res_in      offset:0 atIndex:3];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:4];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:5];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:6];
-        [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding]; [cb commit]; [cb waitUntilCompleted];
-        memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in     contents], DIM * sizeof(float));
+
+        id<MTLCommandBuffer> cmd2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+
+        // Encoder 1: mhc_pre(ffn) → buf_mhc_ffn_in + buf_mhc_post_weights + buf_mhc_comb_weights
+        {
+            id<MTLComputeCommandEncoder> enc = [cmd2 computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_res_in      offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:4];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:5];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        // Encoder 2: ffn_RMSNorm — reads buf_mhc_ffn_in (output of encoder 1)
+        {
+            id<MTLComputeCommandEncoder> e = [cmd2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in           offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:1];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:2];
+            uint rd = DIM; float eps = 1e-6f; uint hw = 1;
+            [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
+            [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
+        // Encoder 3: routing_gate — reads buf_mhc_ffn_norm_bf16 (output of encoder 2)
+        if (eng->gate_proj[layer]) {
+            id<MTLComputeCommandEncoder> enc = [cmd2 computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
+            uint od=N_EXPERTS, id_=DIM;
+            [enc setBytes:&od length:4 atIndex:3]; [enc setBytes:&id_ length:4 atIndex:4];
+            [enc dispatchThreads:MTLSizeMake(N_EXPERTS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+
+        // Single commit + wait for all 3 encoders (was 3 separate CBs with 3 waits)
+        [cmd2 commit]; [cmd2 waitUntilCompleted];
+
+        // Read back results
+        memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in      contents], DIM * sizeof(float));
         memcpy(post,      [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
         memcpy(comb,      [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
-    }
 
-    // ffn RMSNorm — reuse persistent scratch buffers
-    // NOTE: also update normed_bf16_direct so routing gate uses FFN-normed input
-    {
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_ffn_in contents], ffn_input, DIM*sizeof(float));
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
-        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in           offset:0 atIndex:0];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:1];
-        [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:2];
-        uint rd = DIM; float eps = 1e-6f; uint hw = 1;
-        [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
-        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [e endEncoding]; [cb commit]; [cb waitUntilCompleted];
         uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
@@ -1019,27 +1042,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    // === Routing gate — reuse persistent mhc_ffn_norm_bf16 buffer (already contains ffn normed)
+    // Routing scores ready in buf_routing_scores (written by CMD2 encoder 3)
     float *scores = (float *)[(id<MTLBuffer>)eng->buf_routing_scores contents];
-    if (eng->gate_proj[layer]) {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
-        [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
-        uint od=N_EXPERTS, id_=DIM;
-        [enc setBytes:&od length:4 atIndex:3];
-        [enc setBytes:&id_ length:4 atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(N_EXPERTS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc endEncoding];
-        [cb commit]; [cb waitUntilCompleted];
-        // Truncate gate scores to bf16 to match MLX's bf16 gate computation
+    if (!eng->gate_proj[layer]) {
+        for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
+    } else {
+        // Truncate to bf16 to match MLX's bf16 gate computation
         for (int i = 0; i < N_EXPERTS; i++) {
             uint32_t u; memcpy(&u, &scores[i], 4); u &= 0xFFFF0000U; memcpy(&scores[i], &u, 4);
         }
-    } else {
-        for (int i = 0; i < N_EXPERTS; i++) scores[i] = (float)(N_EXPERTS - i);
     }
 
     int expert_ids[N_ACTIVE];
