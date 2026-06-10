@@ -1005,6 +1005,23 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
 
+    // === Wait for deferred cb3 from previous layer (deferred mhc_post_ffn) ===
+    // cb3(N-1) wrote buf_residual_gpu. We wait here, then read residual back to CPU.
+    // Metal queue is serial: CB-A(N) will execute after cb3(N-1) anyway, but we
+    // need the CPU-side residual[] update before using it in CB-A's mhc_pre.
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        if (eng->deferred.gpu_combined) {
+            // Read updated residual from buf_residual_gpu → CPU residual[]
+            float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
+            memcpy(residual, gpu_res, MHC_MULT * DIM * sizeof(float));
+            eng->deferred.gpu_combined = false;
+        }
+    }
+
     @autoreleasepool {    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
@@ -1538,12 +1555,20 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb3 commit]; [cb3 waitUntilCompleted];
+        [cb3 commit]; // DEFERRED — no wait here. Next layer waits at its start.
 
-        // CPU readback for next layer's CB-A (now reads from buf_residual_gpu via mhc_pre)
-        // Also needed for debug output and compress_hc after final layer.
-        uint16_t *res3_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+        // Store deferred state for next layer (or moe_infer_forward end)
+        if (eng->deferred.cmd_experts) {
+            // Should not happen, but force-wait to avoid leak
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        }
+        [cb3 retain];
+        eng->deferred.cmd_experts  = (void *)cb3;
+        eng->deferred.active       = true;
+        eng->deferred.gpu_combined = true;  // cb3 wrote buf_residual_gpu
+        eng->deferred.layer_idx    = layer;
+        // NOTE: CPU residual[] is NOT updated here — done at start of next layer after wait.
     }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
@@ -1584,6 +1609,20 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             fprintf(stderr, "[TIME] pos=%d layer=%d: %.1fms\n", pos, layer, (t1-t0)/1e6);
         }
     }
+
+    // Wait for last layer's deferred cb3 + read final residual back to hidden.
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        if (eng->deferred.gpu_combined) {
+            float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
+            memcpy(hidden, gpu_res, MHC_MULT * DIM * sizeof(float));
+            eng->deferred.gpu_combined = false;
+        }
+    }
+
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
     // calls forward token-by-token). We detect decode mode by checking the engine's
