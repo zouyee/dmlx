@@ -33,6 +33,19 @@ typedef struct {
     id<MTLBuffer> q_norm_buf, kv_norm_buf, attn_sink_buf;
     // wo_a_dense: 8 groups × [O_LORA_RANK, group_feat] f32
     id<MTLBuffer> wo_a_grp[8];   // 8 × 16MB = 128MB total per layer
+    // Persistent scratch buffers for decode pass (reused every forward call)
+    // Eliminates ~18 MTLBuffer allocations per layer per token
+    id<MTLBuffer> scr_q_a;       // [Q_LORA_RANK] bf16   — wq_a output
+    id<MTLBuffer> scr_q_res;     // [Q_LORA_RANK] bf16   — q_norm output
+    id<MTLBuffer> scr_q;         // [N_HEADS*HEAD_DIM] bf16 — wq_b output
+    id<MTLBuffer> scr_q_n;       // [N_HEADS*HEAD_DIM] bf16 — per-head-norm + RoPE
+    id<MTLBuffer> scr_kv;        // [KV_LORA_RANK] bf16  — wkv output
+    id<MTLBuffer> scr_kv_n;      // [KV_LORA_RANK] bf16  — kv_norm + RoPE
+    id<MTLBuffer> scr_attn;      // [N_HEADS*HEAD_DIM] bf16 — SDPA output + RoPE
+    id<MTLBuffer> scr_concat;    // [O_GROUPS*O_LORA_RANK] f32 — wo_a concat
+    id<MTLBuffer> scr_out;       // [DIM] f32             — wo_b output
+    id<MTLBuffer> scr_bog[8];    // [O_LORA_RANK] f32 ×8 — wo_a group outputs
+    id<MTLBuffer> scr_bgv[8];    // [group_feat] bf16 ×8  — wo_a group inputs
     // Validated: points to the AttnWeights that seeded this entry (pointer identity)
     const void *owner;
 } AttnBufCache;
@@ -108,6 +121,28 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
     c->kv_norm_buf   = MKNC(aw->kv_norm,   KV_LORA_RANK * sizeof(float));
     c->attn_sink_buf = MKNC(aw->attn_sink, N_HEADS * sizeof(float));
     #undef MKNC
+
+    // Persistent scratch buffers: allocated once, reused every decode call.
+    // Total: ~18 + 8*2 = ~34 allocations eliminated per layer per token.
+    #define MKSCR(sz) [d newBufferWithLength:(sz) options:MTLResourceStorageModeShared]
+    c->scr_q_a    = MKSCR((size_t)Q_LORA_RANK * sizeof(uint16_t));
+    c->scr_q_res  = MKSCR((size_t)Q_LORA_RANK * sizeof(uint16_t));
+    c->scr_q      = MKSCR((size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    c->scr_q_n    = MKSCR((size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    c->scr_kv     = MKSCR((size_t)KV_LORA_RANK * sizeof(uint16_t));
+    c->scr_kv_n   = MKSCR((size_t)KV_LORA_RANK * sizeof(uint16_t));
+    c->scr_attn   = MKSCR((size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    c->scr_concat = MKSCR((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
+    c->scr_out    = MKSCR((size_t)DIM * sizeof(float));
+    {
+        int group_feat = (N_HEADS / O_GROUPS) * HEAD_DIM;  // 8*512=4096
+        for (int g = 0; g < O_GROUPS; g++) {
+            c->scr_bog[g] = MKSCR((size_t)O_LORA_RANK * sizeof(float));
+            c->scr_bgv[g] = MKSCR((size_t)group_feat * sizeof(uint16_t));
+        }
+    }
+    #undef MKSCR
+
     return c;
 }
 
@@ -590,12 +625,13 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bx     = mkbuf(d, x, DIM * sizeof(uint16_t));
     id<MTLBuffer> bcos   = mkbuf(d, cosv, half * sizeof(float));
     id<MTLBuffer> bsin   = mkbuf(d, sinv, half * sizeof(float));
-    id<MTLBuffer> bq_a   = mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> bq_res = mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> bq     = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
-    id<MTLBuffer> bq_n   = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
-    id<MTLBuffer> bkv    = mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> bkv_n  = mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
+    // Use persistent scratch buffers from AttnBufCache when available
+    id<MTLBuffer> bq_a   = (abc && abc->scr_q_a)   ? abc->scr_q_a   : mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
+    id<MTLBuffer> bq_res = (abc && abc->scr_q_res)  ? abc->scr_q_res : mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
+    id<MTLBuffer> bq     = (abc && abc->scr_q)      ? abc->scr_q     : mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    id<MTLBuffer> bq_n   = (abc && abc->scr_q_n)    ? abc->scr_q_n   : mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    id<MTLBuffer> bkv    = (abc && abc->scr_kv)     ? abc->scr_kv    : mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
+    id<MTLBuffer> bkv_n  = (abc && abc->scr_kv_n)   ? abc->scr_kv_n  : mkbuf(d, NULL, KV_LORA_RANK * sizeof(uint16_t));
 
     // Use persistent norm/sink buffers if available, else fall back to mkbuf
     id<MTLBuffer> bqn_w  = abc ? abc->q_norm_buf    : mkbuf(d, aw->q_norm,    Q_LORA_RANK * sizeof(float));
@@ -650,7 +686,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
     // === CB2: SDPA + inverse RoPE (2 encoders, 1 wait) ===
     id<MTLBuffer> bkvcache = mkbuf(d, kv_cache, (size_t)cache_len * KV_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> battn    = mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    id<MTLBuffer> battn    = (abc && abc->scr_attn) ? abc->scr_attn : mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
     {
         id<MTLCommandBuffer> cb2 = [P->queue commandBuffer];
         {
@@ -676,19 +712,28 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     uint16_t *attn_bf16 = (uint16_t *)[battn contents];
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
-    float *concat = malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    if (!concat) return -1;
+    float *concat = (abc && abc->scr_concat) ? NULL : malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
+    // concat points to either persistent buffer contents (after CB3) or malloc'd memory
+    if (!abc && !concat) return -1;
 
     id<MTLBuffer> bog_arr[O_GROUPS];
     {
         id<MTLCommandBuffer> cb3 = [P->queue commandBuffer];
         for (int g = 0; g < O_GROUPS; g++) {
-            uint16_t *gv_bf16 = malloc((size_t)group_feat * sizeof(uint16_t));
-            if (!gv_bf16) { free(concat); return -1; }
+            uint16_t *gv_bf16_data;
+            id<MTLBuffer> bgv;
+            if (abc && abc->scr_bgv[g]) {
+                // Use persistent bgv scratch — fill it directly
+                bgv = abc->scr_bgv[g];
+                gv_bf16_data = (uint16_t *)[bgv contents];
+            } else {
+                gv_bf16_data = malloc((size_t)group_feat * sizeof(uint16_t));
+                if (!gv_bf16_data) { if (concat) free(concat); return -1; }
+                bgv = mkbuf(d, gv_bf16_data, group_feat * sizeof(uint16_t));
+            }
             for (int hh = 0; hh < heads_per_group; hh++)
-                memcpy(gv_bf16 + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
-            id<MTLBuffer> bgv = mkbuf(d, gv_bf16, group_feat * sizeof(uint16_t));
-            bog_arr[g] = mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
+                memcpy(gv_bf16_data + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
+            bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g] : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
             // Use persistent wo_a group buffer if available, else NoCopy zero-copy
             id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
                                     ? abc->wo_a_grp[g]
@@ -697,16 +742,25 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                                           options:MTLResourceStorageModeShared
                                           deallocator:nil];
             enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
-            free(gv_bf16);
+            if (!abc || !abc->scr_bgv[g]) free(gv_bf16_data);  // free only if not persistent
         }
         [cb3 commit]; [cb3 waitUntilCompleted];
     }
-    for (int g = 0; g < O_GROUPS; g++)
-        memcpy(concat + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
+    // Gather wo_a outputs into concat
+    if (abc && abc->scr_concat) {
+        float *scr_concat_ptr = (float *)[abc->scr_concat contents];
+        for (int g = 0; g < O_GROUPS; g++)
+            memcpy(scr_concat_ptr + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
+        concat = scr_concat_ptr;
+    } else {
+        for (int g = 0; g < O_GROUPS; g++)
+            memcpy(concat + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
+    }
 
     // === CB4: wo_b (1 encoder, 1 wait) ===
-    id<MTLBuffer> bconcat = mkbuf(d, concat, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    id<MTLBuffer> bout    = mkbuf(d, NULL, DIM * sizeof(float));
+    // Use persistent scr_concat as input (already populated above) and scr_out as output
+    id<MTLBuffer> bconcat = (abc && abc->scr_concat) ? abc->scr_concat : mkbuf(d, concat, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
+    id<MTLBuffer> bout    = (abc && abc->scr_out)    ? abc->scr_out    : mkbuf(d, NULL, DIM * sizeof(float));
     {
         id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
         if (abc && abc->wo_b_pack) {
@@ -729,7 +783,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         [cb4 commit]; [cb4 waitUntilCompleted];
     }
     memcpy(out, [bout contents], DIM * sizeof(float));
-    free(concat);
+    if (!abc || !abc->scr_concat) free(concat);  // free only if not using persistent buffer
     } // end @autoreleasepool
     return 0;
 }
