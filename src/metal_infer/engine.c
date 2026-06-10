@@ -49,6 +49,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_moe_combine    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_combine"] error:&err]);
     eng->pipe_fused_6expert_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_gate_up_swiglu"] error:&err]);
     eng->pipe_fused_6expert_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_down"] error:&err]);
+    eng->pipe_gather_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_gate_up_swiglu"] error:&err]);
+    eng->pipe_gather_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_down"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
     eng->pipe_rms_norm_apply = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_apply"] error:&err]);
     eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
@@ -101,6 +103,11 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     }
     eng->buf_expert_contiguous = (void *)[d newBufferWithLength:(size_t)N_ACTIVE*DIM*sizeof(float) options:MTLResourceStorageModeShared];
 
+    // Gather mode output buffers
+    eng->buf_gather_mid = (void *)[d newBufferWithLength:(size_t)N_ACTIVE*INTERMEDIATE*sizeof(float) options:MTLResourceStorageModeShared];
+    eng->buf_gather_out = (void *)[d newBufferWithLength:(size_t)N_ACTIVE*DIM*sizeof(float) options:MTLResourceStorageModeShared];
+    eng->buf_gather_expert_ids = (void *)[d newBufferWithLength:N_ACTIVE*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+
     // Persistent scratch buffers for mhc_pre / mhc_post — eliminates per-call allocation
     const int MIX3_size = MHC_MULT * (MHC_MULT + 2);  // 24
     eng->buf_mhc_res_in        = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(float)         options:MTLResourceStorageModeShared];
@@ -126,6 +133,19 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
 
     // Initialize expert GPU buffer cache to NULL (populated after SMELT warmup)
     memset(eng->expert_gpu_buf, 0, sizeof(eng->expert_gpu_buf));
+
+    // Initialize gather mode buffers to NULL
+    memset(eng->buf_gather_gate_W, 0, sizeof(eng->buf_gather_gate_W));
+    memset(eng->buf_gather_gate_s, 0, sizeof(eng->buf_gather_gate_s));
+    memset(eng->buf_gather_up_W,   0, sizeof(eng->buf_gather_up_W));
+    memset(eng->buf_gather_up_s,   0, sizeof(eng->buf_gather_up_s));
+    memset(eng->buf_gather_down_W, 0, sizeof(eng->buf_gather_down_W));
+    memset(eng->buf_gather_down_s, 0, sizeof(eng->buf_gather_down_s));
+    eng->gather_mode = false;
+    // Initialize all pool_pos remapping slots to -1 (not in pool)
+    for (int l = 0; l < N_LAYERS; l++)
+        for (int e = 0; e < N_EXPERTS; e++)
+            eng->smelt_pool_pos[l][e] = -1;
 
     fprintf(stderr, "Metal engine: initialized\n");
     return 0;
@@ -261,6 +281,7 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
                 return 0;
             }
             eng->expert_mem_cache[layer][eid] = dst;
+            eng->smelt_pool_pos[layer][eid] = eid;  // slot == eid for sequential preload
         }
     }
 
@@ -355,7 +376,10 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
             return 0;
         }
 
-        // Preload experts
+        // Preload experts — also record pool_pos remapping table
+        // Initialize all slots to -1 (uncached)
+        for (int i = 0; i < N_EXPERTS; i++) eng->smelt_pool_pos[layer][i] = -1;
+
         int loaded = 0;
         for (int i = 0; i < n_this_layer && i < N_EXPERTS; i++) {
             int eid = sorted[i];
@@ -364,6 +388,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
             ssize_t bytes = pread(eng->packed_fd[layer], dst, EXPERT_SIZE, offset);
             if (bytes == EXPERT_SIZE) {
                 eng->expert_mem_cache[layer][eid] = dst;
+                eng->smelt_pool_pos[layer][eid] = loaded;  // record slot position
                 loaded++;
             } else {
                 fprintf(stderr, "[smelt] pread failed layer=%d eid=%d got=%ld\n", layer, eid, (long)bytes);
@@ -446,6 +471,85 @@ void moe_infer_smelt_preload_async(MoEInferEngine *eng) {
     }
     pthread_detach(t);
     fprintf(stderr, "[smelt] Async preload started (routing bias inactive until complete)\n");
+}
+
+// ============================================================================
+// Gather mode: create per-layer full-expert buffers for gatherQmm
+// ============================================================================
+
+// Initialize gather mode using the SMELT preloaded expert pool.
+// Works with any smelt_n (doesn't require all 256 experts — only K=6 must be cached).
+// Creates per-layer NoCopy Metal buffer views over the SMELT RAM pool.
+// The gather kernels use pool_pos (slot index) instead of raw expert_id.
+// Caller translates: pool_pos = smelt_pool_pos[layer][expert_id] before dispatch.
+//
+// Returns 1 on success, 0 on failure (SMELT not ready or insufficient cache).
+int moe_infer_init_gather_mode(MoEInferEngine *eng) {
+    if (!eng->smelt_warmup_done) {
+        fprintf(stderr, "[gather] Cannot init gather mode before SMELT warmup\n");
+        return 0;
+    }
+
+    // Count layers with enough cached experts
+    int layers_ok = 0;
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        if (!eng->expert_mem_pool[layer]) continue;
+        int n_cached = 0;
+        for (int eid = 0; eid < N_EXPERTS; eid++) {
+            if (eng->smelt_pool_pos[layer][eid] >= 0) n_cached++;
+        }
+        if (n_cached >= N_ACTIVE) layers_ok++;
+    }
+    if (layers_ok == 0) {
+        fprintf(stderr, "[gather] No layers have >= %d cached experts for gather mode\n", N_ACTIVE);
+        return 0;
+    }
+
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    fprintf(stderr, "[gather] Initializing gather mode (%d/%d layers ready)...\n",
+            layers_ok, N_LAYERS);
+
+    // Each layer: create a single NoCopy Metal buffer over the SMELT pool.
+    // The pool stores experts in slot order: [slot0][slot1]...[slot(n-1)]
+    // Each slot follows packed_experts layout (EXPERT_SIZE bytes):
+    //   [GATE_W: 4MB][GATE_S: 256KB][UP_W: 4MB][UP_S: 256KB][DOWN_W: 4MB][DOWN_S: 256KB]
+    //
+    // Gather kernels use: base = pool + pool_pos * EXPERT_SIZE_U32 + COMPONENT_OFFSET
+    // pool_pos comes from smelt_pool_pos[layer][expert_id] (set during SMELT warmup).
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        uint8_t *pool = eng->expert_mem_pool[layer];
+        if (!pool) continue;
+
+        // Determine actual pool size (max slot + 1) * EXPERT_SIZE
+        int n_slots = 0;
+        for (int eid = 0; eid < N_EXPERTS; eid++) {
+            int s = eng->smelt_pool_pos[layer][eid];
+            if (s >= 0 && s + 1 > n_slots) n_slots = s + 1;
+        }
+        if (n_slots < N_ACTIVE) continue;
+
+        size_t pool_size = (size_t)n_slots * EXPERT_SIZE;
+        id<MTLBuffer> pool_buf = [d newBufferWithBytesNoCopy:pool
+                                                      length:pool_size
+                                                     options:MTLResourceStorageModeShared
+                                                 deallocator:nil];
+        // All 6 "component buffers" alias the same pool (kernel uses internal offsets)
+        eng->buf_gather_gate_W[layer] = (void *)pool_buf;
+        eng->buf_gather_gate_s[layer] = (void *)pool_buf;
+        eng->buf_gather_up_W[layer]   = (void *)pool_buf;
+        eng->buf_gather_up_s[layer]   = (void *)pool_buf;
+        eng->buf_gather_down_W[layer] = (void *)pool_buf;
+        eng->buf_gather_down_s[layer] = (void *)pool_buf;
+
+        if (layer < 3 || layer == 42) {
+            fprintf(stderr, "[gather] L%d: %d slots, %.1f MB NoCopy buffer\n",
+                    layer, n_slots, (double)pool_size/(1024.0*1024.0));
+        }
+    }
+
+    eng->gather_mode = true;
+    fprintf(stderr, "[gather] Ready. Expert IDs remapped via smelt_pool_pos table.\n");
+    return 1;
 }
 
 // Dispatch K parallel preads — uses memory cache if available, falls back to SSD.
@@ -573,38 +677,96 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
-        for (int k = 0; k < K; k++) {
-            char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144)  offset:0 atIndex:3];
-            [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-            [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-            uint od=INTERMEDIATE,id_=DIM,gs=32;
-            [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
-            [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [enc endEncoding];
-        }
+        if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx]) {
+            // === GATHER MODE: gatherQmm-equivalent ===
+            // Single dispatch covering all K experts simultaneously.
+            // GPU reads only selected experts' rows from the full SMELT pool.
+            // Translate expert_ids → pool_pos (slot indices in SMELT pool)
+            uint32_t *eid_buf = (uint32_t *)[(id<MTLBuffer>)eng->buf_gather_expert_ids contents];
+            int all_in_pool = 1;
+            for (int k = 0; k < K; k++) {
+                int pos = eng->smelt_pool_pos[layer_idx][expert_ids[k]];
+                if (pos < 0) { all_in_pool = 0; break; }
+                eid_buf[k] = (uint32_t)pos;  // write pool slot, not raw expert_id
+            }
 
-        for (int k = 0; k < K; k++) {
-            char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-            [enc setComputePipelineState:eng->pipe_dequant_matvec];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+dw_off,4194304) offset:0 atIndex:0];
-            [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+ds_off,262144)  offset:0 atIndex:1];
-            [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
-            [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-            uint od=DIM,id_=INTERMEDIATE,gs=32;
-            [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
-            [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [enc endEncoding];
-        }
+            if (!all_in_pool) goto separate_mode;  // fall back if any expert not in pool
 
-        // Step 3: blit each expert output into persistent contiguous buffer (same CB)
-        {
+            // Encoder 1: gather gate+up+SwiGLU (K experts in parallel via Y dimension)
+            {
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather_gate_up];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_gate_W[layer_idx] offset:0 atIndex:0]; // pool
+                [enc setBuffer:eng->buf_normed offset:0 atIndex:1];                                    // x
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:2];                 // out [K×INT]
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_expert_ids offset:0 atIndex:3];          // eids
+                uint k_val = K;
+                [enc setBytes:&k_val length:4 atIndex:4];
+                // Dispatch: (INTERMEDIATE/8, K, 1) threadgroups × 256 threads
+                [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8, K, 1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc endEncoding];
+            }
+
+            // Encoder 2: gather down_proj (K experts in parallel)
+            {
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather_down];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_gate_W[layer_idx] offset:0 atIndex:0]; // pool
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:1];                // x_mid
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_out offset:0 atIndex:2];                // out [K×DIM]
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_expert_ids offset:0 atIndex:3];
+                uint k_val = K;
+                [enc setBytes:&k_val length:4 atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(DIM/8, K, 1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc endEncoding];
+            }
+        } else {
+            separate_mode:;
+            // === SEPARATE MODE: 6 per-expert dispatches ===
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144)  offset:0 atIndex:3];
+                [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
+                uint od=INTERMEDIATE,id_=DIM,gs=32;
+                [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
+                [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc endEncoding];
+            }
+            for (int k = 0; k < K; k++) {
+                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                [enc setComputePipelineState:eng->pipe_dequant_matvec];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+dw_off,4194304) offset:0 atIndex:0];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+ds_off,262144)  offset:0 atIndex:1];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
+                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
+                uint od=DIM,id_=INTERMEDIATE,gs=32;
+                [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
+                [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc endEncoding];
+            }
+        } // end if gather_mode / else separate mode
+
+        // Step 3: blit outputs into contiguous buffer for combine
+        // In gather mode: buf_gather_out already holds [K×DIM] contiguous
+        // In separate mode: blit from 6 separate buffers
+        if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx]) {
+            // Gather mode: buf_gather_out is already [K×DIM] contiguous
+            // Copy it to buf_expert_contiguous so combine kernel works uniformly
+            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+            [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_gather_out
+                   sourceOffset:0
+                       toBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous
+              destinationOffset:0
+                           size:(size_t)K*DIM*sizeof(float)];
+            [blit endEncoding];
+        } else {
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
             id<MTLBuffer> contiguous = (id<MTLBuffer>)eng->buf_expert_contiguous;
             for (int k = 0; k < K; k++) {

@@ -106,6 +106,19 @@ pub const NativeEngine = struct {
             const n_loaded = metal.smeltFinishWarmup(engine);
             if (n_loaded > 0) {
                 std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM, routing bias active", .{n_loaded});
+                // Gather mode: single-dispatch all K experts from the contiguous SMELT pool.
+                // NOTE: Currently disabled by default — gather kernel with 13MB expert-stride causes
+                // scattered cache-unfriendly memory access that is SLOWER than 6 separate contiguous reads.
+                // Enable via NATIVE_GATHER=1 only for experimentation.
+                const gather_env = std.c.getenv("NATIVE_GATHER");
+                if (gather_env != null) {
+                    const gather_ok = metal.initGatherMode(engine);
+                    if (gather_ok > 0) {
+                        std.log.info("native_engine: gather mode active (EXPERIMENTAL — may be slower)", .{});
+                    } else {
+                        std.log.warn("native_engine: gather mode init failed", .{});
+                    }
+                }
             } else {
                 std.log.warn("native_engine: SMELT preload failed — falling back to SSD reads", .{});
             }

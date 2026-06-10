@@ -190,6 +190,9 @@ typedef struct {
     // Fused 6-expert kernels: process K=6 experts in one dispatch
     void *pipe_fused_6expert_gate_up;   // fused_6expert_gate_up_swiglu
     void *pipe_fused_6expert_down;      // fused_6expert_down
+    // Gather MoE kernels: gatherQmm equivalent — K experts from full N_EXPERTS buffer
+    void *pipe_gather_gate_up;          // gather_gate_up_swiglu
+    void *pipe_gather_down;             // gather_down
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
     void *pipe_matvec;
@@ -237,6 +240,10 @@ typedef struct {
     void *buf_expert_mid[6];         // [INTERMEDIATE] gate+up output per expert
     void *buf_expert_out[6];         // [DIM] down output per expert
     void *buf_expert_contiguous;     // [N_ACTIVE*DIM] contiguous expert outputs for combine
+    // Gather mode output buffers: [K × dim] contiguous (vs K separate buffers)
+    void *buf_gather_mid;            // [N_ACTIVE × INTERMEDIATE] f32 — gather gate+up output
+    void *buf_gather_out;            // [N_ACTIVE × DIM] f32 — gather down output
+    void *buf_gather_expert_ids;     // [N_ACTIVE] uint32 — current expert IDs for gather dispatch
     void *buf_shared_gate;           // [INTERMEDIATE] shared expert gate
     void *buf_shared_up;             // [INTERMEDIATE] shared expert up
     void *buf_shared_down;           // [DIM] shared expert down
@@ -300,6 +307,27 @@ typedef struct {
     // expert_gpu_buf[layer][eid][slot]: slot 0=gate_w, 1=gate_s, 2=up_w, 3=up_s, 4=down_w, 5=down_s
     // NULL if expert not cached.
     void *expert_gpu_buf[N_LAYERS][N_EXPERTS][6];
+
+    // Gather MoE: per-layer NoCopy Metal buffer over the SMELT RAM pool.
+    // The gather kernels address experts via pool_pos (slot index within the pool)
+    // rather than raw expert_id, using the smelt_pool_pos remapping table.
+    // This allows gather mode with any smelt_n (not just full 256).
+    // buf_gather_gate_W[layer] == buf_gather_gate_s[layer] == ... == buf_gather_down_s[layer]
+    // — they all point to the same single NoCopy buffer over expert_mem_pool[layer].
+    // The gather kernel uses: offset = pool_pos * EXPERT_SIZE_U32 + component_offset + row*cols
+    // NULL if gather mode is not active for that layer.
+    void *buf_gather_gate_W[N_LAYERS];   // NoCopy view of entire SMELT pool per layer
+    void *buf_gather_gate_s[N_LAYERS];   // alias of buf_gather_gate_W[layer]
+    void *buf_gather_up_W[N_LAYERS];     // alias
+    void *buf_gather_up_s[N_LAYERS];     // alias
+    void *buf_gather_down_W[N_LAYERS];   // alias
+    void *buf_gather_down_s[N_LAYERS];   // alias
+    bool gather_mode;                    // true = use gather kernels instead of per-expert
+
+    // Remapping table: expert_id → pool_slot (position in SMELT pool).
+    // Set during smelt_finish_warmup: smelt_pool_pos[layer][eid] = slot (0..n-1), or -1 if uncached.
+    // Used in moe_forward_layer gather path to convert expert_ids → pool positions.
+    int smelt_pool_pos[N_LAYERS][N_EXPERTS];
 
     // SMELT-style hot-expert preloading.
     // Phase 1 (warmup): count routing selections per expert per layer.
@@ -469,6 +497,12 @@ void moe_infer_compress_hc(MoEInferEngine *engine, const float *residual, float 
 // logits_out: [vocab_size] (caller allocates)
 // Returns 0 on success.
 int moe_infer_get_logits(MoEInferEngine *engine, const float *hidden, float *logits_out);
+
+// Initialize gather mode using the SMELT preloaded expert pool.
+// Requires smelt_warmup_done=true and all N_EXPERTS cached for all layers.
+// Creates per-layer NoCopy Metal buffer views over the SMELT RAM pool.
+// Returns 1 on success, 0 on failure.
+int moe_infer_init_gather_mode(MoEInferEngine *engine);
 
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);

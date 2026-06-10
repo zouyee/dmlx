@@ -417,6 +417,188 @@ kernel void fused_6expert_down(
 }
 
 
+// ============================================================================
+// Gather MoE kernels — gatherQmm equivalent for MXFP4 expert weights
+// ============================================================================
+//
+// Instead of 6 separate per-expert dispatches (each reading a full 13.4MB expert blob),
+// these kernels take the ENTIRE layer's weights as one buffer and use expert_ids
+// to gather only the K=6 selected experts' rows.
+//
+// Data layout (same as packed_experts/layer_XX.bin components):
+//   gate_W_all: [N_EXPERTS=256, INTERMEDIATE=2048, PACKED_COLS=512] uint32  (1 GB)
+//   gate_s_all: [N_EXPERTS=256, INTERMEDIATE=2048, N_GROUPS=128] uint8      (64 MB)
+//   (same for up_W_all, up_s_all, down_W_all, down_s_all)
+//
+// The key insight: GPU only reads the K=6 selected experts' rows, not all 256.
+// With K=6: reads 6/256 ≈ 2.3% of each weight matrix per forward pass.
+// Per layer: gate_W + up_W = 2 × 6/256 × 1GB = ~47MB (vs 80MB for separate kernel)
+// But more importantly: down_W = 6/256 × 2GB = ~47MB.
+// Total: ~94MB vs 228MB current (sparse access pattern benefits GPU cache).
+
+// gather_gate_up_swiglu: fused gate+up+SwiGLU for K experts selected from N_EXPERTS.
+//
+// Uses packed_experts layout: pool = [e0: gate_W(4MB) gate_s(256KB) up_W(4MB) up_s(256KB) ...]
+//                                     [e1: ...] ... [e255: ...]
+// EXPERT_SIZE = 13369344 bytes, offsets: GATE_W=0, GATE_S=4194304, UP_W=4456448, UP_S=8650752
+//
+// Dispatch: MTLSizeMake(INTERMEDIATE/8, K, 1) threadgroups × 256 threads.
+// K experts run in parallel via Y dimension, all sharing the same x input.
+kernel void gather_gate_up_swiglu(
+    device const uint32_t* pool     [[buffer(0)]],   // entire layer pool (NoCopy from SMELT RAM)
+    device const float*    x        [[buffer(1)]],   // [IN_DIM=4096] shared input
+    device float*          out      [[buffer(2)]],   // [K × INTERMEDIATE] output (after SwiGLU)
+    constant uint*         eids     [[buffer(3)]],   // [K] selected expert indices
+    constant uint&         K        [[buffer(4)]],
+    uint3 tgid       [[threadgroup_position_in_grid]],
+    uint3 lid3       [[thread_position_in_threadgroup]],
+    uint simd_lane   [[thread_index_in_simdgroup]],
+    uint simd_group  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint INTERMEDIATE   = 2048;
+    const uint IN_DIM         = 4096;
+    const uint GS             = 32;
+    const uint PACKED_COLS    = IN_DIM / 8;       // 512 uint32 per row
+    const uint N_GROUPS       = IN_DIM / GS;      // 128 scale groups per row
+    const uint PPG            = GS / 8;           // 4 packed words per group
+    const uint ROWS_PER_TG    = 8;
+    // Byte offsets within one expert blob (matching packed_experts constants)
+    const uint EXPERT_SIZE_U32 = 13369344u / 4u;  // 3342336 uint32 elements
+    const uint GATE_S_BYTE    = 4194304u;          // byte offset of gate_s
+    const uint UP_W_U32       = 4456448u / 4u;    // 1114112 uint32 elements
+    const uint UP_S_BYTE      = 8650752u;          // byte offset of up_s
+
+    uint k_idx = tgid.y;
+    if (k_idx >= K) return;
+    uint eid = eids[k_idx];
+    uint row = tgid.x * ROWS_PER_TG + simd_group;
+    uint lid = lid3.x;  // linearized thread ID within threadgroup
+
+    // gate_W base for this expert: pool + eid * EXPERT_SIZE_U32 + 0 + row * PACKED_COLS
+    device const uint32_t* g_row = pool + eid * EXPERT_SIZE_U32 + row * PACKED_COLS;
+    device const uint32_t* u_row = pool + eid * EXPERT_SIZE_U32 + UP_W_U32 + row * PACKED_COLS;
+    // Scales via byte arithmetic (avoids uint8* cast which may have alignment issues in Metal)
+    const uint gs_byte_base = (uint)(eid * 13369344u) + GATE_S_BYTE + row * N_GROUPS;
+    const uint us_byte_base = (uint)(eid * 13369344u) + UP_S_BYTE   + row * N_GROUPS;
+
+    // Cache x in shared memory — reused for all K experts via Y-dim parallelism
+    // (each (tgid.x, tgid.y) threadgroup loads x independently, but same x data)
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < IN_DIM; i += 256) x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= INTERMEDIATE) return;
+
+    float ga = 0.0f, ua = 0.0f;
+    for (uint g = simd_lane; g < N_GROUPS; g += 32) {
+        // Read scale bytes via byte arithmetic on the uint32 pool buffer
+        uint gs_bidx = gs_byte_base + g;
+        uint us_bidx = us_byte_base + g;
+        float gsf = exp2((float)(uint8_t)((pool[gs_bidx/4] >> ((gs_bidx%4)*8)) & 0xFF) - 127.0f);
+        float usf = exp2((float)(uint8_t)((pool[us_bidx/4] >> ((us_bidx%4)*8)) & 0xFF) - 127.0f);
+        uint bp = g * PPG, bx = g * GS;
+        for (uint p = 0; p < PPG; p++) {
+            uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
+            uint xb = bx + p*8;
+            ga += NIBBLE_TO_FLOAT[(gpw>> 0)&0xF]*gsf*x_shared[xb+0];
+            ga += NIBBLE_TO_FLOAT[(gpw>> 4)&0xF]*gsf*x_shared[xb+1];
+            ga += NIBBLE_TO_FLOAT[(gpw>> 8)&0xF]*gsf*x_shared[xb+2];
+            ga += NIBBLE_TO_FLOAT[(gpw>>12)&0xF]*gsf*x_shared[xb+3];
+            ga += NIBBLE_TO_FLOAT[(gpw>>16)&0xF]*gsf*x_shared[xb+4];
+            ga += NIBBLE_TO_FLOAT[(gpw>>20)&0xF]*gsf*x_shared[xb+5];
+            ga += NIBBLE_TO_FLOAT[(gpw>>24)&0xF]*gsf*x_shared[xb+6];
+            ga += NIBBLE_TO_FLOAT[(gpw>>28)&0xF]*gsf*x_shared[xb+7];
+            ua += NIBBLE_TO_FLOAT[(upw>> 0)&0xF]*usf*x_shared[xb+0];
+            ua += NIBBLE_TO_FLOAT[(upw>> 4)&0xF]*usf*x_shared[xb+1];
+            ua += NIBBLE_TO_FLOAT[(upw>> 8)&0xF]*usf*x_shared[xb+2];
+            ua += NIBBLE_TO_FLOAT[(upw>>12)&0xF]*usf*x_shared[xb+3];
+            ua += NIBBLE_TO_FLOAT[(upw>>16)&0xF]*usf*x_shared[xb+4];
+            ua += NIBBLE_TO_FLOAT[(upw>>20)&0xF]*usf*x_shared[xb+5];
+            ua += NIBBLE_TO_FLOAT[(upw>>24)&0xF]*usf*x_shared[xb+6];
+            ua += NIBBLE_TO_FLOAT[(upw>>28)&0xF]*usf*x_shared[xb+7];
+        }
+    }
+    float gv = simd_sum(ga), uv = simd_sum(ua);
+    if (simd_lane == 0) {
+        const float lim = 10.0f;
+        float gc = min(gv, lim), uc = min(max(uv, -lim), lim);
+        out[k_idx * INTERMEDIATE + row] = (gc / (1.0f + exp(-gc))) * uc;
+    }
+}
+
+// gather_down: down projection for K experts from packed_experts pool.
+// DOWN_W offset = 8912896 bytes, DOWN_S = 13107200 bytes within each expert blob.
+// Dispatch: MTLSizeMake(DIM/8, K, 1) threadgroups × 256 threads.
+kernel void gather_down(
+    device const uint32_t* pool     [[buffer(0)]],   // entire layer pool
+    device const float*    x_mid    [[buffer(1)]],   // [K × INTERMEDIATE] gate*up results
+    device float*          out      [[buffer(2)]],   // [K × DIM]
+    constant uint*         eids     [[buffer(3)]],
+    constant uint&         K        [[buffer(4)]],
+    uint3 tgid       [[threadgroup_position_in_grid]],
+    uint3 lid3       [[thread_position_in_threadgroup]],
+    uint simd_lane   [[thread_index_in_simdgroup]],
+    uint simd_group  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint DIM            = 4096;
+    const uint INTERMEDIATE   = 2048;
+    const uint GS             = 32;
+    const uint PACKED_COLS    = INTERMEDIATE / 8;   // 256 uint32 per row
+    const uint N_GROUPS       = INTERMEDIATE / GS;  // 64
+    const uint PPG            = GS / 8;             // 4
+    const uint ROWS_PER_TG    = 8;
+    const uint EXPERT_SIZE_U32 = 13369344u / 4u;
+    const uint DOWN_W_U32     = 8912896u / 4u;      // 2228224
+    const uint DOWN_S_BYTE    = 13107200u;
+
+    uint k_idx = tgid.y;
+    if (k_idx >= K) return;
+    uint eid = eids[k_idx];
+    uint row = tgid.x * ROWS_PER_TG + simd_group;
+    uint lid = lid3.x;
+    device const uint32_t* w_row = pool + eid * EXPERT_SIZE_U32 + DOWN_W_U32 + row * PACKED_COLS;
+    // Use uint8 view of pool for scales (byte-level access)
+    // Note: casting to uint8* — use separate buffer approach to avoid Metal restrictions
+    // Instead, read scale byte from pool using byte arithmetic on uint32 words
+    // DOWN_S at byte: eid*13369344 + 13107200 + row*N_GROUPS + g
+    // In uint32 words (poolword index) = (eid*13369344 + 13107200 + row*N_GROUPS + g) / 4
+    // byte within word = same % 4
+    // Precompute base byte offset for this row's scales
+    const uint s_byte_base = (uint)(eid * 13369344u) + DOWN_S_BYTE + row * N_GROUPS;
+
+    // Load this expert's intermediate output (gate×up result) into shared memory
+    threadgroup float x_shared[2048];
+    device const float* my_xmid = x_mid + k_idx * INTERMEDIATE;
+    for (uint i = lid; i < INTERMEDIATE; i += 256) x_shared[i] = my_xmid[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= DIM) return;
+
+    float acc = 0.0f;
+    for (uint g = simd_lane; g < N_GROUPS; g += 32) {
+        // Read scale byte from pool using byte arithmetic on uint32 words
+        uint s_byte_idx = s_byte_base + g;
+        uint s_word = pool[s_byte_idx / 4];
+        uint8_t s_byte = (uint8_t)((s_word >> ((s_byte_idx % 4) * 8)) & 0xFF);
+        float sf = exp2((float)s_byte - 127.0f);
+        uint bp = g * PPG, bx = g * GS;
+        for (uint p = 0; p < PPG; p++) {
+            uint32_t pw = w_row[bp+p];
+            uint xb = bx + p*8;
+            acc += NIBBLE_TO_FLOAT[(pw>> 0)&0xF]*sf*x_shared[xb+0];
+            acc += NIBBLE_TO_FLOAT[(pw>> 4)&0xF]*sf*x_shared[xb+1];
+            acc += NIBBLE_TO_FLOAT[(pw>> 8)&0xF]*sf*x_shared[xb+2];
+            acc += NIBBLE_TO_FLOAT[(pw>>12)&0xF]*sf*x_shared[xb+3];
+            acc += NIBBLE_TO_FLOAT[(pw>>16)&0xF]*sf*x_shared[xb+4];
+            acc += NIBBLE_TO_FLOAT[(pw>>20)&0xF]*sf*x_shared[xb+5];
+            acc += NIBBLE_TO_FLOAT[(pw>>24)&0xF]*sf*x_shared[xb+6];
+            acc += NIBBLE_TO_FLOAT[(pw>>28)&0xF]*sf*x_shared[xb+7];
+        }
+    }
+    if (simd_lane == 0) out[k_idx * DIM + row] = simd_sum(acc);
+}
+
+
 kernel void moe_combine(
     device const float* expert_outs [[buffer(0)]],
     device const float* weights     [[buffer(1)]],
