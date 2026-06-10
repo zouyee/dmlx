@@ -235,15 +235,19 @@ typedef struct {
     void *pipe_bf16_to_f32;
     void *pipe_dequant_matvec_affine_bf16in_f32out;
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
-    void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion (enables CB1+CB2 merge)
-    void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert (GPU, eliminates CPU round-trip)
-    void *pipe_f32_to_bf16_vec;         // Path B: residual f32→bf16 on GPU (no CPU readback)
-    void *pipe_bf16_to_f32_vec;         // Path B: residual bf16→f32 writeback on GPU
-
+    void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion
+    void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert
+    void *pipe_f32_to_bf16_vec;         // residual f32→bf16 on GPU
+    void *pipe_bf16_to_f32_vec;         // residual bf16→f32 writeback
+    void *pipe_moe_route_gpu;           // GPU top-K routing (sqrtsoftplus+bitonic+normalize)
     // GPU-resident residual buffer: [MHC_MULT * DIM] f32, Shared mode.
     // Path B: eliminate all CPU↔GPU residual transfers (5 memcpy/layer, 3 GPU syncs).
     // In steady state (Step 2+), residual never leaves GPU between layers.
-    void *buf_residual_gpu;              // id<MTLBuffer> [MHC_MULT*DIM] f32
+    void *buf_residual_gpu;              // [MHC_MULT*DIM] f32 — GPU-resident residual
+    // GPU routing result buffers (written by CMD2, read by CPU after CB1 wait)
+    void *buf_routing_scores_f32;        // [N_EXPERTS] f32 — sqrtsoftplus scores
+    void *buf_routing_selected;          // [N_ACTIVE] int32 — top-6 indices
+    void *buf_routing_weights_gpu;       // [N_ACTIVE] f32  — normalized weights
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
@@ -258,6 +262,9 @@ typedef struct {
     void *buf_gather_mid;            // [N_ACTIVE × INTERMEDIATE] f32 — gather gate+up output
     void *buf_gather_out;            // [N_ACTIVE × DIM] f32 — gather down output
     void *buf_gather_expert_ids;     // [N_ACTIVE] uint32 — current expert IDs for gather dispatch
+    void *buf_gpu_route_selected;    // [N_ACTIVE] int32  — GPU routing: top-K expert IDs
+    void *buf_gpu_route_weights;     // [N_ACTIVE] f32    — GPU routing: normalized weights
+    void *buf_cached_flags;          // [N_EXPERTS] uint8 — 1=cached in SMELT, 0=not
     void *buf_shared_gate;           // [INTERMEDIATE] shared expert gate
     void *buf_shared_up;             // [INTERMEDIATE] shared expert up
     void *buf_shared_down;           // [DIM] shared expert down

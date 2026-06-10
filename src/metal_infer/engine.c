@@ -82,6 +82,19 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_limited_swiglu  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"limited_swiglu"] error:&err]);
     eng->pipe_f32_to_bf16_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"f32_to_bf16_vec"] error:&err]);
     eng->pipe_bf16_to_f32_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32_vec"] error:&err]);
+    {
+        NSError *rerr = nil;
+        id<MTLFunction> fn = [lib newFunctionWithName:@"moe_route_gpu"];
+        if (fn) {
+            id<MTLComputePipelineState> ps = [d newComputePipelineStateWithFunction:fn error:&rerr];
+            eng->pipe_moe_route_gpu = ps ? (void *)ps : NULL;
+            if (!ps) fprintf(stderr, "Metal: moe_route_gpu compile failed: %s\n",
+                             [[rerr localizedDescription] UTF8String]);
+        } else {
+            fprintf(stderr, "Metal: moe_route_gpu function not found in library\n");
+            eng->pipe_moe_route_gpu = NULL;
+        }
+    }
     // mHC GPU kernels (f16/bfloat)
     eng->pipe_mhc_pre_f16   = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_f16"] error:&err]);
     eng->pipe_mhc_post_f16  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_f16"] error:&err]);
@@ -129,9 +142,13 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->buf_mhc_ffn_post_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
     (void)MIX3_size;
 
-    // GPU-resident residual buffer (Path B: eliminate CPU↔GPU residual transfers)
+    // GPU-resident residual buffer (Path B)
     eng->buf_residual_gpu = (void *)[d newBufferWithLength:(size_t)MHC_MULT * DIM * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
+    // GPU routing result buffers
+    eng->buf_routing_scores_f32  = (void *)[d newBufferWithLength:N_EXPERTS * sizeof(float)   options:MTLResourceStorageModeShared];
+    eng->buf_routing_selected    = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    eng->buf_routing_weights_gpu = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(float)   options:MTLResourceStorageModeShared];
 
     // 2MB-aligned expert I/O buffers
     for (int k = 0; k < N_ACTIVE; k++) {
@@ -1000,10 +1017,13 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     static float attn_input[DIM], normed[DIM], attn_out[DIM];
     static float ffn_input[DIM], ffn_out[DIM];
     static uint16_t normed_bf16_direct[DIM];
-    float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
+    float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];          // attn mHC post/comb (for cb3)
+    float post_ffn[MHC_MULT], comb_ffn[MHC_MULT * MHC_MULT];  // ffn mHC post/comb (deferred cb3)
+    bool shared_done_early = false;
+    const bool use_hash_routing = (eng->tid2eid[layer] != NULL && eng->current_token_id >= 0);
+    bool use_gpu_routing = false;  // set in CMD2 enc7 when SMELT warm + score-based layer
 
-    // === Attention sublayer — GPU mhc_pre_f16 (matches MLX bf16 computation) ===
-    MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
+    // === Attention sublayer — GPU mhc_pre bfloat computation ===
     if (layer == 0 && getenv("MF_DBG")) {
         double rn=0; for(int z=0;z<MHC_MULT*DIM;z++) rn+=(double)residual[z]*residual[z];
         fprintf(stderr, "[mf-dbg] L0 pos=%d in residual norm=%.4f res[0]=%.6f res[DIM]=%.6f\n", pos, sqrt(rn), residual[0], residual[DIM]);
@@ -1053,8 +1073,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         [cb commit]; [cb waitUntilCompleted];
 
         memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
-        memcpy(post,       [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
-        memcpy(comb,       [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
+        // post/comb NOT read here — cb2+CMD2 reads buf_mhc_post/comb_weights directly from GPU
         uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
@@ -1211,7 +1230,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [e endEncoding];
         }
-        // Enc 6: routing_gate
+        // Enc 6: routing_gate → buf_routing_scores
         if (eng->gate_proj[layer]) {
             id<MTLComputeCommandEncoder> enc = [cb2cmd2 computeCommandEncoder];
             [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
@@ -1224,14 +1243,16 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [enc endEncoding];
         }
 
+        // (can_gpu_route block with dsv4 kernels already encoded above)
+
         [cb2cmd2 commit]; [cb2cmd2 waitUntilCompleted];
 
         // CPU readback
         uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
         for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
         memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in      contents], DIM * sizeof(float));
-        memcpy(post,      [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
-        memcpy(comb,      [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
+        memcpy(post_ffn,  [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
+        memcpy(comb_ffn,  [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
         uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
@@ -1263,8 +1284,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     int expert_ids[N_ACTIVE];
     float expert_weights[N_ACTIVE];
-    const bool use_hash_routing = (eng->tid2eid[layer] != NULL && eng->current_token_id >= 0);
-    if (use_hash_routing && eng->tid2eid[layer] != NULL && eng->current_token_id >= 0) {
+    if (use_hash_routing) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
         for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
         // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.

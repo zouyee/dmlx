@@ -2468,3 +2468,75 @@ kernel void mla_sdpa_prefill_bfloat(
 #undef PREFILL_NQ
 #undef PREFILL_HD
 #undef PREFILL_SLOTS
+
+// ============================================================================
+// moe_route_gpu: unified GPU MoE routing (replaces cpu_moe_route).
+// Single dispatch: sqrtsoftplus + SMELT penalty + bitonic top-6 + L1-normalize.
+// 256 threads x 1 threadgroup, one thread per expert.
+// ============================================================================
+kernel void moe_route_gpu(
+    device const float*   logits        [[buffer(0)]],  // [256] gate logits (f32)
+    device const float*   bias          [[buffer(1)]],  // [256] e_score_correction_bias
+    device const uint8_t* cached        [[buffer(2)]],  // [256] 1=in SMELT pool
+    device int32_t*       selected      [[buffer(3)]],  // [6]  output: top-6 expert IDs
+    device float*         weights       [[buffer(4)]],  // [6]  output: routing weights
+    constant float&       smelt_penalty [[buffer(5)]],
+    constant uint&        has_bias      [[buffer(6)]],
+    constant uint&        has_smelt     [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    const uint N = 256u, K = 6u;
+    const float ROUTE_SCALE = 1.5f;
+
+    // sqrtsoftplus score (matches MLX DSV4Gate scoring_func=sqrtsoftplus)
+    float l = logits[tid];
+    float sp = l > 0.0f ? l + log(1.0f + exp(-l)) : log(1.0f + exp(l));
+    float score = sqrt(sp);
+
+    // biased score for top-K selection only
+    float biased = score;
+    if (has_bias)  biased += bias[tid];
+    if (has_smelt && !cached[tid]) biased -= smelt_penalty;
+
+    threadgroup float   tg_scores[256];
+    threadgroup float   tg_raw[256];
+    threadgroup int32_t tg_idx[256];
+    threadgroup float   ksum[8];
+
+    tg_scores[tid] = biased;
+    tg_raw[tid]    = score;
+    tg_idx[tid]    = (int32_t)tid;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Bitonic sort descending
+    for (uint k = 2u; k <= N; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            uint other = tid ^ j;
+            if (other > tid) {
+                int32_t ai = tg_idx[tid], bi2 = tg_idx[other];
+                float sa = tg_scores[(uint)ai], sb2 = tg_scores[(uint)bi2];
+                bool ascending = ((tid & k) == 0u);
+                if (ascending ? sa < sb2 : sa > sb2) {
+                    tg_idx[tid] = bi2; tg_idx[other] = ai;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid < K) {
+        selected[tid] = tg_idx[tid];
+        ksum[tid] = tg_raw[(uint)tg_idx[tid]];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float s = 0.0f;
+        for (uint i = 0; i < K; i++) s += ksum[i];
+        s = max(s, 1e-20f);
+        for (uint i = 0; i < K; i++) ksum[i] = ksum[i] / s * ROUTE_SCALE;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid < K) weights[tid] = ksum[tid];
+}
