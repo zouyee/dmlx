@@ -681,32 +681,6 @@ static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
     pthread_mutex_unlock(&pool->mutex);
 }
 
-// Async variant: dispatch without waiting. Call io_pool_wait() to synchronize.
-static void io_pool_dispatch_start(IOPool *pool, int layer_fd, int *expert_ids, int K,
-                                    uint8_t *buffers[6]) {
-    pthread_mutex_lock(&pool->mutex);
-    for (int k = 0; k < K; k++) {
-        pool->fd[k] = layer_fd;
-        pool->buf[k] = buffers[k];
-        pool->size = EXPERT_SIZE;
-        pool->offset[k] = (off_t)expert_ids[k] * EXPERT_SIZE;
-    }
-    pool->num_tasks = K;
-    pool->tasks_done = 0;
-    pool->generation++;
-    pthread_cond_broadcast(&pool->work_ready);
-    pthread_mutex_unlock(&pool->mutex);
-    // returns immediately — call io_pool_wait() before using buffers
-}
-
-static void io_pool_wait(IOPool *pool) {
-    pthread_mutex_lock(&pool->mutex);
-    while (pool->tasks_done < pool->num_tasks) {
-        pthread_cond_wait(&pool->work_done, &pool->mutex);
-    }
-    pthread_mutex_unlock(&pool->mutex);
-}
-
 // ============================================================================
 // Temporal expert prediction
 // ============================================================================
@@ -1072,7 +1046,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     static float ffn_input[DIM], ffn_out[DIM];
     static uint16_t normed_bf16_direct[DIM];
     float post[MHC_MULT], comb[MHC_MULT * MHC_MULT];
-    bool shared_done_early = false;  // set to true if shared expert ran during async pread overlap
 
     // === Attention sublayer — GPU mhc_pre_f16 (matches MLX bf16 computation) ===
     MhcWeights ahc = { eng->attn_hc_fn[layer], eng->attn_hc_base[layer], eng->attn_hc_scale[layer] };
@@ -1401,10 +1374,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
     // the ffn-normed vector into it. MoE combine writes the pure routed-expert
     // sum (zero residual) to buf_hidden.
-    //
-    // Async pread overlap: dispatch pread immediately after routing, then do
-    // shared expert (GPU) and cb3 (GPU) while SSD I/O runs in background.
-    // On cache hit (SMELT), io_pool_dispatch_cached returns instantly anyway.
     {
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
         memcpy(bn, normed, DIM * sizeof(float));
@@ -1412,123 +1381,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
         double ti0=0, ti1=0, ti2=0;
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti0 = ts.tv_sec*1e9+ts.tv_nsec; }
-
-        // Phase 1: determine buffers (cache hit = zero-copy, no I/O needed)
+        // Use cached dispatch: reads from RAM if expert is preloaded, SSD otherwise
         uint8_t *expert_data[6];
         for (int k = 0; k < N_ACTIVE; k++) expert_data[k] = eng->expert_buf[k];
-        int all_cached = 0;
-
-        if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer]) {
-            // Check cache — if all hit, no pread needed
-            all_cached = 1;
-            for (int k = 0; k < N_ACTIVE; k++) {
-                int eid = expert_ids[k];
-                if (eid < 0 || eid >= N_EXPERTS || !eng->expert_mem_cache[layer][eid]) {
-                    all_cached = 0; break;
-                }
-            }
-            if (all_cached) {
-                for (int k = 0; k < N_ACTIVE; k++)
-                    expert_data[k] = eng->expert_mem_cache[layer][expert_ids[k]];
-            }
-        }
-
-        if (!all_cached) {
-            // Async pread start: dispatch immediately, don't wait yet.
-            // Shared expert GPU work below will overlap with SSD I/O.
-            if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer]) {
-                // Partial cache hit: handle via cached dispatch (sync for misses)
-                io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
-                all_cached = 1; // treat as sync-done
-            } else {
-                // No cache: async pread, wait later
-                io_pool_dispatch_start(io, eng->packed_fd[layer], expert_ids, N_ACTIVE, expert_data);
-            }
-        }
-
+        io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti1 = ts.tv_sec*1e9+ts.tv_nsec; }
-
-        // Shared expert is moved BEFORE moe_forward_layer when pread is async,
-        // so GPU shared expert work overlaps with SSD I/O.
-        // Results are accumulated into ffn_out after both complete.
-        float shared_out_tmp[DIM];
-        memset(shared_out_tmp, 0, sizeof(shared_out_tmp));
-        bool shared_done_early = false;
-
-        if (!all_cached && eng->shared[layer].gate.packed != NULL) {
-            // Run shared expert on GPU now (overlaps with async pread)
-            const int SE_GS = 64;
-            const int SE_NG_GU = DIM / SE_GS;
-            const int SE_NG_D  = INTERMEDIATE / SE_GS;
-            memcpy([(id<MTLBuffer>)eng->buf_mhc_attn_in contents], normed, DIM*sizeof(float));
-            id<MTLBuffer> bx    = (id<MTLBuffer>)eng->buf_mhc_attn_in;
-            id<MTLBuffer> bgate = (id<MTLBuffer>)eng->buf_hidden;
-            id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;
-            id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;
-            {
-                id<MTLCommandBuffer> cb_se = [P.queue commandBuffer];
-                // gate
-                { const QuantWeight *qw = &eng->shared[layer].gate;
-                  id bw=[d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                  id bs=[d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                  id bb=[d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                  id<MTLComputeCommandEncoder> e=[cb_se computeCommandEncoder];
-                  [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                  [e setBuffer:bw offset:0 atIndex:0];[e setBuffer:bs offset:0 atIndex:1];[e setBuffer:bb offset:0 atIndex:2];
-                  [e setBuffer:bx offset:0 atIndex:3];[e setBuffer:bgate offset:0 atIndex:4];
-                  uint od=qw->out_dim,id_=qw->in_dim,gs=SE_GS;
-                  [e setBytes:&od length:4 atIndex:5];[e setBytes:&id_ length:4 atIndex:6];[e setBytes:&gs length:4 atIndex:7];
-                  [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-                // up
-                { const QuantWeight *qw = &eng->shared[layer].up;
-                  id bw=[d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                  id bs=[d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                  id bb=[d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                  id<MTLComputeCommandEncoder> e=[cb_se computeCommandEncoder];
-                  [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                  [e setBuffer:bw offset:0 atIndex:0];[e setBuffer:bs offset:0 atIndex:1];[e setBuffer:bb offset:0 atIndex:2];
-                  [e setBuffer:bx offset:0 atIndex:3];[e setBuffer:bup offset:0 atIndex:4];
-                  uint od=qw->out_dim,id_=qw->in_dim,gs=SE_GS;
-                  [e setBytes:&od length:4 atIndex:5];[e setBytes:&id_ length:4 atIndex:6];[e setBytes:&gs length:4 atIndex:7];
-                  [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-                // swiglu
-                { id<MTLComputeCommandEncoder> e=[cb_se computeCommandEncoder];
-                  [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_limited_swiglu];
-                  [e setBuffer:bgate offset:0 atIndex:0];[e setBuffer:bup offset:0 atIndex:1];
-                  uint n=INTERMEDIATE; [e setBytes:&n length:4 atIndex:2];
-                  [e dispatchThreads:MTLSizeMake(INTERMEDIATE,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-                // down
-                { const QuantWeight *qw = &eng->shared[layer].down;
-                  id bw=[d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                  id bs=[d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-                  id bb=[d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-                  id<MTLComputeCommandEncoder> e=[cb_se computeCommandEncoder];
-                  [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                  [e setBuffer:bw offset:0 atIndex:0];[e setBuffer:bs offset:0 atIndex:1];[e setBuffer:bb offset:0 atIndex:2];
-                  [e setBuffer:bgate offset:0 atIndex:3];[e setBuffer:bdown offset:0 atIndex:4];
-                  uint od=qw->out_dim,id_=qw->in_dim,gs=SE_GS;
-                  [e setBytes:&od length:4 atIndex:5];[e setBytes:&id_ length:4 atIndex:6];[e setBytes:&gs length:4 atIndex:7];
-                  [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];[e endEncoding]; }
-                [cb_se commit]; [cb_se waitUntilCompleted];
-                float *sv = (float *)[bdown contents];
-                for (int j = 0; j < DIM; j++) shared_out_tmp[j] = sv[j];
-                shared_done_early = true;
-            }
-            // Now wait for pread to complete (should be done or nearly done by now)
-            io_pool_wait(io);
-        } else if (!all_cached) {
-            // Sync wait (shouldn't reach here normally)
-            io_pool_wait(io);
-        }
-
         moe_forward_layer(eng, layer, expert_data, expert_ids, expert_weights, N_ACTIVE);
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti2 = ts.tv_sec*1e9+ts.tv_nsec;
             fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
-        // Add early shared expert result if computed during pread overlap
-        if (shared_done_early) {
-            for (int j = 0; j < DIM; j++) ffn_out[j] += shared_out_tmp[j];
-        }
     }
 
     if (layer == 0 && getenv("MF_DBG")) {
@@ -1545,8 +1406,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Shared expert: runs on the same normed input, output added to ffn_out.
     // gate + up + limited_swiglu + down in ONE command buffer (4 encoders, 1 wait).
     // Saves 1 GPU sync (was 2 waits) = ~13ms/layer × 43 layers = ~560ms/token.
-    // NOTE: skipped if already executed above during async pread overlap (shared_done_early).
-    if (eng->shared[layer].gate.packed != NULL && !shared_done_early) {
+    if (eng->shared[layer].gate.packed != NULL) {
         const int SE_GS = 64;
         const int SE_NG_GU = DIM / SE_GS;        // 64 groups for gate/up [2048,4096]
         const int SE_NG_D  = INTERMEDIATE / SE_GS; // 32 groups for down [4096,2048]
