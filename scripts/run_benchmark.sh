@@ -141,12 +141,15 @@ print(int((pages.get('Pages free',0)+pages.get('Pages inactive',0)+pages.get('Pa
         echo -e "\n❌ Server failed to start"; tail -20 /tmp/benchmark_serve.log; exit 1
     fi
 
-    # Warmup: heat GPU caches (not measured)
-    echo "   Warmup request..."
-    curl -s --max-time 60 "${SERVER_URL}/v1/chat/completions" \
-        -H 'Content-Type: application/json' \
-        -d '{"model":"d","messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"temperature":0}' \
-        > /dev/null 2>&1 || true
+    # Warmup: heat GPU caches — send 5 requests to fully warm pipeline state
+    # (Metal PSO compilation + GPU thread warmup can take first 3-4 requests)
+    echo "   Warmup (5 requests)..."
+    for i in 1 2 3 4 5; do
+        curl -s --max-time 60 "${SERVER_URL}/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"d","messages":[{"role":"user","content":"Hi"}],"max_tokens":5,"temperature":0}' \
+            > /dev/null 2>&1 || true
+    done
 
     # Correctness: Paris (sequential, measured but not counted in perf)
     echo "   Correctness check..."
@@ -161,6 +164,15 @@ print(int((pages.get('Pages free',0)+pages.get('Pages inactive',0)+pages.get('Pa
         echo "   ✗ Paris FAILED: \"${PARIS_TEXT}\""
         NATIVE_CORRECT=0
     fi
+
+    # Re-warm GPU after Paris (Paris uses a different prompt, which can re-cold the pipeline)
+    echo "   Re-warm after Paris (2 requests)..."
+    for i in 1 2; do
+        curl -s --max-time 60 "${SERVER_URL}/v1/chat/completions" \
+            -H 'Content-Type: application/json' \
+            -d '{"model":"d","messages":[{"role":"user","content":"Hi"}],"max_tokens":5,"temperature":0}' \
+            > /dev/null 2>&1 || true
+    done
 
     # Perf: 3 sequential requests, report median tok/s
     echo "   Performance (3 sequential runs, max_tokens=5)..."
