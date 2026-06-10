@@ -145,10 +145,12 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     // GPU-resident residual buffer (Path B)
     eng->buf_residual_gpu = (void *)[d newBufferWithLength:(size_t)MHC_MULT * DIM * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    // GPU routing result buffers
-    eng->buf_routing_scores_f32  = (void *)[d newBufferWithLength:N_EXPERTS * sizeof(float)   options:MTLResourceStorageModeShared];
-    eng->buf_routing_selected    = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(int32_t) options:MTLResourceStorageModeShared];
-    eng->buf_routing_weights_gpu = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(float)   options:MTLResourceStorageModeShared];
+    // GPU routing result buffers (written by CMD2 Enc 7, read by CPU after waitUntilCompleted)
+    eng->buf_gpu_route_selected  = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(int32_t) options:MTLResourceStorageModeShared];
+    eng->buf_gpu_route_weights   = (void *)[d newBufferWithLength:N_ACTIVE  * sizeof(float)   options:MTLResourceStorageModeShared];
+    eng->buf_cached_flags        = (void *)[d newBufferWithLength:N_EXPERTS * sizeof(uint8_t) options:MTLResourceStorageModeShared];
+    // Zero out cached_flags — will be set per-layer by smelt_finish_warmup
+    memset([(id<MTLBuffer>)eng->buf_cached_flags contents], 0, N_EXPERTS * sizeof(uint8_t));
 
     // 2MB-aligned expert I/O buffers
     for (int k = 0; k < N_ACTIVE; k++) {
@@ -458,6 +460,26 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         }
         fprintf(stderr, "[smelt] Created %d persistent Shared GPU buffers for cached experts\n", n_created * 6);
     }
+
+    // === Populate buf_cached_flags for GPU routing (moe_route_gpu Enc 7) ===
+    // buf_cached_flags is per-expert (not per-layer), shared across all layers.
+    // For simplicity: a flag is set if the expert is cached in ANY score-based layer.
+    // In practice all score layers cache the same top-N experts, so this is correct.
+    // Hash layers (0-2) don't use GPU routing, so they don't consume this buffer.
+    if (eng->buf_cached_flags) {
+        uint8_t *flags = (uint8_t *)[(id<MTLBuffer>)eng->buf_cached_flags contents];
+        memset(flags, 0, N_EXPERTS * sizeof(uint8_t));
+        // Use layer 5 (first score-based layer) as representative
+        for (int eid = 0; eid < N_EXPERTS; eid++) {
+            if (eng->expert_mem_cache[5] && eng->expert_mem_cache[5][eid]) {
+                flags[eid] = 1;
+            }
+        }
+        int n_flagged = 0;
+        for (int eid = 0; eid < N_EXPERTS; eid++) n_flagged += flags[eid];
+        fprintf(stderr, "[smelt] GPU routing flags: %d/%d experts marked cached\n", n_flagged, N_EXPERTS);
+    }
+
     return n;
 }
 
@@ -1243,7 +1265,36 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [enc endEncoding];
         }
 
-        // (can_gpu_route block with dsv4 kernels already encoded above)
+        // Enc 7: GPU routing — sqrtsoftplus + SMELT penalty + bitonic top-6 + L1-normalize.
+        // Dispatched when SMELT warm + score-based routing + kernel compiled.
+        // Reads buf_routing_scores (Enc 6 output), writes buf_gpu_route_selected/weights.
+        if (!use_hash_routing && eng->smelt_warmup_done && eng->pipe_moe_route_gpu && eng->gate_proj[layer]) {
+            id<MTLBuffer> bias_buf;
+            if (eng->gate_bias[layer]) {
+                bias_buf = [(id<MTLDevice>)eng->device
+                    newBufferWithBytes:eng->gate_bias[layer]
+                    length:N_EXPERTS * sizeof(float)
+                    options:MTLResourceStorageModeShared];
+            } else {
+                bias_buf = (id<MTLBuffer>)eng->buf_routing_scores; // dummy, unused
+            }
+            id<MTLComputeCommandEncoder> enc = [cb2cmd2 computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_moe_route_gpu];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores     offset:0 atIndex:0];
+            [enc setBuffer:bias_buf                                    offset:0 atIndex:1];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_cached_flags       offset:0 atIndex:2];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_gpu_route_selected offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_gpu_route_weights  offset:0 atIndex:4];
+            float penalty = eng->smelt_penalty;
+            uint has_bias = (eng->gate_bias[layer] != NULL) ? 1u : 0u;
+            uint has_smelt = 1u;
+            [enc setBytes:&penalty   length:sizeof(float) atIndex:5];
+            [enc setBytes:&has_bias  length:sizeof(uint)  atIndex:6];
+            [enc setBytes:&has_smelt length:sizeof(uint)  atIndex:7];
+            [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+            use_gpu_routing = true;
+        }
 
         [cb2cmd2 commit]; [cb2cmd2 waitUntilCompleted];
 
@@ -1288,7 +1339,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
         for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
         // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.
-        // First compute sqrtsoftplus on the current gate scores.
         float wsum = 0;
         for (int k = 0; k < N_ACTIVE; k++) {
             float l = scores[expert_ids[k]];
@@ -1298,8 +1348,17 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         wsum += 1e-20f;
         for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+    } else if (use_gpu_routing) {
+        // GPU routing: read results from buf_gpu_route_selected / buf_gpu_route_weights
+        // (written by CMD2 Enc 7, guaranteed complete after waitUntilCompleted)
+        int32_t *sel = (int32_t *)[(id<MTLBuffer>)eng->buf_gpu_route_selected contents];
+        float   *wts = (float   *)[(id<MTLBuffer>)eng->buf_gpu_route_weights  contents];
+        for (int k = 0; k < N_ACTIVE; k++) {
+            expert_ids[k]     = (int)sel[k];
+            expert_weights[k] = wts[k];
+        }
     } else {
-        // Determine SMELT cache mask: only apply penalty after warmup
+        // CPU routing fallback (warmup phase or hash routing layers)
         const uint8_t *const *smelt_cache = NULL;
         if (eng->smelt_enabled && eng->smelt_warmup_done && eng->expert_mem_cache[layer]) {
             smelt_cache = (const uint8_t *const *)eng->expert_mem_cache[layer];
