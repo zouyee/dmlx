@@ -441,49 +441,6 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         }
         fprintf(stderr, "[smelt] Created %d persistent Shared GPU buffers for cached experts\n", n_created * 6);
     }
-
-    // === GPU warmup: touch all expert buffers to establish page-table mappings ===
-    // Without this, the first forward pass with any given expert incurs a GPU TLB/page-table
-    // setup cost (~100-160ms vs ~12ms warm). A single dummy read per buffer amortizes this.
-    // We dispatch a tiny compute pass that reads 1 element from each gate_W buffer.
-    // Total data read: n_per_layer × 43 × 4B ≈ negligible; time: <1s for all layers.
-    {
-        id<MTLDevice> d = (id<MTLDevice>)eng->device;
-        id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
-        fprintf(stderr, "[smelt] GPU warmup: touching all expert buffers...\n");
-
-        // Use a persistent scratch output buffer (1 float, discarded)
-        id<MTLBuffer> sink = [d newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
-
-        // For each layer, commit one CB that copies 4 bytes from each expert's gate_W.
-        // Use Metal blit encoder (cheapest touch, no kernel needed).
-        for (int layer = 0; layer < N_LAYERS; layer++) {
-            if (!eng->expert_mem_cache[layer]) continue;
-            id<MTLCommandBuffer> cb = [q commandBuffer];
-            id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-            for (int eid = 0; eid < N_EXPERTS; eid++) {
-                void *gbuf = eng->expert_gpu_buf[layer][eid][0];  // gate_W buffer
-                if (!gbuf) continue;
-                // Copy 4 bytes (one uint32) from the start of this expert's gate_W to sink.
-                // This forces the GPU to establish TLB/page-table entry for the buffer.
-                [blit copyFromBuffer:(id<MTLBuffer>)gbuf
-                       sourceOffset:0
-                           toBuffer:sink
-                  destinationOffset:0
-                               size:4];
-            }
-            [blit endEncoding];
-            [cb commit];
-            // Don't waitUntilCompleted per layer — let them pipeline.
-            // Wait at the end using a final barrier CB.
-        }
-        // Final barrier: wait for all warmup CBs to complete
-        id<MTLCommandBuffer> barrier = [q commandBuffer];
-        [barrier commit];
-        [barrier waitUntilCompleted];
-        fprintf(stderr, "[smelt] GPU warmup complete — all expert page tables established\n");
-    }
-
     return n;
 }
 

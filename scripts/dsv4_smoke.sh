@@ -94,8 +94,7 @@ fi
 run_case() {
     local name="$1" prompt="$2" max_tokens="$3" expected="$4"
     local resp text
-    # 90s timeout per request — sufficient for SMELT mode (1s/tok) and short SSD tests
-    resp="$(curl -s --max-time 90 "http://localhost:${PORT}/v1/chat/completions" \
+    resp="$(curl -s "http://localhost:${PORT}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
         -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}],\"max_tokens\":${max_tokens},\"temperature\":0}")"
     text="$(echo "${resp}" | python3 -c "import sys,json
