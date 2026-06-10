@@ -1021,7 +1021,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Subsequent layers: mhc_post writes back to buf_residual_gpu at end of each layer.
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-
         // Encoder 1: mhc_pre(attn) — reads buf_residual_gpu directly (no CPU memcpy)
         {
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
@@ -1050,7 +1049,24 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb commit]; [cb waitUntilCompleted];
+        [cb commit];
+
+        // Deferred cb3 overlap: wait for previous layer's cb3(N-1) while CB-A(N) runs on GPU.
+        // GPU serializes: cb3(N-1) → CB-A(N). CPU waits here — cb3 wait is hidden inside CB-A GPU time.
+        if (eng->deferred.active && eng->deferred.cmd_experts) {
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+            eng->deferred.cmd_experts = NULL;
+            eng->deferred.active = false;
+            // CPU residual readback (buf_residual_gpu already correct via enc3 of cb3)
+            uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
+            for (int i = 0; i < MHC_MULT * DIM; i++) {
+                uint32_t u = ((uint32_t)res_out[i]) << 16;
+                memcpy(&residual[i], &u, 4);
+            }
+        }
+
+        [cb waitUntilCompleted];
 
         memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
         memcpy(post,       [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
@@ -1459,12 +1475,13 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb3 commit]; [cb3 waitUntilCompleted];
-
-        // CPU readback for next layer's CB-A (now reads from buf_residual_gpu via mhc_pre)
-        // Also needed for debug output and compress_hc after final layer.
-        uint16_t *res3_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+        [cb3 commit];
+        // DEFERRED: don't wait. GPU queue serializes cb3(N) → CB-A(N+1) automatically.
+        // We will wait at the START of CB-A(N+1) (after CB-A commit, before CB-A wait).
+        eng->deferred.active = true;
+        eng->deferred.cmd_experts = (void *)[(id<MTLCommandBuffer>)cb3 retain];
+        // CPU residual readback happens at deferred completion in next layer.
+        // buf_residual_gpu is already written by enc3 above (GPU-side).
     }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
@@ -1505,6 +1522,20 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             fprintf(stderr, "[TIME] pos=%d layer=%d: %.1fms\n", pos, layer, (t1-t0)/1e6);
         }
     }
+    // Wait for the final layer's deferred cb3 before returning.
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        // Final CPU readback: sync hidden[] from GPU for compress_hc / logits
+        uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) {
+            uint32_t u = ((uint32_t)res_out[i]) << 16;
+            memcpy(&hidden[i], &u, 4);
+        }
+    }
+
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
     // calls forward token-by-token). We detect decode mode by checking the engine's
