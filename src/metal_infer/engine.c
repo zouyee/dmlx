@@ -80,6 +80,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_mla_sdpa_prefill_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_prefill_bfloat"] error:&err]);
     eng->pipe_bf16_to_f16_row = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f16_row"] error:&err]);
     eng->pipe_limited_swiglu  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"limited_swiglu"] error:&err]);
+    eng->pipe_f32_to_bf16_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"f32_to_bf16_vec"] error:&err]);
+    eng->pipe_bf16_to_f32_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32_vec"] error:&err]);
     // mHC GPU kernels (f16/bfloat)
     eng->pipe_mhc_pre_f16   = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_f16"] error:&err]);
     eng->pipe_mhc_post_f16  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_f16"] error:&err]);
@@ -126,6 +128,10 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->buf_mhc_post_res_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
     eng->buf_mhc_ffn_post_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
     (void)MIX3_size;
+
+    // GPU-resident residual buffer (Path B: eliminate CPU↔GPU residual transfers)
+    eng->buf_residual_gpu = (void *)[d newBufferWithLength:(size_t)MHC_MULT * DIM * sizeof(float)
+                                                    options:MTLResourceStorageModeShared];
 
     // 2MB-aligned expert I/O buffers
     for (int k = 0; k < N_ACTIVE; k++) {
@@ -1010,20 +1016,20 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     }
     // Use GPU mhc_pre_gpu — reuse persistent scratch buffers (eliminates alloc/dealloc overhead)
     // === CB-A: mhc_pre(attn) + input_RMSNorm merged into ONE command buffer (2 encoders, 1 wait) ===
-    // Eliminates 2→1 waits (was: mhc_pre CB + separate RMSNorm CB).
+    // Path B Step 1: buf_residual_gpu is the source-of-truth for residual.
+    // No memcpy needed — embed() already wrote to buf_residual_gpu.
+    // Subsequent layers: mhc_post writes back to buf_residual_gpu at end of each layer.
     {
-        // Copy residual into persistent input buffer
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
-        // Encoder 1: mhc_pre(attn)
+        // Encoder 1: mhc_pre(attn) — reads buf_residual_gpu directly (no CPU memcpy)
         {
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]    offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]  offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_in           offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu         offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in          offset:0 atIndex:4];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights     offset:0 atIndex:5];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights     offset:0 atIndex:6];
@@ -1125,27 +1131,57 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             if (layer == 0) fprintf(stderr, "[ATTN-TIME] L0 pos=%d attn=%.1fms\n", pos, (ta1-ta0)/1e6); }
     }
 
-    // mHC post (attn) — reuse persistent scratch buffers
+    // mHC post (attn) — Path B: read residual from buf_residual_gpu (no CPU readback)
     {
-        // Convert attn_out and residual to bf16 into persistent buffers
+        // Convert attn_out to bf16
         uint16_t *attn_out_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 contents];
-        uint16_t *res_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_res_bf16_in contents];
         for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &attn_out[i], 4); attn_out_buf[i] = (uint16_t)(u >> 16); }
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_buf[i] = (uint16_t)(u >> 16); }
         memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
         id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
-        [enc2 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
-        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16  offset:0 atIndex:0];
-        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in    offset:0 atIndex:1];
-        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights   offset:0 atIndex:2];
-        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights   offset:0 atIndex:3];
-        [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_res_out   offset:0 atIndex:4];
-        uint hc2 = MHC_MULT, dim2 = DIM;
-        [enc2 setBytes:&hc2 length:4 atIndex:5]; [enc2 setBytes:&dim2 length:4 atIndex:6];
-        [enc2 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc2 endEncoding]; [cb2 commit]; [cb2 waitUntilCompleted];
+
+        // Encoder 1: f32→bf16 on GPU (residual is already in buf_residual_gpu as f32)
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_f32_to_bf16_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu  offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in offset:0 atIndex:1];
+            uint n = MHC_MULT * DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(MHC_MULT*DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
+        // Encoder 2: mhc_post(attn)
+        {
+            id<MTLComputeCommandEncoder> enc2 = [cb2 computeCommandEncoder];
+            [enc2 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16  offset:0 atIndex:0];
+            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in    offset:0 atIndex:1];
+            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights   offset:0 atIndex:2];
+            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights   offset:0 atIndex:3];
+            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_res_out   offset:0 atIndex:4];
+            uint hc2 = MHC_MULT, dim2 = DIM;
+            [enc2 setBytes:&hc2 length:4 atIndex:5]; [enc2 setBytes:&dim2 length:4 atIndex:6];
+            [enc2 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc2 endEncoding];
+        }
+
+        // Encoder 3: bf16→f32, write back to buf_residual_gpu
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_res_out offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu     offset:0 atIndex:1];
+            uint n = MHC_MULT * DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(MHC_MULT*DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
+        [cb2 commit]; [cb2 waitUntilCompleted];
+
+        // CPU readback for downstream use (CPU-side routing, compressor, debug)
         uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
         for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
     }
@@ -1175,21 +1211,20 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     }
 
     // === P0: CMD2 — merge mhc_pre(ffn) + ffn_RMSNorm + routing_gate into single CB
-    // Eliminates 2 redundant waitUntilCompleted per layer (43×2 = 86 fewer GPU syncs/token).
-    // These 3 encoders have pure sequential data dependencies and no type-conversion gaps.
+    // Path B: read residual from buf_residual_gpu directly (no CPU memcpy needed).
     {
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_ffn_res_in contents], residual, MHC_MULT*DIM*sizeof(float));
+        // buf_residual_gpu already holds the updated residual from cb2 above (no memcpy needed)
 
         id<MTLCommandBuffer> cmd2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
-        // Encoder 1: mhc_pre(ffn) → buf_mhc_ffn_in + buf_mhc_post_weights + buf_mhc_comb_weights
+        // Encoder 1: mhc_pre(ffn) — reads buf_residual_gpu directly
         {
             id<MTLComputeCommandEncoder> enc = [cmd2 computeCommandEncoder];
             [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_res_in      offset:0 atIndex:3];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu        offset:0 atIndex:3];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:4];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:5];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:6];
@@ -1411,26 +1446,57 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
     } // end if shared expert
 
-    // mHC post (FFN) — reuse persistent scratch buffers
+    // mHC post (FFN) — Path B: use buf_residual_gpu, no CPU residual readback
     {
         uint16_t *ffn_out_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 contents];
-        uint16_t *res_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_res_bf16_in contents];
         for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &ffn_out[i], 4); ffn_out_buf[i] = (uint16_t)(u >> 16); }
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u; memcpy(&u, &residual[i], 4); res_buf[i] = (uint16_t)(u >> 16); }
         memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
         id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
-        id<MTLComputeCommandEncoder> enc3 = [cb3 computeCommandEncoder];
-        [enc3 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
-        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 offset:0 atIndex:0];
-        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in   offset:0 atIndex:1];
-        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights  offset:0 atIndex:2];
-        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights  offset:0 atIndex:3];
-        [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_post_out  offset:0 atIndex:4];
-        uint hc3 = MHC_MULT, dim3 = DIM;
-        [enc3 setBytes:&hc3 length:4 atIndex:5]; [enc3 setBytes:&dim3 length:4 atIndex:6];
-        [enc3 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-        [enc3 endEncoding]; [cb3 commit]; [cb3 waitUntilCompleted];
+
+        // Encoder 1: f32→bf16 on GPU for residual (buf_residual_gpu → buf_mhc_res_bf16_in)
+        {
+            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_f32_to_bf16_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu    offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in offset:0 atIndex:1];
+            uint n = MHC_MULT * DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(MHC_MULT*DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
+        // Encoder 2: mhc_post(ffn)
+        {
+            id<MTLComputeCommandEncoder> enc3 = [cb3 computeCommandEncoder];
+            [enc3 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
+            [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 offset:0 atIndex:0];
+            [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in   offset:0 atIndex:1];
+            [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights  offset:0 atIndex:2];
+            [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights  offset:0 atIndex:3];
+            [enc3 setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_post_out  offset:0 atIndex:4];
+            uint hc3 = MHC_MULT, dim3 = DIM;
+            [enc3 setBytes:&hc3 length:4 atIndex:5]; [enc3 setBytes:&dim3 length:4 atIndex:6];
+            [enc3 dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc3 endEncoding];
+        }
+
+        // Encoder 3: bf16→f32 writeback to buf_residual_gpu (residual updated for next layer)
+        {
+            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_post_out offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu     offset:0 atIndex:1];
+            uint n = MHC_MULT * DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(MHC_MULT*DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
+        [cb3 commit]; [cb3 waitUntilCompleted];
+
+        // CPU readback for next layer's CB-A (now reads from buf_residual_gpu via mhc_pre)
+        // Also needed for debug output and compress_hc after final layer.
         uint16_t *res3_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
         for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
     }
@@ -1753,6 +1819,12 @@ void moe_infer_embed(MoEInferEngine *eng, int token_id, float *hidden_out) {
             uint32_t u; memcpy(&u, &row[d], 4); u &= 0xFFFF0000U;
             memcpy(&hidden_out[m * DIM + d], &u, 4);
         }
+    }
+    // Step 1 (Path B): keep buf_residual_gpu in sync with CPU hidden_out.
+    // Step 2 will make GPU the source-of-truth and remove the CPU copy.
+    if (eng->buf_residual_gpu) {
+        memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents],
+               hidden_out, (size_t)MHC_MULT * DIM * sizeof(float));
     }
 }
 

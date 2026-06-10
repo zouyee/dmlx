@@ -237,6 +237,13 @@ typedef struct {
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
     void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion (enables CB1+CB2 merge)
     void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert (GPU, eliminates CPU round-trip)
+    void *pipe_f32_to_bf16_vec;         // Path B: residual f32→bf16 on GPU (no CPU readback)
+    void *pipe_bf16_to_f32_vec;         // Path B: residual bf16→f32 writeback on GPU
+
+    // GPU-resident residual buffer: [MHC_MULT * DIM] f32, Shared mode.
+    // Path B: eliminate all CPU↔GPU residual transfers (5 memcpy/layer, 3 GPU syncs).
+    // In steady state (Step 2+), residual never leaves GPU between layers.
+    void *buf_residual_gpu;              // id<MTLBuffer> [MHC_MULT*DIM] f32
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state

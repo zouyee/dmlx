@@ -1135,6 +1135,31 @@ kernel void mhc_post_bfloat(
 }
 
 
+// f32_to_bf16_vec: convert n f32 values → bfloat in-place (GPU-side f32→bf16 conversion).
+// Used in Path B to avoid CPU residual readback before mhc_post.
+// Dispatch: (n + 255) / 256 threadgroups × 256 threads.
+kernel void f32_to_bf16_vec(
+    device const float*   src [[buffer(0)]],
+    device bfloat*        dst [[buffer(1)]],
+    constant uint&        n   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = bfloat(src[tid]);
+}
+
+// bf16_to_f32_vec: convert n bfloat values → f32 (for residual writeback).
+// Dispatch: (n + 255) / 256 threadgroups × 256 threads.
+kernel void bf16_to_f32_vec(
+    device const bfloat*  src [[buffer(0)]],
+    device float*         dst [[buffer(1)]],
+    constant uint&        n   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = float(src[tid]);
+}
+
 // limited_swiglu: in-place GPU SwiGLU for shared expert — eliminates CPU round-trip.
 // gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i], with clamping to avoid overflow.
 // Writes result into gate_buf (in-place); up_buf is read-only.
