@@ -1135,6 +1135,23 @@ kernel void mhc_post_bfloat(
 }
 
 
+// limited_swiglu: in-place GPU SwiGLU for shared expert — eliminates CPU round-trip.
+// gate[i] = gate[i] / (1 + exp(-gate[i])) * up[i], with clamping to avoid overflow.
+// Writes result into gate_buf (in-place); up_buf is read-only.
+// Dispatch: (n + 255) / 256 threadgroups × 256 threads.
+kernel void limited_swiglu(
+    device float*       gate_buf [[buffer(0)]],  // [n] gate (overwritten with SwiGLU output)
+    device const float* up_buf   [[buffer(1)]],  // [n] up
+    constant uint&      n        [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    const float limit = 10.0f;
+    float g = min(gate_buf[tid], limit);
+    float u = min(max(up_buf[tid], -limit), limit);
+    gate_buf[tid] = (g / (1.0f + exp(-g))) * u;
+}
+
 // bf16_to_f16_row: convert KV_LORA_RANK bfloat values → half, writing into kv_cache row.
 // Used within CB1 to eliminate CPU KV-cache round-trip (GPU blit of bf16 + convert in-place).
 // Dispatch: 1 threadgroup × KV_LORA_RANK threads.

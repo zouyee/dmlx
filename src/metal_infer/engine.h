@@ -236,6 +236,7 @@ typedef struct {
     void *pipe_dequant_matvec_affine_bf16in_f32out;
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
     void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion (enables CB1+CB2 merge)
+    void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert (GPU, eliminates CPU round-trip)
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state
