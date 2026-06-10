@@ -46,6 +46,11 @@ typedef struct {
     id<MTLBuffer> scr_out;       // [DIM] f32             — wo_b output
     id<MTLBuffer> scr_bog[8];    // [O_LORA_RANK] f32 ×8 — wo_a group outputs
     id<MTLBuffer> scr_bgv[8];    // [group_feat] bf16 ×8  — wo_a group inputs
+    // Persistent KV cache buffer: GPU-accessible Shared memory.
+    // The kv_cache CPU pointer passed to mla_attention_decode_bf16 MUST alias [kvcache_buf contents].
+    // With this buffer, we can blit bkv_n directly into the cache within CB1, enabling
+    // CB1+CB2 merge (eliminating 1 GPU sync = ~8ms/layer = 344ms/token).
+    id<MTLBuffer> kvcache_buf;   // [MAX_SEQ_LEN * KV_LORA_RANK] f16 — full KV cache
     // Validated: points to the AttnWeights that seeded this entry (pointer identity)
     const void *owner;
 } AttnBufCache;
@@ -62,7 +67,8 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
     // New entry
     if (g_attn_cache_n >= ATTN_BUF_CACHE_SIZE) return NULL;  // overflow — fall back to mkbuf
     AttnBufCache *c = &g_attn_cache[g_attn_cache_n++];
-    memset(c, 0, sizeof(*c));
+    // Zero-initialize without memset (struct contains ObjC id fields — use bzero on raw bytes)
+    bzero((void *)c, sizeof(*c));
     c->owner = (const void *)aw;
 
     // All attention weights use newBufferWithBytesNoCopy (zero-copy from backbone memory).
@@ -141,6 +147,7 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
             c->scr_bgv[g] = MKSCR((size_t)group_feat * sizeof(uint16_t));
         }
     }
+    c->kvcache_buf = MKSCR((size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
     #undef MKSCR
 
     return c;
@@ -612,7 +619,7 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
 // --- BF16 variant of mla_attention_decode ---
 int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
-                              int pos, float *out) {
+                              int pos, float *out, void *kv_cache_gpu_buf) {
     @autoreleasepool {
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
@@ -638,9 +645,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bkvn_w = abc ? abc->kv_norm_buf   : mkbuf(d, aw->kv_norm,   KV_LORA_RANK * sizeof(float));
     id<MTLBuffer> bsink  = abc ? abc->attn_sink_buf : mkbuf(d, aw->attn_sink, N_HEADS * sizeof(float));
 
-    // === CB1: Q chain + KV chain merged into ONE command buffer (8 encoders, 1 wait) ===
-    {
-        id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
+    // === CB1: Q chain + KV chain + KV blit + SDPA merged into ONE command buffer ===
+    // (GPU path: 11 encoders, 1 wait; CPU fallback: 8 encoders + separate CB2)
+    id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
         // Q chain — use cached weight buffers when available (wq_a, wq_b, wkv may be nil if memory-limited)
         if (abc && abc->wq_a_pack) {
             enc_dq_bf16_cached(P, cb1, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
@@ -669,44 +676,84 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         }
         enc_rms_norm_rows_bf16in_bf16out(P, cb1, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
         enc_rope_bf16(P, cb1, bkv_n, bcos, bsin, 1, 0);
-        [cb1 commit]; [cb1 waitUntilCompleted];
-    }
 
-    // CPU: write KV to cache (must happen before SDPA reads cache)
-    {
-        uint16_t *kvn_bf16 = (uint16_t *)[bkv_n contents];
-        uint16_t *dst = kv_cache + (size_t)(cache_len - 1) * KV_LORA_RANK;
-        for (int i = 0; i < KV_LORA_RANK; i++) {
-            uint32_t u32 = ((uint32_t)kvn_bf16[i]) << 16;
-            float fval; memcpy(&fval, &u32, 4);
-            _Float16 f16val = (_Float16)fval;
-            memcpy(&dst[i], &f16val, 2);
-        }
-    }
+        // === KV cache update + SDPA: merged into CB1 when kv_cache_gpu_buf is available ===
+        // This eliminates the CPU round-trip (GPU→CPU→GPU) between CB1 and CB2,
+        // saving ~1 GPU sync overhead (~8ms/layer).
+        id<MTLBuffer> bkvcache_persistent = (__bridge id<MTLBuffer>)kv_cache_gpu_buf;
+        id<MTLBuffer> battn_scr = (abc && abc->scr_attn) ? abc->scr_attn : mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
 
-    // === CB2: SDPA + inverse RoPE (2 encoders, 1 wait) ===
-    id<MTLBuffer> bkvcache = mkbuf(d, kv_cache, (size_t)cache_len * KV_LORA_RANK * sizeof(uint16_t));
-    id<MTLBuffer> battn    = (abc && abc->scr_attn) ? abc->scr_attn : mkbuf(d, NULL, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
-    {
-        id<MTLCommandBuffer> cb2 = [P->queue commandBuffer];
-        {
-            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
-            [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
-            [e setBuffer:bq_n offset:0 atIndex:0];
-            [e setBuffer:bkvcache offset:0 atIndex:1];
-            [e setBuffer:bsink offset:0 atIndex:2];
-            [e setBuffer:battn offset:0 atIndex:3];
-            uint nh=N_HEADS, hd=HEAD_DIM, nk=cache_len; float scale=1.0f/sqrtf((float)HEAD_DIM);
-            [e setBytes:&nh length:4 atIndex:4];
-            [e setBytes:&hd length:4 atIndex:5];
-            [e setBytes:&nk length:4 atIndex:6];
-            [e setBytes:&scale length:4 atIndex:7];
-            [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
-            [e endEncoding];
+        if (bkvcache_persistent) {
+            // GPU bf16→f16 conversion: write bkv_n into kvcache[cache_len-1] as f16.
+            // Avoids CPU round-trip (GPU→CPU→GPU) saving ~1 waitUntilCompleted per layer.
+            {
+                id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+                [e setComputePipelineState:P->bf16_to_f16_row];
+                [e setBuffer:bkv_n                 offset:0 atIndex:0];
+                [e setBuffer:bkvcache_persistent   offset:0 atIndex:1];
+                uint row = (uint)(cache_len - 1);
+                uint rank = KV_LORA_RANK;
+                [e setBytes:&row  length:4 atIndex:2];
+                [e setBytes:&rank length:4 atIndex:3];
+                [e dispatchThreads:MTLSizeMake(KV_LORA_RANK,1,1)
+                   threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            }
+            // SDPA reads the full kvcache (including the new row just written)
+            {
+                id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+                [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
+                [e setBuffer:bq_n                 offset:0 atIndex:0];
+                [e setBuffer:bkvcache_persistent  offset:0 atIndex:1];
+                [e setBuffer:bsink                offset:0 atIndex:2];
+                [e setBuffer:battn_scr            offset:0 atIndex:3];
+                uint nh=N_HEADS, hd=HEAD_DIM, nk=(uint)cache_len;
+                float scale=1.0f/sqrtf((float)HEAD_DIM);
+                [e setBytes:&nh    length:4 atIndex:4];
+                [e setBytes:&hd    length:4 atIndex:5];
+                [e setBytes:&nk    length:4 atIndex:6];
+                [e setBytes:&scale length:4 atIndex:7];
+                [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+                [e endEncoding];
+            }
+            enc_rope_bf16(P, cb1, battn_scr, bcos, bsin, N_HEADS, 1);
+            [cb1 commit]; [cb1 waitUntilCompleted];
+            // No CPU KV copy needed — bf16_to_f16_row kernel already wrote to cache
+        } else {
+            // Fallback: CPU KV copy between CB1 and CB2
+            [cb1 commit]; [cb1 waitUntilCompleted];
+            {
+                uint16_t *kvn_bf16 = (uint16_t *)[bkv_n contents];
+                uint16_t *dst = kv_cache + (size_t)(cache_len - 1) * KV_LORA_RANK;
+                for (int i = 0; i < KV_LORA_RANK; i++) {
+                    uint32_t u32 = ((uint32_t)kvn_bf16[i]) << 16;
+                    float fval; memcpy(&fval, &u32, 4);
+                    _Float16 f16val = (_Float16)fval;
+                    memcpy(&dst[i], &f16val, 2);
+                }
+            }
+            id<MTLBuffer> bkvcache_tmp = mkbuf(d, kv_cache, (size_t)cache_len * KV_LORA_RANK * sizeof(uint16_t));
+            id<MTLCommandBuffer> cb2 = [P->queue commandBuffer];
+            {
+                id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+                [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
+                [e setBuffer:bq_n           offset:0 atIndex:0];
+                [e setBuffer:bkvcache_tmp   offset:0 atIndex:1];
+                [e setBuffer:bsink          offset:0 atIndex:2];
+                [e setBuffer:battn_scr      offset:0 atIndex:3];
+                uint nh=N_HEADS, hd=HEAD_DIM, nk=(uint)cache_len;
+                float scale=1.0f/sqrtf((float)HEAD_DIM);
+                [e setBytes:&nh    length:4 atIndex:4];
+                [e setBytes:&hd    length:4 atIndex:5];
+                [e setBytes:&nk    length:4 atIndex:6];
+                [e setBytes:&scale length:4 atIndex:7];
+                [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
+                [e endEncoding];
+            }
+            enc_rope_bf16(P, cb2, battn_scr, bcos, bsin, N_HEADS, 1);
+            [cb2 commit]; [cb2 waitUntilCompleted];
         }
-        enc_rope_bf16(P, cb2, battn, bcos, bsin, N_HEADS, 1);
-        [cb2 commit]; [cb2 waitUntilCompleted];
-    }
+        id<MTLBuffer> battn = battn_scr;  // alias for code below
 
     // === CB3: wo_a (8 groups) — use cached wo_a_dense buffers ===
     uint16_t *attn_bf16 = (uint16_t *)[battn contents];

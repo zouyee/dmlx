@@ -143,7 +143,12 @@ typedef struct {
 // ============================================================================
 
 typedef struct {
-    uint16_t *kv;  // [MAX_SEQ_LEN, KV_LORA_RANK] post-norm, post-RoPE KV latent (bf16)
+    uint16_t *kv;   // [MAX_SEQ_LEN, KV_LORA_RANK] post-norm, post-RoPE KV latent
+                    // Points to [kv_gpu_buf contents] when kv_gpu_buf is set.
+                    // Format: half-precision (f16, NOT bf16) for SDPA compatibility.
+    void *kv_gpu_buf; // id<MTLBuffer> (Shared mode) wrapping kv — GPU-accessible.
+                      // NULL until first decode call allocates it.
+                      // Enables blit-based KV update (eliminates CPU round-trip between CB1 and CB2).
     int len;
 } KVCache;
 
@@ -230,6 +235,7 @@ typedef struct {
     void *pipe_bf16_to_f32;
     void *pipe_dequant_matvec_affine_bf16in_f32out;
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
+    void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion (enables CB1+CB2 merge)
 
     // Buffers (id<MTLBuffer>)
     void *buf_hidden;            // [DIM] current hidden state

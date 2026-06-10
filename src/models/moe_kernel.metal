@@ -1135,6 +1135,20 @@ kernel void mhc_post_bfloat(
 }
 
 
+// bf16_to_f16_row: convert KV_LORA_RANK bfloat values → half, writing into kv_cache row.
+// Used within CB1 to eliminate CPU KV-cache round-trip (GPU blit of bf16 + convert in-place).
+// Dispatch: 1 threadgroup × KV_LORA_RANK threads.
+kernel void bf16_to_f16_row(
+    device const bfloat* src      [[buffer(0)]],   // [KV_LORA_RANK] bfloat — bkv_n output
+    device half*         dst_cache[[buffer(1)]],   // [MAX_SEQ_LEN, KV_LORA_RANK] half — full kv_cache
+    constant uint&       row_idx  [[buffer(2)]],   // which row to write (= cache_len - 1)
+    constant uint&       rank     [[buffer(3)]],   // KV_LORA_RANK
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= rank) return;
+    dst_cache[row_idx * rank + tid] = half(float(src[tid]));
+}
+
 // mla_sdpa_decode_bfloat: ds4-style decode SDPA — float4 dot product, f16 KV cache.
 //
 // Matches ds4 kernel_flash_attn_ext_vec_f16_dk512_dv512:

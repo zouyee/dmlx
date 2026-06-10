@@ -35,6 +35,8 @@ typedef struct {
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out;
     // Prefill batch SDPA (Path B: matches MLX simdgroup reduction order)
     id<MTLComputePipelineState> mla_sdpa_prefill_bfloat;
+    // KV cache bf16→f16 conversion (used in CB1+CB2 merge to avoid CPU round-trip)
+    id<MTLComputePipelineState> bf16_to_f16_row;
 } MlaPipes;
 
 // Compute one decode-step MLA attention.
@@ -57,9 +59,13 @@ int mla_attention_decode_f16kv(MlaPipes *pipes, const AttnWeights *aw,
                                int pos, float *out);
 
 // BF16 variant: x is bfloat16, kv_cache is bfloat16, out is float.
+// kv_cache_gpu_buf: optional id<MTLBuffer> wrapping kv_cache in Shared mode.
+// When non-NULL, the function uses GPU blit to update the KV cache and merges
+// CB1+CB2 into one command buffer (saves 1 GPU sync = ~8ms/layer).
+// When NULL, falls back to CPU KV copy (safe for any kv_cache pointer).
 int mla_attention_decode_bf16(MlaPipes *pipes, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
-                              int pos, float *out);
+                              int pos, float *out, void *kv_cache_gpu_buf);
 
 // Mixed attention: uint16_t raw KV (SWA window) + f32 comp_kv (selected blocks).
 int mla_attention_decode_mixed(MlaPipes *pipes, const AttnWeights *aw,

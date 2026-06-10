@@ -78,6 +78,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_mla_sdpa_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_bfloat"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
     eng->pipe_mla_sdpa_prefill_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_prefill_bfloat"] error:&err]);
+    eng->pipe_bf16_to_f16_row = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f16_row"] error:&err]);
     // mHC GPU kernels (f16/bfloat)
     eng->pipe_mhc_pre_f16   = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_f16"] error:&err]);
     eng->pipe_mhc_post_f16  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_f16"] error:&err]);
@@ -986,6 +987,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.mla_sdpa_decode_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_bfloat;
     P.dequant_matvec_affine_bf16in_f32out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out;
     P.mla_sdpa_prefill_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_prefill_bfloat;
+    P.bf16_to_f16_row = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f16_row;
 
     // Large scratch buffers are static (forward_layer runs serially).
     static float attn_input[DIM], normed[DIM], attn_out[DIM];
@@ -1069,7 +1071,17 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // MLA attention (decode, single token -> cache_len from kv_cache)
     {
         KVCache *kvc = &eng->kv_cache[layer];
-        if (!kvc->kv) { kvc->kv = (uint16_t *)calloc((size_t)MAX_SEQ_LEN * KV_LORA_RANK, sizeof(uint16_t)); kvc->len = 0; }
+        if (!kvc->kv) {
+            // Allocate KV cache as MTLBuffer (Shared mode) so it's GPU-accessible.
+            // This enables blit-based KV update within CB1, eliminating one GPU sync per layer.
+            size_t kvc_size = (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t);
+            id<MTLBuffer> kvbuf = [(id<MTLDevice>)eng->device newBufferWithLength:kvc_size
+                                       options:MTLResourceStorageModeShared];
+            kvc->kv_gpu_buf = (void *)kvbuf;
+            kvc->kv = (uint16_t *)[kvbuf contents];
+            memset(kvc->kv, 0, kvc_size);
+            kvc->len = 0;
+        }
         kvc->len += 1;
 
         // Convert normed (f32) to bf16 for the attention call
@@ -1102,7 +1114,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                                        allowed, attn_out);
         } else {
             // BF16 attention using directly-computed bf16 normed
-            mla_attention_decode_bf16(&P, &eng->attn[layer], normed_bf16_direct, kvc->kv, kvc->len, pos, attn_out);
+            mla_attention_decode_bf16(&P, &eng->attn[layer], normed_bf16_direct, kvc->kv, kvc->len, pos, attn_out, kvc->kv_gpu_buf);
         }
         // Truncate attn_out to bf16
         for (int i = 0; i < DIM; i++) {
@@ -1657,7 +1669,8 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
             memset(eng->kv_cache[l].kv, 0,
                    (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
         }
-        // Reset compressor state
+        // kv_gpu_buf is NOT freed/released here — it persists for the engine lifetime
+        // and is reused for every new request (kv is zeroed above).
         CompressorState *cs = &eng->comp_state[l];
         cs->n_comp = 0;
         cs->n_idx_comp = 0;
