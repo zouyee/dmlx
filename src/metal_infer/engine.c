@@ -1011,6 +1011,26 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     @autoreleasepool {
 
+    // === Deferred cb3 completion (Path B: deferred mhc_post_ffn) ===
+    // Wait for the previous layer's cb3 (mhc_post_ffn) to complete.
+    // CB-A reads buf_residual_gpu which cb3 writes — the GPU queue serializes them
+    // automatically (same MTLCommandQueue), but we still need to wait before
+    // reading back residual[] for debug or compressor purposes.
+    // For most layers we only wait here; the actual buf_residual_gpu is already
+    // correct on GPU by the time CB-A starts (queue serialization ensures this).
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        // CPU residual readback from the completed cb3 output
+        uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) {
+            uint32_t u = ((uint32_t)res_out[i]) << 16;
+            memcpy(&residual[i], &u, 4);
+        }
+    }
+
     // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
@@ -1095,26 +1115,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb commit];
-
-        // === Deferred cb3 overlap: wait for previous layer's cb3 while CB-A runs on GPU ===
-        // GPU queue is serial: it runs cb3(N-1) then CB-A(N) automatically.
-        // CPU waits here so cb3 wait time is hidden inside CB-A GPU execution time.
-        // No performance regression vs sync wait: cb3(N-1) finishes before CB-A(N) needs its output.
-        if (eng->deferred.active && eng->deferred.cmd_experts) {
-            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
-            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
-            eng->deferred.cmd_experts = NULL;
-            eng->deferred.active = false;
-            // CPU residual readback (buf_residual_gpu already correct on GPU via enc3)
-            uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
-            for (int i = 0; i < MHC_MULT * DIM; i++) {
-                uint32_t u = ((uint32_t)res_out[i]) << 16;
-                memcpy(&residual[i], &u, 4);
-            }
-        }
-
-        [cb waitUntilCompleted];
+        [cb commit]; [cb waitUntilCompleted];
 
         memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
         memcpy(post,       [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
