@@ -755,22 +755,29 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         }
         id<MTLBuffer> battn = battn_scr;  // alias for code below
 
-    // === CB3: wo_a (8 groups) — use cached wo_a_dense buffers ===
+    // === CB3+CB4 merged: wo_a (8 groups) + GPU blit concat + wo_b in ONE CB (1 wait) ===
+    // Replaces: CB3(wo_a wait) + CPU concat memcpy + CB4(wo_b wait)
+    // With:     single CB: wo_a × 8 + blit concat + wo_b, 1 wait
+    // Saves 1 GPU sync/layer = ~13ms × 43 = ~560ms/token.
     uint16_t *attn_bf16 = (uint16_t *)[battn contents];
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
     float *concat = (abc && abc->scr_concat) ? NULL : malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    // concat points to either persistent buffer contents (after CB3) or malloc'd memory
     if (!abc && !concat) return -1;
 
     id<MTLBuffer> bog_arr[O_GROUPS];
+    id<MTLBuffer> bconcat = (abc && abc->scr_concat) ? abc->scr_concat
+                              : mkbuf(d, NULL, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
+    id<MTLBuffer> bout    = (abc && abc->scr_out) ? abc->scr_out
+                              : mkbuf(d, NULL, DIM * sizeof(float));
     {
         id<MTLCommandBuffer> cb3 = [P->queue commandBuffer];
+
+        // --- Part 1: wo_a × 8 group matmuls ---
         for (int g = 0; g < O_GROUPS; g++) {
             uint16_t *gv_bf16_data;
             id<MTLBuffer> bgv;
             if (abc && abc->scr_bgv[g]) {
-                // Use persistent bgv scratch — fill it directly
                 bgv = abc->scr_bgv[g];
                 gv_bf16_data = (uint16_t *)[bgv contents];
             } else {
@@ -779,9 +786,11 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 bgv = mkbuf(d, gv_bf16_data, group_feat * sizeof(uint16_t));
             }
             for (int hh = 0; hh < heads_per_group; hh++)
-                memcpy(gv_bf16_data + hh * HEAD_DIM, attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM, HEAD_DIM * sizeof(uint16_t));
-            bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g] : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            // Use persistent wo_a group buffer if available, else NoCopy zero-copy
+                memcpy(gv_bf16_data + hh * HEAD_DIM,
+                       attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM,
+                       HEAD_DIM * sizeof(uint16_t));
+            bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g]
+                           : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
             id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
                                     ? abc->wo_a_grp[g]
                                     : [d newBufferWithBytesNoCopy:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
@@ -789,48 +798,47 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                                           options:MTLResourceStorageModeShared
                                           deallocator:nil];
             enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
-            if (!abc || !abc->scr_bgv[g]) free(gv_bf16_data);  // free only if not persistent
+            if (!abc || !abc->scr_bgv[g]) free(gv_bf16_data);
         }
-        [cb3 commit]; [cb3 waitUntilCompleted];
-    }
-    // Gather wo_a outputs into concat
-    if (abc && abc->scr_concat) {
-        float *scr_concat_ptr = (float *)[abc->scr_concat contents];
-        for (int g = 0; g < O_GROUPS; g++)
-            memcpy(scr_concat_ptr + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
-        concat = scr_concat_ptr;
-    } else {
-        for (int g = 0; g < O_GROUPS; g++)
-            memcpy(concat + (size_t)g * O_LORA_RANK, [bog_arr[g] contents], O_LORA_RANK * sizeof(float));
-    }
 
-    // === CB4: wo_b (1 encoder, 1 wait) ===
-    // Use persistent scr_concat as input (already populated above) and scr_out as output
-    id<MTLBuffer> bconcat = (abc && abc->scr_concat) ? abc->scr_concat : mkbuf(d, concat, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    id<MTLBuffer> bout    = (abc && abc->scr_out)    ? abc->scr_out    : mkbuf(d, NULL, DIM * sizeof(float));
-    {
-        id<MTLCommandBuffer> cb4 = [P->queue commandBuffer];
+        // --- Part 2: GPU blit concat (bog_arr[g] → bconcat[g * O_LORA_RANK]) ---
+        // Replaces CPU memcpy loop — allows wo_b to follow in the same CB.
+        {
+            id<MTLBlitCommandEncoder> blit = [cb3 blitCommandEncoder];
+            size_t chunk = (size_t)O_LORA_RANK * sizeof(float);
+            for (int g = 0; g < O_GROUPS; g++) {
+                [blit copyFromBuffer:bog_arr[g]
+                       sourceOffset:0
+                           toBuffer:bconcat
+                  destinationOffset:(size_t)g * chunk
+                               size:chunk];
+            }
+            [blit endEncoding];
+        }
+
+        // --- Part 3: wo_b output projection ---
         if (abc && abc->wo_b_pack) {
-            id<MTLComputeCommandEncoder> e = [cb4 computeCommandEncoder];
+            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
             [e setComputePipelineState:P->dequant_matvec_affine];
             [e setBuffer:abc->wo_b_pack offset:0 atIndex:0];
             [e setBuffer:abc->wo_b_sc   offset:0 atIndex:1];
             [e setBuffer:abc->wo_b_bi   offset:0 atIndex:2];
-            [e setBuffer:bconcat offset:0 atIndex:3];
-            [e setBuffer:bout    offset:0 atIndex:4];
+            [e setBuffer:bconcat        offset:0 atIndex:3];
+            [e setBuffer:bout           offset:0 atIndex:4];
             uint od=aw->wo_b.out_dim, id_=aw->wo_b.in_dim, gs=aw->wo_b.group_size;
-            [e setBytes:&od length:4 atIndex:5];
+            [e setBytes:&od  length:4 atIndex:5];
             [e setBytes:&id_ length:4 atIndex:6];
             [e setBytes:&gs  length:4 atIndex:7];
             [e dispatchThreads:MTLSizeMake(aw->wo_b.out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [e endEncoding];
         } else {
-            enc_dequant_matvec(P, cb4, &aw->wo_b, bconcat, bout);
+            enc_dequant_matvec(P, cb3, &aw->wo_b, bconcat, bout);
         }
-        [cb4 commit]; [cb4 waitUntilCompleted];
+
+        [cb3 commit]; [cb3 waitUntilCompleted];
     }
     memcpy(out, [bout contents], DIM * sizeof(float));
-    if (!abc || !abc->scr_concat) free(concat);  // free only if not using persistent buffer
+    if (!abc || !abc->scr_concat) free(concat);
     } // end @autoreleasepool
     return 0;
 }
