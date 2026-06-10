@@ -1009,7 +1009,29 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
 
-    @autoreleasepool {    // Build MlaPipes view over the engine's pipelines.
+    @autoreleasepool {
+
+    // === Deferred cb3 completion (Path B: deferred mhc_post_ffn) ===
+    // Wait for the previous layer's cb3 (mhc_post_ffn) to complete.
+    // CB-A reads buf_residual_gpu which cb3 writes — the GPU queue serializes them
+    // automatically (same MTLCommandQueue), but we still need to wait before
+    // reading back residual[] for debug or compressor purposes.
+    // For most layers we only wait here; the actual buf_residual_gpu is already
+    // correct on GPU by the time CB-A starts (queue serialization ensures this).
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        // CPU residual readback from the completed cb3 output
+        uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) {
+            uint32_t u = ((uint32_t)res_out[i]) << 16;
+            memcpy(&residual[i], &u, 4);
+        }
+    }
+
+    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
     P.queue = (id<MTLCommandQueue>)eng->queue;
@@ -1505,12 +1527,16 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb3 commit]; [cb3 waitUntilCompleted];
+        [cb3 commit];
+        // DEFERRED: don't wait — buf_residual_gpu will be written by this cb3.
+        // The GPU queue serializes cb3 before the next layer's CB-A automatically.
+        // We will wait at the START of the next layer (or after the final layer).
+        // Save cb3 for deferred completion.
+        eng->deferred.active = true;
+        eng->deferred.cmd_experts = (void *)[(id<MTLCommandBuffer>)cb3 retain];
 
-        // CPU readback for next layer's CB-A (now reads from buf_residual_gpu via mhc_pre)
-        // Also needed for debug output and compress_hc after final layer.
-        uint16_t *res3_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res3_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+        // No CPU readback here — residual is updated via buf_residual_gpu on GPU.
+        // The CPU residual[] array will be updated after deferred wait (next layer's start).
     }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
@@ -1551,6 +1577,21 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             fprintf(stderr, "[TIME] pos=%d layer=%d: %.1fms\n", pos, layer, (t1-t0)/1e6);
         }
     }
+    // Wait for the final deferred cb3 (last layer's mhc_post_ffn).
+    // This ensures buf_residual_gpu is fully written before the caller reads hidden[].
+    if (eng->deferred.active && eng->deferred.cmd_experts) {
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+        eng->deferred.cmd_experts = NULL;
+        eng->deferred.active = false;
+        // Final CPU readback: sync hidden[] (= residual) from GPU for compress_hc etc.
+        uint16_t *res_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_post_out contents];
+        for (int i = 0; i < MHC_MULT * DIM; i++) {
+            uint32_t u = ((uint32_t)res_out[i]) << 16;
+            memcpy(&hidden[i], &u, 4);
+        }
+    }
+
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
     // calls forward token-by-token). We detect decode mode by checking the engine's
