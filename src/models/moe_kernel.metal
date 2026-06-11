@@ -879,6 +879,112 @@ kernel void rope_tail_interleaved_bf16(
     q[j1] = (bfloat)(x0 * sin_v + x1 * cos_v);
 }
 
+// matvec_q8_0_f32: ds4 kernel_mul_mv_q8_0_f32 adapted for dmlx wo_a.
+//
+// Q8_0 format: each block has a float scale (d) and 32 int8 values.
+// Weight = d * qs[i] for element i in the block.
+//
+// Design (from ds4 dense.metal:108-176):
+//   - NR0=2 rows per threadgroup, NSG=4 simdgroups, 32 threads each → 128 threads/TG
+//   - Shared memory: 32 * 2 * sizeof(float) = 256 bytes (very small)
+//   - Coalesced access: thread (ix, il) loads NQ=8 elements from each block
+//   - Reduction: simd_sum per row → threadgroup scatter → final simd_sum
+//
+// For wo_a [1024, 4096]: 1024/2 = 512 threadgroups, 128 threads each = 65,536 threads.
+// Per thread: 4096 / (4*8) = 128 blocks / (NSG*NQ) = 4 outer loop iterations.
+kernel void matvec_q8_0_f32(
+    device const char*    W        [[buffer(0)]],  // Q8_0 blocks: [out_dim, in_dim/32]
+    device const bfloat*  x        [[buffer(1)]],  // [in_dim]
+    device float*         out      [[buffer(2)]],  // [out_dim]
+    constant uint&        out_dim  [[buffer(3)]],
+    constant uint&        in_dim   [[buffer(4)]],
+    threadgroup float*    shmem    [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2;       // rows per threadgroup
+    const short NSG = 4;       // simdgroups per threadgroup
+    const short NW  = 32;      // SIMD width
+    const short NQ  = 8;       // elements per thread per block
+    const short QK  = 32;      // block size
+    const short NB  = 36;      // bytes per Q8_0 block (4B scale + 32B int8)
+
+    const int nb = (int)in_dim / QK;  // blocks per row (= 128 for in_dim=4096)
+    const int row0 = (int)tgpig.x * NR0;
+
+    // Thread indexing within SIMD group
+    const short ix = tiisg / (NW / NQ);   // block offset within simdgroup (0..3)
+    const short il = tiisg % (NW / NQ);   // lane within block (0..3)
+    const int ib0 = (int)sgitg * NQ + (int)ix;
+
+    // Input vector access pattern — bfloat→float conversion on load
+    const int offset_y = ib0 * QK + (int)il * NQ;
+    device const bfloat *yb = x + offset_y;
+
+    // Weight pointers for 2 rows
+    device const char *ax[NR0];
+    for (short row = 0; row < NR0; row++) {
+        if (row0 + row < (int)out_dim) {
+            ax[row] = W + (row0 + row) * nb * NB;
+        }
+    }
+
+    float sumf[NR0] = { 0.0f };
+    float yl[NQ];
+
+    // Main loop: iterate over blocks, each thread processes NQ elements per block
+    for (int ib = ib0; ib < nb; ib += NSG * NQ) {
+        // Load NQ input values with bf16→f32 conversion
+        for (short i = 0; i < NQ; i++) {
+            yl[i] = float(yb[i]);
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            if (row0 + row >= (int)out_dim) continue;
+            // Block layout: [4B scale][32B int8]
+            device const char *blk = ax[row] + ib * NB;
+            float d = *(device const float *)blk;
+            device const int8_t *qs = (device const int8_t *)(blk + 4) + (int)il * NQ;
+
+            float sumq = 0.0f;
+            for (short i = 0; i < NQ; i++) {
+                sumq += (float)qs[i] * yl[i];
+            }
+            sumf[row] += sumq * d;
+        }
+
+        yb += NSG * NQ * QK;  // advance input pointer
+    }
+
+    // Reduction (ds4 helper_mv_reduce_and_write pattern)
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row] = shmem + NW * row;
+        if (sgitg == 0) {
+            shmem_f32[row][tiisg] = 0.0f;
+        }
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) {
+            shmem_f32[row][sgitg] = sumf[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            out[d] = tot;
+        }
+    }
+}
+
 // matvec_f32_bf16in: dense f32 matmul with bfloat input.
 // Used for wo_a (dense) with bfloat attn output.
 kernel void matvec_f32_bf16in(
@@ -1134,6 +1240,214 @@ kernel void mhc_post_bfloat(
     }
 }
 
+
+// mhc_post_ffn_expand4: ds4 kernel_dsv4_hc_expand4 adapted for dmlx.
+//
+// Replaces the 3-encoder mhc_post_ffn cb3 with a single pure-f32 dispatch.
+// Each thread handles one dimension, computing all 4 HC output streams.
+// ZERO shared memory — no occupancy risk.
+//
+// Corresponds to ds4 dsv4_hc.metal:579-620 with HC=4, decode mode.
+//
+// block_out: ffn output [DIM] f32
+// residual:  current residual [4, DIM] f32
+// post:      per-HC gate coefficients [4] f32
+// comb:      HC×HC comb matrix [4, 4] f32 (row-major: comb[k*4+m] = comb[k][m])
+// dst:       new residual [4, DIM] f32 (in-place: dst can alias residual)
+kernel void mhc_post_ffn_expand4(
+    device const float* block_out  [[buffer(0)]],  // [DIM]
+    device const float* residual   [[buffer(1)]],  // [4, DIM]
+    device const float* post       [[buffer(2)]],  // [4]
+    device const float* comb       [[buffer(3)]],  // [4, 4] row-major: comb[k*4+m]=comb[k][m]
+    device float*       dst        [[buffer(4)]],  // [4, DIM]
+    constant uint&      dim        [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= dim) return;
+
+    // Read block_out and residual with bfloat truncation to match the old
+    // 3-encoder cb3 precision path:
+    //   old: f32 → bf16 (encoder 1) → mhc_post_bfloat → bf16→f32 (encoder 3)
+    //   new: emulate the bf16 round-trip within the kernel
+    float block_v = float(bfloat(block_out[gid]));
+
+    float r0 = float(bfloat(residual[0 * dim + gid]));
+    float r1 = float(bfloat(residual[1 * dim + gid]));
+    float r2 = float(bfloat(residual[2 * dim + gid]));
+    float r3 = float(bfloat(residual[3 * dim + gid]));
+
+    // HC stream 0
+    float acc0 = block_v * post[0];
+    acc0 += comb[0] * r0 + comb[4] * r1 + comb[8]  * r2 + comb[12] * r3;
+    dst[0 * dim + gid] = float(bfloat(acc0));
+
+    // HC stream 1
+    float acc1 = block_v * post[1];
+    acc1 += comb[1] * r0 + comb[5] * r1 + comb[9]  * r2 + comb[13] * r3;
+    dst[1 * dim + gid] = float(bfloat(acc1));
+
+    // HC stream 2
+    float acc2 = block_v * post[2];
+    acc2 += comb[2] * r0 + comb[6] * r1 + comb[10] * r2 + comb[14] * r3;
+    dst[2 * dim + gid] = float(bfloat(acc2));
+
+    // HC stream 3
+    float acc3 = block_v * post[3];
+    acc3 += comb[3] * r0 + comb[7] * r1 + comb[11] * r2 + comb[15] * r3;
+    dst[3 * dim + gid] = float(bfloat(acc3));
+}
+
+// mhc_pre_split_weighted_sum_norm: ds4 kernel_dsv4_hc_split_weighted_sum_norm4 adapted for dmlx.
+//
+// Replaces CB-A's 2 encoders (mhc_pre_gpu + rms_norm_rows_bf16out) with a single
+// dispatch that computes HC coefficients, collapses 4 residual streams, and applies
+// RMSNorm — all in one kernel.
+//
+// Corresponds to ds4 dsv4_hc.metal:395-536.
+//
+// fn_weight: [24, 16384] f32  (MIX3 × MHC_H)
+// base:      [24] f32
+// scale_v:   [3] f32  (pre, post, comb scales)
+// residual:  [4, DIM] f32  (4 HC streams × 4096)
+// out_post:  [4] f32  (HC gate coefficients, for later mhc_post)
+// out_comb:  [16] f32  (Sinkhorn'd comb matrix, for later mhc_post)
+// attn_input:[DIM] f32  (collapsed row, for CPU diagnostics/compressor)
+// norm_weight: [DIM] f32  (RMSNorm weight)
+// normed:    [DIM] bf16  (RMSNorm'd output, feeds attention Q/KV chain)
+//
+// Threadgroup memory: ~17.5KB (row_shmem 16KB + mixes/pre_mix/comb/ss_buf ~1.5KB).
+// 256 threads per threadgroup. 1 threadgroup for decode (1 token).
+kernel void mhc_pre_split_weighted_sum_norm(
+    device const float*  fn_weight   [[buffer(0)]],  // [24, 16384]
+    device const float*  base        [[buffer(1)]],  // [24]
+    device const float*  scale_v     [[buffer(2)]],  // [3]
+    device const float*  residual    [[buffer(3)]],  // [4, DIM]
+    device float*        out_post    [[buffer(4)]],  // [4]
+    device float*        out_comb    [[buffer(5)]],  // [16]
+    device float*        attn_input  [[buffer(6)]],  // [DIM]
+    device const float*  norm_weight [[buffer(7)]],  // [DIM]
+    device bfloat*       normed      [[buffer(8)]],  // [DIM]
+    uint lid     [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    const uint HC = 4, DIM = 4096, MHC_H = HC * DIM, MIX3 = 24;
+    const float EPS = 1e-6f, POST_MULT = 2.0f, NORM_EPS = 1e-6f;
+
+    // Shared memory layout:
+    //   row_shmem[0..DIM-1]:    collapsed row for RMSNorm (4096 floats = 16KB)
+    //   mixes[DIM..DIM+23]:     dot products [24] (96B)
+    //   pre_mix[DIM+24..DIM+27]: gate coefficients [4] (16B)
+    //   comb_mat[DIM+28..DIM+43]: Sinkhorn matrix [16] (64B)
+    //   ss_buf/DIM+44..]: sum-of-squares reduction (256 floats = 1KB)
+    // Total: 16384 + 96 + 16 + 64 + 1024 = 17584 bytes < 32KB
+
+    // Reusable shared memory: ss_buf used for both residual norm reduction (Phase A)
+    // and collapsed-row sum-of-squares reduction (Phase B).
+    threadgroup float ss_buf[256];
+
+    // --- Phase A: mhc_pre (compute HC coefficients) ---
+
+    // Step 1: compute sum(residual^2) / MHC_H → norm factor
+    float local_ss = 0.0f;
+    for (uint i = lid; i < MHC_H; i += tg_size) local_ss += residual[i] * residual[i];
+    ss_buf[lid] = local_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) ss_buf[lid] += ss_buf[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float norm = rsqrt(ss_buf[0] / float(MHC_H) + EPS);
+
+    // Note: can't use dynamic shared memory index on pre-declared threadgroup arrays,
+    // so we use separate named threadgroup arrays for the Phase A data.
+    threadgroup float mixes[24];
+    threadgroup float pre_mix[4];
+    threadgroup float comb_mat[16];
+
+    // Step 2: mixes[r] = (fn[r,:] @ residual) * norm
+    for (uint r = lid; r < MIX3; r += tg_size) {
+        device const float* fn_r = fn_weight + r * MHC_H;
+        float acc = 0.0f;
+        for (uint i = 0; i < MHC_H; i++) acc += fn_r[i] * residual[i];
+        mixes[r] = acc * norm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 3: compute pre_mix, post, comb from mixes (single-threaded)
+    if (lid == 0) {
+        float s0 = scale_v[0], s1 = scale_v[1], s2 = scale_v[2];
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[m] * s0 + base[m];
+            pre_mix[m] = 1.0f / (1.0f + exp(-biased)) + EPS;
+        }
+        for (uint m = 0; m < HC; m++) {
+            float biased = mixes[HC + m] * s1 + base[HC + m];
+            out_post[m] = (1.0f / (1.0f + exp(-biased))) * POST_MULT;
+        }
+        for (uint c = 0; c < HC * HC; c++) {
+            comb_mat[c] = mixes[2 * HC + c] * s2 + base[2 * HC + c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Sinkhorn normalization on comb_mat (single-threaded, 4×4 matrix)
+    if (lid == 0) {
+        for (uint i = 0; i < HC; i++) {
+            float m_val = comb_mat[i * HC];
+            for (uint j = 1; j < HC; j++) if (comb_mat[i*HC+j] > m_val) m_val = comb_mat[i*HC+j];
+            float s_val = 0.0f;
+            for (uint j = 0; j < HC; j++) { comb_mat[i*HC+j] = exp(comb_mat[i*HC+j] - m_val); s_val += comb_mat[i*HC+j]; }
+            for (uint j = 0; j < HC; j++) comb_mat[i*HC+j] = comb_mat[i*HC+j] / s_val + EPS;
+        }
+        for (uint j = 0; j < HC; j++) {
+            float cs = 0.0f; for (uint i = 0; i < HC; i++) cs += comb_mat[i*HC+j];
+            cs += EPS; for (uint i = 0; i < HC; i++) comb_mat[i*HC+j] /= cs;
+        }
+        for (uint it = 0; it < 19; it++) {
+            for (uint i = 0; i < HC; i++) {
+                float rs = 0.0f; for (uint j = 0; j < HC; j++) rs += comb_mat[i*HC+j];
+                rs += EPS; for (uint j = 0; j < HC; j++) comb_mat[i*HC+j] /= rs;
+            }
+            for (uint j = 0; j < HC; j++) {
+                float cs = 0.0f; for (uint i = 0; i < HC; i++) cs += comb_mat[i*HC+j];
+                cs += EPS; for (uint i = 0; i < HC; i++) comb_mat[i*HC+j] /= cs;
+            }
+        }
+        for (uint c = 0; c < HC * HC; c++) out_comb[c] = comb_mat[c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Phase B: weighted sum + RMSNorm (ds4 kernel_dsv4_hc_split_weighted_sum_norm4 pattern) ---
+    // Compute collapsed row in shared memory, accumulate sum_sq on the fly,
+    // then apply RMSNorm.
+
+    // Step 5: weighted sum → row_shmem (with bf16 truncation to match
+    //   old mhc_pre_gpu's out_input[d] = float((bfloat)acc)), accumulate sum_sq
+    threadgroup float row_shmem[4096];
+    float row_ss = 0.0f;
+    for (uint d = lid; d < DIM; d += tg_size) {
+        float acc = 0.0f;
+        for (uint m = 0; m < HC; m++) acc += pre_mix[m] * residual[m * DIM + d];
+        float v = float(bfloat(acc));  // bf16 truncation — matches old 2-encoder path
+        row_shmem[d] = v;
+        row_ss += v * v;
+    }
+    // Reduce sum_sq across threads
+    ss_buf[lid] = row_ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint s = tg_size / 2; s > 0; s >>= 1) {
+        if (lid < s) ss_buf[lid] += ss_buf[lid + s];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float norm_scale = rsqrt(ss_buf[0] / float(DIM) + NORM_EPS);
+
+    // Step 6: write attn_input + apply RMSNorm → normed
+    for (uint d = lid; d < DIM; d += tg_size) {
+        float v = row_shmem[d];
+        attn_input[d] = v;                               // f32 collapsed row (CPU diagnostics)
+        normed[d] = bfloat(v * norm_scale * norm_weight[d]); // bf16 normed output (attention input)
+    }
+}
 
 // f32_to_bf16_vec: convert n f32 values → bfloat in-place (GPU-side f32→bf16 conversion).
 // Used in Path B to avoid CPU residual readback before mhc_post.

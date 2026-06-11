@@ -31,6 +31,7 @@ typedef struct {
     id<MTLComputePipelineState> rms_norm_rows_bf16in_bf16out;
     id<MTLComputePipelineState> rope_tail_interleaved_bf16;
     id<MTLComputePipelineState> matvec_f32_bf16in;
+    id<MTLComputePipelineState> matvec_q8_0_f32;    // ds4 Q8_0 matvec for wo_a
     id<MTLComputePipelineState> mla_sdpa_decode_bfloat;
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out;
     // Prefill batch SDPA (Path B: matches MLX simdgroup reduction order)

@@ -32,7 +32,8 @@ typedef struct {
     // Norm/sink (small, < 10KB each)
     id<MTLBuffer> q_norm_buf, kv_norm_buf, attn_sink_buf;
     // wo_a_dense: 8 groups × [O_LORA_RANK, group_feat] f32
-    id<MTLBuffer> wo_a_grp[8];   // 8 × 16MB = 128MB total per layer
+    id<MTLBuffer> wo_a_grp[8];   // 8 × 16MB = 128MB total per layer (f32 dense, fallback)
+    id<MTLBuffer> wo_a_q8_gpu[8]; // 8 × 4.5MB = 36MB total per layer (Q8_0 quantized)
     // Persistent scratch buffers for decode pass (reused every forward call)
     // Eliminates ~18 MTLBuffer allocations per layer per token
     id<MTLBuffer> scr_q_a;       // [Q_LORA_RANK] bf16   — wq_a output
@@ -110,13 +111,42 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
         c->wo_b_bi   = MKNC(aw->wo_b.biases, sc);
     }
     // wo_a_dense: [O_GROUPS, O_LORA_RANK, group_feat] f32 — 128MB/layer, always NoCopy
+    // Also quantize to Q8_0 format (ds4 kernel_mul_mv_q8_0_f32) for the fast path.
     {
         int heads_per_group = N_HEADS / O_GROUPS;
         int group_feat = heads_per_group * HEAD_DIM;  // 8×512=4096
-        size_t grp_sz = (size_t)O_LORA_RANK * group_feat * sizeof(float);  // 16MB each
+        size_t grp_sz = (size_t)O_LORA_RANK * group_feat * sizeof(float);  // 16MB each (f32)
+        // Q8_0: 32 elements per block, 36 bytes per block (4B scale + 32B int8)
+        int nb = group_feat / 32;  // 128 blocks per row
+        size_t q8_grp_sz = (size_t)O_LORA_RANK * nb * 36;  // ~4.5MB per group
         for (int g = 0; g < O_GROUPS; g++) {
             const float *wg = aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat;
-            c->wo_a_grp[g] = MKNC(wg, grp_sz);
+            c->wo_a_grp[g] = MKNC(wg, grp_sz);  // f32 fallback
+
+            // Quantize to Q8_0 format
+            id<MTLBuffer> q8_buf = [d newBufferWithLength:q8_grp_sz options:MTLResourceStorageModeShared];
+            uint8_t *q8_raw = (uint8_t *)[q8_buf contents];
+            for (int r = 0; r < O_LORA_RANK; r++) {
+                const float *row = wg + (size_t)r * group_feat;
+                for (int b = 0; b < nb; b++) {
+                    const float *x = row + b * 32;
+                    float amax = 0.0f;
+                    for (int i = 0; i < 32; i++) { float ax = fabsf(x[i]); if (ax > amax) amax = ax; }
+                    float d = amax / 127.0f;
+                    float id = (d > 0.0f) ? (1.0f / d) : 0.0f;
+                    // Write scale (4 bytes)
+                    memcpy(q8_raw, &d, 4); q8_raw += 4;
+                    // Write quantized values (32 bytes)
+                    for (int i = 0; i < 32; i++) {
+                        float v = x[i] * id;
+                        int q = (int)roundf(v);        // round to nearest integer
+                        if (q > 127) q = 127;
+                        if (q < -127) q = -127;
+                        *q8_raw++ = (uint8_t)((int8_t)q);
+                    }
+                }
+            }
+            c->wo_a_q8_gpu[g] = q8_buf;
         }
     }
     #undef MKNC
@@ -359,6 +389,25 @@ static void enc_matvec_f32_bf16in(MlaPipes *P, id<MTLCommandBuffer> cb,
     [e setBytes:&out_dim length:4 atIndex:3];
     [e setBytes:&in_dim length:4 atIndex:4];
     [e dispatchThreads:MTLSizeMake(out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+    [e endEncoding];
+}
+
+// ds4 kernel_mul_mv_q8_0_f32 dispatch for Q8_0-quantized wo_a.
+// NR0=2 rows per TG, NSG=4 simdgroups, 256B threadgroup memory.
+static void enc_matvec_q8_0(MlaPipes *P, id<MTLCommandBuffer> cb,
+                            id<MTLBuffer> W, id<MTLBuffer> x, id<MTLBuffer> out,
+                            uint out_dim, uint in_dim) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->matvec_q8_0_f32];
+    [e setBuffer:W offset:0 atIndex:0];
+    [e setBuffer:x offset:0 atIndex:1];
+    [e setBuffer:out offset:0 atIndex:2];
+    [e setBytes:&out_dim length:4 atIndex:3];
+    [e setBytes:&in_dim length:4 atIndex:4];
+    [e setThreadgroupMemoryLength:256 atIndex:0];  // 32*2*4 bytes
+    uint num_tgs = (out_dim + 1) / 2;  // NR0=2 rows per threadgroup
+    [e dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];  // (SIMD width=32, NSG=4, 1)
     [e endEncoding];
 }
 
@@ -791,13 +840,19 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                        HEAD_DIM * sizeof(uint16_t));
             bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g]
                            : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
-                                    ? abc->wo_a_grp[g]
-                                    : [d newBufferWithBytesNoCopy:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
-                                          length:(size_t)O_LORA_RANK * group_feat * sizeof(float)
-                                          options:MTLResourceStorageModeShared
-                                          deallocator:nil];
-            enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
+            id<MTLBuffer> bwg = (abc && abc->wo_a_q8_gpu[g])
+                                    ? abc->wo_a_q8_gpu[g]
+                                    : ((abc && abc->wo_a_grp[g])
+                                        ? abc->wo_a_grp[g]
+                                        : [d newBufferWithBytesNoCopy:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
+                                              length:(size_t)O_LORA_RANK * group_feat * sizeof(float)
+                                              options:MTLResourceStorageModeShared
+                                              deallocator:nil]);
+            if (abc && abc->wo_a_q8_gpu[g]) {
+                enc_matvec_q8_0(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
+            } else {
+                enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
+            }
             if (!abc || !abc->scr_bgv[g]) free(gv_bf16_data);
         }
 

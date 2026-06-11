@@ -87,6 +87,14 @@ typedef struct {
     QuantWeight down;  // [4096, 2048]
 } SharedExpert;
 
+// Q8_0 quantization block (GGUF format, used by ds4 kernel_mul_mv_q8_0_f32).
+// 32 elements quantized to int8 with a shared float scale.
+// d = max(|x_i|) / 127.0, qs[i] = round(x_i / d) clamped to [-127, 127].
+typedef struct {
+    float d;       // block scale
+    int8_t qs[32]; // quantized values
+} Q8_0Block;
+
 // Per-layer MLA attention weights (quantized, on-the-fly dequant in Metal).
 typedef struct {
     QuantWeight wq_a;        // [1024, 4096]
@@ -228,9 +236,12 @@ typedef struct {
     void *pipe_rms_norm_rows_bf16in_bf16out;
     void *pipe_rope_tail_bf16;
     void *pipe_matvec_f32_bf16in;
+    void *pipe_matvec_q8_0_f32;        // ds4 Q8_0 matvec for wo_a
     void *pipe_mla_sdpa_bfloat;
     void *pipe_mhc_pre_bfloat;
     void *pipe_mhc_post_bfloat;
+    void *pipe_mhc_post_ffn_expand4; // ds4 kernel_dsv4_hc_expand4: single f32 dispatch mhc_post_ffn
+    void *pipe_mhc_pre_split_weighted_sum_norm; // ds4 fused mhc_pre + weighted sum + RMSNorm
     void *pipe_f32_to_bf16;
     void *pipe_bf16_to_f32;
     void *pipe_dequant_matvec_affine_bf16in_f32out;
@@ -295,6 +306,7 @@ typedef struct {
     void *buf_mhc_res_bf16_in;   // [MHC_MULT*DIM] u16  — residual in bf16 for mhc_post input
     void *buf_mhc_post_res_out;  // [MHC_MULT*DIM] u16  — mhc_post result (bf16)
     void *buf_mhc_ffn_post_out;  // [MHC_MULT*DIM] u16  — mhc_post result for FFN sublayer (bf16)
+    void *buf_ffn_out_f32;        // [DIM] f32              — ffn output in f32 for mhc_post_ffn_expand4
 
     // Persistent GPU buffers for per-layer mHC weights (uploaded once at set_layer_hc)
     // Avoids 1.5MB newBufferWithBytes per forward_layer call (was main OOM source)
