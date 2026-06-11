@@ -11,6 +11,7 @@ typedef struct {
     id<MTLDevice> dev;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> dequant_matvec_affine;
+    id<MTLComputePipelineState> dequant_matvec_affine_v2; // coalesced ds4 pattern
     id<MTLComputePipelineState> rms_norm_rows;
     id<MTLComputePipelineState> rope_tail_interleaved;
     id<MTLComputePipelineState> mla_sdpa_decode;

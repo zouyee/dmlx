@@ -871,10 +871,10 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             [blit endEncoding];
         }
 
-        // --- Part 3: wo_b output projection ---
+        // --- Part 3: wo_b output projection (coalesced v2 kernel) ---
         if (abc && abc->wo_b_pack) {
             id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
-            [e setComputePipelineState:P->dequant_matvec_affine];
+            [e setComputePipelineState:P->dequant_matvec_affine_v2];
             [e setBuffer:abc->wo_b_pack offset:0 atIndex:0];
             [e setBuffer:abc->wo_b_sc   offset:0 atIndex:1];
             [e setBuffer:abc->wo_b_bi   offset:0 atIndex:2];
@@ -884,7 +884,10 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             [e setBytes:&od  length:4 atIndex:5];
             [e setBytes:&id_ length:4 atIndex:6];
             [e setBytes:&gs  length:4 atIndex:7];
-            [e dispatchThreads:MTLSizeMake(aw->wo_b.out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e setThreadgroupMemoryLength:256 atIndex:0];  // 32*2*4 bytes
+            uint num_tgs = (aw->wo_b.out_dim + 1) / 2;     // NR0=2
+            [e dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];  // (32, NSG=4, 1)
             [e endEncoding];
         } else {
             enc_dequant_matvec(P, cb3, &aw->wo_b, bconcat, bout);

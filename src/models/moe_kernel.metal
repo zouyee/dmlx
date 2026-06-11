@@ -616,6 +616,105 @@ kernel void moe_combine(
     output[tid] = sum;
 }
 
+// dequant_matvec_affine_v2: coalesced affine 4-bit dequant matvec (ds4 Q8_0 pattern).
+//
+// Design (ds4 kernel_mul_mv_q8_0_f32 adapted for affine 4-bit, group_size=64):
+//   - NR0=2 rows per threadgroup, NSG=4 simdgroups, 32 threads each → 128 threads/TG
+//   - Shared memory: 32 * 2 * sizeof(float) = 256 bytes
+//   - NO x_shared — no occupancy risk
+//   - Coalesced access: 8 threads per group, each reads 1 uint32 word
+//     Adjacent threads read adjacent uint32 words from W and adjacent floats from x.
+//   - FMA optimization: pre-compute scale*x, bias*x per nibble
+//
+// For wo_b [4096, 8192]: 2048 threadgroups, 128 threads each = 262,144 threads.
+//   num_groups=128, packed_per_group=8.
+//   Each SIMD group: 32 threads → 4 groups per iteration, 32 iterations.
+kernel void dequant_matvec_affine_v2(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
+    device const float*    scales     [[buffer(1)]],  // [out_dim, num_groups]
+    device const float*    biases     [[buffer(2)]],  // [out_dim, num_groups]
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    threadgroup float*     shmem      [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 4, TPG = 8;
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *wr[NR0];
+    device const float    *sr[NR0];
+    device const float    *br[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            wr[row] = W_packed + r * packed_cols;
+            sr[row] = scales   + r * num_groups;
+            br[row] = biases   + r * num_groups;
+        }
+    }
+
+    float sumf[NR0] = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+            float scale = sr[row][gg], bias = br[row][gg];
+            float sx0 = scale*xv0, bx0 = bias*xv0;
+            float sx1 = scale*xv1, bx1 = bias*xv1;
+            float sx2 = scale*xv2, bx2 = bias*xv2;
+            float sx3 = scale*xv3, bx3 = bias*xv3;
+            float sx4 = scale*xv4, bx4 = bias*xv4;
+            float sx5 = scale*xv5, bx5 = bias*xv5;
+            float sx6 = scale*xv6, bx6 = bias*xv6;
+            float sx7 = scale*xv7, bx7 = bias*xv7;
+            uint32_t pw = wr[row][gg * packed_per_group + (uint)il];
+            sumf[row] += fma(float((pw>> 0)&0xF), sx0, bx0);
+            sumf[row] += fma(float((pw>> 4)&0xF), sx1, bx1);
+            sumf[row] += fma(float((pw>> 8)&0xF), sx2, bx2);
+            sumf[row] += fma(float((pw>>12)&0xF), sx3, bx3);
+            sumf[row] += fma(float((pw>>16)&0xF), sx4, bx4);
+            sumf[row] += fma(float((pw>>20)&0xF), sx5, bx5);
+            sumf[row] += fma(float((pw>>24)&0xF), sx6, bx6);
+            sumf[row] += fma(float((pw>>28)&0xF), sx7, bx7);
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row] = shmem + NW * row;
+        if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[d] = tot;
+    }
+}
+
 // dequant_matvec_affine: out = W @ x, W affine-4bit quantized (gs=64, bf16 scales+biases).
 // Matches MLX affine dequant: w = scale_g * nibble + bias_g  (nibble in [0,15], no LUT).
 // W_packed: [out_dim, in_dim/8] uint32 (8 nibbles per uint32).

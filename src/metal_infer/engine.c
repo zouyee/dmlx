@@ -56,6 +56,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
     // S7: MLA attention pipelines
     eng->pipe_dequant_matvec_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine"] error:&err]);
+    eng->pipe_dequant_matvec_affine_v2 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_v2"] error:&err]);
     eng->pipe_rms_norm_rows = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows"] error:&err]);
     eng->pipe_rope_tail = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved"] error:&err]);
     eng->pipe_mla_sdpa = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode"] error:&err]);
@@ -1031,6 +1032,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.dev = d;
     P.queue = (id<MTLCommandQueue>)eng->queue;
     P.dequant_matvec_affine = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine;
+    P.dequant_matvec_affine_v2 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_v2;
     P.rms_norm_rows = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows;
     P.rope_tail_interleaved = (id<MTLComputePipelineState>)eng->pipe_rope_tail;
     P.mla_sdpa_decode = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa;

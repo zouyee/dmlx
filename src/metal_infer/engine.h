@@ -211,6 +211,7 @@ typedef struct {
     void *pipe_matvec;
     // S7: MLA attention pipelines (f32 baseline)
     void *pipe_dequant_matvec_affine;
+    void *pipe_dequant_matvec_affine_v2;   // coalesced ds4 pattern (NR0=2, NSG=4)
     void *pipe_rms_norm_rows;
     void *pipe_rope_tail;
     void *pipe_mla_sdpa;
