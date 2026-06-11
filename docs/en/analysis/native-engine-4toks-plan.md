@@ -120,12 +120,24 @@ Gather mode 默认禁用（13MB expert-stride 导致 scattered memory access，�
 | `matvec_q8_0_f32` | `kernel_mul_mv_q8_0_f32` | bandwidth | `b4b63f0` |
 | `dequant_matvec_affine_v2` | ds4 Q8_0 模式适配 | bandwidth | `6b704ef` |
 
-## 6. 未移植的 ds4 内核
+## 6. 未移植的 ds4 内核 + flash-moe 对比
 
-| 内核 | 原因 |
-|------|------|
-| `kernel_dsv4_q8_hc_expand4_q8_0` | 需要 wo_b 改为 Q8_0 格式（当前 affine 4-bit） |
-| `kernel_dsv4_shared_down_hc_expand4_q8_0` | 需要 shared expert 改为 Q8_0 格式 |
+| 内核/技术 | 原因 | 备注 |
+|-----------|------|------|
+| `kernel_dsv4_q8_hc_expand4_q8_0` | 需要 wo_b 改为 Q8_0 格式 | Q8_0 带宽需求高，M4 Pro 120GB/s 可能不够 |
+| `kernel_dsv4_shared_down_hc_expand4_q8_0` | 需要 shared expert 改为 Q8_0 格式 | 同上 |
+| Expert MXFP4→affine 4-bit | flash-moe 用此格式达到 4.36 tok/s | **SMELT 兼容，内存不变** |
+
+### 6.1 flash-moe 对比：affine 4-bit vs MXFP4
+
+| | flash-moe (Qwen3.5, 4.36 tok/s) | dmlx (DSV4, 0.78 tok/s) |
+|---|---|---|
+| Expert 量化 | affine 4-bit (g=64): w = nibble * scale + bias | MXFP4 E2M1 (g=32): w = LUT[nibble] * exp2(scale-127) |
+| Dequant 操作 | 简单: multiply + add | 复杂: LUT + exp2 + multiply |
+| Expert 大小 | ~10.5MB | ~10.5MB |
+| GPU 瓶颈 | I/O (SSD → RAM) | GPU compute (LUT+exp2 overhead) |
+
+**结论**：将 expert 从 MXFP4 改为 affine 4-bit 可能消除 MoE GPU compute 瓶颈。SMELT N=51 仍可在 48GB 内存中运行，I/O 不变，仅为 dequant 算法替换。
 
 ---
 
