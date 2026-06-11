@@ -64,26 +64,37 @@ ds4 的单个 CB 包含的不是多个独立 kernel dispatch，而是 **fused ke
 
 ---
 
-## 3. 剩余瓶颈：score layer 交替 42ms/75ms 分析
+## 3. Phase-level profiling 结果（NATIVE_PHASE_TIME=1，pos=1 warm-state）
 
-### 3.1 可能原因
+### 3.1 每层耗时分解
 
-| 假说 | 可能性 | 验证方法 |
-|------|--------|---------|
-| Expert I/O 偶发 cache miss | 中 | 对比 `io_pool_dispatch_cached` 耗时 |
-| SMELT pool 内 alternating access pattern | 低 | 检查 pool 布局 |
-| GPU 资源竞争（shared mem 等） | 低 | 单层 profiling |
-| 仍存在未优化的 CB 边界 | 中 | 需要 phase-level profiling |
+| Phase | 时间（with overhead） | 占比 | 估算 raw（÷10） | 43层 raw |
+|-------|---------------------|------|----------------|---------|
+| MLA (merged CB-A+CB1+CB3) | 15.6ms | 5.5% | 1.6ms | 69ms |
+| CMD2 | 8.1ms | 2.8% | 0.8ms | 34ms |
+| Expert I/O | 0.6ms | 0.2% | 0.06ms | 3ms |
+| **MoE GPU** | **258.5ms** | **90.3%** | **25.9ms** | **1111ms** |
+| Shared expert | 3.6ms | 1.2% | 0.4ms | 17ms |
+| **Total** | **286ms** | | **29ms** | **1234ms** |
 
-### 3.2 需要添加的 profiling
+> Note: Profiling adds ~10× overhead from clock_gettime at each phase boundary.
+> Relative ratios are accurate; absolute numbers projected from benchmark 0.778 tok/s.
+> Estimated raw matches benchmark (1234ms vs 1285ms measured).
 
-当前只有 `NATIVE_TIME_LAYERS` 给出每层总时间。需要新增 phase-level profiling 来分解每层的 CB-A/CB1/CB3/CMD2/MoE/cb3 耗时。
+---
 
-### 3.3 下一步方向
+### 3.3 结论：MoE GPU 是下一个优化目标
 
-1. **添加 phase-level profiling**：在 engine.c 的关键 CB wait 点添加计时
-2. **精确定位 75ms vs 42ms 差异来源**：是 I/O、GPU compute、还是 wait？
-3. **根据 profiling 结果定向优化**
+MoE GPU 占 per-layer 时间的 90%，估计 43 层合计 **~1100ms**（benchmark 总 1285ms 的 86%）。
+
+当前 separate mode: 12 dispatches/layer (6 × fused_gate_up_swiglu + 6 × dequant_matvec_4bit).
+每个 dispatch 使用 x_shared[4096]=16KB（flash-moe v3 pattern）。
+Gather mode 默认禁用（13MB expert-stride 导致 scattered memory access，实测比 separate 更慢）。
+
+优化方向：
+1. **Fix gather mode**: 改变 SMELT pool 布局（interleaved expert data）避免 13MB stride
+2. **Optimize separate mode**: 用 ds4 no-x_shared coalesced pattern 替代 x_shared[4096]=16KB
+3. **Apply FMA optimization**: pre-compute scale*x, bias*x（类似 wo_b v2 +12% gain）
 
 ---
 
