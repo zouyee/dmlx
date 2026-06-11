@@ -668,7 +668,8 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
 // --- BF16 variant of mla_attention_decode ---
 int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
-                              int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf) {
+                              int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf,
+                              void *external_cb1) {
     @autoreleasepool {
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
@@ -697,7 +698,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
     // === CB1: Q chain + KV chain + KV blit + SDPA merged into ONE command buffer ===
     // (GPU path: 11 encoders, 1 wait; CPU fallback: 8 encoders + separate CB2)
-    id<MTLCommandBuffer> cb1 = [P->queue commandBuffer];
+    id<MTLCommandBuffer> cb1 = external_cb1 ? (__bridge id<MTLCommandBuffer>)external_cb1
+                                             : [P->queue commandBuffer];
         // Q chain — use cached weight buffers when available (wq_a, wq_b, wkv may be nil if memory-limited)
         if (abc && abc->wq_a_pack) {
             enc_dq_bf16_cached(P, cb1, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,

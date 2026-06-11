@@ -1080,12 +1080,16 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             FILE *f = fopen(path, "wb"); if (f) { fwrite(residual, sizeof(float), MHC_MULT*DIM, f); fclose(f); }
         }
     }
-    // === CB-A: mhc_pre + weighted_sum + RMSNorm fused (ds4 kernel, 1 encoder, 1 wait) ===
-    // Single dispatch replaces 2 encoders. Matches old bf16 precision at each boundary.
+    // === CB-A + CB1 merged: mhc_pre + Q/KV/SDPA in ONE command buffer (1 wait) ===
+    // Encoder 1: mhc_pre_split_weighted_sum_norm → post/comb/normed_bf16/attn_input on GPU
+    // Encoders 2..N: Q chain + KV chain + SDPA (reads normed_bf16 from GPU, no CPU roundtrip)
+    // Eliminates CB-A wait (32ms/token) by merging two CB boundaries into one.
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+
+        // Encoder 1: mhc_pre (attn) — writes normed_bf16 to GPU, consumed by Q/KV chain below
         {
-            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc = [merged_cb computeCommandEncoder];
             [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_split_weighted_sum_norm];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]       offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer]     offset:0 atIndex:1];
@@ -1099,19 +1103,46 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [enc endEncoding];
         }
-        [cb commit]; [cb waitUntilCompleted];
 
+        // Encoders 2..N: Q/KV/SDPA via external CB1 (reads buf_mhc_attn_norm_bf16 from GPU)
+        // Uses kv_cache GPU path to keep everything in the same CB (no CPU roundtrip).
+        // This call encodes into merged_cb and does NOT commit or wait.
+        KVCache *kvc = &eng->kv_cache[layer];
+        if (!kvc->kv) {
+            size_t kvc_size = (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t);
+            id<MTLBuffer> kvbuf = [(id<MTLDevice>)eng->device newBufferWithLength:kvc_size
+                                       options:MTLResourceStorageModeShared];
+            kvc->kv_gpu_buf = (void *)kvbuf;
+            kvc->kv = (uint16_t *)[kvbuf contents];
+            memset(kvc->kv, 0, kvc_size);
+            kvc->len = 0;
+        }
+        kvc->len += 1;
+
+        int attn_ret = mla_attention_decode_bf16(&P, &eng->attn[layer],
+            NULL, kvc->kv, kvc->len, pos, attn_out,
+            kvc->kv_gpu_buf,                                    // GPU KV path
+            eng->buf_mhc_attn_norm_bf16,                        // x_gpu_buf (from encoder 1)
+            (void *)merged_cb);                                 // external_cb1 — encode + commit + wait inside
+        // merged_cb was committed inside mla_attention_decode_bf16; data is ready now.
+
+        // CPU reads after merged CB completes:
+        // - attn_input (for compressor/indexer)
+        // - normed (for compressor/indexer + routing)
         memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
-        // post/comb NOT read here — CMD2 reads buf_mhc_post/comb_weights directly from GPU
         uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
         memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
         for (int i = 0; i < DIM; i++) {
             uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
             memcpy(&normed[i], &u, 4);
         }
+        // post/comb NOT read here — CMD2 reads buf_mhc_post/comb_weights directly from GPU
+
+        if (attn_ret != 0) return -1;
     }
 
     // Compressor step (before attention, for layers with compress_ratio > 0)
+    // Note: now runs AFTER merged CB-A+CB1. Compressor state updates are for future tokens.
     if (eng->compress_ratio[layer] > 0) {
         moe_infer_compressor_step(eng, layer, pos, normed);
     }
@@ -1123,53 +1154,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         has_comp_selection = moe_infer_indexer_step(eng, layer, pos, normed, NULL, comp_allowed);
     }
 
-    // MLA attention (decode, single token -> cache_len from kv_cache)
-    {
-        KVCache *kvc = &eng->kv_cache[layer];
-        if (!kvc->kv) {
-            // Allocate KV cache as MTLBuffer (Shared mode) so it's GPU-accessible.
-            // This enables blit-based KV update within CB1, eliminating one GPU sync per layer.
-            size_t kvc_size = (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t);
-            id<MTLBuffer> kvbuf = [(id<MTLDevice>)eng->device newBufferWithLength:kvc_size
-                                       options:MTLResourceStorageModeShared];
-            kvc->kv_gpu_buf = (void *)kvbuf;
-            kvc->kv = (uint16_t *)[kvbuf contents];
-            memset(kvc->kv, 0, kvc_size);
-            kvc->len = 0;
-        }
-        kvc->len += 1;
-
-        const uint32_t n_comp = eng->comp_state[layer].n_comp;
-        // Use mixed attention (raw SWA KV + compressed KV blocks) only when the
-        // raw KV cache exceeds the sliding window. For short sequences (all tokens
-        // fit in SWA_WINDOW), MLX does not compress and uses plain attention — we
-        // must do the same to match numerics.
-        const int use_comp = (n_comp > 0 && kvc->len > SWA_WINDOW);
-        const int tl_attn = (getenv("NATIVE_TIME_LAYERS") != NULL);
-        double ta0=0, ta1=0;
-        if (tl_attn) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ta0 = ts.tv_sec*1e9+ts.tv_nsec; }
-        if (use_comp) {
-            // Decode x to f32 for the mixed attention path
-            float x_f32[DIM];
-            for (int i = 0; i < DIM; i++) {
-                uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
-                memcpy(&x_f32[i], &u, 4);
-            }
-            const bool *allowed = has_comp_selection ? comp_allowed : NULL;
-            mla_attention_decode_mixed(&P, &eng->attn[layer], x_f32, kvc->kv, kvc->len,
-                                       pos, eng->comp_state[layer].comp_kv, (int)n_comp,
-                                       allowed, attn_out);
-        } else {
-            // BF16 attention using GPU-resident normed_bf16 (eliminates CPU→GPU upload)
-            mla_attention_decode_bf16(&P, &eng->attn[layer], NULL, kvc->kv, kvc->len, pos, attn_out,
-                                       kvc->kv_gpu_buf, eng->buf_mhc_attn_norm_bf16);
-        }
-        // Truncate attn_out to bf16
-        for (int i = 0; i < DIM; i++) {
-            uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
-        }
-        if (tl_attn) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ta1 = ts.tv_sec*1e9+ts.tv_nsec;
-            if (layer == 0) fprintf(stderr, "[ATTN-TIME] L0 pos=%d attn=%.1fms\n", pos, (ta1-ta0)/1e6); }
+    // Truncate attn_out to bf16 (matches MLX precision)
+    for (int i = 0; i < DIM; i++) {
+        uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
     }
 
     // === CB2+CMD2 merged: mhc_post(attn) + mhc_pre(ffn) + ffn_norm + routing in ONE CB ===
