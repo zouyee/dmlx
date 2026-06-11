@@ -71,10 +71,13 @@ int mla_attention_decode_f16kv(MlaPipes *pipes, const AttnWeights *aw,
 // external_cb1: optional id<MTLCommandBuffer>. When non-NULL, the function encodes
 // Q/KV/SDPA into this existing command buffer instead of creating its own CB1,
 // and does NOT commit or wait (caller is responsible). Requires kv_cache_gpu_buf.
+// out_gpu_buf: optional id<MTLBuffer> [DIM] f32. When non-NULL and external_cb1 is set,
+// wo_b output is written to this GPU buffer instead of being copied to CPU `out`.
+// Caller must read from this buffer after committing external_cb1.
 int mla_attention_decode_bf16(MlaPipes *pipes, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
                               int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf,
-                              void *external_cb1);
+                              void *external_cb1, void *out_gpu_buf);
 
 // Mixed attention: uint16_t raw KV (SWA window) + f32 comp_kv (selected blocks).
 int mla_attention_decode_mixed(MlaPipes *pipes, const AttnWeights *aw,

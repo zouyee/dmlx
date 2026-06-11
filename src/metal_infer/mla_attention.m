@@ -669,7 +669,7 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
 int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
                               int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf,
-                              void *external_cb1) {
+                              void *external_cb1, void *out_gpu_buf) {
     @autoreleasepool {
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
@@ -769,7 +769,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 [e endEncoding];
             }
             enc_rope_bf16(P, cb1, battn_scr, bcos, bsin, N_HEADS, 1);
-            [cb1 commit]; [cb1 waitUntilCompleted];
+            if (!external_cb1) {
+                [cb1 commit]; [cb1 waitUntilCompleted];
+            }
             // No CPU KV copy needed — bf16_to_f16_row kernel already wrote to cache
         } else {
             // Fallback: CPU KV copy between CB1 and CB2
@@ -808,10 +810,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         id<MTLBuffer> battn = battn_scr;  // alias for code below
 
     // === CB3+CB4 merged: wo_a (8 groups) + GPU blit concat + wo_b in ONE CB (1 wait) ===
-    // Replaces: CB3(wo_a wait) + CPU concat memcpy + CB4(wo_b wait)
-    // With:     single CB: wo_a × 8 + blit concat + wo_b, 1 wait
-    // Saves 1 GPU sync/layer = ~13ms × 43 = ~560ms/token.
-    uint16_t *attn_bf16 = (uint16_t *)[battn contents];
+    // When external_cb1 is set: uses it for CB3 too (GPU blit grouping, no CPU readback).
+    // When external_cb1 is NULL: legacy path with CPU memcpy grouping (backward compat).
+    uint16_t *attn_bf16 = external_cb1 ? NULL : (uint16_t *)[battn contents];
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
     float *concat = (abc && abc->scr_concat) ? NULL : malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
@@ -820,27 +821,47 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     id<MTLBuffer> bog_arr[O_GROUPS];
     id<MTLBuffer> bconcat = (abc && abc->scr_concat) ? abc->scr_concat
                               : mkbuf(d, NULL, (size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    id<MTLBuffer> bout    = (abc && abc->scr_out) ? abc->scr_out
-                              : mkbuf(d, NULL, DIM * sizeof(float));
+    id<MTLBuffer> bout    = out_gpu_buf ? (__bridge id<MTLBuffer>)out_gpu_buf
+                              : ((abc && abc->scr_out) ? abc->scr_out
+                                  : mkbuf(d, NULL, DIM * sizeof(float)));
     {
-        id<MTLCommandBuffer> cb3 = [P->queue commandBuffer];
+        id<MTLCommandBuffer> cb3 = external_cb1 ? (__bridge id<MTLCommandBuffer>)external_cb1
+                                                 : [P->queue commandBuffer];
 
         // --- Part 1: wo_a × 8 group matmuls ---
         for (int g = 0; g < O_GROUPS; g++) {
-            uint16_t *gv_bf16_data;
             id<MTLBuffer> bgv;
             if (abc && abc->scr_bgv[g]) {
                 bgv = abc->scr_bgv[g];
-                gv_bf16_data = (uint16_t *)[bgv contents];
             } else {
-                gv_bf16_data = malloc((size_t)group_feat * sizeof(uint16_t));
-                if (!gv_bf16_data) { if (concat) free(concat); return -1; }
-                bgv = mkbuf(d, gv_bf16_data, group_feat * sizeof(uint16_t));
+                bgv = mkbuf(d, NULL, group_feat * sizeof(uint16_t));
             }
-            for (int hh = 0; hh < heads_per_group; hh++)
-                memcpy(gv_bf16_data + hh * HEAD_DIM,
-                       attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM,
-                       HEAD_DIM * sizeof(uint16_t));
+
+            if (external_cb1) {
+                // GPU blit: copy group g's heads from battn → bgv (no CPU readback)
+                id<MTLBlitCommandEncoder> blit = [cb3 blitCommandEncoder];
+                [blit copyFromBuffer:battn
+                       sourceOffset:(size_t)g * group_feat * sizeof(uint16_t)
+                           toBuffer:bgv
+                  destinationOffset:0
+                               size:(size_t)group_feat * sizeof(uint16_t)];
+                [blit endEncoding];
+            } else {
+                // Legacy: CPU memcpy grouping
+                uint16_t *gv_bf16_data = (abc && abc->scr_bgv[g])
+                    ? (uint16_t *)[bgv contents]
+                    : malloc((size_t)group_feat * sizeof(uint16_t));
+                if (!(abc && abc->scr_bgv[g]) && !gv_bf16_data) { if (concat) free(concat); return -1; }
+                for (int hh = 0; hh < heads_per_group; hh++)
+                    memcpy(gv_bf16_data + hh * HEAD_DIM,
+                           attn_bf16 + (g * heads_per_group + hh) * HEAD_DIM,
+                           HEAD_DIM * sizeof(uint16_t));
+                if (!(abc && abc->scr_bgv[g])) {
+                    bgv = mkbuf(d, gv_bf16_data, group_feat * sizeof(uint16_t));
+                    free(gv_bf16_data);
+                }
+            }
+
             bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g]
                            : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
             id<MTLBuffer> bwg = (abc && abc->wo_a_q8_gpu[g])
@@ -856,11 +877,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             } else {
                 enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
             }
-            if (!abc || !abc->scr_bgv[g]) free(gv_bf16_data);
         }
 
         // --- Part 2: GPU blit concat (bog_arr[g] → bconcat[g * O_LORA_RANK]) ---
-        // Replaces CPU memcpy loop — allows wo_b to follow in the same CB.
         {
             id<MTLBlitCommandEncoder> blit = [cb3 blitCommandEncoder];
             size_t chunk = (size_t)O_LORA_RANK * sizeof(float);
@@ -896,9 +915,14 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             enc_dequant_matvec(P, cb3, &aw->wo_b, bconcat, bout);
         }
 
-        [cb3 commit]; [cb3 waitUntilCompleted];
+        if (!external_cb1) {
+            [cb3 commit]; [cb3 waitUntilCompleted];
+        }
     }
-    memcpy(out, [bout contents], DIM * sizeof(float));
+    // When external_cb1: bout hasn't been committed yet — caller reads after commit+wait.
+    if (!external_cb1) {
+        memcpy(out, [bout contents], DIM * sizeof(float));
+    }
     if (!abc || !abc->scr_concat) free(concat);
     } // end @autoreleasepool
     return 0;

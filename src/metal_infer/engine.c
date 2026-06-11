@@ -1123,8 +1123,13 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             NULL, kvc->kv, kvc->len, pos, attn_out,
             kvc->kv_gpu_buf,                                    // GPU KV path
             eng->buf_mhc_attn_norm_bf16,                        // x_gpu_buf (from encoder 1)
-            (void *)merged_cb);                                 // external_cb1 — encode + commit + wait inside
-        // merged_cb was committed inside mla_attention_decode_bf16; data is ready now.
+            (void *)merged_cb,                                  // external_cb1
+            eng->buf_attn_out);                                 // out_gpu_buf — wo_b writes here
+        // merged_cb now contains: mhc_pre + Q/KV/SDPA + GPU blit wo_a grouping + wo_a×8 + wo_b
+        [merged_cb commit]; [merged_cb waitUntilCompleted];
+
+        // Read attn_out from GPU buffer (written by wo_b in merged_cb)
+        memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));
 
         // CPU reads after merged CB completes:
         // - attn_input (for compressor/indexer)
