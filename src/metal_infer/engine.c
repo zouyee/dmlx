@@ -45,6 +45,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
 
     id<MTLDevice> d = (id<MTLDevice>)dev;
     eng->pipe_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu"] error:&err]);
+    eng->pipe_gate_up_swiglu_v2 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_v2"] error:&err]);
     eng->pipe_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit"] error:&err]);
     eng->pipe_moe_combine    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_combine"] error:&err]);
     eng->pipe_fused_6expert_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_gate_up_swiglu"] error:&err]);
@@ -774,11 +775,11 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             }
         } else {
             separate_mode:;
-            // === SEPARATE MODE: 6 per-expert dispatches ===
+            // === SEPARATE MODE: 6 per-expert dispatches (v2 no-x_shared coalesced) ===
             for (int k = 0; k < K; k++) {
                 char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_gate_up_swiglu];
+                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
                 [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
                 [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
                 [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
@@ -787,7 +788,9 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                 [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
                 uint od=INTERMEDIATE,id_=DIM,gs=32;
                 [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
-                [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc setThreadgroupMemoryLength:512 atIndex:0];  // 32*4*4 bytes (2 gate+up rows)
+                uint ntg = (INTERMEDIATE + 1) / 2;
+                [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
                 [enc endEncoding];
             }
             for (int k = 0; k < K; k++) {

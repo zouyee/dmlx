@@ -198,6 +198,7 @@ typedef struct {
 
     // Pipeline states (id<MTLComputePipelineState>)
     void *pipe_gate_up_swiglu;
+    void *pipe_gate_up_swiglu_v2;      // ds4 no-x_shared coalesced pattern
     void *pipe_dequant_matvec;
     void *pipe_moe_combine;
     // Fused 6-expert kernels: process K=6 experts in one dispatch

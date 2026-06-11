@@ -110,6 +110,127 @@ kernel void fused_gate_up_swiglu(
     }
 }
 
+// fused_gate_up_swiglu_v2 — ds4 no-x_shared coalesced pattern for MoE gate+up.
+//
+// Design (ds4 Q8_0 pattern adapted for MXFP4, group_size=32):
+//   - NR0=2 rows per threadgroup, NSG=4 simdgroups, 32 threads each → 128 threads/TG
+//   - Shared memory: 32 * 2 * sizeof(float) = 256 bytes (reduction only)
+//   - NO x_shared — no 16KB occupancy penalty
+//   - Coalesced access: 4 threads per group word, 8 groups per SIMD group
+//   - Each thread reads 8 consecutive x values, adjacent threads read adjacent blocks
+//
+// For gate/up [2048, 4096]: 2048/2 = 1024 threadgroups, 128 threads each = 131K threads.
+//   num_groups=128, packed_per_group=4. Each SIMD group: 32 threads → 8 groups per iteration,
+//   4 iterations total.
+kernel void fused_gate_up_swiglu_v2(
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint8_t*  gate_s    [[buffer(1)]],
+    device const uint32_t* up_W      [[buffer(2)]],
+    device const uint8_t*  up_s      [[buffer(3)]],
+    device const float*    x         [[buffer(4)]],
+    device float*          out       [[buffer(5)]],
+    constant uint&         out_dim   [[buffer(6)]],
+    constant uint&         in_dim    [[buffer(7)]],
+    constant uint&         group_size [[buffer(8)]],
+    threadgroup float*     shmem     [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 8, TPG = 4;
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;  // = 4 for gs=32
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *gr[NR0], *ur[NR0];
+    device const uint8_t  *gs[NR0], *us[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            gr[row] = gate_W + r * packed_cols;
+            gs[row] = gate_s + r * num_groups;
+            ur[row] = up_W   + r * packed_cols;
+            us[row] = up_s   + r * num_groups;
+        }
+    }
+
+    float gate_sum[NR0] = { 0.0f };
+    float up_sum[NR0]   = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+
+            float gsf = exp2((float)gs[row][gg] - 127.0f);
+            float usf = exp2((float)us[row][gg] - 127.0f);
+            uint gpw = gr[row][gg * packed_per_group + (uint)il];
+            uint upw = ur[row][gg * packed_per_group + (uint)il];
+
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 0)&0xF] * gsf * xv0;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 4)&0xF] * gsf * xv1;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 8)&0xF] * gsf * xv2;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>12)&0xF] * gsf * xv3;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>16)&0xF] * gsf * xv4;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>20)&0xF] * gsf * xv5;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>24)&0xF] * gsf * xv6;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>28)&0xF] * gsf * xv7;
+
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>> 0)&0xF] * usf * xv0;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>> 4)&0xF] * usf * xv1;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>> 8)&0xF] * usf * xv2;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>>12)&0xF] * usf * xv3;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>>16)&0xF] * usf * xv4;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>>20)&0xF] * usf * xv5;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>>24)&0xF] * usf * xv6;
+            up_sum[row] += NIBBLE_TO_FLOAT[(upw>>28)&0xF] * usf * xv7;
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0*2];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row*2]   = shmem + NW * (row*2);
+        shmem_f32[row*2+1] = shmem + NW * (row*2+1);
+        if (sgitg == 0) {
+            shmem_f32[row*2][tiisg] = 0.0f;
+            shmem_f32[row*2+1][tiisg] = 0.0f;
+        }
+        gate_sum[row] = simd_sum(gate_sum[row]);
+        up_sum[row]   = simd_sum(up_sum[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) {
+            shmem_f32[row*2][sgitg]   = gate_sum[row];
+            shmem_f32[row*2+1][sgitg] = up_sum[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float limit = 10.0f;
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float gv = simd_sum(shmem_f32[row*2][tiisg]);
+        float uv = simd_sum(shmem_f32[row*2+1][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float g_c = min(gv, limit);
+            float u_c = min(max(uv, -limit), limit);
+            out[d] = (g_c / (1.0f + exp(-g_c))) * u_c;
+        }
+    }
+}
+
 // dequant_matvec_4bit — SIMD-optimized MXFP4 matvec (down_proj: [4096, 2048]).
 //
 // Same strategy as fused_gate_up_swiglu: 8 SIMD groups per threadgroup,
