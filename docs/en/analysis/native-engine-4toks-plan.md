@@ -91,10 +91,13 @@ MoE GPU 占 per-layer 时间的 90%，估计 43 层合计 **~1100ms**（benchmar
 每个 dispatch 使用 x_shared[4096]=16KB（flash-moe v3 pattern）。
 Gather mode 默认禁用（13MB expert-stride 导致 scattered memory access，实测比 separate 更慢）。
 
-优化方向：
-1. **Fix gather mode**: 改变 SMELT pool 布局（interleaved expert data）避免 13MB stride
-2. **Optimize separate mode**: 用 ds4 no-x_shared coalesced pattern 替代 x_shared[4096]=16KB
-3. **Apply FMA optimization**: pre-compute scale*x, bias*x（类似 wo_b v2 +12% gain）
+### 3.4 MoE v2 尝试：no-x_shared pattern
+
+**结果**：Paris ✓，0.704 tok/s — 无改进。
+
+**原因**：v1（256 threads, x_shared[4096], 8 rows/TG）vs v2（128 threads, no x_shared, 2 rows/TG）。v1 的 x_shared 成本分摊到 8 行，v2 减少的并行度抵消了 x_shared 的节省。
+
+**结论**：MoE GPU 是 **compute-bound**，不是 occupancy-bound。当前 flash-moe v3 pattern 已接近最优。进一步优化需改 expert 量化格式（如 ds4 的 Q8_0）。
 
 ---
 
