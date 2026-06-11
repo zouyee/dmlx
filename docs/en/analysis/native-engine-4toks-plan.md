@@ -1,194 +1,117 @@
-# Native Engine：4 tok/s 性能优化 — 执行记录 + ds4 路径
+# Native Engine：4 tok/s 性能优化 — 执行记录 + 瓶颈分析
 
 date: 2026-06-11（持续更新）
 baseline: commit `e01aed5`，实测 **0.709 tok/s**（SMELT N=51，热状态，M4 Pro 48GB）
 target: **≥ 4 tok/s**
-current: commit `40425ab`，实测 **~0.72 tok/s**（benchmark 噪声范围，无统计显著改进）
+current: commit `b750770`，实测 **~0.778 tok/s**（benchmark 固有不稳定性 ±8%，无统计显著改进）
 
 ---
 
-## 1. 已完成的优化
+## 0. 当前性能 profile（NATIVE_TIME_LAYERS=1, pos=8, warm state）
 
-### 1.1 性能演进
+```
+Hash layers (0-2):  88ms (3.6%)  — L0 9.5ms, L1 7.3ms, L2 71.0ms
+Score layers odd:   ~42ms × 20 = 840ms (34.6%)
+Score layers even:  ~75ms × 20 = 1500ms (61.8%)
+─────────────────────────────────
+Total:              ~2529ms (with profiling overhead)
+Estimated raw:      ~1264ms → 0.79 tok/s ✓ (matches benchmark ~0.78)
+```
 
-| Commit | 内容 | tok/s | 提升 | 备注 |
-|--------|------|-------|------|------|
-| `e01aed5` | **baseline** | **0.709** | — | — |
-| `b4b63f0` | Phase 1+2+3: mHC fusion + Q8_0 wo_a | 0.752 | +6.1% | 实质收益 |
-| `6b704ef` | Phase 4: coalesced wo_b v2 | 0.778 | +3.5% | 实质收益 |
-| `ea18a9c` | GPU buffer pass-through | ~0.72 | 0 | 接口重构，无收益 |
-| `40425ab` | CB-A + CB1 merge | ~0.72 | 0 | 接口重构，无收益 |
-
-### 1.2 各 Phase 详情
-
-见下方"已移植的 ds4 内核"章节。
+**关键发现：score layers 交替出现 42ms/75ms 模式**。差值的 33ms ✕ 20 层 = 660ms 是最大单一损失。
 
 ---
 
-## 2. CB-A Wait 消除尝试 — 为什么失败了
+## 1. 已完成优化（5 个 commit, 639 insertions）
 
-### 2.1 尝试的内容
+| Commit | 内容 | 类型 | tok/s | 收益 |
+|--------|------|------|-------|------|
+| `b4b63f0` | Phase 1+2+3: mHC fusion + Q8_0 wo_a | **kernel fusion + bandwidth** | 0.752 | +6.1% |
+| `6b704ef` | Phase 4: coalesced wo_b v2 | **bandwidth** | 0.778 | +3.5% |
+| `ea18a9c` | GPU buffer pass-through | CB merge (无效) | ~0.72 | 0 |
+| `40425ab` | CB-A + CB1 merge | CB merge (无效) | ~0.67 | 0 |
+| `b750770` | GPU blit CB1+CB3 merge | CB merge (无效) | ~0.72 | 0 |
 
-两个 commit：
-
-1. **GPU buffer pass-through** (`ea18a9c`)：消除 CB-A → MLA 之间的 CPU normed 读回，传入 GPU buffer
-2. **CB-A + CB1 merge** (`40425ab`)：将 mhc_pre 编码合并进 CB1，消除独立的 CB-A
-
-### 2.2 为什么性能没提升
-
-根因：**CB1 和 CB3 之间仍然有 CPU 读回**。
-
-```
-merged CB:
-  Enc 1:  mhc_pre → buf_mhc_attn_norm_bf16 (GPU)
-  Enc 2..N: Q/KV/SDPA → battn (GPU)
-  [commit + wait]           ← 这个 wait 仍然存在
-  CPU: 读 battn → 提取 wo_a 8 groups → bconcat (CPU)  ← 强制 CPU 读回
-  CB3: wo_a × 8 + wo_b
-  [commit + wait]
-```
-
-mhc_pre 和 Q/KV/SDPA 合并在同一个 CB 里了，但 CB 内部的 `[commit + wait]` 本身没变——GPU 执行的工作量完全一样，wait 时间也完全一样。只是少了一个 Metal encoder 的创建开销（微秒级，不可测）。
-
-**真正的瓶颈是 CB1→CB3 之间的 CPU battn 读回**：mla_attention_decode_bf16 在 SDPA 之后必须把 `battn` 读到 CPU，做 head grouping（8 组 wo_a 各自提取对应的 head 输出），然后才能编码 wo_a+wo_b。这个 CPU 读回强制了 CB1 和 CB3 不能合并。
-
-### 2.3 结论
-
-**局部 CB 合并不起作用。必须遵循 ds4 的方式：整个 layer 一个 CB，所有中间数据留在 GPU 上。**
+**结论：只有减少 GPU 计算量/带宽的优化有收益。CB 级合并不减少 GPU 计算，无效。**
 
 ---
 
-## 3. ds4 的正确路径：单 CB 全层流水线
+## 2. 关键教训：CB 合并 ≠ Kernel 融合
 
-### 3.1 ds4 架构
+### 2.1 文档此前没有区分清楚
 
-ds4 把每个 layer 的所有操作编码进**一个** command buffer：
+`ds4-kernel-deconstruction.md` 原文：
+> "CB-A wait = 32ms/token（实测）的来源（是 CB 边界导致的）"
+> "最高 ROI：移植 kernel_dsv4_hc_split_weighted_sum_norm4（消除 CB-A wait）"
 
-```
-begin_cb
-  → mhc_pre (split + weighted sum + norm)
-  → attention (Q/K/V/SDPA)
-  → attention output + HC expand (FUSED: Q8_0 matvec + mhc_post)
-  → mhc_pre_ffn (split + weighted sum + norm)
-  → FFN (expert routing + compute + shared + combine)
-  → FFN output + HC expand (FUSED)
-commit + wait (一次)
-```
+**这是错误的**。32ms 是 GPU 执行 mhc_pre 的时间，不是 "CB 边界的 idle wait"。
 
-关键差别：
-- ds4 的 attention 输出直接做 HC expand，**不需要 CPU 读回 SDPA 输出做 head grouping**
-- ds4 的 FFN 输出直接做 HC expand，**不需要 CPU 读回 ffn_out**
-- 全程 GPU-side，零中间 CPU 干预
+### 2.2 正确理解
 
-### 3.2 dmlx 要改成 ds4 方式需要做什么
+| | CB 合并 | Kernel 融合 |
+|---|---|---|
+| 做了什么 | 多个 kernel dispatch → 同一 CB | 多个操作 → 一个 kernel dispatch |
+| 减少 GPU 计算？ | ❌ 不 | ✅ 是（消除中间读写） |
+| 减少 dispatch 开销？ | ✅ 微秒级 | ✅ 同左 |
+| 实际收益 | 0（已验证 3 次） | +6.1%（Phase 1-2） |
 
-**核心改动**：消除两个 CPU 读回点。
+### 2.3 ds4 真正优势是 Kernel 融合，不是 CB 合并
 
-**读回点 1：SDPA 输出 → wo_a head grouping**
-
-当前 `mla_attention_decode_bf16`：
-```objc
-// CB1: SDPA → battn (GPU, bf16)
-[cb1 commit]; [cb1 waitUntilCompleted];
-uint16_t *attn_bf16 = [battn contents];  // ← CPU 读回
-for (int g = 0; g < 8; g++) {
-    // CPU memcpy: 提取 group g 的 head 输出 → bgv
-    memcpy(gv_bf16_data + hh * HEAD_DIM, attn_bf16 + ..., HEAD_DIM * sizeof(uint16_t));
-    // CB3: wo_a matvec
-    enc_matvec_q8_0(..., bgv, ...);
-}
-```
-
-改为 GPU blit：
-```objc
-// CB1: SDPA → battn (GPU, bf16)
-// NO commit, NO wait, NO CPU readback
-// GPU blit: 直接提取 group g 的 head 输出 → bgv (GPU)
-for (int g = 0; g < 8; g++) {
-    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-    // blit battn[g*heads_per_group*HEAD_DIM .. (g+1)*heads_per_group*HEAD_DIM]
-    //   → bgv[0 .. group_feat]
-    [blit copyFromBuffer:battn sourceOffset:... toBuffer:bgv destinationOffset:0 size:...];
-    [blit endEncoding];
-    // CB3: wo_a matvec (same CB, after blit)
-    enc_matvec_q8_0(..., bgv, ...);
-}
-// ONE commit + wait at the end
-```
-
-**读回点 2：ffn_out → mhc_post_ffn**
-
-已解决（Phase 1 的 `mhc_post_ffn_expand4` 直接读 `buf_ffn_out_f32`）。
-
-### 3.3 实施计划
-
-#### Step A: GPU blit wo_a grouping（消除读回点 1）
-
-**文件**：`mla_attention.m`（CB3 部分，~810-870 行）
-
-改动：
-- 不再 CPU 读 `battn`，用 Metal blit encoder 在 GPU 上提取每个 group 的 head 输出
-- CB1 和 CB3 合并为一个 CB
-- 一个 commit + wait
-
-**涉及函数**：`mla_attention_decode_bf16`（或新增 `mla_attention_decode_bf16_merged`）
-
-**关键**：blit encoder 必须在 compute encoder 之间穿插，Metal 支持在同一 CB 中混合 blit 和 compute。
-
-#### Step B: CB-A + CB1 + CB3 全合并（在 Step A 基础上）
-
-**文件**：`engine.c` + `mla_attention.m`
-
-改动：
-- engine.c 不再单独编码 CB-A
-- mhc_pre 作为第一个 encoder 编入合并的 CB
-- 然后 Q/KV/SDPA（GPU path）
-- 然后 GPU blit wo_a grouping + wo_a×8 + wo_b
-- 一个 commit + wait
-
-**预期收益**：消除 CB-A wait（32ms） + CB1→CB3 间隔。tok/s: 0.72 → ~0.85-0.95。
-
-#### Step C: CMD2 合并（远期，消除第二个 wait）
-
-**文件**：`engine.c`
-
-改动：
-- CMD2（mhc_post + mhc_pre_ffn + routing）合并进同一个 CB
-- Expert I/O 仍然需要 CPU 决策，但可以在 commit 之前编码 CMD2
-- 一个 commit + wait per layer（ds4 方式）
-
-**预期收益**：消除 CMD2 wait（52ms）。tok/s: ~0.95 → ~1.3-1.5。
+ds4 的单个 CB 包含的不是多个独立 kernel dispatch，而是 **fused kernel dispatch**：
+- `kernel_dsv4_hc_split_weighted_sum_norm4`: 3 个操作融合为 1 个 kernel（我们已移植 ✓）
+- `kernel_dsv4_q8_hc_expand4_q8_0`: attention 输出 + HC expand 融合为 1 个 kernel（未移植）
+- `kernel_dsv4_shared_down_hc_expand4_q8_0`: shared expert + HC expand 融合（未移植）
 
 ---
 
-## 4. 已移植的 ds4 内核
+## 3. 剩余瓶颈：score layer 交替 42ms/75ms 分析
 
-| dmlx 内核 | ds4 原版 | 作用 | Commit |
+### 3.1 可能原因
+
+| 假说 | 可能性 | 验证方法 |
+|------|--------|---------|
+| Expert I/O 偶发 cache miss | 中 | 对比 `io_pool_dispatch_cached` 耗时 |
+| SMELT pool 内 alternating access pattern | 低 | 检查 pool 布局 |
+| GPU 资源竞争（shared mem 等） | 低 | 单层 profiling |
+| 仍存在未优化的 CB 边界 | 中 | 需要 phase-level profiling |
+
+### 3.2 需要添加的 profiling
+
+当前只有 `NATIVE_TIME_LAYERS` 给出每层总时间。需要新增 phase-level profiling 来分解每层的 CB-A/CB1/CB3/CMD2/MoE/cb3 耗时。
+
+### 3.3 下一步方向
+
+1. **添加 phase-level profiling**：在 engine.c 的关键 CB wait 点添加计时
+2. **精确定位 75ms vs 42ms 差异来源**：是 I/O、GPU compute、还是 wait？
+3. **根据 profiling 结果定向优化**
+
+---
+
+## 4. Expert I/O 现状
+
+- SMELT N=51：51 个 experts/layer 缓存 在 RAM（~29GB）
+- penalty routing：确保 6 个选中 experts 都在缓存中
+- `io_pool_dispatch_cached`：全命中时零 I/O（直接返回 RAM 指针）
+- gather mode：默认禁用（13MB expert-stride 导致 scattered access，比 separate 更慢）
+- **结论：expert I/O 瓶颈已被 SMELT 解决，剩余 208ms 是纯 GPU compute + dispatch overhead**
+
+---
+
+## 5. 已移植的 ds4 内核
+
+| dmlx 内核 | ds4 原版 | 类型 | Commit |
 |-----------|---------|------|--------|
-| `mhc_post_ffn_expand4` | `kernel_dsv4_hc_expand4` | cb3: 3 encoders → 1 | `b4b63f0` |
-| `mhc_pre_split_weighted_sum_norm` | `kernel_dsv4_hc_split_weighted_sum_norm4` | CB-A: 2 encoders → 1 | `b4b63f0` |
-| `matvec_q8_0_f32` | `kernel_mul_mv_q8_0_f32` | wo_a f32→Q8_0 | `b4b63f0` |
-| `dequant_matvec_affine_v2` | ds4 Q8_0 模式适配 affine 4-bit | wo_b coalesced | `6b704ef` |
+| `mhc_post_ffn_expand4` | `kernel_dsv4_hc_expand4` | kernel fusion | `b4b63f0` |
+| `mhc_pre_split_weighted_sum_norm` | `kernel_dsv4_hc_split_weighted_sum_norm4` | kernel fusion | `b4b63f0` |
+| `matvec_q8_0_f32` | `kernel_mul_mv_q8_0_f32` | bandwidth | `b4b63f0` |
+| `dequant_matvec_affine_v2` | ds4 Q8_0 模式适配 | bandwidth | `6b704ef` |
 
----
+## 6. 未移植的 ds4 内核
 
-## 5. 关键教训
-
-1. **bf16 精度匹配**：移植内核必须保留 `float(bfloat(...))` cast，否则 43 层累积误差导致 Paris 失败
-2. **Q8_0 量化用 `roundf()`**：`(int)(v+0.5f)` 对负数舍入错误
-3. **局部 CB 合并不起作用**：只要中间有 CPU 读回，合并就无法消除 wait。必须把所有操作放在一个 CB 中，全程 GPU-side
-4. **GPU blit 是消除 CPU 读回的关键**：Metal blit encoder 可以在同一 CB 中重新排列 GPU buffer 数据，替代 CPU memcpy
-
----
-
-## 6. 不做的事（已验证）
-
-| 方案 | 结果 | 原因 |
-|------|------|------|
-| flash-moe v3 | 退步 | x_shared[4096]=16KB→occupancy 崩溃 |
-| shared expert v2 | Paris ✗ | bug 未定位 |
-| 局部 CB merge（无 GPU blit） | 无收益 | CB3 CPU 读回强制 wait |
-| batched_wo_a / shared_mem xs / 4-bit 等 | 退步 | 均未解决 non-coalesced access |
+| 内核 | 原因 |
+|------|------|
+| `kernel_dsv4_q8_hc_expand4_q8_0` | 需要 wo_b 改为 Q8_0 格式（当前 affine 4-bit） |
+| `kernel_dsv4_shared_down_hc_expand4_q8_0` | 需要 shared expert 改为 Q8_0 格式 |
 
 ---
 
@@ -196,6 +119,6 @@ for (int g = 0; g < 8; g++) {
 
 ```bash
 sudo purge
-bash scripts/run_benchmark.sh  # SMELT N=51，顺序，热状态
+NATIVE_TIME_LAYERS=1 bash scripts/run_benchmark.sh  # 获得 phase-level 时间分解
 # 要求：Paris ✓，tok/s 不退化
 ```
