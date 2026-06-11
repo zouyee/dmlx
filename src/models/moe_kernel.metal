@@ -12,6 +12,11 @@ constant float NIBBLE_TO_FLOAT[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
 };
 
+// Read bf16 value from uint16_t pointer and convert to f32.
+inline float bf16_to_f32(device const uint16_t* p) {
+    return float(*(device const bfloat*)p);
+}
+
 // fused_gate_up_swiglu — SIMD-optimized MXFP4 fused gate+up+SwiGLU.
 //
 // Strategy (matches flash-moe dequant_matvec_4bit_fast pattern):
@@ -231,7 +236,123 @@ kernel void fused_gate_up_swiglu_v2(
     }
 }
 
-// dequant_matvec_4bit — SIMD-optimized MXFP4 matvec (down_proj: [4096, 2048]).
+kernel void fused_gate_up_swiglu_v2_affine(
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint16_t* gate_s    [[buffer(1)]],  // bf16 scales
+    device const uint16_t* gate_b    [[buffer(2)]],  // bf16 biases
+    device const uint32_t* up_W      [[buffer(3)]],
+    device const uint16_t* up_s      [[buffer(4)]],  // bf16 scales
+    device const uint16_t* up_b      [[buffer(5)]],  // bf16 biases
+    device const float*    x         [[buffer(6)]],
+    device float*          out       [[buffer(7)]],
+    constant uint&         out_dim   [[buffer(8)]],
+    constant uint&         in_dim    [[buffer(9)]],
+    constant uint&         group_size [[buffer(10)]],
+    threadgroup float*     shmem     [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 8, TPG = 4;
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;  // = 8 for gs=64
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *gr[NR0], *ur[NR0];
+    device const uint16_t *gs[NR0], *gb[NR0], *us[NR0], *ub[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            gr[row] = gate_W + r * packed_cols;
+            gs[row] = gate_s + r * num_groups;
+            gb[row] = gate_b + r * num_groups;
+            ur[row] = up_W   + r * packed_cols;
+            us[row] = up_s   + r * num_groups;
+            ub[row] = up_b   + r * num_groups;
+        }
+    }
+
+    float gate_sum[NR0] = { 0.0f };
+    float up_sum[NR0]   = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+
+            float gsf = bf16_to_f32(&gs[row][gg]);
+            float gbf = bf16_to_f32(&gb[row][gg]);
+            float usf = bf16_to_f32(&us[row][gg]);
+            float ubf = bf16_to_f32(&ub[row][gg]);
+
+            uint gpw = gr[row][gg * packed_per_group + (uint)il];
+            uint upw = ur[row][gg * packed_per_group + (uint)il];
+
+            gate_sum[row] += fma(float((gpw>> 0)&0xF), gsf, gbf) * xv0;
+            gate_sum[row] += fma(float((gpw>> 4)&0xF), gsf, gbf) * xv1;
+            gate_sum[row] += fma(float((gpw>> 8)&0xF), gsf, gbf) * xv2;
+            gate_sum[row] += fma(float((gpw>>12)&0xF), gsf, gbf) * xv3;
+            gate_sum[row] += fma(float((gpw>>16)&0xF), gsf, gbf) * xv4;
+            gate_sum[row] += fma(float((gpw>>20)&0xF), gsf, gbf) * xv5;
+            gate_sum[row] += fma(float((gpw>>24)&0xF), gsf, gbf) * xv6;
+            gate_sum[row] += fma(float((gpw>>28)&0xF), gsf, gbf) * xv7;
+
+            up_sum[row]   += fma(float((upw>> 0)&0xF), usf, ubf) * xv0;
+            up_sum[row]   += fma(float((upw>> 4)&0xF), usf, ubf) * xv1;
+            up_sum[row]   += fma(float((upw>> 8)&0xF), usf, ubf) * xv2;
+            up_sum[row]   += fma(float((upw>>12)&0xF), usf, ubf) * xv3;
+            up_sum[row]   += fma(float((upw>>16)&0xF), usf, ubf) * xv4;
+            up_sum[row]   += fma(float((upw>>20)&0xF), usf, ubf) * xv5;
+            up_sum[row]   += fma(float((upw>>24)&0xF), usf, ubf) * xv6;
+            up_sum[row]   += fma(float((upw>>28)&0xF), usf, ubf) * xv7;
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0*2];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row*2]   = shmem + NW * (row*2);
+        shmem_f32[row*2+1] = shmem + NW * (row*2+1);
+        if (sgitg == 0) {
+            shmem_f32[row*2][tiisg] = 0.0f;
+            shmem_f32[row*2+1][tiisg] = 0.0f;
+        }
+        gate_sum[row] = simd_sum(gate_sum[row]);
+        up_sum[row]   = simd_sum(up_sum[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) {
+            shmem_f32[row*2][sgitg]   = gate_sum[row];
+            shmem_f32[row*2+1][sgitg] = up_sum[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float limit = 10.0f;
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float gv = simd_sum(shmem_f32[row*2][tiisg]);
+        float uv = simd_sum(shmem_f32[row*2+1][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float g_c = min(gv, limit);
+            float u_c = min(max(uv, -limit), limit);
+            out[d] = (g_c / (1.0f + exp(-g_c))) * u_c;
+        }
+    }
+}
+
+// dequant_matvec_4bit_affine — ds4 no-x_shared affine 4-bit down_proj [4096, 2048] gs=64.
 //
 // Same strategy as fused_gate_up_swiglu: 8 SIMD groups per threadgroup,
 // each SIMD group handles one output row with simd_sum reduction.
@@ -239,6 +360,92 @@ kernel void fused_gate_up_swiglu_v2(
 //
 // Dispatch: MTLSizeMake(out_dim/8, 1, 1) threadgroups × 256 threads.
 // (For out_dim=4096: 512 threadgroups × 256 threads)
+
+// dequant_matvec_4bit_affine — ds4 no-x_shared affine 4-bit down_proj [4096, 2048] gs=64.
+
+kernel void dequant_matvec_4bit_affine(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const uint16_t* scales   [[buffer(1)]],  // bf16
+    device const uint16_t* biases   [[buffer(2)]],  // bf16
+    device const float*    x        [[buffer(3)]],
+    device float*          out      [[buffer(4)]],
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    threadgroup float*     shmem    [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32;
+    const short TPG = 8;  // threads per group: packed_per_group = group_size/8 = 8 for gs=64
+    const short NQ  = 4;  // groups per SIMD group: NW/TPG = 32/8 = 4
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *wr[NR0];
+    device const uint16_t *sr[NR0];
+    device const uint16_t *br[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            wr[row] = W_packed + r * packed_cols;
+            sr[row] = scales   + r * num_groups;
+            br[row] = biases   + r * num_groups;
+        }
+    }
+
+    float sumf[NR0] = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+
+            float sf = bf16_to_f32(&sr[row][gg]);
+            float bf = bf16_to_f32(&br[row][gg]);
+            uint32_t pw = wr[row][gg * packed_per_group + (uint)il];
+
+            sumf[row] += fma(float((pw>> 0)&0xF), sf, bf) * xv0;
+            sumf[row] += fma(float((pw>> 4)&0xF), sf, bf) * xv1;
+            sumf[row] += fma(float((pw>> 8)&0xF), sf, bf) * xv2;
+            sumf[row] += fma(float((pw>>12)&0xF), sf, bf) * xv3;
+            sumf[row] += fma(float((pw>>16)&0xF), sf, bf) * xv4;
+            sumf[row] += fma(float((pw>>20)&0xF), sf, bf) * xv5;
+            sumf[row] += fma(float((pw>>24)&0xF), sf, bf) * xv6;
+            sumf[row] += fma(float((pw>>28)&0xF), sf, bf) * xv7;
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row] = shmem + NW * row;
+        if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[d] = tot;
+    }
+}
+
 kernel void dequant_matvec_4bit(
     device const uint32_t* W_packed [[buffer(0)]],
     device const uint8_t*  scales   [[buffer(1)]],

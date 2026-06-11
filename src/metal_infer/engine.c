@@ -46,6 +46,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     id<MTLDevice> d = (id<MTLDevice>)dev;
     eng->pipe_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu"] error:&err]);
     eng->pipe_gate_up_swiglu_v2 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_v2"] error:&err]);
+    eng->pipe_gate_up_swiglu_v2_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_v2_affine"] error:&err]);
+    eng->pipe_dequant_matvec_4bit_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit_affine"] error:&err]);
     eng->pipe_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit"] error:&err]);
     eng->pipe_moe_combine    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"moe_combine"] error:&err]);
     eng->pipe_fused_6expert_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_gate_up_swiglu"] error:&err]);
@@ -457,10 +459,13 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
                 if (!base) continue;
                 eng->expert_gpu_buf[layer][eid][0] = (void *)[d newBufferWithBytesNoCopy:base+GATE_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
                 eng->expert_gpu_buf[layer][eid][1] = (void *)[d newBufferWithBytesNoCopy:base+GATE_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+GATE_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+UP_B_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][6] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][7] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                eng->expert_gpu_buf[layer][eid][8] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
                 n_created++;
             }
         }
@@ -775,19 +780,21 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             }
         } else {
             separate_mode:;
-            // === SEPARATE MODE: 6 per-expert dispatches (v2 no-x_shared coalesced) ===
+            // === SEPARATE MODE: 6 per-expert dispatches (affine 4-bit no-x_shared) ===
             for (int k = 0; k < K; k++) {
                 char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+gw_off,4194304) offset:0 atIndex:0];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+gs_off,262144)  offset:0 atIndex:1];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+uw_off,4194304) offset:0 atIndex:2];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+us_off,262144)  offset:0 atIndex:3];
-                [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-                uint od=INTERMEDIATE,id_=DIM,gs=32;
-                [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
+                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2_affine];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+GATE_W_OFF,4194304) offset:0 atIndex:0];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+GATE_S_OFF,262144)  offset:0 atIndex:1];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+GATE_B_OFF,262144)  offset:0 atIndex:2];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_W_OFF,4194304)   offset:0 atIndex:3];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+UP_S_OFF,262144)    offset:0 atIndex:4];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+UP_B_OFF,262144)    offset:0 atIndex:5];
+                [enc setBuffer:eng->buf_normed offset:0 atIndex:6];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:7];
+                uint od=INTERMEDIATE,id_=DIM,gs=64;
+                [enc setBytes:&od length:4 atIndex:8]; [enc setBytes:&id_ length:4 atIndex:9]; [enc setBytes:&gs length:4 atIndex:10];
                 [enc setThreadgroupMemoryLength:512 atIndex:0];  // 32*4*4 bytes (2 gate+up rows)
                 uint ntg = (INTERMEDIATE + 1) / 2;
                 [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
@@ -796,14 +803,17 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             for (int k = 0; k < K; k++) {
                 char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_dequant_matvec];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+dw_off,4194304) offset:0 atIndex:0];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+ds_off,262144)  offset:0 atIndex:1];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
-                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-                uint od=DIM,id_=INTERMEDIATE,gs=32;
-                [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
-                [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [enc setComputePipelineState:eng->pipe_dequant_matvec_4bit_affine];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+DOWN_S_OFF,262144) offset:0 atIndex:1];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+DOWN_B_OFF,262144) offset:0 atIndex:2];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:3];
+                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:4];
+                uint od=DIM,id_=INTERMEDIATE,gs=64;
+                [enc setBytes:&od length:4 atIndex:5]; [enc setBytes:&id_ length:4 atIndex:6]; [enc setBytes:&gs length:4 atIndex:7];
+                [enc setThreadgroupMemoryLength:256 atIndex:0];  // 32*2*4 bytes
+                uint d_ntg = (DIM + 1) / 2;
+                [enc dispatchThreadgroups:MTLSizeMake(d_ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
                 [enc endEncoding];
             }
         } // end if gather_mode / else separate mode

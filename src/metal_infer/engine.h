@@ -110,14 +110,17 @@ typedef struct {
 } AttnWeights;
 
 
-// Expert packed binary layout (see repack_experts.py)
-#define EXPERT_SIZE 13369344  // bytes per expert
+// Expert packed binary layout (affine 4-bit, group_size=64)
+#define EXPERT_SIZE 14155776  // bytes per expert (~13.5 MB)
 #define GATE_W_OFF  0
 #define GATE_S_OFF  4194304
-#define UP_W_OFF    4456448
-#define UP_S_OFF    8650752
-#define DOWN_W_OFF  8912896
-#define DOWN_S_OFF  13107200
+#define GATE_B_OFF  4456448
+#define UP_W_OFF    4718592
+#define UP_S_OFF    8912896
+#define UP_B_OFF    9175040
+#define DOWN_W_OFF  9437184
+#define DOWN_S_OFF  13631488
+#define DOWN_B_OFF  13893632
 
 // ============================================================================
 // Layer config — which layers use full attention vs linear attention
@@ -199,6 +202,8 @@ typedef struct {
     // Pipeline states (id<MTLComputePipelineState>)
     void *pipe_gate_up_swiglu;
     void *pipe_gate_up_swiglu_v2;      // ds4 no-x_shared coalesced pattern
+    void *pipe_gate_up_swiglu_v2_affine; // affine 4-bit dequant (FMA, no exp2)
+    void *pipe_dequant_matvec_4bit_affine; // affine 4-bit down_proj
     void *pipe_dequant_matvec;
     void *pipe_moe_combine;
     // Fused 6-expert kernels: process K=6 experts in one dispatch
@@ -339,9 +344,9 @@ typedef struct {
 
     // Persistent GPU MTLBuffer wrappers for SMELT-cached experts.
     // Created once after SMELT warmup; reused every forward call.
-    // expert_gpu_buf[layer][eid][slot]: slot 0=gate_w, 1=gate_s, 2=up_w, 3=up_s, 4=down_w, 5=down_s
+    // expert_gpu_buf[layer][eid][slot]: slot 0=gate_W, 1=gate_S, 2=gate_B, 3=up_W, 4=up_S, 5=up_B, 6=down_W, 7=down_S, 8=down_B
     // NULL if expert not cached.
-    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][6];
+    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][9];
 
     // Gather MoE: per-layer NoCopy Metal buffer over the SMELT RAM pool.
     // The gather kernels address experts via pool_pos (slot index within the pool)
