@@ -65,9 +65,12 @@ int mla_attention_decode_f16kv(MlaPipes *pipes, const AttnWeights *aw,
 // When non-NULL, the function uses GPU blit to update the KV cache and merges
 // CB1+CB2 into one command buffer (saves 1 GPU sync = ~8ms/layer).
 // When NULL, falls back to CPU KV copy (safe for any kv_cache pointer).
+// x_gpu_buf: optional id<MTLBuffer> [DIM] bf16. When x is NULL and x_gpu_buf is
+// non-NULL, the function reads the attention input directly from GPU memory
+// (eliminates CPU→GPU upload of normed input).
 int mla_attention_decode_bf16(MlaPipes *pipes, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
-                              int pos, float *out, void *kv_cache_gpu_buf);
+                              int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf);
 
 // Mixed attention: uint16_t raw KV (SWA window) + f32 comp_kv (selected blocks).
 int mla_attention_decode_mixed(MlaPipes *pipes, const AttnWeights *aw,

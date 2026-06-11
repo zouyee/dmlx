@@ -1139,14 +1139,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         kvc->len += 1;
 
-        // Convert normed (f32) to bf16 for the attention call
-        uint16_t normed_bf16[DIM];
-        for (int i = 0; i < DIM; i++) {
-            // f32 -> bf16: take upper 16 bits of float32
-            uint32_t u; memcpy(&u, &normed[i], 4);
-            normed_bf16[i] = (uint16_t)(u >> 16);
-        }
-
         const uint32_t n_comp = eng->comp_state[layer].n_comp;
         // Use mixed attention (raw SWA KV + compressed KV blocks) only when the
         // raw KV cache exceeds the sliding window. For short sequences (all tokens
@@ -1168,8 +1160,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                                        pos, eng->comp_state[layer].comp_kv, (int)n_comp,
                                        allowed, attn_out);
         } else {
-            // BF16 attention using directly-computed bf16 normed
-            mla_attention_decode_bf16(&P, &eng->attn[layer], normed_bf16_direct, kvc->kv, kvc->len, pos, attn_out, kvc->kv_gpu_buf);
+            // BF16 attention using GPU-resident normed_bf16 (eliminates CPU→GPU upload)
+            mla_attention_decode_bf16(&P, &eng->attn[layer], NULL, kvc->kv, kvc->len, pos, attn_out,
+                                       kvc->kv_gpu_buf, eng->buf_mhc_attn_norm_bf16);
         }
         // Truncate attn_out to bf16
         for (int i = 0; i < DIM; i++) {

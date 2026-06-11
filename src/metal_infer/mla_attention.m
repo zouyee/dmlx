@@ -668,7 +668,7 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
 // --- BF16 variant of mla_attention_decode ---
 int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
-                              int pos, float *out, void *kv_cache_gpu_buf) {
+                              int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf) {
     @autoreleasepool {
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
@@ -678,7 +678,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     // === Get (or create) persistent GPU buffers for fixed attention weights ===
     AttnBufCache *abc = attn_buf_cache_get(d, aw);
 
-    id<MTLBuffer> bx     = mkbuf(d, x, DIM * sizeof(uint16_t));
+    id<MTLBuffer> bx     = (x_gpu_buf && !x) ? (__bridge id<MTLBuffer>)x_gpu_buf
+                               : mkbuf(d, x, DIM * sizeof(uint16_t));
     id<MTLBuffer> bcos   = mkbuf(d, cosv, half * sizeof(float));
     id<MTLBuffer> bsin   = mkbuf(d, sinv, half * sizeof(float));
     // Use persistent scratch buffers from AttnBufCache when available
