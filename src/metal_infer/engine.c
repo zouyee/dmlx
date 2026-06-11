@@ -1006,6 +1006,9 @@ static void encode_rms_norm(id<MTLCommandBuffer> cb, MoEInferEngine *eng,
 int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int pos) {
     if (!eng->initialized) return -1;
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    const int phase_time = (getenv("NATIVE_PHASE_TIME") != NULL);
+    double pt0=0, pt1=0, pt2=0, pt3=0, pt4=0, pt5=0;
+    if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt0 = ts.tv_sec*1e9+ts.tv_nsec; }
 
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
@@ -1130,6 +1133,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
         // Read attn_out from GPU buffer (written by wo_b in merged_cb)
         memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt1 = ts.tv_sec*1e9+ts.tv_nsec; }
 
         // CPU reads after merged CB completes:
         // - attn_input (for compressor/indexer)
@@ -1289,6 +1293,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
 
         [cb2cmd2 commit]; [cb2cmd2 waitUntilCompleted];
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt2 = ts.tv_sec*1e9+ts.tv_nsec; }
 
         // CPU readback
         uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
@@ -1390,9 +1395,11 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         for (int k = 0; k < N_ACTIVE; k++) expert_data[k] = eng->expert_buf[k];
         io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti1 = ts.tv_sec*1e9+ts.tv_nsec; }
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt3 = ts.tv_sec*1e9+ts.tv_nsec; }
         moe_forward_layer(eng, layer, expert_data, expert_ids, expert_weights, N_ACTIVE);
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti2 = ts.tv_sec*1e9+ts.tv_nsec;
             fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt4 = ts.tv_sec*1e9+ts.tv_nsec; }
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
     }
 
@@ -1481,6 +1488,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         float *sv = (float *)[bdown contents];
         for (int j = 0; j < DIM; j++) ffn_out[j] += sv[j];
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt5 = ts.tv_sec*1e9+ts.tv_nsec; }
     } // end if shared expert
 
     // mHC post (FFN) — ds4 kernel_dsv4_hc_expand4: single pure-f32 dispatch.
@@ -1545,6 +1553,8 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     }
 
     } // end @autoreleasepool
+    if (phase_time) { fprintf(stderr, "[PHASE] L%d mla=%.2fms cmd2=%.2fms io=%.2fms moe=%.2fms shared=%.2fms total=%.2fms\n",
+        layer, (pt1-pt0)/1e6, (pt2-pt1)/1e6, (pt3-pt2)/1e6, (pt4-pt3)/1e6, (pt5-pt4)/1e6, (pt5-pt0)/1e6); }
     return 0;
 }
 
