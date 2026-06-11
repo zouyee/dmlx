@@ -1,370 +1,201 @@
-# CB-A Wait 消除 — 流水线重构方案
+# Native Engine：4 tok/s 性能优化 — 执行记录 + ds4 路径
 
-date: 2026-06-11
-current: commit `6b704ef`，0.778 tok/s
-target: 消除 CB-A wait（32ms/token）+ CB1/CB3 间隔，目标 ≥ 1.0 tok/s
-
----
-
-## 0. 问题分析
-
-### 0.1 当前流水线（4 个 GPU sync 点）
-
-```
-L(N-1) cb3 deferred wait ──→ CPU 读 residual
-  ↓
-CB-A wait ──→ CPU 读 attn_input + normed          ← 32ms/token
-  ↓
-CB1 wait ──→ (internal, MLA attention Q/KV/SDPA)
-  ↓
-CB3 wait ──→ CPU 读 attn_out
-  ↓
-CMD2 wait ──→ CPU 读 residual + routing            ← 52ms/token
-  ↓
-MoE + shared expert wait ──→ CPU 读 ffn_out
-  ↓
-cb3 deferred (no wait) ──→ next layer
-```
-
-每个 token 43 层，每层 ~18ms，其中 GPU sync 等待 ~84ms（CB-A 32ms + CMD2 52ms）。
-
-### 0.2 ds4 的做法
-
-ds4 将整个 layer 编码进**一个** command buffer：
-```
-begin_cb → mhc_pre → attention → hc_expand → mhc_pre_ffn → FFN → hc_expand → commit+wait
-```
-
-一次 `waitUntilCompleted`，中间零 CPU 干预。dmlx 无法直接照搬，因为：
-- dmlx 的 expert I/O 需要 CPU 做路由决策 + 文件读取（ds4 也是 CPU routing + I/O）
-- dmlx 的 MLA attention 接口要求 CPU pointer 入参
-
-### 0.3 最小可行目标
-
-**消除 CB-A wait（32ms）**：将 mhc_pre 编码合并进 MLA attention 的 CB1，消除中间的 CPU↔GPU 同步。
-
-CMD2 wait（52ms）暂时保留——它涉及 expert I/O，需要 CPU 侧路由决策，改动更大。
+date: 2026-06-11（持续更新）
+baseline: commit `e01aed5`，实测 **0.709 tok/s**（SMELT N=51，热状态，M4 Pro 48GB）
+target: **≥ 4 tok/s**
+current: commit `40425ab`，实测 **~0.72 tok/s**（benchmark 噪声范围，无统计显著改进）
 
 ---
 
-## 1. 重构方案
+## 1. 已完成的优化
 
-### 1.1 核心思路
+### 1.1 性能演进
 
-将 `mhc_pre_split_weighted_sum_norm`（当前在 `engine.c` 的 CB-A 中）移入 `mla_attention_decode_bf16` 的 CB1 中，作为第一个 encoder。CB1 的输出（normed_bf16）直接在 GPU 上传递给后续的 Q/KV chain，无需 CPU 读回。
+| Commit | 内容 | tok/s | 提升 | 备注 |
+|--------|------|-------|------|------|
+| `e01aed5` | **baseline** | **0.709** | — | — |
+| `b4b63f0` | Phase 1+2+3: mHC fusion + Q8_0 wo_a | 0.752 | +6.1% | 实质收益 |
+| `6b704ef` | Phase 4: coalesced wo_b v2 | 0.778 | +3.5% | 实质收益 |
+| `ea18a9c` | GPU buffer pass-through | ~0.72 | 0 | 接口重构，无收益 |
+| `40425ab` | CB-A + CB1 merge | ~0.72 | 0 | 接口重构，无收益 |
 
-### 1.2 修改后的流水线
+### 1.2 各 Phase 详情
 
-```
-L(N-1) cb3 deferred wait ──→ CPU 读 residual
-  ↓
-CB-MEGA (CB-A + CB1 + CB3 合并，一个 CB，一次 wait)
-  Enc 1: mhc_pre_split_weighted_sum_norm → post/comb/normed_bf16 (GPU)
-  Enc 2..N: Q chain + KV chain + SDPA (读 normed_bf16, GPU 内传递)
-  Enc N+1..: wo_a × 8 + wo_b (读 SDPA 输出, GPU 内传递)
-  wait ──→ CPU 读 attn_out + attn_input
-  ↓
-CMD2 wait ──→ (不变)
-  ↓
-MoE + shared expert wait ──→ (不变)
-  ↓
-cb3 deferred ──→ (不变)
-```
-
-**节省**：CB-A wait 32ms/token。
-
-### 1.3 对 tok/s 的影响
-
-当前 771ms/token → 771 - 32 = 739ms/token → **1.35 tok/s** (+73% over 0.778)。
+见下方"已移植的 ds4 内核"章节。
 
 ---
 
-## 2. 具体改动
+## 2. CB-A Wait 消除尝试 — 为什么失败了
 
-### 2.1 `mla_attention_decode_bf16` 接口变更
+### 2.1 尝试的内容
 
-**文件**：`src/metal_infer/mla_attention.h`
+两个 commit：
 
-```c
-// 新增 GPU-input 变体：x 来自 GPU buffer 而非 CPU pointer
-int mla_attention_decode_bf16_gpu_in(
-    MlaPipes *pipes, const AttnWeights *aw,
-    id<MTLBuffer> x_bf16,              // [DIM] bf16，GPU buffer（替代 CPU uint16_t *x）
-    uint16_t *kv_cache, int cache_len,
-    int pos, float *out, void *kv_cache_gpu_buf);
+1. **GPU buffer pass-through** (`ea18a9c`)：消除 CB-A → MLA 之间的 CPU normed 读回，传入 GPU buffer
+2. **CB-A + CB1 merge** (`40425ab`)：将 mhc_pre 编码合并进 CB1，消除独立的 CB-A
+
+### 2.2 为什么性能没提升
+
+根因：**CB1 和 CB3 之间仍然有 CPU 读回**。
+
 ```
-
-或者更简洁的方案——在现有函数中检测 `x == NULL` 时从 GPU buffer 读：
-
-```c
-// x: 如果非 NULL，同原来。如果 NULL，从 x_gpu_buf 读
-// x_gpu_buf: 可选的 GPU buffer（当 x == NULL 时使用）
-int mla_attention_decode_bf16(MlaPipes *pipes, const AttnWeights *aw,
-    const uint16_t *x, uint16_t *kv_cache, int cache_len,
-    int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf);
-```
-
-**推荐第二种**：改动最小，向后兼容。
-
-### 2.2 `mla_attention_decode_bf16` 内部改动
-
-**文件**：`src/metal_infer/mla_attention.m`
-
-改动点（~620 行附近）：
-
-```objc
-// 旧代码：
-id<MTLBuffer> bx = mkbuf(d, x, DIM * sizeof(uint16_t));
-
-// 新代码：
-id<MTLBuffer> bx;
-if (x_gpu_buf) {
-    bx = (__bridge id<MTLBuffer>)x_gpu_buf;
-} else {
-    bx = mkbuf(d, x, DIM * sizeof(uint16_t));
-}
-```
-
-仅此一处改动。后续 Q chain、KV chain、SDPA 都不变——它们已经通过 `bx` 使用 GPU buffer。
-
-### 2.3 CB-A 移入 `engine.c` → 调用 MLA 时传入 GPU buffer
-
-**文件**：`src/metal_infer/engine.c`（CB-A 段，~1078 行）
-
-```c
-// === 旧代码：CB-A 独立编码 + wait + CPU 读回 ===
-{
-    id<MTLCommandBuffer> cb = ...;
-    // mhc_pre... (1 encoder)
-    [cb commit]; [cb waitUntilCompleted];
-    memcpy(attn_input, ...);
-    memcpy(normed_bf16_direct, ...);
-    // bf16→f32 转换 normed
-}
-
-// MLA attention(normed, ...)
-
-// === 新代码：CB-A 移入 MLA，CB-A + CB1 合并 ===
-// MLA attention 内部做 mhc_pre + Q/KV/SDPA
-// 传入 GPU buffers 替代 CPU pointers
-mla_attention_decode_bf16(..., 
-    NULL,                    // x = NULL（使用 GPU buffer）
-    kv_cache, cache_len, pos, attn_out,
-    kv_cache_gpu_buf,        // 现有
-    eng->buf_mhc_attn_norm_bf16  // x_gpu_buf: CB-A 在此 buffer 中
-);
-
-// CB-A 的 mhc_pre 不在此处编码——它已在 MLA 内部完成。
-// attn_input 仍需要 CPU 读回（给 compressor），但可以异步。
-```
-
-**关键**：`buf_mhc_attn_norm_bf16` 现在由 MLA 内部的 mhc_pre encoder 写入，而不是 engine.c 的独立 CB-A。
-
-但这意味着 mhc_pre 的编码必须在 MLA 内部完成。有两种实现方式：
-
-**方式 A**：在 `mla_attention_decode_bf16` 内部编码 mhc_pre
-
-- 优点：简洁，CB-A + CB1 真正合并为一个 CB
-- 缺点：MLA 函数需要知道 mhc_pre 的 buffer 布局（fn_weight, base, scale, residual）
-
-**方式 B**：在 `engine.c` 中预先将 mhc_pre 编码进一个 CB，然后将此 CB 的 encoder 传递给 MLA
-
-- 优点：不改 MLA 内部结构
-- 缺点：Metal 不支持跨函数共享 encoder
-
-**选择方式 A**。需要给 MLA 函数传递 mhc_pre 所需的 buffers：
-
-```c
-// 扩展 MlaPipes 或新增参数
-int mla_attention_decode_bf16_with_hc_pre(
-    MlaPipes *pipes, const AttnWeights *aw,
-    // mhc_pre 参数：
-    id<MTLBuffer> hc_fn, id<MTLBuffer> hc_base, id<MTLBuffer> hc_scale,
-    id<MTLBuffer> residual_gpu,
-    id<MTLBuffer> post_out, id<MTLBuffer> comb_out,
-    id<MTLBuffer> attn_input_out,
-    id<MTLBuffer> norm_weight,
-    // 原有参数：
-    uint16_t *kv_cache, int cache_len, int pos,
-    float *out, void *kv_cache_gpu_buf);
-```
-
-这个签名太长了。更实用的做法：**给 MLA 函数传入一个预编码的 mhc_pre CB**，MLA 将其作为 CB1 的第一个 encoder。
-
-但 Metal 不支持这种操作。encoder 必须在 CB 内创建。
-
-**最实用的方案**：在 `engine.c` 中创建一个新的 CB，将 mhc_pre + MLA attention 全部编码进去。不调用 `mla_attention_decode_bf16`，而是内联它的编码逻辑。
-
-实际上，让我重新思考。当前 `mla_attention_decode_bf16` 创建了自己的 CB（CB1 和 CB3）。如果把 mhc_pre 也放进去，就变成了一个包含 mhc_pre + Q chain + KV chain + SDPA + wo_a + wo_b 的超大 CB。
-
-一个折中方案：**在 engine.c 中创建一个 CB，先编码 mhc_pre，再调用 MLA 的 Q/KV/SDPA 编码（不创建新 CB）**。这需要将 MLA 的内部编码逻辑拆分为可重用的函数。
-
-但这改动太大。让我退一步思考最简单的可行方案。
-
-### 2.4 最简方案：GPU buffer pass-through
-
-**不改 MLA 内部结构**，只消除 CPU 读回 normed_bf16：
-
-当前：
-```
-CB-A → buf_mhc_attn_norm_bf16 (GPU)
-CB-A wait
-CPU read buf_mhc_attn_norm_bf16 → normed_bf16_direct → normed (f32)
-MLA: normed → bf16 → bx (GPU buffer) → CB1
-```
-
-改为：
-```
-CB-A + CB1 合并为一个 CB:
-  Enc 1: mhc_pre → buf_mhc_attn_norm_bf16 (GPU)
-  Enc 2: Q chain (读 buf_mhc_attn_norm_bf16) → ...
-  ...
+merged CB:
+  Enc 1:  mhc_pre → buf_mhc_attn_norm_bf16 (GPU)
+  Enc 2..N: Q/KV/SDPA → battn (GPU)
+  [commit + wait]           ← 这个 wait 仍然存在
+  CPU: 读 battn → 提取 wo_a 8 groups → bconcat (CPU)  ← 强制 CPU 读回
+  CB3: wo_a × 8 + wo_b
   [commit + wait]
 ```
 
-关键变化：在 engine.c 中，不创建独立的 CB-A。而是在一个 CB 中先编码 mhc_pre，再编码 MLA attention 的 CB1。
+mhc_pre 和 Q/KV/SDPA 合并在同一个 CB 里了，但 CB 内部的 `[commit + wait]` 本身没变——GPU 执行的工作量完全一样，wait 时间也完全一样。只是少了一个 Metal encoder 的创建开销（微秒级，不可测）。
 
-但这需要 engine.c 能够直接编码 MLA attention 的 CB1。当前 MLA attention 封装了这个逻辑。
+**真正的瓶颈是 CB1→CB3 之间的 CPU battn 读回**：mla_attention_decode_bf16 在 SDPA 之后必须把 `battn` 读到 CPU，做 head grouping（8 组 wo_a 各自提取对应的 head 输出），然后才能编码 wo_a+wo_b。这个 CPU 读回强制了 CB1 和 CB3 不能合并。
 
-**最终决策**：采用两阶段重构。
+### 2.3 结论
 
-**Phase A**（最小改动，验证可行）：eliminate normed CPU readback，但仍保留 CB-A 作为独立 CB（与 CB1 不合并）。
+**局部 CB 合并不起作用。必须遵循 ds4 的方式：整个 layer 一个 CB，所有中间数据留在 GPU 上。**
 
-具体做法：
-1. CB-A 将 normed_bf16 写在 GPU buffer `buf_mhc_attn_norm_bf16`
-2. CB-A commit + wait（保留）
-3. 不再 CPU 读回 normed
-4. 将 `buf_mhc_attn_norm_bf16` 作为 `x_gpu_buf` 传给 MLA
-5. MLA 中跳过 CPU→GPU 上传
+---
 
-Phase A 不改 CB-A wait，只消除 CPU↔GPU 的数据搬运。wait 时间基本不变。
+## 3. ds4 的正确路径：单 CB 全层流水线
 
-**Phase B**（真正合并 CB-A + CB1）：将 mhc_pre 编码移入 MLA 函数，或者将 MLA 编码逻辑暴露给 engine.c。
+### 3.1 ds4 架构
 
-让我设计 Phase B 的具体实现。
+ds4 把每个 layer 的所有操作编码进**一个** command buffer：
 
-### 2.5 Phase B 详细设计：CB-A + CB1 合并
-
-**新增函数**：`mla_attention_encode_qkv_sdpa` — 编码 Q/KV/SDPA 到指定的 command buffer
-
-```c
-// 将 Q chain + KV chain + SDPA 编码到给定的 command buffer
-// x_bf16_buf: GPU buffer [DIM] bf16（已经 normed）
-static void mla_encode_qkv_sdpa(
-    MlaPipes *P, id<MTLCommandBuffer> cb,
-    const AttnWeights *aw, AttnBufCache *abc,
-    id<MTLBuffer> x_bf16_buf,
-    id<MTLBuffer> kvcache_buf, int cache_len, int pos,
-    id<MTLBuffer> bcos, id<MTLBuffer> bsin,
-    id<MTLBuffer> out_sdpa_bf16  // [N_HEADS, HEAD_DIM] bf16 output
-);
+```
+begin_cb
+  → mhc_pre (split + weighted sum + norm)
+  → attention (Q/K/V/SDPA)
+  → attention output + HC expand (FUSED: Q8_0 matvec + mhc_post)
+  → mhc_pre_ffn (split + weighted sum + norm)
+  → FFN (expert routing + compute + shared + combine)
+  → FFN output + HC expand (FUSED)
+commit + wait (一次)
 ```
 
-然后在 `engine.c` 中：
-```c
-// Phase 1: CB-A + CB1 merged
-{
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    
-    // Encoder 1: mhc_pre (原 CB-A)
-    encode_mhc_pre(cb, ...);
-    
-    // Encoder 2..N: Q chain + KV chain + SDPA (原 CB1)
-    mla_encode_qkv_sdpa(P, cb, aw, abc, 
-        eng->buf_mhc_attn_norm_bf16,  // GPU buffer, written by Enc 1
-        ...);
-    
-    [cb commit]; [cb waitUntilCompleted];
-    
-    // CPU reads: attn_input, SDPA output (for CB3)
+关键差别：
+- ds4 的 attention 输出直接做 HC expand，**不需要 CPU 读回 SDPA 输出做 head grouping**
+- ds4 的 FFN 输出直接做 HC expand，**不需要 CPU 读回 ffn_out**
+- 全程 GPU-side，零中间 CPU 干预
+
+### 3.2 dmlx 要改成 ds4 方式需要做什么
+
+**核心改动**：消除两个 CPU 读回点。
+
+**读回点 1：SDPA 输出 → wo_a head grouping**
+
+当前 `mla_attention_decode_bf16`：
+```objc
+// CB1: SDPA → battn (GPU, bf16)
+[cb1 commit]; [cb1 waitUntilCompleted];
+uint16_t *attn_bf16 = [battn contents];  // ← CPU 读回
+for (int g = 0; g < 8; g++) {
+    // CPU memcpy: 提取 group g 的 head 输出 → bgv
+    memcpy(gv_bf16_data + hh * HEAD_DIM, attn_bf16 + ..., HEAD_DIM * sizeof(uint16_t));
+    // CB3: wo_a matvec
+    enc_matvec_q8_0(..., bgv, ...);
 }
 ```
 
----
-
-## 3. 实施步骤
-
-### Step 1: GPU buffer pass-through for MLA input（Phase A）
-
-**文件**：`mla_attention.h`, `mla_attention.m`
-- 新增 `x_gpu_buf` 参数到 `mla_attention_decode_bf16`（或新增变体函数）
-- 当 `x == NULL && x_gpu_buf != NULL` 时，直接使用 GPU buffer
-- 改动量：~10 行
-
-**文件**：`engine.c`
-- CB-A 后不再 CPU 读回 normed_bf16
-- 将 `buf_mhc_attn_norm_bf16` 作为 `x_gpu_buf` 传给 MLA
-- 改动量：~15 行删除 + 5 行新增
-
-**验证**：benchmark — 应保持 Paris ✓，性能略有提升（消除 2 次 memcpy）
-
-### Step 2: 提取 MLA Q/KV/SDPA 编码逻辑（Phase B 预备）
-
-**文件**：`mla_attention.m`
-- 新增 `mla_encode_qkv_sdpa()` 函数
-- 从 `mla_attention_decode_bf16` 中提取 CB1 的编码逻辑
-- 改动量：~50 行新增 + 原有函数调用新函数
-
-### Step 3: CB-A + CB1 合并（Phase B 主体）
-
-**文件**：`engine.c`
-- 删除独立的 CB-A
-- 新增 merged CB：mhc_pre + Q/KV/SDPA
-- CPU 读取 attn_input + SDPA 输出（用于 CB3）
-- 改动量：~40 行
-
-**文件**：`mla_attention.m`
-- CB1 → 被 engine.c 的 merged CB 替代
-- 原有 CB1 编码逻辑通过 `mla_encode_qkv_sdpa` 调用
-- 改动量：~10 行
-
-### Step 4: CB3 + CB1 合并（将 wo_a+wo_b 也放进 merged CB）
-
-**文件**：`engine.c` + `mla_attention.m`
-- 将 CB3 的 wo_a+wo_b 编码也加入 merged CB
-- 完全消除 CB1→CB3 的间隔
-- 改动量：~30 行
-
-### Step 5: 验证
-
-每步完成后：
-```bash
-bash scripts/run_benchmark.sh
-# Paris ✓，tok/s 不退化
+改为 GPU blit：
+```objc
+// CB1: SDPA → battn (GPU, bf16)
+// NO commit, NO wait, NO CPU readback
+// GPU blit: 直接提取 group g 的 head 输出 → bgv (GPU)
+for (int g = 0; g < 8; g++) {
+    id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+    // blit battn[g*heads_per_group*HEAD_DIM .. (g+1)*heads_per_group*HEAD_DIM]
+    //   → bgv[0 .. group_feat]
+    [blit copyFromBuffer:battn sourceOffset:... toBuffer:bgv destinationOffset:0 size:...];
+    [blit endEncoding];
+    // CB3: wo_a matvec (same CB, after blit)
+    enc_matvec_q8_0(..., bgv, ...);
+}
+// ONE commit + wait at the end
 ```
 
+**读回点 2：ffn_out → mhc_post_ffn**
+
+已解决（Phase 1 的 `mhc_post_ffn_expand4` 直接读 `buf_ffn_out_f32`）。
+
+### 3.3 实施计划
+
+#### Step A: GPU blit wo_a grouping（消除读回点 1）
+
+**文件**：`mla_attention.m`（CB3 部分，~810-870 行）
+
+改动：
+- 不再 CPU 读 `battn`，用 Metal blit encoder 在 GPU 上提取每个 group 的 head 输出
+- CB1 和 CB3 合并为一个 CB
+- 一个 commit + wait
+
+**涉及函数**：`mla_attention_decode_bf16`（或新增 `mla_attention_decode_bf16_merged`）
+
+**关键**：blit encoder 必须在 compute encoder 之间穿插，Metal 支持在同一 CB 中混合 blit 和 compute。
+
+#### Step B: CB-A + CB1 + CB3 全合并（在 Step A 基础上）
+
+**文件**：`engine.c` + `mla_attention.m`
+
+改动：
+- engine.c 不再单独编码 CB-A
+- mhc_pre 作为第一个 encoder 编入合并的 CB
+- 然后 Q/KV/SDPA（GPU path）
+- 然后 GPU blit wo_a grouping + wo_a×8 + wo_b
+- 一个 commit + wait
+
+**预期收益**：消除 CB-A wait（32ms） + CB1→CB3 间隔。tok/s: 0.72 → ~0.85-0.95。
+
+#### Step C: CMD2 合并（远期，消除第二个 wait）
+
+**文件**：`engine.c`
+
+改动：
+- CMD2（mhc_post + mhc_pre_ffn + routing）合并进同一个 CB
+- Expert I/O 仍然需要 CPU 决策，但可以在 commit 之前编码 CMD2
+- 一个 commit + wait per layer（ds4 方式）
+
+**预期收益**：消除 CMD2 wait（52ms）。tok/s: ~0.95 → ~1.3-1.5。
+
 ---
 
-## 4. 文件改动清单
+## 4. 已移植的 ds4 内核
 
-| 步骤 | 文件 | 改动 |
+| dmlx 内核 | ds4 原版 | 作用 | Commit |
+|-----------|---------|------|--------|
+| `mhc_post_ffn_expand4` | `kernel_dsv4_hc_expand4` | cb3: 3 encoders → 1 | `b4b63f0` |
+| `mhc_pre_split_weighted_sum_norm` | `kernel_dsv4_hc_split_weighted_sum_norm4` | CB-A: 2 encoders → 1 | `b4b63f0` |
+| `matvec_q8_0_f32` | `kernel_mul_mv_q8_0_f32` | wo_a f32→Q8_0 | `b4b63f0` |
+| `dequant_matvec_affine_v2` | ds4 Q8_0 模式适配 affine 4-bit | wo_b coalesced | `6b704ef` |
+
+---
+
+## 5. 关键教训
+
+1. **bf16 精度匹配**：移植内核必须保留 `float(bfloat(...))` cast，否则 43 层累积误差导致 Paris 失败
+2. **Q8_0 量化用 `roundf()`**：`(int)(v+0.5f)` 对负数舍入错误
+3. **局部 CB 合并不起作用**：只要中间有 CPU 读回，合并就无法消除 wait。必须把所有操作放在一个 CB 中，全程 GPU-side
+4. **GPU blit 是消除 CPU 读回的关键**：Metal blit encoder 可以在同一 CB 中重新排列 GPU buffer 数据，替代 CPU memcpy
+
+---
+
+## 6. 不做的事（已验证）
+
+| 方案 | 结果 | 原因 |
 |------|------|------|
-| Step 1 | `mla_attention.h` | 新增 `x_gpu_buf` 参数 |
-| Step 1 | `mla_attention.m` | GPU buffer 分支（~10 行） |
-| Step 1 | `engine.c` | 消除 normed CPU readback（~20 行） |
-| Step 2 | `mla_attention.m` | 提取 `mla_encode_qkv_sdpa`（~50 行） |
-| Step 3 | `engine.c` | CB-A + CB1 合并（~40 行新增，~30 行删除） |
-| Step 4 | `engine.c` | CB3 合并进 merged CB（~30 行） |
+| flash-moe v3 | 退步 | x_shared[4096]=16KB→occupancy 崩溃 |
+| shared expert v2 | Paris ✗ | bug 未定位 |
+| 局部 CB merge（无 GPU blit） | 无收益 | CB3 CPU 读回强制 wait |
+| batched_wo_a / shared_mem xs / 4-bit 等 | 退步 | 均未解决 non-coalesced access |
 
 ---
 
-## 5. 预期收益
+## 7. 验收标准
 
-| 步骤 | 消除项 | 预期 tok/s |
-|------|--------|-----------|
-| Step 1 | normed CPU readback | ~0.79（+1-2%） |
-| Step 3 | CB-A wait（32ms） | ~1.0-1.1（+30-40%） |
-| Step 4 | CB3 sync（~5ms） | ~1.05-1.15 |
-
-累计：0.778 → ~1.1 tok/s（+41%）
-
----
-
-## 6. 风险
-
-| 风险 | 缓解 |
-|------|------|
-| CB-A + CB1 合并后 CB3 读 SDPA 输出时序错误 | CB3 在同一 CB 内，encoder 顺序保证正确性 |
-| `buf_mhc_attn_norm_bf16` 被 CB1 的 encoder 覆盖 | 确认 buffer 无别名 |
-| compressor/indexer 需要 attn_input | CPU 仍可从 `buf_mhc_attn_in` 读回 |
-| 重构后 Paris 失败 | 逐 step 提交，每步 benchmark 验证 |
+```bash
+sudo purge
+bash scripts/run_benchmark.sh  # SMELT N=51，顺序，热状态
+# 要求：Paris ✓，tok/s 不退化
+```
