@@ -177,7 +177,7 @@ pub const NativeEngine = struct {
         // Skip BOS token (token 0) if present — MLX strips it before generation
         const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
         const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
-        const effective_prompt_len = prompt_tokens.len - prompt_offset;
+        const effective_prompt_len = if (prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token) prompt_tokens.len - prompt_offset - 1 else prompt_tokens.len - prompt_offset;
         var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
         @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
@@ -283,7 +283,7 @@ pub const NativeEngine = struct {
         // Skip BOS token (token 0) if present — MLX strips it before generation
         const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
         const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
-        const effective_prompt_len = prompt_tokens.len - prompt_offset;
+        const effective_prompt_len = if (prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token) prompt_tokens.len - prompt_offset - 1 else prompt_tokens.len - prompt_offset;
         var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
         @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
