@@ -174,11 +174,15 @@ pub const NativeEngine = struct {
             return try allocator.alloc(u32, 0);
         }
 
-        var tokens = try allocator.alloc(u32, prompt_tokens.len + max_new_tokens);
+        // Skip BOS token (token 0) if present — MLX strips it before generation
+        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
+        const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
+        const effective_prompt_len = prompt_tokens.len - prompt_offset;
+        var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
-        @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
+        @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
 
-        var current_len = prompt_tokens.len;
+        var current_len = effective_prompt_len;
         var start_pos: usize = start_pos_override orelse 0;
 
         // Reset KV cache at the start of each new sequence
@@ -245,7 +249,7 @@ pub const NativeEngine = struct {
             start_pos += 1;
 
             if (next_token == self.eos_token) {
-                std.log.info("native_engine: EOS token generated, stopping", .{});
+                std.log.info("native_engine: EOS token generated, stopping at pos={d}", .{start_pos});
                 break;
             }
         }
@@ -276,11 +280,15 @@ pub const NativeEngine = struct {
             return try allocator.alloc(u32, 0);
         }
 
-        var tokens = try allocator.alloc(u32, prompt_tokens.len + max_new_tokens);
+        // Skip BOS token (token 0) if present — MLX strips it before generation
+        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
+        const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
+        const effective_prompt_len = prompt_tokens.len - prompt_offset;
+        var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
-        @memcpy(tokens[0..prompt_tokens.len], prompt_tokens);
+        @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
 
-        var current_len = prompt_tokens.len;
+        var current_len = effective_prompt_len;
         var start_pos: usize = start_pos_override orelse 0;
 
         // Reset KV cache

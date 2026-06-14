@@ -111,7 +111,7 @@ kernel void fused_gate_up_swiglu(
         const float limit = 10.0f;
         float g_c = min(gate_val, limit);
         float u_c = min(max(up_val, -limit), limit);
-        out[row] = (g_c / (1.0f + exp(-g_c))) * u_c;
+        out[row] = (bfloat)((g_c / (1.0f + exp(-g_c))) * u_c);
     }
 }
 
@@ -231,7 +231,7 @@ kernel void fused_gate_up_swiglu_v2(
         if (tiisg == 0 && sgitg == 0) {
             float g_c = min(gv, limit);
             float u_c = min(max(uv, -limit), limit);
-            out[d] = (g_c / (1.0f + exp(-g_c))) * u_c;
+            out[d] = (bfloat)((g_c / (1.0f + exp(-g_c))) * u_c);
         }
     }
 }
@@ -253,7 +253,7 @@ kernel void fused_gate_up_swiglu_v2_affine(
     ushort tiisg  [[thread_index_in_simdgroup]],
     ushort sgitg  [[simdgroup_index_in_threadgroup]]
 ) {
-    const short NR0 = 2, NSG = 4, NW = 32, NQ = 8, TPG = 4;
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 4, TPG = 8;
 
     const uint num_groups = in_dim / group_size;
     const uint packed_per_group = group_size / 8;  // = 8 for gs=64
@@ -347,7 +347,7 @@ kernel void fused_gate_up_swiglu_v2_affine(
         if (tiisg == 0 && sgitg == 0) {
             float g_c = min(gv, limit);
             float u_c = min(max(uv, -limit), limit);
-            out[d] = (g_c / (1.0f + exp(-g_c))) * u_c;
+            out[d] = (bfloat)((g_c / (1.0f + exp(-g_c))) * u_c);
         }
     }
 }
@@ -442,7 +442,7 @@ kernel void dequant_matvec_4bit_affine(
         const int d = row0 + row;
         if (d >= (int)out_dim) continue;
         float tot = simd_sum(shmem_f32[row][tiisg]);
-        if (tiisg == 0 && sgitg == 0) out[d] = tot;
+        if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
     }
 }
 
@@ -499,7 +499,7 @@ kernel void dequant_matvec_4bit(
 
     float sum = simd_sum(acc);
     if (simd_lane == 0) {
-        out[row] = sum;
+        out[row] = (bfloat)sum;
     }
 }
 
@@ -850,7 +850,7 @@ kernel void gather_gate_up_swiglu(
     if (simd_lane == 0) {
         const float lim = 10.0f;
         float gc = min(gv, lim), uc = min(max(uv, -lim), lim);
-        out[k_idx * INTERMEDIATE + row] = (gc / (1.0f + exp(-gc))) * uc;
+        out[k_idx * INTERMEDIATE + row] = (bfloat)((gc / (1.0f + exp(-gc))) * uc);
     }
 }
 
@@ -923,7 +923,7 @@ kernel void gather_down(
             acc += NIBBLE_TO_FLOAT[(pw>>28)&0xF]*sf*x_shared[xb+7];
         }
     }
-    if (simd_lane == 0) out[k_idx * DIM + row] = simd_sum(acc);
+    if (simd_lane == 0) out[k_idx * DIM + row] = (bfloat)simd_sum(acc);
 }
 
 
@@ -1039,7 +1039,7 @@ kernel void dequant_matvec_affine_v2(
         const int d = row0 + row;
         if (d >= (int)out_dim) continue;
         float tot = simd_sum(shmem_f32[row][tiisg]);
-        if (tiisg == 0 && sgitg == 0) out[d] = tot;
+        if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
     }
 }
 
@@ -1958,7 +1958,7 @@ kernel void mla_sdpa_decode_bfloat(
     // Thread tiisg owns float4 indices: {tiisg, tiisg+32, tiisg+64, tiisg+96}
     const uint NW    = 32;
     const uint DK4   = 512 / 4;    // = 128 float4s per row
-    const uint SLOTS = DK4 / NW;   // = 4
+    // const uint SLOTS = DK4 / NW;   // = 4
 
     // Load Q row for this head as float4 array
     // Use explicit conversion from bfloat* via float4 cast
@@ -3280,4 +3280,202 @@ kernel void moe_route_gpu(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (tid < K) weights[tid] = ksum[tid];
+}
+
+// ============================================================================
+// LUT-based affine 4-bit kernels (same formula as MXFP4, group_size=64)
+// These use the same NIBBLE_TO_FLOAT LUT and E8M0 scales as MXFP4, but with
+// group_size=64 instead of 32. Format: value = LUT[nibble] * exp2(scale - 127)
+// No biases — scale-only quantization with non-uniform LUT.
+// ============================================================================
+
+// fused_gate_up_swiglu_v2_lut — LUT-based gate+up for affine 4-bit (gs=64)
+kernel void fused_gate_up_swiglu_v2_lut(
+    device const uint32_t* gate_W    [[buffer(0)]],
+    device const uint8_t*  gate_s    [[buffer(1)]],  // E8M0 scales
+    device const uint32_t* up_W      [[buffer(2)]],
+    device const uint8_t*  up_s      [[buffer(3)]],  // E8M0 scales
+    device const float*    x         [[buffer(4)]],
+    device float*          out       [[buffer(5)]],
+    constant uint&         out_dim   [[buffer(6)]],
+    constant uint&         in_dim    [[buffer(7)]],
+    constant uint&         group_size [[buffer(8)]],
+    threadgroup float*     shmem     [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 4, TPG = 8;
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;  // = 8 for gs=64
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *gr[NR0], *ur[NR0];
+    device const uint8_t  *gs[NR0], *us[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            gr[row] = gate_W + r * packed_cols;
+            gs[row] = gate_s + r * num_groups;
+            ur[row] = up_W   + r * packed_cols;
+            us[row] = up_s   + r * num_groups;
+        }
+    }
+
+    float gate_sum[NR0] = { 0.0f };
+    float up_sum[NR0]   = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+
+            float gsf = exp2((float)gs[row][gg] - 127.0f);
+            float usf = exp2((float)us[row][gg] - 127.0f);
+
+            uint gpw = gr[row][gg * packed_per_group + (uint)il];
+            uint upw = ur[row][gg * packed_per_group + (uint)il];
+
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 0)&0xF] * gsf * xv0;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 4)&0xF] * gsf * xv1;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>> 8)&0xF] * gsf * xv2;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>12)&0xF] * gsf * xv3;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>16)&0xF] * gsf * xv4;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>20)&0xF] * gsf * xv5;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>24)&0xF] * gsf * xv6;
+            gate_sum[row] += NIBBLE_TO_FLOAT[(gpw>>28)&0xF] * gsf * xv7;
+
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>> 0)&0xF] * usf * xv0;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>> 4)&0xF] * usf * xv1;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>> 8)&0xF] * usf * xv2;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>>12)&0xF] * usf * xv3;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>>16)&0xF] * usf * xv4;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>>20)&0xF] * usf * xv5;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>>24)&0xF] * usf * xv6;
+            up_sum[row]   += NIBBLE_TO_FLOAT[(upw>>28)&0xF] * usf * xv7;
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0*2];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row*2]   = shmem + NW * (row*2);
+        shmem_f32[row*2+1] = shmem + NW * (row*2+1);
+        if (sgitg == 0) {
+            shmem_f32[row*2][tiisg] = 0.0f;
+            shmem_f32[row*2+1][tiisg] = 0.0f;
+        }
+        gate_sum[row] = simd_sum(gate_sum[row]);
+        up_sum[row]   = simd_sum(up_sum[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) {
+            shmem_f32[row*2][sgitg]   = gate_sum[row];
+            shmem_f32[row*2+1][sgitg] = up_sum[row];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const float limit = 10.0f;
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float gv = simd_sum(shmem_f32[row*2][tiisg]);
+        float uv = simd_sum(shmem_f32[row*2+1][tiisg]);
+        if (tiisg == 0 && sgitg == 0) {
+            float g_c = min(gv, limit);
+            float u_c = min(max(uv, -limit), limit);
+            out[d] = (bfloat)((g_c / (1.0f + exp(-g_c))) * u_c);
+        }
+    }
+}
+
+// dequant_matvec_4bit_lut — LUT-based down_proj for affine 4-bit (gs=64)
+kernel void dequant_matvec_4bit_lut(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const uint8_t*  scales   [[buffer(1)]],  // E8M0 scales
+    device const float*    x        [[buffer(2)]],
+    device float*          out      [[buffer(3)]],
+    constant uint&         out_dim  [[buffer(4)]],
+    constant uint&         in_dim   [[buffer(5)]],
+    constant uint&         group_size [[buffer(6)]],
+    threadgroup float*     shmem    [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32;
+    const short TPG = 8;  // threads per group: packed_per_group = group_size/8 = 8 for gs=64
+    const short NQ  = 4;  // groups per SIMD group: NW/TPG = 32/8 = 4
+
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;
+    const uint packed_cols = in_dim / 8;
+
+    const int row0 = (int)tgpig.x * NR0;
+    const short ix = tiisg / TPG, il = tiisg % TPG;
+    const int g0 = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *wr[NR0];
+    device const uint8_t  *sr[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            wr[row] = W_packed + r * packed_cols;
+            sr[row] = scales   + r * num_groups;
+        }
+    }
+
+    float sumf[NR0] = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
+        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+
+            float sf = exp2((float)sr[row][gg] - 127.0f);
+            uint32_t pw = wr[row][gg * packed_per_group + (uint)il];
+
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>> 0)&0xF] * sf * xv0;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>> 4)&0xF] * sf * xv1;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>> 8)&0xF] * sf * xv2;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>>12)&0xF] * sf * xv3;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>>16)&0xF] * sf * xv4;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>>20)&0xF] * sf * xv5;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>>24)&0xF] * sf * xv6;
+            sumf[row] += NIBBLE_TO_FLOAT[(pw>>28)&0xF] * sf * xv7;
+        }
+    }
+
+    threadgroup float *shmem_f32[NR0];
+    for (short row = 0; row < NR0; row++) {
+        shmem_f32[row] = shmem + NW * row;
+        if (sgitg == 0) shmem_f32[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) shmem_f32[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float tot = simd_sum(shmem_f32[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
+    }
 }

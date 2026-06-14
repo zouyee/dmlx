@@ -465,7 +465,6 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
                 eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+UP_B_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
                 eng->expert_gpu_buf[layer][eid][6] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
                 eng->expert_gpu_buf[layer][eid][7] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][8] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
                 n_created++;
             }
         }
@@ -780,37 +779,34 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             }
         } else {
             separate_mode:;
-            // === SEPARATE MODE: 6 per-expert dispatches (affine 4-bit no-x_shared) ===
+            // === SEPARATE MODE: 6 per-expert dispatches (MXFP4, gs=32) ===
             for (int k = 0; k < K; k++) {
                 char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2_affine];
+                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
                 [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+GATE_W_OFF,4194304) offset:0 atIndex:0];
                 [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+GATE_S_OFF,262144)  offset:0 atIndex:1];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+GATE_B_OFF,262144)  offset:0 atIndex:2];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_W_OFF,4194304)   offset:0 atIndex:3];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+UP_S_OFF,262144)    offset:0 atIndex:4];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+UP_B_OFF,262144)    offset:0 atIndex:5];
-                [enc setBuffer:eng->buf_normed offset:0 atIndex:6];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:7];
-                uint od=INTERMEDIATE,id_=DIM,gs=64;
-                [enc setBytes:&od length:4 atIndex:8]; [enc setBytes:&id_ length:4 atIndex:9]; [enc setBytes:&gs length:4 atIndex:10];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+UP_W_OFF,4194304)   offset:0 atIndex:2];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_S_OFF,262144)    offset:0 atIndex:3];
+                [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
+                uint od=INTERMEDIATE,id_=DIM,gs=32;
+                [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
                 [enc setThreadgroupMemoryLength:512 atIndex:0];  // 32*4*4 bytes (2 gate+up rows)
                 uint ntg = (INTERMEDIATE + 1) / 2;
-                [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+[enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
                 [enc endEncoding];
             }
             for (int k = 0; k < K; k++) {
                 char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_dequant_matvec_4bit_affine];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+DOWN_S_OFF,262144) offset:0 atIndex:1];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+DOWN_B_OFF,262144) offset:0 atIndex:2];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:3];
-                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:4];
-                uint od=DIM,id_=INTERMEDIATE,gs=64;
-                [enc setBytes:&od length:4 atIndex:5]; [enc setBytes:&id_ length:4 atIndex:6]; [enc setBytes:&gs length:4 atIndex:7];
+                [enc setComputePipelineState:eng->pipe_dequant_matvec];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
+                [enc setBuffer:EXPERT_BUF(layer_idx,eid,7,base+DOWN_S_OFF,262144)  offset:0 atIndex:1];
+                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
+                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
+                uint od=DIM,id_=INTERMEDIATE,gs=32;
+                [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
                 [enc setThreadgroupMemoryLength:256 atIndex:0];  // 32*2*4 bytes
                 uint d_ntg = (DIM + 1) / 2;
                 [enc dispatchThreadgroups:MTLSizeMake(d_ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
@@ -1399,6 +1395,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     {
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
         memcpy(bn, normed, DIM * sizeof(float));
+        // Truncate to bf16 in-place for GPU kernel (mxp4 for MoE expects bf16 input)
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u;
+            memcpy(&u, &bn[i], 4);
+            bn[i] = (uint16_t)(u >> 16);
+        }
         IOPool *io = (IOPool *)eng->io_pool;
         const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
         double ti0=0, ti1=0, ti2=0;
@@ -1414,6 +1416,29 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt4 = ts.tv_sec*1e9+ts.tv_nsec; }
         memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
+    }
+
+    if (getenv("MF_DBG")) {
+        float *test_input = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+        fprintf(stderr, "[moe-dbg] buf_normed[0..3]=[%.6f,%.6f,%.6f,%.6f]\n", test_input[0], test_input[1], test_input[2], test_input[3]);
+        float *test_mid = (float *)[(id<MTLBuffer>)eng->buf_expert_mid[0] contents];
+        fprintf(stderr, "[moe-dbg] expert_mid[0][0..3]=[%.6f,%.6f,%.6f,%.6f]\n", test_mid[0], test_mid[1], test_mid[2], test_mid[3]);
+        float *test_out = (float *)[(id<MTLBuffer>)eng->buf_expert_out[0] contents];
+        fprintf(stderr, "[moe-dbg] expert_out[0][0..3]=[%.6f,%.6f,%.6f,%.6f]\n", test_out[0], test_out[1], test_out[2], test_out[3]);
+    }
+
+    if (layer == 0 && getenv("MF_DBG")) {
+        int first_nonzero = -1;
+        float maxv = 0.0f, minv = 0.0f, sum = 0.0f;
+        for (int i=0;i<DIM;i++) {
+            float v = ffn_out[i];
+            sum += v;
+            if (v > maxv) maxv = v;
+            if (v < minv) minv = v;
+            if (first_nonzero < 0 && v != 0.0f) first_nonzero = i;
+        }
+        fprintf(stderr, "[mf-dbg] L%d moe_out[0..3]=[%.6f,%.6f,%.6f,%.6f] sum=%.6f min=%.6f max=%.6f nonzero@%d\n",
+                layer, ffn_out[0], ffn_out[1], ffn_out[2], ffn_out[3], sum, minv, maxv, first_nonzero);
     }
 
     if (layer == 0 && getenv("MF_DBG")) {

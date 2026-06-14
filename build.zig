@@ -29,7 +29,6 @@ pub fn build(b: *std.Build) void {
     const run_load_bench_step = b.step("run-load-bench", "Run native loader weight benchmark");
     run_load_bench_step.dependOn(&run_load_bench.step);
 
-
     const native_loader_test = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/native_loader/test_loader.zig"),
@@ -67,7 +66,7 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addImport("regex", zig_regex.module("regex"));
     // Metal MoE C wrapper — needed for test compilation
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/models/moe_metal_wrapper.c"), .flags = &.{"-fobjc-arc"}, .language = .objective_c });
-    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/engine.c"), .flags = &.{}, .language = .objective_c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/engine.c"), .flags = &.{"-Wno-deprecated-declarations"}, .language = .objective_c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mla_attention.m"), .flags = &.{"-fobjc-arc"}, .language = .objective_c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mhc.c"), .flags = &.{}, .language = .c });
     lib_tests.root_module.linkFramework("Metal", .{});
@@ -115,7 +114,7 @@ pub fn build(b: *std.Build) void {
         });
         target_step.root_module.addCSourceFile(.{
             .file = b.path("src/metal_infer/engine.c"),
-            .flags = &.{},
+            .flags = &.{"-Wno-deprecated-declarations"},
             .language = .objective_c,
         });
         target_step.root_module.addCSourceFile(.{

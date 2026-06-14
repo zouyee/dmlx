@@ -110,8 +110,11 @@ typedef struct {
 } AttnWeights;
 
 
-// Expert packed binary layout (affine 4-bit, group_size=64)
-#define EXPERT_SIZE 14155776  // bytes per expert (~13.5 MB)
+// Expert packed binary layout (MXFP4, group_size=32)
+// Uses formula: LUT[nibble] * exp2(scale - 127)
+// Scales stored as uint8 (E8M0), weights as uint32
+// Note: DOWN_B is reserved but not present in the actual files
+#define EXPERT_SIZE 13369344  // bytes per expert (~12.75 MB)
 #define GATE_W_OFF  0
 #define GATE_S_OFF  4194304
 #define GATE_B_OFF  4456448
@@ -120,7 +123,6 @@ typedef struct {
 #define UP_B_OFF    9175040
 #define DOWN_W_OFF  9437184
 #define DOWN_S_OFF  13631488
-#define DOWN_B_OFF  13893632
 
 // ============================================================================
 // Layer config — which layers use full attention vs linear attention
@@ -201,8 +203,8 @@ typedef struct {
 
     // Pipeline states (id<MTLComputePipelineState>)
     void *pipe_gate_up_swiglu;
-    void *pipe_gate_up_swiglu_v2;      // ds4 no-x_shared coalesced pattern
-    void *pipe_gate_up_swiglu_v2_affine; // affine 4-bit dequant (FMA, no exp2)
+    void *pipe_gate_up_swiglu_v2;      // ds4 no-x_shared coalesced pattern (MXFP4, gs=32)
+    void *pipe_gate_up_swiglu_v2_affine; // affine 4-bit dequant (bf16 scales+biases, gs=64) — experimental
     void *pipe_dequant_matvec_4bit_affine; // affine 4-bit down_proj
     void *pipe_dequant_matvec;
     void *pipe_moe_combine;
@@ -344,9 +346,9 @@ typedef struct {
 
     // Persistent GPU MTLBuffer wrappers for SMELT-cached experts.
     // Created once after SMELT warmup; reused every forward call.
-    // expert_gpu_buf[layer][eid][slot]: slot 0=gate_W, 1=gate_S, 2=gate_B, 3=up_W, 4=up_S, 5=up_B, 6=down_W, 7=down_S, 8=down_B
+    // expert_gpu_buf[layer][eid][slot]: slot 0=gate_W, 1=gate_S, 2=up_W, 3=up_S, 4=down_W, 5=down_S
     // NULL if expert not cached.
-    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][9];
+    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][8];
 
     // Gather MoE: per-layer NoCopy Metal buffer over the SMELT RAM pool.
     // The gather kernels address experts via pool_pos (slot index within the pool)
