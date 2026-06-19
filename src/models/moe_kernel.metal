@@ -819,11 +819,11 @@ kernel void gather_gate_up_swiglu(
 
     float ga = 0.0f, ua = 0.0f;
     for (uint g = simd_lane; g < N_GROUPS; g += 32) {
-        // Read scale bytes via byte arithmetic on the uint32 pool buffer
+        // Read scale bytes: use shift/mask instead of division/modulo for ALU efficiency.
         uint gs_bidx = gs_byte_base + g;
         uint us_bidx = us_byte_base + g;
-        float gsf = exp2((float)(uint8_t)((pool[gs_bidx/4] >> ((gs_bidx%4)*8)) & 0xFF) - 127.0f);
-        float usf = exp2((float)(uint8_t)((pool[us_bidx/4] >> ((us_bidx%4)*8)) & 0xFF) - 127.0f);
+        float gsf = exp2((float)(uint8_t)((pool[gs_bidx >> 2] >> ((gs_bidx & 3) << 3)) & 0xFF) - 127.0f);
+        float usf = exp2((float)(uint8_t)((pool[us_bidx >> 2] >> ((us_bidx & 3) << 3)) & 0xFF) - 127.0f);
         uint bp = g * PPG, bx = g * GS;
         for (uint p = 0; p < PPG; p++) {
             uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
@@ -904,10 +904,10 @@ kernel void gather_down(
 
     float acc = 0.0f;
     for (uint g = simd_lane; g < N_GROUPS; g += 32) {
-        // Read scale byte from pool using byte arithmetic on uint32 words
+        // Read scale byte: shift/mask instead of division/modulo.
         uint s_byte_idx = s_byte_base + g;
-        uint s_word = pool[s_byte_idx / 4];
-        uint8_t s_byte = (uint8_t)((s_word >> ((s_byte_idx % 4) * 8)) & 0xFF);
+        uint s_word = pool[s_byte_idx >> 2];
+        uint8_t s_byte = (uint8_t)((s_word >> ((s_byte_idx & 3) << 3)) & 0xFF);
         float sf = exp2((float)s_byte - 127.0f);
         uint bp = g * PPG, bx = g * GS;
         for (uint p = 0; p < PPG; p++) {
@@ -1412,8 +1412,8 @@ kernel void matvec_q8_0_f32(
     }
 }
 
-// matvec_f32_bf16in: dense f32 matmul with bfloat input.
-// Used for wo_a (dense) with bfloat attn output.
+// matvec_f32_bf16in: dense f32 matmul with bfloat input. (naive, 1-thread-per-row)
+// Used for wo_a with small out_dim — kept for MLA attention path.
 kernel void matvec_f32_bf16in(
     device const float*  W   [[buffer(0)]],
     device const bfloat* x   [[buffer(1)]],
@@ -1426,6 +1426,48 @@ kernel void matvec_f32_bf16in(
     float acc = 0.0f;
     for (uint i = 0; i < in_dim; i++) acc += W[tid * in_dim + i] * float(x[i]);
     out[tid] = acc;
+}
+
+// matvec_f32_bf16in_simd: SIMD-parallel routing gate matmul.
+// Optimized for routing gate [N_EXPERTS=256, DIM=4096] × [DIM] bfloat → [N_EXPERTS] f32.
+// Strategy: ROWS_PER_TG=8 rows per threadgroup (one SIMD group per row),
+//   x cached as f32 in threadgroup shared memory (eliminates redundant bf16→f32 converts),
+//   32-thread simd_sum reduction → 32× fewer serial FMAs vs naive, coalesced W access.
+// Dispatch: MTLSizeMake((out_dim+7)/8, 1, 1) threadgroups × 256 threads.
+kernel void matvec_f32_bf16in_simd(
+    device const float*  W       [[buffer(0)]],
+    device const bfloat* x       [[buffer(1)]],
+    device float*        out     [[buffer(2)]],
+    constant uint&       out_dim [[buffer(3)]],
+    constant uint&       in_dim  [[buffer(4)]],
+    uint tgid      [[threadgroup_position_in_grid]],
+    uint lid       [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_grp  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    uint row = tgid * ROWS_PER_TG + simd_grp;
+
+    // Cache x as f32 in shared memory (4096 bf16 → f32, 16KB per TG).
+    // All 256 threads cooperate before any early return.
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = float(x[i]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const float* w_row = W + row * in_dim;
+    float acc = 0.0f;
+    // 32 threads in SIMD group stripe across in_dim: coalesced access.
+    for (uint i = simd_lane; i < in_dim; i += 32) {
+        acc += w_row[i] * x_shared[i];
+    }
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
 }
 
 // mhc_pre_gpu: full mhc_pre computation on GPU with bfloat output for out_input.

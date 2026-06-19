@@ -260,6 +260,7 @@ typedef struct {
     void *pipe_rms_norm_rows_bf16in_bf16out;
     void *pipe_rope_tail_bf16;
     void *pipe_matvec_f32_bf16in;
+    void *pipe_matvec_f32_bf16in_simd;  // SIMD-parallel routing gate matmul
     void *pipe_matvec_q8_0_f32;        // ds4 Q8_0 matvec for wo_a
     void *pipe_mla_sdpa_bfloat;
     void *pipe_mhc_pre_bfloat;
@@ -505,6 +506,13 @@ int moe_infer_preload_experts(MoEInferEngine *engine, int expert_cache_mb);
 // penalty: routing score subtracted from uncached experts during inference (e.g. 1e9).
 // Call this INSTEAD of moe_infer_preload_experts when using SMELT.
 void moe_infer_smelt_init(MoEInferEngine *engine, int warmup_tokens, int n_per_layer, float penalty);
+
+// Save/load routing_counts to/from disk for SMELT hot-expert persistence.
+// path: file path (e.g. "/path/to/model/.smelt_routing_stats.bin")
+// load returns 1 if successfully loaded, 0 on first-run/error.
+// Call load BEFORE smelt_init so smelt_finish_warmup uses the correct expert order.
+void moe_infer_smelt_save_stats(MoEInferEngine *engine, const char *path);
+int  moe_infer_smelt_load_stats(MoEInferEngine *engine, const char *path);
 
 // Signal that prefill is complete and decode phase begins.
 // SMELT token counting (for warmup) only runs after this is called, ensuring

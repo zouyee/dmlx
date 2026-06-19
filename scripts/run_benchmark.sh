@@ -91,7 +91,21 @@ echo "   $BM_UNIT ($(($(date +%s)-T_UNIT))s)"
 (cd "$PROJECT_DIR" && zig build -Doptimize=ReleaseFast 2>/dev/null)
 
 # Cleanup helper
-cleanup() { pkill -9 -f "dmlx serve.*${PORT}" 2>/dev/null || true; sleep 1; }
+cleanup() {
+    # Use graceful shutdown (SIGTERM) so routing stats are saved via deinit()
+    # Fall back to SIGKILL only if graceful shutdown times out
+    if curl -sf --max-time 3 -X POST "http://localhost:${PORT}/shutdown" > /dev/null 2>&1; then
+        sleep 2
+    fi
+    pkill -f "dmlx serve.*${PORT}" 2>/dev/null || true
+    sleep 1
+}
+
+# Delete routing stats before each benchmark run to ensure reproducible results.
+# The benchmark mixes short "Hi" perf prompts + long E2E prompts, which pollutes
+# the stats in a way that hurts "Hi" performance on next run (E2E dominates).
+# Production servers benefit from persistent stats; benchmark uses fresh state.
+rm -f "${PACKED_DIR}/.smelt_routing_stats.bin" 2>/dev/null || true
 trap cleanup EXIT
 cleanup
 

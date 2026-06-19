@@ -87,6 +87,8 @@ extern fn moe_infer_smelt_finish_warmup(engine: *Engine) c_int;
 extern fn moe_infer_smelt_preload_async(engine: *Engine) void;
 extern fn moe_infer_smelt_set_decode_phase(engine: *Engine) void;
 extern fn moe_infer_init_gather_mode(engine: *Engine) c_int;
+extern fn moe_infer_smelt_save_stats(engine: *Engine, path: [*c]const u8) void;
+extern fn moe_infer_smelt_load_stats(engine: *Engine, path: [*c]const u8) c_int;
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
@@ -110,6 +112,14 @@ pub fn smeltPreloadAsync(engine: *Engine) void {
 
 pub fn smeltSetDecodePhase(engine: *Engine) void {
     moe_infer_smelt_set_decode_phase(engine);
+}
+
+pub fn smeltSaveStats(engine: *Engine, path: [*c]const u8) void {
+    moe_infer_smelt_save_stats(engine, path);
+}
+
+pub fn smeltLoadStats(engine: *Engine, path: [*c]const u8) i32 {
+    return moe_infer_smelt_load_stats(engine, path);
 }
 
 pub fn initGatherMode(engine: *Engine) i32 {

@@ -28,6 +28,7 @@ pub const NativeEngine = struct {
     config: native_loader.DSV4NativeConfig,
     logits_buffer: []f32,
     eos_token: u32 = EOS_TOKEN,
+    smelt_stats_path: []u8, // path to routing stats file, owned by NativeEngine
 
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8, packed_dir: []const u8) !NativeEngine {
         // 1. Load config
@@ -95,29 +96,31 @@ pub const NativeEngine = struct {
         //    NATIVE_SMELT_N=0 to disable (full SSD reads, ~4200ms/tok)
         const smelt_n_str = std.c.getenv("NATIVE_SMELT_N");
         const smelt_n: i32 = if (smelt_n_str) |s| std.fmt.parseInt(i32, std.mem.span(s), 10) catch 51 else 51;
+
+        // Build stats file path: {packed_dir}/.smelt_routing_stats.bin
+        const stats_path_buf = try std.fmt.allocPrint(allocator, "{s}/.smelt_routing_stats.bin\x00", .{packed_dir});
+        errdefer allocator.free(stats_path_buf);
+
         if (smelt_n > 0) {
             std.log.info("native_engine: SMELT preloading {d} experts/layer ({d:.1} GB) — please wait...", .{
                 smelt_n,
                 @as(f64, @floatFromInt(smelt_n)) * 43.0 * 13.4 / 1024.0,
             });
-            // Use warmup_tokens=0 for immediate preload of experts 0..N-1 (synchronous).
-            // Routing bias is disabled (penalty=0.0): SMELT acts as a cache, CPU/GPU routing
-            // selects the true top-6 experts. This preserves correctness but leaves SSD I/O
-            // on cache miss. Real routing-stats-driven warmup has race-condition bugs in the
-            // async preload path (see §38) and is not enabled by default.
+            // Load routing stats from previous runs so smelt_finish_warmup
+            // selects the ACTUAL hot experts rather than experts 0..N-1 by ID.
+            // On first run (no stats file), falls back to loading experts 0..N-1.
+            // warmup=0 means smelt_finish_warmup is triggered immediately at startup.
             metal.smeltInit(engine, 0, smelt_n, 0.0);
+            // Load stats AFTER smeltInit (smeltInit zeros routing_counts, so load must come after)
+            _ = metal.smeltLoadStats(engine, stats_path_buf[0 .. stats_path_buf.len - 1 :0].ptr);
             const n_loaded = metal.smeltFinishWarmup(engine);
             if (n_loaded > 0) {
-                std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM, no routing bias", .{n_loaded});
-                // Gather mode: single-dispatch all K experts from the contiguous SMELT pool.
-                // NOTE: Currently disabled by default — gather kernel with 13MB expert-stride causes
-                // scattered cache-unfriendly memory access that is SLOWER than 6 separate contiguous reads.
-                // Enable via NATIVE_GATHER=1 only for experimentation.
+                std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM (routing-stats based)", .{n_loaded});
                 const gather_env = std.c.getenv("NATIVE_GATHER");
                 if (gather_env != null) {
                     const gather_ok = metal.initGatherMode(engine);
                     if (gather_ok > 0) {
-                        std.log.info("native_engine: gather mode active (EXPERIMENTAL — may be slower)", .{});
+                        std.log.info("native_engine: gather mode active (EXPERIMENTAL)", .{});
                     } else {
                         std.log.warn("native_engine: gather mode init failed", .{});
                     }
@@ -137,10 +140,14 @@ pub const NativeEngine = struct {
             .weight_store = store,
             .config = cfg,
             .logits_buffer = logits,
+            .smelt_stats_path = stats_path_buf,
         };
     }
 
     pub fn deinit(self: *NativeEngine) void {
+        // Save routing stats so next startup loads the correct hot experts
+        metal.smeltSaveStats(self.engine, self.smelt_stats_path[0 .. self.smelt_stats_path.len - 1 :0].ptr);
+        self.allocator.free(self.smelt_stats_path);
         self.allocator.free(self.logits_buffer);
         metal.deinit(self.engine);
         self.weight_store.deinit();

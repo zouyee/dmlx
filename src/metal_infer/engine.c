@@ -16,6 +16,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <Accelerate/Accelerate.h>
 
 // ============================================================================
@@ -81,6 +82,20 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_rms_norm_rows_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16in_bf16out"] error:&err]);
     eng->pipe_rope_tail_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_bf16"] error:&err]);
     eng->pipe_matvec_f32_bf16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_bf16in"] error:&err]);
+    {
+        NSError *rerr2 = nil;
+        id<MTLFunction> fn2 = [lib newFunctionWithName:@"matvec_f32_bf16in_simd"];
+        if (fn2) {
+            id<MTLComputePipelineState> ps2 = [d newComputePipelineStateWithFunction:fn2 error:&rerr2];
+            eng->pipe_matvec_f32_bf16in_simd = ps2 ? (void *)ps2 : NULL;
+            if (!ps2) fprintf(stderr, "Metal: matvec_f32_bf16in_simd compile failed: %s\n",
+                             [[rerr2 localizedDescription] UTF8String]);
+            else fprintf(stderr, "Metal: matvec_f32_bf16in_simd compiled OK\n");
+        } else {
+            fprintf(stderr, "Metal: matvec_f32_bf16in_simd not found in library — fallback to naive\n");
+            eng->pipe_matvec_f32_bf16in_simd = NULL;
+        }
+    }
     eng->pipe_matvec_q8_0_f32    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_q8_0_f32"]    error:&err]);
     eng->pipe_mla_sdpa_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_bfloat"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
@@ -533,6 +548,9 @@ static void *smelt_preload_thread(void *arg) {
 // Meanwhile, all SSD reads proceed normally (no penalty applied yet).
 void moe_infer_smelt_preload_async(MoEInferEngine *eng) {
     if (!eng->smelt_enabled || eng->smelt_warmup_done) return;
+    // Set warmup_done = true IMMEDIATELY to prevent duplicate thread launches.
+    // The preload thread will finish loading experts; smelt_warmup_done stays true.
+    eng->smelt_warmup_done = true;  // guard: prevent re-entry before thread finishes
     SmeltPreloadArgs *a = (SmeltPreloadArgs *)malloc(sizeof(SmeltPreloadArgs));
     if (!a) { moe_infer_smelt_finish_warmup(eng); return; }
     a->eng = eng;
@@ -544,6 +562,74 @@ void moe_infer_smelt_preload_async(MoEInferEngine *eng) {
     }
     pthread_detach(t);
     fprintf(stderr, "[smelt] Async preload started (routing bias inactive until complete)\n");
+}
+
+// ============================================================================
+// SMELT routing stats persistence: save/load routing_counts to/from disk.
+// Format: magic(4) + version(4) + n_layers(4) + n_experts(4) + counts(N_LAYERS*N_EXPERTS*4)
+// Total: ~44 KB. Saved once at server shutdown, loaded at next startup so that
+// smelt_finish_warmup loads the ACTUAL hot experts rather than experts 0..N-1.
+// ============================================================================
+
+#define SMELT_STATS_MAGIC   0x534D454C  // "SMEL"
+#define SMELT_STATS_VERSION 1
+
+void moe_infer_smelt_save_stats(MoEInferEngine *eng, const char *path) {
+    if (!eng || !path || !eng->smelt_enabled) return;
+    // Create parent dirs if needed (best effort)
+    char dir[1024];
+    snprintf(dir, sizeof(dir), "%s", path);
+    char *slash = strrchr(dir, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir(dir, 0755);
+    }
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        fprintf(stderr, "[smelt] save_stats: cannot open %s: %s\n", path, strerror(errno));
+        return;
+    }
+    uint32_t hdr[4] = { SMELT_STATS_MAGIC, SMELT_STATS_VERSION, N_LAYERS, N_EXPERTS };
+    fwrite(hdr, sizeof(hdr), 1, f);
+    fwrite(eng->routing_counts, sizeof(eng->routing_counts), 1, f);
+    fclose(f);
+    // Compute total token count for logging
+    uint64_t total = 0;
+    for (int l = 0; l < N_LAYERS; l++)
+        for (int e = 0; e < N_EXPERTS; e++)
+            total += eng->routing_counts[l][e];
+    fprintf(stderr, "[smelt] save_stats: saved to %s (%.1fK total selections)\n",
+            path, (double)total / 1000.0);
+}
+
+int moe_infer_smelt_load_stats(MoEInferEngine *eng, const char *path) {
+    if (!eng || !path) return 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "[smelt] load_stats: no saved stats at %s (first run — will use default order)\n", path);
+        return 0;
+    }
+    uint32_t hdr[4];
+    if (fread(hdr, sizeof(hdr), 1, f) != 1 ||
+        hdr[0] != SMELT_STATS_MAGIC || hdr[1] != SMELT_STATS_VERSION ||
+        hdr[2] != N_LAYERS || hdr[3] != N_EXPERTS) {
+        fprintf(stderr, "[smelt] load_stats: invalid or stale stats file (will regenerate)\n");
+        fclose(f);
+        return 0;
+    }
+    if (fread(eng->routing_counts, sizeof(eng->routing_counts), 1, f) != 1) {
+        fprintf(stderr, "[smelt] load_stats: read error\n");
+        fclose(f);
+        return 0;
+    }
+    fclose(f);
+    uint64_t total = 0;
+    for (int l = 0; l < N_LAYERS; l++)
+        for (int e = 0; e < N_EXPERTS; e++)
+            total += eng->routing_counts[l][e];
+    fprintf(stderr, "[smelt] load_stats: loaded from %s (%.1fK historical selections)\n",
+            path, (double)total / 1000.0);
+    return 1;
 }
 
 // ============================================================================
@@ -1312,13 +1398,27 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         // Enc 6: routing_gate → buf_routing_scores
         if (eng->gate_proj[layer]) {
             id<MTLComputeCommandEncoder> enc = [cb2cmd2 computeCommandEncoder];
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
-            uint od=N_EXPERTS, id_=DIM;
-            [enc setBytes:&od length:4 atIndex:3]; [enc setBytes:&id_ length:4 atIndex:4];
-            [enc dispatchThreads:MTLSizeMake(N_EXPERTS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            // Routing gate matmul [N_EXPERTS=256, DIM=4096] × [DIM] bfloat → [N_EXPERTS] f32.
+            // Use SIMD parallel dispatch if kernel available (ROWS_PER_TG=8, x_shared, simd_sum).
+            // Fall back to naive 1-thread-per-row dispatch.
+            if (eng->pipe_matvec_f32_bf16in_simd) {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in_simd];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
+                uint od=N_EXPERTS, id_=DIM;
+                [enc setBytes:&od length:4 atIndex:3]; [enc setBytes:&id_ length:4 atIndex:4];
+                uint ntg_route = (N_EXPERTS + 7) / 8;  // 32 threadgroups
+                [enc dispatchThreadgroups:MTLSizeMake(ntg_route,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            } else {
+                [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gate_proj_gpu[layer] offset:0 atIndex:0];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_routing_scores        offset:0 atIndex:2];
+                uint od=N_EXPERTS, id_=DIM;
+                [enc setBytes:&od length:4 atIndex:3]; [enc setBytes:&id_ length:4 atIndex:4];
+                [enc dispatchThreads:MTLSizeMake(N_EXPERTS,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            }
             [enc endEncoding];
         }
 
@@ -1434,8 +1534,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights,
                       smelt_cache, eng->smelt_penalty);
     }
-    // SMELT warmup: accumulate routing statistics (only for score-based routing, not hash)
-    if (eng->smelt_enabled && !eng->smelt_warmup_done && !use_hash_routing) {
+    // SMELT: always accumulate routing statistics for score-based layers during decode.
+    // This ensures stats remain current for the next startup (loaded via smelt_load_stats).
+    if (eng->smelt_enabled && eng->smelt_in_decode_phase && !use_hash_routing) {
         for (int k = 0; k < N_ACTIVE; k++) {
             int eid = expert_ids[k];
             if (eid >= 0 && eid < N_EXPERTS) {
