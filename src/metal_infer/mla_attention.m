@@ -72,17 +72,12 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
     bzero((void *)c, sizeof(*c));
     c->owner = (const void *)aw;
 
-    // All attention weights use newBufferWithBytesNoCopy (zero-copy from backbone memory).
-    // These weights are fixed for the layer lifetime — data already loaded by NativeLoader.
-    // NoCopy eliminates CPU memcpy overhead:
-    //   wq_b packed: 16MB/layer × 43 = 688MB saved/token (was newBufferWithBytes = COPY!)
-    //   wo_b packed: 16MB/layer × 43 = 688MB saved/token
-    //   wq_a: 2MB/layer × 43 = 86MB, wkv: 1MB/layer × 43 = 43MB
-    // Scales/biases are small (<2MB/layer), use NoCopy too for consistency.
-    // NoCopy requires the pointer to remain valid for the buffer's lifetime — guaranteed
-    // since backbone weights are pinned for the engine's lifetime.
-    #define MKNC(ptr, sz) [d newBufferWithBytesNoCopy:(void*)(ptr) length:(sz) \
-                             options:MTLResourceStorageModeShared deallocator:nil]
+    // Use newBufferWithBytes (copy) for attention weights. NativeLoader data is not
+    // guaranteed to be page-aligned, which newBufferWithBytesNoCopy requires on macOS.
+    // Copying guarantees correct GPU reads even if the source pointer is unaligned.
+    // Future optimization: page-align weight allocations in native_loader and revert to NoCopy.
+    #define MKNC(ptr, sz) [d newBufferWithBytes:(void*)(ptr) length:(sz) \
+                             options:MTLResourceStorageModeShared]
     {
         size_t pw; int ng; size_t sc;
         // wq_a: [1024, 4096] affine 4-bit → packed=2MB, scales/biases=2×256KB
@@ -150,9 +145,9 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
         }
     }
     #undef MKNC
-    // q_norm, kv_norm, attn_sink (tiny, always NoCopy cached)
-    #define MKNC(ptr, sz) [d newBufferWithBytesNoCopy:(void*)(ptr) length:(sz) \
-                             options:MTLResourceStorageModeShared deallocator:nil]
+    // q_norm, kv_norm, attn_sink (tiny, always copied for alignment safety)
+    #define MKNC(ptr, sz) [d newBufferWithBytes:(void*)(ptr) length:(sz) \
+                             options:MTLResourceStorageModeShared]
     c->q_norm_buf    = MKNC(aw->q_norm,    Q_LORA_RANK * sizeof(float));
     c->kv_norm_buf   = MKNC(aw->kv_norm,   KV_LORA_RANK * sizeof(float));
     c->attn_sink_buf = MKNC(aw->attn_sink, N_HEADS * sizeof(float));
@@ -864,17 +859,19 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
             bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g]
                            : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            id<MTLBuffer> bwg = (abc && abc->wo_a_q8_gpu[g])
-                                    ? abc->wo_a_q8_gpu[g]
-                                    : ((abc && abc->wo_a_grp[g])
-                                        ? abc->wo_a_grp[g]
-                                        : [d newBufferWithBytesNoCopy:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
-                                              length:(size_t)O_LORA_RANK * group_feat * sizeof(float)
-                                              options:MTLResourceStorageModeShared
-                                              deallocator:nil]);
-            if (abc && abc->wo_a_q8_gpu[g]) {
-                enc_matvec_q8_0(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
+            // Prefer Q8_0 quantized wo_a when explicitly enabled via DMLX_USE_Q8_WOA=1;
+            // default remains f32 dense for numerical stability. Q8_0 gives ~+5.8% tok/s
+            // but currently causes stricter correctness checks to fail on some prompts.
+            static int use_q8_woa = -1;
+            if (use_q8_woa < 0) use_q8_woa = getenv("DMLX_USE_Q8_WOA") ? 1 : 0;
+            if (use_q8_woa && abc && abc->wo_a_q8_gpu[g]) {
+                enc_matvec_q8_0(P, cb3, abc->wo_a_q8_gpu[g], bgv, bog_arr[g], O_LORA_RANK, group_feat);
             } else {
+                id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
+                                        ? abc->wo_a_grp[g]
+                                        : [d newBufferWithBytes:(void*)(aw->wo_a_dense + (size_t)g * O_LORA_RANK * group_feat)
+                                              length:(size_t)O_LORA_RANK * group_feat * sizeof(float)
+                                              options:MTLResourceStorageModeShared];
                 enc_matvec_f32_bf16in(P, cb3, bwg, bgv, bog_arr[g], O_LORA_RANK, group_feat);
             }
         }

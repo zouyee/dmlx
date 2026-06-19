@@ -42,7 +42,7 @@ fi
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 PACKED_DIR="${MODEL_PATH}/packed_experts"
-NATIVE_SMELT_N="${NATIVE_SMELT_N:-51}"
+NATIVE_SMELT_N="${NATIVE_SMELT_N:-20}"
 
 # MLX-mode legacy params
 SMELT_EXPERTS="${2:-0.20}"
@@ -155,7 +155,7 @@ print(int((pages.get('Pages free',0)+pages.get('Pages inactive',0)+pages.get('Pa
     echo "   Correctness check..."
     PARIS_RESP=$(curl -s --max-time 60 "${SERVER_URL}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d '{"model":"d","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":5,"temperature":0}')
+        -d '{"model":"d","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":30,"temperature":0}')
     PARIS_TEXT=$(echo "$PARIS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
     if echo "$PARIS_TEXT" | grep -qi "paris"; then
         echo "   ✓ Paris correct: \"${PARIS_TEXT}\""
@@ -199,6 +199,52 @@ print(f'{vals[1]:.3f}')")
     export BM_PERF_SECS=$(($(date +%s)-T_PERF))
     export BM_SMELT_N="$NATIVE_SMELT_N"
 
+    # --- E2E: 7-Prompt correctness test via native serve mode ---
+    echo ""
+    echo "✅ E2E (7 prompts via native serve)..."
+    T_E2E=$(date +%s)
+
+    PROMPTS=(
+        "2+2=|4"
+        "The capital of France is|Paris"
+        "What temperature does water freeze at in Celsius? Just give the number.|0"
+        "Is the Earth round? Reply with only yes or no.|yes"
+        "3*3=|9"
+        "10-5=|5"
+        "What is capital of France?|Paris"
+    )
+
+    EF=$(mktemp)
+    E2E_PASS=0
+    E2E_FAIL=0
+
+    for idx in "${!PROMPTS[@]}"; do
+        IFS='|' read -r prompt expected <<< "${PROMPTS[$idx]}"
+
+        result=$(curl -sf --max-time 300 \
+            "${SERVER_URL}/v1/chat/completions" \
+            -H "Content-Type: application/json" \
+            -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"${prompt}\"}],\"max_tokens\":30,\"temperature\":0}" 2>&1)
+
+        content=$(echo "$result" | jq -r '.choices[0].message.content // ""' 2>/dev/null || echo "")
+
+        if echo "$content" | grep -qi "$expected"; then
+            echo "   P$((idx+1)): ✅ PASSED"
+            echo "✅ PASSED P$((idx+1)): ${prompt}" >> "$EF"
+            echo "   Generated: ${content:0:80}" >> "$EF"
+            E2E_PASS=$((E2E_PASS + 1))
+        else
+            echo "   P$((idx+1)): ❌ FAILED (expected '${expected}' in output)"
+            echo "❌ FAILED P$((idx+1)): ${prompt}" >> "$EF"
+            echo "   Generated: ${content:0:80}" >> "$EF"
+            E2E_FAIL=$((E2E_FAIL + 1))
+        fi
+        sleep 1
+    done
+
+    export BM_E2E_SECS=$(($(date +%s)-T_E2E))
+    echo "   Results: ${E2E_PASS} passed, ${E2E_FAIL} failed (${BM_E2E_SECS}s)"
+
     cleanup
 
     # Report
@@ -209,10 +255,11 @@ print(f'{vals[1]:.3f}')")
     echo "  SMELT N: ${NATIVE_SMELT_N}"
     echo "  tok/s:   ${NATIVE_MEDIAN_TPS} (median of 3 sequential)"
     echo "  Paris:   $([ "$NATIVE_CORRECT" -eq 1 ] && echo '✓ PASS' || echo '✗ FAIL')"
+    echo "  E2E:     ${E2E_PASS}/7 passed"
     echo "  unit:    ${BM_UNIT}"
     echo "  time:    ${BM_PERF_SECS}s"
     echo "════════════════════════════════════════"
-    exit $([ "$NATIVE_CORRECT" -eq 1 ] && echo 0 || echo 1)
+    exit $([ "$NATIVE_CORRECT" -eq 1 ] && [ "$E2E_FAIL" -eq 0 ] && echo 0 || echo 1)
 fi
 
 # ==================================================================

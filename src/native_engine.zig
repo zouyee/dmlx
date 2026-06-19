@@ -16,8 +16,9 @@ const sampling_mod = @import("sampling.zig");
 const DIM = 4096;
 const MHC_MULT = 4;
 const N_LAYERS = 43;
-// EOS token ID: 1 is the `</s>` token for DeepSeek-V4-Flash tokenizer.
-// This matches the BpeTokenizer.eos_id loaded from tokenizer.json.
+// BOS token ID: 0 is the `<｜begin▁of▁sentence｜>` token for DeepSeek-V4-Flash.
+// EOS token ID: 1 is the `</s>` token loaded from tokenizer.json.
+const BOS_TOKEN: u32 = 0;
 const EOS_TOKEN: u32 = 1;
 
 pub const NativeEngine = struct {
@@ -99,13 +100,15 @@ pub const NativeEngine = struct {
                 smelt_n,
                 @as(f64, @floatFromInt(smelt_n)) * 43.0 * 13.4 / 1024.0,
             });
-            // warmup_tokens=0: no routing stats → preloads experts 0..N-1 (uniform, same as MLX default)
-            // Synchronous: blocks until all 29GB is loaded into RAM.
-            // Routing bias activates immediately after preload completes.
-            metal.smeltInit(engine, 0, smelt_n, 1e9);
+            // Use warmup_tokens=0 for immediate preload of experts 0..N-1 (synchronous).
+            // Routing bias is disabled (penalty=0.0): SMELT acts as a cache, CPU/GPU routing
+            // selects the true top-6 experts. This preserves correctness but leaves SSD I/O
+            // on cache miss. Real routing-stats-driven warmup has race-condition bugs in the
+            // async preload path (see §38) and is not enabled by default.
+            metal.smeltInit(engine, 0, smelt_n, 0.0);
             const n_loaded = metal.smeltFinishWarmup(engine);
             if (n_loaded > 0) {
-                std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM, routing bias active", .{n_loaded});
+                std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM, no routing bias", .{n_loaded});
                 // Gather mode: single-dispatch all K experts from the contiguous SMELT pool.
                 // NOTE: Currently disabled by default — gather kernel with 13MB expert-stride causes
                 // scattered cache-unfriendly memory access that is SLOWER than 6 separate contiguous reads.
@@ -174,13 +177,20 @@ pub const NativeEngine = struct {
             return try allocator.alloc(u32, 0);
         }
 
-        // Skip BOS token (token 0) if present — MLX strips it before generation
-        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
-        const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
-        const effective_prompt_len = if (prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token) prompt_tokens.len - prompt_offset - 1 else prompt_tokens.len - prompt_offset;
+        // Skip BOS (token 0) and EOS (token 1) if present — MLX strips both before generation.
+        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == BOS_TOKEN;
+        const has_eos = prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token;
+        const prompt_offset: usize = if (has_bos) 1 else 0;
+        const eos_offset: usize = if (has_eos) 1 else 0;
+        const effective_prompt_len = if (prompt_tokens.len > prompt_offset + eos_offset)
+            prompt_tokens.len - prompt_offset - eos_offset
+        else
+            0;
         var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
-        @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
+        if (effective_prompt_len > 0) {
+            @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset .. prompt_tokens.len - eos_offset]);
+        }
 
         var current_len = effective_prompt_len;
         var start_pos: usize = start_pos_override orelse 0;
@@ -188,18 +198,16 @@ pub const NativeEngine = struct {
         // Reset KV cache at the start of each new sequence
         self.resetKv();
 
-        // Prefill: token-by-token forward (same path as decode for numerical consistency).
-        // Using batch forward caused ~0.73% per-layer error vs MLX batch GPU path;
-        // single-token forward is self-consistent and avoids this issue.
-        if (start_pos_override == null and prompt_tokens.len > 0) {
-            for (prompt_tokens, 0..) |tok, t| {
+        // Prefill: token-by-token forward over effective prompt tokens only.
+        if (start_pos_override == null and effective_prompt_len > 0) {
+            for (tokens[0..effective_prompt_len], 0..) |tok, t| {
                 var hidden: [MHC_MULT * DIM]f32 = undefined;
                 metal.setTokenId(self.engine, @intCast(tok));
                 metal.embed(self.engine, @intCast(tok), &hidden);
                 try metal.forward(self.engine, hidden[0..], @intCast(start_pos + t));
 
                 // On the last prompt token, compute logits for the first decode token
-                if (t == prompt_tokens.len - 1) {
+                if (t == effective_prompt_len - 1) {
                     var compressed: [DIM]f32 = undefined;
                     metal.hyperHeadCompress(
                         self.weight_store.weights.hc_head_fn.ptr,
@@ -211,9 +219,10 @@ pub const NativeEngine = struct {
                     try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
 
                     const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
-                    start_pos += prompt_tokens.len;
+                    start_pos += effective_prompt_len;
                     tokens[current_len] = next_token;
                     current_len += 1;
+                    std.log.info("native_engine: effective_prompt_len={d} first_token={d}", .{ effective_prompt_len, next_token });
 
                     if (next_token == self.eos_token) {
                         std.log.info("native_engine: EOS after prefill", .{});
@@ -254,9 +263,13 @@ pub const NativeEngine = struct {
             }
         }
 
-        // Return only generated tokens (skip prompt)
-        const result = try allocator.alloc(u32, current_len - prompt_tokens.len);
-        @memcpy(result, tokens[prompt_tokens.len..current_len]);
+        // Return only generated tokens (skip effective prompt), and drop trailing EOS.
+        var result_len = current_len - effective_prompt_len;
+        if (result_len > 0 and tokens[current_len - 1] == self.eos_token) {
+            result_len -= 1;
+        }
+        const result = try allocator.alloc(u32, result_len);
+        @memcpy(result, tokens[effective_prompt_len .. effective_prompt_len + result_len]);
         return result;
     }
 
@@ -280,13 +293,20 @@ pub const NativeEngine = struct {
             return try allocator.alloc(u32, 0);
         }
 
-        // Skip BOS token (token 0) if present — MLX strips it before generation
-        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == EOS_TOKEN;
-        const prompt_offset: usize = if (has_bos) @as(usize, 1) else @as(usize, 0);
-        const effective_prompt_len = if (prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token) prompt_tokens.len - prompt_offset - 1 else prompt_tokens.len - prompt_offset;
+        // Skip BOS (token 0) and EOS (token 1) if present — MLX strips both before generation.
+        const has_bos = prompt_tokens.len > 0 and prompt_tokens[0] == BOS_TOKEN;
+        const has_eos = prompt_tokens.len > 0 and prompt_tokens[prompt_tokens.len - 1] == self.eos_token;
+        const prompt_offset: usize = if (has_bos) 1 else 0;
+        const eos_offset: usize = if (has_eos) 1 else 0;
+        const effective_prompt_len = if (prompt_tokens.len > prompt_offset + eos_offset)
+            prompt_tokens.len - prompt_offset - eos_offset
+        else
+            0;
         var tokens = try allocator.alloc(u32, effective_prompt_len + max_new_tokens);
         defer allocator.free(tokens);
-        @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset..]);
+        if (effective_prompt_len > 0) {
+            @memcpy(tokens[0..effective_prompt_len], prompt_tokens[prompt_offset .. prompt_tokens.len - eos_offset]);
+        }
 
         var current_len = effective_prompt_len;
         var start_pos: usize = start_pos_override orelse 0;
@@ -294,16 +314,15 @@ pub const NativeEngine = struct {
         // Reset KV cache
         self.resetKv();
 
-        // Prefill: batch forward (proper transformer order: all tokens per layer).
-        if (start_pos_override == null and prompt_tokens.len > 0) {
-            // Token-by-token prefill (same path as decode for numerical consistency)
-            for (prompt_tokens, 0..) |tok, t| {
+        // Prefill: token-by-token forward over effective prompt tokens only.
+        if (start_pos_override == null and effective_prompt_len > 0) {
+            for (tokens[0..effective_prompt_len], 0..) |tok, t| {
                 var hidden: [MHC_MULT * DIM]f32 = undefined;
                 metal.setTokenId(self.engine, @intCast(tok));
                 metal.embed(self.engine, @intCast(tok), &hidden);
                 try metal.forward(self.engine, hidden[0..], @intCast(start_pos + t));
 
-                if (t == prompt_tokens.len - 1) {
+                if (t == effective_prompt_len - 1) {
                     var compressed: [DIM]f32 = undefined;
                     metal.hyperHeadCompress(
                         self.weight_store.weights.hc_head_fn.ptr,
@@ -315,9 +334,10 @@ pub const NativeEngine = struct {
                     try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
 
                     const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
-                    start_pos += prompt_tokens.len;
+                    start_pos += effective_prompt_len;
                     tokens[current_len] = next_token;
                     current_len += 1;
+                    std.log.info("native_engine: effective_prompt_len={d} first_token={d}", .{ effective_prompt_len, next_token });
 
                     if (callback) |cb| {
                         const is_final = max_new_tokens == 1 or next_token == self.eos_token;
@@ -368,8 +388,13 @@ pub const NativeEngine = struct {
             }
         }
 
-        const result = try allocator.alloc(u32, current_len - prompt_tokens.len);
-        @memcpy(result, tokens[prompt_tokens.len..current_len]);
+        // Return only generated tokens (skip effective prompt), and drop trailing EOS.
+        var result_len = current_len - effective_prompt_len;
+        if (result_len > 0 and tokens[current_len - 1] == self.eos_token) {
+            result_len -= 1;
+        }
+        const result = try allocator.alloc(u32, result_len);
+        @memcpy(result, tokens[effective_prompt_len .. effective_prompt_len + result_len]);
         return result;
     }
 
@@ -391,6 +416,7 @@ pub const NativeEngine = struct {
                 max_idx = i;
             }
         }
+        std.log.info("sampleFromLogits: max_idx={d} max_val={d:.4} logit[0]={d:.4} logit[304]={d:.4}", .{ max_idx, max_val, logits[0], logits[304] });
         return @intCast(max_idx);
     }
 };

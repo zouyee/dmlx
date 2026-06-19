@@ -4,6 +4,7 @@
 //
 // Architecture (per layer):
 //   CMD1: attention projections (q/k/v proj matvecs)
+#include <stddef.h>
 //   CPU:  RoPE, KV cache update, SDPA
 //   CMD2: o_proj + residual_add + rms_norm + routing + shared expert
 //   CPU:  softmax + topK → expert indices
@@ -113,16 +114,28 @@ typedef struct {
 // Expert packed binary layout (MXFP4, group_size=32)
 // Uses formula: LUT[nibble] * exp2(scale - 127)
 // Scales stored as uint8 (E8M0), weights as uint32
-// Note: DOWN_B is reserved but not present in the actual files
+// Layout per expert: [GATE_W: 4MB][GATE_S: 256KB][UP_W: 4MB][UP_S: 256KB][DOWN_W: 4MB][DOWN_S: 256KB]
+// Bias planes (GATE_B/UP_B/DOWN_B) are reserved but not present in the actual files.
 #define EXPERT_SIZE 13369344  // bytes per expert (~12.75 MB)
 #define GATE_W_OFF  0
 #define GATE_S_OFF  4194304
-#define GATE_B_OFF  4456448
-#define UP_W_OFF    4718592
-#define UP_S_OFF    8912896
-#define UP_B_OFF    9175040
-#define DOWN_W_OFF  9437184
-#define DOWN_S_OFF  13631488
+#define UP_W_OFF    4456448
+#define UP_S_OFF    8650752
+#define DOWN_W_OFF  8912896
+#define DOWN_S_OFF  13107200
+
+// Affine v2 layout: proper dequant→requantize, bf16 scale+bias, gs=64
+// [gate: W(4MB) S(256KB) B(256KB)] [up: ...] [down: W(4MB) S(256KB) B(256KB)]
+#define AFFINE_EXPERT_SIZE  14155776  // 3 * (4194304 + 262144 + 262144)
+#define AFFINE_GATE_W_OFF   0
+#define AFFINE_GATE_S_OFF   4194304
+#define AFFINE_GATE_B_OFF   4456448
+#define AFFINE_UP_W_OFF     4718592
+#define AFFINE_UP_S_OFF     8912896
+#define AFFINE_UP_B_OFF     9175040
+#define AFFINE_DOWN_W_OFF   9437184
+#define AFFINE_DOWN_S_OFF   13631488
+#define AFFINE_DOWN_B_OFF   13893632
 
 // ============================================================================
 // Layer config — which layers use full attention vs linear attention
@@ -204,6 +217,8 @@ typedef struct {
     // Pipeline states (id<MTLComputePipelineState>)
     void *pipe_gate_up_swiglu;
     void *pipe_gate_up_swiglu_v2;      // ds4 no-x_shared coalesced pattern (MXFP4, gs=32)
+    void *pipe_gate_up_swiglu_v4;      // MLX-style: 64 threads, 0 TGMEM, 4 rows/SIMD (new)
+    void *pipe_gather_gate_up_v4;      // MLX-style gather version
     void *pipe_gate_up_swiglu_v2_affine; // affine 4-bit dequant (bf16 scales+biases, gs=64) — experimental
     void *pipe_dequant_matvec_4bit_affine; // affine 4-bit down_proj
     void *pipe_dequant_matvec;
@@ -348,7 +363,7 @@ typedef struct {
     // Created once after SMELT warmup; reused every forward call.
     // expert_gpu_buf[layer][eid][slot]: slot 0=gate_W, 1=gate_S, 2=up_W, 3=up_S, 4=down_W, 5=down_S
     // NULL if expert not cached.
-    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][8];
+    void *expert_gpu_buf[N_LAYERS][N_EXPERTS][9];  // 6 for MXFP4, 9 for affine_v2
 
     // Gather MoE: per-layer NoCopy Metal buffer over the SMELT RAM pool.
     // The gather kernels address experts via pool_pos (slot index within the pool)
@@ -365,6 +380,8 @@ typedef struct {
     void *buf_gather_down_W[N_LAYERS];   // alias
     void *buf_gather_down_s[N_LAYERS];   // alias
     bool gather_mode;                    // true = use gather kernels instead of per-expert
+    bool use_affine_experts;             // true = experts are in affine_v2 format (bf16 scale+bias, gs=64)
+    size_t active_expert_size;           // EXPERT_SIZE or AFFINE_EXPERT_SIZE based on format
 
     // Remapping table: expert_id → pool_slot (position in SMELT pool).
     // Set during smelt_finish_warmup: smelt_pool_pos[layer][eid] = slot (0..n-1), or -1 if uncached.

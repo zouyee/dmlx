@@ -46,6 +46,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     id<MTLDevice> d = (id<MTLDevice>)dev;
     eng->pipe_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu"] error:&err]);
     eng->pipe_gate_up_swiglu_v2 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_v2"] error:&err]);
+    eng->pipe_gate_up_swiglu_v4 = NULL;  // not dispatched
+    eng->pipe_gather_gate_up_v4  = NULL;  // not dispatched
     eng->pipe_gate_up_swiglu_v2_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_v2_affine"] error:&err]);
     eng->pipe_dequant_matvec_4bit_affine = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit_affine"] error:&err]);
     eng->pipe_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_4bit"] error:&err]);
@@ -162,8 +164,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
 
     // 2MB-aligned expert I/O buffers
     for (int k = 0; k < N_ACTIVE; k++) {
-        posix_memalign((void**)&eng->expert_buf[k], 2*1024*1024, EXPERT_SIZE);
-        posix_memalign((void**)&eng->expert_buf_pred[k], 2*1024*1024, EXPERT_SIZE);
+        posix_memalign((void**)&eng->expert_buf[k], 2*1024*1024, AFFINE_EXPERT_SIZE);
+        posix_memalign((void**)&eng->expert_buf_pred[k], 2*1024*1024, AFFINE_EXPERT_SIZE);
     }
 
     // Initialize expert GPU buffer cache to NULL (populated after SMELT warmup)
@@ -177,6 +179,10 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     memset(eng->buf_gather_down_W, 0, sizeof(eng->buf_gather_down_W));
     memset(eng->buf_gather_down_s, 0, sizeof(eng->buf_gather_down_s));
     eng->gather_mode = false;
+    eng->use_affine_experts = (getenv("DMLX_AFFINE_EXPERTS") != NULL);
+    eng->active_expert_size = eng->use_affine_experts ? AFFINE_EXPERT_SIZE : EXPERT_SIZE;
+    if (eng->use_affine_experts)
+        fprintf(stderr, "Metal engine: affine expert format (gs=64, bf16 scale+bias)\n");
     // Initialize all pool_pos remapping slots to -1 (not in pool)
     for (int l = 0; l < N_LAYERS; l++)
         for (int e = 0; e < N_EXPERTS; e++)
@@ -257,7 +263,7 @@ static void io_pool_init(IOPool *pool) {
 }
 
 // Forward declaration for io_pool_dispatch (defined below)
-static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K, uint8_t *buffers[6]);
+static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K, uint8_t *buffers[6], size_t expert_sz);
 
 // ============================================================================
 // Expert memory cache — preload experts from SSD into RAM to eliminate I/O
@@ -271,19 +277,19 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
     if (expert_cache_mb == 0) {
         // Preload all experts
         n_per_layer = N_EXPERTS;
-        total_bytes = (size_t)N_LAYERS * N_EXPERTS * EXPERT_SIZE;
+        total_bytes = (size_t)N_LAYERS * N_EXPERTS * eng->active_expert_size;
     } else {
-        n_per_layer = (int)(total_bytes / ((size_t)N_LAYERS * EXPERT_SIZE));
+        n_per_layer = (int)(total_bytes / ((size_t)N_LAYERS * eng->active_expert_size));
         if (n_per_layer > N_EXPERTS) n_per_layer = N_EXPERTS;
         if (n_per_layer == 0) {
             fprintf(stderr, "[expert-cache] Budget %dMB too small for even 1 expert per layer (need %luMB)\n",
-                expert_cache_mb, (unsigned long)((size_t)N_LAYERS * EXPERT_SIZE / (1024*1024)));
+                expert_cache_mb, (unsigned long)((size_t)N_LAYERS * eng->active_expert_size / (1024*1024)));
             return 0;
         }
     }
 
     fprintf(stderr, "[expert-cache] Preloading %d/%d experts per layer (%lu MB total)...\n",
-        n_per_layer, N_EXPERTS, (unsigned long)(((size_t)N_LAYERS * n_per_layer * EXPERT_SIZE) / (1024*1024)));
+        n_per_layer, N_EXPERTS, (unsigned long)(((size_t)N_LAYERS * n_per_layer * eng->active_expert_size) / (1024*1024)));
     eng->expert_cache_n_experts = n_per_layer;
 
     for (int layer = 0; layer < N_LAYERS; layer++) {
@@ -296,7 +302,7 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
         }
 
         // Allocate flat pool for this layer
-        size_t pool_bytes = (size_t)n_per_layer * EXPERT_SIZE;
+        size_t pool_bytes = (size_t)n_per_layer * eng->active_expert_size;
         if (posix_memalign((void**)&eng->expert_mem_pool[layer], 2*1024*1024, pool_bytes) != 0) {
             fprintf(stderr, "[expert-cache] OOM allocating %luMB pool for layer %d\n",
                 (unsigned long)(pool_bytes / (1024*1024)), layer);
@@ -307,10 +313,10 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
         // Read n_per_layer experts starting from 0 (most frequently used in practice)
         // For hash routing layers (0-2), these are exactly the needed experts
         for (int eid = 0; eid < n_per_layer; eid++) {
-            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)eid * EXPERT_SIZE;
-            off_t offset = (off_t)eid * EXPERT_SIZE;
-            ssize_t n = pread(eng->packed_fd[layer], dst, EXPERT_SIZE, offset);
-            if (n != EXPERT_SIZE) {
+            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)eid * eng->active_expert_size;
+            off_t offset = (off_t)eid * eng->active_expert_size;
+            ssize_t n = pread(eng->packed_fd[layer], dst, eng->active_expert_size, offset);
+            if (n != eng->active_expert_size) {
                 fprintf(stderr, "[expert-cache] pread failed: layer=%d expert=%d got=%ld\n", layer, eid, (long)n);
                 eng->expert_cache_n_experts = 0;
                 return 0;
@@ -321,7 +327,7 @@ int moe_infer_preload_experts(MoEInferEngine *eng, int expert_cache_mb) {
     }
 
     fprintf(stderr, "[expert-cache] Done. %d experts/layer cached (%lu MB)\n",
-        n_per_layer, (unsigned long)(((size_t)N_LAYERS * n_per_layer * EXPERT_SIZE) / (1024*1024)));
+        n_per_layer, (unsigned long)(((size_t)N_LAYERS * n_per_layer * eng->active_expert_size) / (1024*1024)));
     return n_per_layer;
 }
 
@@ -358,7 +364,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
     size_t total_bytes = 0;
     for (int layer = 0; layer < N_LAYERS; layer++) {
         int n_this_layer = (eng->tid2eid[layer] != NULL) ? N_EXPERTS : n;
-        total_bytes += (size_t)n_this_layer * EXPERT_SIZE;
+        total_bytes += (size_t)n_this_layer * eng->active_expert_size;
     }
     fprintf(stderr, "[smelt] Total preload: %.1f GB (hash layers: all 256, score layers: top-%d)\n",
         (double)total_bytes / (1024.0*1024.0*1024.0), n);
@@ -404,7 +410,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
             free(eng->expert_mem_pool[layer]);
             eng->expert_mem_pool[layer] = NULL;
         }
-        size_t pool_bytes = (size_t)n_this_layer * EXPERT_SIZE;
+        size_t pool_bytes = (size_t)n_this_layer * eng->active_expert_size;
         if (posix_memalign((void**)&eng->expert_mem_pool[layer], 2*1024*1024, pool_bytes) != 0) {
             fprintf(stderr, "[smelt] OOM: pool for layer %d (%lu MB)\n", layer,
                 (unsigned long)(pool_bytes / (1024*1024)));
@@ -418,10 +424,10 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         int loaded = 0;
         for (int i = 0; i < n_this_layer && i < N_EXPERTS; i++) {
             int eid = sorted[i];
-            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)loaded * EXPERT_SIZE;
-            off_t offset = (off_t)eid * EXPERT_SIZE;
-            ssize_t bytes = pread(eng->packed_fd[layer], dst, EXPERT_SIZE, offset);
-            if (bytes == EXPERT_SIZE) {
+            uint8_t *dst = eng->expert_mem_pool[layer] + (size_t)loaded * eng->active_expert_size;
+            off_t offset = (off_t)eid * eng->active_expert_size;
+            ssize_t bytes = pread(eng->packed_fd[layer], dst, eng->active_expert_size, offset);
+            if (bytes == eng->active_expert_size) {
                 eng->expert_mem_cache[layer][eid] = dst;
                 eng->smelt_pool_pos[layer][eid] = loaded;  // record slot position
                 loaded++;
@@ -457,14 +463,24 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
             for (int eid = 0; eid < N_EXPERTS; eid++) {
                 uint8_t *base = eng->expert_mem_cache[layer][eid];
                 if (!base) continue;
-                eng->expert_gpu_buf[layer][eid][0] = (void *)[d newBufferWithBytesNoCopy:base+GATE_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][1] = (void *)[d newBufferWithBytesNoCopy:base+GATE_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+GATE_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+UP_B_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][6] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
-                eng->expert_gpu_buf[layer][eid][7] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                if (eng->use_affine_experts) {
+                    eng->expert_gpu_buf[layer][eid][0] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_GATE_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][1] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_GATE_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_GATE_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_UP_B_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][6] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][7] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][8] = (void *)[d newBufferWithBytesNoCopy:base+AFFINE_DOWN_B_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                } else {
+                    eng->expert_gpu_buf[layer][eid][0] = (void *)[d newBufferWithBytesNoCopy:base+GATE_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][1] = (void *)[d newBufferWithBytesNoCopy:base+GATE_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][2] = (void *)[d newBufferWithBytesNoCopy:base+UP_W_OFF   length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][3] = (void *)[d newBufferWithBytesNoCopy:base+UP_S_OFF   length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][4] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_W_OFF length:4194304 options:MTLResourceStorageModeShared deallocator:nil];
+                    eng->expert_gpu_buf[layer][eid][5] = (void *)[d newBufferWithBytesNoCopy:base+DOWN_S_OFF length:262144  options:MTLResourceStorageModeShared deallocator:nil];
+                }
                 n_created++;
             }
         }
@@ -585,7 +601,7 @@ int moe_infer_init_gather_mode(MoEInferEngine *eng) {
         }
         if (n_slots < N_ACTIVE) continue;
 
-        size_t pool_size = (size_t)n_slots * EXPERT_SIZE;
+        size_t pool_size = (size_t)n_slots * eng->active_expert_size;
         id<MTLBuffer> pool_buf = [d newBufferWithBytesNoCopy:pool
                                                       length:pool_size
                                                      options:MTLResourceStorageModeShared
@@ -655,7 +671,7 @@ static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer
             }
         }
         if (n_fallback > 0) {
-            io_pool_dispatch(pool, eng->packed_fd[layer], fallback_ids, n_fallback, fallback_bufs);
+            io_pool_dispatch(pool, eng->packed_fd[layer], fallback_ids, n_fallback, fallback_bufs, eng->active_expert_size);
             for (int i = 0; i < n_fallback; i++) {
                 buffers[fallback_k_map[i]] = fallback_bufs[i];
             }
@@ -663,18 +679,18 @@ static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer
         return;
     }
     // No cache: regular pread
-    io_pool_dispatch(pool, eng->packed_fd[layer], expert_ids, K, buffers);
+    io_pool_dispatch(pool, eng->packed_fd[layer], expert_ids, K, buffers, eng->active_expert_size);
 }
 
 // Dispatch K parallel preads. Blocks until all complete.
 static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
-                              uint8_t *buffers[6]) {
+                              uint8_t *buffers[6], size_t expert_sz) {
     pthread_mutex_lock(&pool->mutex);
     for (int k = 0; k < K; k++) {
         pool->fd[k] = layer_fd;
         pool->buf[k] = buffers[k];
-        pool->size = EXPERT_SIZE;
-        pool->offset[k] = (off_t)expert_ids[k] * EXPERT_SIZE;
+        pool->size = expert_sz;
+        pool->offset[k] = (off_t)expert_ids[k] * (off_t)expert_sz;
     }
     pool->num_tasks = K;
     pool->tasks_done = 0;
@@ -734,7 +750,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
-        if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx]) {
+        if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx] && !eng->use_affine_experts) {
             // === GATHER MODE: gatherQmm-equivalent ===
             // Single dispatch covering all K experts simultaneously.
             // GPU reads only selected experts' rows from the full SMELT pool.
@@ -753,13 +769,12 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             {
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
                 [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather_gate_up];
-                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_gate_W[layer_idx] offset:0 atIndex:0]; // pool
-                [enc setBuffer:eng->buf_normed offset:0 atIndex:1];                                    // x
-                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:2];                 // out [K×INT]
-                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_expert_ids offset:0 atIndex:3];          // eids
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_gate_W[layer_idx] offset:0 atIndex:0];
+                [enc setBuffer:eng->buf_normed offset:0 atIndex:1];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:2];
+                [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_expert_ids offset:0 atIndex:3];
                 uint k_val = K;
                 [enc setBytes:&k_val length:4 atIndex:4];
-                // Dispatch: (INTERMEDIATE/8, K, 1) threadgroups × 256 threads
                 [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8, K, 1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [enc endEncoding];
             }
@@ -781,35 +796,73 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             separate_mode:;
             // === SEPARATE MODE: 6 per-expert dispatches (MXFP4, gs=32) ===
             for (int k = 0; k < K; k++) {
-                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                int eid = expert_ids[k];
+                if (eid < 0 || eid >= N_EXPERTS) continue;
+                char *base = (char *)expert_bufs[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+GATE_W_OFF,4194304) offset:0 atIndex:0];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+GATE_S_OFF,262144)  offset:0 atIndex:1];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+UP_W_OFF,4194304)   offset:0 atIndex:2];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_S_OFF,262144)    offset:0 atIndex:3];
-                [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-                uint od=INTERMEDIATE,id_=DIM,gs=32;
-                [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
-                [enc setThreadgroupMemoryLength:512 atIndex:0];  // 32*4*4 bytes (2 gate+up rows)
-                uint ntg = (INTERMEDIATE + 1) / 2;
-[enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+                if (eng->use_affine_experts) {
+                    // affine v2: bf16 scale+bias, gs=64
+                    [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2_affine];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+AFFINE_GATE_W_OFF,4194304) offset:0 atIndex:0];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+AFFINE_GATE_S_OFF,262144)  offset:0 atIndex:1];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+AFFINE_GATE_B_OFF,262144)  offset:0 atIndex:2];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+AFFINE_UP_W_OFF,4194304)   offset:0 atIndex:3];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+AFFINE_UP_S_OFF,262144)    offset:0 atIndex:4];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+AFFINE_UP_B_OFF,262144)    offset:0 atIndex:5];
+                    [enc setBuffer:eng->buf_normed offset:0 atIndex:6];
+                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:7];
+                    uint od=INTERMEDIATE,id_=DIM,gs=64;
+                    [enc setBytes:&od length:4 atIndex:8]; [enc setBytes:&id_ length:4 atIndex:9]; [enc setBytes:&gs length:4 atIndex:10];
+                    [enc setThreadgroupMemoryLength:512 atIndex:0];
+                    uint ntg = (INTERMEDIATE + 1) / 2;
+                    [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+                } else {
+                    // MXFP4: u8 scale, gs=32
+                    [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+GATE_W_OFF,4194304) offset:0 atIndex:0];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+GATE_S_OFF,262144)  offset:0 atIndex:1];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+UP_W_OFF,4194304)   offset:0 atIndex:2];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_S_OFF,262144)    offset:0 atIndex:3];
+                    [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
+                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
+                    uint od=INTERMEDIATE,id_=DIM,gs=32;
+                    [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
+                    [enc setThreadgroupMemoryLength:512 atIndex:0];
+                    uint ntg = (INTERMEDIATE + 1) / 2;
+                    [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+                }
                 [enc endEncoding];
             }
             for (int k = 0; k < K; k++) {
-                char *base = (char *)expert_bufs[k]; int eid = expert_ids[k];
+                int eid = expert_ids[k];
+                if (eid < 0 || eid >= N_EXPERTS) continue;
+                char *base = (char *)expert_bufs[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                [enc setComputePipelineState:eng->pipe_dequant_matvec];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
-                [enc setBuffer:EXPERT_BUF(layer_idx,eid,7,base+DOWN_S_OFF,262144)  offset:0 atIndex:1];
-                [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
-                [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-                uint od=DIM,id_=INTERMEDIATE,gs=32;
-                [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
-                [enc setThreadgroupMemoryLength:256 atIndex:0];  // 32*2*4 bytes
-                uint d_ntg = (DIM + 1) / 2;
-                [enc dispatchThreadgroups:MTLSizeMake(d_ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+                if (eng->use_affine_experts) {
+                    // affine v2 down: bf16 scale+bias, gs=64
+                    [enc setComputePipelineState:eng->pipe_dequant_matvec_4bit_affine];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+AFFINE_DOWN_W_OFF,4194304) offset:0 atIndex:0];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,7,base+AFFINE_DOWN_S_OFF,262144)  offset:0 atIndex:1];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,8,base+AFFINE_DOWN_B_OFF,262144)  offset:0 atIndex:2];
+                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:3];
+                    [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:4];
+                    uint od=DIM,id_=INTERMEDIATE,gs=64;
+                    [enc setBytes:&od length:4 atIndex:5]; [enc setBytes:&id_ length:4 atIndex:6]; [enc setBytes:&gs length:4 atIndex:7];
+                    [enc setThreadgroupMemoryLength:256 atIndex:0];
+                    uint d_ntg = (DIM + 1) / 2;
+                    [enc dispatchThreadgroups:MTLSizeMake(d_ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+                } else {
+                    // MXFP4 down: u8 scale, gs=32
+                    [enc setComputePipelineState:eng->pipe_dequant_matvec];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
+                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+DOWN_S_OFF,262144)  offset:0 atIndex:1];
+                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
+                    [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
+                    uint od=DIM,id_=INTERMEDIATE,gs=32;
+                    [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
+                    [enc setThreadgroupMemoryLength:256 atIndex:0];
+                    [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                }
                 [enc endEncoding];
             }
         } // end if gather_mode / else separate mode
@@ -879,27 +932,26 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
 static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
                           int *out_indices, float *out_weights,
                           const uint8_t *const *cache_ptr, float smelt_penalty) {
-    // 1. sqrtsoftplus: scores[i] = sqrt(log(1 + exp(logits[i])))
+    // DSV4Gate: add e_score_correction_bias to logits BEFORE sqrtsoftplus.
+    // Bias affects both selection and routing weights. SMELT cache penalty
+    // only steers selection and does not alter final weights.
     float *scores = (float *)alloca(n * sizeof(float));
     for (int i = 0; i < n; i++) {
-        float l = logits[i];
+        float l = logits[i] + (bias ? bias[i] : 0.0f);
         float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
         scores[i] = sqrtf(sp);
     }
-    // 2. Add e_score_correction_bias for topK selection (not for weight computation)
+    // SMELT: penalize uncached experts for selection only.
     float *scores_for_choice = scores;
     float *biased = NULL;
-    if (bias != NULL || cache_ptr != NULL) {
+    if (cache_ptr != NULL) {
         biased = (float *)alloca(n * sizeof(float));
         for (int i = 0; i < n; i++) {
-            biased[i] = scores[i];
-            if (bias) biased[i] += bias[i];
-            // SMELT: penalize uncached experts to steer routing toward cached ones
-            if (cache_ptr && !cache_ptr[i]) biased[i] -= smelt_penalty;
+            biased[i] = scores[i] - (cache_ptr[i] ? 0.0f : smelt_penalty);
         }
         scores_for_choice = biased;
     }
-    // 3. topK selection by biased scores
+    // topK selection by (bias-adjusted, optionally cache-penalized) scores
     int *taken = (int *)calloc(n, sizeof(int));
     for (int k = 0; k < K; k++) {
         int best = -1; float bv = -1e30f;
@@ -907,11 +959,11 @@ static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
             if (!taken[i] && scores_for_choice[i] > bv) { bv = scores_for_choice[i]; best = i; }
         }
         out_indices[k] = best;
-        out_weights[k] = scores[best]; // gather ORIGINAL scores (not biased)
+        out_weights[k] = scores[best];
         taken[best] = 1;
     }
     free(taken);
-    // 4. L1-normalize + scale by 1.5
+    // L1-normalize + scale by route_scale (1.5)
     float wsum = 0; for (int k = 0; k < K; k++) wsum += out_weights[k];
     wsum += 1e-20f;
     for (int k = 0; k < K; k++) out_weights[k] = out_weights[k] / wsum * 1.5f;
@@ -1343,17 +1395,27 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     float expert_weights[N_ACTIVE];
     if (use_hash_routing) {
         const int64_t *row = eng->tid2eid[layer] + (size_t)eng->current_token_id * N_ACTIVE;
-        for (int k = 0; k < N_ACTIVE; k++) expert_ids[k] = (int)row[k];
-        // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.
-        float wsum = 0;
+        int hash_valid = 1;
         for (int k = 0; k < N_ACTIVE; k++) {
-            float l = scores[expert_ids[k]];
-            float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
-            expert_weights[k] = sqrtf(sp);
-            wsum += expert_weights[k];
+            expert_ids[k] = (int)row[k];
+            if (expert_ids[k] < 0 || expert_ids[k] >= N_EXPERTS) hash_valid = 0;
         }
-        wsum += 1e-20f;
-        for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+        // Weights: gather sqrtsoftplus(logits) at hash-selected positions, L1-normalize, scale.
+        // If any expert_id is invalid (token not in hash table), fall back to CPU score routing.
+        if (!hash_valid) {
+            cpu_moe_route(scores, eng->gate_bias[layer], N_EXPERTS, N_ACTIVE, expert_ids, expert_weights,
+                          NULL, 0.0f);
+        } else {
+            float wsum = 0;
+            for (int k = 0; k < N_ACTIVE; k++) {
+                float l = scores[expert_ids[k]];
+                float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
+                expert_weights[k] = sqrtf(sp);
+                wsum += expert_weights[k];
+            }
+            wsum += 1e-20f;
+            for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+        }
     } else if (use_gpu_routing) {
         // GPU routing: read results from buf_gpu_route_selected / buf_gpu_route_weights
         // (written by CMD2 Enc 7, guaranteed complete after waitUntilCompleted)
@@ -1395,12 +1457,6 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     {
         float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
         memcpy(bn, normed, DIM * sizeof(float));
-        // Truncate to bf16 in-place for GPU kernel (mxp4 for MoE expects bf16 input)
-        for (int i = 0; i < DIM; i++) {
-            uint32_t u;
-            memcpy(&u, &bn[i], 4);
-            bn[i] = (uint16_t)(u >> 16);
-        }
         IOPool *io = (IOPool *)eng->io_pool;
         const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
         double ti0=0, ti1=0, ti2=0;
@@ -1532,8 +1588,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // mHC post (FFN) — ds4 kernel_dsv4_hc_expand4: single pure-f32 dispatch.
     // Replaces 3-encoder f32→bf16 + mhc_post_bfloat + bf16→f32 with 1 encoder.
     {
-        // Write ffn_out as f32 to GPU buffer (no bf16 conversion needed)
+        // Write ffn_out and post-attention residual to GPU buffers
         memcpy([(id<MTLBuffer>)eng->buf_ffn_out_f32 contents], ffn_out, DIM * sizeof(float));
+        // IMPORTANT: Upload post-attention residual to GPU — mhc_post_ffn needs it
+        memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents], residual, MHC_MULT * DIM * sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
         id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBuffer];

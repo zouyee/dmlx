@@ -24,7 +24,7 @@ PACKED_DIR="${MODEL_PATH}/packed_experts"
 CLI="${PROJECT_DIR}/zig-out/bin/dmlx"
 PORT="${PORT:-8932}"
 MIN_TPS="${MIN_TPS:-0.30}"
-SMELT_N="${NATIVE_SMELT_N:-51}"
+SMELT_N="${NATIVE_SMELT_N:-20}"
 
 GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 
