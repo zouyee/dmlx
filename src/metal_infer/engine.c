@@ -518,21 +518,25 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
 
     // === Populate buf_cached_flags for GPU routing (moe_route_gpu Enc 7) ===
     // buf_cached_flags is per-expert (not per-layer), shared across all layers.
-    // For simplicity: a flag is set if the expert is cached in ANY score-based layer.
-    // In practice all score layers cache the same top-N experts, so this is correct.
+    // A flag is set if the expert is cached in ANY score-based layer (union across layers).
+    // This ensures penalty is only applied to experts not cached in any layer.
     // Hash layers (0-2) don't use GPU routing, so they don't consume this buffer.
     if (eng->buf_cached_flags) {
         uint8_t *flags = (uint8_t *)[(id<MTLBuffer>)eng->buf_cached_flags contents];
         memset(flags, 0, N_EXPERTS * sizeof(uint8_t));
-        // Use layer 5 (first score-based layer) as representative
-        for (int eid = 0; eid < N_EXPERTS; eid++) {
-            if (eng->expert_mem_cache[5] && eng->expert_mem_cache[5][eid]) {
-                flags[eid] = 1;
+        // Union across ALL score layers (not just layer 5) — avoids forcing routing to
+        // uncached experts in layers whose hot experts differ from layer 5.
+        for (int layer = 3; layer < N_LAYERS; layer++) {
+            if (!eng->expert_mem_cache[layer]) continue;
+            for (int eid = 0; eid < N_EXPERTS; eid++) {
+                if (eng->expert_mem_cache[layer][eid]) {
+                    flags[eid] = 1;
+                }
             }
         }
         int n_flagged = 0;
         for (int eid = 0; eid < N_EXPERTS; eid++) n_flagged += flags[eid];
-        fprintf(stderr, "[smelt] GPU routing flags: %d/%d experts marked cached\n", n_flagged, N_EXPERTS);
+        fprintf(stderr, "[smelt] GPU routing flags: %d/%d experts marked cached (union of all score layers)\n", n_flagged, N_EXPERTS);
     }
 
     return n;
@@ -1449,6 +1453,17 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         // Enc 7: GPU routing — sqrtsoftplus + SMELT penalty + bitonic top-6 + L1-normalize.
         // Dispatched when SMELT warm + score-based routing + kernel compiled.
         // Reads buf_routing_scores (Enc 6 output), writes buf_gpu_route_selected/weights.
+        // Update buf_cached_flags for THIS layer so routing penalty correctly reflects
+        // which experts are cached in the current layer's SMELT pool.
+        // Note: CPU write to a Shared MTLBuffer before commit is safe on Apple Silicon
+        // (unified memory, no explicit cache flush needed).
+        if (!use_hash_routing && eng->smelt_warmup_done && eng->buf_cached_flags &&
+            eng->expert_mem_cache[layer] && eng->smelt_penalty > 0.0f) {
+            uint8_t *flags = (uint8_t *)[(id<MTLBuffer>)eng->buf_cached_flags contents];
+            for (int eid = 0; eid < N_EXPERTS; eid++) {
+                flags[eid] = eng->expert_mem_cache[layer][eid] ? 1 : 0;
+            }
+        }
         if (!use_hash_routing && eng->smelt_warmup_done && eng->pipe_moe_route_gpu && eng->gate_proj[layer]) {
             id<MTLBuffer> bias_buf;
             if (eng->gate_bias[layer]) {
