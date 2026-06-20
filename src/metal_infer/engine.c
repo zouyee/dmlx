@@ -79,6 +79,20 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_dequant_matvec_affine_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16out"] error:&err]);
     eng->pipe_rms_norm_rows_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16out"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_bf16out"] error:&err]);
+    {
+        NSError *ev2err = nil;
+        id<MTLFunction> fv2 = [lib newFunctionWithName:@"dequant_matvec_affine_bf16in_bf16out_v2"];
+        if (fv2) {
+            id<MTLComputePipelineState> pv2 = [d newComputePipelineStateWithFunction:fv2 error:&ev2err];
+            eng->pipe_dequant_matvec_affine_bf16in_bf16out_v2 = pv2 ? (void *)pv2 : NULL;
+            if (!pv2) fprintf(stderr, "Metal: dequant_matvec_affine_bf16in_bf16out_v2 failed: %s\n",
+                              [[ev2err localizedDescription] UTF8String]);
+            else fprintf(stderr, "Metal: dequant_matvec_affine_bf16in_bf16out_v2 compiled OK\n");
+        } else {
+            fprintf(stderr, "Metal: dequant_matvec_affine_bf16in_bf16out_v2 not found\n");
+            eng->pipe_dequant_matvec_affine_bf16in_bf16out_v2 = NULL;
+        }
+    }
     eng->pipe_rms_norm_rows_bf16in_bf16out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_rows_bf16in_bf16out"] error:&err]);
     eng->pipe_rope_tail_bf16 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rope_tail_interleaved_bf16"] error:&err]);
     eng->pipe_matvec_f32_bf16in = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32_bf16in"] error:&err]);
@@ -1200,6 +1214,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.dequant_matvec_affine_bf16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16out;
     P.rms_norm_rows_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out;
     P.dequant_matvec_affine_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out;
+    P.dequant_matvec_affine_bf16in_bf16out_v2 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out_v2;
     P.rms_norm_rows_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16in_bf16out;
     P.rope_tail_interleaved_bf16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_bf16;
     P.matvec_f32_bf16in = (id<MTLComputePipelineState>)eng->pipe_matvec_f32_bf16in;

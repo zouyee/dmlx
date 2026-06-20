@@ -241,13 +241,19 @@ pub const NativeEngine = struct {
         // Decode loop — signal SMELT that prefill is done (enables decode token counting for warmup)
         metal.smeltSetDecodePhase(self.engine);
         const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
+        var _t_forward_total: u64 = 0;
+        var _t_logits_total: u64 = 0;
+        var _t_decode_n: u64 = 0;
+        const _do_decode_time = (std.c.getenv("NATIVE_DECODE_TIME") != null);
         for (0..decode_count) |_| {
             if (current_len >= tokens.len) break;
 
             var hidden: [MHC_MULT * DIM]f32 = undefined;
             metal.setTokenId(self.engine, @intCast(tokens[current_len - 1]));
             metal.embed(self.engine, @intCast(tokens[current_len - 1]), &hidden);
+            const _t0 = if (_do_decode_time) std.c.mach_absolute_time() else 0;
             try metal.forward(self.engine, hidden[0..], @intCast(start_pos));
+            const _t1 = if (_do_decode_time) std.c.mach_absolute_time() else 0;
 
             var compressed: [DIM]f32 = undefined;
             metal.hyperHeadCompress(
@@ -258,6 +264,14 @@ pub const NativeEngine = struct {
                 &compressed,
             );
             try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
+            const _t2 = if (_do_decode_time) std.c.mach_absolute_time() else 0;
+            if (_do_decode_time) {
+                // mach_absolute_time is in CPU ticks; on M4 Pro ~125MHz TB freq → 8ns/tick
+                // Approximate: ticks * 125 / 3_000_000 ≈ ms (same as Metal timestamps)
+                _t_forward_total += _t1 - _t0;
+                _t_logits_total += _t2 - _t1;
+                _t_decode_n += 1;
+            }
 
             const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
             tokens[current_len] = next_token;
@@ -268,6 +282,14 @@ pub const NativeEngine = struct {
                 std.log.info("native_engine: EOS token generated, stopping at pos={d}", .{start_pos});
                 break;
             }
+        }
+
+        if (_do_decode_time and _t_decode_n > 0) {
+            const fwd_ms = @as(u64, @intFromFloat(@as(f64, @floatFromInt(_t_forward_total)) * 125.0 / 3_000_000.0 / @as(f64, @floatFromInt(_t_decode_n))));
+            const log_ms = @as(u64, @intFromFloat(@as(f64, @floatFromInt(_t_logits_total)) * 125.0 / 3_000_000.0 / @as(f64, @floatFromInt(_t_decode_n))));
+            std.log.info("[DECODE_TIME] n={d} forward={d}ms logits={d}ms per_tok={d}ms", .{
+                _t_decode_n, fwd_ms, log_ms, fwd_ms + log_ms,
+            });
         }
 
         // Return only generated tokens (skip effective prompt), and drop trailing EOS.

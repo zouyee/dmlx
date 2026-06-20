@@ -1249,6 +1249,106 @@ kernel void dequant_matvec_affine_bf16in_bf16out(
     out[tid] = (bfloat)acc;
 }
 
+// dequant_matvec_affine_bf16in_bf16out_v2: SIMD-parallel affine 4-bit matmul, bfloat in/out.
+// Optimized for MLA attention weights (wq_a, wq_b, wkv, wo_b):
+//   - wq_b [32768, 1024] gs=64: 16MB weight — biggest attention bottleneck
+//   - Same coalesced pattern as dequant_matvec_affine_v2, adapted for bf16 I/O
+// Strategy: NR0=2 rows/TG, NSG=4 SIMD groups, 32 threads each (128 threads/TG).
+//   8 threads per group: 4 threads for TPG_x sub-groups × 8 packed_per_group reads.
+//   Adjacent threads read adjacent W words (coalesced) + adjacent x elements.
+//   simd_sum reduction via threadgroup memory (256B).
+// Dispatch: MTLSizeMake((out_dim+1)/2, 1, 1) TGs × MTLSizeMake(32,4,1) threads.
+kernel void dequant_matvec_affine_bf16in_bf16out_v2(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const float*    scales     [[buffer(1)]],
+    device const float*    biases     [[buffer(2)]],
+    device const bfloat*   x          [[buffer(3)]],  // bfloat input
+    device bfloat*         out        [[buffer(4)]],  // bfloat output
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    threadgroup float*     shmem      [[threadgroup(0)]],
+    uint3  tgpig  [[threadgroup_position_in_grid]],
+    ushort tiisg  [[thread_index_in_simdgroup]],
+    ushort sgitg  [[simdgroup_index_in_threadgroup]]
+) {
+    const short NR0 = 2, NSG = 4, NW = 32, NQ = 4, TPG = 8;
+
+    const uint num_groups     = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;
+    const uint packed_cols    = in_dim / 8;
+
+    const int row0  = (int)tgpig.x * NR0;
+    const short ix  = tiisg / TPG;
+    const short il  = tiisg % TPG;
+    const int g0    = (int)sgitg * NQ + (int)ix;
+
+    device const uint32_t *wr[NR0];
+    device const float    *sr[NR0];
+    device const float    *br[NR0];
+    for (short row = 0; row < NR0; row++) {
+        int r = row0 + row;
+        if (r < (int)out_dim) {
+            wr[row] = W_packed + r * packed_cols;
+            sr[row] = scales   + r * num_groups;
+            br[row] = biases   + r * num_groups;
+        }
+    }
+
+    float sumf[NR0] = { 0.0f };
+
+    for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
+        uint xb = (uint)gg * group_size + (uint)il * 8;
+        // Load 8 bfloat x values and convert to f32
+        float xv0 = float(x[xb+0]), xv1 = float(x[xb+1]);
+        float xv2 = float(x[xb+2]), xv3 = float(x[xb+3]);
+        float xv4 = float(x[xb+4]), xv5 = float(x[xb+5]);
+        float xv6 = float(x[xb+6]), xv7 = float(x[xb+7]);
+
+        for (short row = 0; row < NR0; row++) {
+            int r = row0 + row;
+            if (r >= (int)out_dim) continue;
+            float scale = sr[row][gg], bias = br[row][gg];
+            float sx0 = scale*xv0, bx0 = bias*xv0;
+            float sx1 = scale*xv1, bx1 = bias*xv1;
+            float sx2 = scale*xv2, bx2 = bias*xv2;
+            float sx3 = scale*xv3, bx3 = bias*xv3;
+            float sx4 = scale*xv4, bx4 = bias*xv4;
+            float sx5 = scale*xv5, bx5 = bias*xv5;
+            float sx6 = scale*xv6, bx6 = bias*xv6;
+            float sx7 = scale*xv7, bx7 = bias*xv7;
+            uint32_t pw = wr[row][gg * packed_per_group + (uint)il];
+            sumf[row] += fma(float((pw>> 0)&0xF), sx0, bx0);
+            sumf[row] += fma(float((pw>> 4)&0xF), sx1, bx1);
+            sumf[row] += fma(float((pw>> 8)&0xF), sx2, bx2);
+            sumf[row] += fma(float((pw>>12)&0xF), sx3, bx3);
+            sumf[row] += fma(float((pw>>16)&0xF), sx4, bx4);
+            sumf[row] += fma(float((pw>>20)&0xF), sx5, bx5);
+            sumf[row] += fma(float((pw>>24)&0xF), sx6, bx6);
+            sumf[row] += fma(float((pw>>28)&0xF), sx7, bx7);
+        }
+    }
+
+    // Reduce across SIMD groups via threadgroup memory
+    threadgroup float *sf[NR0];
+    for (short row = 0; row < NR0; row++) {
+        sf[row] = shmem + NW * row;
+        if (sgitg == 0) sf[row][tiisg] = 0.0f;
+        sumf[row] = simd_sum(sumf[row]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        if (tiisg == 0) sf[row][sgitg] = sumf[row];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (short row = 0; row < NR0; row++) {
+        const int d = row0 + row;
+        if (d >= (int)out_dim) continue;
+        float tot = simd_sum(sf[row][tiisg]);
+        if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
+    }
+}
+
 // rms_norm_rows_bf16in_bf16out: RMSNorm with bfloat input AND bfloat output.
 // Used for q_norm and per-head norm in the full bf16 attention chain.
 kernel void rms_norm_rows_bf16in_bf16out(

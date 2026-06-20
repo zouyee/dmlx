@@ -185,6 +185,10 @@ static void enc_dq_bf16_cached(MlaPipes *P, id<MTLCommandBuffer> cb,
                                int out_dim, int in_dim, int group_size,
                                id<MTLBuffer> x, id<MTLBuffer> out,
                                id<MTLComputePipelineState> pipe) {
+    // NOTE: v2 (SIMD-parallel) dispatch was tried for attention matmuls but regresses
+    // performance due to high TG-scheduling overhead (e.g. wq_b needs 16384 TGs vs 128
+    // for naive). Apple GPU L2 cache (32-64MB) absorbs non-coalesced reads for these
+    // relatively small matrices. Always use naive 1-thread-per-row dispatch here.
     id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
     [e setComputePipelineState:pipe];
     [e setBuffer:bw offset:0 atIndex:0];

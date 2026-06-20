@@ -257,6 +257,7 @@ typedef struct {
     void *pipe_dequant_matvec_affine_bf16out;
     void *pipe_rms_norm_rows_bf16out;
     void *pipe_dequant_matvec_affine_bf16in_bf16out;
+    void *pipe_dequant_matvec_affine_bf16in_bf16out_v2;  // SIMD-parallel v2
     void *pipe_rms_norm_rows_bf16in_bf16out;
     void *pipe_rope_tail_bf16;
     void *pipe_matvec_f32_bf16in;

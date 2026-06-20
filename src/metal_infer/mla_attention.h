@@ -29,6 +29,7 @@ typedef struct {
     id<MTLComputePipelineState> dequant_matvec_affine_bf16out;
     id<MTLComputePipelineState> rms_norm_rows_bf16out;
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_bf16out;
+    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_bf16out_v2;  // SIMD-parallel
     id<MTLComputePipelineState> rms_norm_rows_bf16in_bf16out;
     id<MTLComputePipelineState> rope_tail_interleaved_bf16;
     id<MTLComputePipelineState> matvec_f32_bf16in;
