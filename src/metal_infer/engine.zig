@@ -90,6 +90,7 @@ extern fn moe_infer_init_gather_mode(engine: *Engine) c_int;
 extern fn moe_infer_smelt_save_stats(engine: *Engine, path: [*c]const u8) void;
 extern fn moe_infer_smelt_load_stats(engine: *Engine, path: [*c]const u8) c_int;
 extern fn moe_infer_smelt_set_penalty(engine: *Engine, penalty: f32) void;
+extern fn moe_infer_smelt_set_stats_path(engine: *Engine, path: [*c]const u8) void;
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
@@ -125,6 +126,10 @@ pub fn smeltLoadStats(engine: *Engine, path: [*c]const u8) i32 {
 
 pub fn smeltSetPenalty(engine: *Engine, penalty: f32) void {
     moe_infer_smelt_set_penalty(engine, penalty);
+}
+
+pub fn smeltSetStatsPath(engine: *Engine, path: [*c]const u8) void {
+    moe_infer_smelt_set_stats_path(engine, path);
 }
 
 pub fn initGatherMode(engine: *Engine) i32 {

@@ -650,8 +650,11 @@ void moe_infer_smelt_set_penalty(MoEInferEngine *eng, float penalty) {
     if (!eng) return;
     eng->smelt_penalty = penalty;
     fprintf(stderr, "[smelt] routing bias penalty updated to %.0f\n", penalty);
-    // Also update GPU cached_flags buffer for GPU routing kernel
-    // (buf_cached_flags is already set, penalty is passed directly to GPU routing kernel)
+}
+
+void moe_infer_smelt_set_stats_path(MoEInferEngine *eng, const char *path) {
+    if (!eng) return;
+    eng->smelt_stats_path = path;  // caller owns the string
 }
 
 // ============================================================================
@@ -1563,6 +1566,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             if (eid >= 0 && eid < N_EXPERTS) {
                 eng->routing_counts[layer][eid]++;
             }
+        }
+        // Periodic stats auto-save: every 50 decode tokens on the last score layer.
+        // Protects against stats loss on OOM kill (SIGKILL bypasses graceful shutdown).
+        if (layer == N_LAYERS - 1 && eng->smelt_tokens_seen > 0 &&
+            (eng->smelt_tokens_seen % 50) == 0 && eng->smelt_stats_path) {
+            moe_infer_smelt_save_stats(eng, eng->smelt_stats_path);
         }
     }
     if (layer == 0 && getenv("MF_DBG")) {

@@ -42,7 +42,7 @@ fi
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 PACKED_DIR="${MODEL_PATH}/packed_experts"
-NATIVE_SMELT_N="${NATIVE_SMELT_N:-40}"
+NATIVE_SMELT_N="${NATIVE_SMELT_N:-20}"
 
 # MLX-mode legacy params
 SMELT_EXPERTS="${2:-0.20}"

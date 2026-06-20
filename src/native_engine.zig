@@ -109,23 +109,21 @@ pub const NativeEngine = struct {
             // Load routing stats from previous runs so smelt_finish_warmup
             // selects the ACTUAL hot experts rather than experts 0..N-1 by ID.
             // MLX-aligned approach: two phases are automatic, no manual pre-warmup needed.
-            // - Phase 1 (no stats file): penalty=0, unbiased routing → discovers true hot experts
-            //   → routing_counts accumulate → saved at shutdown
-            // - Phase 2 (stats loaded): true hot experts in cache, penalty=1e3 steers routing
-            //   toward them → I/O ≈ 0 → performance on par with MLX
-            // LFU eviction also helps: miss experts gradually replace wrong initial experts.
+            // - Phase 1 (no stats, default N=20): penalty=0, unbiased routing → discovers hot experts
+            // - Phase 2 (stats loaded): penalty=1e3 steers routing to hot experts → I/O ≈ 0
             metal.smeltInit(engine, 0, smelt_n, 0.0);
             // Load stats AFTER smeltInit (smeltInit zeros routing_counts, so load must come after)
             const stats_loaded = metal.smeltLoadStats(engine, stats_path_buf[0 .. stats_path_buf.len - 1 :0].ptr);
             if (stats_loaded != 0) {
                 // Stats available: true hot experts loaded → enable routing bias (MLX alignment)
-                // Use smeltSetPenalty (NOT smeltInit) to avoid zeroing routing_counts again.
                 metal.smeltSetPenalty(engine, 1e3);
                 std.log.info("native_engine: Phase 2 — routing bias=1e3 (hot experts loaded, I/O→0)", .{});
             } else {
-                std.log.info("native_engine: Phase 1 — no stats, collecting routing history (penalty=0)", .{});
+                std.log.info("native_engine: Phase 1 — collecting routing stats (penalty=0, N={d})", .{smelt_n});
             }
             const n_loaded = metal.smeltFinishWarmup(engine);
+            // Register stats path for periodic auto-save (protects against OOM kill)
+            metal.smeltSetStatsPath(engine, stats_path_buf[0 .. stats_path_buf.len - 1 :0].ptr);
             if (n_loaded > 0) {
                 std.log.info("native_engine: SMELT ready — {d} experts/layer in RAM (routing-stats based)", .{n_loaded});
                 const gather_env = std.c.getenv("NATIVE_GATHER");

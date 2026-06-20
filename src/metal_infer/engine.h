@@ -401,6 +401,7 @@ typedef struct {
     bool smelt_warmup_done;       // true once warmup is complete and cache is populated
     bool smelt_enabled;           // true if SMELT is active
     bool smelt_in_decode_phase;   // true after prefill completes (set by moe_infer_set_decode_phase)
+    const char *smelt_stats_path; // path to routing stats file (for periodic auto-save on OOM protection)
     float smelt_penalty;          // routing score penalty for uncached experts (default -1e9)
 
     // Deferred CMD3
@@ -515,6 +516,7 @@ void moe_infer_smelt_init(MoEInferEngine *engine, int warmup_tokens, int n_per_l
 void moe_infer_smelt_save_stats(MoEInferEngine *engine, const char *path);
 int  moe_infer_smelt_load_stats(MoEInferEngine *engine, const char *path);
 void moe_infer_smelt_set_penalty(MoEInferEngine *engine, float penalty);
+void moe_infer_smelt_set_stats_path(MoEInferEngine *engine, const char *path);
 
 // Signal that prefill is complete and decode phase begins.
 // SMELT token counting (for warmup) only runs after this is called, ensuring
