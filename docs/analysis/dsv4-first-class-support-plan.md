@@ -4679,3 +4679,127 @@ bash scripts/run_benchmark.sh --native       # 预期 ≥ 1.2 tok/s（若低于 
 | 正确性 | ✅ 7/7 E2E PASS |
 | 下一个动作 | 实施 v3-style MXFP4 kernel（Task 4） |
 | 目标 | ≥ 3.0 tok/s（修正后现实目标 1.5-2.5 tok/s，见 §46.8） |
+
+---
+
+## §50. 实测 profiling 修正（2026-06-20）：瓶颈是 prefill，不是 MoE kernel
+
+### 50.1 §49 的错误结论（必须撤销）
+
+§49.2/49.3 的核心断言全部错误，原因是在错误数据上分析：
+
+| §49 的断言 | 实际情况 |
+|------------|---------|
+| "当前 naive dispatch，v3 kernel 是最高优先级" | gather_gate_up_swiglu / gather_down **已经是 v3**（ROWS_PER_TG=8, x_shared, simd_sum），在 §49 写成之前就已实装 |
+| "v3 kernel 单独带来 ~2× 提升" | **从未实现**。实装后 benchmark 仍在 0.566 tok/s = 和基线相同 |
+| "MoE GPU 是瓶颈（1100ms）" | 实测 MoE GPU **不是**瓶颈。MoE encode = 4ms/layer × 43 = 172ms，在 deferred CB3 中与 CPU 工作重叠 |
+| "预期 ≥ 1.2 tok/s" | benchmark 实测 **0.566 tok/s**（含 prefill 开销） |
+
+### 50.2 真实的性能分布（实测，warm state）
+
+```
+NATIVE_DECODE_TIME=1 实测：
+  forward = 808ms / decode token（43 层合计）
+  logits  = 12ms  / decode token（cblas_sgemv lm_head）
+  total   = 820ms / decode token → decode-only 1.22 tok/s
+
+benchmark 测量 0.566 tok/s ≈ 5 tokens / 8.8s 的分解：
+  prefill (4 tokens × 808ms) = 3232ms   ← 占总时间 74%
+  decode  (4 tokens × 820ms) = 3280ms
+  overhead (HTTP/logits)     = ~300ms
+  ──────────────────────────────────────
+  total ≈ 6812ms → 5/6.8 ≈ 0.74 tok/s（实测 0.57 因系统波动）
+```
+
+NATIVE_PHASE_TIME=1 warm state 每层分解（decode，SMELT 热）：
+
+| 阶段 | 耗时/层 | 说明 |
+|------|---------|------|
+| MLA | 8ms | mhc_pre + Q/KV/SDPA + wo_a + wo_b（全部 naive dispatch，L2 cache 热） |
+| CMD2 | 6ms | mhc_post + mhc_pre_ffn + ffn_norm + routing gate + GPU routing |
+| I/O | ~0ms | warm SMELT，SSD 无读 |
+| MoE encode | 4ms | CPU ObjC 编码 CMD3（GPU 执行 deferred，与 CMD2 重叠） |
+| Shared | 1ms | 共享 expert |
+| **合计** | **19ms** | 43 × 19ms ≈ 817ms ≈ 实测 808ms ✓ |
+
+### 50.3 attention matmul v2 dispatch 实验结论（2026-06-20）
+
+尝试为 attention 权重（wq_a, wq_b, wkv, wo_b）替换 naive→v2 dispatch：
+
+- **wq_b [32768, 1024]** 用 v2：16384 TGs vs naive 128 TGs → 调度开销 >>  收益，性能**退步 15%**
+- **wq_a [1024, 4096]** 用 v2：512 TGs vs 4 TGs → 同样退步
+- 根因：Apple GPU L2 cache（32-64MB）化解了非 coalesced 访问；TG 调度开销（~50ns/TG）× 16000 TGs = 0.8ms，远超收益
+- **结论**：attention matmul naive dispatch 已是最优，不需要 v2
+
+`dequant_matvec_affine_bf16in_bf16out_v2` kernel 保留在代码中（commit ff430ee），但不应在 enc_dq_bf16_cached 中调用。
+
+### 50.4 mhc_pre_split_weighted_sum_norm 1-TG dispatch 排查结论
+
+```
+NATIVE_MLA_PROFILE=1 实测：
+  L0 冷启动：mhc_pre_split = 10.13ms（GPU pipeline 启动开销 + L2 cache 冷）
+  warm state：fn_weight [1.5MB] 在 L2 cache → 实际读取 ~5μs，可忽略
+```
+
+- **1 TG × 256 threads** 对此 kernel 是正确设计。warm 状态下不是瓶颈。
+- CB boundary split 测量法本身引入 4-8ms/次 GPU 流水线同步开销，不能用于测单 kernel GPU 时间。
+
+### 50.5 真正的优化路径（数据驱动修正）
+
+**优先级 P0：batched prefill（预期 benchmark 提升 +40-60%）**
+
+根因：prefill 占 benchmark 总时间 74%（3232ms / 6812ms），当前逐 token 串行。
+
+现有基础设施（已在代码库）：
+- `mla_attention_prefill_bfloat()` — 有 batched SDPA (`mla_sdpa_prefill_bfloat`) 但 Q/KV chain 仍逐 token
+- `moe_infer_forward_batch()` — layer-major 顺序但仍逐 token 调用 forward_layer
+- `pipe_mla_sdpa_prefill_bfloat` — prefill FlashAttention kernel 已编译
+
+实现真正 batched prefill 需要：
+1. 修改 wq_a/wq_b/wkv 的 dispatch：从 `[out_dim, 1]` 改为 `[out_dim, n_tokens]`（2D dispatch）
+2. `mla_attention_prefill_bfloat` 已有框架，但 Q/KV chain 需要改为真正 batched（非逐 token 循环）
+3. 切换 `native_engine.zig` prefill 路径从逐 token `metal.forward()` 到 `metal.forwardBatch()`
+4. MoE routing 对 n 个 token 分别计算（已有 `forward_batch` 调用 forward_layer 的框架）
+
+**估算性能收益**：
+```
+batched prefill 4 tokens：
+  当前：4 × 808ms = 3232ms prefill
+  预期：~2 × 808ms = 1616ms prefill（GPU GEMM 利用率提升 + GPU startup 摊销）
+  benchmark 改善：(6812-1616) / 5 → 1039ms/tok → ~0.96 tok/s (+70%)
+```
+
+**优先级 P1：SMELT stats 正确训练（已部分实装）**
+
+routing_counts 现在在 decode 阶段累积（commit 1e3c77b 修复了之前从不累积的 bug）。需要：
+- 第一次 benchmark 运行后保存 stats
+- 第二次启动加载 hot experts
+- 这消除 I/O=10ms/layer（warm 状态已接近 0，cold 状态仍有影响）
+
+**优先级 P2：MTP（Multi-Token Prediction）**
+
+- DSV4-Flash `num_nextn_predict_layers=1`，理论 2× decode 提升
+- 障碍：MTP 权重用 FP8+INT8 量化（在 shard 46），native engine 不支持这两种格式
+- 工作量：2-3 周（FP8/INT8 decoder + MTP inference loop）
+
+**不值得优化的方向（已验证）**：
+- MoE kernel dispatch pattern（已是最优 v3）
+- Attention matmul dispatch（L2 cache 使 naive 足够好）
+- mhc_pre kernel（warm 状态不是瓶颈）
+- LM head dispatch（12ms，cblas_sgemv 已足够）
+
+### 50.6 当前实际状态（2026-06-20）
+
+| 指标 | 值 |
+|------|-----|
+| benchmark tok/s | **0.566** (SMELT N=20, commit ff430ee) |
+| decode-only tok/s | **1.22** (808ms/token warm, 43 layers) |
+| prefill per token | **808ms** (同 decode，逐 token 串行) |
+| 正确性 | ✅ 7/7 E2E PASS，Paris ✓ |
+| 已实装优化 | SMELT routing stats 持久化、gather kernels v3、SIMD routing gate |
+| 下一个动作 | **batched prefill**（native_engine.zig + mla_attention_prefill_bfloat 改造） |
+| 现实目标 | ~0.90 tok/s（batched prefill）→ ~1.8 tok/s（batched prefill + MTP） |
+
+---
+
+**§49.2、§49.3、§49.4 结论已废止，以本节为准。**

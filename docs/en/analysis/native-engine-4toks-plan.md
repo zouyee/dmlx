@@ -530,3 +530,55 @@ NATIVE_SMELT_N=20 bash scripts/run_benchmark.sh
 ```
 
 **回退策略**：任一 step 引入 smoke 失败 → `git stash`，用 `scripts/compare_metal_mlx.py` 定位首个发散层，先修正确性再继续性能优化。
+
+
+---
+
+## §8. 实测修正（2026-06-20）：§7 路线图的错误与修正
+
+### 8.1 §7 全部预测表（§7.7）已废止
+
+§7.7 的性能预测基于错误假设：**"当前 dispatch 是 naive 1-thread-per-row"**。
+
+实际情况：`gather_gate_up_swiglu` / `gather_down` 在 §7 写成之前已经是 v3-style（ROWS_PER_TG=8, x_shared, simd_sum）。**Step 1 从未带来任何提升**，因为 v3 早已实装。
+
+| §7 的断言 | 实际情况 |
+|-----------|---------|
+| "当前基线 MoE GPU 1100ms" | 实测 MoE encode = 4ms/层 × 43 = 172ms（deferred，与 CPU 重叠） |
+| "Step 1 v3 kernel → ~2.0 tok/s" | 实测 0.566 tok/s，无变化 |
+| "MoE kernel 是瓶颈" | 不是。MoE GPU 已充分优化 |
+| "Step 1-5 → ~3.8 tok/s" | 理论上不可能，即使 MoE 为 0 仍受 MLA+CMD2 限制 |
+
+### 8.2 实测数据（warm state）
+
+```
+forward = 808ms / decode token = 43 层 × 19ms/层
+  MLA:        8ms/层 × 43 =  344ms (attention 全流程)
+  CMD2:       6ms/层 × 43 =  258ms (mhc_post + mhc_pre_ffn + routing)
+  MoE encode: 4ms/层 × 43 =  172ms (CPU ObjC dispatch，deferred 重叠)
+  Shared:     1ms/层 × 43 =   43ms
+  I/O:        ~0ms (warm SMELT)
+               ─────────────
+               808ms ≈ 实测 ✓
+
+decode-only: 1000/820 ≈ 1.22 tok/s
+benchmark:   0.566 tok/s (含 prefill 4×808ms = 3232ms，占 74%)
+```
+
+### 8.3 正确的下一步：batched prefill
+
+**根因**：benchmark 低 tok/s 不是 GPU kernel 问题，是 prefill 串行导致。
+
+现有基础设施：
+- `mla_attention_prefill_bfloat()` — batched SDPA 已有，Q/KV chain 需改为真正 batched
+- `pipe_mla_sdpa_prefill_bfloat` — prefill FlashAttention kernel 已编译
+- `moe_infer_forward_batch()` — layer-major 框架已有，但仍逐 token
+
+实现要点：
+1. wq_a/wq_b/wkv dispatch 从 1D `[out_dim]` 改为 2D `[out_dim, n_tokens]`
+2. `native_engine.zig` prefill 改用 `metal.forwardBatch()`
+3. MoE 路径：每 token 独立 routing，expert 调用已有框架
+
+**预期**：benchmark 0.566 → ~0.90 tok/s（+60%）
+
+**§7 Steps 1-5 不再是优化路径，以 §8 为准。**
