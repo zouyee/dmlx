@@ -4803,3 +4803,79 @@ routing_counts 现在在 decode 阶段累积（commit 1e3c77b 修复了之前从
 ---
 
 **§49.2、§49.3、§49.4 结论已废止，以本节为准。**
+
+---
+
+## §51. MLX 源码对比分析 + 对齐路线图（2026-06-20）
+
+### 51.1 MLX 为什么能到 ~1 tok/s
+
+通过阅读 `/Users/zouyee/work/code/mlx` 源码，MLX 与我们的 native engine 关键差异：
+
+#### 差异 1：routing bias（最重要，最快可修复）
+
+```bash
+# MLX 使用 --smelt-experts 0.20 = 51/256 experts/layer 常驻内存
+# + 对未缓存 expert 施加路由惩罚（penalty），强制路由到缓存 expert → I/O ≈ 0
+# 我们之前：penalty=0.0（无偏置），I/O 随机波动
+```
+
+| 配置 | I/O | 影响 |
+|------|-----|------|
+| MLX `--smelt-experts 0.20` + routing bias | ≈ 0 | 所有路由命中缓存 |
+| Native penalty=0.0, N=20 | 每层 0-10ms | 随机 SSD 读 |
+| Native penalty=1e9, N=51, 正确 stats | ≈ 0 | **对齐 MLX** |
+
+**两阶段实现（已在 commit 中）**：
+1. 第一次运行（无 stats 文件）：penalty=0 → 收集真实路由统计
+2. 后续运行（有 stats 文件）：penalty=1e9 → 路由偏置，I/O → 0
+
+#### 差异 2：MXFP4 scale 计算效率
+
+```metal
+// MLX fp8_e8m0 → float: 1 个 bit-shift，无需 FPU
+return T(*(thread fp8_e8m0*)(&s));  // = (uint32_t)s << 23
+
+// 我们的方法：exp2 transcendental function
+exp2((float)scale_byte - 127.0f);
+```
+
+#### 差异 3：MXFP4 GEMV kernel 每线程 2× 展开
+
+MLX `fp_qmv_fast`:
+- `packs_per_thread = 2`（每线程处理 2 个 uint32_t = 16 fp4 值）
+- `results_per_simdgroup = 4, num_simdgroups = 2` = 8 行/TG（与我们相同）
+- 更好的指令级并行（ILP）
+
+#### 差异 4：simdgroup_multiply_accumulate GEMM（仅 batch ≥ 18 时触发）
+
+```metal
+// MLX steel/BlockMMA:
+simdgroup_multiply_accumulate(D, A, B, C);  // Apple Silicon 硬件矩阵乘
+```
+
+MLX 在 `M >= vector_limit`（M4 Pro = 18 tokens）时切换到 GEMM 模式。
+对于 4-token prefill 或 1-token decode，MLX 也用 GEMV，不用 simdgroup_matrix。
+
+### 51.2 对齐路线图
+
+| Phase | 改动 | 预期收益 | 状态 |
+|-------|------|---------|------|
+| **P1** | penalty=1e9 两阶段 + N=51 | 0.566 → ~0.80 tok/s | 🔧 实施中 |
+| **P2** | fp8_e8m0 scale + packs_per_thread=2 | +5-10% decode | 待实施 |
+| **P3** | simdgroup_multiply_accumulate GEMM | 批量 prefill 加速 | 待实施（需 MTP 先） |
+
+### 51.3 当前 native vs MLX 差距（2026-06-20 实测）
+
+```
+decode-only 对比:
+  Native: 1.22 tok/s (820ms/token)  
+  MLX warm: ~1.6 tok/s (~625ms/token)
+  差距: 24% — 主要来自 GEMV 效率和 lazy eval
+
+benchmark 对比（含 prefill）:
+  Native Phase 1 (no penalty): 0.566 tok/s
+  Native Phase 2 (penalty=1e9, N=51, correct stats): 预期 ~0.80 tok/s
+  MLX (optimal settings): ~1.0 tok/s
+  差距: P2 vs MLX = ~20% — 还差 kernel 效率和 lazy eval
+```

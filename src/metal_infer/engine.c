@@ -646,6 +646,14 @@ int moe_infer_smelt_load_stats(MoEInferEngine *eng, const char *path) {
     return 1;
 }
 
+void moe_infer_smelt_set_penalty(MoEInferEngine *eng, float penalty) {
+    if (!eng) return;
+    eng->smelt_penalty = penalty;
+    fprintf(stderr, "[smelt] routing bias penalty updated to %.0f\n", penalty);
+    // Also update GPU cached_flags buffer for GPU routing kernel
+    // (buf_cached_flags is already set, penalty is passed directly to GPU routing kernel)
+}
+
 // ============================================================================
 // Gather mode: create per-layer full-expert buffers for gatherQmm
 // ============================================================================
@@ -751,15 +759,13 @@ static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer
             if (eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid]) {
                 buffers[k] = eng->expert_mem_cache[layer][eid];
             } else {
-                // This expert not in cache — must pread into expert_buf[k]
-                // We need a writable buffer; reset to the pre-allocated ones
                 buffers[k] = eng->expert_buf[k];  // fallback to pread buffer
             }
         }
         // For uncached experts, do selective pread
         uint8_t *fallback_bufs[6];
         int fallback_ids[6];
-        int fallback_k_map[6];  // maps fallback_idx → original k
+        int fallback_k_map[6];
         int n_fallback = 0;
         for (int k = 0; k < K; k++) {
             int eid = expert_ids[k];

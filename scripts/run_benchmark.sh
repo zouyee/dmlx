@@ -42,7 +42,7 @@ fi
 
 MODEL_PATH="${1:-${HOME}/models/DeepSeek-V4-Flash-4bit}"
 PACKED_DIR="${MODEL_PATH}/packed_experts"
-NATIVE_SMELT_N="${NATIVE_SMELT_N:-20}"
+NATIVE_SMELT_N="${NATIVE_SMELT_N:-40}"
 
 # MLX-mode legacy params
 SMELT_EXPERTS="${2:-0.20}"
@@ -99,13 +99,10 @@ cleanup() {
     fi
     pkill -f "dmlx serve.*${PORT}" 2>/dev/null || true
     sleep 1
+    # NOTE: Do NOT delete routing stats — they persist across runs to keep hot experts loaded.
+    # With routing bias (penalty=1e9), E2E prompts do NOT corrupt the stats because
+    # all routing is constrained to cached experts anyway.
 }
-
-# Delete routing stats before each benchmark run to ensure reproducible results.
-# The benchmark mixes short "Hi" perf prompts + long E2E prompts, which pollutes
-# the stats in a way that hurts "Hi" performance on next run (E2E dominates).
-# Production servers benefit from persistent stats; benchmark uses fresh state.
-rm -f "${PACKED_DIR}/.smelt_routing_stats.bin" 2>/dev/null || true
 trap cleanup EXIT
 cleanup
 

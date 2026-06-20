@@ -514,6 +514,7 @@ void moe_infer_smelt_init(MoEInferEngine *engine, int warmup_tokens, int n_per_l
 // Call load BEFORE smelt_init so smelt_finish_warmup uses the correct expert order.
 void moe_infer_smelt_save_stats(MoEInferEngine *engine, const char *path);
 int  moe_infer_smelt_load_stats(MoEInferEngine *engine, const char *path);
+void moe_infer_smelt_set_penalty(MoEInferEngine *engine, float penalty);
 
 // Signal that prefill is complete and decode phase begins.
 // SMELT token counting (for warmup) only runs after this is called, ensuring
