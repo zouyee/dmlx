@@ -1559,19 +1559,12 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                       smelt_cache, eng->smelt_penalty);
     }
     // SMELT: always accumulate routing statistics for score-based layers during decode.
-    // This ensures stats remain current for the next startup (loaded via smelt_load_stats).
     if (eng->smelt_enabled && eng->smelt_in_decode_phase && !use_hash_routing) {
         for (int k = 0; k < N_ACTIVE; k++) {
             int eid = expert_ids[k];
             if (eid >= 0 && eid < N_EXPERTS) {
                 eng->routing_counts[layer][eid]++;
             }
-        }
-        // Periodic stats auto-save: every 50 decode tokens on the last score layer.
-        // Protects against stats loss on OOM kill (SIGKILL bypasses graceful shutdown).
-        if (layer == N_LAYERS - 1 && eng->smelt_tokens_seen > 0 &&
-            (eng->smelt_tokens_seen % 50) == 0 && eng->smelt_stats_path) {
-            moe_infer_smelt_save_stats(eng, eng->smelt_stats_path);
         }
     }
     if (layer == 0 && getenv("MF_DBG")) {
