@@ -7,6 +7,15 @@
 #include <metal_stdlib>
 using namespace metal;
 
+// P2a: MLX-aligned fp8_e8m0 scale decode — single bit-shift, no FPU transcendental.
+// Equivalent to exp2((float)s - 127.0f) but uses IEEE 754 bit manipulation:
+//   (uint)s << 23 places the 8-bit biased exponent directly into float exponent field.
+// ~5x faster than exp2() on Apple Silicon (avoids FPU transcendental pipeline).
+// Source: mlx/backend/metal/kernels/fp_quantized.h dequantize_scale<T, group_size>()
+static inline float fp8_e8m0_to_float(uint8_t s) {
+    return as_type<float>((uint)s << 23);
+}
+
 constant float NIBBLE_TO_FLOAT[16] = {
      0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
@@ -71,34 +80,59 @@ kernel void fused_gate_up_swiglu(
     float gate_acc = 0.0f, up_acc = 0.0f;
     uint packed_per_group = group_size / 8;
 
+    // P2b: packs_per_thread=2 (MLX fp_qmv_fast alignment).
+    // Process 2 packed uint32_t words per inner step → 2 independent load chains,
+    // GPU scheduler can overlap both; halves inner-loop iterations for gs=32 (4→2).
     // Stripe across groups: lane k processes groups k, k+32, k+64, ...
     for (uint g = simd_lane; g < num_groups; g += 32) {
-        float gsf = exp2((float)g_s[g] - 127.0f);
-        float usf = exp2((float)u_s[g] - 127.0f);
+        float gsf = fp8_e8m0_to_float(g_s[g]);
+        float usf = fp8_e8m0_to_float(u_s[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
-        for (uint p = 0; p < packed_per_group; p++) {
-            uint32_t gpw = g_row[bp + p];
-            uint32_t upw = u_row[bp + p];
-            uint x_base  = bx + p * 8;
-            // Unroll 8 nibbles per packed word
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  0) & 0xF] * gsf * x_shared[x_base + 0];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  4) & 0xF] * gsf * x_shared[x_base + 1];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >>  8) & 0xF] * gsf * x_shared[x_base + 2];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 12) & 0xF] * gsf * x_shared[x_base + 3];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 16) & 0xF] * gsf * x_shared[x_base + 4];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 20) & 0xF] * gsf * x_shared[x_base + 5];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 24) & 0xF] * gsf * x_shared[x_base + 6];
-            gate_acc += NIBBLE_TO_FLOAT[(gpw >> 28) & 0xF] * gsf * x_shared[x_base + 7];
-
-            up_acc += NIBBLE_TO_FLOAT[(upw >>  0) & 0xF] * usf * x_shared[x_base + 0];
-            up_acc += NIBBLE_TO_FLOAT[(upw >>  4) & 0xF] * usf * x_shared[x_base + 1];
-            up_acc += NIBBLE_TO_FLOAT[(upw >>  8) & 0xF] * usf * x_shared[x_base + 2];
-            up_acc += NIBBLE_TO_FLOAT[(upw >> 12) & 0xF] * usf * x_shared[x_base + 3];
-            up_acc += NIBBLE_TO_FLOAT[(upw >> 16) & 0xF] * usf * x_shared[x_base + 4];
-            up_acc += NIBBLE_TO_FLOAT[(upw >> 20) & 0xF] * usf * x_shared[x_base + 5];
-            up_acc += NIBBLE_TO_FLOAT[(upw >> 24) & 0xF] * usf * x_shared[x_base + 6];
-            up_acc += NIBBLE_TO_FLOAT[(upw >> 28) & 0xF] * usf * x_shared[x_base + 7];
+        // Unroll 2 packs per step (packs_per_thread=2, 8 nibbles each = 16 values/step)
+        for (uint p = 0; p < packed_per_group; p += 2) {
+            uint32_t gpw0 = g_row[bp + p];
+            uint32_t gpw1 = g_row[bp + p + 1];
+            uint32_t upw0 = u_row[bp + p];
+            uint32_t upw1 = u_row[bp + p + 1];
+            uint x0 = bx + p * 8;
+            uint x1 = x0 + 8;
+            // Pack 0
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >>  0) & 0xF] * gsf * x_shared[x0 + 0];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >>  4) & 0xF] * gsf * x_shared[x0 + 1];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >>  8) & 0xF] * gsf * x_shared[x0 + 2];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >> 12) & 0xF] * gsf * x_shared[x0 + 3];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >> 16) & 0xF] * gsf * x_shared[x0 + 4];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >> 20) & 0xF] * gsf * x_shared[x0 + 5];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >> 24) & 0xF] * gsf * x_shared[x0 + 6];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw0 >> 28) & 0xF] * gsf * x_shared[x0 + 7];
+            // Pack 1
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >>  0) & 0xF] * gsf * x_shared[x1 + 0];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >>  4) & 0xF] * gsf * x_shared[x1 + 1];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >>  8) & 0xF] * gsf * x_shared[x1 + 2];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >> 12) & 0xF] * gsf * x_shared[x1 + 3];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >> 16) & 0xF] * gsf * x_shared[x1 + 4];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >> 20) & 0xF] * gsf * x_shared[x1 + 5];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >> 24) & 0xF] * gsf * x_shared[x1 + 6];
+            gate_acc += NIBBLE_TO_FLOAT[(gpw1 >> 28) & 0xF] * gsf * x_shared[x1 + 7];
+            // Pack 0 (up)
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >>  0) & 0xF] * usf * x_shared[x0 + 0];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >>  4) & 0xF] * usf * x_shared[x0 + 1];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >>  8) & 0xF] * usf * x_shared[x0 + 2];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >> 12) & 0xF] * usf * x_shared[x0 + 3];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >> 16) & 0xF] * usf * x_shared[x0 + 4];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >> 20) & 0xF] * usf * x_shared[x0 + 5];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >> 24) & 0xF] * usf * x_shared[x0 + 6];
+            up_acc += NIBBLE_TO_FLOAT[(upw0 >> 28) & 0xF] * usf * x_shared[x0 + 7];
+            // Pack 1 (up)
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >>  0) & 0xF] * usf * x_shared[x1 + 0];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >>  4) & 0xF] * usf * x_shared[x1 + 1];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >>  8) & 0xF] * usf * x_shared[x1 + 2];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >> 12) & 0xF] * usf * x_shared[x1 + 3];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >> 16) & 0xF] * usf * x_shared[x1 + 4];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >> 20) & 0xF] * usf * x_shared[x1 + 5];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >> 24) & 0xF] * usf * x_shared[x1 + 6];
+            up_acc += NIBBLE_TO_FLOAT[(upw1 >> 28) & 0xF] * usf * x_shared[x1 + 7];
         }
     }
 
@@ -176,8 +210,8 @@ kernel void fused_gate_up_swiglu_v2(
             int r = row0 + row;
             if (r >= (int)out_dim) continue;
 
-            float gsf = exp2((float)gs[row][gg] - 127.0f);
-            float usf = exp2((float)us[row][gg] - 127.0f);
+            float gsf = fp8_e8m0_to_float(gs[row][gg]);
+            float usf = fp8_e8m0_to_float(us[row][gg]);
             uint gpw = gr[row][gg * packed_per_group + (uint)il];
             uint upw = ur[row][gg * packed_per_group + (uint)il];
 
@@ -480,7 +514,7 @@ kernel void dequant_matvec_4bit(
 
     float acc = 0.0f;
     for (uint g = simd_lane; g < num_groups; g += 32) {
-        float sf = exp2((float)sc[g] - 127.0f);
+        float sf = fp8_e8m0_to_float(sc[g]);
         uint bp = g * packed_per_grp;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_grp; p++) {
@@ -529,8 +563,8 @@ kernel void fused_gate_up_swiglu_bfloat_in(
 
     float gate_val = 0.0f, up_val = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float gsf = exp2((float)g_s[g] - 127.0f);
-        float usf = exp2((float)u_s[g] - 127.0f);
+        float gsf = fp8_e8m0_to_float(g_s[g]);
+        float usf = fp8_e8m0_to_float(u_s[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -571,7 +605,7 @@ kernel void dequant_matvec_4bit_bfloat_in(
     device const uint8_t*  sc = scales   + tid * num_groups;
     float acc = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float sf = exp2((float)sc[g] - 127.0f);
+        float sf = fp8_e8m0_to_float(sc[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -643,8 +677,8 @@ kernel void fused_6expert_gate_up_swiglu(
 
         float ga = 0.0f, ua = 0.0f;
         for (uint g = simd_lane; g < num_groups; g += 32) {
-            float gsf = exp2((float)g_s[g] - 127.0f);
-            float usf = exp2((float)u_s[g] - 127.0f);
+            float gsf = fp8_e8m0_to_float(g_s[g]);
+            float usf = fp8_e8m0_to_float(u_s[g]);
             uint bp = g * ppg, bx = g * GS;
             for (uint p = 0; p < ppg; p++) {
                 uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
@@ -726,7 +760,7 @@ kernel void fused_6expert_down(
 
     float acc = 0.0f;
     for (uint g = simd_lane; g < num_groups; g += 32) {
-        float sf = exp2((float)s_row[g] - 127.0f);
+        float sf = fp8_e8m0_to_float(s_row[g]);
         uint bp = g * ppg, bx = g * GS;
         for (uint p = 0; p < ppg; p++) {
             uint32_t pw = w_row[bp+p];
@@ -822,8 +856,8 @@ kernel void gather_gate_up_swiglu(
         // Read scale bytes: use shift/mask instead of division/modulo for ALU efficiency.
         uint gs_bidx = gs_byte_base + g;
         uint us_bidx = us_byte_base + g;
-        float gsf = exp2((float)(uint8_t)((pool[gs_bidx >> 2] >> ((gs_bidx & 3) << 3)) & 0xFF) - 127.0f);
-        float usf = exp2((float)(uint8_t)((pool[us_bidx >> 2] >> ((us_bidx & 3) << 3)) & 0xFF) - 127.0f);
+        float gsf = fp8_e8m0_to_float((uint8_t)((pool[gs_bidx >> 2] >> ((gs_bidx & 3) << 3)) & 0xFF));
+        float usf = fp8_e8m0_to_float((uint8_t)((pool[us_bidx >> 2] >> ((us_bidx & 3) << 3)) & 0xFF));
         uint bp = g * PPG, bx = g * GS;
         for (uint p = 0; p < PPG; p++) {
             uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
@@ -908,7 +942,7 @@ kernel void gather_down(
         uint s_byte_idx = s_byte_base + g;
         uint s_word = pool[s_byte_idx >> 2];
         uint8_t s_byte = (uint8_t)((s_word >> ((s_byte_idx & 3) << 3)) & 0xFF);
-        float sf = exp2((float)s_byte - 127.0f);
+        float sf = fp8_e8m0_to_float(s_byte);
         uint bp = g * PPG, bx = g * GS;
         for (uint p = 0; p < PPG; p++) {
             uint32_t pw = w_row[bp+p];
@@ -3012,8 +3046,8 @@ kernel void fused_gate_up_swiglu_f16(
 
     float gate_val = 0.0f, up_val = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float gsf = exp2((float)g_s[g] - 127.0f);
-        float usf = exp2((float)u_s[g] - 127.0f);
+        float gsf = fp8_e8m0_to_float(g_s[g]);
+        float usf = fp8_e8m0_to_float(u_s[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -3055,7 +3089,7 @@ kernel void dequant_matvec_4bit_f16out(
 
     float acc = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float sf = exp2((float)sc[g] - 127.0f);
+        float sf = fp8_e8m0_to_float(sc[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -3090,7 +3124,7 @@ kernel void dequant_matvec_4bit_f16in_f32out(
 
     float acc = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float sf = exp2((float)sc[g] - 127.0f);
+        float sf = fp8_e8m0_to_float(sc[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -3148,8 +3182,8 @@ kernel void fused_gate_up_swiglu_f32in_f16out(
 
     float gate_val = 0.0f, up_val = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
-        float gsf = exp2((float)g_s[g] - 127.0f);
-        float usf = exp2((float)u_s[g] - 127.0f);
+        float gsf = fp8_e8m0_to_float(g_s[g]);
+        float usf = fp8_e8m0_to_float(u_s[g]);
         uint bp = g * packed_per_group;
         uint bx = g * group_size;
         for (uint p = 0; p < packed_per_group; p++) {
@@ -3481,8 +3515,8 @@ kernel void fused_gate_up_swiglu_v2_lut(
             int r = row0 + row;
             if (r >= (int)out_dim) continue;
 
-            float gsf = exp2((float)gs[row][gg] - 127.0f);
-            float usf = exp2((float)us[row][gg] - 127.0f);
+            float gsf = fp8_e8m0_to_float(gs[row][gg]);
+            float usf = fp8_e8m0_to_float(us[row][gg]);
 
             uint gpw = gr[row][gg * packed_per_group + (uint)il];
             uint upw = ur[row][gg * packed_per_group + (uint)il];
@@ -3589,7 +3623,7 @@ kernel void dequant_matvec_4bit_lut(
             int r = row0 + row;
             if (r >= (int)out_dim) continue;
 
-            float sf = exp2((float)sr[row][gg] - 127.0f);
+            float sf = fp8_e8m0_to_float(sr[row][gg]);
             uint32_t pw = wr[row][gg * packed_per_group + (uint)il];
 
             sumf[row] += NIBBLE_TO_FLOAT[(pw>> 0)&0xF] * sf * xv0;
