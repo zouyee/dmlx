@@ -219,47 +219,76 @@ pub const NativeEngine = struct {
 
         // Prefill: token-by-token forward over effective prompt tokens only.
         if (start_pos_override == null and effective_prompt_len > 0) {
-            // Batched prefill: process all prompt tokens in one forwardBatch call.
-            // layer-major order (all tokens per layer) enables KV cache reuse between tokens.
-            // Allocate hidden_batch [n_tokens × MHC_MULT × DIM] on the heap.
-            const n = effective_prompt_len;
-            const hidden_batch = try allocator.alloc(f32, n * MHC_MULT * DIM);
-            defer allocator.free(hidden_batch);
-            const token_ids_batch = try allocator.alloc(i32, n);
-            defer allocator.free(token_ids_batch);
+            // Use batched prefill for longer prompts (n>=8): amortizes GPU sync overhead.
+            // Fall back to serial for short prompts (n<8): fewer GPU syncs, lower overhead.
+            // Threshold: batched requires n*43 GPU syncs vs serial's 43 — only worth it for n>=8.
+            if (effective_prompt_len >= 8) {
+                const n = effective_prompt_len;
+                const hidden_batch = try allocator.alloc(f32, n * MHC_MULT * DIM);
+                defer allocator.free(hidden_batch);
+                const token_ids_batch = try allocator.alloc(i32, n);
+                defer allocator.free(token_ids_batch);
 
-            // Embed each prompt token into its slot in hidden_batch.
-            for (tokens[0..n], 0..) |tok, t| {
-                token_ids_batch[t] = @intCast(tok);
-                metal.setTokenId(self.engine, @intCast(tok));
-                metal.embed(self.engine, @intCast(tok), hidden_batch[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
-            }
+                for (tokens[0..n], 0..) |tok, t| {
+                    token_ids_batch[t] = @intCast(tok);
+                    metal.setTokenId(self.engine, @intCast(tok));
+                    metal.embed(self.engine, @intCast(tok), hidden_batch[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
+                }
 
-            // Forward all prompt tokens through all 43 layers at once.
-            try metal.forwardBatch(self.engine, hidden_batch, n, @intCast(start_pos), token_ids_batch);
+                try metal.forwardBatch(self.engine, hidden_batch, n, @intCast(start_pos), token_ids_batch);
 
-            // Extract last token's hidden state → compress → compute logits → first decode token.
-            var hidden_last: [MHC_MULT * DIM]f32 = undefined;
-            @memcpy(&hidden_last, hidden_batch[(n - 1) * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
+                var hidden_last: [MHC_MULT * DIM]f32 = undefined;
+                @memcpy(&hidden_last, hidden_batch[(n - 1) * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
 
-            var compressed: [DIM]f32 = undefined;
-            metal.hyperHeadCompress(
-                self.weight_store.weights.hc_head_fn.ptr,
-                self.weight_store.weights.hc_head_base.ptr,
-                self.weight_store.weights.hc_head_scale.ptr,
-                &hidden_last,
-                &compressed,
-            );
-            try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
+                var compressed: [DIM]f32 = undefined;
+                metal.hyperHeadCompress(
+                    self.weight_store.weights.hc_head_fn.ptr,
+                    self.weight_store.weights.hc_head_base.ptr,
+                    self.weight_store.weights.hc_head_scale.ptr,
+                    &hidden_last,
+                    &compressed,
+                );
+                try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
 
-            const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
-            start_pos += effective_prompt_len;
-            tokens[current_len] = next_token;
-            current_len += 1;
-            std.log.info("native_engine: effective_prompt_len={d} first_token={d}", .{ effective_prompt_len, next_token });
+                const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
+                start_pos += effective_prompt_len;
+                tokens[current_len] = next_token;
+                current_len += 1;
+                std.log.info("native_engine: effective_prompt_len={d} first_token={d} [batched]", .{ effective_prompt_len, next_token });
 
-            if (next_token == self.eos_token) {
-                std.log.info("native_engine: EOS after prefill", .{});
+                if (next_token == self.eos_token) {
+                    std.log.info("native_engine: EOS after prefill", .{});
+                }
+            } else {
+                // Serial prefill: token-by-token (optimal for short prompts n<8)
+                for (tokens[0..effective_prompt_len], 0..) |tok, t| {
+                    var hidden: [MHC_MULT * DIM]f32 = undefined;
+                    metal.setTokenId(self.engine, @intCast(tok));
+                    metal.embed(self.engine, @intCast(tok), &hidden);
+                    try metal.forward(self.engine, hidden[0..], @intCast(start_pos + t));
+
+                    if (t == effective_prompt_len - 1) {
+                        var compressed: [DIM]f32 = undefined;
+                        metal.hyperHeadCompress(
+                            self.weight_store.weights.hc_head_fn.ptr,
+                            self.weight_store.weights.hc_head_base.ptr,
+                            self.weight_store.weights.hc_head_scale.ptr,
+                            &hidden,
+                            &compressed,
+                        );
+                        try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
+
+                        const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
+                        start_pos += effective_prompt_len;
+                        tokens[current_len] = next_token;
+                        current_len += 1;
+                        std.log.info("native_engine: effective_prompt_len={d} first_token={d}", .{ effective_prompt_len, next_token });
+
+                        if (next_token == self.eos_token) {
+                            std.log.info("native_engine: EOS after prefill", .{});
+                        }
+                    }
+                }
             }
         }
 
