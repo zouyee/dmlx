@@ -1204,6 +1204,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
+    // Sync CPU residual → buf_residual_gpu AFTER deferred readback.
+    // Single-token decode: residual was just updated from GPU (deferred) → sync back ✓
+    // Batch prefill (deferred cleared by caller): residual = hidden_t (current token embed) → sync ✓
+    // This ensures mhc_pre GPU kernel always reads the correct token's residual.
+    if (eng->buf_residual_gpu) {
+        memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents],
+               residual, (size_t)MHC_MULT * DIM * sizeof(float));
+    }
+
     @autoreleasepool {    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
@@ -1878,9 +1887,42 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         for (int t = 0; t < n_tokens; t++) {
             float *hidden_t = hidden_batch + (size_t)t * (MHC_MULT * DIM);
-            // Set token ID per-token so hash routing uses the correct expert table row
             if (token_ids != NULL) eng->current_token_id = (int)token_ids[t];
+            // Batch prefill deferred state management:
+            // The previous token (t-1) may have left deferred.active=true with its GPU output
+            // in buf_residual_gpu. We must:
+            //   1. Wait for GPU to finish (correctness barrier)
+            //   2. Read GPU output back to hidden_batch[t-1] — the correct layer-N output for
+            //      token t-1, which token t-1 needs as input for layer N+1
+            //   3. Do NOT overwrite hidden_t (current token's input for this layer)
+            // Then forward_layer will sync hidden_t → buf_residual_gpu for this token.
+            if (eng->deferred.active && eng->deferred.cmd_experts) {
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+                eng->deferred.cmd_experts = NULL;
+                eng->deferred.active = false;
+                if (eng->deferred.gpu_combined && t > 0) {
+                    float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
+                    float *prev = hidden_batch + (size_t)(t - 1) * (MHC_MULT * DIM);
+                    memcpy(prev, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
+                }
+                eng->deferred.gpu_combined = false;
+            }
             if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) return -1;
+        }
+        // After all tokens in this layer: drain deferred for the last token
+        // and update its hidden with the GPU's final output.
+        if (eng->deferred.active && eng->deferred.cmd_experts) {
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+            eng->deferred.cmd_experts = NULL;
+            eng->deferred.active = false;
+            if (eng->deferred.gpu_combined) {
+                float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
+                float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
+                memcpy(last, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
+                eng->deferred.gpu_combined = false;
+            }
         }
         // Per-layer residual dump: write last token's residual as raw f32 bin
         if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
