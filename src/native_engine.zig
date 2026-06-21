@@ -116,7 +116,7 @@ pub const NativeEngine = struct {
             const stats_loaded = metal.smeltLoadStats(engine, stats_path_buf[0 .. stats_path_buf.len - 1 :0].ptr);
             if (stats_loaded != 0) {
                 // Stats available: true hot experts loaded → enable routing bias (MLX alignment)
-                metal.smeltSetPenalty(engine, 1e3);
+                metal.smeltSetPenalty(engine, 100.0);
                 std.log.info("native_engine: Phase 2 — routing bias=1e3 (hot experts loaded, I/O→0)", .{});
             } else {
                 std.log.info("native_engine: Phase 1 — collecting routing stats (penalty=0, N={d})", .{smelt_n});

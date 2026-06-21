@@ -4879,3 +4879,84 @@ benchmark 对比（含 prefill）:
   MLX (optimal settings): ~1.0 tok/s
   差距: P2 vs MLX = ~20% — 还差 kernel 效率和 lazy eval
 ```
+
+---
+
+## §52. Phase 2 路由偏置实测结果（2026-06-20）
+
+### 52.1 当前实现状态（commit 35cc32c）
+
+**两阶段路由偏置**已完整实现：
+
+- Phase 1（无 stats 文件）：penalty=0，自然路由，收集统计
+- Phase 2（有 stats 文件）：penalty=1e3，强制路由到 SMELT 缓存 experts → io≈0
+
+**关键修复**：`buf_cached_flags` 现在每层 forward 前动态更新（per-layer），正确反映当前层的实际缓存 experts，而非仅使用 layer 5 代表所有层。
+
+### 52.2 实测结果（2026-06-20，SMELT N=20）
+
+| 指标 | 值 | 对比基线 |
+|------|-----|---------|
+| **benchmark tok/s（Phase 2）** | **0.878** | +55% vs 0.566 |
+| 单请求 latency（warm） | 5.6-5.8s / 5 tokens | ↓ from 8.83s |
+| score layers io 时间 | ≈0.01ms（≈0 SSD reads）| ↓ from 10ms/layer |
+| Paris 正确性 | ✗ FAIL（超时）| 从 ✓ PASS 退步 |
+| E2E | 3/7 passed | 从 7/7 退步 |
+
+### 52.3 正确性回归根因
+
+**Phase 2 penalty=1e3 强制路由到 stats-based hot experts**。stats 质量不足时会导致错误输出：
+
+```
+当前 stats：仅来自 5 次 warmup "Hi" 请求 = 25 decode tokens
+                                 ↓
+per-layer top-20 experts = 针对 "Hi" 优化
+                                 ↓
+"The capital of France is" → 强制使用 Hi-specific experts
+                                 ↓
+输出变成: "你好！??" 而非 "Paris"
+```
+
+**规律**：
+- Phase 2 stats 来自单一 prompt → 其他 prompt 正确性下降
+- Phase 2 stats 来自多样化 queries → 所有 prompt 正确性保持
+- ff430ee benchmark 删除 stats 的原因：避免 stats 污染导致错误结果
+
+### 52.4 性能分析（per-layer profiling）
+
+| 阶段 | hash layers moe | score layers moe | score layers io | 总计/pass |
+|------|----------------|-----------------|----------------|----------|
+| Phase 1（冷） | 125-300ms | 3-6ms | 10ms | ~41s |
+| Phase 1（暖） | 125-300ms | 3-6ms | 10ms | ~10.5s |
+| Phase 2（per-layer flags）| 125-300ms | 12-17ms | ≈0ms | ~37.5s cold / ~5.6s warm |
+
+**发现**：
+1. Hash layers moe=150-300ms 在两个 Phase 都一样 — 这是正常的（hash layers 加载全 256 experts 的 GPU 并行开销）
+2. Phase 2 score layers：moe 稍慢（13ms vs 4ms），但 io=0 节省 10ms → 净提升 ~1ms/layer
+3. **主要性能来源**：Phase 2 warm state 5.6s vs Phase 1 warm 10.5s → **差距来自 OS page cache**
+
+### 52.5 根本性能分析
+
+Phase 2 的 `0.878 tok/s` vs Phase 1 的 `0.566 tok/s` 的差距来自：
+
+1. **OS page cache 效应**：Phase 2 routing 总是选择相同的 20 experts → 这些 experts 的 file blocks 常驻 OS page cache → 后续请求 pread ≈ 内存速度而非 SSD 速度
+2. **I/O 真正为 0**（per-layer flags 验证）：score layers io≈0.01ms
+3. **Phase 1 性能受限于 SSD**：每次 warmup 后 OS page cache 被不同 experts 替换
+
+**关键结论**：Phase 2 对 benchmark（固定 prompt 重复请求）有 +55% 提升，但这是由 OS page cache warmup 带来的，并非纯计算改善。在真实多样化场景中，Phase 2 需要高质量 routing stats 才能既保持速度又保证正确性。
+
+### 52.6 待解决问题
+
+1. **正确性**：需要从多样化 queries 收集 routing stats（不能只用 benchmark warmup）
+2. **OOM during E2E**：server 在 P4 被 SIGKILL。可能是 Phase 2 routing 导致模型生成超长序列 + KV cache 内存溢出
+3. **Paris 超时**：Paris 30 tokens 理论上 ~45s，接近 60s 超时限制；需要将超时延长到 120s
+
+### 52.7 下一步行动
+
+| 优先级 | 动作 | 效果 |
+|--------|------|------|
+| P0 | 修复 benchmark script：Paris 超时从 60s → 120s | 修复 Paris FAIL |
+| P0 | routing stats 收集：从多样化 prompts 预热 | 修复 E2E 正确性 |  
+| P1 | Phase 2 penalty 降低到 100（允许路由灵活性） | 平衡速度与正确性 |
+| P2 | fp8_e8m0 scale bit-shift + packs_per_thread=2 | +5-10% compute |
+| P3 | Batched prefill | +20-30% benchmark |
