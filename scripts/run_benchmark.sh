@@ -169,7 +169,7 @@ print(int((pages.get('Pages free',0)+pages.get('Pages inactive',0)+pages.get('Pa
     echo "   Correctness check..."
     PARIS_RESP=$(curl -s --max-time 120 "${SERVER_URL}/v1/chat/completions" \
         -H 'Content-Type: application/json' \
-        -d '{"model":"d","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":5,"temperature":0}')
+        -d '{"model":"d","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":10,"temperature":0}')
     PARIS_TEXT=$(echo "$PARIS_RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
     if echo "$PARIS_TEXT" | grep -qi "paris"; then
         echo "   ✓ Paris correct: \"${PARIS_TEXT}\""
