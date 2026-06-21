@@ -421,6 +421,7 @@ typedef struct {
     SharedExpert shared[N_LAYERS];       // shared expert (affine 4bit, gs=64)
     const float *gate_proj[N_LAYERS];    // [N_EXPERTS, DIM] router weight
     const float *gate_bias[N_LAYERS];    // [N_EXPERTS] e_score_correction_bias (NULL if absent)
+    void *gate_bias_gpu[N_LAYERS];      // pre-allocated MTLBuffer wrapping gate_bias (avoids per-call newBuffer)
     const int64_t *tid2eid[N_LAYERS];    // [vocab_size, N_ACTIVE] hash routing table (NULL = score-based)
     // mHC weights per layer (f32): fn [24,16384], base [24], scale [3]
     const float *attn_hc_fn[N_LAYERS];

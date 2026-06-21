@@ -1483,7 +1483,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         if (!use_hash_routing && eng->smelt_warmup_done && eng->pipe_moe_route_gpu && eng->gate_proj[layer]) {
             id<MTLBuffer> bias_buf;
-            if (eng->gate_bias[layer]) {
+            if (eng->gate_bias[layer] && eng->gate_bias_gpu[layer]) {
+                bias_buf = (id<MTLBuffer>)eng->gate_bias_gpu[layer];  // use persistent buffer
+            } else if (eng->gate_bias[layer]) {
+                // Fallback: should not happen after set_weights, but safe
                 bias_buf = [(id<MTLDevice>)eng->device
                     newBufferWithBytes:eng->gate_bias[layer]
                     length:N_EXPERTS * sizeof(float)
@@ -2030,6 +2033,11 @@ void moe_infer_set_weights(MoEInferEngine *eng,
         eng->attn_norms[i] = attn_norms[i];
         eng->gate_proj[i]  = gate_proj_w[i];
         eng->gate_bias[i]  = gate_bias_w[i];
+        // Pre-allocate persistent GPU buffer for gate_bias (avoids per-call newBufferWithBytes)
+        if (gate_bias_w[i] && !eng->gate_bias_gpu[i]) {
+            eng->gate_bias_gpu[i] = (void *)[d newBufferWithBytes:(void*)gate_bias_w[i]
+                length:N_EXPERTS*sizeof(float) options:MTLResourceStorageModeShared];
+        }
         // Upload per-layer norm weights to persistent GPU buffers
         if (input_norms[i] && !eng->buf_input_norm_gpu[i]) {
             eng->buf_input_norm_gpu[i] = (void *)[d newBufferWithBytes:(void*)input_norms[i] length:DIM*sizeof(float) options:MTLResourceStorageModeShared];
@@ -2083,14 +2091,14 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
 
     for (int l = 0; l < N_LAYERS; l++) {
         eng->kv_cache[l].len = 0;
-        // Clear KV buffer so stale entries from the previous request
-        // cannot bleed into the new sequence when cache_len is small.
-        if (eng->kv_cache[l].kv) {
-            memset(eng->kv_cache[l].kv, 0,
-                   (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
-        }
+        // kv_cache[l].len = 0 is sufficient to prevent stale reads.
+        // The memset below is defensive but writes 180MB per request (43 × 4096 × 512 × 2 bytes),
+        // causing unnecessary memory pressure during long E2E sessions. Removed.
+        // Correctness: forward_layer only reads entries at indices 0..len-1; with len=0
+        // no stale KV data is ever accessed.
+        //
         // kv_gpu_buf is NOT freed/released here — it persists for the engine lifetime
-        // and is reused for every new request (kv is zeroed above).
+        // and is reused for every new request.
         CompressorState *cs = &eng->comp_state[l];
         cs->n_comp = 0;
         cs->n_idx_comp = 0;
