@@ -99,9 +99,12 @@ cleanup() {
     fi
     pkill -f "dmlx serve.*${PORT}" 2>/dev/null || true
     sleep 1
-    # NOTE: Do NOT delete routing stats — they persist across runs to keep hot experts loaded.
-    # With routing bias (penalty=1e9), E2E prompts do NOT corrupt the stats because
-    # all routing is constrained to cached experts anyway.
+    # Delete routing stats before each benchmark run to ensure reproducible results.
+    # With penalty=0 (natural routing), stats-based SMELT may hurt benchmark performance
+    # for prompts not in the training stats. Phase 1 (default experts 0..N-1) gives
+    # consistent baseline numbers. Production servers benefit from persistent stats;
+    # benchmarks need fresh state for fair comparisons.
+    rm -f "${PACKED_DIR}/.smelt_routing_stats.bin" 2>/dev/null || true
 }
 trap cleanup EXIT
 cleanup
