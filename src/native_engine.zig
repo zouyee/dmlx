@@ -115,9 +115,11 @@ pub const NativeEngine = struct {
             // Load stats AFTER smeltInit (smeltInit zeros routing_counts, so load must come after)
             const stats_loaded = metal.smeltLoadStats(engine, stats_path_buf[0 .. stats_path_buf.len - 1 :0].ptr);
             if (stats_loaded != 0) {
-                // Stats available: true hot experts loaded → enable routing bias (MLX alignment)
-                metal.smeltSetPenalty(engine, 100.0);
-                std.log.info("native_engine: Phase 2 — routing bias=1e3 (hot experts loaded, I/O→0)", .{});
+                // Stats available: hot experts loaded into SMELT (stats-based selection).
+                // Keep penalty=0 so routing remains natural and correct for all prompts.
+                // The performance benefit comes from SMELT caching the actual hot experts
+                // (not the default 0..N-1), improving cache hit rate without routing bias.
+                std.log.info("native_engine: Phase 2 — hot experts loaded from stats (natural routing, N={d})", .{smelt_n});
             } else {
                 std.log.info("native_engine: Phase 1 — collecting routing stats (penalty=0, N={d})", .{smelt_n});
             }
