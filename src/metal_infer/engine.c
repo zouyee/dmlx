@@ -1187,6 +1187,13 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
 
+    // Track whether the deferred readback already put the correct data into buf_residual_gpu.
+    // If deferred gpu_combined was true → GPU wrote buf_residual_gpu → we read it to CPU residual
+    // → buf_residual_gpu still has correct data → no need to sync.
+    // In all other cases (no deferred, deferred with gpu_combined=false, batch path after clear)
+    // → residual has data that is NOT yet in buf_residual_gpu → must sync.
+    bool gpu_residual_current = false;
+
     // === Wait for deferred cb3 from previous layer (deferred mhc_post_ffn) ===
     // cb3(N-1) wrote buf_residual_gpu. We wait here, then read residual back to CPU.
     // Metal queue is serial: CB-A(N) will execute after cb3(N-1) anyway, but we
@@ -1201,14 +1208,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
             memcpy(residual, gpu_res, MHC_MULT * DIM * sizeof(float));
             eng->deferred.gpu_combined = false;
+            gpu_residual_current = true;  // buf_residual_gpu already has correct data
         }
     }
 
-    // Sync CPU residual → buf_residual_gpu AFTER deferred readback.
-    // Single-token decode: residual was just updated from GPU (deferred) → sync back ✓
-    // Batch prefill (deferred cleared by caller): residual = hidden_t (current token embed) → sync ✓
-    // This ensures mhc_pre GPU kernel always reads the correct token's residual.
-    if (eng->buf_residual_gpu) {
+    // Sync CPU residual → buf_residual_gpu only when needed (not already current).
+    // Skip when deferred gpu readback just provided the data (it's already correct in GPU buf).
+    // Always sync for: layer 0 (no deferred), batch path (deferred cleared without readback),
+    // or when embed was the last writer.
+    if (!gpu_residual_current && eng->buf_residual_gpu) {
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents],
                residual, (size_t)MHC_MULT * DIM * sizeof(float));
     }
