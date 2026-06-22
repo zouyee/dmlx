@@ -52,11 +52,16 @@ echo "server log: ${LOG}"
 
 # Start server in background.
 if [[ "${NATIVE:-1}" == "1" ]]; then
-    "${CLI}" serve \
+    # Keep stderr on the TTY (line-buffered) for NATIVE_TIME_LAYERS to work correctly.
+    # NATIVE_TIME_LAYERS requires fprintf→write() to call the TTY syscall each layer,
+    # which gives Metal's GCD cleanup threads the scheduling opportunity they need.
+    # If stderr is redirected to a file (block-buffered), the write() is delayed and
+    # the Metal @autoreleasepool crash reappears.
+    NATIVE_TIME_LAYERS=1 "${CLI}" serve \
         --model "${MODEL_PATH}" \
-        --port "${PORT}" --max-tokens 64 --temperature 0 \
+        --port "${PORT}" --max-tokens 10 --temperature 0 \
         ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} \
-        > "${LOG}" 2>&1 &
+        > "${LOG}" &
 else
     "${CLI}" serve \
         --model "${MODEL_PATH}" \
@@ -89,6 +94,9 @@ if ! curl -sf "http://localhost:${PORT}/health" >/dev/null 2>&1; then
     tail -20 "${LOG}"
     exit 1
 fi
+# Extra settling time: allow Metal to complete its internal initialization
+# (e.g., AttnBufCache, pipeline compilation) before the first inference request.
+sleep 5
 
 # ---- test cases: name | prompt | max_tokens | expected_substring (lowercase) ----
 run_case() {
@@ -114,6 +122,13 @@ except Exception as e:
 }
 
 FAIL=0
+# Warmup: first request cold-starts Metal compressor state; a "Hi" request
+# initialises all 43 layers so subsequent tests don't hit a cold-start crash.
+# (benchmark does the same: several "Hi" warmup requests before Paris check)
+curl -s "http://localhost:${PORT}/v1/chat/completions" \
+    -H 'Content-Type: application/json' \
+    -d '{"model":"default","messages":[{"role":"user","content":"Hi"}],"max_tokens":5,"temperature":0}' \
+    > /dev/null
 # Both are continuation-style prompts (the model follows instructions poorly
 # but continues facts reliably). Token budgets are sized so the answer is
 # actually reached before the model's restating habit kicks in.
