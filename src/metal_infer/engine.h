@@ -464,6 +464,9 @@ typedef struct {
     int current_pos;       // current sequence position
     int current_token_id;  // current input token ID (needed for hash routing in layers 0-2)
     bool initialized;
+
+    // DSpark speculative decoding engine (optional, set by caller after init)
+    void *dspark_engine;   // DSparkEngine* — NULL if DSpark not active
 } MoEInferEngine;
 
 // ============================================================================
@@ -497,6 +500,12 @@ void moe_infer_set_layer_shared(MoEInferEngine *engine, int layer, SharedExpert 
 
 // Reset KV cache (call at the start of each new sequence/request).
 void moe_infer_reset_kv(MoEInferEngine *engine);
+
+// Rollback KV cache to a specific position (for speculative decoding).
+// After a batch verification where some draft tokens are rejected, roll back
+// the KV cache to keep only entries at positions [0, valid_len).
+// This truncates kv_cache[l].len and comp_state[l].n_comp/n_idx_comp appropriately.
+void moe_infer_rollback_kv(MoEInferEngine *engine, int valid_len);
 
 // Preload N experts per layer into a memory cache (eliminates SSD reads on cache hits).
 // expert_cache_mb: total MB to allocate for cache. Pass 0 to preload ALL experts (~3.43 GB).

@@ -72,6 +72,7 @@ const CSharedExpert = extern struct {
 };
 extern fn moe_infer_set_layer_shared(engine: *Engine, layer: c_int, se: CSharedExpert) void;
 extern fn moe_infer_reset_kv(engine: *Engine) void;
+extern fn moe_infer_rollback_kv(engine: *Engine, valid_len: c_int) void;
 extern fn moe_infer_set_layer_tid2eid(engine: *Engine, layer: c_int, tid2eid: [*c]const i64) void;
 extern fn moe_infer_set_token_id(engine: *Engine, token_id: c_int) void;
 extern fn moe_infer_embed(engine: *Engine, token_id: c_int, hidden_out: [*c]f32) void;
@@ -94,6 +95,10 @@ extern fn moe_infer_smelt_set_stats_path(engine: *Engine, path: [*c]const u8) vo
 
 pub fn resetKv(engine: *Engine) void {
     moe_infer_reset_kv(engine);
+}
+
+pub fn rollbackKv(engine: *Engine, valid_len: i32) void {
+    moe_infer_rollback_kv(engine, @intCast(valid_len));
 }
 
 pub fn preloadExperts(engine: *Engine, expert_cache_mb: i32) i32 {
@@ -244,4 +249,77 @@ pub fn toCQuantWeight(q: anytype) CQuantWeight {
         .in_dim = q.in_dim,
         .group_size = q.group_size,
     };
+}
+
+// ============================================================================
+// DSpark Engine Bindings
+// ============================================================================
+
+pub const DSparkEngine = opaque {};
+
+extern fn dspark_init(
+    dspark_weight_dir: [*c]const u8,
+    packed_expert_dir: [*c]const u8,
+    target_engine: *Engine,
+) ?*DSparkEngine;
+
+extern fn dspark_deinit(eng: *DSparkEngine) void;
+extern fn dspark_reset(eng: *DSparkEngine) void;
+
+extern fn dspark_forward(
+    eng: *DSparkEngine,
+    main_hidden: ?[*]const f32,
+    anchor_token_id: c_int,
+    start_pos: c_int,
+    draft_logits: [*]f32,
+    confidence: ?[*]f32,
+) c_int;
+
+extern fn dspark_markov_sample(
+    eng: *DSparkEngine,
+    draft_logits: [*]f32,
+    anchor_token_id: c_int,
+    corrected_logits: [*]f32,
+    draft_tokens: [*]u32,
+) c_int;
+
+extern fn dspark_update_main_kv(
+    eng: *DSparkEngine,
+    target_kv_entry: [*c]const u16,
+    pos: c_int,
+) void;
+
+// Set the dspark_engine pointer on the target engine (enables hidden state extraction)
+extern fn moe_infer_set_dspark_engine(engine: *Engine, dspark: ?*DSparkEngine) void;
+
+// --- Zig-friendly wrappers ---
+
+pub fn dsparkInit(dspark_weight_dir: []const u8, packed_expert_dir: []const u8, target: *Engine) ?*DSparkEngine {
+    return dspark_init(dspark_weight_dir.ptr, packed_expert_dir.ptr, target);
+}
+
+pub fn dsparkDeinit(eng: *DSparkEngine) void {
+    dspark_deinit(eng);
+}
+
+pub fn dsparkReset(eng: *DSparkEngine) void {
+    dspark_reset(eng);
+}
+
+pub fn dsparkForward(eng: *DSparkEngine, main_hidden: ?[]const f32, anchor_token_id: i32, start_pos: i32, draft_logits: []f32, confidence: ?[]f32) i32 {
+    const mh = if (main_hidden) |h| h.ptr else null;
+    const conf_ptr = if (confidence) |cf| cf.ptr else null;
+    return dspark_forward(eng, mh, @intCast(anchor_token_id), @intCast(start_pos), draft_logits.ptr, conf_ptr);
+}
+
+pub fn dsparkMarkovSample(eng: *DSparkEngine, draft_logits: []f32, anchor_token_id: i32, corrected_logits: []f32, draft_tokens: []u32) i32 {
+    return dspark_markov_sample(eng, draft_logits.ptr, @intCast(anchor_token_id), corrected_logits.ptr, draft_tokens.ptr);
+}
+
+pub fn dsparkUpdateMainKv(eng: *DSparkEngine, target_kv_entry: [*c]const u16, pos: i32) void {
+    dspark_update_main_kv(eng, target_kv_entry, @intCast(pos));
+}
+
+pub fn setDSparkEngine(engine: *Engine, dspark: ?*DSparkEngine) void {
+    moe_infer_set_dspark_engine(engine, dspark);
 }

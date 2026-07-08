@@ -69,6 +69,9 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/engine.c"), .flags = &.{"-Wno-deprecated-declarations"}, .language = .objective_c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mla_attention.m"), .flags = &.{"-fobjc-arc"}, .language = .objective_c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mhc.c"), .flags = &.{}, .language = .c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mach_compat.c"), .flags = &.{}, .language = .c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_engine.c"), .flags = &.{"-Wno-deprecated-declarations"}, .language = .c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_attention.c"), .flags = &.{}, .language = .c });
     lib_tests.root_module.linkFramework("Metal", .{});
     lib_tests.root_module.linkFramework("Foundation", .{});
     lib_tests.root_module.linkFramework("Accelerate", .{});
@@ -124,6 +127,21 @@ pub fn build(b: *std.Build) void {
         });
         target_step.root_module.addCSourceFile(.{
             .file = b.path("src/metal_infer/mhc.c"),
+            .flags = &.{},
+            .language = .c,
+        });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/metal_infer/mach_compat.c"),
+            .flags = &.{},
+            .language = .c,
+        });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/metal_infer/dspark_engine.c"),
+            .flags = &.{"-Wno-deprecated-declarations"},
+            .language = .c,
+        });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/metal_infer/dspark_attention.c"),
             .flags = &.{},
             .language = .c,
         });

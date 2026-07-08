@@ -3655,3 +3655,147 @@ kernel void dequant_matvec_4bit_lut(
         if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
     }
 }
+
+// ============================================================================
+// INT8 + E8M0 Scale dequantized matvec (for DSpark MTP experts)
+// ============================================================================
+//
+// Weight format: int8 [out_dim, in_dim], row-major.
+// Scale format: uint8 E8M0 [out_dim, in_dim / block_size], row-major.
+// Dequant: w_float = (float)int8_val * 2^(scale_byte - 127)
+//        = (float)int8_val * as_type<float>((uint)scale_byte << 23)
+//
+// Dispatch: threadgroups = out_dim / ROWS_PER_TG, threads per TG = 256 (8 simdgroups × 32).
+// Each simdgroup handles one output row. 32 threads cooperatively reduce in_dim.
+// x_shared: input vector cached in threadgroup memory (up to 4096 floats = 16KB).
+//
+// block_size for MTP experts: 16 (weight_cols / scale_cols = 2048/128 or 1024/64).
+
+kernel void dequant_matvec_int8_e8m0(
+    device const int8_t*   W        [[buffer(0)]],   // [out_dim, in_dim] int8
+    device const uint8_t*  scales   [[buffer(1)]],   // [out_dim, in_dim/block_size] uint8 E8M0
+    device const float*    x        [[buffer(2)]],   // [in_dim] float32
+    device float*          out      [[buffer(3)]],   // [out_dim] float32
+    constant uint&         out_dim  [[buffer(4)]],
+    constant uint&         in_dim   [[buffer(5)]],
+    constant uint&         block_size [[buffer(6)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    uint num_groups = in_dim / block_size;
+
+    // Cache x in threadgroup shared memory
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const int8_t*  wr = W      + row * in_dim;
+    device const uint8_t* sc = scales  + row * num_groups;
+
+    float acc = 0.0f;
+    // Each simd lane processes a subset of groups
+    for (uint g = simd_lane; g < num_groups; g += 32) {
+        // E8M0 scale decode via bit-shift: 2^(byte - 127) = as_type<float>((uint)byte << 23)
+        float sf = as_type<float>((uint)sc[g] << 23);
+        uint base_idx = g * block_size;
+
+        // Unroll by 4 for ILP
+        float local_acc = 0.0f;
+        for (uint i = 0; i < block_size; i += 4) {
+            uint idx = base_idx + i;
+            local_acc += (float)wr[idx + 0] * x_shared[idx + 0];
+            local_acc += (float)wr[idx + 1] * x_shared[idx + 1];
+            local_acc += (float)wr[idx + 2] * x_shared[idx + 2];
+            local_acc += (float)wr[idx + 3] * x_shared[idx + 3];
+        }
+        acc += local_acc * sf;
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// Fused gate + up + SwiGLU for INT8 + E8M0 (DSpark MTP experts).
+// Same logic as fused_gate_up_swiglu but reads int8 weights + e8m0 scales.
+// block_size = 16 for MTP experts.
+// Uses ROWS_PER_TG=8, 256 threads, x_shared for input caching.
+
+kernel void fused_gate_up_swiglu_int8_e8m0(
+    device const int8_t*   gate_W   [[buffer(0)]],   // [out_dim, in_dim] int8
+    device const uint8_t*  gate_s   [[buffer(1)]],   // [out_dim, in_dim/bs] e8m0
+    device const int8_t*   up_W     [[buffer(2)]],   // [out_dim, in_dim] int8
+    device const uint8_t*  up_s     [[buffer(3)]],   // [out_dim, in_dim/bs] e8m0
+    device const float*    x        [[buffer(4)]],   // [in_dim] float32
+    device float*          out      [[buffer(5)]],   // [out_dim] float32 (SwiGLU output)
+    constant uint&         out_dim  [[buffer(6)]],
+    constant uint&         in_dim   [[buffer(7)]],
+    constant uint&         block_size [[buffer(8)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint ROWS_PER_TG = 8;
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    uint num_groups = in_dim / block_size;
+
+    // Cache x in shared memory
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= out_dim) return;
+
+    device const int8_t*  g_row = gate_W + row * in_dim;
+    device const uint8_t* g_s   = gate_s + row * num_groups;
+    device const int8_t*  u_row = up_W   + row * in_dim;
+    device const uint8_t* u_s   = up_s   + row * num_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+
+    for (uint g = simd_lane; g < num_groups; g += 32) {
+        float gsf = as_type<float>((uint)g_s[g] << 23);
+        float usf = as_type<float>((uint)u_s[g] << 23);
+        uint base_idx = g * block_size;
+
+        float g_local = 0.0f, u_local = 0.0f;
+        for (uint i = 0; i < block_size; i += 4) {
+            uint idx = base_idx + i;
+            float x0 = x_shared[idx + 0], x1 = x_shared[idx + 1];
+            float x2 = x_shared[idx + 2], x3 = x_shared[idx + 3];
+            g_local += (float)g_row[idx + 0] * x0 + (float)g_row[idx + 1] * x1
+                     + (float)g_row[idx + 2] * x2 + (float)g_row[idx + 3] * x3;
+            u_local += (float)u_row[idx + 0] * x0 + (float)u_row[idx + 1] * x1
+                     + (float)u_row[idx + 2] * x2 + (float)u_row[idx + 3] * x3;
+        }
+        gate_acc += g_local * gsf;
+        up_acc += u_local * usf;
+    }
+
+    float gate_val = simd_sum(gate_acc);
+    float up_val = simd_sum(up_acc);
+
+    if (simd_lane == 0) {
+        // Limited SwiGLU (swiglu_limit=10)
+        const float limit = 10.0f;
+        float g_c = min(gate_val, limit);
+        float u_c = min(max(up_val, -limit), limit);
+        float act = g_c / (1.0f + exp(-g_c));  // silu(gate)
+        out[row] = act * u_c;
+    }
+}

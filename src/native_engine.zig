@@ -12,6 +12,7 @@ const std = @import("std");
 const native_loader = @import("native_loader/loader.zig");
 const metal = @import("metal_infer/engine.zig");
 const sampling_mod = @import("sampling.zig");
+const dspark_mod = @import("dspark.zig");
 
 const DIM = 4096;
 const MHC_MULT = 4;
@@ -29,8 +30,14 @@ pub const NativeEngine = struct {
     logits_buffer: []f32,
     eos_token: u32 = EOS_TOKEN,
     smelt_stats_path: []u8, // path to routing stats file, owned by NativeEngine
+    dspark: ?dspark_mod.DSparkState = null, // DSpark Markov Head (legacy, optional)
+    dspark_engine: ?*metal.DSparkEngine = null, // Full DSpark engine (new, optional)
 
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8, packed_dir: []const u8) !NativeEngine {
+        return initWithDSpark(allocator, model_path, packed_dir, null);
+    }
+
+    pub fn initWithDSpark(allocator: std.mem.Allocator, model_path: []const u8, packed_dir: []const u8, dspark_dir: ?[]const u8) !NativeEngine {
         // 1. Load config
         var loader = try native_loader.NativeEngineLoader.init(allocator, model_path);
         defer loader.deinit();
@@ -146,6 +153,37 @@ pub const NativeEngine = struct {
 
         std.log.info("native_engine: initialized (layers={d}, vocab={d})", .{ cfg.num_hidden_layers, cfg.vocab_size });
 
+        // Load DSpark Markov Head if directory provided
+        var dspark_state: ?dspark_mod.DSparkState = null;
+        if (dspark_dir) |dir| {
+            dspark_state = dspark_mod.DSparkState.init(allocator, dir, cfg.vocab_size) catch |err| blk: {
+                std.log.warn("native_engine: DSpark load failed ({any}), falling back to standard decode", .{err});
+                break :blk null;
+            };
+        }
+
+        // Initialize full DSpark engine if weights directory is available
+        // (uses dspark_weights/ subdir for non-expert weights, packed_mtp_experts/ for INT8 experts)
+        var dspark_full_engine: ?*metal.DSparkEngine = null;
+        if (dspark_dir) |dir| {
+            const weight_dir_z = try allocator.dupeZ(u8, dir);
+            defer allocator.free(weight_dir_z);
+            // Construct packed_mtp_experts path: sibling of dspark_weights dir
+            const mtp_expert_path = try std.fmt.allocPrint(allocator, "{s}/../packed_mtp_experts\x00", .{dir});
+            defer allocator.free(mtp_expert_path);
+            dspark_full_engine = metal.dsparkInit(
+                weight_dir_z,
+                mtp_expert_path[0 .. mtp_expert_path.len - 1 :0],
+                engine,
+            );
+            if (dspark_full_engine) |de| {
+                metal.setDSparkEngine(engine, de);
+                std.log.info("native_engine: DSpark full engine initialized (block_size=5)", .{});
+            } else {
+                std.log.warn("native_engine: DSpark full engine init failed, using Markov-only fallback", .{});
+            }
+        }
+
         return .{
             .allocator = allocator,
             .engine = engine,
@@ -153,6 +191,8 @@ pub const NativeEngine = struct {
             .config = cfg,
             .logits_buffer = logits,
             .smelt_stats_path = stats_path_buf,
+            .dspark = dspark_state,
+            .dspark_engine = dspark_full_engine,
         };
     }
 
@@ -161,12 +201,18 @@ pub const NativeEngine = struct {
         metal.smeltSaveStats(self.engine, self.smelt_stats_path[0 .. self.smelt_stats_path.len - 1 :0].ptr);
         self.allocator.free(self.smelt_stats_path);
         self.allocator.free(self.logits_buffer);
+        if (self.dspark) |*ds| ds.deinit();
+        if (self.dspark_engine) |de| {
+            metal.setDSparkEngine(self.engine, null);
+            metal.dsparkDeinit(de);
+        }
         metal.deinit(self.engine);
         self.weight_store.deinit();
     }
 
     pub fn resetKv(self: *NativeEngine) void {
         metal.resetKv(self.engine);
+        if (self.dspark_engine) |de| metal.dsparkReset(de);
     }
 
     // ------------------------------------------------------------------
@@ -299,9 +345,21 @@ pub const NativeEngine = struct {
         var _t_logits_total: u64 = 0;
         var _t_decode_n: u64 = 0;
         const _do_decode_time = (std.c.getenv("NATIVE_DECODE_TIME") != null);
-        for (0..decode_count) |_| {
+
+        // DSpark speculative decoding buffers (stack-allocated for block_size <= 8)
+        const DSPARK_MAX_BLOCK = 8;
+        var dspark_draft_tokens: [DSPARK_MAX_BLOCK]u32 = undefined;
+        var dspark_draft_logits_buf: ?[]f32 = null;
+        defer if (dspark_draft_logits_buf) |buf| self.allocator.free(buf);
+        if (self.dspark != null) {
+            dspark_draft_logits_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
+        }
+
+        var remaining = decode_count;
+        while (remaining > 0) {
             if (current_len >= tokens.len) break;
 
+            // --- Standard single-token decode step (produces anchor logits) ---
             var hidden: [MHC_MULT * DIM]f32 = undefined;
             metal.setTokenId(self.engine, @intCast(tokens[current_len - 1]));
             metal.embed(self.engine, @intCast(tokens[current_len - 1]), &hidden);
@@ -320,8 +378,6 @@ pub const NativeEngine = struct {
             try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
             const _t2 = if (_do_decode_time) std.c.mach_absolute_time() else 0;
             if (_do_decode_time) {
-                // mach_absolute_time is in CPU ticks; on M4 Pro ~125MHz TB freq → 8ns/tick
-                // Approximate: ticks * 125 / 3_000_000 ≈ ms (same as Metal timestamps)
                 _t_forward_total += _t1 - _t0;
                 _t_logits_total += _t2 - _t1;
                 _t_decode_n += 1;
@@ -331,10 +387,180 @@ pub const NativeEngine = struct {
             tokens[current_len] = next_token;
             current_len += 1;
             start_pos += 1;
+            remaining -= 1;
 
             if (next_token == self.eos_token) {
                 std.log.info("native_engine: EOS token generated, stopping at pos={d}", .{start_pos});
                 break;
+            }
+
+            // --- DSpark speculative decoding (propose + verify) ---
+            // Priority: use full DSpark engine if available, else fall back to Markov-only
+            if (self.dspark_engine) |de| {
+                if (remaining == 0 or current_len >= tokens.len) continue;
+
+                const max_draft: usize = @min(5, remaining, tokens.len - current_len);
+
+                // dspark_forward writes [block_size × vocab] logits — use Markov Head's buffer
+                // which is already allocated as [DSPARK_MAX_BLOCK × vocab_size]
+                if (self.dspark == null or dspark_draft_logits_buf == null) continue;
+
+                const vocab: usize = @intCast(self.config.vocab_size);
+                const draft_buf = dspark_draft_logits_buf.?;
+
+                // Run simplified DSpark forward (embed → norm → lm_head per position)
+                const n_draft_raw = metal.dsparkForward(
+                    de,
+                    null,
+                    @intCast(next_token),
+                    @intCast(start_pos),
+                    draft_buf[0 .. max_draft * vocab],
+                    null,
+                );
+                if (n_draft_raw <= 0) continue;
+
+                // Use Markov Head (Zig-side) for sequential correction on the draft logits
+                const ds = &(self.dspark.?);
+                const n_proposed = ds.propose(
+                    draft_buf[0..vocab], // base logits for position 0 (anchor corrected)
+                    next_token,
+                    dspark_draft_tokens[0..max_draft],
+                    draft_buf, // reuse as working buffer
+                );
+                if (n_proposed == 0) continue;
+
+                // Verify draft tokens against target model
+                const verify_len: usize = @intCast(n_proposed);
+                var verify_hidden = try self.allocator.alloc(f32, verify_len * MHC_MULT * DIM);
+                defer self.allocator.free(verify_hidden);
+                var verify_token_ids = try self.allocator.alloc(i32, verify_len);
+                defer self.allocator.free(verify_token_ids);
+
+                for (0..verify_len) |t| {
+                    const tok = dspark_draft_tokens[t];
+                    verify_token_ids[t] = @intCast(tok);
+                    metal.setTokenId(self.engine, @intCast(tok));
+                    metal.embed(self.engine, @intCast(tok), verify_hidden[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
+                }
+                try metal.forwardBatch(self.engine, verify_hidden, @intCast(verify_len), @intCast(start_pos), verify_token_ids);
+
+                var accepted: usize = 0;
+                for (0..verify_len) |k| {
+                    var verify_compressed: [DIM]f32 = undefined;
+                    metal.hyperHeadCompress(
+                        self.weight_store.weights.hc_head_fn.ptr,
+                        self.weight_store.weights.hc_head_base.ptr,
+                        self.weight_store.weights.hc_head_scale.ptr,
+                        verify_hidden[k * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM],
+                        &verify_compressed,
+                    );
+                    try metal.getLogits(self.engine, &verify_compressed, self.logits_buffer.ptr);
+                    const target_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
+
+                    if (target_token == dspark_draft_tokens[k]) {
+                        tokens[current_len] = dspark_draft_tokens[k];
+                        current_len += 1;
+                        accepted += 1;
+                        remaining -|= 1;
+                        if (dspark_draft_tokens[k] == self.eos_token) break;
+                    } else {
+                        tokens[current_len] = target_token;
+                        current_len += 1;
+                        accepted += 1;
+                        remaining -|= 1;
+                        break;
+                    }
+                }
+                start_pos += accepted;
+                if (accepted < verify_len) {
+                    metal.rollbackKv(self.engine, @intCast(start_pos));
+                }
+                if (current_len > 0 and tokens[current_len - 1] == self.eos_token) break;
+            } else if (self.dspark) |*ds| {
+                if (remaining == 0 or current_len >= tokens.len) continue;
+
+                // Propose draft tokens using Markov Head
+                const max_draft = @min(@as(usize, ds.block_size), remaining, tokens.len - current_len);
+                const n_draft = ds.propose(
+                    self.logits_buffer[0..@as(usize, self.config.vocab_size)],
+                    next_token,
+                    dspark_draft_tokens[0..max_draft],
+                    dspark_draft_logits_buf.?,
+                );
+
+                if (n_draft == 0) continue;
+
+                // Build verification batch: embed all draft tokens and forwardBatch
+                const verify_len = @as(usize, n_draft);
+                var verify_hidden = try self.allocator.alloc(f32, verify_len * MHC_MULT * DIM);
+                defer self.allocator.free(verify_hidden);
+                var verify_token_ids = try self.allocator.alloc(i32, verify_len);
+                defer self.allocator.free(verify_token_ids);
+
+                for (0..verify_len) |t| {
+                    const tok = dspark_draft_tokens[t];
+                    verify_token_ids[t] = @intCast(tok);
+                    metal.setTokenId(self.engine, @intCast(tok));
+                    metal.embed(self.engine, @intCast(tok), verify_hidden[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
+                }
+
+                // forwardBatch processes all draft tokens in one pass,
+                // writing KV cache entries at positions [start_pos .. start_pos + verify_len - 1]
+                try metal.forwardBatch(self.engine, verify_hidden, @intCast(verify_len), @intCast(start_pos), verify_token_ids);
+
+                // Verify each draft position: get target logits, check if draft matches
+                var accepted: usize = 0;
+                for (0..verify_len) |k| {
+                    var verify_compressed: [DIM]f32 = undefined;
+                    metal.hyperHeadCompress(
+                        self.weight_store.weights.hc_head_fn.ptr,
+                        self.weight_store.weights.hc_head_base.ptr,
+                        self.weight_store.weights.hc_head_scale.ptr,
+                        verify_hidden[k * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM],
+                        &verify_compressed,
+                    );
+                    try metal.getLogits(self.engine, &verify_compressed, self.logits_buffer.ptr);
+
+                    // Greedy verification: accept if target model agrees with draft
+                    const target_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
+
+                    if (target_token == dspark_draft_tokens[k]) {
+                        // Accepted — the draft token matches target
+                        tokens[current_len] = dspark_draft_tokens[k];
+                        current_len += 1;
+                        accepted += 1;
+                        remaining -|= 1;
+
+                        if (dspark_draft_tokens[k] == self.eos_token) {
+                            std.log.info("native_engine: EOS in draft (accepted pos {d})", .{k});
+                            break;
+                        }
+                    } else {
+                        // Rejected — use target's token as the bonus token
+                        tokens[current_len] = target_token;
+                        current_len += 1;
+                        accepted += 1; // bonus token counts as 1 accepted position
+                        remaining -|= 1;
+                        break;
+                    }
+                }
+
+                // If all draft tokens accepted, we need the bonus token from the last position
+                // (already handled: the last getLogits/sample above produced it in the reject case,
+                //  and if all accepted we continue to next iteration which does a fresh forward)
+
+                // Advance start_pos by accepted count and rollback KV
+                start_pos += accepted;
+                // Rollback KV cache: positions start_pos..start_pos+(verify_len-accepted) are invalid
+                if (accepted < verify_len) {
+                    metal.rollbackKv(self.engine, @intCast(start_pos));
+                }
+
+                // Check if we hit EOS in the accepted tokens
+                if (current_len > 0 and tokens[current_len - 1] == self.eos_token) {
+                    std.log.info("native_engine: EOS token generated (spec), stopping at pos={d}", .{start_pos});
+                    break;
+                }
             }
         }
 

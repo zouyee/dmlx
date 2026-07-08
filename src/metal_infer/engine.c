@@ -5,6 +5,7 @@
 //
 // See docs/analysis/flash-moe-alignment-plan.md for architecture details.
 #include "engine.h"
+#include "dspark_engine.h"
 #include "mla_attention.h"
 #include "mhc.h"
 #include <Metal/Metal.h>
@@ -661,6 +662,12 @@ void moe_infer_smelt_set_stats_path(MoEInferEngine *eng, const char *path) {
     eng->smelt_stats_path = path;  // caller owns the string
 }
 
+// Set DSpark engine pointer (enables hidden state extraction during forward)
+void moe_infer_set_dspark_engine(MoEInferEngine *eng, void *dspark) {
+    if (!eng) return;
+    eng->dspark_engine = dspark;
+}
+
 // ============================================================================
 // Gather mode: create per-layer full-expert buffers for gatherQmm
 // ============================================================================
@@ -841,7 +848,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                               uint8_t *expert_bufs[6], int *expert_ids,
                               float *expert_weights, int K) {
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
-    id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+    id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
     const int gw_off = GATE_W_OFF, gs_off = GATE_S_OFF;
     const int uw_off = UP_W_OFF, us_off = UP_S_OFF;
     const int dw_off = DOWN_W_OFF, ds_off = DOWN_S_OFF;
@@ -861,7 +868,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     // Note: fused_6expert_gate_up was tried but is slower due to reduced GPU parallelism
     // (serial expert loop in kernel vs GPU scheduling multiple dispatches in parallel).
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx] && !eng->use_affine_experts) {
             // === GATHER MODE: gatherQmm-equivalent ===
@@ -1280,7 +1287,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Encoders 2..N: Q chain + KV chain + SDPA (reads normed_bf16 from GPU, no CPU roundtrip)
     // Eliminates CB-A wait (32ms/token) by merging two CB boundaries into one.
     {
-        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         // Encoder 1: mhc_pre (attn) — writes normed_bf16 to GPU, consumed by Q/KV chain below
         {
@@ -1371,7 +1378,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         // NOTE: post/comb NOT written here — CMD2 (mhc_pre_ffn) overwrites buf_mhc_post_weights/comb
         // so any CPU memcpy of post/comb before CMD2 is wasted work.
 
-        id<MTLCommandBuffer> cb2cmd2 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> cb2cmd2 = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         // --- CB2 section: mhc_post(attn) ---
         // Enc 1: f32→bf16 for residual
@@ -1680,7 +1687,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;     // up output [INTERMEDIATE]
         id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;  // down output [DIM]
         {
-            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
+            id<MTLCommandBuffer> cb = [P.queue commandBufferWithUnretainedReferences];
             // Encoder 1: gate projection
             {
                 const QuantWeight *qw = &eng->shared[layer].gate;
@@ -1753,7 +1760,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents], residual, MHC_MULT * DIM * sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
         memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
-        id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         // Single encoder: mhc_post_ffn_expand4
         // block_out = buf_ffn_out_f32 (ffn output in f32)
@@ -1775,20 +1782,25 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [e endEncoding];
         }
 
-        [cb3 commit]; // DEFERRED — no wait here. Next layer waits at its start.
-
-        // Store deferred state for next layer (or moe_infer_forward end)
+        [cb3 commit];
+        // SYNCHRONOUS wait with dedicated pool — MLX pattern: avoid retained references cascade
+        // causing autoreleased 0x20 object in outer @autoreleasepool drain.
+        @autoreleasepool {
+            [cb3 waitUntilCompleted];
+        }
+        // Read residual from GPU buffer (cb3 wrote buf_residual_gpu)
+        {
+            float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
+            memcpy(residual, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
+        }
+        // Clean up deferred state
         if (eng->deferred.cmd_experts) {
-            // Should not happen, but force-wait to avoid leak
             [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
             [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
         }
-        [cb3 retain];
-        eng->deferred.cmd_experts  = (void *)cb3;
-        eng->deferred.active       = true;
-        eng->deferred.gpu_combined = true;  // cb3 wrote buf_residual_gpu
-        eng->deferred.layer_idx    = layer;
-        // NOTE: CPU residual[] is NOT updated here — done at start of next layer after wait.
+        eng->deferred.cmd_experts  = NULL;
+        eng->deferred.active       = false;
+        eng->deferred.gpu_combined = false;
     }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
@@ -1829,6 +1841,12 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
             double t1 = ts.tv_sec * 1e9 + ts.tv_nsec;
             fprintf(stderr, "[TIME] pos=%d layer=%d: %.1fms\n", pos, layer, (t1-t0)/1e6);
+        }
+        // DSpark: extract target hidden states from layers 40, 41, 42
+        // for use as input to the DSpark draft backbone.
+        if (eng->dspark_engine && (layer == 40 || layer == 41 || layer == 42)) {
+            dspark_accumulate_target_hidden(
+                (DSparkEngine *)eng->dspark_engine, hidden, layer);
         }
     }
 
@@ -1934,6 +1952,13 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 memcpy(last, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
                 eng->deferred.gpu_combined = false;
             }
+        }
+        // DSpark: extract last prefill token's hidden from layers 40/41/42.
+        // This provides the main_hidden input for DSpark draft during subsequent decode.
+        if (eng->dspark_engine && (layer == 40 || layer == 41 || layer == 42)) {
+            float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
+            dspark_accumulate_target_hidden(
+                (DSparkEngine *)eng->dspark_engine, last, layer);
         }
         // Per-layer residual dump: write last token's residual as raw f32 bin
         if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
@@ -2112,6 +2137,36 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
         if (cs->idx_state_score) memset(cs->idx_state_score, 0, 8 * 256 * sizeof(float));
         if (cs->idx_comp_kv)
             memset(cs->idx_comp_kv, 0, (size_t)MAX_COMP_BLOCKS * IDX_HEAD_DIM * sizeof(float));
+    }
+}
+
+void moe_infer_rollback_kv(MoEInferEngine *eng, int valid_len) {
+    // Truncate KV cache for all layers to valid_len.
+    // Used by speculative decoding when draft tokens are rejected.
+    if (valid_len < 0) valid_len = 0;
+    for (int l = 0; l < N_LAYERS; l++) {
+        if (eng->kv_cache[l].len > valid_len) {
+            eng->kv_cache[l].len = valid_len;
+        }
+        // Rollback compressor state: n_comp = valid_len / ratio (rounded down)
+        CompressorState *cs = &eng->comp_state[l];
+        if (cs->ratio > 0) {
+            uint32_t new_n_comp = (uint32_t)valid_len / cs->ratio;
+            if (cs->n_comp > new_n_comp) {
+                cs->n_comp = new_n_comp;
+            }
+            // Reset the rolling state buffer for partial blocks
+            // (tokens that haven't formed a complete compressed block yet)
+            uint32_t partial = (uint32_t)valid_len % cs->ratio;
+            if (partial == 0 && cs->state_kv && cs->out_dim > 0) {
+                memset(cs->state_kv, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
+                memset(cs->state_score, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
+            }
+            // Indexer compressor (ratio=4 layers only)
+            if (cs->n_idx_comp > new_n_comp) {
+                cs->n_idx_comp = new_n_comp;
+            }
+        }
     }
 }
 

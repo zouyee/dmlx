@@ -363,6 +363,143 @@ static void test_dequant_affine(void) {
     free(packed); free(scales); free(biases); free(x); free(ref);
 }
 
+// ---- test: dequant_matvec_int8_e8m0 ----
+static void test_dequant_int8_e8m0(void) {
+    printf("test_dequant_int8_e8m0:\n");
+    // Small test: out_dim=16, in_dim=64, block_size=16 → num_groups=4
+    const uint out_dim = 16, in_dim = 64, block_size_val = 16;
+    const uint num_groups = in_dim / block_size_val;
+
+    int8_t *W = malloc(out_dim * in_dim);
+    uint8_t *scales = malloc(out_dim * num_groups);
+    float *x = malloc(sizeof(float) * in_dim);
+    for (uint i = 0; i < out_dim * in_dim; i++) W[i] = (int8_t)((i * 7 + 3) % 251 - 125);
+    for (uint i = 0; i < out_dim * num_groups; i++) scales[i] = 120 + (i % 8); // E8M0: 2^(120..127 - 127)
+    for (uint i = 0; i < in_dim; i++) x[i] = ((float)(i % 11) - 5.0f) * 0.1f;
+
+    // CPU reference
+    float ref[16];
+    for (uint r = 0; r < out_dim; r++) {
+        double acc = 0;
+        for (uint g = 0; g < num_groups; g++) {
+            // E8M0 decode: 2^(byte - 127)
+            uint8_t sb = scales[r * num_groups + g];
+            uint32_t fbits = (uint32_t)sb << 23;
+            float sf = *(float*)&fbits;
+            for (uint i = 0; i < block_size_val; i++) {
+                uint idx = g * block_size_val + i;
+                acc += (double)W[r * in_dim + idx] * sf * (double)x[idx];
+            }
+        }
+        ref[r] = (float)acc;
+    }
+
+    // GPU
+    id<MTLComputePipelineState> p = mkpipe("dequant_matvec_int8_e8m0");
+    id<MTLBuffer> bW = buf(W, out_dim * in_dim);
+    id<MTLBuffer> bS = buf(scales, out_dim * num_groups);
+    id<MTLBuffer> bX = buf(x, sizeof(float) * in_dim);
+    id<MTLBuffer> bO = bufz(sizeof(float) * out_dim);
+    uint od = out_dim, id_val = in_dim, bs = block_size_val;
+
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:p];
+    [e setBuffer:bW offset:0 atIndex:0];
+    [e setBuffer:bS offset:0 atIndex:1];
+    [e setBuffer:bX offset:0 atIndex:2];
+    [e setBuffer:bO offset:0 atIndex:3];
+    [e setBytes:&od length:4 atIndex:4];
+    [e setBytes:&id_val length:4 atIndex:5];
+    [e setBytes:&bs length:4 atIndex:6];
+    [e dispatchThreadgroups:MTLSizeMake((out_dim + 7) / 8, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out_data = [bO contents];
+    float maxd = 0;
+    for (uint i = 0; i < out_dim; i++) {
+        float d = fabsf(ref[i] - out_data[i]);
+        if (d > maxd) maxd = d;
+    }
+    check("int8_e8m0 matvec", maxd, 1e-4f);
+    free(W); free(scales); free(x);
+}
+
+// ---- test: fused_gate_up_swiglu_int8_e8m0 ----
+static void test_fused_gate_up_swiglu_int8_e8m0(void) {
+    printf("test_fused_gate_up_swiglu_int8_e8m0:\n");
+    const uint out_dim = 8, in_dim = 64, block_size_val = 16;
+    const uint num_groups = in_dim / block_size_val;
+
+    int8_t *gate_W = malloc(out_dim * in_dim);
+    uint8_t *gate_s = malloc(out_dim * num_groups);
+    int8_t *up_W = malloc(out_dim * in_dim);
+    uint8_t *up_s = malloc(out_dim * num_groups);
+    float *x = malloc(sizeof(float) * in_dim);
+
+    for (uint i = 0; i < out_dim * in_dim; i++) { gate_W[i] = (int8_t)((i * 3 + 1) % 127 - 63); up_W[i] = (int8_t)((i * 5 + 7) % 127 - 63); }
+    for (uint i = 0; i < out_dim * num_groups; i++) { gate_s[i] = 121 + (i % 4); up_s[i] = 120 + (i % 5); }
+    for (uint i = 0; i < in_dim; i++) x[i] = ((float)(i % 9) - 4.0f) * 0.05f;
+
+    // CPU reference
+    float ref[8];
+    for (uint r = 0; r < out_dim; r++) {
+        double gate_val = 0, up_val = 0;
+        for (uint g = 0; g < num_groups; g++) {
+            uint32_t gb = (uint32_t)gate_s[r * num_groups + g] << 23;
+            uint32_t ub = (uint32_t)up_s[r * num_groups + g] << 23;
+            float gsf = *(float*)&gb, usf = *(float*)&ub;
+            for (uint i = 0; i < block_size_val; i++) {
+                uint idx = g * block_size_val + i;
+                gate_val += (double)gate_W[r * in_dim + idx] * gsf * (double)x[idx];
+                up_val += (double)up_W[r * in_dim + idx] * usf * (double)x[idx];
+            }
+        }
+        float g_c = fminf((float)gate_val, 10.0f);
+        float u_c = fminf(fmaxf((float)up_val, -10.0f), 10.0f);
+        float act = g_c / (1.0f + expf(-g_c));
+        ref[r] = act * u_c;
+    }
+
+    // GPU
+    id<MTLComputePipelineState> p = mkpipe("fused_gate_up_swiglu_int8_e8m0");
+    id<MTLBuffer> bGW = buf(gate_W, out_dim * in_dim);
+    id<MTLBuffer> bGS = buf(gate_s, out_dim * num_groups);
+    id<MTLBuffer> bUW = buf(up_W, out_dim * in_dim);
+    id<MTLBuffer> bUS = buf(up_s, out_dim * num_groups);
+    id<MTLBuffer> bX = buf(x, sizeof(float) * in_dim);
+    id<MTLBuffer> bO = bufz(sizeof(float) * out_dim);
+    uint od = out_dim, id_val = in_dim, bs = block_size_val;
+
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:p];
+    [enc setBuffer:bGW offset:0 atIndex:0];
+    [enc setBuffer:bGS offset:0 atIndex:1];
+    [enc setBuffer:bUW offset:0 atIndex:2];
+    [enc setBuffer:bUS offset:0 atIndex:3];
+    [enc setBuffer:bX offset:0 atIndex:4];
+    [enc setBuffer:bO offset:0 atIndex:5];
+    [enc setBytes:&od length:4 atIndex:6];
+    [enc setBytes:&id_val length:4 atIndex:7];
+    [enc setBytes:&bs length:4 atIndex:8];
+    [enc dispatchThreadgroups:MTLSizeMake((out_dim + 7) / 8, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [enc endEncoding];
+    [cb commit]; [cb waitUntilCompleted];
+
+    float *out_data = [bO contents];
+    float maxd = 0;
+    for (uint i = 0; i < out_dim; i++) {
+        float d = fabsf(ref[i] - out_data[i]);
+        if (d > maxd) maxd = d;
+    }
+    check("int8_e8m0 fused_gate_up_swiglu", maxd, 1e-4f);
+    free(gate_W); free(gate_s); free(up_W); free(up_s); free(x);
+}
+
 int main(int argc, char **argv) {
     const char *src_path = (argc > 1) ? argv[1] : "src/models/moe_kernel.metal";
     dev = MTLCreateSystemDefaultDevice();
@@ -385,6 +522,8 @@ int main(int argc, char **argv) {
     test_sdpa_f16();
     test_sdpa_f16in_f16out_multi_kv();
     test_dequant_affine();
+    test_dequant_int8_e8m0();
+    test_fused_gate_up_swiglu_int8_e8m0();
 
     printf(g_fail ? "\nRESULT: KERNEL TESTS FAILED\n" : "\nRESULT: ALL KERNEL TESTS PASSED\n");
     return g_fail;
