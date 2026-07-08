@@ -351,6 +351,9 @@ pub const NativeEngine = struct {
         var dspark_draft_tokens: [DSPARK_MAX_BLOCK]u32 = undefined;
         var dspark_draft_logits_buf: ?[]f32 = null;
         defer if (dspark_draft_logits_buf) |buf| self.allocator.free(buf);
+        var dspark_total_drafted: usize = 0;
+        var dspark_total_accepted: usize = 0;
+        var dspark_total_steps: usize = 0;
         if (self.dspark_engine != null or self.dspark != null) {
             dspark_draft_logits_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
         }
@@ -469,17 +472,24 @@ pub const NativeEngine = struct {
                         remaining -|= 1;
                         if (dspark_draft_tokens[k] == self.eos_token) break;
                     } else {
+                        // Reject: use target's token but DON'T count as accepted for KV purposes.
+                        // The target_token needs its own proper forward pass (next loop iteration)
+                        // to write correct KV. We just record it for output.
                         tokens[current_len] = target_token;
                         current_len += 1;
-                        accepted += 1;
                         remaining -|= 1;
                         break;
                     }
                 }
+                // Rollback KV: only keep entries for truly accepted draft tokens.
+                // Positions start_pos..start_pos+accepted-1 have correct KV (draft == target).
+                // Position start_pos+accepted has wrong KV (was draft, should be target).
                 start_pos += accepted;
-                if (accepted < verify_len) {
-                    metal.rollbackKv(self.engine, @intCast(start_pos));
-                }
+                dspark_total_drafted += verify_len;
+                dspark_total_accepted += accepted;
+                dspark_total_steps += 1;
+                // Always rollback to start_pos (discard verification KV beyond accepted tokens)
+                metal.rollbackKv(self.engine, @intCast(start_pos));
                 if (current_len > 0 and tokens[current_len - 1] == self.eos_token) break;
             } else if (self.dspark) |*ds| {
                 if (remaining == 0 or current_len >= tokens.len) continue;
@@ -576,6 +586,18 @@ pub const NativeEngine = struct {
             const log_ms = @as(u64, @intFromFloat(@as(f64, @floatFromInt(_t_logits_total)) * 125.0 / 3_000_000.0 / @as(f64, @floatFromInt(_t_decode_n))));
             std.log.info("[DECODE_TIME] n={d} forward={d}ms logits={d}ms per_tok={d}ms", .{
                 _t_decode_n, fwd_ms, log_ms, fwd_ms + log_ms,
+            });
+        }
+
+        if (dspark_total_steps > 0) {
+            std.log.info("[dspark-stats] steps={d} drafted={d} accepted={d} rate={d:.1}%", .{
+                dspark_total_steps,
+                dspark_total_drafted,
+                dspark_total_accepted,
+                if (dspark_total_drafted > 0)
+                    @as(f64, @floatFromInt(dspark_total_accepted)) * 100.0 / @as(f64, @floatFromInt(dspark_total_drafted))
+                else
+                    0.0,
             });
         }
 
