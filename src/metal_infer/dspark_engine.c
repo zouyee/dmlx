@@ -25,10 +25,14 @@
 //
 #include "dspark_engine.h"
 #include "engine.h"
+#include "mhc.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <Accelerate/Accelerate.h>
 
 // Forward declarations for dspark_attention.c
@@ -92,19 +96,38 @@ static void fp8_matvec_cpu(
     }
 }
 
-// mHC pre: reduces [MHC_MULT, DIM] → [DIM] via learned weighted sum + sinkhorn.
-// Reuses the same algorithm as engine.c's mhc_pre (CPU version from mhc.c).
-// For DSpark we keep this simple — delegate to the existing mhc.h functions.
-extern void mhc_pre(const float *residual, const float *fn, const float *base,
-                    const float *scale, float *out_input, float *out_post,
-                    float *out_comb, int dim, int hc_mult, int sinkhorn_iters, float eps);
-extern void mhc_post(const float *x, const float *residual,
-                     const float *post, const float *comb,
-                     float *out, int dim, int hc_mult);
-// hc_head (simplified mhc_pre without sinkhorn, used for final output compression)
-// Uses hyper_head_compress from mhc.c
-extern void hyper_head_compress(const float *fn, const float *base, const float *scale,
-                                const float *residual, float *out);
+// mHC pre/post: now included via mhc.h
+
+// ============================================================================
+// FP8 E4M3 weight dequantization to f32 (done once at init for attention weights)
+// ============================================================================
+
+static void dequant_fp8_to_f32(const DSparkFP8Weight *w, float *out) {
+    if (!w->weight || !w->scale) return;
+    int out_dim = w->out_dim, in_dim = w->in_dim, bs = w->block_size;
+    int scale_cols = (in_dim + bs - 1) / bs;
+    for (int r = 0; r < out_dim; r++) {
+        int sr = r / bs;
+        for (int c = 0; c < in_dim; c++) {
+            int sc = c / bs;
+            uint8_t sb = w->scale[sr * scale_cols + sc];
+            uint32_t sf_bits = (uint32_t)sb << 23;
+            float sf = *(float*)&sf_bits;
+            uint8_t byte = w->weight[r * in_dim + c];
+            int sign = (byte >> 7) & 1;
+            int exp = (byte >> 3) & 0xF;
+            int man = byte & 0x7;
+            float val;
+            if (exp == 0) {
+                val = (man == 0) ? 0.0f : (float)man / 8.0f * (1.0f / 64.0f);
+            } else {
+                val = (1.0f + (float)man / 8.0f) * exp2f((float)exp - 7.0f);
+            }
+            if (sign) val = -val;
+            out[r * in_dim + c] = val * sf;
+        }
+    }
+}
 
 // ============================================================================
 // dspark_init
@@ -149,17 +172,30 @@ DSparkEngine *dspark_init(
         eng->kv_cache[l].draft_len = 0;
     }
 
-    // Open packed expert files (INT8 format)
+    // Open packed expert files (INT8 format) and mmap for GPU dispatch
+    eng->expert_mmap_size = (size_t)N_EXPERTS * DSPARK_EXPERT_SIZE;
     for (int l = 0; l < DSPARK_N_LAYERS; l++) {
         char path[512];
         snprintf(path, sizeof(path), "%s/mtp_layer_%02d.bin", packed_expert_dir, l);
-        FILE *f = fopen(path, "r");
-        if (f) {
-            eng->expert_fd[l] = fileno(f);
-            // Don't fclose — keep fd open for pread
+        int fd = open(path, O_RDONLY);
+        if (fd >= 0) {
+            eng->expert_fd[l] = fd;
+            // mmap the entire file for zero-copy GPU buffer creation
+            void *mapped = mmap(NULL, eng->expert_mmap_size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (mapped == MAP_FAILED) {
+                fprintf(stderr, "[dspark] WARNING: mmap failed for %s, falling back to pread\n", path);
+                eng->expert_mmap[l] = NULL;
+            } else {
+                eng->expert_mmap[l] = (uint8_t *)mapped;
+                // Advise sequential access for prefetching
+                madvise(mapped, eng->expert_mmap_size, MADV_SEQUENTIAL);
+                printf("[dspark] mmap'd layer %d experts: %.1f GB\n", l,
+                       (float)eng->expert_mmap_size / (1024.0f * 1024.0f * 1024.0f));
+            }
         } else {
             fprintf(stderr, "[dspark] WARNING: cannot open %s\n", path);
             eng->expert_fd[l] = -1;
+            eng->expert_mmap[l] = NULL;
         }
     }
 
@@ -273,6 +309,56 @@ DSparkEngine *dspark_init(
         #undef LOAD_BIN
         #undef LOAD_FP8
 
+        // Pre-dequantize FP8 attention weights to f32 for fast cblas_sgemv
+        for (int l = 0; l < DSPARK_N_LAYERS; l++) {
+            DSparkAttnWeights *aw = &eng->layers[l].attn;
+            if (aw->wq_a.weight) {
+                aw->wq_a_f32 = (float *)malloc((size_t)aw->wq_a.out_dim * aw->wq_a.in_dim * sizeof(float));
+                if (aw->wq_a_f32) dequant_fp8_to_f32(&aw->wq_a, aw->wq_a_f32);
+            }
+            if (aw->wq_b.weight) {
+                aw->wq_b_f32 = (float *)malloc((size_t)aw->wq_b.out_dim * aw->wq_b.in_dim * sizeof(float));
+                if (aw->wq_b_f32) dequant_fp8_to_f32(&aw->wq_b, aw->wq_b_f32);
+            }
+            if (aw->wkv.weight) {
+                aw->wkv_f32 = (float *)malloc((size_t)aw->wkv.out_dim * aw->wkv.in_dim * sizeof(float));
+                if (aw->wkv_f32) dequant_fp8_to_f32(&aw->wkv, aw->wkv_f32);
+            }
+            if (aw->wo_a.weight) {
+                aw->wo_a_f32 = (float *)malloc((size_t)aw->wo_a.out_dim * aw->wo_a.in_dim * sizeof(float));
+                if (aw->wo_a_f32) dequant_fp8_to_f32(&aw->wo_a, aw->wo_a_f32);
+            }
+            if (aw->wo_b.weight) {
+                aw->wo_b_f32 = (float *)malloc((size_t)aw->wo_b.out_dim * aw->wo_b.in_dim * sizeof(float));
+                if (aw->wo_b_f32) dequant_fp8_to_f32(&aw->wo_b, aw->wo_b_f32);
+            }
+        }
+        {
+            // Report memory usage
+            size_t attn_mem = 0;
+            for (int l = 0; l < DSPARK_N_LAYERS; l++) {
+                DSparkAttnWeights *aw = &eng->layers[l].attn;
+                if (aw->wq_a_f32) attn_mem += (size_t)aw->wq_a.out_dim * aw->wq_a.in_dim * 4;
+                if (aw->wq_b_f32) attn_mem += (size_t)aw->wq_b.out_dim * aw->wq_b.in_dim * 4;
+                if (aw->wkv_f32)  attn_mem += (size_t)aw->wkv.out_dim * aw->wkv.in_dim * 4;
+                if (aw->wo_a_f32) attn_mem += (size_t)aw->wo_a.out_dim * aw->wo_a.in_dim * 4;
+                if (aw->wo_b_f32) attn_mem += (size_t)aw->wo_b.out_dim * aw->wo_b.in_dim * 4;
+            }
+            printf("[dspark] attention weights dequantized to f32: %.1f MB\n",
+                   (float)attn_mem / (1024.0f * 1024.0f));
+        }
+
+        // Pre-dequantize main_proj to f32
+        if (eng->head.main_proj.weight) {
+            size_t mp_size = (size_t)eng->head.main_proj.out_dim * eng->head.main_proj.in_dim;
+            eng->head.main_proj_f32 = (float *)malloc(mp_size * sizeof(float));
+            if (eng->head.main_proj_f32) {
+                dequant_fp8_to_f32(&eng->head.main_proj, eng->head.main_proj_f32);
+                printf("[dspark] main_proj dequantized to f32: %.1f MB\n",
+                       (float)(mp_size * 4) / (1024.0f * 1024.0f));
+            }
+        }
+
         // Verify critical weights loaded
         if (eng->head.markov_w1 && eng->head.markov_w2) {
             printf("[dspark] Markov Head loaded: W1+W2 [%d × %d] (%.1f MB)\n",
@@ -306,7 +392,10 @@ void dspark_deinit(DSparkEngine *eng) {
     for (int l = 0; l < DSPARK_N_LAYERS; l++) {
         free(eng->kv_cache[l].main_kv);
         free(eng->kv_cache[l].draft_kv);
-        // Note: expert_fd is borrowed from target, don't close here
+        if (eng->expert_mmap[l]) {
+            munmap(eng->expert_mmap[l], eng->expert_mmap_size);
+        }
+        if (eng->expert_fd[l] >= 0) close(eng->expert_fd[l]);
     }
     free(eng);
 }
@@ -369,6 +458,109 @@ void dspark_update_main_kv(DSparkEngine *eng, const uint16_t *target_kv_entry, i
 }
 
 // ============================================================================
+// CPU MoE forward for DSpark INT8+E8M0 experts
+// ============================================================================
+
+// INT8 dequant matvec: out[r] = sum_c( int8_to_float(w[r,c]) * e8m0_scale(scale[r*cols+c)/16]) * x[c] )
+// Layout: weight is row-major [out_dim, in_dim] int8; scale is [out_dim*in_dim/16] E8M0
+// (one scale byte per 16 consecutive weight bytes in row-major order).
+static void int8_e8m0_matvec(
+    const uint8_t *weight, const uint8_t *scale,
+    const float *x, float *out,
+    int out_dim, int in_dim
+) {
+    const int bs = DSPARK_EXPERT_BLOCK_SIZE; // 16
+    for (int r = 0; r < out_dim; r++) {
+        float acc = 0.0f;
+        const uint8_t *w_row = weight + (size_t)r * in_dim;
+        const uint8_t *s_row = scale + (size_t)r * (in_dim / bs);
+        for (int c = 0; c < in_dim; c += bs) {
+            // E8M0 scale for this block of 16
+            uint8_t sb = s_row[c / bs];
+            uint32_t sf_bits = (uint32_t)sb << 23;
+            float sf = *(float*)&sf_bits;  // 2^(sb-127)
+            for (int j = 0; j < bs && (c + j) < in_dim; j++) {
+                int8_t wval = (int8_t)w_row[c + j];
+                acc += (float)wval * sf * x[c + j];
+            }
+        }
+        out[r] = acc;
+    }
+}
+
+// SwiGLU activation: out[i] = silu(gate[i]) * up[i]
+static void swiglu(const float *gate, const float *up, float *out, int dim) {
+    for (int i = 0; i < dim; i++) {
+        float g = gate[i];
+        float silu_g = g / (1.0f + expf(-g));
+        out[i] = silu_g * up[i];
+    }
+}
+
+// CPU MoE forward for a single token position in DSpark.
+// Performs: gate matmul → routing → pread experts → gate_up_swiglu → down → weighted combine.
+// Falls back to CPU if mmap not available; otherwise uses GPU dispatch.
+static void dspark_moe_forward_cpu(
+    DSparkEngine *eng, int layer_idx,
+    const float *normed_input,  // [DIM] — ffn_norm output
+    float *moe_out              // [DIM] — output (weighted sum of K=6 experts)
+) {
+    DSparkLayerWeights *lw = &eng->layers[layer_idx];
+    MoEInferEngine *target = (MoEInferEngine *)eng->target_engine;
+
+    // 1. Gate matmul: scores[e] = dot(gate_weight[e], normed_input) for e in 0..N_EXPERTS
+    float scores[N_EXPERTS];
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                N_EXPERTS, DIM, 1.0f, lw->gate_weight, DIM,
+                normed_input, 1, 0.0f, scores, 1);
+
+    // 2. CPU routing: sqrtsoftplus + bias + topK + L1-normalize
+    int expert_ids[N_ACTIVE];
+    float expert_weights[N_ACTIVE];
+    {
+        float processed[N_EXPERTS];
+        for (int i = 0; i < N_EXPERTS; i++) {
+            float l = scores[i] + (lw->gate_bias ? lw->gate_bias[i] : 0.0f);
+            float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
+            processed[i] = sqrtf(sp);
+        }
+        uint8_t taken[N_EXPERTS];
+        memset(taken, 0, sizeof(taken));
+        for (int k = 0; k < N_ACTIVE; k++) {
+            int best = -1; float bv = -1e30f;
+            for (int i = 0; i < N_EXPERTS; i++) {
+                if (!taken[i] && processed[i] > bv) { bv = processed[i]; best = i; }
+            }
+            expert_ids[k] = best;
+            expert_weights[k] = processed[best];
+            taken[best] = 1;
+        }
+        float wsum = 0;
+        for (int k = 0; k < N_ACTIVE; k++) wsum += expert_weights[k];
+        wsum += 1e-20f;
+        for (int k = 0; k < N_ACTIVE; k++) expert_weights[k] = expert_weights[k] / wsum * 1.5f;
+    }
+
+    // 3. GPU dispatch if mmap is available
+    if (eng->expert_mmap[layer_idx]) {
+        uint8_t *expert_ptrs[6];
+        for (int k = 0; k < N_ACTIVE; k++) {
+            int eid = expert_ids[k];
+            expert_ptrs[k] = eng->expert_mmap[layer_idx] + (size_t)eid * DSPARK_EXPERT_SIZE;
+        }
+        dspark_moe_forward_gpu(target, normed_input, expert_ptrs, expert_ids, expert_weights, N_ACTIVE, moe_out);
+        return;
+    }
+
+    // 4. CPU fallback (no mmap — should not happen in normal operation)
+    memset(moe_out, 0, DIM * sizeof(float));
+    fprintf(stderr, "[dspark] WARNING: CPU MoE fallback (no mmap). Output will be zero.\n");
+
+moe_cleanup:
+    (void)0;  // no heap allocations in GPU path
+}
+
+// ============================================================================
 // dspark_forward — Main DSpark 3-layer forward pass
 // ============================================================================
 
@@ -392,31 +584,143 @@ int dspark_forward(
 
     const int bs = eng->block_size;
     const int vocab = eng->vocab_size;
+    const float *src_hidden = main_hidden ? main_hidden : eng->buf_main_hidden;
 
     // =====================================================================
-    // Phase 3 simplified forward: skip 3-layer backbone (placeholder),
-    // just produce base logits from embedding + lm_head for each draft position.
-    // The Markov Head correction will still provide useful draft tokens.
-    // Full backbone will be enabled once stack overflow / mhc_pre issues are fixed.
+    // Step 1: main_proj(concat(target_hidden[40,41,42])) → main_x [DIM]
     // =====================================================================
-
-    // For each draft position, compute logits from the embedding of the noise token
-    // (or anchor for pos 0). This is a simplified "embedding-only" draft.
-    for (int k = 0; k < bs; k++) {
-        int tok = (k == 0) ? anchor_token_id : (int)eng->noise_token_id;
-        const float *emb_row = target->embed + tok * DIM;
-
-        // norm + lm_head → logits
-        float normed[DIM];
-        rms_norm_cpu(emb_row, eng->head.final_norm, normed, DIM);
-
-        float *logits_k = draft_logits + k * vocab;
-        cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                    vocab, DIM, 1.0f, target->lm_head, DIM,
-                    normed, 1, 0.0f, logits_k, 1);
+    float *main_x = eng->buf_main_x;
+    {
+        float proj_raw[DIM];
+        if (eng->head.main_proj_f32) {
+            // Use pre-dequantized f32 weights with cblas (fast + precise)
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        DIM, 3 * DIM, 1.0f, eng->head.main_proj_f32, 3 * DIM,
+                        src_hidden, 1, 0.0f, proj_raw, 1);
+        } else {
+            fp8_matvec_cpu(eng->head.main_proj.weight, eng->head.main_proj.scale,
+                           src_hidden, proj_raw,
+                           DIM, 3 * DIM, eng->head.main_proj.block_size);
+        }
+        rms_norm_cpu(proj_raw, eng->head.main_norm, main_x, DIM);
     }
 
-    // Confidence: just return 0.5 for all positions (neutral)
+    // =====================================================================
+    // Step 2: Initialize draft_hidden [DSPARK_BLOCK_SIZE, MHC_MULT, DIM]
+    //   Position 0: embed(anchor_token) + main_x (combined input from target)
+    //   Position 1-4: embed(noise_token) + main_x
+    //   Each position's residual is [MHC_MULT, DIM] with combined input replicated.
+    // =====================================================================
+    float *draft_hidden = eng->buf_draft_hidden; // [bs * MHC_MULT * DIM]
+    for (int k = 0; k < bs; k++) {
+        int tok = (k == 0) ? anchor_token_id : (int)eng->noise_token_id;
+        const float *emb_row = target->embed + (size_t)tok * DIM;
+        float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+        // Initialize all MHC_MULT streams with embedding + main_x
+        for (int m = 0; m < MHC_MULT; m++) {
+            float *dst = res_k + m * DIM;
+            for (int d = 0; d < DIM; d++) {
+                dst[d] = emb_row[d] + main_x[d];
+            }
+        }
+    }
+
+    // =====================================================================
+    // Step 3: 3-layer backbone loop
+    //   For each layer: mhc_pre(attn) → attn_norm → attention → mhc_post(attn)
+    //                   mhc_pre(ffn)  → ffn_norm  → MoE       → mhc_post(ffn)
+    // =====================================================================
+
+    // Scratch per-position
+    float sublayer_input[DIM];
+    float post_mix[MHC_MULT];
+    float comb_mix[MHC_MULT * MHC_MULT];
+    float normed[DIM];
+    float sublayer_out[DIM];
+    float new_residual[MHC_MULT * DIM];
+
+    // Batch buffers for attention (all positions at once)
+    float *attn_normed_batch = (float *)malloc((size_t)bs * DIM * sizeof(float));
+    float *attn_out_batch = (float *)malloc((size_t)bs * DIM * sizeof(float));
+
+    if (!attn_normed_batch || !attn_out_batch) {
+        fprintf(stderr, "[dspark] forward scratch alloc failed\n");
+        free(attn_normed_batch);
+        free(attn_out_batch);
+        return 0;
+    }
+
+    for (int layer = 0; layer < DSPARK_N_LAYERS; layer++) {
+        DSparkLayerWeights *lw = &eng->layers[layer];
+        MhcWeights hc_attn = { .fn = lw->hc_attn_fn, .base = lw->hc_attn_base, .scale = lw->hc_attn_scale };
+        MhcWeights hc_ffn  = { .fn = lw->hc_ffn_fn,  .base = lw->hc_ffn_base,  .scale = lw->hc_ffn_scale  };
+
+        // --- Attention sublayer ---
+        // mhc_pre(attn) for each position → gather normed inputs for batch attention
+        float post_mix_attn[DSPARK_BLOCK_SIZE][MHC_MULT];
+        float comb_mix_attn[DSPARK_BLOCK_SIZE][MHC_MULT * MHC_MULT];
+
+        for (int k = 0; k < bs; k++) {
+            float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+            mhc_pre(&hc_attn, res_k, sublayer_input, post_mix_attn[k], comb_mix_attn[k]);
+            rms_norm_cpu(sublayer_input, lw->attn_norm, attn_normed_batch + k * DIM, DIM);
+        }
+
+        // Batch attention forward (placeholder: identity passthrough)
+        dspark_attention_forward(eng, layer, attn_normed_batch, main_x, attn_out_batch, start_pos);
+
+        // mhc_post(attn) for each position
+        for (int k = 0; k < bs; k++) {
+            float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+            mhc_post(attn_out_batch + k * DIM, res_k, post_mix_attn[k], comb_mix_attn[k], new_residual);
+            memcpy(res_k, new_residual, MHC_MULT * DIM * sizeof(float));
+        }
+
+        // --- FFN/MoE sublayer ---
+        for (int k = 0; k < bs; k++) {
+            float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+
+            // mhc_pre(ffn)
+            mhc_pre(&hc_ffn, res_k, sublayer_input, post_mix, comb_mix);
+
+            // ffn_norm
+            rms_norm_cpu(sublayer_input, lw->ffn_norm, normed, DIM);
+
+            // MoE forward (CPU: gate → route → pread → dequant → combine)
+            dspark_moe_forward_cpu(eng, layer, normed, sublayer_out);
+
+            // mhc_post(ffn)
+            mhc_post(sublayer_out, res_k, post_mix, comb_mix, new_residual);
+            memcpy(res_k, new_residual, MHC_MULT * DIM * sizeof(float));
+        }
+    }
+
+    free(attn_normed_batch);
+    free(attn_out_batch);
+
+    // =====================================================================
+    // Step 4: hc_head compress → final_norm → lm_head → logits
+    // =====================================================================
+    for (int k = 0; k < bs; k++) {
+        float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+        float compressed[DIM];
+
+        // hc_head: compress [MHC_MULT, DIM] → [DIM]
+        hyper_head_compress(eng->head.hc_head_fn, eng->head.hc_head_base,
+                           eng->head.hc_head_scale, res_k, compressed);
+
+        // final RMSNorm
+        float final_normed[DIM];
+        rms_norm_cpu(compressed, eng->head.final_norm, final_normed, DIM);
+
+        // lm_head matmul → logits
+        float *logits_k = draft_logits + (size_t)k * vocab;
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    vocab, DIM, 1.0f, target->lm_head, DIM,
+                    final_normed, 1, 0.0f, logits_k, 1);
+    }
+
+    // Confidence: placeholder 0.5 for now (real confidence head needs hidden + markov embed)
     if (confidence) {
         for (int k = 0; k < bs; k++) confidence[k] = 0.5f;
     }

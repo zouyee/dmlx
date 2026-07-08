@@ -323,3 +323,8 @@ pub fn dsparkUpdateMainKv(eng: *DSparkEngine, target_kv_entry: [*c]const u16, po
 pub fn setDSparkEngine(engine: *Engine, dspark: ?*DSparkEngine) void {
     moe_infer_set_dspark_engine(engine, dspark);
 }
+
+extern fn moe_infer_set_dspark_accumulate(engine: *Engine, enabled: bool) void;
+pub fn setDSparkAccumulate(engine: *Engine, enabled: bool) void {
+    moe_infer_set_dspark_accumulate(engine, enabled);
+}

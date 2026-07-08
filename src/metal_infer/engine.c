@@ -58,6 +58,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_fused_6expert_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_down"] error:&err]);
     eng->pipe_gather_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_gate_up_swiglu"] error:&err]);
     eng->pipe_gather_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_down"] error:&err]);
+    eng->pipe_int8_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_int8_e8m0"] error:&err]);
+    eng->pipe_int8_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_int8_e8m0"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
     eng->pipe_rms_norm_apply = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_apply"] error:&err]);
     eng->pipe_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_f32"] error:&err]);
@@ -666,6 +668,11 @@ void moe_infer_smelt_set_stats_path(MoEInferEngine *eng, const char *path) {
 void moe_infer_set_dspark_engine(MoEInferEngine *eng, void *dspark) {
     if (!eng) return;
     eng->dspark_engine = dspark;
+    eng->dspark_accumulate_enabled = (dspark != NULL);  // enabled by default when DSpark is active
+}
+
+void moe_infer_set_dspark_accumulate(MoEInferEngine *eng, bool enabled) {
+    if (eng) eng->dspark_accumulate_enabled = enabled;
 }
 
 // ============================================================================
@@ -1844,10 +1851,18 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
         }
         // DSpark: extract target hidden states from layers 40, 41, 42
         // for use as input to the DSpark draft backbone.
-        if (eng->dspark_engine && (layer == 40 || layer == 41 || layer == 42)) {
+        if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
             dspark_accumulate_target_hidden(
                 (DSparkEngine *)eng->dspark_engine, hidden, layer);
         }
+    }
+
+    // DSpark: feed the latest KV entry from layer 0 into DSpark's sliding window.
+    // Each decode step writes one KV entry at pos; DSpark needs this for attention context.
+    if (eng->dspark_engine && eng->dspark_accumulate_enabled && eng->kv_cache[0].len > 0) {
+        int kv_pos = eng->kv_cache[0].len - 1;  // latest entry
+        uint16_t *kv_entry = eng->kv_cache[0].kv + (size_t)kv_pos * KV_LORA_RANK;
+        dspark_update_main_kv((DSparkEngine *)eng->dspark_engine, kv_entry, kv_pos);
     }
 
     // Wait for last layer's deferred cb3 + read final residual back to hidden.
@@ -1955,7 +1970,7 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         }
         // DSpark: extract last prefill token's hidden from layers 40/41/42.
         // This provides the main_hidden input for DSpark draft during subsequent decode.
-        if (eng->dspark_engine && (layer == 40 || layer == 41 || layer == 42)) {
+        if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
             float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
             dspark_accumulate_target_hidden(
                 (DSparkEngine *)eng->dspark_engine, last, layer);
@@ -1971,6 +1986,16 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 fwrite(last, sizeof(float), MHC_MULT * DIM, fl);
                 fclose(fl);
             }
+        }
+    }
+
+    // DSpark: feed prefilled KV entries into DSpark's sliding window.
+    // After prefill, layer 0's KV cache has entries for all prefilled positions.
+    if (eng->dspark_engine && eng->dspark_accumulate_enabled && eng->kv_cache[0].len > 0) {
+        int kv_len = eng->kv_cache[0].len;
+        for (int p = 0; p < kv_len; p++) {
+            uint16_t *kv_entry = eng->kv_cache[0].kv + (size_t)p * KV_LORA_RANK;
+            dspark_update_main_kv((DSparkEngine *)eng->dspark_engine, kv_entry, p);
         }
     }
 
@@ -2594,4 +2619,138 @@ void moe_infer_deinit(MoEInferEngine *eng) {
         free(cs->idx_comp_kv);
     }
     free(eng);
+}
+
+// ============================================================================
+// DSpark INT8 MoE GPU dispatch (called from dspark_engine.c via C linkage)
+// ============================================================================
+// Performs: gate_up_swiglu + down_proj for K=6 MXFP4 experts on GPU.
+// Input: normed[DIM] in buf_normed, expert data pointers, expert weights.
+// Output: combined MoE output in out_buf[DIM].
+//
+// Uses the SAME MXFP4 kernels as target model (pipe_gate_up_swiglu_v2 + pipe_dequant_matvec).
+
+void dspark_moe_forward_gpu(
+    MoEInferEngine *eng,
+    const float *normed_input,       // [DIM] — will be copied to buf_normed
+    uint8_t *expert_ptrs[6],         // [K] pointers to preloaded expert data
+    int *expert_ids,                 // [K] (for logging only)
+    float *expert_weights,           // [K] normalized routing weights
+    int K,
+    float *moe_out                   // [DIM] output
+) {
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
+
+    // Copy input to buf_normed
+    float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
+    memcpy(bn, normed_input, DIM * sizeof(float));
+
+    // MXFP4 expert layout (same as target: dim=4096, inter=2048, gs=32)
+    const uint out_dim_gu = INTERMEDIATE;  // 2048
+    const uint in_dim_gu  = DIM;           // 4096
+    const uint out_dim_d  = DIM;           // 4096
+    const uint in_dim_d   = INTERMEDIATE;  // 2048
+    const uint gs = MOE_GROUP_SIZE;        // 32
+
+    // Byte sizes for MXFP4 packed weights (2 nibbles per byte)
+    const size_t gu_w_bytes = (size_t)out_dim_gu * in_dim_gu / 2;  // 4194304
+    const size_t gu_s_bytes = (size_t)out_dim_gu * (in_dim_gu / gs); // 262144
+    const size_t dn_w_bytes = (size_t)out_dim_d * in_dim_d / 2;     // 4194304
+    const size_t dn_s_bytes = (size_t)out_dim_d * (in_dim_d / gs);   // 262144
+    // Offsets within each expert: w1.w, w1.s, w3.w, w3.s, w2.w, w2.s
+    const size_t w1_w_off = 0;
+    const size_t w1_s_off = gu_w_bytes;
+    const size_t w3_w_off = gu_w_bytes + gu_s_bytes;
+    const size_t w3_s_off = w3_w_off + gu_w_bytes;
+    const size_t w2_w_off = w3_s_off + gu_s_bytes;
+    const size_t w2_s_off = w2_w_off + dn_w_bytes;
+
+    id<MTLCommandBuffer> cb = [q commandBufferWithUnretainedReferences];
+
+    // Step 1: gate_up_swiglu for each expert (MXFP4 kernel — same as target)
+    for (int k = 0; k < K; k++) {
+        uint8_t *base = expert_ptrs[k];
+        if (!base) continue;
+
+        id<MTLBuffer> gate_w = [d newBufferWithBytesNoCopy:base+w1_w_off length:gu_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> gate_s = [d newBufferWithBytesNoCopy:base+w1_s_off length:gu_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> up_w   = [d newBufferWithBytesNoCopy:base+w3_w_off length:gu_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> up_s   = [d newBufferWithBytesNoCopy:base+w3_s_off length:gu_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gate_up_swiglu_v2];
+        [enc setBuffer:gate_w offset:0 atIndex:0];
+        [enc setBuffer:gate_s offset:0 atIndex:1];
+        [enc setBuffer:up_w   offset:0 atIndex:2];
+        [enc setBuffer:up_s   offset:0 atIndex:3];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:4];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_mid[k] offset:0 atIndex:5];
+        uint od=out_dim_gu, id_=in_dim_gu, g=gs;
+        [enc setBytes:&od  length:4 atIndex:6];
+        [enc setBytes:&id_ length:4 atIndex:7];
+        [enc setBytes:&g   length:4 atIndex:8];
+        [enc setThreadgroupMemoryLength:512 atIndex:0];
+        uint ntg = (out_dim_gu + 1) / 2;
+        [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+        [enc endEncoding];
+    }
+
+    // Step 2: down_proj for each expert (MXFP4 dequant matvec — same as target)
+    for (int k = 0; k < K; k++) {
+        uint8_t *base = expert_ptrs[k];
+        if (!base) continue;
+
+        id<MTLBuffer> dn_w = [d newBufferWithBytesNoCopy:base+w2_w_off length:dn_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+        id<MTLBuffer> dn_s = [d newBufferWithBytesNoCopy:base+w2_s_off length:dn_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec];
+        [enc setBuffer:dn_w offset:0 atIndex:0];
+        [enc setBuffer:dn_s offset:0 atIndex:1];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_mid[k] offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_out[k] offset:0 atIndex:3];
+        uint od=out_dim_d, id_=in_dim_d, g=gs;
+        [enc setBytes:&od  length:4 atIndex:4];
+        [enc setBytes:&id_ length:4 atIndex:5];
+        [enc setBytes:&g   length:4 atIndex:6];
+        [enc setThreadgroupMemoryLength:256 atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+
+    // Step 3: combine (blit to contiguous + weighted sum)
+    {
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        for (int k = 0; k < K; k++) {
+            [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_expert_out[k]
+                   sourceOffset:0
+                       toBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous
+              destinationOffset:(size_t)k * DIM * sizeof(float)
+                           size:(size_t)DIM * sizeof(float)];
+        }
+        [blit endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_moe_combine];
+        id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:0];
+        [enc setBuffer:weights_buf offset:0 atIndex:1];
+        [enc setBuffer:zero_resid  offset:0 atIndex:2];
+        [enc setBuffer:(id<MTLBuffer>)eng->buf_hidden offset:0 atIndex:3];
+        uint kv = K, hd = DIM;
+        [enc setBytes:&kv length:4 atIndex:4];
+        [enc setBytes:&hd length:4 atIndex:5];
+        [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    // Copy result from buf_hidden
+    float *result = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
+    memcpy(moe_out, result, DIM * sizeof(float));
 }

@@ -229,6 +229,8 @@ typedef struct {
     // Gather MoE kernels: gatherQmm equivalent — K experts from full N_EXPERTS buffer
     void *pipe_gather_gate_up;          // gather_gate_up_swiglu
     void *pipe_gather_down;             // gather_down
+    void *pipe_int8_gate_up_swiglu;     // fused_gate_up_swiglu_int8_e8m0 (DSpark MTP)
+    void *pipe_int8_dequant_matvec;     // dequant_matvec_int8_e8m0 (DSpark MTP)
     void *pipe_rms_norm_sum_sq;
     void *pipe_rms_norm_apply;
     void *pipe_matvec;
@@ -467,6 +469,7 @@ typedef struct {
 
     // DSpark speculative decoding engine (optional, set by caller after init)
     void *dspark_engine;   // DSparkEngine* — NULL if DSpark not active
+    bool dspark_accumulate_enabled;  // Only accumulate hidden during real decode, not verification
 } MoEInferEngine;
 
 // ============================================================================
@@ -587,6 +590,20 @@ int moe_infer_init_gather_mode(MoEInferEngine *engine);
 
 // Cleanup
 void moe_infer_deinit(MoEInferEngine *engine);
+
+// DSpark INT8 MoE GPU forward (called from dspark_engine.c)
+void dspark_moe_forward_gpu(
+    MoEInferEngine *eng,
+    const float *normed_input,
+    uint8_t *expert_ptrs[6],
+    int *expert_ids,
+    float *expert_weights,
+    int K,
+    float *moe_out
+);
+
+// Enable/disable DSpark hidden state accumulation (disable during verification)
+void moe_infer_set_dspark_accumulate(MoEInferEngine *eng, bool enabled);
 
 // Set one layer's compressor weights. Call after moe_infer_set_layer_attn.
 void moe_infer_set_layer_compressor(MoEInferEngine *engine, int layer,

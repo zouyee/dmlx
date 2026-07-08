@@ -38,6 +38,7 @@
 //
 #pragma once
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -58,9 +59,21 @@ extern "C" {
 #define DSPARK_TARGET_LAYER_IDS_COUNT 3
 static const int DSPARK_TARGET_LAYER_IDS[3] = {40, 41, 42};
 
-// Expert format: INT8 weight + E8M0 scale (block_size=16)
-#define DSPARK_EXPERT_BLOCK_SIZE 16
-#define DSPARK_EXPERT_SIZE       13369344  // bytes per expert (same layout as target)
+// Expert format: MXFP4 (E2M1 4-bit packed + E8M0 scales, group_size=32)
+// Same format as target model experts! Storage is uint8 (2 nibbles per byte).
+#define DSPARK_EXPERT_BLOCK_SIZE 32       // quantization group size
+#define DSPARK_EXPERT_SIZE       13369344 // bytes per expert
+#define DSPARK_EXPERT_IN_DIM     4096     // expert input dim = DIM (gate/up input)
+#define DSPARK_EXPERT_INTER_DIM  2048     // gate/up output dim (moe_inter_dim)
+#define DSPARK_EXPERT_OUT_DIM    4096     // down output dim = DIM
+// Expert binary layout per expert (contiguous, 4-bit packed):
+//   w1.weight [INTER_DIM, IN_DIM/2]  uint8  = [2048, 2048] = 4194304 bytes
+//   w1.scale  [INTER_DIM, IN_DIM/32] E8M0   = [2048, 128]  = 262144 bytes
+//   w3.weight [INTER_DIM, IN_DIM/2]  uint8  = [2048, 2048] = 4194304 bytes
+//   w3.scale  [INTER_DIM, IN_DIM/32] E8M0   = [2048, 128]  = 262144 bytes
+//   w2.weight [OUT_DIM, INTER_DIM/2] uint8  = [4096, 1024] = 4194304 bytes
+//   w2.scale  [OUT_DIM, INTER_DIM/32] E8M0  = [4096, 64]   = 262144 bytes
+//   Total = 3 * (4194304 + 262144) = 13369344 ✓
 
 // Reuse target engine constants where identical
 // DIM=4096, INTERMEDIATE=2048, N_EXPERTS=256, N_ACTIVE=6, HEAD_DIM=512,
@@ -92,6 +105,12 @@ typedef struct {
     DSparkFP8Weight wo_a;     // [N_HEADS*HEAD_DIM/O_GROUPS * O_GROUPS, DIM] = [8192, 4096]
     DSparkFP8Weight wo_b;     // [DIM, O_GROUPS*O_LORA_RANK] = [4096, 8192]
     const float *attn_sink;   // [N_HEADS] = [64]
+    // Pre-dequantized f32 weights for fast cblas_sgemv dispatch
+    float *wq_a_f32;          // [Q_LORA_RANK * DIM] = [1024 * 4096]
+    float *wq_b_f32;          // [N_HEADS*HEAD_DIM * Q_LORA_RANK] = [32768 * 1024]
+    float *wkv_f32;           // [KV_LORA_RANK * DIM] = [512 * 4096]
+    float *wo_a_f32;          // [O_GROUPS*O_LORA_RANK * (N_HEADS/O_GROUPS)*HEAD_DIM] = [8192 * 4096]
+    float *wo_b_f32;          // [DIM * O_GROUPS*O_LORA_RANK] = [4096 * 8192]
 } DSparkAttnWeights;
 
 // Per-layer DSpark block weights (complete layer)
@@ -116,6 +135,7 @@ typedef struct {
     // input = concat(target_hidden[40], target_hidden[41], target_hidden[42]) ∈ R^{3*DIM}
     // output = main_proj(input) ∈ R^{DIM}
     DSparkFP8Weight main_proj;   // [DIM, 3*DIM] = [4096, 12288]
+    float *main_proj_f32;        // pre-dequantized [DIM * 3*DIM] f32
     const float *main_norm;      // [DIM] RMSNorm after main_proj
 
     // Markov Head (only on last DSpark layer output)
@@ -171,6 +191,8 @@ typedef struct {
     // --- Expert I/O (INT8 packed binary, same pool as target) ---
     int expert_fd[DSPARK_N_LAYERS];       // per-layer packed expert file descriptors
     uint8_t *expert_buf[6];               // reuse target's 2MB-aligned buffers
+    uint8_t *expert_mmap[DSPARK_N_LAYERS]; // mmap'd full expert files (preloaded)
+    size_t expert_mmap_size;               // size of each mmap'd file
 
     // --- KV Cache (one per DSpark layer) ---
     DSparkKVCache kv_cache[DSPARK_N_LAYERS];

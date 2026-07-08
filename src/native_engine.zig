@@ -351,7 +351,7 @@ pub const NativeEngine = struct {
         var dspark_draft_tokens: [DSPARK_MAX_BLOCK]u32 = undefined;
         var dspark_draft_logits_buf: ?[]f32 = null;
         defer if (dspark_draft_logits_buf) |buf| self.allocator.free(buf);
-        if (self.dspark != null) {
+        if (self.dspark_engine != null or self.dspark != null) {
             dspark_draft_logits_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
         }
 
@@ -401,9 +401,8 @@ pub const NativeEngine = struct {
 
                 const max_draft: usize = @min(5, remaining, tokens.len - current_len);
 
-                // dspark_forward writes [block_size × vocab] logits — use Markov Head's buffer
-                // which is already allocated as [DSPARK_MAX_BLOCK × vocab_size]
-                if (self.dspark == null or dspark_draft_logits_buf == null) continue;
+                // dspark_forward writes [block_size × vocab] logits
+                if (dspark_draft_logits_buf == null) continue;
 
                 const vocab: usize = @intCast(self.config.vocab_size);
                 const draft_buf = dspark_draft_logits_buf.?;
@@ -419,14 +418,15 @@ pub const NativeEngine = struct {
                 );
                 if (n_draft_raw <= 0) continue;
 
-                // Use Markov Head (Zig-side) for sequential correction on the draft logits
-                const ds = &(self.dspark.?);
-                const n_proposed = ds.propose(
-                    draft_buf[0..vocab], // base logits for position 0 (anchor corrected)
-                    next_token,
+                // Use C-side Markov Head which processes ALL positions' logits independently
+                const n_proposed_raw = metal.dsparkMarkovSample(
+                    de,
+                    draft_buf[0 .. max_draft * vocab],
+                    @intCast(next_token),
+                    draft_buf[0 .. max_draft * vocab], // corrected in-place
                     dspark_draft_tokens[0..max_draft],
-                    draft_buf, // reuse as working buffer
                 );
+                const n_proposed: usize = if (n_proposed_raw > 0) @intCast(n_proposed_raw) else 0;
                 if (n_proposed == 0) continue;
 
                 // Verify draft tokens against target model
@@ -442,7 +442,12 @@ pub const NativeEngine = struct {
                     metal.setTokenId(self.engine, @intCast(tok));
                     metal.embed(self.engine, @intCast(tok), verify_hidden[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
                 }
+                // Disable accumulation during verification (don't corrupt DSpark's main_hidden)
+                metal.setDSparkAccumulate(self.engine, false);
                 try metal.forwardBatch(self.engine, verify_hidden, @intCast(verify_len), @intCast(start_pos), verify_token_ids);
+
+                // Re-enable accumulation after verification
+                metal.setDSparkAccumulate(self.engine, true);
 
                 var accepted: usize = 0;
                 for (0..verify_len) |k| {
@@ -506,7 +511,9 @@ pub const NativeEngine = struct {
 
                 // forwardBatch processes all draft tokens in one pass,
                 // writing KV cache entries at positions [start_pos .. start_pos + verify_len - 1]
+                metal.setDSparkAccumulate(self.engine, false);
                 try metal.forwardBatch(self.engine, verify_hidden, @intCast(verify_len), @intCast(start_pos), verify_token_ids);
+                metal.setDSparkAccumulate(self.engine, true);
 
                 // Verify each draft position: get target logits, check if draft matches
                 var accepted: usize = 0;
