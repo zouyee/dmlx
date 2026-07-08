@@ -68,10 +68,10 @@ echo "  hw: ${BM_HW} ${BM_MEM}"
 echo "════════════════════════════════════════════════"
 
 # ------------------------------------------------------------------
-# Phase 0: Build
+# Phase 0: Build (clean cache to avoid stale struct layout issues)
 # ------------------------------------------------------------------
-echo "🔧 Build (ReleaseFast)..."
-(cd "$PROJECT_DIR" && zig build -Doptimize=ReleaseFast 2>/dev/null) || {
+echo "🔧 Build (clean + ReleaseFast)..."
+(cd "$PROJECT_DIR" && rm -rf .zig-cache && zig build -Doptimize=ReleaseFast 2>/dev/null) || {
     echo "❌ Build failed"; exit 1
 }
 
@@ -260,6 +260,73 @@ print(f'{vals[1]:.3f}')")
     echo "   Results: ${E2E_PASS} passed, ${E2E_FAIL} failed (${BM_E2E_SECS}s)"
 
     cleanup
+
+    # --- DSpark benchmark (optional, if weights available) ---
+    DSPARK_DIR="${HOME}/models/DeepSeek-V4-Flash-DSpark/dspark_weights"
+    DSPARK_PACKED="${HOME}/models/DeepSeek-V4-Flash-DSpark/packed_mtp_experts"
+    if [ -f "${DSPARK_DIR}/markov_w1.bin" ] && [ -d "${DSPARK_PACKED}" ]; then
+        echo ""
+        echo "📊 DSpark benchmark (SMELT N=${NATIVE_SMELT_N})..."
+        cleanup
+
+        NATIVE_SMELT_N="${NATIVE_SMELT_N}" "$CLI" serve \
+            --model "$MODEL_PATH" \
+            --port "$PORT" \
+            --native \
+            --expert-packed-dir "$PACKED_DIR" \
+            --dspark "$DSPARK_DIR" \
+            --max-tokens 30 \
+            --temperature 0 \
+            > /tmp/benchmark_dspark.log 2>&1 &
+
+        echo -n "   Waiting for DSpark server..."
+        for i in $(seq 1 120); do
+            if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+                echo " ready (${i}s)"
+                break
+            fi
+            echo -n "."
+            sleep 1
+        done
+
+        if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+            # Warmup
+            curl -s --max-time 120 "${SERVER_URL}/v1/chat/completions" \
+                -H 'Content-Type: application/json' \
+                -d '{"model":"d","messages":[{"role":"user","content":"Hi"}],"max_tokens":5,"temperature":0,"stream":false}' > /dev/null 2>&1
+
+            # Test with diverse prompt to measure acceptance
+            echo "   DSpark perf (max_tokens=30, diverse prompt)..."
+            T_DSPARK=$(python3 -c "import time; print(time.time())")
+            DSPARK_RESP=$(curl -s --max-time 300 "${SERVER_URL}/v1/chat/completions" \
+                -H 'Content-Type: application/json' \
+                -d '{"model":"d","messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":30,"temperature":0,"stream":false}')
+            T_DSPARK_DONE=$(python3 -c "import time; print(time.time())")
+            DSPARK_TEXT=$(echo "$DSPARK_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+            DSPARK_TOKS=$(echo "$DSPARK_RESP" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['completion_tokens'])" 2>/dev/null || echo "0")
+            DSPARK_ELAPSED=$(python3 -c "print(f'{$T_DSPARK_DONE-$T_DSPARK:.1f}')")
+            DSPARK_TPS=$(python3 -c "t=$DSPARK_TOKS; e=$T_DSPARK_DONE-$T_DSPARK; print(f'{t/e:.3f}' if e>0 and t>0 else '0')")
+
+            # Get DSpark stats from server log
+            DSPARK_STATS=$(grep "dspark-stats" /tmp/benchmark_dspark.log | tail -1 || echo "")
+
+            echo "   DSpark result: ${DSPARK_TOKS} tokens in ${DSPARK_ELAPSED}s = ${DSPARK_TPS} tok/s"
+            echo "   DSpark output: \"${DSPARK_TEXT:0:60}\""
+            echo "   DSpark stats: ${DSPARK_STATS}"
+            if echo "$DSPARK_TEXT" | grep -qi "paris"; then
+                echo "   ✓ Paris correct with DSpark"
+            else
+                echo "   ✗ Paris NOT found with DSpark"
+            fi
+        else
+            echo "   ⚠️  DSpark server failed to start"
+        fi
+        cleanup
+    else
+        echo ""
+        echo "⚠️  DSpark weights not found, skipping DSpark benchmark"
+        echo "   Expected: ${DSPARK_DIR}/markov_w1.bin"
+    fi
 
     # Report
     echo ""
