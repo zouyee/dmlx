@@ -15,6 +15,10 @@ const generation = @import("generation.zig");
 const safetensors_reader = @import("mlx").safetensors_reader;
 const expert_stream = @import("models/expert_stream.zig");
 
+// Mach task_info wrappers — avoids cImport of mach/message.h (broken in Zig 0.16)
+extern fn dmlx_get_rss_bytes() u64;
+extern fn dmlx_get_virtual_bytes() u64;
+
 // Model implementations
 const llama = @import("models/llama.zig");
 const llama_loader = @import("models/llama_loader.zig");
@@ -331,22 +335,10 @@ fn deepseekV4Loader(
         model_ptr.setExpertStreamProvider(sp);
 
         // Log memory usage after expert stream provider setup
-        const posix_c_mem = @cImport({
-            @cInclude("mach/mach.h");
-            @cInclude("mach/task.h");
-        });
-        var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
-        var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
-        const kr = posix_c_mem.task_info(
-            posix_c_mem.mach_task_self(),
-            posix_c_mem.MACH_TASK_BASIC_INFO,
-            @ptrCast(&task_info),
-            &count,
-        );
-        if (kr == posix_c_mem.KERN_SUCCESS) {
-            const rss_mb = task_info.resident_size / (1024 * 1024);
-            const virt_mb = task_info.virtual_size / (1024 * 1024);
-            std.log.info("Memory after expert stream setup: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+        {
+            const rss_mb = dmlx_get_rss_bytes() / (1024 * 1024);
+            const virt_mb = dmlx_get_virtual_bytes() / (1024 * 1024);
+            if (rss_mb > 0) std.log.info("Memory after expert stream setup: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
         }
 
         std.log.info("model_registry: Expert streaming enabled for DeepSeek V4", .{});

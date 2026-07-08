@@ -605,6 +605,36 @@ void dspark_moe_forward_gpu(
 // Enable/disable DSpark hidden state accumulation (disable during verification)
 void moe_infer_set_dspark_accumulate(MoEInferEngine *eng, bool enabled);
 
+// DSpark GPU-accelerated shared expert forward (f32 weights)
+void dspark_shared_expert_gpu(
+    MoEInferEngine *eng,
+    const float *input,
+    const float *w1_f32,
+    const float *w3_f32,
+    const float *w2_f32,
+    float *output
+);
+
+// DSpark GPU f32 matvec (generic, for attention projections)
+void dspark_matvec_f32_gpu(
+    MoEInferEngine *eng,
+    const float *W,
+    const float *x,
+    float *out,
+    int out_dim,
+    int in_dim
+);
+
+// DSpark batched MoE: all positions in ONE command buffer (eliminates 15× sync)
+void dspark_moe_forward_batched_gpu(
+    MoEInferEngine *eng,
+    int n_pos,
+    const float *normed_inputs,
+    uint8_t **all_expert_ptrs,
+    float *all_expert_weights,
+    float *all_moe_out
+);
+
 // Set one layer's compressor weights. Call after moe_infer_set_layer_attn.
 void moe_infer_set_layer_compressor(MoEInferEngine *engine, int layer,
     uint32_t compress_ratio,

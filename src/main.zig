@@ -42,6 +42,7 @@ const ChatCommand = struct {
     metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
     metal_full: bool = false, // Full-metal engine (attention + mHC + MoE in engine.c)
     native: bool = false, // MLX-free native engine (no MLX runtime)
+    dspark_dir: ?[]const u8 = null, // DSpark Markov Head weights dir (speculative decoding)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
 };
@@ -73,6 +74,7 @@ const ServerCommand = struct {
     metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
     metal_full: bool = false, // Full-metal engine (attention + mHC + MoE in engine.c)
     native: bool = false, // MLX-free native engine (no MLX runtime)
+    dspark_dir: ?[]const u8 = null, // DSpark Markov Head weights dir (speculative decoding)
     distributed: bool = false,
 };
 
@@ -185,6 +187,7 @@ pub fn main(init: std.process.Init) !void {
             allocator.free(cmd.model_path);
             if (cmd.kv_cold_dir) |d| allocator.free(d);
             if (cmd.prompt_cache_file) |f| allocator.free(f);
+            if (cmd.dspark_dir) |d| allocator.free(d);
         }
         const server_config = root.server.ServerConfig{
             .model_path = cmd.model_path,
@@ -212,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
             .metal_moe = cmd.metal_moe,
             .metal_full = cmd.metal_full,
             .native = cmd.native,
+            .dspark_dir = cmd.dspark_dir,
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
@@ -444,6 +448,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--native")) {
             cmd.native = true;
+        } else if (std.mem.eql(u8, flag, "--dspark")) {
+            cmd.dspark_dir = try allocator.dupe(u8, args[i + 1]);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         }
@@ -518,6 +524,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--native")) {
             cmd.native = true;
+        } else if (std.mem.eql(u8, flag, "--dspark")) {
+            cmd.dspark_dir = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
             cmd.distributed = true;
         } else if (std.mem.eql(u8, flag, "--raw")) {

@@ -2754,3 +2754,247 @@ void dspark_moe_forward_gpu(
     float *result = (float *)[(id<MTLBuffer>)eng->buf_hidden contents];
     memcpy(moe_out, result, DIM * sizeof(float));
 }
+
+// ============================================================================
+// DSpark GPU-accelerated shared expert (f32 weights, matvec_f32 kernel)
+// ============================================================================
+// Computes: out = silu(w1 @ x) * (w3 @ x), then down = w2 @ mid
+// All weights are pre-dequantized f32. Uses pipe_matvec for GPU dispatch.
+
+void dspark_shared_expert_gpu(
+    MoEInferEngine *eng,
+    const float *input,         // [DIM=4096]
+    const float *w1_f32,        // [INTERMEDIATE*DIM] = [2048*4096] gate
+    const float *w3_f32,        // [INTERMEDIATE*DIM] up
+    const float *w2_f32,        // [DIM*INTERMEDIATE] down
+    float *output               // [DIM=4096]
+) {
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
+
+    // Create GPU buffers (copy data — malloc'd f32 arrays aren't page-aligned)
+    id<MTLBuffer> x_buf  = [d newBufferWithBytes:(void*)input length:DIM*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> w1_buf = [d newBufferWithBytes:(void*)w1_f32 length:(size_t)INTERMEDIATE*DIM*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> w3_buf = [d newBufferWithBytes:(void*)w3_f32 length:(size_t)INTERMEDIATE*DIM*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> w2_buf = [d newBufferWithBytes:(void*)w2_f32 length:(size_t)DIM*INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> gate_buf = [d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> up_buf   = [d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> mid_buf  = [d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> out_buf  = [d newBufferWithLength:DIM*4 options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cb = [q commandBufferWithUnretainedReferences];
+    uint od, id_;
+
+    // gate = w1 @ x
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec];
+        [enc setBuffer:w1_buf offset:0 atIndex:0];
+        [enc setBuffer:x_buf  offset:0 atIndex:1];
+        [enc setBuffer:gate_buf offset:0 atIndex:2];
+        od = INTERMEDIATE; id_ = DIM;
+        [enc setBytes:&od  length:4 atIndex:3];
+        [enc setBytes:&id_ length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((INTERMEDIATE+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+    // up = w3 @ x
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec];
+        [enc setBuffer:w3_buf offset:0 atIndex:0];
+        [enc setBuffer:x_buf  offset:0 atIndex:1];
+        [enc setBuffer:up_buf offset:0 atIndex:2];
+        od = INTERMEDIATE; id_ = DIM;
+        [enc setBytes:&od  length:4 atIndex:3];
+        [enc setBytes:&id_ length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((INTERMEDIATE+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    // SwiGLU on CPU (small: 2048 elements)
+    float *gate = (float*)[gate_buf contents];
+    float *up = (float*)[up_buf contents];
+    float *mid = (float*)[mid_buf contents];
+    for (int i = 0; i < INTERMEDIATE; i++) {
+        float g = gate[i];
+        mid[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+
+    // down = w2 @ mid (GPU)
+    id<MTLCommandBuffer> cb2 = [q commandBufferWithUnretainedReferences];
+    {
+        id<MTLComputeCommandEncoder> enc = [cb2 computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec];
+        [enc setBuffer:w2_buf offset:0 atIndex:0];
+        [enc setBuffer:mid_buf offset:0 atIndex:1];
+        [enc setBuffer:out_buf offset:0 atIndex:2];
+        od = DIM; id_ = INTERMEDIATE;
+        [enc setBytes:&od  length:4 atIndex:3];
+        [enc setBytes:&id_ length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+    [cb2 commit];
+    [cb2 waitUntilCompleted];
+
+    memcpy(output, [out_buf contents], DIM * sizeof(float));
+}
+
+// ============================================================================
+// DSpark GPU f32 matvec (generic, for attention projections)
+// ============================================================================
+// out = W @ x, where W is [out_dim, in_dim] f32, x is [in_dim] f32.
+// Uses pipe_matvec (1-thread-per-row). Fast for large out_dim (e.g. wq_b 32768).
+
+void dspark_matvec_f32_gpu(
+    MoEInferEngine *eng,
+    const float *W,        // [out_dim * in_dim] f32
+    const float *x,        // [in_dim] f32
+    float *out,            // [out_dim] f32
+    int out_dim,
+    int in_dim
+) {
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
+
+    id<MTLBuffer> w_buf = [d newBufferWithBytes:(void*)W length:(size_t)out_dim*in_dim*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> x_buf = [d newBufferWithBytes:(void*)x length:(size_t)in_dim*4 options:MTLResourceStorageModeShared];
+    id<MTLBuffer> o_buf = [d newBufferWithLength:(size_t)out_dim*4 options:MTLResourceStorageModeShared];
+
+    id<MTLCommandBuffer> cb = [q commandBufferWithUnretainedReferences];
+    {
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_matvec];
+        [enc setBuffer:w_buf offset:0 atIndex:0];
+        [enc setBuffer:x_buf offset:0 atIndex:1];
+        [enc setBuffer:o_buf offset:0 atIndex:2];
+        uint od = (uint)out_dim, id_ = (uint)in_dim;
+        [enc setBytes:&od  length:4 atIndex:3];
+        [enc setBytes:&id_ length:4 atIndex:4];
+        [enc dispatchThreadgroups:MTLSizeMake(((uint)out_dim+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [enc endEncoding];
+    }
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    memcpy(out, [o_buf contents], (size_t)out_dim * sizeof(float));
+}
+
+// ============================================================================
+// DSpark batched MoE: all positions in ONE command buffer
+// ============================================================================
+// Processes n_pos positions, each with K=6 experts. Single commit+wait.
+// This eliminates the 15× GPU sync overhead (was: 1 commit per position per layer).
+
+void dspark_moe_forward_batched_gpu(
+    MoEInferEngine *eng,
+    int n_pos,                        // number of positions (typically 5)
+    const float *normed_inputs,       // [n_pos * DIM] — all normed inputs concatenated
+    uint8_t **all_expert_ptrs,        // [n_pos * K] expert data pointers
+    float *all_expert_weights,        // [n_pos * K] routing weights
+    float *all_moe_out                // [n_pos * DIM] output
+) {
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
+    const int K = N_ACTIVE;
+
+    // MXFP4 layout constants
+    const uint out_dim_gu = INTERMEDIATE;
+    const uint in_dim_gu  = DIM;
+    const uint out_dim_d  = DIM;
+    const uint in_dim_d   = INTERMEDIATE;
+    const uint gs = MOE_GROUP_SIZE;
+    const size_t gu_w_bytes = (size_t)out_dim_gu * in_dim_gu / 2;
+    const size_t gu_s_bytes = (size_t)out_dim_gu * (in_dim_gu / gs);
+    const size_t dn_w_bytes = (size_t)out_dim_d * in_dim_d / 2;
+    const size_t dn_s_bytes = (size_t)out_dim_d * (in_dim_d / gs);
+    const size_t w1_w_off = 0;
+    const size_t w1_s_off = gu_w_bytes;
+    const size_t w3_w_off = gu_w_bytes + gu_s_bytes;
+    const size_t w3_s_off = w3_w_off + gu_w_bytes;
+    const size_t w2_w_off = w3_s_off + gu_s_bytes;
+
+    // Allocate per-position GPU buffers for input/mid/out
+    id<MTLBuffer> pos_normed[5];
+    id<MTLBuffer> pos_mid[5][6];
+    id<MTLBuffer> pos_out[5][6];
+    for (int p = 0; p < n_pos; p++) {
+        pos_normed[p] = [d newBufferWithBytes:(void*)(normed_inputs + p * DIM) length:DIM*4 options:MTLResourceStorageModeShared];
+        for (int k = 0; k < K; k++) {
+            pos_mid[p][k] = [d newBufferWithLength:INTERMEDIATE*4 options:MTLResourceStorageModeShared];
+            pos_out[p][k] = [d newBufferWithLength:DIM*4 options:MTLResourceStorageModeShared];
+        }
+    }
+
+    id<MTLCommandBuffer> cb = [q commandBufferWithUnretainedReferences];
+
+    // Encode ALL gate_up_swiglu dispatches
+    for (int p = 0; p < n_pos; p++) {
+        for (int k = 0; k < K; k++) {
+            uint8_t *base = all_expert_ptrs[p * K + k];
+            if (!base) continue;
+            id<MTLBuffer> gw = [d newBufferWithBytesNoCopy:base+w1_w_off length:gu_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLBuffer> gs_b = [d newBufferWithBytesNoCopy:base+w1_s_off length:gu_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLBuffer> uw = [d newBufferWithBytesNoCopy:base+w3_w_off length:gu_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLBuffer> us = [d newBufferWithBytesNoCopy:base+w3_s_off length:gu_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gate_up_swiglu_v2];
+            [enc setBuffer:gw offset:0 atIndex:0];
+            [enc setBuffer:gs_b offset:0 atIndex:1];
+            [enc setBuffer:uw offset:0 atIndex:2];
+            [enc setBuffer:us offset:0 atIndex:3];
+            [enc setBuffer:pos_normed[p] offset:0 atIndex:4];
+            [enc setBuffer:pos_mid[p][k] offset:0 atIndex:5];
+            uint od=out_dim_gu, id_v=in_dim_gu, g=gs;
+            [enc setBytes:&od length:4 atIndex:6];
+            [enc setBytes:&id_v length:4 atIndex:7];
+            [enc setBytes:&g length:4 atIndex:8];
+            [enc setThreadgroupMemoryLength:512 atIndex:0];
+            uint ntg = (out_dim_gu + 1) / 2;
+            [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+            [enc endEncoding];
+        }
+    }
+
+    // Encode ALL down_proj dispatches
+    for (int p = 0; p < n_pos; p++) {
+        for (int k = 0; k < K; k++) {
+            uint8_t *base = all_expert_ptrs[p * K + k];
+            if (!base) continue;
+            id<MTLBuffer> dw = [d newBufferWithBytesNoCopy:base+w2_w_off length:dn_w_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLBuffer> ds = [d newBufferWithBytesNoCopy:base+w2_w_off+dn_w_bytes length:dn_s_bytes options:MTLResourceStorageModeShared deallocator:nil];
+            id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec];
+            [enc setBuffer:dw offset:0 atIndex:0];
+            [enc setBuffer:ds offset:0 atIndex:1];
+            [enc setBuffer:pos_mid[p][k] offset:0 atIndex:2];
+            [enc setBuffer:pos_out[p][k] offset:0 atIndex:3];
+            uint od=out_dim_d, id_v=in_dim_d, g=gs;
+            [enc setBytes:&od length:4 atIndex:4];
+            [enc setBytes:&id_v length:4 atIndex:5];
+            [enc setBytes:&g length:4 atIndex:6];
+            [enc setThreadgroupMemoryLength:256 atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [enc endEncoding];
+        }
+    }
+
+    // Single commit + wait for ALL positions
+    [cb commit];
+    [cb waitUntilCompleted];
+
+    // Combine on CPU (weighted sum of expert outputs per position)
+    for (int p = 0; p < n_pos; p++) {
+        float *moe_out = all_moe_out + p * DIM;
+        memset(moe_out, 0, DIM * sizeof(float));
+        for (int k = 0; k < K; k++) {
+            float w = all_expert_weights[p * K + k];
+            float *expert_out = (float *)[pos_out[p][k] contents];
+            for (int d = 0; d < DIM; d++) moe_out[d] += w * expert_out[d];
+        }
+    }
+}

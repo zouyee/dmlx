@@ -575,30 +575,12 @@ static void dspark_moe_forward_cpu(
         }
         dspark_moe_forward_gpu(target, normed_input, expert_ptrs, expert_ids, expert_weights, N_ACTIVE, moe_out);
 
-        // Add shared expert output: gate_up_swiglu + down, added to routed output
+        // Add shared expert output: GPU-accelerated SwiGLU
         if (lw->shared_w1_f32 && lw->shared_w3_f32 && lw->shared_w2_f32) {
-            float gate_se[INTERMEDIATE];
-            float up_se[INTERMEDIATE];
-            float mid_se[INTERMEDIATE];
             float down_se[DIM];
-            // gate = shared_w1 @ normed_input → [INTERMEDIATE]
-            cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                        INTERMEDIATE, DIM, 1.0f, lw->shared_w1_f32, DIM,
-                        normed_input, 1, 0.0f, gate_se, 1);
-            // up = shared_w3 @ normed_input → [INTERMEDIATE]
-            cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                        INTERMEDIATE, DIM, 1.0f, lw->shared_w3_f32, DIM,
-                        normed_input, 1, 0.0f, up_se, 1);
-            // SwiGLU
-            for (int i = 0; i < INTERMEDIATE; i++) {
-                float g = gate_se[i];
-                mid_se[i] = (g / (1.0f + expf(-g))) * up_se[i];
-            }
-            // down = shared_w2 @ mid → [DIM]
-            cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                        DIM, INTERMEDIATE, 1.0f, lw->shared_w2_f32, INTERMEDIATE,
-                        mid_se, 1, 0.0f, down_se, 1);
-            // Add to routed expert output
+            dspark_shared_expert_gpu(target, normed_input,
+                                     lw->shared_w1_f32, lw->shared_w3_f32, lw->shared_w2_f32,
+                                     down_se);
             for (int d = 0; d < DIM; d++) moe_out[d] += down_se[d];
         }
         return;
@@ -728,21 +710,83 @@ int dspark_forward(
             memcpy(res_k, new_residual, MHC_MULT * DIM * sizeof(float));
         }
 
-        // --- FFN/MoE sublayer ---
+        // --- FFN/MoE sublayer (batched: all positions in one GPU dispatch) ---
+        // Step 1: CPU pre-processing for all positions (mhc_pre + ffn_norm + routing)
+        float normed_all[DSPARK_BLOCK_SIZE * DIM];
+        float post_mix_ffn[DSPARK_BLOCK_SIZE][MHC_MULT];
+        float comb_mix_ffn[DSPARK_BLOCK_SIZE][MHC_MULT * MHC_MULT];
+        uint8_t *batch_expert_ptrs[DSPARK_BLOCK_SIZE * N_ACTIVE];
+        float batch_expert_weights[DSPARK_BLOCK_SIZE * N_ACTIVE];
+        int batch_valid = 1;
+
         for (int k = 0; k < bs; k++) {
             float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+            mhc_pre(&hc_ffn, res_k, sublayer_input, post_mix_ffn[k], comb_mix_ffn[k]);
+            rms_norm_cpu(sublayer_input, lw->ffn_norm, normed_all + k * DIM, DIM);
 
-            // mhc_pre(ffn)
-            mhc_pre(&hc_ffn, res_k, sublayer_input, post_mix, comb_mix);
+            // CPU routing
+            float scores[N_EXPERTS];
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        N_EXPERTS, DIM, 1.0f, lw->gate_weight, DIM,
+                        normed_all + k * DIM, 1, 0.0f, scores, 1);
+            float processed[N_EXPERTS];
+            for (int i = 0; i < N_EXPERTS; i++) {
+                float l = scores[i] + (lw->gate_bias ? lw->gate_bias[i] : 0.0f);
+                float sp = l > 0 ? l + log1pf(expf(-l)) : log1pf(expf(l));
+                processed[i] = sqrtf(sp);
+            }
+            uint8_t taken[N_EXPERTS];
+            memset(taken, 0, sizeof(taken));
+            for (int e = 0; e < N_ACTIVE; e++) {
+                int best = -1; float bv = -1e30f;
+                for (int i = 0; i < N_EXPERTS; i++) {
+                    if (!taken[i] && processed[i] > bv) { bv = processed[i]; best = i; }
+                }
+                if (best < 0) { batch_valid = 0; break; }
+                batch_expert_ptrs[k * N_ACTIVE + e] = eng->expert_mmap[layer]
+                    ? eng->expert_mmap[layer] + (size_t)best * DSPARK_EXPERT_SIZE : NULL;
+                batch_expert_weights[k * N_ACTIVE + e] = processed[best];
+                taken[best] = 1;
+            }
+            if (!batch_valid) break;
+            // L1-normalize weights
+            float wsum = 0;
+            for (int e = 0; e < N_ACTIVE; e++) wsum += batch_expert_weights[k * N_ACTIVE + e];
+            wsum += 1e-20f;
+            for (int e = 0; e < N_ACTIVE; e++) batch_expert_weights[k * N_ACTIVE + e] = batch_expert_weights[k * N_ACTIVE + e] / wsum * 1.5f;
+        }
 
-            // ffn_norm
-            rms_norm_cpu(sublayer_input, lw->ffn_norm, normed, DIM);
+        // Step 2: Single batched GPU dispatch for all positions
+        float moe_out_all[DSPARK_BLOCK_SIZE * DIM];
+        if (batch_valid && eng->expert_mmap[layer]) {
+            dspark_moe_forward_batched_gpu(target, bs, normed_all,
+                                           batch_expert_ptrs, batch_expert_weights, moe_out_all);
+        } else {
+            memset(moe_out_all, 0, sizeof(moe_out_all));
+        }
 
-            // MoE forward (CPU: gate → route → pread → dequant → combine)
-            dspark_moe_forward_cpu(eng, layer, normed, sublayer_out);
+        // Step 2b: Add shared expert for each position (CPU cblas — fast, avoids GPU sync)
+        for (int k = 0; k < bs; k++) {
+            if (lw->shared_w1_f32 && lw->shared_w3_f32 && lw->shared_w2_f32) {
+                float gate_se[INTERMEDIATE], up_se[INTERMEDIATE], mid_se[INTERMEDIATE], se_out[DIM];
+                cblas_sgemv(CblasRowMajor, CblasNoTrans, INTERMEDIATE, DIM, 1.0f,
+                            lw->shared_w1_f32, DIM, normed_all + k * DIM, 1, 0.0f, gate_se, 1);
+                cblas_sgemv(CblasRowMajor, CblasNoTrans, INTERMEDIATE, DIM, 1.0f,
+                            lw->shared_w3_f32, DIM, normed_all + k * DIM, 1, 0.0f, up_se, 1);
+                for (int i = 0; i < INTERMEDIATE; i++) {
+                    float g = gate_se[i];
+                    mid_se[i] = (g / (1.0f + expf(-g))) * up_se[i];
+                }
+                cblas_sgemv(CblasRowMajor, CblasNoTrans, DIM, INTERMEDIATE, 1.0f,
+                            lw->shared_w2_f32, INTERMEDIATE, mid_se, 1, 0.0f, se_out, 1);
+                for (int d = 0; d < DIM; d++) moe_out_all[k * DIM + d] += se_out[d];
+            }
+        }
 
-            // mhc_post(ffn)
-            mhc_post(sublayer_out, res_k, post_mix, comb_mix, new_residual);
+        // Step 3: CPU post-processing (mhc_post)
+        for (int k = 0; k < bs; k++) {
+            float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
+            mhc_post(moe_out_all + k * DIM, res_k, post_mix_ffn[k], comb_mix_ffn[k], new_residual);
             memcpy(res_k, new_residual, MHC_MULT * DIM * sizeof(float));
         }
     }

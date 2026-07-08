@@ -14,6 +14,10 @@ const creation = @import("mlx").creation;
 const io = @import("mlx").io;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const deepseek_v4 = @import("deepseek_v4.zig");
+
+// Mach task_info wrappers — avoids cImport of mach/message.h (broken in Zig 0.16)
+extern fn dmlx_get_rss_bytes() u64;
+extern fn dmlx_get_virtual_bytes() u64;
 const quantize_mod = @import("mlx").quantize;
 const shape_mod = @import("mlx").shape;
 const cmp_mod = @import("mlx").comparison;
@@ -580,22 +584,10 @@ pub fn loadWeightsSelective(
     std.log.info("Loading {d} backbone weights ({d} expert weights skipped)", .{ to_load, to_skip });
 
     // Log memory usage before loading
-    const posix_c_mem = @cImport({
-        @cInclude("mach/mach.h");
-        @cInclude("mach/task.h");
-    });
-    var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
-    var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
-    const kr = posix_c_mem.task_info(
-        posix_c_mem.mach_task_self(),
-        posix_c_mem.MACH_TASK_BASIC_INFO,
-        @ptrCast(&task_info),
-        &count,
-    );
-    if (kr == posix_c_mem.KERN_SUCCESS) {
-        const rss_mb = task_info.resident_size / (1024 * 1024);
-        const virt_mb = task_info.virtual_size / (1024 * 1024);
-        std.log.info("Memory before loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
+    {
+        const rss_mb = dmlx_get_rss_bytes() / (1024 * 1024);
+        const virt_mb = dmlx_get_virtual_bytes() / (1024 * 1024);
+        if (rss_mb > 0) std.log.info("Memory before loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
     }
 
     // Load each tensor using pre-opened file descriptors
@@ -735,17 +727,9 @@ pub fn loadWeightsSelective(
 
     // Log memory usage after loading
     {
-        const kr2 = posix_c_mem.task_info(
-            posix_c_mem.mach_task_self(),
-            posix_c_mem.MACH_TASK_BASIC_INFO,
-            @ptrCast(&task_info),
-            &count,
-        );
-        if (kr2 == posix_c_mem.KERN_SUCCESS) {
-            const rss_mb = task_info.resident_size / (1024 * 1024);
-            const virt_mb = task_info.virtual_size / (1024 * 1024);
-            std.log.info("Memory after loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
-        }
+        const rss_mb = dmlx_get_rss_bytes() / (1024 * 1024);
+        const virt_mb = dmlx_get_virtual_bytes() / (1024 * 1024);
+        if (rss_mb > 0) std.log.info("Memory after loading: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
     }
 
     std.log.info("TTFT breakdown: index={d}ms fd={d}ms mmap={d}ms load={d}ms total={d}ms", .{
@@ -1348,24 +1332,10 @@ pub fn buildDSV4Model(
     _ = stream;
 
     // Log memory usage at start of model building
-    const posix_c_mem = @cImport({
-        @cInclude("mach/mach.h");
-        @cInclude("mach/task.h");
-    });
-    var task_info: posix_c_mem.mach_task_basic_info_data_t = undefined;
-    var count: posix_c_mem.mach_msg_type_number_t = posix_c_mem.MACH_TASK_BASIC_INFO_COUNT;
     {
-        const kr = posix_c_mem.task_info(
-            posix_c_mem.mach_task_self(),
-            posix_c_mem.MACH_TASK_BASIC_INFO,
-            @ptrCast(&task_info),
-            &count,
-        );
-        if (kr == posix_c_mem.KERN_SUCCESS) {
-            const rss_mb = task_info.resident_size / (1024 * 1024);
-            const virt_mb = task_info.virtual_size / (1024 * 1024);
-            std.log.info("Memory at start of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
-        }
+        const rss_mb = dmlx_get_rss_bytes() / (1024 * 1024);
+        const virt_mb = dmlx_get_virtual_bytes() / (1024 * 1024);
+        if (rss_mb > 0) std.log.info("Memory at start of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
     }
 
     const model_config = try config.clone(allocator);
@@ -2374,17 +2344,9 @@ pub fn buildDSV4Model(
 
     // Log memory usage at end of model building
     {
-        const kr2 = posix_c_mem.task_info(
-            posix_c_mem.mach_task_self(),
-            posix_c_mem.MACH_TASK_BASIC_INFO,
-            @ptrCast(&task_info),
-            &count,
-        );
-        if (kr2 == posix_c_mem.KERN_SUCCESS) {
-            const rss_mb = task_info.resident_size / (1024 * 1024);
-            const virt_mb = task_info.virtual_size / (1024 * 1024);
-            std.log.info("Memory at end of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
-        }
+        const rss_mb = dmlx_get_rss_bytes() / (1024 * 1024);
+        const virt_mb = dmlx_get_virtual_bytes() / (1024 * 1024);
+        if (rss_mb > 0) std.log.info("Memory at end of buildDSV4Model: RSS={d}MB, Virtual={d}MB", .{ rss_mb, virt_mb });
     }
 
     return deepseek_v4.DSV4Model{
@@ -2473,22 +2435,13 @@ test "mlockBackboneWeights locks array pages into RAM" {
     try weights.put(try allocator.dupe(u8, "model.layers.0.attn.v_proj.weight"), arr_c);
 
     // 2. Record RSS before mlock
-    const mach = @cImport({
-        @cInclude("mach/mach.h");
-        @cInclude("mach/task.h");
-    });
-    var info_before: mach.mach_task_basic_info_data_t = undefined;
-    var count: mach.mach_msg_type_number_t = mach.MACH_TASK_BASIC_INFO_COUNT;
-    _ = mach.task_info(mach.mach_task_self(), mach.MACH_TASK_BASIC_INFO, @ptrCast(&info_before), &count);
-    const rss_before = info_before.resident_size;
+    const rss_before = dmlx_get_rss_bytes();
 
     // 3. Call mlock
     mlockBackboneWeights(&weights);
 
     // 4. Record RSS after mlock
-    var info_after: mach.mach_task_basic_info_data_t = undefined;
-    _ = mach.task_info(mach.mach_task_self(), mach.MACH_TASK_BASIC_INFO, @ptrCast(&info_after), &count);
-    const rss_after = info_after.resident_size;
+    const rss_after = dmlx_get_rss_bytes();
 
     // 5. Verify: mlock should have materialized pages, so RSS should grow
     // (fromData copies data, so RSS already includes them; mlock just pins them)

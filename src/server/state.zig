@@ -108,7 +108,10 @@ pub const ServerState = struct {
 };
 
 fn dummyForward(ctx: *anyopaque, input: Array, mask: ?Array, caches: ?[]kvcache.KVCacheStrategy) anyerror!Array {
-    _ = ctx; _ = input; _ = mask; _ = caches;
+    _ = ctx;
+    _ = input;
+    _ = mask;
+    _ = caches;
     return error.NotImplemented;
 }
 fn dummyDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
@@ -158,7 +161,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         std.log.info("Native mode: initializing MLX-free engine...", .{});
         const ne = try allocator.create(native_engine_mod.NativeEngine);
         errdefer allocator.destroy(ne);
-        ne.* = try native_engine_mod.NativeEngine.init(allocator, config.model_path, packed_dir);
+        ne.* = try native_engine_mod.NativeEngine.initWithDSpark(allocator, config.model_path, packed_dir, config.dspark_dir);
 
         // Dummy vtable for API compatibility (server.zig reads vtable.config)
         const dummy_ptr = try allocator.create(u8);

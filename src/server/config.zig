@@ -51,4 +51,5 @@ pub const ServerConfig = struct {
     metal_moe: bool = false,
     metal_full: bool = false, // Full-metal engine path (attention + mHC + MoE in engine.c)
     native: bool = false, // MLX-free native engine (native_loader + engine.c/Metal, no MLX runtime)
+    dspark_dir: ?[]const u8 = null, // DSpark Markov Head weights directory (enables speculative decoding)
 };

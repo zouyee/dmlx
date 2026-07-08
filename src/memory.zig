@@ -20,7 +20,7 @@ const TieredKVCache = tiered_mod.TieredKVCache;
 const darwin = @cImport({
     @cInclude("sys/types.h");
     @cInclude("sys/sysctl.h");
-    @cInclude("mach/mach.h");
+    @cInclude("sys/resource.h");
 });
 
 // ------------------------------------------------------------------
@@ -64,19 +64,13 @@ pub fn getSystemMemoryBytes() usize {
     return @intCast(mem_size);
 }
 
-/// Return current process resident memory (RSS) in bytes via mach_task_basic_info.
+/// Return current process resident memory (RSS) in bytes via getrusage.
 /// Returns 0 on failure.
 pub fn getProcessMemoryBytes() usize {
-    var info: darwin.mach_task_basic_info_data_t = undefined;
-    var count: darwin.mach_msg_type_number_t = @intCast(@sizeOf(darwin.mach_task_basic_info_data_t) / @sizeOf(darwin.natural_t));
-    const kr = darwin.task_info(
-        darwin.mach_task_self(),
-        darwin.MACH_TASK_BASIC_INFO,
-        @ptrCast(&info),
-        &count,
-    );
-    if (kr != darwin.KERN_SUCCESS) return 0;
-    return @intCast(info.resident_size);
+    var ru: darwin.rusage = undefined;
+    if (darwin.getrusage(darwin.RUSAGE_SELF, &ru) != 0) return 0;
+    // On macOS, ru_maxrss is in bytes (unlike Linux where it's KB)
+    return @intCast(ru.ru_maxrss);
 }
 
 // ------------------------------------------------------------------

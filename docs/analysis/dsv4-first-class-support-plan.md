@@ -4960,3 +4960,100 @@ Phase 2 的 `0.878 tok/s` vs Phase 1 的 `0.566 tok/s` 的差距来自：
 | P1 | Phase 2 penalty 降低到 100（允许路由灵活性） | 平衡速度与正确性 |
 | P2 | fp8_e8m0 scale bit-shift + packs_per_thread=2 | +5-10% compute |
 | P3 | Batched prefill | +20-30% benchmark |
+
+---
+
+## §53. 当前状态修订 + MLX 对齐计划（2026-06-21）
+
+### 53.1 最新 benchmark 结果（commit 9a4122e）
+
+| 指标 | 值 | 说明 |
+|------|-----|------|
+| benchmark tok/s | **0.588** | SMELT N=20，Phase 1（Phase 2 penalty=0 自然路由） |
+| Paris | ✓ PASS | "The capital of France is **Paris**." |
+| E2E | **7/7 PASS** | 正确性完全恢复 |
+| unit tests | 399 passed | 全通 |
+| decode-only | 1.22 tok/s | 808ms/token，43 layers，warm state |
+
+### 53.2 `--smelt-experts 0.20 --smelt-cache 0` 对齐状态
+
+MLX 的关键配置 `--smelt-experts 0.20 --smelt-cache 0` 含义：
+- **`--smelt-experts 0.20`**：预加载 20% × 256 = **51 experts/layer** 到 RAM（≈28GB SMELT）
+- **`--smelt-cache 0`**：信任 OS page cache，不强制路由到 SMELT（penalty=0）
+
+| 功能 | MLX | Native（当前） | 状态 |
+|------|-----|--------------|------|
+| N=51 experts/layer | ✅ | ❌ 默认 N=20 | 差距：缓存覆盖率 7.8% vs 20% |
+| penalty=0 自然路由 | ✅ | ✅ Phase 2 penalty=0 | ✅ 对齐 |
+| stats-based SMELT preload | ✅ | ✅ routing_counts 持久化 | ✅ 对齐 |
+| fp8_e8m0 scale bit-shift | ✅ | ❌ exp2(scale-127) FPU | 待 P2 |
+| packs_per_thread=2 ILP | ✅ | ❌ packs_per_thread=1 | 待 P2 |
+| simdgroup_multiply_accumulate | ✅（batch≥18） | ❌ | 待 batched prefill 后 |
+
+### 53.3 simdgroup_multiply_accumulate 分析：何时有用
+
+**重要结论**：`simdgroup_multiply_accumulate` 对 decode（batch=1）无任何收益。
+
+```
+MLX 内部逻辑（fp_quantized.h）：
+  if M >= vector_limit（M4 Pro = 18 tokens）:
+    使用 GEMM → simdgroup_multiply_accumulate
+  else:  
+    使用 GEMV → fp_qmv_fast（我们当前要对齐的内核）
+
+推论：
+  - 单 token decode（M=1）：MLX 也用 GEMV，GEMM 无益
+  - 4-token prefill（M=4）：MLX 也用 GEMV，GEMM 无益
+  - MTP 2-token decode（M=2）：MLX 也用 GEMV，GEMM 无益
+  - batched prefill N≥18：MLX 切换到 GEMM，simdgroup_multiply_accumulate 有用
+```
+
+**结论**：要实现 `simdgroup_multiply_accumulate` 收益，必须先实现 batched prefill（N≥18 tokens 同时处理）。在此之前，GEMV kernel 对齐（fp8_e8m0 + ILP）是最直接的提升路径。
+
+### 53.4 P2 优化计划（即将实施）
+
+#### P2a: fp8_e8m0 scale bit-shift
+
+```metal
+// 当前（FPU transcendental）:
+float gsf = exp2((float)g_s[g] - 127.0f);
+
+// MLX 方案（1 次 bit-shift，无 FPU）:
+float gsf = as_type<float>((uint)g_s[g] << 23);
+// 原理：IEEE754 float 指数 bias=127，scale_byte 直接填入 [22:30] 位 → 等效 exp2(s-127)
+```
+
+适用于所有 expert 计算 kernel：`fused_gate_up_swiglu` v1/v2、`gather_gate_up_swiglu`、`gather_down`。
+
+#### P2b: packs_per_thread=2 ILP
+
+MLX `fp_qmv_fast`:
+```metal
+constexpr int packs_per_thread = 2;  // 每线程每次处理 2 个 pack = 16 nibbles
+constexpr int results_per_simdgroup = 4;
+constexpr int num_simdgroups = 2;
+```
+
+我们当前 v1 kernel：每次处理 1 个 uint32_t (8 nibbles)。
+改进：每线程每次处理 2 个 uint32_t，手动展开 → GPU 可以乱序执行两倍数据，隐藏内存延迟。
+
+#### P2c: N=51 SMELT（更大 cache 覆盖）
+
+内存预算（M4 Pro 48GB）：
+- N=51 SMELT：51 × 43 × 2 × 12.75MB / 1024 = **27.6GB**
+- 模型权重：~5GB
+- GPU/OS：~3GB
+- **总计 ~35.6GB，剩余 12.4GB** → 安全（之前验证过 N=51 可运行）
+
+默认 N 从 20 改为 51 即可对齐 MLX。
+
+### 53.5 理论收益估算
+
+| 优化 | decode-only | benchmark | 来源 |
+|------|------------|-----------|------|
+| P2a: fp8_e8m0 | +3-6% | +3-6% | ~128 scale 计算/GEMV，FPU → bit-shift |
+| P2b: packs_per_thread=2 | +5-15% | +5-15% | ILP：两倍数据展开，GPU 流水线利用率提升 |
+| P2c: N=51 | +10-20% | +15-25% | cache hit 7.8%→20%，减少 SSD reads |
+| P2 合计 | ~+20-40% | ~+25-45% | 预期 1.22→1.5-1.7 tok/s decode |
+
+**到 MLX 1.6 tok/s decode 还需**：P2 全部 + batched prefill 后的 GEMM（simdgroup_multiply_accumulate）。
