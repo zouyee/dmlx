@@ -288,6 +288,30 @@ DSparkEngine *dspark_init(
             snprintf(path, sizeof(path), "%s/hc_ffn_scale.bin", ldir);
             LOAD_BIN(lw->hc_ffn_scale, path, 3 * sizeof(float));
 
+            // Shared expert (FP8 E4M3 + E8M0, block_size=128)
+            {
+                DSparkFP8Weight se_w1, se_w3, se_w2;
+                LOAD_FP8(se_w1, "shared_w1", INTERMEDIATE, DIM, 128);
+                LOAD_FP8(se_w3, "shared_w3", INTERMEDIATE, DIM, 128);
+                LOAD_FP8(se_w2, "shared_w2", DIM, INTERMEDIATE, 128);
+                if (se_w1.weight) {
+                    lw->shared_w1_f32 = (float *)malloc((size_t)INTERMEDIATE * DIM * sizeof(float));
+                    if (lw->shared_w1_f32) dequant_fp8_to_f32(&se_w1, lw->shared_w1_f32);
+                }
+                if (se_w3.weight) {
+                    lw->shared_w3_f32 = (float *)malloc((size_t)INTERMEDIATE * DIM * sizeof(float));
+                    if (lw->shared_w3_f32) dequant_fp8_to_f32(&se_w3, lw->shared_w3_f32);
+                }
+                if (se_w2.weight) {
+                    lw->shared_w2_f32 = (float *)malloc((size_t)DIM * INTERMEDIATE * sizeof(float));
+                    if (lw->shared_w2_f32) dequant_fp8_to_f32(&se_w2, lw->shared_w2_f32);
+                }
+                // Free raw FP8 data (only need f32)
+                free((void*)se_w1.weight); free((void*)se_w1.scale);
+                free((void*)se_w3.weight); free((void*)se_w3.scale);
+                free((void*)se_w2.weight); free((void*)se_w2.scale);
+            }
+
             // Layer 0 special: main_proj
             if (l == 0) {
                 LOAD_FP8(eng->head.main_proj, "main_proj", DIM, 3*DIM, 128);
@@ -550,6 +574,33 @@ static void dspark_moe_forward_cpu(
             expert_ptrs[k] = eng->expert_mmap[layer_idx] + (size_t)eid * DSPARK_EXPERT_SIZE;
         }
         dspark_moe_forward_gpu(target, normed_input, expert_ptrs, expert_ids, expert_weights, N_ACTIVE, moe_out);
+
+        // Add shared expert output: gate_up_swiglu + down, added to routed output
+        if (lw->shared_w1_f32 && lw->shared_w3_f32 && lw->shared_w2_f32) {
+            float gate_se[INTERMEDIATE];
+            float up_se[INTERMEDIATE];
+            float mid_se[INTERMEDIATE];
+            float down_se[DIM];
+            // gate = shared_w1 @ normed_input → [INTERMEDIATE]
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        INTERMEDIATE, DIM, 1.0f, lw->shared_w1_f32, DIM,
+                        normed_input, 1, 0.0f, gate_se, 1);
+            // up = shared_w3 @ normed_input → [INTERMEDIATE]
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        INTERMEDIATE, DIM, 1.0f, lw->shared_w3_f32, DIM,
+                        normed_input, 1, 0.0f, up_se, 1);
+            // SwiGLU
+            for (int i = 0; i < INTERMEDIATE; i++) {
+                float g = gate_se[i];
+                mid_se[i] = (g / (1.0f + expf(-g))) * up_se[i];
+            }
+            // down = shared_w2 @ mid → [DIM]
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        DIM, INTERMEDIATE, 1.0f, lw->shared_w2_f32, INTERMEDIATE,
+                        mid_se, 1, 0.0f, down_se, 1);
+            // Add to routed expert output
+            for (int d = 0; d < DIM; d++) moe_out[d] += down_se[d];
+        }
         return;
     }
 

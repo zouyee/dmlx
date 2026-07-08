@@ -127,6 +127,10 @@ typedef struct {
     const float *hc_ffn_fn;     // [24, MHC_MULT*DIM]
     const float *hc_ffn_base;   // [24]
     const float *hc_ffn_scale;  // [3]
+    // Shared expert (FP8 E4M3, pre-dequantized to f32)
+    float *shared_w1_f32;       // [INTERMEDIATE, DIM] = [2048, 4096] gate
+    float *shared_w3_f32;       // [INTERMEDIATE, DIM] = [2048, 4096] up
+    float *shared_w2_f32;       // [DIM, INTERMEDIATE] = [4096, 2048] down
 } DSparkLayerWeights;
 
 // DSpark-specific weights (beyond the 3 backbone layers)
