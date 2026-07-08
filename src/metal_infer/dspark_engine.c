@@ -531,6 +531,7 @@ static void dspark_moe_forward_cpu(
             for (int i = 0; i < N_EXPERTS; i++) {
                 if (!taken[i] && processed[i] > bv) { bv = processed[i]; best = i; }
             }
+            if (best < 0) { memset(moe_out, 0, DIM * sizeof(float)); goto moe_cleanup; }
             expert_ids[k] = best;
             expert_weights[k] = processed[best];
             taken[best] = 1;
