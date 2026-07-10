@@ -875,7 +875,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     // Note: fused_6expert_gate_up was tried but is slower due to reduced GPU parallelism
     // (serial expert loop in kernel vs GPU scheduling multiple dispatches in parallel).
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx] && !eng->use_affine_experts) {
             // === GATHER MODE: gatherQmm-equivalent ===
@@ -1021,11 +1021,12 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         }
 
         // Step 4: moe_combine in the SAME CB
+        // Hoist temp buffers so they survive until [cb commit] (for commandBufferWithUnretainedReferences)
+        id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
+        id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
         {
             id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
             [enc setComputePipelineState:eng->pipe_moe_combine];
-            id<MTLBuffer> weights_buf = [d newBufferWithBytes:expert_weights length:K*sizeof(float) options:MTLResourceStorageModeShared];
-            id<MTLBuffer> zero_resid  = [d newBufferWithLength:DIM*sizeof(float) options:MTLResourceStorageModeShared];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:0];
             [enc setBuffer:weights_buf offset:0 atIndex:1];
             [enc setBuffer:zero_resid  offset:0 atIndex:2];
@@ -1694,38 +1695,43 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;     // up output [INTERMEDIATE]
         id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;  // down output [DIM]
         {
-            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
+            id<MTLCommandBuffer> cb = [P.queue commandBufferWithUnretainedReferences];
+            // Hoist all temp buffers to CB scope (commandBufferWithUnretainedReferences doesn't retain)
+            const QuantWeight *qw_g = &eng->shared[layer].gate;
+            const QuantWeight *qw_u = &eng->shared[layer].up;
+            const QuantWeight *qw_d = &eng->shared[layer].down;
+            id bw_g = [d newBufferWithBytesNoCopy:(void*)qw_g->packed length:(size_t)qw_g->out_dim*(qw_g->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+            id bs_g = [d newBufferWithBytes:(void*)qw_g->scales length:(size_t)qw_g->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+            id bb_g = [d newBufferWithBytes:(void*)qw_g->biases length:(size_t)qw_g->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+            id bw_u = [d newBufferWithBytesNoCopy:(void*)qw_u->packed length:(size_t)qw_u->out_dim*(qw_u->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+            id bs_u = [d newBufferWithBytes:(void*)qw_u->scales length:(size_t)qw_u->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+            id bb_u = [d newBufferWithBytes:(void*)qw_u->biases length:(size_t)qw_u->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
+            id bw_d = [d newBufferWithBytesNoCopy:(void*)qw_d->packed length:(size_t)qw_d->out_dim*(qw_d->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+            id bs_d = [d newBufferWithBytes:(void*)qw_d->scales length:(size_t)qw_d->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
+            id bb_d = [d newBufferWithBytes:(void*)qw_d->biases length:(size_t)qw_d->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
             // Encoder 1: gate projection
             {
-                const QuantWeight *qw = &eng->shared[layer].gate;
-                id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                 [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
+                [e setBuffer:bw_g offset:0 atIndex:0]; [e setBuffer:bs_g offset:0 atIndex:1]; [e setBuffer:bb_g offset:0 atIndex:2];
                 [e setBuffer:bx offset:0 atIndex:3]; [e setBuffer:bgate offset:0 atIndex:4];
-                uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
+                uint od=qw_g->out_dim, id_=qw_g->in_dim, gs=SE_GS;
                 [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
-                [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e dispatchThreads:MTLSizeMake(qw_g->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [e endEncoding];
             }
             // Encoder 2: up projection
             {
-                const QuantWeight *qw = &eng->shared[layer].up;
-                id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-                id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                 [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
+                [e setBuffer:bw_u offset:0 atIndex:0]; [e setBuffer:bs_u offset:0 atIndex:1]; [e setBuffer:bb_u offset:0 atIndex:2];
                 [e setBuffer:bx offset:0 atIndex:3]; [e setBuffer:bup offset:0 atIndex:4];
-                uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
+                uint od=qw_u->out_dim, id_=qw_u->in_dim, gs=SE_GS;
                 [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
-                [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e dispatchThreads:MTLSizeMake(qw_u->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [e endEncoding];
             }
-            // Encoder 3: limited SwiGLU in-place on bgate (reads bup) — GPU kernel eliminates CPU round-trip
+            // Encoder 3: limited SwiGLU
             {
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                 [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_limited_swiglu];
@@ -1736,19 +1742,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                 [e dispatchThreads:MTLSizeMake(INTERMEDIATE,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [e endEncoding];
             }
-            // Encoder 4: down projection (reads bgate = SwiGLU output)
+            // Encoder 4: down projection
             {
-                const QuantWeight *qw = &eng->shared[layer].down;
-                id bw = [d newBufferWithBytesNoCopy:(void*)qw->packed length:(size_t)qw->out_dim*(qw->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-                id bs = [d newBufferWithBytes:(void*)qw->scales length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-                id bb = [d newBufferWithBytes:(void*)qw->biases length:(size_t)qw->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
                 [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
-                [e setBuffer:bw offset:0 atIndex:0]; [e setBuffer:bs offset:0 atIndex:1]; [e setBuffer:bb offset:0 atIndex:2];
+                [e setBuffer:bw_d offset:0 atIndex:0]; [e setBuffer:bs_d offset:0 atIndex:1]; [e setBuffer:bb_d offset:0 atIndex:2];
                 [e setBuffer:bgate offset:0 atIndex:3]; [e setBuffer:bdown offset:0 atIndex:4];
-                uint od=qw->out_dim, id_=qw->in_dim, gs=SE_GS;
+                uint od=qw_d->out_dim, id_=qw_d->in_dim, gs=SE_GS;
                 [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
-                [e dispatchThreads:MTLSizeMake(qw->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e dispatchThreads:MTLSizeMake(qw_d->out_dim,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 [e endEncoding];
             }
             [cb commit]; [cb waitUntilCompleted];
