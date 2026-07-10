@@ -855,7 +855,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                               uint8_t *expert_bufs[6], int *expert_ids,
                               float *expert_weights, int K) {
     id<MTLDevice> d = (id<MTLDevice>)eng->device;
-    id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+    id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
     const int gw_off = GATE_W_OFF, gs_off = GATE_S_OFF;
     const int uw_off = UP_W_OFF, us_off = UP_S_OFF;
     const int dw_off = DOWN_W_OFF, ds_off = DOWN_S_OFF;
@@ -875,7 +875,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     // Note: fused_6expert_gate_up was tried but is slower due to reduced GPU parallelism
     // (serial expert loop in kernel vs GPU scheduling multiple dispatches in parallel).
     {
-        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
         if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx] && !eng->use_affine_experts) {
             // === GATHER MODE: gatherQmm-equivalent ===
@@ -1294,7 +1294,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Encoders 2..N: Q chain + KV chain + SDPA (reads normed_bf16 from GPU, no CPU roundtrip)
     // Eliminates CB-A wait (32ms/token) by merging two CB boundaries into one.
     {
-        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
 
         // Encoder 1: mhc_pre (attn) — writes normed_bf16 to GPU, consumed by Q/KV chain below
         {
@@ -1694,7 +1694,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;     // up output [INTERMEDIATE]
         id<MTLBuffer> bdown = (id<MTLBuffer>)eng->buf_attn_out;  // down output [DIM]
         {
-            id<MTLCommandBuffer> cb = [P.queue commandBufferWithUnretainedReferences];
+            id<MTLCommandBuffer> cb = [P.queue commandBuffer];
             // Encoder 1: gate projection
             {
                 const QuantWeight *qw = &eng->shared[layer].gate;
@@ -1765,8 +1765,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         memcpy([(id<MTLBuffer>)eng->buf_ffn_out_f32 contents], ffn_out, DIM * sizeof(float));
         // IMPORTANT: Upload post-attention residual to GPU — mhc_post_ffn needs it
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents], residual, MHC_MULT * DIM * sizeof(float));
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_post_weights contents], post, MHC_MULT*sizeof(float));
-        memcpy([(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], comb, MHC_MULT*MHC_MULT*sizeof(float));
+        // buf_mhc_post_weights/comb_weights already hold correct FFN values from cb2cmd2.
+        // (The previous uninitialized post/comb upload was a latent bug masked by commandBuffer
+        //  retaining the correct buffer state from cb2cmd2's kernel output.)
         id<MTLCommandBuffer> cb3 = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         // Single encoder: mhc_post_ffn_expand4
