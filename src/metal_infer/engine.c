@@ -1295,7 +1295,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Encoders 2..N: Q chain + KV chain + SDPA (reads normed_bf16 from GPU, no CPU roundtrip)
     // Eliminates CB-A wait (32ms/token) by merging two CB boundaries into one.
     {
-        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBuffer];
+        id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
         // Encoder 1: mhc_pre (attn) — writes normed_bf16 to GPU, consumed by Q/KV chain below
         {

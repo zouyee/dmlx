@@ -47,6 +47,8 @@ typedef struct {
     id<MTLBuffer> scr_out;       // [DIM] f32             — wo_b output
     id<MTLBuffer> scr_bog[8];    // [O_LORA_RANK] f32 ×8 — wo_a group outputs
     id<MTLBuffer> scr_bgv[8];    // [group_feat] bf16 ×8  — wo_a group inputs
+    id<MTLBuffer> scr_cos;       // [QK_ROPE_DIM/2] f32  — RoPE cos (persistent, memcpy per pos)
+    id<MTLBuffer> scr_sin;       // [QK_ROPE_DIM/2] f32  — RoPE sin (persistent, memcpy per pos)
     // Persistent KV cache buffer: GPU-accessible Shared memory.
     // The kv_cache CPU pointer passed to mla_attention_decode_bf16 MUST alias [kvcache_buf contents].
     // With this buffer, we can blit bkv_n directly into the cache within CB1, enabling
@@ -173,6 +175,8 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
         }
     }
     c->kvcache_buf = MKSCR((size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
+    c->scr_cos = MKSCR((size_t)(QK_ROPE_DIM / 2) * sizeof(float));
+    c->scr_sin = MKSCR((size_t)(QK_ROPE_DIM / 2) * sizeof(float));
     #undef MKSCR
 
     return c;
@@ -680,8 +684,15 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
     id<MTLBuffer> bx     = (x_gpu_buf && !x) ? (__bridge id<MTLBuffer>)x_gpu_buf
                                : mkbuf(d, x, DIM * sizeof(uint16_t));
-    id<MTLBuffer> bcos   = mkbuf(d, cosv, half * sizeof(float));
-    id<MTLBuffer> bsin   = mkbuf(d, sinv, half * sizeof(float));
+    id<MTLBuffer> bcos, bsin;
+    if (abc && abc->scr_cos) {
+        bcos = abc->scr_cos; bsin = abc->scr_sin;
+        memcpy([bcos contents], cosv, half * sizeof(float));
+        memcpy([bsin contents], sinv, half * sizeof(float));
+    } else {
+        bcos = mkbuf(d, cosv, half * sizeof(float));
+        bsin = mkbuf(d, sinv, half * sizeof(float));
+    }
     // Use persistent scratch buffers from AttnBufCache when available
     id<MTLBuffer> bq_a   = (abc && abc->scr_q_a)   ? abc->scr_q_a   : mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
     id<MTLBuffer> bq_res = (abc && abc->scr_q_res)  ? abc->scr_q_res : mkbuf(d, NULL, Q_LORA_RANK * sizeof(uint16_t));
