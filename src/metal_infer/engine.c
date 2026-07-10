@@ -1236,7 +1236,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                residual, (size_t)MHC_MULT * DIM * sizeof(float));
     }
 
-    @autoreleasepool {    // Build MlaPipes view over the engine's pipelines.
+    {    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
     P.dev = d;
     P.queue = (id<MTLCommandQueue>)eng->queue;
@@ -1793,11 +1793,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
 
         [cb3 commit];
-        // SYNCHRONOUS wait with dedicated pool — MLX pattern: avoid retained references cascade
-        // causing autoreleased 0x20 object in outer @autoreleasepool drain.
-        @autoreleasepool {
-            [cb3 waitUntilCompleted];
-        }
+        [cb3 waitUntilCompleted];
         // Read residual from GPU buffer (cb3 wrote buf_residual_gpu)
         {
             float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
@@ -1829,7 +1825,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
     }
 
-    } // end @autoreleasepool
+    } // end layer body
     if (phase_time) { fprintf(stderr, "[PHASE] L%d mla=%.2fms cmd2=%.2fms io=%.2fms moe=%.2fms shared=%.2fms total=%.2fms\n",
         layer, (pt1-pt0)/1e6, (pt2-pt1)/1e6, (pt3-pt2)/1e6, (pt4-pt3)/1e6, (pt5-pt4)/1e6, (pt5-pt0)/1e6); }
     return 0;
@@ -1840,6 +1836,7 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     const char *nl = getenv("NATIVE_MAX_LAYERS");
     if (nl) max_layers = atoi(nl);
     const char *time_layers = getenv("NATIVE_TIME_LAYERS");
+    @autoreleasepool {  // Per-token pool: drain after all 43 layers complete (avoids per-layer race)
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         double t0 = 0;
         if (time_layers) {
@@ -1880,6 +1877,7 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             eng->deferred.gpu_combined = false;
         }
     }
+    } // end per-token @autoreleasepool
 
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
