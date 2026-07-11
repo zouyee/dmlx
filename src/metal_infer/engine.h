@@ -447,6 +447,14 @@ typedef struct {
     uint32_t compress_ratio[N_LAYERS];   // 0=none, 4=CSA, 128=HCA
     QuantWeight comp_wkv[N_LAYERS];
     QuantWeight comp_wgate[N_LAYERS];
+    // Pre-allocated GPU buffers for compressor weights (avoid CPU matvec)
+    void *comp_wkv_gpu_w[N_LAYERS];   // packed weights
+    void *comp_wkv_gpu_s[N_LAYERS];   // scales
+    void *comp_wkv_gpu_b[N_LAYERS];   // biases
+    void *comp_wgate_gpu_w[N_LAYERS];
+    void *comp_wgate_gpu_s[N_LAYERS];
+    void *comp_wgate_gpu_b[N_LAYERS];
+    void *comp_out_gpu[N_LAYERS];     // [max(CSA_OUT_DIM, HCA_OUT_DIM)] f32 output buffer
     const float *comp_ape[N_LAYERS];     // [compress_ratio, out_dim] f32
     const float *comp_norm[N_LAYERS];    // [COMP_HEAD_DIM] f32
     // Indexer weights (only ratio=4 layers)

@@ -2300,6 +2300,32 @@ void moe_infer_set_layer_compressor(MoEInferEngine *eng, int layer,
     eng->comp_wgate[layer] = comp_wgate;
     eng->comp_ape[layer] = comp_ape;
     eng->comp_norm[layer] = comp_norm;
+    // Pre-allocate GPU buffers for compressor weights (eliminates CPU matvec in hot path)
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    if (comp_wkv.packed && !eng->comp_wkv_gpu_w[layer]) {
+        const QuantWeight *w = &eng->comp_wkv[layer];
+        int ng = w->in_dim / w->group_size;
+        eng->comp_wkv_gpu_w[layer] = (void *)[d newBufferWithBytesNoCopy:(void*)w->packed
+            length:(size_t)w->out_dim*(w->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+        eng->comp_wkv_gpu_s[layer] = (void *)[d newBufferWithBytes:(void*)w->scales
+            length:(size_t)w->out_dim*ng*sizeof(float) options:MTLResourceStorageModeShared];
+        eng->comp_wkv_gpu_b[layer] = (void *)[d newBufferWithBytes:(void*)w->biases
+            length:(size_t)w->out_dim*ng*sizeof(float) options:MTLResourceStorageModeShared];
+    }
+    if (comp_wgate.packed && !eng->comp_wgate_gpu_w[layer]) {
+        const QuantWeight *w = &eng->comp_wgate[layer];
+        int ng = w->in_dim / w->group_size;
+        eng->comp_wgate_gpu_w[layer] = (void *)[d newBufferWithBytesNoCopy:(void*)w->packed
+            length:(size_t)w->out_dim*(w->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
+        eng->comp_wgate_gpu_s[layer] = (void *)[d newBufferWithBytes:(void*)w->scales
+            length:(size_t)w->out_dim*ng*sizeof(float) options:MTLResourceStorageModeShared];
+        eng->comp_wgate_gpu_b[layer] = (void *)[d newBufferWithBytes:(void*)w->biases
+            length:(size_t)w->out_dim*ng*sizeof(float) options:MTLResourceStorageModeShared];
+    }
+    if (!eng->comp_out_gpu[layer]) {
+        int out_dim = (compress_ratio == 4) ? CSA_OUT_DIM : HCA_OUT_DIM;
+        eng->comp_out_gpu[layer] = (void *)[d newBufferWithLength:out_dim*sizeof(float) options:MTLResourceStorageModeShared];
+    }
 }
 
 void moe_infer_set_layer_indexer(MoEInferEngine *eng, int layer,
@@ -2382,9 +2408,51 @@ void moe_infer_compressor_step(MoEInferEngine *eng, int layer, int pos,
     float *kv_cur   = (float*)alloca(out_dim * sizeof(float));
     float *gate_cur = (float*)alloca(out_dim * sizeof(float));
 
-    // 1. Project
-    cpu_affine_matvec_safe(kv_cur,   &eng->comp_wkv[layer],   attn_normed);
-    cpu_affine_matvec_safe(gate_cur, &eng->comp_wgate[layer], attn_normed);
+    // 1. Project — GPU dispatch (replaces cpu_affine_matvec_safe, ~50× faster)
+    if (eng->comp_wkv_gpu_w[layer]) {
+        id<MTLDevice> d = (id<MTLDevice>)eng->device;
+        // Copy input to GPU buffer (reuse buf_normed which already has normed from MoE path)
+        memcpy([(id<MTLBuffer>)eng->buf_normed contents], attn_normed, DIM * sizeof(float));
+        id<MTLBuffer> out_buf = (id<MTLBuffer>)eng->comp_out_gpu[layer];
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        // kv projection
+        {
+            id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_w[layer] offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_s[layer] offset:0 atIndex:1];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_b[layer] offset:0 atIndex:2];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+            [e setBuffer:out_buf offset:0 atIndex:4];
+            uint od = eng->comp_wkv[layer].out_dim, id_ = eng->comp_wkv[layer].in_dim, gs = eng->comp_wkv[layer].group_size;
+            [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+        [cb commit]; [cb waitUntilCompleted];
+        memcpy(kv_cur, [out_buf contents], out_dim * sizeof(float));
+        // gate projection
+        id<MTLCommandBuffer> cb2 = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        {
+            id<MTLComputeCommandEncoder> e = [cb2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_w[layer] offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_s[layer] offset:0 atIndex:1];
+            [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_b[layer] offset:0 atIndex:2];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+            [e setBuffer:out_buf offset:0 atIndex:4];
+            uint od = eng->comp_wgate[layer].out_dim, id_ = eng->comp_wgate[layer].in_dim, gs = eng->comp_wgate[layer].group_size;
+            [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+        [cb2 commit]; [cb2 waitUntilCompleted];
+        memcpy(gate_cur, [out_buf contents], out_dim * sizeof(float));
+    } else {
+        // Fallback: CPU (when GPU buffers not allocated)
+        cpu_affine_matvec_safe(kv_cur,   &eng->comp_wkv[layer],   attn_normed);
+        cpu_affine_matvec_safe(gate_cur, &eng->comp_wgate[layer], attn_normed);
+    }
 
     // 2. Add positional bias
     if (eng->comp_ape[layer]) {
