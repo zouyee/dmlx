@@ -454,7 +454,8 @@ typedef struct {
     void *comp_wgate_gpu_w[N_LAYERS];
     void *comp_wgate_gpu_s[N_LAYERS];
     void *comp_wgate_gpu_b[N_LAYERS];
-    void *comp_out_gpu[N_LAYERS];     // [max(CSA_OUT_DIM, HCA_OUT_DIM)] f32 output buffer
+    void *comp_out_gpu[N_LAYERS];     // [max(CSA_OUT_DIM, HCA_OUT_DIM)] f32 — kv output
+    void *comp_out2_gpu[N_LAYERS];    // [max(CSA_OUT_DIM, HCA_OUT_DIM)] f32 — gate output
     const float *comp_ape[N_LAYERS];     // [compress_ratio, out_dim] f32
     const float *comp_norm[N_LAYERS];    // [COMP_HEAD_DIM] f32
     // Indexer weights (only ratio=4 layers)
