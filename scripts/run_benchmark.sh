@@ -213,6 +213,32 @@ print(f'{vals[1]:.3f}')")
     export BM_PERF_SECS=$(($(date +%s)-T_PERF))
     export BM_SMELT_N="$NATIVE_SMELT_N"
 
+    # Restart the server before E2E: after the perf phase the process has spent
+    # ~250s streaming ~3.4GB/token of expert data through the page cache, and on
+    # a 48GB machine the accumulated pressure gets the server Jetsam-killed
+    # mid-E2E (observed 2/2 at P7, SIGKILL "Killed: 9"). A fresh process halves
+    # the per-process lifetime and cache churn; perf numbers are already captured.
+    echo "   Restarting server before E2E (avoid Jetsam kill from accumulated memory pressure)..."
+    cleanup
+    NATIVE_SMELT_N="${NATIVE_SMELT_N}" "$CLI" serve \
+        --model "$MODEL_PATH" \
+        --port "$PORT" \
+        --native \
+        --expert-packed-dir "$PACKED_DIR" \
+        > /tmp/benchmark_serve.log 2>&1 &
+    echo -n "   Waiting for server (SMELT preload)..."
+    for i in $(seq 1 180); do
+        if curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+            echo " ready (${i}s)"
+            break
+        fi
+        echo -n "."
+        sleep 1
+    done
+    if ! curl -sf "${SERVER_URL}/health" > /dev/null 2>&1; then
+        echo -e "\n❌ Server failed to restart"; tail -20 /tmp/benchmark_serve.log; exit 1
+    fi
+
     # --- E2E: 7-Prompt correctness test via native serve mode ---
     echo ""
     echo "✅ E2E (7 prompts via native serve)..."
