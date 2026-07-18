@@ -1930,6 +1930,14 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     }
 
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
+        // Per-layer autorelease pool for the batch path. Unlike moe_infer_forward
+        // (which wraps each token in a pool), forward_batch previously had NO pool:
+        // the ~5 autoreleased MTLCommandBuffers created per (layer,token) leaked into
+        // the void, and after ~64 outstanding CB objects Metal's queue semaphore
+        // blocked commandBuffer creation forever (0% GPU deadlock on 9+ token prompts).
+        // Draining here is safe: the per-layer deferred drain below waits + releases
+        // the last in-flight CB before the pool exits, so no drain races live GPU work.
+        @autoreleasepool {
         for (int t = 0; t < n_tokens; t++) {
             float *hidden_t = hidden_batch + (size_t)t * (MHC_MULT * DIM);
             if (token_ids != NULL) eng->current_token_id = (int)token_ids[t];
@@ -1988,6 +1996,7 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 fclose(fl);
             }
         }
+        } // end per-layer @autoreleasepool
     }
 
     // DSpark: feed prefilled KV entries into DSpark's sliding window.
