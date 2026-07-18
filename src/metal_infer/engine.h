@@ -352,8 +352,21 @@ typedef struct {
     // Expert I/O
     int packed_fd[N_LAYERS];     // per-layer packed expert file descriptors
     uint8_t *expert_buf[6];      // 2MB-aligned expert data buffers
-    uint8_t *expert_buf_pred[6]; // second buffer set for prediction prefetch
-    void *io_pool;               // persistent I/O thread pool
+    uint8_t *expert_buf_pred[6]; // prefetch buffer set 0 (layer parity: even layers)
+    uint8_t *expert_buf_pred2[6];// prefetch buffer set 1 (odd layers)
+    void *io_pool;               // persistent I/O thread pool (critical path)
+    void *prefetch_pool;         // second I/O thread pool (async prediction prefetch)
+
+    // Predictive cross-layer expert prefetch state.
+    // After layer L's routing is known, async-prefetch layer L+1's predicted
+    // experts (previous token's routing at L+1) into pred set (L+1)%2 while
+    // layer L's GPU work + layer L+1's attention chain execute (~11ms window).
+    int  prefetch_layer;         // target layer of in-flight prefetch (-1 = none)
+    int  prefetch_ids[6];        // prefetched expert ids aligned to buffer slots
+    int  prefetch_count;         // number of valid slots in prefetch_ids
+    bool prefetch_active;        // a prefetch is in flight for prefetch_layer
+    int  in_batch;               // !=0 inside moe_infer_forward_batch (prefetch off)
+    int  prefetch_disabled;      // 0=auto, 1=off (env NATIVE_PREFETCH=0 or adaptive)
 
     // Expert memory cache — avoids SSD reads for frequently-used experts.
     // Layout: expert_mem_cache[layer][expert_id] = pointer into expert_mem_pool,
@@ -403,6 +416,7 @@ typedef struct {
     bool smelt_warmup_done;       // true once warmup is complete and cache is populated
     bool smelt_enabled;           // true if SMELT is active
     bool smelt_in_decode_phase;   // true after prefill completes (set by moe_infer_set_decode_phase)
+    bool decode_phase;            // true after prefill completes (unconditional; gates predictive prefetch)
     const char *smelt_stats_path; // path to routing stats file (for periodic auto-save on OOM protection)
     float smelt_penalty;          // routing score penalty for uncached experts (default -1e9)
 

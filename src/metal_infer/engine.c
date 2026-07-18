@@ -198,6 +198,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     for (int k = 0; k < N_ACTIVE; k++) {
         posix_memalign((void**)&eng->expert_buf[k], 2*1024*1024, AFFINE_EXPERT_SIZE);
         posix_memalign((void**)&eng->expert_buf_pred[k], 2*1024*1024, AFFINE_EXPERT_SIZE);
+        posix_memalign((void**)&eng->expert_buf_pred2[k], 2*1024*1024, AFFINE_EXPERT_SIZE);
     }
 
     // Initialize expert GPU buffer cache to NULL (populated after SMELT warmup)
@@ -478,7 +479,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
         }
     }
 
-    eng->expert_cache_n_experts = n;  // used as guard in io_pool_dispatch_cached
+    eng->expert_cache_n_experts = n;  // used as guard in expert data resolution (cache > prefetch > pread)
     eng->smelt_warmup_done = true;
     fprintf(stderr, "[smelt] Done. %.1f GB preloaded, routing bias penalty=%.0f\n",
         (double)total_bytes / (1024.0*1024.0*1024.0), eng->smelt_penalty);
@@ -546,6 +547,7 @@ int moe_infer_smelt_finish_warmup(MoEInferEngine *eng) {
 }
 
 void moe_infer_smelt_set_decode_phase(MoEInferEngine *eng) {
+    if (eng) eng->decode_phase = true;  // unconditional: gates predictive prefetch
     if (eng && eng->smelt_enabled && !eng->smelt_in_decode_phase) {
         eng->smelt_in_decode_phase = true;
         fprintf(stderr, "[smelt] Decode phase started — SMELT token counting enabled\n");
@@ -754,64 +756,9 @@ int moe_infer_init_gather_mode(MoEInferEngine *eng) {
     return 1;
 }
 
-// Dispatch K parallel preads — uses memory cache if available, falls back to SSD.
-static void io_pool_dispatch_cached(MoEInferEngine *eng, IOPool *pool, int layer, int *expert_ids, int K,
-                                    uint8_t *buffers[6]) {
-    if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer]) {
-        // Check if all requested experts are in cache
-        int all_cached = 1;
-        for (int k = 0; k < K; k++) {
-            int eid = expert_ids[k];
-            if (eid < 0 || eid >= N_EXPERTS || !eng->expert_mem_cache[layer][eid]) {
-                all_cached = 0;
-                break;
-            }
-        }
-        if (all_cached) {
-            // Zero-copy: point buffer pointers directly at cached data
-            for (int k = 0; k < K; k++) {
-                buffers[k] = eng->expert_mem_cache[layer][expert_ids[k]];
-            }
-            return;
-        }
-        // Partial hit: fill cached ones directly, pread the rest
-        for (int k = 0; k < K; k++) {
-            int eid = expert_ids[k];
-            if (eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid]) {
-                buffers[k] = eng->expert_mem_cache[layer][eid];
-            } else {
-                buffers[k] = eng->expert_buf[k];  // fallback to pread buffer
-            }
-        }
-        // For uncached experts, do selective pread
-        uint8_t *fallback_bufs[6];
-        int fallback_ids[6];
-        int fallback_k_map[6];
-        int n_fallback = 0;
-        for (int k = 0; k < K; k++) {
-            int eid = expert_ids[k];
-            if (!(eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid])) {
-                fallback_ids[n_fallback] = eid;
-                fallback_bufs[n_fallback] = eng->expert_buf[k];
-                fallback_k_map[n_fallback] = k;
-                n_fallback++;
-            }
-        }
-        if (n_fallback > 0) {
-            io_pool_dispatch(pool, eng->packed_fd[layer], fallback_ids, n_fallback, fallback_bufs, eng->active_expert_size);
-            for (int i = 0; i < n_fallback; i++) {
-                buffers[fallback_k_map[i]] = fallback_bufs[i];
-            }
-        }
-        return;
-    }
-    // No cache: regular pread
-    io_pool_dispatch(pool, eng->packed_fd[layer], expert_ids, K, buffers, eng->active_expert_size);
-}
-
-// Dispatch K parallel preads. Blocks until all complete.
-static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
-                              uint8_t *buffers[6], size_t expert_sz) {
+// Post K parallel preads without blocking. Completion is observed via io_pool_wait.
+static void io_pool_start(IOPool *pool, int layer_fd, int *expert_ids, int K,
+                          uint8_t *buffers[6], size_t expert_sz) {
     pthread_mutex_lock(&pool->mutex);
     for (int k = 0; k < K; k++) {
         pool->fd[k] = layer_fd;
@@ -823,28 +770,124 @@ static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
     pool->tasks_done = 0;
     pool->generation++;
     pthread_cond_broadcast(&pool->work_ready);
+    pthread_mutex_unlock(&pool->mutex);
+}
 
-    while (pool->tasks_done < K) {
+// Block until all tasks posted by the last io_pool_start complete.
+static void io_pool_wait(IOPool *pool) {
+    pthread_mutex_lock(&pool->mutex);
+    while (pool->tasks_done < pool->num_tasks) {
         pthread_cond_wait(&pool->work_done, &pool->mutex);
     }
     pthread_mutex_unlock(&pool->mutex);
 }
 
+// Dispatch K parallel preads. Blocks until all complete.
+static void io_pool_dispatch(IOPool *pool, int layer_fd, int *expert_ids, int K,
+                              uint8_t *buffers[6], size_t expert_sz) {
+    io_pool_start(pool, layer_fd, expert_ids, K, buffers, expert_sz);
+    io_pool_wait(pool);
+}
+
 // ============================================================================
-// Temporal expert prediction
+// Temporal expert prediction + predictive cross-layer prefetch
 // ============================================================================
 
 static void predictor_record(ExpertPredictor *pred, int layer, int *experts, int K) {
     for (int k = 0; k < K && k < N_ACTIVE; k++) {
         pred->experts[layer][k] = experts[k];
     }
+    pred->valid = true;
 }
 
-static void predictor_prefetch_start(ExpertPredictor *pred, int layer_fd,
-                                      int layer, uint8_t *buffers[6]) {
-    // TODO: async prefetch into prediction buffers
-    (void)pred; (void)layer_fd; (void)layer; (void)buffers;
-    // Phase 2: implement GCD async pread for prediction
+// Issue an async prefetch for `layer`'s predicted experts (previous token's
+// routing at that layer) into pred buffer set (layer % 2). Non-blocking:
+// the reads proceed on the dedicated prefetch pool while the current layer's
+// GPU work and the target layer's attention chain execute (~11ms window).
+static void prefetch_issue(MoEInferEngine *eng, int layer) {
+    if (eng->prefetch_disabled == 1 || !eng->predictor.valid) return;
+    if (eng->in_batch) return;
+    if (!eng->decode_phase) return;  // decode only: prefill hit rate ~16% and
+                                     // prefetch contention costs +240ms/layer there
+    if (layer < 0 || layer >= N_LAYERS) return;
+    if (eng->tid2eid[layer] != NULL) return;   // hash-routing layer: all preloaded
+    if (!eng->prefetch_pool) return;
+
+    uint8_t **set = (layer % 2 == 0) ? eng->expert_buf_pred : eng->expert_buf_pred2;
+    uint8_t *bufs[6];
+    int ids[6], slots[6];
+    int n = 0;
+    for (int k = 0; k < N_ACTIVE; k++) {
+        int eid = eng->predictor.experts[layer][k];
+        if (eid < 0 || eid >= N_EXPERTS) continue;
+        // Skip SMELT-cached experts — they are zero-copy hits at use time.
+        if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer] &&
+            eng->expert_mem_cache[layer][eid]) continue;
+        ids[n] = eid; bufs[n] = set[k]; slots[n] = k;
+        n++;
+    }
+    if (n == 0) return;
+    // Safety net: drain any unconsumed previous prefetch before reusing the pool.
+    // In lockstep layer order the previous prefetch is consumed one layer after
+    // issue, so this wait is normally a no-op.
+    io_pool_wait((IOPool *)eng->prefetch_pool);
+    io_pool_start((IOPool *)eng->prefetch_pool, eng->packed_fd[layer], ids, n, bufs,
+                  eng->active_expert_size);
+    for (int k = 0; k < N_ACTIVE; k++) eng->prefetch_ids[k] = -1;
+    for (int i = 0; i < n; i++) eng->prefetch_ids[slots[i]] = ids[i];
+    eng->prefetch_count = n;
+    eng->prefetch_layer = layer;
+    eng->prefetch_active = true;
+}
+
+// Consume a prefetch targeted at `layer`: wait for completion and point
+// unresolved expert_data slots at the prefetched buffers where the predicted
+// expert matches the actual routing. Slots left NULL fall back to pread.
+static void prefetch_consume(MoEInferEngine *eng, int layer, const int *expert_ids,
+                             uint8_t *expert_data[6]) {
+    if (!eng->prefetch_active || eng->prefetch_layer != layer) return;
+    io_pool_wait((IOPool *)eng->prefetch_pool);
+    eng->prefetch_active = false;
+    uint8_t **set = (layer % 2 == 0) ? eng->expert_buf_pred : eng->expert_buf_pred2;
+    for (int k = 0; k < N_ACTIVE; k++) {
+        if (expert_data[k] != NULL) continue;  // already resolved (SMELT cache)
+        if (expert_ids[k] < 0 || expert_ids[k] >= N_EXPERTS) continue;  // invalid id → miss path
+        for (int s = 0; s < N_ACTIVE; s++) {
+            if (eng->prefetch_ids[s] == expert_ids[k]) {
+                expert_data[k] = set[s];
+                eng->predictor.hits++;
+                break;
+            }
+        }
+        if (expert_data[k] == NULL) eng->predictor.misses++;
+    }
+}
+
+// Adaptive kill-switch: with enough samples, stop prefetching when the
+// temporal hit rate is too low — a wrong prediction wastes ~80MB of SSD
+// bandwidth and pollutes the page cache. Only relevant when prefetch is
+// enabled (NATIVE_PREFETCH=1 → prefetch_disabled == 0); default is off.
+// Threshold is 5 tokens' worth of samples (1200) so the decision reflects
+// steady-state routing, not the atypical first token(s) of a request
+// (special chat-template tokens route near-disjointly and would otherwise
+// trip the gate instantly — observed 0/240 on token 1 vs 39% steady-state).
+static void prefetch_update_adaptive(MoEInferEngine *eng) {
+    if (eng->prefetch_disabled != 0) return;
+    int total = eng->predictor.hits + eng->predictor.misses;
+    if (total >= 1200 && eng->predictor.hits * 4 < total) {  // hit rate < 25%
+        eng->prefetch_disabled = 1;
+        fprintf(stderr, "[prefetch] adaptive disable: hit rate %d/%d < 25%%\n",
+                eng->predictor.hits, total);
+    }
+}
+
+// Drain any in-flight prefetch (request reset / KV rollback safety).
+static void prefetch_drain(MoEInferEngine *eng) {
+    if (eng->prefetch_active && eng->prefetch_pool) {
+        io_pool_wait((IOPool *)eng->prefetch_pool);
+    }
+    eng->prefetch_active = false;
+    eng->prefetch_layer = -1;
 }
 
 // ============================================================================
@@ -1617,6 +1660,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             }
         }
     }
+    // Temporal prediction: record this layer's routing for next-token prefetch.
+    predictor_record(&eng->predictor, layer, expert_ids, N_ACTIVE);
+    prefetch_update_adaptive(eng);
     if (layer == 0 && getenv("MF_DBG")) {
         fprintf(stderr, "[mf-dbg] L0 expert_ids=[%d,%d,%d,%d,%d,%d] weights=[%.3f,%.3f,%.3f] hash=%s tok=%d\n",
             expert_ids[0],expert_ids[1],expert_ids[2],expert_ids[3],expert_ids[4],expert_ids[5],
@@ -1635,12 +1681,42 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
         double ti0=0, ti1=0, ti2=0;
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti0 = ts.tv_sec*1e9+ts.tv_nsec; }
-        // Use cached dispatch: reads from RAM if expert is preloaded, SSD otherwise
-        uint8_t *expert_data[6];
-        for (int k = 0; k < N_ACTIVE; k++) expert_data[k] = eng->expert_buf[k];
-        io_pool_dispatch_cached(eng, io, layer, expert_ids, N_ACTIVE, expert_data);
+        // Resolve expert data in priority order:
+        //   1. SMELT RAM cache (zero-copy)
+        //   2. predictive prefetch buffers (async pread issued one layer earlier)
+        //   3. blocking parallel pread of the remaining misses
+        uint8_t *expert_data[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+        if (eng->expert_cache_n_experts > 0 && eng->expert_mem_cache[layer]) {
+            for (int k = 0; k < N_ACTIVE; k++) {
+                int eid = expert_ids[k];
+                if (eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid]) {
+                    expert_data[k] = eng->expert_mem_cache[layer][eid];
+                }
+            }
+        }
+        prefetch_consume(eng, layer, expert_ids, expert_data);
+        int miss_ids[6], miss_map[6];
+        uint8_t *miss_bufs[6];
+        int n_miss = 0;
+        for (int k = 0; k < N_ACTIVE; k++) {
+            if (expert_data[k] == NULL) {
+                miss_ids[n_miss] = expert_ids[k];
+                miss_bufs[n_miss] = eng->expert_buf[k];
+                miss_map[n_miss] = k;
+                n_miss++;
+            }
+        }
+        if (n_miss > 0) {
+            io_pool_dispatch(io, eng->packed_fd[layer], miss_ids, n_miss, miss_bufs,
+                             eng->active_expert_size);
+            for (int i = 0; i < n_miss; i++) expert_data[miss_map[i]] = miss_bufs[i];
+        }
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti1 = ts.tv_sec*1e9+ts.tv_nsec; }
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt3 = ts.tv_sec*1e9+ts.tv_nsec; }
+        // Kick off async prefetch for the next layer now that this layer's
+        // critical-path I/O is done — the reads overlap the GPU MoE/attention
+        // work between here and the next layer's expert dispatch.
+        prefetch_issue(eng, layer + 1);
         moe_forward_layer(eng, layer, expert_data, expert_ids, expert_weights, N_ACTIVE);
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti2 = ts.tv_sec*1e9+ts.tv_nsec;
             fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
@@ -1879,6 +1955,13 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     }
     } // end per-token @autoreleasepool
 
+    if ((time_layers || getenv("NATIVE_PREFETCH_DEBUG")) && eng->predictor.valid) {
+        int h = eng->predictor.hits, m = eng->predictor.misses;
+        fprintf(stderr, "[prefetch] pos=%d hits=%d misses=%d rate=%.2f%s\n", pos, h, m,
+                (h + m) > 0 ? (double)h / (h + m) : 0.0,
+                eng->prefetch_disabled == 1 ? " (disabled)" : "");
+    }
+
     // SMELT: count this decode token, trigger warmup completion if threshold reached.
     // Only count tokens after prefill (pos > 0 is not sufficient since prefill also
     // calls forward token-by-token). We detect decode mode by checking the engine's
@@ -1906,6 +1989,7 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     int max_layers = N_LAYERS;
     const char *nl = getenv("NATIVE_MAX_LAYERS");
     if (nl) max_layers = atoi(nl);
+    eng->in_batch++;  // disable predictive prefetch for the whole batch pass
 
     // Dump all token embed outputs (before any layer processing) for diagnostics
     if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
@@ -1961,7 +2045,10 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 }
                 eng->deferred.gpu_combined = false;
             }
-            if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) return -1;
+            if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) {
+                eng->in_batch--;
+                return -1;
+            }
         }
         // After all tokens in this layer: drain deferred for the last token
         // and update its hidden with the GPU's final output.
@@ -2036,6 +2123,7 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             }
         }
     }
+    eng->in_batch--;
     return 0;
 }
 
@@ -2064,6 +2152,25 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
     IOPool *io = (IOPool *)calloc(1, sizeof(IOPool));
     io_pool_init(io);
     eng->io_pool = io;
+
+    // Dedicated pool for async prediction prefetch (kept separate from the
+    // critical-path pool so prefetches never steal bandwidth from blocking reads)
+    IOPool *pf = (IOPool *)calloc(1, sizeof(IOPool));
+    io_pool_init(pf);
+    eng->prefetch_pool = pf;
+    eng->prefetch_layer = -1;
+    eng->prefetch_active = false;
+    eng->in_batch = 0;
+    // NATIVE_PREFETCH: "1"=on (opt-in), unset/other=off.
+    // Default OFF: official benchmark A/B (2026-07-18, M4 Pro 48GB) showed
+    // 0.851 tok/s with auto-prefetch vs 0.889 without (-4.3%). Mechanism: on
+    // cold SSD the 80MB prefetch takes longer than the ~11ms GPU window, and
+    // prefetch_consume waits for the whole batch (incl. ~61% useless experts),
+    // blocking the critical path. Code kept for future refinement (wait only
+    // on hit slots; re-evaluate on long-decode workloads where hit rate is
+    // ~39% and io= dropped 6.8→3.84ms/layer).
+    const char *pfenv = getenv("NATIVE_PREFETCH");
+    eng->prefetch_disabled = (pfenv && pfenv[0] == '1') ? 0 : 1;
 
     eng->initialized = true;
     // Initialize SMELT fields (disabled by default)
@@ -2139,6 +2246,14 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
         eng->deferred.cmd_experts = NULL;
     }
     eng->deferred.active = false;
+    prefetch_drain(eng);
+    // Invalidate cross-request predictions: routing from the previous request
+    // is stale, and the first token(s) of a new request (special chat-template
+    // tokens) route atypically. Re-recording starts fresh on the next token.
+    eng->predictor.valid = false;
+    eng->predictor.hits = 0;
+    eng->predictor.misses = 0;
+    eng->decode_phase = false;  // re-armed by moe_infer_smelt_set_decode_phase after prefill
     eng->deferred.gpu_combined = false;
 
     // Reset SMELT decode phase flag so next request's prefill doesn't count for warmup.
@@ -2179,6 +2294,7 @@ void moe_infer_rollback_kv(MoEInferEngine *eng, int valid_len) {
     // Truncate KV cache for all layers to valid_len.
     // Used by speculative decoding when draft tokens are rejected.
     if (valid_len < 0) valid_len = 0;
+    prefetch_drain(eng);
     for (int l = 0; l < N_LAYERS; l++) {
         if (eng->kv_cache[l].len > valid_len) {
             eng->kv_cache[l].len = valid_len;
@@ -2670,12 +2786,24 @@ void moe_infer_deinit(MoEInferEngine *eng) {
         }
         free(io);
     }
+    IOPool *pfp = (IOPool *)eng->prefetch_pool;
+    if (pfp) {
+        pthread_mutex_lock(&pfp->mutex);
+        pfp->shutdown = true;
+        pthread_cond_broadcast(&pfp->work_ready);
+        pthread_mutex_unlock(&pfp->mutex);
+        for (int i = 0; i < NUM_IO_THREADS; i++) {
+            pthread_join(pfp->threads[i], NULL);
+        }
+        free(pfp);
+    }
     for (int l = 0; l < N_LAYERS; l++) {
         if (eng->packed_fd[l] >= 0) close(eng->packed_fd[l]);
     }
     for (int k = 0; k < N_ACTIVE; k++) {
         free(eng->expert_buf[k]);
         free(eng->expert_buf_pred[k]);
+        free(eng->expert_buf_pred2[k]);
     }
     // Free expert memory cache
     if (eng->expert_cache_n_experts > 0) {
