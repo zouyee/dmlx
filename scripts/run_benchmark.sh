@@ -208,6 +208,20 @@ vals=sorted([${NATIVE_TPS_LIST[0]},${NATIVE_TPS_LIST[1]},${NATIVE_TPS_LIST[2]}])
 print(f'{vals[1]:.3f}')")
     echo "   Median: ${NATIVE_MEDIAN_TPS} tok/s"
 
+    # Long-decode perf: 1 request x 100 tokens. The 5-token runs above are
+    # dominated by prefill + request overhead, which makes decode-phase
+    # optimizations (expert prefetch, DSpark, etc.) invisible; this metric
+    # isolates sustained decode throughput.
+    echo "   Long-decode (1 run, max_tokens=100)..."
+    T_REQ=$(python3 -c "import time; print(time.time())")
+    RESP=$(curl -s --max-time 600 "${SERVER_URL}/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d '{"model":"d","messages":[{"role":"user","content":"Count from 1 to 50."}],"max_tokens":100,"temperature":0}')
+    T_DONE=$(python3 -c "import time; print(time.time())")
+    N_COMPLETION=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('usage',{}).get('completion_tokens',100))" 2>/dev/null || echo 100)
+    NATIVE_DECODE_TPS=$(python3 -c "print(f'{$N_COMPLETION/($T_DONE-$T_REQ):.3f}')")
+    echo "   long-decode: $(python3 -c "print(f'{$T_DONE-$T_REQ:.1f}')")s | ${NATIVE_DECODE_TPS} tok/s (${N_COMPLETION} tokens)"
+
     export BM_NATIVE_TPS="$NATIVE_MEDIAN_TPS"
     export BM_NATIVE_CORRECT="$NATIVE_CORRECT"
     export BM_PERF_SECS=$(($(date +%s)-T_PERF))
@@ -294,6 +308,7 @@ print(f'{vals[1]:.3f}')")
     echo "  commit:  ${BM_COMMIT}"
     echo "  SMELT N: ${NATIVE_SMELT_N}"
     echo "  tok/s:   ${NATIVE_MEDIAN_TPS} (median of 3 sequential)"
+    echo "  decode:  ${NATIVE_DECODE_TPS} tok/s (100-token run)"
     echo "  Paris:   $([ "$NATIVE_CORRECT" -eq 1 ] && echo '✓ PASS' || echo '✗ FAIL')"
     echo "  E2E:     ${E2E_PASS}/7 passed"
     echo "  unit:    ${BM_UNIT}"
