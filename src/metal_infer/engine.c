@@ -241,6 +241,7 @@ typedef struct {
     off_t offset[NUM_IO_THREADS];
     int num_tasks;
     int tasks_done;
+    int done[NUM_IO_THREADS];     // per-task completion flags (for wait_task)
     int generation;
     bool shutdown;
     pthread_t threads[NUM_IO_THREADS];
@@ -273,10 +274,11 @@ static void *io_worker(void *arg) {
         (void)n;
 
         pthread_mutex_lock(&pool->mutex);
+        pool->done[tid] = 1;
         pool->tasks_done++;
-        if (pool->tasks_done == pool->num_tasks) {
-            pthread_cond_signal(&pool->work_done);
-        }
+        // Signal on EVERY completion so io_pool_wait_task waiters wake promptly;
+        // only the dispatcher thread ever waits on work_done.
+        pthread_cond_signal(&pool->work_done);
         pthread_mutex_unlock(&pool->mutex);
     }
     return NULL;
@@ -765,6 +767,7 @@ static void io_pool_start(IOPool *pool, int layer_fd, int *expert_ids, int K,
         pool->buf[k] = buffers[k];
         pool->size = expert_sz;
         pool->offset[k] = (off_t)expert_ids[k] * (off_t)expert_sz;
+        pool->done[k] = 0;
     }
     pool->num_tasks = K;
     pool->tasks_done = 0;
@@ -777,6 +780,17 @@ static void io_pool_start(IOPool *pool, int layer_fd, int *expert_ids, int K,
 static void io_pool_wait(IOPool *pool) {
     pthread_mutex_lock(&pool->mutex);
     while (pool->tasks_done < pool->num_tasks) {
+        pthread_cond_wait(&pool->work_done, &pool->mutex);
+    }
+    pthread_mutex_unlock(&pool->mutex);
+}
+
+// Block until task `task_idx` of the last io_pool_start completes.
+// Other tasks may still be in flight — callers that only need a subset of the
+// posted reads (e.g. prefetch hits) avoid waiting on the rest.
+static void io_pool_wait_task(IOPool *pool, int task_idx) {
+    pthread_mutex_lock(&pool->mutex);
+    while (!pool->done[task_idx]) {
         pthread_cond_wait(&pool->work_done, &pool->mutex);
     }
     pthread_mutex_unlock(&pool->mutex);
@@ -833,20 +847,25 @@ static void prefetch_issue(MoEInferEngine *eng, int layer) {
     io_pool_wait((IOPool *)eng->prefetch_pool);
     io_pool_start((IOPool *)eng->prefetch_pool, eng->packed_fd[layer], ids, n, bufs,
                   eng->active_expert_size);
-    for (int k = 0; k < N_ACTIVE; k++) eng->prefetch_ids[k] = -1;
-    for (int i = 0; i < n; i++) eng->prefetch_ids[slots[i]] = ids[i];
+    for (int k = 0; k < N_ACTIVE; k++) { eng->prefetch_ids[k] = -1; eng->prefetch_task[k] = -1; }
+    for (int i = 0; i < n; i++) {
+        eng->prefetch_ids[slots[i]] = ids[i];
+        eng->prefetch_task[slots[i]] = i;
+    }
     eng->prefetch_count = n;
     eng->prefetch_layer = layer;
     eng->prefetch_active = true;
 }
 
-// Consume a prefetch targeted at `layer`: wait for completion and point
-// unresolved expert_data slots at the prefetched buffers where the predicted
-// expert matches the actual routing. Slots left NULL fall back to pread.
+// Consume a prefetch targeted at `layer`: for slots whose actual routing
+// matches a predicted expert, wait ONLY for that expert's read task and point
+// expert_data at its buffer. Missed slots fall back to the blocking pread
+// path, and unmatched prefetch reads are left to finish in the background
+// (their buffers are not reused until a later prefetch_issue safety-drains
+// the pool) — the critical path never waits for useless experts.
 static void prefetch_consume(MoEInferEngine *eng, int layer, const int *expert_ids,
                              uint8_t *expert_data[6]) {
     if (!eng->prefetch_active || eng->prefetch_layer != layer) return;
-    io_pool_wait((IOPool *)eng->prefetch_pool);
     eng->prefetch_active = false;
     uint8_t **set = (layer % 2 == 0) ? eng->expert_buf_pred : eng->expert_buf_pred2;
     for (int k = 0; k < N_ACTIVE; k++) {
@@ -854,6 +873,7 @@ static void prefetch_consume(MoEInferEngine *eng, int layer, const int *expert_i
         if (expert_ids[k] < 0 || expert_ids[k] >= N_EXPERTS) continue;  // invalid id → miss path
         for (int s = 0; s < N_ACTIVE; s++) {
             if (eng->prefetch_ids[s] == expert_ids[k]) {
+                io_pool_wait_task((IOPool *)eng->prefetch_pool, eng->prefetch_task[s]);
                 expert_data[k] = set[s];
                 eng->predictor.hits++;
                 break;

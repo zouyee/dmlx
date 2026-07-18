@@ -363,6 +363,7 @@ typedef struct {
     // layer L's GPU work + layer L+1's attention chain execute (~11ms window).
     int  prefetch_layer;         // target layer of in-flight prefetch (-1 = none)
     int  prefetch_ids[6];        // prefetched expert ids aligned to buffer slots
+    int  prefetch_task[6];       // io_pool task index per buffer slot (for wait_task)
     int  prefetch_count;         // number of valid slots in prefetch_ids
     bool prefetch_active;        // a prefetch is in flight for prefetch_layer
     int  in_batch;               // !=0 inside moe_infer_forward_batch (prefetch off)
