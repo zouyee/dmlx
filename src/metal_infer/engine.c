@@ -58,6 +58,8 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_fused_6expert_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_6expert_down"] error:&err]);
     eng->pipe_gather_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_gate_up_swiglu"] error:&err]);
     eng->pipe_gather_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_down"] error:&err]);
+    eng->pipe_gather6_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_gate_up_swiglu"] error:&err]);
+    eng->pipe_gather6_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_down"] error:&err]);
     eng->pipe_int8_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_int8_e8m0"] error:&err]);
     eng->pipe_int8_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_int8_e8m0"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
@@ -939,6 +941,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
     // (serial expert loop in kernel vs GPU scheduling multiple dispatches in parallel).
     {
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        int used_gather6 = 0;  // set when gather6 path wrote directly to buf_expert_contiguous
 
         if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx] && !eng->use_affine_experts) {
             // === GATHER MODE: gatherQmm-equivalent ===
@@ -984,13 +987,65 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
             }
         } else {
             separate_mode:;
-            // === SEPARATE MODE: 6 per-expert dispatches (MXFP4, gs=32) ===
+            if (!eng->use_affine_experts) {
+                // === GATHER6 MODE: 6 independent expert blobs via pointer array ===
+                // MXFP4 (gs=32). 2 dispatches total replace 12 per-expert encoders
+                // and the 6 blits: down writes directly into buf_expert_contiguous.
+                id<MTLBuffer> blob_bufs[6];
+                for (int k = 0; k < 6; k++) {
+                    int kk = (k < K) ? k : 0;
+                    void *ptr = expert_bufs[kk] ? (void *)expert_bufs[kk]
+                                                : (void *)eng->expert_buf[kk];
+                    // Reuse persistent wrappers for the fixed pread/prefetch buffers
+                    // so GPU page mappings stay stable across tokens; fresh NoCopy
+                    // only for SMELT pool pointers (rare per-slot case).
+                    void **slot = NULL;
+                    if (ptr == (void *)eng->expert_buf[kk])       slot = &eng->blob_wrap_pread[kk];
+                    else if (ptr == (void *)eng->expert_buf_pred[kk])  slot = &eng->blob_wrap_pred[kk];
+                    else if (ptr == (void *)eng->expert_buf_pred2[kk]) slot = &eng->blob_wrap_pred2[kk];
+                    if (slot) {
+                        if (!*slot)
+                            *slot = (void *)[d newBufferWithBytesNoCopy:ptr
+                                                                 length:EXPERT_SIZE
+                                                                options:MTLResourceStorageModeShared
+                                                            deallocator:nil];
+                        blob_bufs[k] = (id<MTLBuffer>)*slot;
+                    } else {
+                        blob_bufs[k] = [d newBufferWithBytesNoCopy:ptr
+                                                            length:EXPERT_SIZE
+                                                           options:MTLResourceStorageModeShared
+                                                       deallocator:nil];
+                    }
+                }
+                // Encoder 1: fused gate+up+SwiGLU for all K experts
+                {
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather6_gate_up];
+                    for (int k = 0; k < 6; k++) [enc setBuffer:blob_bufs[k] offset:0 atIndex:k];
+                    [enc setBuffer:eng->buf_normed offset:0 atIndex:6];
+                    [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake(INTERMEDIATE/8, K, 1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [enc endEncoding];
+                }
+                // Encoder 2: down_proj for all K experts → contiguous [K×DIM]
+                {
+                    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather6_down];
+                    for (int k = 0; k < 6; k++) [enc setBuffer:blob_bufs[k] offset:0 atIndex:k];
+                    [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:6];
+                    [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:7];
+                    [enc dispatchThreadgroups:MTLSizeMake(DIM/8, K, 1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [enc endEncoding];
+                }
+                used_gather6 = 1;
+            } else {
+            // === SEPARATE MODE: 6 per-expert dispatches (affine, gs=64) ===
             for (int k = 0; k < K; k++) {
                 int eid = expert_ids[k];
                 if (eid < 0 || eid >= N_EXPERTS) continue;
                 char *base = (char *)expert_bufs[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                if (eng->use_affine_experts) {
+                {
                     // affine v2: bf16 scale+bias, gs=64
                     [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2_affine];
                     [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+AFFINE_GATE_W_OFF,4194304) offset:0 atIndex:0];
@@ -1006,20 +1061,6 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                     [enc setThreadgroupMemoryLength:512 atIndex:0];
                     uint ntg = (INTERMEDIATE + 1) / 2;
                     [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
-                } else {
-                    // MXFP4: u8 scale, gs=32
-                    [enc setComputePipelineState:eng->pipe_gate_up_swiglu_v2];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,0,base+GATE_W_OFF,4194304) offset:0 atIndex:0];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,1,base+GATE_S_OFF,262144)  offset:0 atIndex:1];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,2,base+UP_W_OFF,4194304)   offset:0 atIndex:2];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,3,base+UP_S_OFF,262144)    offset:0 atIndex:3];
-                    [enc setBuffer:eng->buf_normed offset:0 atIndex:4];
-                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:5];
-                    uint od=INTERMEDIATE,id_=DIM,gs=32;
-                    [enc setBytes:&od length:4 atIndex:6]; [enc setBytes:&id_ length:4 atIndex:7]; [enc setBytes:&gs length:4 atIndex:8];
-                    [enc setThreadgroupMemoryLength:512 atIndex:0];
-                    uint ntg = (INTERMEDIATE + 1) / 2;
-                    [enc dispatchThreadgroups:MTLSizeMake(ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
                 }
                 [enc endEncoding];
             }
@@ -1028,7 +1069,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                 if (eid < 0 || eid >= N_EXPERTS) continue;
                 char *base = (char *)expert_bufs[k];
                 id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                if (eng->use_affine_experts) {
+                {
                     // affine v2 down: bf16 scale+bias, gs=64
                     [enc setComputePipelineState:eng->pipe_dequant_matvec_4bit_affine];
                     [enc setBuffer:EXPERT_BUF(layer_idx,eid,6,base+AFFINE_DOWN_W_OFF,4194304) offset:0 atIndex:0];
@@ -1041,26 +1082,19 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                     [enc setThreadgroupMemoryLength:256 atIndex:0];
                     uint d_ntg = (DIM + 1) / 2;
                     [enc dispatchThreadgroups:MTLSizeMake(d_ntg,1,1) threadsPerThreadgroup:MTLSizeMake(32,4,1)];
-                } else {
-                    // MXFP4 down: u8 scale, gs=32
-                    [enc setComputePipelineState:eng->pipe_dequant_matvec];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,4,base+DOWN_W_OFF,4194304) offset:0 atIndex:0];
-                    [enc setBuffer:EXPERT_BUF(layer_idx,eid,5,base+DOWN_S_OFF,262144)  offset:0 atIndex:1];
-                    [enc setBuffer:eng->buf_expert_mid[k] offset:0 atIndex:2];
-                    [enc setBuffer:eng->buf_expert_out[k] offset:0 atIndex:3];
-                    uint od=DIM,id_=INTERMEDIATE,gs=32;
-                    [enc setBytes:&od length:4 atIndex:4]; [enc setBytes:&id_ length:4 atIndex:5]; [enc setBytes:&gs length:4 atIndex:6];
-                    [enc setThreadgroupMemoryLength:256 atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(DIM/8,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
                 }
                 [enc endEncoding];
             }
+            } // end if gather6 / else affine separate
         } // end if gather_mode / else separate mode
 
         // Step 3: blit outputs into contiguous buffer for combine
         // In gather mode: buf_gather_out already holds [K×DIM] contiguous
+        // In gather6 mode: down kernel wrote directly into buf_expert_contiguous
         // In separate mode: blit from 6 separate buffers
-        if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx]) {
+        if (used_gather6) {
+            // no copy needed
+        } else if (eng->gather_mode && eng->buf_gather_gate_W[layer_idx]) {
             // Gather mode: buf_gather_out is already [K×DIM] contiguous
             // Copy it to buf_expert_contiguous so combine kernel works uniformly
             id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];

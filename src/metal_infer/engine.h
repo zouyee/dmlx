@@ -229,6 +229,15 @@ typedef struct {
     // Gather MoE kernels: gatherQmm equivalent — K experts from full N_EXPERTS buffer
     void *pipe_gather_gate_up;          // gather_gate_up_swiglu
     void *pipe_gather_down;             // gather_down
+    // Gather6 MoE kernels: pointer-array variant for non-contiguous expert blobs
+    void *pipe_gather6_gate_up;         // gather6_gate_up_swiglu
+    void *pipe_gather6_down;            // gather6_down
+    // Persistent whole-blob NoCopy wrappers for the fixed pread/prefetch buffers,
+    // so gather6 reuses stable GPU page mappings across tokens instead of
+    // remapping 6×13.4MB fresh every layer.
+    void *blob_wrap_pread[6];
+    void *blob_wrap_pred[6];
+    void *blob_wrap_pred2[6];
     void *pipe_int8_gate_up_swiglu;     // fused_gate_up_swiglu_int8_e8m0 (DSpark MTP)
     void *pipe_int8_dequant_matvec;     // dequant_matvec_int8_e8m0 (DSpark MTP)
     void *pipe_rms_norm_sum_sq;
