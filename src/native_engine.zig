@@ -432,22 +432,33 @@ pub const NativeEngine = struct {
                 const n_proposed: usize = if (n_proposed_raw > 0) @intCast(n_proposed_raw) else 0;
                 if (n_proposed == 0) continue;
 
-                // Verify draft tokens against target model
+                // Verify draft tokens against target model.
+                // Feed [anchor(next_token), d0..d_{v-1}] at positions start_pos..start_pos+v.
+                // Output at position start_pos+k predicts the token at start_pos+k+1:
+                //   out[0] (after anchor) ↔ d0, out[k] (after d_{k-1}) ↔ d_k.
+                // (Previously the anchor was never forwarded — drafts were fed starting at
+                //  start_pos, shifting the conditioning by one token → 0% acceptance and
+                //  correction tokens sampled from a corrupted context.)
                 const verify_len: usize = @intCast(n_proposed);
-                var verify_hidden = try self.allocator.alloc(f32, verify_len * MHC_MULT * DIM);
+                const batch_len: usize = verify_len + 1; // anchor + drafts
+                var verify_hidden = try self.allocator.alloc(f32, batch_len * MHC_MULT * DIM);
                 defer self.allocator.free(verify_hidden);
-                var verify_token_ids = try self.allocator.alloc(i32, verify_len);
+                var verify_token_ids = try self.allocator.alloc(i32, batch_len);
                 defer self.allocator.free(verify_token_ids);
 
+                // Slot 0: anchor (next_token) — emitted by the standard step but not yet forwarded
+                verify_token_ids[0] = @intCast(next_token);
+                metal.setTokenId(self.engine, @intCast(next_token));
+                metal.embed(self.engine, @intCast(next_token), verify_hidden[0 .. MHC_MULT * DIM]);
                 for (0..verify_len) |t| {
                     const tok = dspark_draft_tokens[t];
-                    verify_token_ids[t] = @intCast(tok);
+                    verify_token_ids[t + 1] = @intCast(tok);
                     metal.setTokenId(self.engine, @intCast(tok));
-                    metal.embed(self.engine, @intCast(tok), verify_hidden[t * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
+                    metal.embed(self.engine, @intCast(tok), verify_hidden[(t + 1) * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM]);
                 }
                 // Disable accumulation during verification (don't corrupt DSpark's main_hidden)
                 metal.setDSparkAccumulate(self.engine, false);
-                try metal.forwardBatch(self.engine, verify_hidden, @intCast(verify_len), @intCast(start_pos), verify_token_ids);
+                try metal.forwardBatch(self.engine, verify_hidden, @intCast(batch_len), @intCast(start_pos), verify_token_ids);
 
                 // Re-enable accumulation after verification
                 metal.setDSparkAccumulate(self.engine, true);
@@ -472,23 +483,37 @@ pub const NativeEngine = struct {
                         remaining -|= 1;
                         if (dspark_draft_tokens[k] == self.eos_token) break;
                     } else {
-                        // Reject: use target's token but DON'T count as accepted for KV purposes.
-                        // The target_token needs its own proper forward pass (next loop iteration)
-                        // to write correct KV. We just record it for output.
+                        // Reject: correction token, conditioned on the CORRECT context
+                        // (anchor + accepted drafts). Its KV is not written yet — it becomes
+                        // the next loop iteration's anchor via tokens[current_len-1].
                         tokens[current_len] = target_token;
                         current_len += 1;
                         remaining -|= 1;
                         break;
                     }
                 }
-                // Rollback KV: only keep entries for truly accepted draft tokens.
-                // Positions start_pos..start_pos+accepted-1 have correct KV (draft == target).
-                // Position start_pos+accepted has wrong KV (was draft, should be target).
-                start_pos += accepted;
+                // All drafts accepted → bonus token from out[verify_len] (after last draft)
+                if (accepted == verify_len and remaining > 0 and current_len < tokens.len) {
+                    var bonus_compressed: [DIM]f32 = undefined;
+                    metal.hyperHeadCompress(
+                        self.weight_store.weights.hc_head_fn.ptr,
+                        self.weight_store.weights.hc_head_base.ptr,
+                        self.weight_store.weights.hc_head_scale.ptr,
+                        verify_hidden[verify_len * MHC_MULT * DIM ..][0 .. MHC_MULT * DIM],
+                        &bonus_compressed,
+                    );
+                    try metal.getLogits(self.engine, &bonus_compressed, self.logits_buffer.ptr);
+                    const bonus_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
+                    tokens[current_len] = bonus_token;
+                    current_len += 1;
+                    remaining -|= 1;
+                }
+                // KV state: positions start_pos..start_pos+accepted hold [anchor, d0..d_{a-1}]
+                // — all correct. Discard speculative KV beyond that.
+                start_pos += accepted + 1;
                 dspark_total_drafted += verify_len;
                 dspark_total_accepted += accepted;
                 dspark_total_steps += 1;
-                // Always rollback to start_pos (discard verification KV beyond accepted tokens)
                 metal.rollbackKv(self.engine, @intCast(start_pos));
                 if (current_len > 0 and tokens[current_len - 1] == self.eos_token) break;
             } else if (self.dspark) |*ds| {
