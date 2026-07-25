@@ -2084,6 +2084,15 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         // Draining here is safe: the per-layer deferred drain below waits + releases
         // the last in-flight CB before the pool exits, so no drain races live GPU work.
         @autoreleasepool {
+        // Per-token pool: the per-layer pool above alone only covers ≤12-token
+        // prompts — ~5 unretained CBs accumulate per (layer,token) and Metal
+        // caps outstanding unretained CB objects (~64), so CB creation
+        // deadlocks mid-layer on 13+ token prompts (semaphore_wait in
+        // commandBufferWithUnretainedReferences, 0% GPU). Drain cadence mirrors
+        // moe_infer_forward's per-token pool; each drain happens right after
+        // the deferred wait+release below, when no GPU work is in flight, so
+        // no drain races live GPU work (ac6e291/13a433a pattern).
+        NSAutoreleasePool *tok_pool = [[NSAutoreleasePool alloc] init];
         for (int t = 0; t < n_tokens; t++) {
             float *hidden_t = hidden_batch + (size_t)t * (MHC_MULT * DIM);
             if (token_ids != NULL) eng->current_token_id = (int)token_ids[t];
@@ -2107,7 +2116,12 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 }
                 eng->deferred.gpu_combined = false;
             }
+            // Previous token's last in-flight CB was just wait+released above —
+            // nothing is in flight now, so draining its autoreleased CBs is safe.
+            [tok_pool drain];
+            tok_pool = [[NSAutoreleasePool alloc] init];
             if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) {
+                [tok_pool drain];
                 eng->in_batch--;
                 return -1;
             }
@@ -2126,6 +2140,8 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 eng->deferred.gpu_combined = false;
             }
         }
+        // Last token's deferred CB was wait+released above — nothing in flight.
+        [tok_pool drain];
         // DSpark: extract last prefill token's hidden from layers 40/41/42.
         // This provides the main_hidden input for DSpark draft during subsequent decode.
         if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
