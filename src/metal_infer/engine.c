@@ -1437,18 +1437,33 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
         kvc->len += 1;
 
+        // MF_STAGE_TIME: commit the mhc_pre-only CB now (mla_attention will use
+        // its own staged CBs and must not run ahead of mhc_pre's output).
+        const int stage_time = getenv("MF_STAGE_TIME") != NULL;
+        if (stage_time) {
+            double s0 = 0;
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); s0 = ts.tv_sec*1e9+ts.tv_nsec; }
+            [merged_cb commit]; [merged_cb waitUntilCompleted];
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              fprintf(stderr, "[STAGE] L%d mhc_pre=%.2f\n", layer, (ts.tv_sec*1e9+ts.tv_nsec-s0)/1e6); }
+        }
+
         int attn_ret = mla_attention_decode_bf16(&P, &eng->attn[layer],
             NULL, kvc->kv, kvc->len, pos, attn_out,
             kvc->kv_gpu_buf,                                    // GPU KV path
             eng->buf_mhc_attn_norm_bf16,                        // x_gpu_buf (from encoder 1)
-            (void *)merged_cb,                                  // external_cb1
+            (void *)merged_cb,                                  // external_cb1 (mla_attention stages internally under MF_STAGE_TIME)
             eng->buf_attn_out);                                 // out_gpu_buf — wo_b writes here
+        if (!stage_time) {
         // merged_cb now contains: mhc_pre + Q/KV/SDPA + GPU blit wo_a grouping + wo_a×8 + wo_b
         [merged_cb commit];
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptB = ts.tv_sec*1e9+ts.tv_nsec; }
         [merged_cb waitUntilCompleted];
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptC = ts.tv_sec*1e9+ts.tv_nsec; }
         if (phase_time) gpu_exec_ms = ([merged_cb GPUEndTime] - [merged_cb GPUStartTime]) * 1e3;
+        } else {
+            if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptB = ptC = ts.tv_sec*1e9+ts.tv_nsec; }
+        }
 
         // Read attn_out from GPU buffer (written by wo_b in merged_cb)
         memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));

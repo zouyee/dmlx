@@ -678,6 +678,10 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     int half = QK_ROPE_DIM / 2;
     float cosv[QK_ROPE_DIM / 2], sinv[QK_ROPE_DIM / 2];
     yarn_cos_sin(pos, cosv, sinv);
+    // MF_STAGE_TIME: split the merged CB into per-stage CBs (commit+wait each)
+    // and print per-stage GPU wait times. Same kernels, same order — numerics
+    // unchanged, only extra syncs. Caller (engine.c) must gate its own commit.
+    const int stage_time = getenv("MF_STAGE_TIME") != NULL;
 
     // === Get (or create) persistent GPU buffers for fixed attention weights ===
     AttnBufCache *abc = attn_buf_cache_get(d, aw);
@@ -708,7 +712,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
     // === CB1: Q chain + KV chain + KV blit + SDPA merged into ONE command buffer ===
     // (GPU path: 11 encoders, 1 wait; CPU fallback: 8 encoders + separate CB2)
-    id<MTLCommandBuffer> cb1 = external_cb1 ? (__bridge id<MTLCommandBuffer>)external_cb1
+    id<MTLCommandBuffer> cb1 = (external_cb1 && !stage_time) ? (__bridge id<MTLCommandBuffer>)external_cb1
                                              : [P->queue commandBuffer];
         // Q chain — use cached weight buffers when available (wq_a, wq_b, wkv may be nil if memory-limited)
         if (abc && abc->wq_a_pack) {
@@ -779,8 +783,12 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 [e endEncoding];
             }
             enc_rope_bf16(P, cb1, battn_scr, bcos, bsin, N_HEADS, 1);
-            if (!external_cb1) {
+            if (!external_cb1 || stage_time) {
+                double s0 = 0;
+                if (stage_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); s0 = ts.tv_sec*1e9+ts.tv_nsec; }
                 [cb1 commit]; [cb1 waitUntilCompleted];
+                if (stage_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                    fprintf(stderr, "[STAGE] pos=%d qkv_sdpa=%.2f\n", pos, (ts.tv_sec*1e9+ts.tv_nsec-s0)/1e6); }
             }
             // No CPU KV copy needed — bf16_to_f16_row kernel already wrote to cache
         } else {
@@ -835,7 +843,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               : ((abc && abc->scr_out) ? abc->scr_out
                                   : mkbuf(d, NULL, DIM * sizeof(float)));
     {
-        id<MTLCommandBuffer> cb3 = external_cb1 ? (__bridge id<MTLCommandBuffer>)external_cb1
+        id<MTLCommandBuffer> cb3 = (external_cb1 && !stage_time) ? (__bridge id<MTLCommandBuffer>)external_cb1
                                                  : [P->queue commandBuffer];
 
         // --- Part 1: wo_a × 8 group matmuls ---
@@ -892,6 +900,14 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         }
 
         // --- Part 2: GPU blit concat (bog_arr[g] → bconcat[g * O_LORA_RANK]) ---
+        if (stage_time) {
+            double s0 = 0;
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); s0 = ts.tv_sec*1e9+ts.tv_nsec; }
+            [cb3 commit]; [cb3 waitUntilCompleted];
+            { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+              fprintf(stderr, "[STAGE] pos=%d wo_a8=%.2f\n", pos, (ts.tv_sec*1e9+ts.tv_nsec-s0)/1e6); }
+            cb3 = [P->queue commandBuffer];
+        }
         {
             id<MTLBlitCommandEncoder> blit = [cb3 blitCommandEncoder];
             size_t chunk = (size_t)O_LORA_RANK * sizeof(float);
@@ -927,8 +943,12 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             enc_dequant_matvec(P, cb3, &aw->wo_b, bconcat, bout);
         }
 
-        if (!external_cb1) {
+        if (!external_cb1 || stage_time) {
+            double s0 = 0;
+            if (stage_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); s0 = ts.tv_sec*1e9+ts.tv_nsec; }
             [cb3 commit]; [cb3 waitUntilCompleted];
+            if (stage_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
+                fprintf(stderr, "[STAGE] pos=%d wo_b=%.2f\n", pos, (ts.tv_sec*1e9+ts.tv_nsec-s0)/1e6); }
         }
     }
     // When external_cb1: bout hasn't been committed yet — caller reads after commit+wait.
