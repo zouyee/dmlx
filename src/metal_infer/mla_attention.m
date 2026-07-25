@@ -34,6 +34,9 @@ typedef struct {
     // wo_a_dense: 8 groups × [O_LORA_RANK, group_feat] f32
     id<MTLBuffer> wo_a_grp[8];   // 8 × 16MB = 128MB total per layer (f32 dense, fallback)
     id<MTLBuffer> wo_a_q8_gpu[8]; // 8 × 4.5MB = 36MB total per layer (Q8_0 quantized)
+    // wo_a packed affine 4-bit (native format): 8 × (2MB + 2×256KB) per layer.
+    // Preferred path — 6.4x less per-token weight traffic than f32 dense.
+    id<MTLBuffer> wo_a_pack[8], wo_a_sc[8], wo_a_bi[8];
     // Persistent scratch buffers for decode pass (reused every forward call)
     // Eliminates ~18 MTLBuffer allocations per layer per token
     id<MTLBuffer> scr_q_a;       // [Q_LORA_RANK] bf16   — wq_a output
@@ -107,11 +110,26 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
         c->wo_b_sc   = MKNC(aw->wo_b.scales, sc);
         c->wo_b_bi   = MKNC(aw->wo_b.biases, sc);
     }
-    // wo_a_dense: [O_GROUPS, O_LORA_RANK, group_feat] f32 — 128MB/layer, always NoCopy
-    // Also quantize to Q8_0 format (ds4 kernel_mul_mv_q8_0_f32) for the fast path.
+    // wo_a: native packed affine 4-bit per group (preferred) — created whenever
+    // the loader kept wo_a packed. The f32 dense (128MB/layer) and Q8_0 fallback
+    // buffers are only created when packed is unavailable or explicitly forced.
     {
         int heads_per_group = N_HEADS / O_GROUPS;
         int group_feat = heads_per_group * HEAD_DIM;  // 8×512=4096
+        const int have_woa_packed = (aw->wo_a.packed != NULL && aw->wo_a.out_dim > 0);
+        if (have_woa_packed) {
+            int ng = group_feat / aw->wo_a.group_size;  // 4096/64 = 64
+            size_t grp_pack = (size_t)O_LORA_RANK * (group_feat / 8) * sizeof(uint32_t);
+            size_t grp_sb   = (size_t)O_LORA_RANK * ng * sizeof(float);
+            for (int g = 0; g < O_GROUPS; g++) {
+                c->wo_a_pack[g] = MKNC(aw->wo_a.packed + (size_t)g * O_LORA_RANK * (group_feat / 8), grp_pack);
+                c->wo_a_sc[g]   = MKNC(aw->wo_a.scales + (size_t)g * O_LORA_RANK * ng, grp_sb);
+                c->wo_a_bi[g]   = MKNC(aw->wo_a.biases + (size_t)g * O_LORA_RANK * ng, grp_sb);
+            }
+        }
+        const int want_f32 = getenv("DMLX_WOA_F32") != NULL;
+        const int want_q8  = getenv("DMLX_USE_Q8_WOA") != NULL;
+        if (aw->wo_a_dense && (!have_woa_packed || want_f32 || want_q8)) {
         size_t grp_sz = (size_t)O_LORA_RANK * group_feat * sizeof(float);  // 16MB each (f32)
         // Q8_0: 32 elements per block, 36 bytes per block (4B scale + 32B int8)
         int nb = group_feat / 32;  // 128 blocks per row
@@ -145,6 +163,7 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
             }
             c->wo_a_q8_gpu[g] = q8_buf;
         }
+        } // end f32/Q8 fallback block
     }
     #undef MKNC
     // q_norm, kv_norm, attn_sink (tiny, always copied for alignment safety)
@@ -558,6 +577,9 @@ static inline uint16_t f32_to_f16(float f) {
 int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
                          const float *x, uint16_t *kv_cache, int cache_len,
                          int pos, float *out) {
+    // wo_a_dense is not loaded by default anymore (packed path);
+    // this legacy f32-dense path requires it (DMLX_WOA_F32=1).
+    if (!aw->wo_a_dense) return -2;
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
     float cosv[QK_ROPE_DIM / 2], sinv[QK_ROPE_DIM / 2];
@@ -882,12 +904,19 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
             bog_arr[g] = (abc && abc->scr_bog[g]) ? abc->scr_bog[g]
                            : mkbuf(d, NULL, O_LORA_RANK * sizeof(float));
-            // Prefer Q8_0 quantized wo_a when explicitly enabled via DMLX_USE_Q8_WOA=1;
-            // default remains f32 dense for numerical stability. Q8_0 gives ~+5.8% tok/s
-            // but currently causes stricter correctness checks to fail on some prompts.
+            // wo_a path priority: native packed 4-bit (default; model's own
+            // quantization, 2MB/group vs 16MB f32) → Q8_0 (DMLX_USE_Q8_WOA=1,
+            // known correctness issues on some prompts) → f32 dense
+            // (DMLX_WOA_F32=1 or packed unavailable).
             static int use_q8_woa = -1;
             if (use_q8_woa < 0) use_q8_woa = getenv("DMLX_USE_Q8_WOA") ? 1 : 0;
-            if (use_q8_woa && abc && abc->wo_a_q8_gpu[g]) {
+            static int use_f32_woa = -1;
+            if (use_f32_woa < 0) use_f32_woa = getenv("DMLX_WOA_F32") ? 1 : 0;
+            if (!use_f32_woa && abc && abc->wo_a_pack[g]) {
+                enc_dq_bf16_cached(P, cb3, abc->wo_a_pack[g], abc->wo_a_sc[g], abc->wo_a_bi[g],
+                                   O_LORA_RANK, group_feat, 64, bgv, bog_arr[g],
+                                   P->dequant_matvec_affine_bf16in_f32out);
+            } else if (use_q8_woa && abc && abc->wo_a_q8_gpu[g]) {
                 enc_matvec_q8_0(P, cb3, abc->wo_a_q8_gpu[g], bgv, bog_arr[g], O_LORA_RANK, group_feat);
             } else {
                 id<MTLBuffer> bwg = (abc && abc->wo_a_grp[g])
@@ -964,6 +993,9 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 int mla_attention_decode_f16kv(MlaPipes *P, const AttnWeights *aw,
                                const float *x, float *kv_cache, int cache_len,
                                int pos, float *out) {
+    // wo_a_dense is not loaded by default anymore (packed path);
+    // this legacy f32-dense path requires it (DMLX_WOA_F32=1).
+    if (!aw->wo_a_dense) return -2;
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
     float cosv[QK_ROPE_DIM / 2], sinv[QK_ROPE_DIM / 2];
@@ -1097,6 +1129,9 @@ int mla_attention_decode_mixed(MlaPipes *P, const AttnWeights *aw,
                                const float *x, uint16_t *raw_kv_cache, int raw_cache_len,
                                int pos, const float *comp_kv, int n_comp,
                                const bool *comp_allowed, float *out) {
+    // wo_a_dense is not loaded by default anymore (packed path);
+    // this legacy f32-dense path requires it (DMLX_WOA_F32=1).
+    if (!aw->wo_a_dense) return -2;
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
     float cosv[QK_ROPE_DIM / 2], sinv[QK_ROPE_DIM / 2];
@@ -1310,6 +1345,9 @@ int mla_attention_prefill_bfloat(MlaPipes *P, const AttnWeights *aw,
                                   const uint16_t *x_batch, int n_tokens,
                                   uint16_t *kv_cache, int start_pos,
                                   float *out_batch) {
+    // wo_a_dense is not loaded by default anymore (packed path);
+    // this legacy f32-dense path requires it (DMLX_WOA_F32=1).
+    if (!aw->wo_a_dense) return -2;
     id<MTLDevice> d = P->dev;
     const int half_rope = QK_ROPE_DIM / 2;
 

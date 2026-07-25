@@ -26,6 +26,7 @@ pub const AttnWeightPtrs = struct {
     wkv: QuantWeightPtrs,
     kv_norm: []const f32,
     wo_a_dense: []const f32,
+    wo_a: QuantWeightPtrs,
     wo_b: QuantWeightPtrs,
     attn_sink: []const f32,
 };
@@ -150,17 +151,13 @@ pub fn loadAll(
     // Embed tokens: affine-quantized U32 → dequant to dense F32
     // shape: [vocab_size, hidden_size/8] U32 + [vocab_size, hidden_size/gs] BF16 scales/biases
     // =========================================================================
-    const embed_f32 = try dequantAffineF32(a, idx,
-        "model.embed_tokens",
-        cfg.vocab_size, cfg.hidden_size, 64);
+    const embed_f32 = try dequantAffineF32(a, idx, "model.embed_tokens", cfg.vocab_size, cfg.hidden_size, 64);
     w.embed = embed_f32;
 
     // =========================================================================
     // LM head: same format as embed
     // =========================================================================
-    const lm_head_f32 = try dequantAffineF32(a, idx,
-        "lm_head",
-        cfg.vocab_size, cfg.hidden_size, 64);
+    const lm_head_f32 = try dequantAffineF32(a, idx, "lm_head", cfg.vocab_size, cfg.hidden_size, 64);
     w.lm_head = lm_head_f32;
 
     // =========================================================================
@@ -183,25 +180,20 @@ pub fn loadAll(
         if (progress_fn) |cb| cb(i, cfg.num_hidden_layers);
 
         // ---- RMSNorm weights ----
-        w.input_norms[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "model.layers.{d}.attn_norm.weight", .{i}), a);
-        w.attn_norms[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn_norm.weight", .{i}), a);
+        w.input_norms[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "model.layers.{d}.attn_norm.weight", .{i}), a);
+        w.attn_norms[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn_norm.weight", .{i}), a);
 
         // ---- Router gate (BF16 dense → F32) ----
-        w.gate_projs[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn.gate.weight", .{i}), a);
+        w.gate_projs[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn.gate.weight", .{i}), a);
 
         // e_score_correction_bias (layers 3-42, not present on hash layers 0-2)
-        const bias_name = try std.fmt.bufPrint(&name_buf,
-            "model.layers.{d}.ffn.gate.e_score_correction_bias", .{i});
+        const bias_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn.gate.e_score_correction_bias", .{i});
         if (idx.get(bias_name) != null) {
             w.gate_biases[i] = try idx.loadBF16AsF32(bias_name, a);
         }
 
         // tid2eid (hash routing, layers 0-2)
-        const tid2eid_name = try std.fmt.bufPrint(&name_buf,
-            "model.layers.{d}.ffn.gate.tid2eid", .{i});
+        const tid2eid_name = try std.fmt.bufPrint(&name_buf, "model.layers.{d}.ffn.gate.tid2eid", .{i});
         if (idx.get(tid2eid_name) != null) {
             w.tid2eid[i] = try idx.loadI64(tid2eid_name, a);
         }
@@ -210,27 +202,39 @@ pub fn loadAll(
         var ap: AttnWeightPtrs = undefined;
         const layer_prefix = try std.fmt.allocPrint(a, "model.layers.{d}.attn", .{i});
 
-        ap.wq_a = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.wq_a", .{layer_prefix}), 64);
-        ap.q_norm = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.q_norm.weight", .{layer_prefix}), a);
-        ap.wq_b = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.wq_b", .{layer_prefix}), 64);
-        ap.wkv = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.wkv", .{layer_prefix}), 64);
-        ap.kv_norm = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.kv_norm.weight", .{layer_prefix}), a);
+        ap.wq_a = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wq_a", .{layer_prefix}), 64);
+        ap.q_norm = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.q_norm.weight", .{layer_prefix}), a);
+        ap.wq_b = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wq_b", .{layer_prefix}), 64);
+        ap.wkv = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wkv", .{layer_prefix}), 64);
+        ap.kv_norm = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.kv_norm.weight", .{layer_prefix}), a);
 
-        // wo_a: quantized U32 → dequant to F32 dense
-        // Shape: [8192, 512] U32 = 8 groups × (N_HEADS/O_GROUPS) × HEAD_DIM × (in_dim/8)
-        // in_dim = 4096, out_dim = 8192 (= O_GROUPS * O_LORA_RANK = 8 * 1024)
-        // After dequant: [8192, 4096] F32
-        ap.wo_a_dense = try dequantAffineF32(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.wo_a", .{layer_prefix}),
-            8192, 4096, 64);
+        // wo_a: keep native packed affine 4-bit — the GPU dequants in-kernel.
+        // The f32 dense form costs 128MB/layer of per-token GPU reads (evicted
+        // and refaulted under memory pressure) vs 16MB packed, so dense is now
+        // only a fallback (DMLX_WOA_F32 / DMLX_USE_Q8_WOA) or used when the
+        // packed tensors are missing.
+        ap.wo_a = loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wo_a", .{layer_prefix}), 64) catch
+            QuantWeightPtrs{
+                .packed_ptr = &[_]u32{},
+                .scales = &[_]f32{},
+                .biases = &[_]f32{},
+                .out_dim = 0,
+                .in_dim = 0,
+                .group_size = 64,
+            };
+        const want_dense = std.c.getenv("DMLX_WOA_F32") != null or
+            std.c.getenv("DMLX_USE_Q8_WOA") != null or
+            ap.wo_a.packed_ptr.len == 0;
+        if (want_dense) {
+            // Shape: [8192, 512] U32 = 8 groups × (N_HEADS/O_GROUPS) × HEAD_DIM × (in_dim/8)
+            // in_dim = 4096, out_dim = 8192 (= O_GROUPS * O_LORA_RANK = 8 * 1024)
+            // After dequant: [8192, 4096] F32
+            ap.wo_a_dense = try dequantAffineF32(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wo_a", .{layer_prefix}), 8192, 4096, 64);
+        } else {
+            ap.wo_a_dense = &[_]f32{};
+        }
 
-        ap.wo_b = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.wo_b", .{layer_prefix}), 64);
+        ap.wo_b = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.wo_b", .{layer_prefix}), 64);
 
         // attn_sink: F32 [64]
         const sink_name = try std.fmt.bufPrint(&name_buf, "{s}.attn_sink", .{layer_prefix});
@@ -246,31 +250,21 @@ pub fn loadAll(
         w.attn[i] = ap;
 
         // ---- Shared expert (affine quantized, gs=64) ----
-        const se_prefix = try std.fmt.allocPrint(a,
-            "model.layers.{d}.ffn.shared_experts", .{i});
-        w.shared_gate[i] = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.gate_proj", .{se_prefix}), 64);
-        w.shared_up[i] = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.up_proj", .{se_prefix}), 64);
-        w.shared_down[i] = try loadQuantWeight(a, idx,
-            try std.fmt.bufPrint(&name_buf, "{s}.down_proj", .{se_prefix}), 64);
+        const se_prefix = try std.fmt.allocPrint(a, "model.layers.{d}.ffn.shared_experts", .{i});
+        w.shared_gate[i] = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.gate_proj", .{se_prefix}), 64);
+        w.shared_up[i] = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.up_proj", .{se_prefix}), 64);
+        w.shared_down[i] = try loadQuantWeight(a, idx, try std.fmt.bufPrint(&name_buf, "{s}.down_proj", .{se_prefix}), 64);
 
         // ---- mHC weights (BF16 → F32) ----
         const ahc = try std.fmt.allocPrint(a, "model.layers.{d}.attn_hc", .{i});
-        w.attn_hc_fn[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.fn", .{ahc}), a);
-        w.attn_hc_base[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.base", .{ahc}), a);
-        w.attn_hc_scale[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.scale", .{ahc}), a);
+        w.attn_hc_fn[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.fn", .{ahc}), a);
+        w.attn_hc_base[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.base", .{ahc}), a);
+        w.attn_hc_scale[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.scale", .{ahc}), a);
 
         const fhc = try std.fmt.allocPrint(a, "model.layers.{d}.ffn_hc", .{i});
-        w.ffn_hc_fn[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.fn", .{fhc}), a);
-        w.ffn_hc_base[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.base", .{fhc}), a);
-        w.ffn_hc_scale[i] = try idx.loadBF16AsF32(
-            try std.fmt.bufPrint(&name_buf, "{s}.scale", .{fhc}), a);
+        w.ffn_hc_fn[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.fn", .{fhc}), a);
+        w.ffn_hc_base[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.base", .{fhc}), a);
+        w.ffn_hc_scale[i] = try idx.loadBF16AsF32(try std.fmt.bufPrint(&name_buf, "{s}.scale", .{fhc}), a);
 
         // ---- Compressor/Indexer weights (T2C.1) ----
         const ratio = cfg.compress_ratios[i];
@@ -398,9 +392,9 @@ fn dequantAffineF32(
     const packed_cols = in_dim / 8;
 
     for (0..out_dim) |row| {
-        const packed_row = packed_data[row * packed_cols..][0..packed_cols];
-        const scale_row = scales[row * num_groups..][0..num_groups];
-        const bias_row = if (biases.len > 0) biases[row * num_groups..][0..num_groups] else null;
+        const packed_row = packed_data[row * packed_cols ..][0..packed_cols];
+        const scale_row = scales[row * num_groups ..][0..num_groups];
+        const bias_row = if (biases.len > 0) biases[row * num_groups ..][0..num_groups] else null;
 
         for (0..num_groups) |g| {
             const scale = scale_row[g];

@@ -106,6 +106,7 @@ typedef struct {
     // wo_a is DENSE f32 (loader dequantizes it): [O_GROUPS, O_LORA_RANK, group_feat]
     // flattened, group_feat = (N_HEADS/O_GROUPS)*HEAD_DIM = 4096.
     const float *wo_a_dense; // [O_GROUPS * O_LORA_RANK * 4096]
+    QuantWeight wo_a;        // [8192, 4096] packed affine gs=64 (native format; preferred path)
     QuantWeight wo_b;        // [4096, 8192]  (DIM, O_GROUPS*O_LORA_RANK)
     const float *attn_sink;  // [64] per-head sink logits
 } AttnWeights;

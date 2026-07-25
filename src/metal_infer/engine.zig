@@ -50,6 +50,7 @@ const CAttnWeights = extern struct {
     wkv: CQuantWeight,
     kv_norm: [*c]const f32,
     wo_a_dense: [*c]const f32,
+    wo_a: CQuantWeight,
     wo_b: CQuantWeight,
     attn_sink: [*c]const f32,
 };
@@ -201,6 +202,14 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         ca.wkv = cqw(ap.wkv);
         ca.kv_norm = ap.kv_norm.ptr;
         ca.wo_a_dense = ap.wo_a_dense.ptr;
+        // native_loader keeps wo_a packed (GPU dequants in-kernel); the older
+        // DSV4Model loader only has the f32 dense form — leave wo_a empty so
+        // the C side takes its f32 fallback.
+        if (@hasField(@TypeOf(ap), "wo_a")) {
+            ca.wo_a = cqw(ap.wo_a);
+        } else {
+            ca.wo_a = .{ .packed_ptr = null, .scales = null, .biases = null, .out_dim = 0, .in_dim = 0, .group_size = 64 };
+        }
         ca.wo_b = cqw(ap.wo_b);
         ca.attn_sink = ap.attn_sink.ptr;
         moe_infer_set_layer_attn(engine, @intCast(i), ca);
