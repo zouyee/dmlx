@@ -1332,6 +1332,8 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents],
                residual, (size_t)MHC_MULT * DIM * sizeof(float));
     }
+    double ptA=0, ptB=0, ptC=0, gpu_exec_ms=0;
+    if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptA = ts.tv_sec*1e9+ts.tv_nsec; }
 
     {    // Build MlaPipes view over the engine's pipelines.
     MlaPipes P;
@@ -1433,7 +1435,11 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             (void *)merged_cb,                                  // external_cb1
             eng->buf_attn_out);                                 // out_gpu_buf — wo_b writes here
         // merged_cb now contains: mhc_pre + Q/KV/SDPA + GPU blit wo_a grouping + wo_a×8 + wo_b
-        [merged_cb commit]; [merged_cb waitUntilCompleted];
+        [merged_cb commit];
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptB = ts.tv_sec*1e9+ts.tv_nsec; }
+        [merged_cb waitUntilCompleted];
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptC = ts.tv_sec*1e9+ts.tv_nsec; }
+        if (phase_time) gpu_exec_ms = ([merged_cb GPUEndTime] - [merged_cb GPUStartTime]) * 1e3;
 
         // Read attn_out from GPU buffer (written by wo_b in merged_cb)
         memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));
@@ -1957,7 +1963,9 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
 
     } // end layer body
     if (phase_time) { fprintf(stderr, "[PHASE] L%d mla=%.2fms cmd2=%.2fms io=%.2fms moe=%.2fms shared=%.2fms total=%.2fms\n",
-        layer, (pt1-pt0)/1e6, (pt2-pt1)/1e6, (pt3-pt2)/1e6, (pt4-pt3)/1e6, (pt5-pt4)/1e6, (pt5-pt0)/1e6); }
+        layer, (pt1-pt0)/1e6, (pt2-pt1)/1e6, (pt3-pt2)/1e6, (pt4-pt3)/1e6, (pt5-pt4)/1e6, (pt5-pt0)/1e6);
+        fprintf(stderr, "[PHASE-MLA] L%d drain=%.2f enc=%.2f gpu=%.2f rb=%.2f gpuexec=%.2f\n",
+        layer, (ptA-pt0)/1e6, (ptB-ptA)/1e6, (ptC-ptB)/1e6, (pt1-ptC)/1e6, gpu_exec_ms); }
     return 0;
 }
 
