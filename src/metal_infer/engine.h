@@ -238,6 +238,17 @@ typedef struct {
     void *blob_wrap_pread[6];
     void *blob_wrap_pred[6];
     void *blob_wrap_pred2[6];
+    // Cross-token expert I/O dedup pool for moe_infer_forward_batch (prefill).
+    // Within one layer, each unique expert is pread once into a pool slot and
+    // shared by all tokens that routed to it (60 reads → ~28 for N=10).
+    // Lazily allocated on first batch forward; decode-only paths pay nothing.
+    uint8_t *batch_pool;         // contiguous slot memory (2MB-aligned)
+    void   **batch_wrap;         // [capacity] persistent NoCopy MTLBuffer wrappers
+    int     *batch_eids;         // [capacity] slot → expert_id (this layer)
+    int      batch_count;        // slots used this layer (reset per layer)
+    int      batch_hits;         // cross-token pool hits this layer (stats)
+    int      batch_capacity;     // total slots (env NATIVE_BATCH_POOL_SLOTS, default 48)
+    size_t   batch_slot_size;    // = active_expert_size at alloc time
     void *pipe_int8_gate_up_swiglu;     // fused_gate_up_swiglu_int8_e8m0 (DSpark MTP)
     void *pipe_int8_dequant_matvec;     // dequant_matvec_int8_e8m0 (DSpark MTP)
     void *pipe_rms_norm_sum_sq;

@@ -1003,6 +1003,15 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                     if (ptr == (void *)eng->expert_buf[kk])       slot = &eng->blob_wrap_pread[kk];
                     else if (ptr == (void *)eng->expert_buf_pred[kk])  slot = &eng->blob_wrap_pred[kk];
                     else if (ptr == (void *)eng->expert_buf_pred2[kk]) slot = &eng->blob_wrap_pred2[kk];
+                    else if (eng->batch_pool && eng->batch_slot_size &&
+                             (uint8_t *)ptr >= eng->batch_pool &&
+                             (uint8_t *)ptr < eng->batch_pool + (size_t)eng->batch_capacity * eng->batch_slot_size) {
+                        // Batch dedup pool slot → per-slot persistent wrapper
+                        // (pool memory is stable, so the wrapper stays valid
+                        // across layers even as slot contents change).
+                        size_t sidx = (size_t)((uint8_t *)ptr - eng->batch_pool) / eng->batch_slot_size;
+                        slot = &eng->batch_wrap[sidx];
+                    }
                     if (slot) {
                         if (!*slot)
                             *slot = (void *)[d newBufferWithBytesNoCopy:ptr
@@ -1755,13 +1764,34 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             }
         }
         prefetch_consume(eng, layer, expert_ids, expert_data);
+        // Cross-token dedup (batch/prefill path only): resolve misses against
+        // this layer's pool first; each unique expert is read once per layer.
+        const int use_batch_pool = (eng->in_batch > 0 && eng->batch_pool != NULL);
+        if (use_batch_pool) {
+            for (int k = 0; k < N_ACTIVE; k++) {
+                if (expert_data[k] != NULL) continue;
+                for (int s = 0; s < eng->batch_count; s++) {
+                    if (eng->batch_eids[s] == expert_ids[k]) {
+                        expert_data[k] = eng->batch_pool + (size_t)s * eng->batch_slot_size;
+                        eng->batch_hits++;
+                        break;
+                    }
+                }
+            }
+        }
         int miss_ids[6], miss_map[6];
         uint8_t *miss_bufs[6];
         int n_miss = 0;
         for (int k = 0; k < N_ACTIVE; k++) {
             if (expert_data[k] == NULL) {
                 miss_ids[n_miss] = expert_ids[k];
-                miss_bufs[n_miss] = eng->expert_buf[k];
+                if (use_batch_pool && eng->batch_count < eng->batch_capacity) {
+                    int s = eng->batch_count++;
+                    eng->batch_eids[s] = expert_ids[k];
+                    miss_bufs[n_miss] = eng->batch_pool + (size_t)s * eng->batch_slot_size;
+                } else {
+                    miss_bufs[n_miss] = eng->expert_buf[k];
+                }
                 miss_map[n_miss] = k;
                 n_miss++;
             }
@@ -2053,6 +2083,36 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     if (nl) max_layers = atoi(nl);
     eng->in_batch++;  // disable predictive prefetch for the whole batch pass
 
+    // Lazy-allocate the cross-token expert dedup pool (gather6/MXFP4 mode only).
+    // First batch forward pays one ~645MB aligned alloc; decode-only processes
+    // never allocate. On failure, capacity=0 keeps the legacy per-token path.
+    if (!eng->batch_pool && !eng->use_affine_experts && eng->active_expert_size > 0 &&
+        getenv("NATIVE_BATCH_POOL") == NULL) {
+        int cap = 48;
+        const char *cs = getenv("NATIVE_BATCH_POOL_SLOTS");
+        if (cs) cap = atoi(cs);
+        if (cap < 6) cap = 6;
+        uint8_t *pool = NULL;
+        void **wrap = NULL;
+        int *eids = NULL;
+        if (posix_memalign((void**)&pool, 2*1024*1024, (size_t)cap * eng->active_expert_size) == 0 && pool) {
+            wrap = (void **)calloc((size_t)cap, sizeof(void *));
+            eids = (int *)malloc((size_t)cap * sizeof(int));
+        }
+        if (pool && wrap && eids) {
+            eng->batch_pool = pool;
+            eng->batch_wrap = wrap;
+            eng->batch_eids = eids;
+            eng->batch_capacity = cap;
+            eng->batch_slot_size = eng->active_expert_size;
+            eng->batch_count = 0;
+            eng->batch_hits = 0;
+        } else {
+            free(pool); free(wrap); free(eids);
+            eng->batch_capacity = 0;
+        }
+    }
+
     // Dump all token embed outputs (before any layer processing) for diagnostics
     if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
         const char *dd = getenv("DSV4_DUMP_DIR");
@@ -2084,6 +2144,8 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         // Draining here is safe: the per-layer deferred drain below waits + releases
         // the last in-flight CB before the pool exits, so no drain races live GPU work.
         @autoreleasepool {
+        eng->batch_count = 0;  // per-layer reset: pool contents are layer-specific
+        eng->batch_hits = 0;
         // Per-token pool: the per-layer pool above alone only covers ≤12-token
         // prompts — ~5 unretained CBs accumulate per (layer,token) and Metal
         // caps outstanding unretained CB objects (~64), so CB creation
@@ -2142,6 +2204,10 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         }
         // Last token's deferred CB was wait+released above — nothing in flight.
         [tok_pool drain];
+        if (eng->batch_pool && getenv("NATIVE_PHASE_TIME")) {
+            fprintf(stderr, "[BATCH-IO] L%d uniq=%d saved=%d\n",
+                    layer, eng->batch_count, eng->batch_hits);
+        }
         // DSpark: extract last prefill token's hidden from layers 40/41/42.
         // This provides the main_hidden input for DSpark draft during subsequent decode.
         if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
@@ -2883,6 +2949,16 @@ void moe_infer_deinit(MoEInferEngine *eng) {
         free(eng->expert_buf_pred[k]);
         free(eng->expert_buf_pred2[k]);
     }
+    // Free cross-token batch dedup pool (wrappers are NoCopy views — release
+    // the MTLBuffer objects but never the backing memory they point at).
+    if (eng->batch_wrap) {
+        for (int s = 0; s < eng->batch_capacity; s++) {
+            if (eng->batch_wrap[s]) [(id<MTLBuffer>)eng->batch_wrap[s] release];
+        }
+        free(eng->batch_wrap);
+    }
+    free(eng->batch_eids);
+    free(eng->batch_pool);
     // Free expert memory cache
     if (eng->expert_cache_n_experts > 0) {
         for (int layer = 0; layer < N_LAYERS; layer++) {
