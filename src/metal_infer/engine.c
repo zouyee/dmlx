@@ -2082,6 +2082,8 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     const char *nl = getenv("NATIVE_MAX_LAYERS");
     if (nl) max_layers = atoi(nl);
     eng->in_batch++;  // disable predictive prefetch for the whole batch pass
+    const int phase_time_batch = (getenv("NATIVE_PHASE_TIME") != NULL);
+    double batch_dwait_ms = 0;  // per-layer deferred-wait total (MoE GPU tail)
 
     // Lazy-allocate the cross-token expert dedup pool (gather6/MXFP4 mode only).
     // First batch forward pays one ~645MB aligned alloc; decode-only processes
@@ -2146,6 +2148,7 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         @autoreleasepool {
         eng->batch_count = 0;  // per-layer reset: pool contents are layer-specific
         eng->batch_hits = 0;
+        batch_dwait_ms = 0;
         // Per-token pool: the per-layer pool above alone only covers ≤12-token
         // prompts — ~5 unretained CBs accumulate per (layer,token) and Metal
         // caps outstanding unretained CB objects (~64), so CB creation
@@ -2167,7 +2170,10 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             //   3. Do NOT overwrite hidden_t (current token's input for this layer)
             // Then forward_layer will sync hidden_t → buf_residual_gpu for this token.
             if (eng->deferred.active && eng->deferred.cmd_experts) {
+                double dw0 = 0;
+                if (phase_time_batch) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); dw0 = ts.tv_sec*1e9+ts.tv_nsec; }
                 [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+                if (phase_time_batch) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); batch_dwait_ms += (ts.tv_sec*1e9+ts.tv_nsec - dw0)/1e6; }
                 [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
                 eng->deferred.cmd_experts = NULL;
                 eng->deferred.active = false;
@@ -2191,7 +2197,10 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         // After all tokens in this layer: drain deferred for the last token
         // and update its hidden with the GPU's final output.
         if (eng->deferred.active && eng->deferred.cmd_experts) {
+            double dw0 = 0;
+            if (phase_time_batch) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); dw0 = ts.tv_sec*1e9+ts.tv_nsec; }
             [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+            if (phase_time_batch) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); batch_dwait_ms += (ts.tv_sec*1e9+ts.tv_nsec - dw0)/1e6; }
             [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
             eng->deferred.cmd_experts = NULL;
             eng->deferred.active = false;
@@ -2205,8 +2214,8 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         // Last token's deferred CB was wait+released above — nothing in flight.
         [tok_pool drain];
         if (eng->batch_pool && getenv("NATIVE_PHASE_TIME")) {
-            fprintf(stderr, "[BATCH-IO] L%d uniq=%d saved=%d\n",
-                    layer, eng->batch_count, eng->batch_hits);
+            fprintf(stderr, "[BATCH-IO] L%d uniq=%d saved=%d dwait=%.2fms\n",
+                    layer, eng->batch_count, eng->batch_hits, batch_dwait_ms);
         }
         // DSpark: extract last prefill token's hidden from layers 40/41/42.
         // This provides the main_hidden input for DSpark draft during subsequent decode.
