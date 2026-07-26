@@ -362,6 +362,7 @@ pub const NativeEngine = struct {
         const dspark_eval = std.c.getenv("NATIVE_DSPARK_EVAL") != null;
         var eval_hits: usize = 0;
         var eval_total: usize = 0;
+        var eval_rank_sum: usize = 0;
         if (self.dspark_engine != null or self.dspark != null) {
             dspark_draft_logits_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
         }
@@ -417,21 +418,27 @@ pub const NativeEngine = struct {
                         if (n > 0) {
                             var pred: u32 = 0;
                             var best: f32 = -std.math.inf(f32);
+                            var actual_rank: usize = 1;
+                            const actual_logit = draft_buf[next_token];
                             for (draft_buf[0..vocab], 0..) |l, i| {
                                 if (l > best) {
                                     best = l;
                                     pred = @intCast(i);
                                 }
+                                if (l > actual_logit) actual_rank += 1;
                             }
                             eval_total += 1;
                             if (pred == next_token) eval_hits += 1;
+                            eval_rank_sum += actual_rank;
                             if (eval_total % 10 == 0) {
-                                std.log.info("[dspark-eval] top1={d}/{d} ({d:.1}%) last pred={d} actual={d}", .{
+                                std.log.info("[dspark-eval] top1={d}/{d} ({d:.1}%) avg_rank={d:.0} last pred={d} actual={d}(rank {d})", .{
                                     eval_hits,
                                     eval_total,
                                     @as(f64, @floatFromInt(eval_hits)) * 100.0 / @as(f64, @floatFromInt(eval_total)),
+                                    @as(f64, @floatFromInt(eval_rank_sum)) / @as(f64, @floatFromInt(eval_total)),
                                     pred,
                                     next_token,
+                                    actual_rank,
                                 });
                             }
                         }

@@ -620,6 +620,23 @@ int dspark_forward(
     const int vocab = eng->vocab_size;
     const float *src_hidden = main_hidden ? main_hidden : eng->buf_main_hidden;
 
+    // DSPARK_DEBUG: verify the main_hidden injection chain is alive — print
+    // L2 norms of the accumulated target hidden (3 slots) and main_x after
+    // projection. norm≈0 means the accumulate path never fed real hidden
+    // states (implementation bug upstream of the backbone).
+    static int dbg = -1;
+    if (dbg < 0) dbg = getenv("DSPARK_DEBUG") ? 1 : 0;
+    if (dbg) {
+        double n0=0,n1=0,n2=0;
+        for (int d = 0; d < DIM; d++) {
+            n0 += (double)src_hidden[d]*src_hidden[d];
+            n1 += (double)src_hidden[DIM+d]*src_hidden[DIM+d];
+            n2 += (double)src_hidden[2*DIM+d]*src_hidden[2*DIM+d];
+        }
+        fprintf(stderr, "[dspark-dbg] pos=%d anchor=%d |main_hidden| slots=[%.3f %.3f %.3f]\n",
+                start_pos, anchor_token_id, sqrt(n0), sqrt(n1), sqrt(n2));
+    }
+
     // =====================================================================
     // Step 1: main_proj(concat(target_hidden[40,41,42])) → main_x [DIM]
     // =====================================================================
