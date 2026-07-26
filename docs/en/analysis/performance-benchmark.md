@@ -1,12 +1,12 @@
 ---
 date: 2026-07-26
-Commit: 51969b8 (main)
+Commit: c79fc6b (main)
 model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
 hardware: Apple M4 Pro, 48GB
 mode: serve, smelt 0.15 + stream, ExpertCache 10240MB, temperature=0
 build: zig build -Doptimize=ReleaseFast
 generated_by: scripts/run_benchmark.sh
-total_time: ?s (perf 159s + e2e 111s)
+total_time: ?s (perf 138s + e2e 93s)
 ---
 
 # dmlx Performance Benchmark Report
@@ -16,8 +16,8 @@ total_time: ?s (perf 159s + e2e 111s)
 ## 1. Token Generation Latency (Serve Mode)
 
 **Native engine results**:
-- Sequential decode (median of 3): **1.113 tok/s**
-- Long decode (100-token run): **1.271 tok/s**
+- Sequential decode (median of 3): **1.217 tok/s**
+- Long decode (100-token run): **1.607 tok/s**
 - Paris correctness: PASS (see E2E below)
 - (Per-token latency table requires MLX-era "Token step" server logs,
   which the native engine does not emit.)
@@ -29,14 +29,14 @@ total_time: ?s (perf 159s + e2e 111s)
 | 30-token | 30 | ? | ? | — |
 | 100-token | 100 | ? | ? | — |
 
-### Comparison with Previous Version (c8abc13 → 51969b8)
+### Comparison with Previous Version (51969b8 → c79fc6b)
 
-| Metric | Previous (c8abc13) | Current (51969b8) | Change |
+| Metric | Previous (51969b8) | Current (c79fc6b) | Change |
 |--------|-------------------------|-------------------|--------|
 | Prefill | 0.0ms | **0.0ms** | — |
 | Steady-state avg | 0.0ms | **0.0ms** | — |
-| Throughput | ~0.0 tok/s | **~1.1 tok/s** | — |
-| Perf phase | 176s | **159s** | **+10%** |
+| Throughput | ~0.0 tok/s | **~1.2 tok/s** | — |
+| Perf phase | 159s | **138s** | **+13%** |
 
 Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
 
@@ -84,11 +84,11 @@ zig build test → PASS (430+)
 
 ## 5. Key Performance Metrics
 
-| Metric | Previous (c8abc13) | Current (51969b8) | Change |
+| Metric | Previous (51969b8) | Current (c79fc6b) | Change |
 |--------|-------------------------|-------------------|--------|
 | Prefill latency | 0.0ms | **0.0ms** | — |
 | Steady-state ITL | 0.0ms | **0.0ms** | — |
-| Steady-state tok/s | ~0.0 | **~1.1** | — |
+| Steady-state tok/s | ~0.0 | **~1.2** | — |
 | Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
 | 100-token HTTP total | — | **?s** | — |
 | Server RSS | — | **? MB** | — |
