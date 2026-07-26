@@ -682,6 +682,13 @@ void moe_infer_set_dspark_accumulate(MoEInferEngine *eng, bool enabled) {
     if (eng) eng->dspark_accumulate_enabled = enabled;
 }
 
+void moe_infer_dspark_commit(MoEInferEngine *eng, int n_accepted, int start_pos) {
+    if (!eng || !eng->dspark_engine || !eng->dspark_hidden3) return;
+    dspark_commit_accepted((DSparkEngine *)eng->dspark_engine,
+                           eng->dspark_hidden3, eng->dspark_hidden3_n,
+                           n_accepted, start_pos);
+}
+
 // ============================================================================
 // Gather mode: create per-layer full-expert buffers for gatherQmm
 // ============================================================================
@@ -1375,6 +1382,7 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.matvec_q8_0_f32    = (id<MTLComputePipelineState>)eng->pipe_matvec_q8_0_f32;
     P.mla_sdpa_decode_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_bfloat;
     P.dequant_matvec_affine_bf16in_f32out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out;
+    P.dequant_matvec_affine_bf16in_f32out_grp8 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8;
     P.mla_sdpa_prefill_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_prefill_bfloat;
     P.bf16_to_f16_row = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f16_row;
 
@@ -2160,9 +2168,18 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
 
     // DSpark prefill: per-position mean-pooled hidden for layers 40/41/42,
     // used to build the main_kv context window after the layer loop.
-    float *dsp_hidden3 = NULL;
-    if (eng->dspark_engine && eng->dspark_accumulate_enabled) {
-        dsp_hidden3 = (float *)malloc((size_t)3 * n_tokens * DIM * sizeof(float));
+    // DSpark prefill: per-position mean-pooled hidden for layers 40/41/42.
+    // Collected whenever a DSpark engine is attached (also during verify
+    // batches — needed to backfill accepted positions afterward). The
+    // main_kv window build itself happens only for real prefill (accumulate
+    // enabled); verify callers commit accepted positions explicitly.
+    if (eng->dspark_engine) {
+        if (eng->dspark_hidden3_cap < n_tokens) {
+            free(eng->dspark_hidden3);
+            eng->dspark_hidden3 = (float *)malloc((size_t)3 * n_tokens * DIM * sizeof(float));
+            eng->dspark_hidden3_cap = eng->dspark_hidden3 ? n_tokens : 0;
+        }
+        eng->dspark_hidden3_n = eng->dspark_hidden3 ? n_tokens : 0;
     }
 
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
@@ -2246,14 +2263,17 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                     layer, eng->batch_count, eng->batch_hits, batch_dwait_ms);
         }
         // DSpark: collect mean-pooled hidden from layers 40/41/42 for EVERY
-        // prefill position (for the main_kv context window) plus the last
-        // token's hidden (main_hidden for the first decode step).
-        if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
-            float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
-            dspark_accumulate_target_hidden(
-                (DSparkEngine *)eng->dspark_engine, last, layer);
-            if (dsp_hidden3) {
-                float *dst = dsp_hidden3 + (size_t)(layer - 40) * n_tokens * DIM;
+        // position (main_kv window backfill) whenever a DSpark engine is
+        // attached — including verify batches. The last token's
+        // buf_main_hidden accumulate stays gated by accumulate_enabled.
+        if (eng->dspark_engine && (layer == 40 || layer == 41 || layer == 42)) {
+            if (eng->dspark_accumulate_enabled) {
+                float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
+                dspark_accumulate_target_hidden(
+                    (DSparkEngine *)eng->dspark_engine, last, layer);
+            }
+            if (eng->dspark_hidden3) {
+                float *dst = eng->dspark_hidden3 + (size_t)(layer - 40) * n_tokens * DIM;
                 for (int t = 0; t < n_tokens; t++) {
                     const float *src = hidden_batch + (size_t)t * (MHC_MULT * DIM);
                     float *d = dst + (size_t)t * DIM;
@@ -2282,10 +2302,14 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
 
     // DSpark main_kv prefill: build the context window for every prefill
     // position (reference DSparkAttention start_pos==0 branch semantics).
-    if (dsp_hidden3) {
-        dspark_build_window((DSparkEngine *)eng->dspark_engine, dsp_hidden3, n_tokens, start_pos);
-        free(dsp_hidden3);
-        dsp_hidden3 = NULL;
+    // DSpark main_kv prefill: build the context window for every prefill
+    // position (reference DSparkAttention start_pos==0 branch semantics).
+    // Skipped during verify batches (accumulate disabled) — the verify caller
+    // commits accepted positions via moe_infer_dspark_commit instead.
+    if (eng->dspark_engine && eng->dspark_accumulate_enabled &&
+        eng->dspark_hidden3 && eng->dspark_hidden3_n == n_tokens) {
+        dspark_build_window((DSparkEngine *)eng->dspark_engine,
+                            eng->dspark_hidden3, n_tokens, start_pos);
     }
 
     // SMELT: do NOT count prefill tokens for warmup statistics.

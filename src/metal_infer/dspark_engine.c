@@ -534,6 +534,35 @@ void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, 
     free(main_x);
 }
 
+// Commit accepted draft positions after a verify batch: backfill main_kv
+// for batch positions 1..n_accepted (anchor pos 0 is already in the window
+// from the drafting step) and set buf_main_hidden to the hidden of the last
+// accepted position — the correct context for the next draft. Rejected
+// positions are rolled back by omission (cursors only advance for accepted).
+void dspark_commit_accepted(DSparkEngine *eng, const float *hidden3, int n_batch, int n_accepted, int start_pos) {
+    if (!eng || !eng->initialized || !hidden3) return;
+    if (n_accepted < 0 || n_accepted >= n_batch) return;
+    float *mh = (float *)malloc(3 * DIM * sizeof(float));
+    float *main_x = (float *)malloc(DIM * sizeof(float));
+    if (!mh || !main_x) { free(mh); free(main_x); return; }
+    // Backfill main_kv for accepted draft positions (batch index j = draft
+    // position j, sequence position start_pos + j).
+    for (int j = 1; j <= n_accepted; j++) {
+        for (int s = 0; s < 3; s++)
+            memcpy(mh + s * DIM, hidden3 + ((size_t)s * n_batch + j) * DIM, DIM * sizeof(float));
+        dspark_compute_main_x(eng, mh, main_x);
+        dspark_write_main_kv(eng, main_x, start_pos + j);
+    }
+    // buf_main_hidden = hidden of the last accepted batch position (index
+    // n_accepted) — the context from which the correction/bonus token was
+    // sampled, and the right conditioning for the next draft.
+    for (int s = 0; s < 3; s++)
+        memcpy(eng->buf_main_hidden + s * DIM,
+               hidden3 + ((size_t)s * n_batch + n_accepted) * DIM, DIM * sizeof(float));
+    free(mh);
+    free(main_x);
+}
+
 // ============================================================================
 // dspark_update_main_kv
 // ============================================================================

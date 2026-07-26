@@ -337,3 +337,8 @@ extern fn moe_infer_set_dspark_accumulate(engine: *Engine, enabled: bool) void;
 pub fn setDSparkAccumulate(engine: *Engine, enabled: bool) void {
     moe_infer_set_dspark_accumulate(engine, enabled);
 }
+
+extern fn moe_infer_dspark_commit(engine: *Engine, n_accepted: i32, start_pos: i32) void;
+pub fn dsparkCommit(engine: *Engine, n_accepted: i32, start_pos: i32) void {
+    moe_infer_dspark_commit(engine, n_accepted, start_pos);
+}

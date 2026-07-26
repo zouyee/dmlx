@@ -578,6 +578,11 @@ pub const NativeEngine = struct {
                         current_len += 1;
                         remaining -|= 1;
                     }
+                    // Commit accepted draft positions to DSpark state: backfill
+                    // main_kv for accepted positions and set buf_main_hidden to
+                    // the last accepted position's hidden (correct context for
+                    // the next draft). start_pos is still the anchor position here.
+                    metal.dsparkCommit(self.engine, @intCast(accepted), @intCast(start_pos));
                     // KV state: positions start_pos..start_pos+accepted hold [anchor, d0..d_{a-1}]
                     // — all correct. Discard speculative KV beyond that.
                     start_pos += accepted + 1;

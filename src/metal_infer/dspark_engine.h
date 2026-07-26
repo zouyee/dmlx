@@ -309,6 +309,13 @@ void dspark_reset(DSparkEngine *eng);
 // layer's window. start_pos = sequence position of hidden3 position 0.
 void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, int start_pos);
 
+// Commit accepted draft positions after a verify batch: backfill main_kv
+// entries for batch positions 1..n_accepted (anchor is position 0, already
+// in the window from the drafting step) and set buf_main_hidden to the
+// hidden of the last accepted position — the correct context for the next
+// draft (rejected positions are rolled back by omission).
+void dspark_commit_accepted(DSparkEngine *eng, const float *hidden3, int n_batch, int n_accepted, int start_pos);
+
 // --- Target integration helpers ---
 
 // Extract and accumulate target hidden state for DSpark consumption.

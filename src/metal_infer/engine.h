@@ -384,6 +384,11 @@ typedef struct {
     void *io_pool;               // persistent I/O thread pool (critical path)
     void *prefetch_pool;         // second I/O thread pool (async prediction prefetch)
 
+    // DSpark prefill/verify: per-position mean-pooled hidden for layers
+    // 40/41/42 ([3, n, DIM]), engine-owned, grown on demand.
+    float *dspark_hidden3;
+    int    dspark_hidden3_n;
+    int    dspark_hidden3_cap;
     // Predictive cross-layer expert prefetch state.
     // After layer L's routing is known, async-prefetch layer L+1's predicted
     // experts (previous token's routing at L+1) into pred set (L+1)%2 while
@@ -655,6 +660,9 @@ void dspark_moe_forward_gpu(
 
 // Enable/disable DSpark hidden state accumulation (disable during verification)
 void moe_infer_set_dspark_accumulate(MoEInferEngine *eng, bool enabled);
+// Commit accepted draft positions after a verify batch (backfill main_kv +
+// correct buf_main_hidden for the next draft). start_pos = anchor position.
+void moe_infer_dspark_commit(MoEInferEngine *eng, int n_accepted, int start_pos);
 
 // DSpark GPU-accelerated shared expert forward (f32 weights)
 void dspark_shared_expert_gpu(
