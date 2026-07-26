@@ -35,6 +35,8 @@ pub const DSV4NativeConfig = struct {
     index_topk: u32 = 512,
     index_n_heads: u32 = 64,
     index_head_dim: u32 = 128,
+    // Special tokens (from config.json; DSV4 defaults)
+    eos_token_id: u32 = 1,
 };
 
 pub fn parse(allocator: std.mem.Allocator, model_dir: []const u8) !DSV4NativeConfig {
@@ -81,6 +83,7 @@ pub fn parse(allocator: std.mem.Allocator, model_dir: []const u8) !DSV4NativeCon
     if (getInt(obj, "qk_rope_head_dim")) |v| cfg.qk_rope_head_dim = @intCast(v);
     if (getInt(obj, "q_lora_rank")) |v| cfg.q_lora_rank = @intCast(v);
     if (getInt(obj, "kv_lora_rank")) |v| cfg.kv_lora_rank = @intCast(v);
+    if (getInt(obj, "eos_token_id")) |v| cfg.eos_token_id = @intCast(v);
 
     // use_mhc
     if (obj.get("use_mhc")) |v| {

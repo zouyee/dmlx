@@ -18,7 +18,8 @@ const DIM = 4096;
 const MHC_MULT = 4;
 const N_LAYERS = 43;
 // BOS token ID: 0 is the `<｜begin▁of▁sentence｜>` token for DeepSeek-V4-Flash.
-// EOS token ID: 1 is the `</s>` token loaded from tokenizer.json.
+// EOS token ID: read from the model's config.json (eos_token_id) at init;
+// this constant is only the fallback default (DSV4: 1 = `<｜end▁of▁sentence｜>`).
 const BOS_TOKEN: u32 = 0;
 const EOS_TOKEN: u32 = 1;
 
@@ -190,6 +191,7 @@ pub const NativeEngine = struct {
             .weight_store = store,
             .config = cfg,
             .logits_buffer = logits,
+            .eos_token = cfg.eos_token_id,
             .smelt_stats_path = stats_path_buf,
             .dspark = dspark_state,
             .dspark_engine = dspark_full_engine,
