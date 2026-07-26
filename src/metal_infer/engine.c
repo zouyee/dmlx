@@ -2048,13 +2048,11 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
         }
     }
 
-    // DSpark: feed the latest KV entry from layer 0 into DSpark's sliding window.
-    // Each decode step writes one KV entry at pos; DSpark needs this for attention context.
-    if (eng->dspark_engine && eng->dspark_accumulate_enabled && eng->kv_cache[0].len > 0) {
-        int kv_pos = eng->kv_cache[0].len - 1;  // latest entry
-        uint16_t *kv_entry = eng->kv_cache[0].kv + (size_t)kv_pos * KV_LORA_RANK;
-        dspark_update_main_kv((DSparkEngine *)eng->dspark_engine, kv_entry, kv_pos);
-    }
+    // DSpark main_kv: the window is now written inside dspark_forward from
+    // main_x (kv_norm(wkv(main_x)) per draft layer, reference semantics).
+    // The old path fed target layer-0 KV entries — a different vector space
+    // the backbone's queries are not trained to read. Disabled.
+    (void)0;
 
     // Wait for last layer's deferred cb3 + read final residual back to hidden.
     if (eng->deferred.active && eng->deferred.cmd_experts) {
@@ -2262,15 +2260,11 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         } // end per-layer @autoreleasepool
     }
 
-    // DSpark: feed prefilled KV entries into DSpark's sliding window.
-    // After prefill, layer 0's KV cache has entries for all prefilled positions.
-    if (eng->dspark_engine && eng->dspark_accumulate_enabled && eng->kv_cache[0].len > 0) {
-        int kv_len = eng->kv_cache[0].len;
-        for (int p = 0; p < kv_len; p++) {
-            uint16_t *kv_entry = eng->kv_cache[0].kv + (size_t)p * KV_LORA_RANK;
-            dspark_update_main_kv((DSparkEngine *)eng->dspark_engine, kv_entry, p);
-        }
-    }
+    // DSpark main_kv prefill: disabled — feeding target layer-0 KV entries was
+    // semantically wrong (reference: kv_norm(wkv(main_x)) per position via the
+    // draft layers' own wkv). The window is now written per decode step inside
+    // dspark_forward; building it for prefill positions is a follow-up.
+    (void)0;
 
     // SMELT: do NOT count prefill tokens for warmup statistics.
     // Prefill uses hash-routing for layers 0-2 (routing_counts all 0), so

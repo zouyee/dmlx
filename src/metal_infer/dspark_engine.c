@@ -657,22 +657,72 @@ int dspark_forward(
     }
 
     // =====================================================================
+    // Step 1b: main_kv entry for this position (per draft layer).
+    // Reference (DSpark inference/model.py DSparkAttention.forward):
+    //   main_kv = kv_norm(wkv(main_x)) with RoPE at the anchor position,
+    //   written to the layer's window at start_pos % window_size.
+    // The context channel: the backbone attends to target hidden states
+    // (layers 40/41/42) projected through main_proj + ITS OWN wkv — NOT the
+    // target layer-0 KV cache (which lives in a different vector space).
+    // =====================================================================
+    {
+        const int win = DSPARK_WINDOW_SIZE;
+        const int slot = start_pos % win;
+        for (int l = 0; l < DSPARK_N_LAYERS; l++) {
+            DSparkLayerWeights *lw = &eng->layers[l];
+            DSparkAttnWeights *aw = &lw->attn;
+            DSparkKVCache *kvc = &eng->kv_cache[l];
+            if (!aw->wkv_f32 || !aw->kv_norm) continue;
+            float kv_n[KV_LORA_RANK];
+            {
+                float kv_raw[KV_LORA_RANK];
+                cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                            KV_LORA_RANK, DIM, 1.0f, aw->wkv_f32, DIM,
+                            main_x, 1, 0.0f, kv_raw, 1);
+                // kv_norm (RMSNorm with learned weight)
+                float ss = 0.0f;
+                for (int i = 0; i < KV_LORA_RANK; i++) ss += kv_raw[i] * kv_raw[i];
+                float rms = 1.0f / sqrtf(ss / (float)KV_LORA_RANK + 1e-6f);
+                for (int i = 0; i < KV_LORA_RANK; i++) kv_n[i] = kv_raw[i] * rms * aw->kv_norm[i];
+                // RoPE on last 64 dims at the anchor position
+                float *rp = kv_n + (KV_LORA_RANK - 64);
+                for (int i = 0; i < 32; i++) {
+                    float theta = (float)start_pos * powf(10000000.0f, -2.0f * i / 64.0f);
+                    float c = cosf(theta), s = sinf(theta);
+                    float x0 = rp[i], x1 = rp[i + 32];
+                    rp[i]      = x0 * c - x1 * s;
+                    rp[i + 32] = x0 * s + x1 * c;
+                }
+            }
+            uint16_t *dst = kvc->main_kv + (size_t)slot * KV_LORA_RANK;
+            for (int i = 0; i < KV_LORA_RANK; i++) {
+                _Float16 h = (_Float16)kv_n[i];
+                union { _Float16 f; uint16_t u; } cv; cv.f = h; dst[i] = cv.u;
+            }
+            if (kvc->main_len < win) kvc->main_len++;
+        }
+    }
+
+    // =====================================================================
     // Step 2: Initialize draft_hidden [DSPARK_BLOCK_SIZE, MHC_MULT, DIM]
-    //   Position 0: embed(anchor_token) + main_x (combined input from target)
-    //   Position 1-4: embed(noise_token) + main_x
-    //   Each position's residual is [MHC_MULT, DIM] with combined input replicated.
+    //   Position 0: embed(anchor_token)
+    //   Position 1-4: embed(noise_token)
+    //   Each position's residual is [MHC_MULT, DIM] with the EMBEDDING ONLY
+    //   replicated — main_x must NOT be added here. Reference (DSpark
+    //   inference/model.py forward_embed + Block.forward): residual = embed;
+    //   main_x enters exclusively as attention context (main_kv), never into
+    //   the residual stream. (Previously added main_x here — polluted the
+    //   residual from step 0 and destroyed backbone accuracy.)
     // =====================================================================
     float *draft_hidden = eng->buf_draft_hidden; // [bs * MHC_MULT * DIM]
     for (int k = 0; k < bs; k++) {
         int tok = (k == 0) ? anchor_token_id : (int)eng->noise_token_id;
         const float *emb_row = target->embed + (size_t)tok * DIM;
         float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
-        // Initialize all MHC_MULT streams with embedding + main_x
+        // Initialize all MHC_MULT streams with the embedding only
         for (int m = 0; m < MHC_MULT; m++) {
             float *dst = res_k + m * DIM;
-            for (int d = 0; d < DIM; d++) {
-                dst[d] = emb_row[d] + main_x[d];
-            }
+            memcpy(dst, emb_row, DIM * sizeof(float));
         }
     }
 

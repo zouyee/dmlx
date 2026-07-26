@@ -100,7 +100,8 @@ void dspark_attention_forward(
                     KV_LORA_RANK, DIM, 1.0f, aw->wkv_f32, DIM,
                     x_k, 1, 0.0f, kv_raw, 1);
         attn_rms_norm(kv_raw, aw->kv_norm, kv_k, KV_LORA_RANK);
-        attn_apply_rope(kv_k, start_pos + k);
+        // Reference: draft position k sits AFTER the anchor (pos p) → rope at p+1+k
+        attn_apply_rope(kv_k, start_pos + 1 + k);
     }
 
     // Step 2: Convert main_kv from f16 to f32
@@ -131,9 +132,18 @@ void dspark_attention_forward(
                     N_HEADS * HEAD_DIM, Q_LORA_RANK, 1.0f, aw->wq_b_f32, Q_LORA_RANK,
                     q_normed_buf, 1, 0.0f, q_full, 1);
 
-        // Per-head RoPE
+        // Per-head RMS rescale (reference: q *= rsqrt(mean(q^2)+eps), no learned weight)
         for (int h = 0; h < N_HEADS; h++) {
-            attn_apply_rope(q_full + h * HEAD_DIM, start_pos + k);
+            float *qh = q_full + h * HEAD_DIM;
+            float ss = 0.0f;
+            for (int i = 0; i < HEAD_DIM; i++) ss += qh[i] * qh[i];
+            float rs = 1.0f / sqrtf(ss / (float)HEAD_DIM + 1e-6f);
+            for (int i = 0; i < HEAD_DIM; i++) qh[i] *= rs;
+        }
+
+        // Per-head RoPE (reference: draft positions are after the anchor → p+1+k)
+        for (int h = 0; h < N_HEADS; h++) {
+            attn_apply_rope(q_full + h * HEAD_DIM, start_pos + 1 + k);
         }
 
         // SDPA per head
@@ -182,8 +192,8 @@ void dspark_attention_forward(
                 cblas_saxpy(HEAD_DIM, scores[main_len + t], draft_kvs + t * KV_LORA_RANK, 1, o_h, 1);
             }
 
-            // Inverse RoPE
-            attn_inverse_rope(o_h, start_pos + k);
+            // Inverse RoPE (reference: same position basis as Q → p+1+k)
+            attn_inverse_rope(o_h, start_pos + 1 + k);
         }
 
         // O-proj: grouped wo_a → wo_b

@@ -462,11 +462,13 @@ pub const NativeEngine = struct {
                     const draft_buf = dspark_draft_logits_buf.?;
 
                     // Run simplified DSpark forward (embed → norm → lm_head per position)
+                    // start_pos-1: dspark_forward expects the anchor's own position
+                    // (reference: main_kv slot = anchor_pos % window).
                     const n_draft_raw = metal.dsparkForward(
                         de,
                         null,
                         @intCast(next_token),
-                        @intCast(start_pos),
+                        @intCast(start_pos - 1),
                         draft_buf[0 .. max_draft * vocab],
                         null,
                     );
