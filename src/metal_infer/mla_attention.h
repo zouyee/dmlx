@@ -36,6 +36,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_q8_0_f32;    // ds4 Q8_0 matvec for wo_a
     id<MTLComputePipelineState> mla_sdpa_decode_bfloat;
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out;
+    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out_grp8; // fused wo_a
     // Prefill batch SDPA (Path B: matches MLX simdgroup reduction order)
     id<MTLComputePipelineState> mla_sdpa_prefill_bfloat;
     // KV cache bf16→f16 conversion (used in CB1+CB2 merge to avoid CPU round-trip)

@@ -1427,6 +1427,45 @@ kernel void dequant_matvec_affine_bf16in_f32out(
     out[tid] = acc;
 }
 
+// dequant_matvec_affine_bf16in_f32out_grp8: grouped variant for wo_a.
+// The full weight is [8*out_g, in_dim]; row tid belongs to group
+// g = tid / out_g and reads x from x[g*in_dim ..]. Writes straight into the
+// concat layout (out[tid]) — replaces 8 per-group dispatches + 8 input blits
+// + concat blit with ONE dispatch. Per-row accumulation order is identical
+// to dequant_matvec_affine_bf16in_f32out (bit-exact).
+kernel void dequant_matvec_affine_bf16in_f32out_grp8(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // [8, in_dim] grouped input
+    device float*          out      [[buffer(4)]],  // [8*out_g] concat output
+    constant uint&         out_g    [[buffer(5)]],  // rows per group (O_LORA_RANK)
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + tid * packed_cols;
+    device const float*    sc = scales   + tid * num_groups;
+    device const float*    bi = biases   + tid * num_groups;
+    device const bfloat*   xg = x + (tid / out_g) * in_dim;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(xg[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
 // dequant_matvec_affine_bf16in_bf16out: affine 4bit matmul with bfloat input AND output.
 // Used for wq_b, wkv, wo_b in the full bf16 attention chain.
 kernel void dequant_matvec_affine_bf16in_bf16out(

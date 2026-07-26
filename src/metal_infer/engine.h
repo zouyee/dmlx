@@ -294,6 +294,7 @@ typedef struct {
     void *pipe_f32_to_bf16;
     void *pipe_bf16_to_f32;
     void *pipe_dequant_matvec_affine_bf16in_f32out;
+    void *pipe_dequant_matvec_affine_bf16in_f32out_grp8;  // fused wo_a (8 groups, 1 dispatch)
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
     void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion
     void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert

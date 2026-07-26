@@ -118,6 +118,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_matvec_q8_0_f32    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"matvec_q8_0_f32"]    error:&err]);
     eng->pipe_mla_sdpa_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_bfloat"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out_grp8"] error:&err]);
     eng->pipe_mla_sdpa_prefill_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_prefill_bfloat"] error:&err]);
     eng->pipe_bf16_to_f16_row = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f16_row"] error:&err]);
     eng->pipe_limited_swiglu  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"limited_swiglu"] error:&err]);

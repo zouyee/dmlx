@@ -37,6 +37,9 @@ typedef struct {
     // wo_a packed affine 4-bit (native format): 8 × (2MB + 2×256KB) per layer.
     // Preferred path — 6.4x less per-token weight traffic than f32 dense.
     id<MTLBuffer> wo_a_pack[8], wo_a_sc[8], wo_a_bi[8];
+    // Contiguous whole-weight views of the same data for the fused grp8
+    // kernel (one dispatch instead of 8 + blits + concat).
+    id<MTLBuffer> wo_a_pack_all, wo_a_sc_all, wo_a_bi_all;
     // Persistent scratch buffers for decode pass (reused every forward call)
     // Eliminates ~18 MTLBuffer allocations per layer per token
     id<MTLBuffer> scr_q_a;       // [Q_LORA_RANK] bf16   — wq_a output
@@ -126,6 +129,10 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
                 c->wo_a_sc[g]   = MKNC(aw->wo_a.scales + (size_t)g * O_LORA_RANK * ng, grp_sb);
                 c->wo_a_bi[g]   = MKNC(aw->wo_a.biases + (size_t)g * O_LORA_RANK * ng, grp_sb);
             }
+            // Contiguous whole-weight views for the fused grp8 kernel
+            c->wo_a_pack_all = MKNC(aw->wo_a.packed, (size_t)O_GROUPS * grp_pack);
+            c->wo_a_sc_all   = MKNC(aw->wo_a.scales, (size_t)O_GROUPS * grp_sb);
+            c->wo_a_bi_all   = MKNC(aw->wo_a.biases, (size_t)O_GROUPS * grp_sb);
         }
         const int want_f32 = getenv("DMLX_WOA_F32") != NULL;
         const int want_q8  = getenv("DMLX_USE_Q8_WOA") != NULL;
@@ -868,6 +875,32 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
         id<MTLCommandBuffer> cb3 = (external_cb1 && !stage_time) ? (__bridge id<MTLCommandBuffer>)external_cb1
                                                  : [P->queue commandBuffer];
 
+        static int use_q8_woa = -1;
+        if (use_q8_woa < 0) use_q8_woa = getenv("DMLX_USE_Q8_WOA") ? 1 : 0;
+        static int use_f32_woa = -1;
+        if (use_f32_woa < 0) use_f32_woa = getenv("DMLX_WOA_F32") ? 1 : 0;
+
+        if (!use_f32_woa && !use_q8_woa && abc && abc->wo_a_pack_all && external_cb1) {
+            // --- Fused wo_a: ONE grp8 dispatch for all 8 groups ---
+            // Reads battn directly with per-group x offsets and writes the
+            // concat layout straight into bconcat — replaces 8 blits + 8
+            // matvec dispatches + the concat blit. Per-row accumulation is
+            // identical to the per-group path (bit-exact).
+            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
+            [e setComputePipelineState:P->dequant_matvec_affine_bf16in_f32out_grp8];
+            [e setBuffer:abc->wo_a_pack_all offset:0 atIndex:0];
+            [e setBuffer:abc->wo_a_sc_all   offset:0 atIndex:1];
+            [e setBuffer:abc->wo_a_bi_all   offset:0 atIndex:2];
+            [e setBuffer:battn              offset:0 atIndex:3];
+            [e setBuffer:bconcat            offset:0 atIndex:4];
+            uint og = O_LORA_RANK, id_ = (uint)group_feat, gs = 64;
+            [e setBytes:&og  length:4 atIndex:5];
+            [e setBytes:&id_ length:4 atIndex:6];
+            [e setBytes:&gs  length:4 atIndex:7];
+            [e dispatchThreads:MTLSizeMake(O_GROUPS * O_LORA_RANK, 1, 1)
+              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [e endEncoding];
+        } else {
         // --- Part 1: wo_a × 8 group matmuls ---
         for (int g = 0; g < O_GROUPS; g++) {
             id<MTLBuffer> bgv;
@@ -908,10 +941,6 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             // quantization, 2MB/group vs 16MB f32) → Q8_0 (DMLX_USE_Q8_WOA=1,
             // known correctness issues on some prompts) → f32 dense
             // (DMLX_WOA_F32=1 or packed unavailable).
-            static int use_q8_woa = -1;
-            if (use_q8_woa < 0) use_q8_woa = getenv("DMLX_USE_Q8_WOA") ? 1 : 0;
-            static int use_f32_woa = -1;
-            if (use_f32_woa < 0) use_f32_woa = getenv("DMLX_WOA_F32") ? 1 : 0;
             if (!use_f32_woa && abc && abc->wo_a_pack[g]) {
                 enc_dq_bf16_cached(P, cb3, abc->wo_a_pack[g], abc->wo_a_sc[g], abc->wo_a_bi[g],
                                    O_LORA_RANK, group_feat, 64, bgv, bog_arr[g],
@@ -949,6 +978,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             }
             [blit endEncoding];
         }
+        } // end else (legacy per-group wo_a path)
 
         // --- Part 3: wo_b output projection (coalesced v2 kernel) ---
         if (abc && abc->wo_b_pack) {
