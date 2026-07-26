@@ -363,8 +363,11 @@ pub const NativeEngine = struct {
         var eval_hits: usize = 0;
         var eval_total: usize = 0;
         var eval_rank_sum: usize = 0;
+        var eval_markov_hits: usize = 0;
+        var eval_corrected_buf: ?[]f32 = null;
         if (self.dspark_engine != null or self.dspark != null) {
             dspark_draft_logits_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
+            if (dspark_eval) eval_corrected_buf = try self.allocator.alloc(f32, DSPARK_MAX_BLOCK * @as(usize, self.config.vocab_size));
         }
 
         var remaining = decode_count;
@@ -430,11 +433,25 @@ pub const NativeEngine = struct {
                             eval_total += 1;
                             if (pred == next_token) eval_hits += 1;
                             eval_rank_sum += actual_rank;
+                            // Markov-corrected top-1 (reference forward_head adds the
+                            // Markov bias before sampling — system-level accuracy)
+                            var m_pred: u32 = pred;
+                            if (eval_corrected_buf) |cbuf| {
+                                const blk = DSPARK_MAX_BLOCK * vocab;
+                                @memcpy(cbuf[0..blk], draft_buf[0..blk]);
+                                var toks: [8]u32 = undefined;
+                                const nm = metal.dsparkMarkovSample(de, cbuf[0..vocab], @intCast(anchor), cbuf[0..vocab], toks[0..8]);
+                                if (nm > 0) m_pred = toks[0];
+                            }
+                            if (m_pred == next_token) eval_markov_hits += 1;
                             if (eval_total % 10 == 0) {
-                                std.log.info("[dspark-eval] top1={d}/{d} ({d:.1}%) avg_rank={d:.0} last pred={d} actual={d}(rank {d})", .{
+                                std.log.info("[dspark-eval] top1={d}/{d} ({d:.1}%) markov={d}/{d} ({d:.1}%) avg_rank={d:.0} last pred={d} actual={d}(rank {d})", .{
                                     eval_hits,
                                     eval_total,
                                     @as(f64, @floatFromInt(eval_hits)) * 100.0 / @as(f64, @floatFromInt(eval_total)),
+                                    eval_markov_hits,
+                                    eval_total,
+                                    @as(f64, @floatFromInt(eval_markov_hits)) * 100.0 / @as(f64, @floatFromInt(eval_total)),
                                     @as(f64, @floatFromInt(eval_rank_sum)) / @as(f64, @floatFromInt(eval_total)),
                                     pred,
                                     next_token,
@@ -669,10 +686,13 @@ pub const NativeEngine = struct {
         }
 
         if (eval_total > 0) {
-            std.log.info("[dspark-eval] FINAL backbone top-1 = {d}/{d} = {d:.1}% (restart milestone: >=40%)", .{
+            std.log.info("[dspark-eval] FINAL backbone top-1 = {d}/{d} = {d:.1}% | markov top-1 = {d}/{d} = {d:.1}% (restart milestone: >=40%)", .{
                 eval_hits,
                 eval_total,
                 @as(f64, @floatFromInt(eval_hits)) * 100.0 / @as(f64, @floatFromInt(eval_total)),
+                eval_markov_hits,
+                eval_total,
+                @as(f64, @floatFromInt(eval_markov_hits)) * 100.0 / @as(f64, @floatFromInt(eval_total)),
             });
         }
 
