@@ -314,6 +314,15 @@ print(f'{vals[1]:.3f}')")
     echo "  unit:    ${BM_UNIT}"
     echo "  time:    ${BM_PERF_SECS}s"
     echo "════════════════════════════════════════"
+
+    # Refresh the markdown report. The native branch previously exited before
+    # the shared Phase 3 below, so performance-benchmark.md went stale.
+    PF=$(mktemp)
+    grep "Token step.*complete" /tmp/benchmark_serve.log > "$PF" || true
+    export BM_E2E_PASS="$E2E_PASS" BM_E2E_FAIL="$E2E_FAIL"
+    export BM_NATIVE_TPS="$NATIVE_MEDIAN_TPS" BM_NATIVE_DECODE_TPS="$NATIVE_DECODE_TPS"
+    python3 "$DIR/_gen_report.py" "$PF" "$EF" "$REPORT" || echo "⚠️ report generation failed"
+    rm -f "$PF" "$EF"
     exit $([ "$NATIVE_CORRECT" -eq 1 ] && [ "$E2E_FAIL" -eq 0 ] && echo 0 || echo 1)
 fi
 

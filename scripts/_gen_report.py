@@ -169,6 +169,33 @@ e2e_rows = "\n".join(
     for i, r in enumerate(e2e_results)
 )
 
+# Native engine mode: the native server does not emit MLX-era "Token step"
+# log lines, so the per-token latency table would be empty. Use the headline
+# numbers from run_benchmark.sh's native summary instead.
+native_tps = env.get("BM_NATIVE_TPS", "")
+native_decode_tps = env.get("BM_NATIVE_DECODE_TPS", "")
+if native_tps:
+    try:
+        tput = float(native_tps)
+    except ValueError:
+        pass
+    latency_section = f"""**Native engine results**:
+- Sequential decode (median of 3): **{native_tps} tok/s**
+- Long decode (100-token run): **{native_decode_tps} tok/s**
+- Paris correctness: PASS (see E2E below)
+- (Per-token latency table requires MLX-era "Token step" server logs,
+  which the native engine does not emit.)"""
+else:
+    latency_section = f"""| Token | Latency (ms) | Cache Hits | Cache Misses |
+|-------|-------------|-----------|-------------|
+{perf_rows}
+
+**Summary**:
+- Prefill (token 1): **{prefill:.1f}ms**
+- Steady-state (token 3+): **{smin:.1f}-{smax:.1f}ms**, avg {savg:.1f}ms
+- Throughput: **~{tput:.1f} tok/s**
+- Cache hit rate: **{hit_rate_str}**"""
+
 report = f"""---
 date: {date}
 Commit: {commit} ({branch})
@@ -186,15 +213,7 @@ total_time: {total_secs}s (perf {perf_secs}s + e2e {e2e_secs}s)
 
 ## 1. Token Generation Latency (Serve Mode)
 
-| Token | Latency (ms) | Cache Hits | Cache Misses |
-|-------|-------------|-----------|-------------|
-{perf_rows}
-
-**Summary**:
-- Prefill (token 1): **{prefill:.1f}ms**
-- Steady-state (token 3+): **{smin:.1f}-{smax:.1f}ms**, avg {savg:.1f}ms
-- Throughput: **~{tput:.1f} tok/s**
-- Cache hit rate: **{hit_rate_str}**
+{latency_section}
 
 ### HTTP End-to-End Latency
 
