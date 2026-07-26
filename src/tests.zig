@@ -28,6 +28,7 @@ pub const llava_tests = @import("vision/llava.zig");
 pub const prompt_cache_tests = @import("prompt_cache.zig");
 pub const fused_tests = @import("tests/fused_tests.zig");
 pub const scheduler_tests = @import("tests/scheduler_tests.zig");
+pub const native_loader_config_tests = @import("tests/native_loader_config_tests.zig");
 pub const server_tests = @import("server.zig");
 pub const batch_builder_tests = @import("tests/batch_builder_tests.zig");
 pub const speculative_tests = @import("speculative.zig");
@@ -95,6 +96,7 @@ test {
     _ = prompt_cache_tests;
     _ = fused_tests;
     _ = scheduler_tests;
+    _ = native_loader_config_tests;
     _ = server_tests;
     _ = batch_builder_tests;
     _ = speculative_tests;
