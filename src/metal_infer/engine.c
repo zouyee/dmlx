@@ -1564,32 +1564,23 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
         }
 
         // --- CMD2 section: mhc_pre(ffn) + ffn_norm + routing ---
-        // Enc 4: mhc_pre(ffn) — reads buf_residual_gpu (just written by Enc 3)
-        //        overwrites buf_mhc_post_weights and buf_mhc_comb_weights with FFN values
+        // Enc 4+5 fused: mhc_pre(ffn) + RMSNorm in ONE dispatch (same fused
+        // kernel the merged_cb uses for the ATTN side). Writes ffn_in (f32),
+        // post/comb weights, and normed bf16 — all former Enc4+Enc5 outputs.
         {
             id<MTLComputeCommandEncoder> enc = [cb2cmd2 computeCommandEncoder];
-            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_bfloat];
+            [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_split_weighted_sum_norm];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_fn[layer]    offset:0 atIndex:0];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_base[layer]  offset:0 atIndex:1];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_ffn_hc_scale[layer] offset:0 atIndex:2];
             [enc setBuffer:(id<MTLBuffer>)eng->buf_residual_gpu        offset:0 atIndex:3];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:4];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:5];
-            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:6];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights    offset:0 atIndex:4];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights    offset:0 atIndex:5];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in          offset:0 atIndex:6];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:7];
+            [enc setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16   offset:0 atIndex:8];
             [enc dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
             [enc endEncoding];
-        }
-        // Enc 5: ffn_RMSNorm
-        {
-            id<MTLComputeCommandEncoder> e = [cb2cmd2 computeCommandEncoder];
-            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16out];
-            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_in           offset:0 atIndex:0];
-            [e setBuffer:(id<MTLBuffer>)eng->buf_attn_norm_gpu[layer] offset:0 atIndex:1];
-            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16    offset:0 atIndex:2];
-            uint rd = DIM; float eps = 1e-6f; uint hw = 1;
-            [e setBytes:&rd length:4 atIndex:3]; [e setBytes:&eps length:4 atIndex:4]; [e setBytes:&hw length:4 atIndex:5];
-            [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [e endEncoding];
         }
         // Enc 6: routing_gate → buf_routing_scores
         if (eng->gate_proj[layer]) {
