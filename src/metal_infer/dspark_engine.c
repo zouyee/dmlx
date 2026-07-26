@@ -431,6 +431,7 @@ void dspark_deinit(DSparkEngine *eng) {
 void dspark_reset(DSparkEngine *eng) {
     for (int l = 0; l < DSPARK_N_LAYERS; l++) {
         eng->kv_cache[l].main_len = 0;
+        eng->kv_cache[l].main_pos = 0;
         eng->kv_cache[l].draft_len = 0;
         memset(eng->kv_cache[l].main_kv, 0, DSPARK_WINDOW_SIZE * KV_LORA_RANK * sizeof(uint16_t));
     }
@@ -460,6 +461,77 @@ void dspark_accumulate_target_hidden(DSparkEngine *eng, const float *hidden, int
         }
         dst[d] = sum * inv_mult;
     }
+}
+
+// ============================================================================
+// main_x computation + main_kv window writes (shared by dspark_forward and
+// the prefill window builder)
+// ============================================================================
+
+// main_x = main_norm(main_proj(src_hidden [3*DIM]))
+static void dspark_compute_main_x(DSparkEngine *eng, const float *src_hidden, float *main_x) {
+    float proj_raw[DIM];
+    if (eng->head.main_proj_f32) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    DIM, 3 * DIM, 1.0f, eng->head.main_proj_f32, 3 * DIM,
+                    src_hidden, 1, 0.0f, proj_raw, 1);
+    } else {
+        fp8_matvec_cpu(eng->head.main_proj.weight, eng->head.main_proj.scale,
+                       src_hidden, proj_raw,
+                       DIM, 3 * DIM, eng->head.main_proj.block_size);
+    }
+    rms_norm_cpu(proj_raw, eng->head.main_norm, main_x, DIM);
+}
+
+// Per draft layer: main_kv = kv_norm(wkv(main_x)) with RoPE at absolute
+// position pos, appended to the layer's ring window. The attention reads the
+// window as a contiguous [0, main_len) array, so the write slot follows the
+// append cursor (RoPE uses the absolute position — slot is storage only).
+static void dspark_write_main_kv(DSparkEngine *eng, const float *main_x, int pos) {
+    const int win = DSPARK_WINDOW_SIZE;
+    for (int l = 0; l < DSPARK_N_LAYERS; l++) {
+        DSparkLayerWeights *lw = &eng->layers[l];
+        DSparkAttnWeights *aw = &lw->attn;
+        DSparkKVCache *kvc = &eng->kv_cache[l];
+        if (!aw->wkv_f32 || !aw->kv_norm) continue;
+        const int slot = kvc->main_pos % win;
+        kvc->main_pos++;
+        float kv_n[KV_LORA_RANK];
+        {
+            float kv_raw[KV_LORA_RANK];
+            cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                        KV_LORA_RANK, DIM, 1.0f, aw->wkv_f32, DIM,
+                        main_x, 1, 0.0f, kv_raw, 1);
+            float ss = 0.0f;
+            for (int i = 0; i < KV_LORA_RANK; i++) ss += kv_raw[i] * kv_raw[i];
+            float rms = 1.0f / sqrtf(ss / (float)KV_LORA_RANK + 1e-6f);
+            for (int i = 0; i < KV_LORA_RANK; i++) kv_n[i] = kv_raw[i] * rms * aw->kv_norm[i];
+            dspark_rope_yarn(kv_n, pos, 0);
+        }
+        uint16_t *dst = kvc->main_kv + (size_t)slot * KV_LORA_RANK;
+        for (int i = 0; i < KV_LORA_RANK; i++) {
+            union { _Float16 f; uint16_t u; } cv; cv.f = (_Float16)kv_n[i]; dst[i] = cv.u;
+        }
+        if (kvc->main_len < win) kvc->main_len++;
+    }
+}
+
+// Build the main_kv window for all prefill positions (reference:
+// DSparkAttention start_pos==0 branch). hidden3: [3, n_tokens, DIM]
+// mean-pooled target hidden from layers 40/41/42 for every prefill position.
+void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, int start_pos) {
+    if (!eng || !eng->initialized || !hidden3 || n_tokens <= 0) return;
+    float *mh = (float *)malloc(3 * DIM * sizeof(float));
+    float *main_x = (float *)malloc(DIM * sizeof(float));
+    if (!mh || !main_x) { free(mh); free(main_x); return; }
+    for (int p = 0; p < n_tokens; p++) {
+        for (int s = 0; s < 3; s++)
+            memcpy(mh + s * DIM, hidden3 + ((size_t)s * n_tokens + p) * DIM, DIM * sizeof(float));
+        dspark_compute_main_x(eng, mh, main_x);
+        dspark_write_main_kv(eng, main_x, start_pos + p);
+    }
+    free(mh);
+    free(main_x);
 }
 
 // ============================================================================
@@ -641,20 +713,7 @@ int dspark_forward(
     // Step 1: main_proj(concat(target_hidden[40,41,42])) → main_x [DIM]
     // =====================================================================
     float *main_x = eng->buf_main_x;
-    {
-        float proj_raw[DIM];
-        if (eng->head.main_proj_f32) {
-            // Use pre-dequantized f32 weights with cblas (fast + precise)
-            cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                        DIM, 3 * DIM, 1.0f, eng->head.main_proj_f32, 3 * DIM,
-                        src_hidden, 1, 0.0f, proj_raw, 1);
-        } else {
-            fp8_matvec_cpu(eng->head.main_proj.weight, eng->head.main_proj.scale,
-                           src_hidden, proj_raw,
-                           DIM, 3 * DIM, eng->head.main_proj.block_size);
-        }
-        rms_norm_cpu(proj_raw, eng->head.main_norm, main_x, DIM);
-    }
+    dspark_compute_main_x(eng, src_hidden, main_x);
 
     // =====================================================================
     // Step 1b: main_kv entry for this position (per draft layer).
@@ -665,42 +724,22 @@ int dspark_forward(
     // (layers 40/41/42) projected through main_proj + ITS OWN wkv — NOT the
     // target layer-0 KV cache (which lives in a different vector space).
     // =====================================================================
-    {
-        const int win = DSPARK_WINDOW_SIZE;
-        const int slot = start_pos % win;
-        for (int l = 0; l < DSPARK_N_LAYERS; l++) {
-            DSparkLayerWeights *lw = &eng->layers[l];
-            DSparkAttnWeights *aw = &lw->attn;
-            DSparkKVCache *kvc = &eng->kv_cache[l];
-            if (!aw->wkv_f32 || !aw->kv_norm) continue;
-            float kv_n[KV_LORA_RANK];
-            {
-                float kv_raw[KV_LORA_RANK];
-                cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                            KV_LORA_RANK, DIM, 1.0f, aw->wkv_f32, DIM,
-                            main_x, 1, 0.0f, kv_raw, 1);
-                // kv_norm (RMSNorm with learned weight)
-                float ss = 0.0f;
-                for (int i = 0; i < KV_LORA_RANK; i++) ss += kv_raw[i] * kv_raw[i];
-                float rms = 1.0f / sqrtf(ss / (float)KV_LORA_RANK + 1e-6f);
-                for (int i = 0; i < KV_LORA_RANK; i++) kv_n[i] = kv_raw[i] * rms * aw->kv_norm[i];
-                // RoPE on last 64 dims at the anchor position
-                float *rp = kv_n + (KV_LORA_RANK - 64);
-                for (int i = 0; i < 32; i++) {
-                    float theta = (float)start_pos * powf(10000000.0f, -2.0f * i / 64.0f);
-                    float c = cosf(theta), s = sinf(theta);
-                    float x0 = rp[i], x1 = rp[i + 32];
-                    rp[i]      = x0 * c - x1 * s;
-                    rp[i + 32] = x0 * s + x1 * c;
-                }
-            }
-            uint16_t *dst = kvc->main_kv + (size_t)slot * KV_LORA_RANK;
-            for (int i = 0; i < KV_LORA_RANK; i++) {
-                _Float16 h = (_Float16)kv_n[i];
-                union { _Float16 f; uint16_t u; } cv; cv.f = h; dst[i] = cv.u;
-            }
-            if (kvc->main_len < win) kvc->main_len++;
-        }
+    dspark_write_main_kv(eng, main_x, start_pos);
+
+    // DSPARK_DUMP_DIR: dump intermediates for the incremental alignment
+    // oracle (numpy recompute). First call only — files are overwritten per
+    // process: main_hidden.bin [3*DIM f32], main_x.bin [DIM f32],
+    // meta.txt (anchor, start_pos).
+    const char *dump_dir = getenv("DSPARK_DUMP_DIR");
+    static int dumped = 0;
+    if (dump_dir && !dumped) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/main_hidden.bin", dump_dir);
+        FILE *f = fopen(path, "wb"); if (f) { fwrite(src_hidden, sizeof(float), 3 * DIM, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/main_x.bin", dump_dir);
+        f = fopen(path, "wb"); if (f) { fwrite(main_x, sizeof(float), DIM, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s/meta.txt", dump_dir);
+        f = fopen(path, "w"); if (f) { fprintf(f, "anchor=%d start_pos=%d\n", anchor_token_id, start_pos); fclose(f); }
     }
 
     // =====================================================================
@@ -770,6 +809,16 @@ int dspark_forward(
         // Batch attention forward (placeholder: identity passthrough)
         dspark_attention_forward(eng, layer, attn_normed_batch, main_x, attn_out_batch, start_pos);
 
+        if (dump_dir && !dumped && layer == 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_normed_l0.bin", dump_dir);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(attn_normed_batch, sizeof(float), (size_t)bs * DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/attn_out_l0.bin", dump_dir);
+            f = fopen(path, "wb"); if (f) { fwrite(attn_out_batch, sizeof(float), (size_t)bs * DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/draft_hidden_init.bin", dump_dir);
+            f = fopen(path, "wb"); if (f) { fwrite(draft_hidden, sizeof(float), (size_t)bs * MHC_MULT * DIM, f); fclose(f); }
+        }
+
         // mhc_post(attn) for each position
         for (int k = 0; k < bs; k++) {
             float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
@@ -832,6 +881,27 @@ int dspark_forward(
             memset(moe_out_all, 0, sizeof(moe_out_all));
         }
 
+        if (dump_dir && !dumped && layer == 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/moe_normed_l0.bin", dump_dir);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(normed_all, sizeof(float), (size_t)bs * DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/moe_out_l0.bin", dump_dir);
+            f = fopen(path, "wb"); if (f) { fwrite(moe_out_all, sizeof(float), (size_t)bs * DIM, f); fclose(f); }
+            // expert routing for the oracle (ids inferred from ptr offsets)
+            snprintf(path, sizeof(path), "%s/moe_routing_l0.bin", dump_dir);
+            f = fopen(path, "wb");
+            if (f) {
+                for (int kk = 0; kk < bs * N_ACTIVE; kk++) {
+                    int32_t id = -1;
+                    if (batch_expert_ptrs[kk] && eng->expert_mmap[layer])
+                        id = (int32_t)((batch_expert_ptrs[kk] - eng->expert_mmap[layer]) / DSPARK_EXPERT_SIZE);
+                    fwrite(&id, 4, 1, f);
+                }
+                fwrite(batch_expert_weights, sizeof(float), (size_t)bs * N_ACTIVE, f);
+                fclose(f);
+            }
+        }
+
         // Step 2b: Add shared expert for each position (CPU cblas — fast, avoids GPU sync)
         for (int k = 0; k < bs; k++) {
             if (lw->shared_w1_f32 && lw->shared_w3_f32 && lw->shared_w2_f32) {
@@ -881,11 +951,29 @@ int dspark_forward(
         cblas_sgemv(CblasRowMajor, CblasNoTrans,
                     vocab, DIM, 1.0f, target->lm_head, DIM,
                     final_normed, 1, 0.0f, logits_k, 1);
+
+        if (dump_dir && !dumped && k == 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/final_residual.bin", dump_dir);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(res_k, sizeof(float), (size_t)MHC_MULT * DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/final_compressed.bin", dump_dir);
+            f = fopen(path, "wb"); if (f) { fwrite(compressed, sizeof(float), DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/final_normed.bin", dump_dir);
+            f = fopen(path, "wb"); if (f) { fwrite(final_normed, sizeof(float), DIM, f); fclose(f); }
+        }
     }
 
     // Confidence: placeholder 0.5 for now (real confidence head needs hidden + markov embed)
     if (confidence) {
         for (int k = 0; k < bs; k++) confidence[k] = 0.5f;
+    }
+
+    if (dump_dir && !dumped) {
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/draft_logits.bin", dump_dir);
+        FILE *f = fopen(path, "wb");
+        if (f) { fwrite(draft_logits, sizeof(float), (size_t)bs * vocab, f); fclose(f); }
+        dumped = 1;
     }
 
     return bs;

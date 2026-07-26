@@ -2158,6 +2158,13 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             hidden_batch[4*MHC_MULT*DIM+2], hidden_batch[4*MHC_MULT*DIM+3]);
     }
 
+    // DSpark prefill: per-position mean-pooled hidden for layers 40/41/42,
+    // used to build the main_kv context window after the layer loop.
+    float *dsp_hidden3 = NULL;
+    if (eng->dspark_engine && eng->dspark_accumulate_enabled) {
+        dsp_hidden3 = (float *)malloc((size_t)3 * n_tokens * DIM * sizeof(float));
+    }
+
     for (int layer = 0; layer < max_layers && layer < N_LAYERS; layer++) {
         // Per-layer autorelease pool for the batch path. Unlike moe_infer_forward
         // (which wraps each token in a pool), forward_batch previously had NO pool:
@@ -2238,12 +2245,25 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             fprintf(stderr, "[BATCH-IO] L%d uniq=%d saved=%d dwait=%.2fms\n",
                     layer, eng->batch_count, eng->batch_hits, batch_dwait_ms);
         }
-        // DSpark: extract last prefill token's hidden from layers 40/41/42.
-        // This provides the main_hidden input for DSpark draft during subsequent decode.
+        // DSpark: collect mean-pooled hidden from layers 40/41/42 for EVERY
+        // prefill position (for the main_kv context window) plus the last
+        // token's hidden (main_hidden for the first decode step).
         if (eng->dspark_engine && eng->dspark_accumulate_enabled && (layer == 40 || layer == 41 || layer == 42)) {
             float *last = hidden_batch + (size_t)(n_tokens - 1) * (MHC_MULT * DIM);
             dspark_accumulate_target_hidden(
                 (DSparkEngine *)eng->dspark_engine, last, layer);
+            if (dsp_hidden3) {
+                float *dst = dsp_hidden3 + (size_t)(layer - 40) * n_tokens * DIM;
+                for (int t = 0; t < n_tokens; t++) {
+                    const float *src = hidden_batch + (size_t)t * (MHC_MULT * DIM);
+                    float *d = dst + (size_t)t * DIM;
+                    for (int i = 0; i < DIM; i++) {
+                        float s = 0.0f;
+                        for (int m = 0; m < MHC_MULT; m++) s += src[m * DIM + i];
+                        d[i] = s / (float)MHC_MULT;
+                    }
+                }
+            }
         }
         // Per-layer residual dump: write last token's residual as raw f32 bin
         if (getenv("DSV4_DUMP_DIR") && getenv("MF_DBG")) {
@@ -2260,11 +2280,13 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         } // end per-layer @autoreleasepool
     }
 
-    // DSpark main_kv prefill: disabled — feeding target layer-0 KV entries was
-    // semantically wrong (reference: kv_norm(wkv(main_x)) per position via the
-    // draft layers' own wkv). The window is now written per decode step inside
-    // dspark_forward; building it for prefill positions is a follow-up.
-    (void)0;
+    // DSpark main_kv prefill: build the context window for every prefill
+    // position (reference DSparkAttention start_pos==0 branch semantics).
+    if (dsp_hidden3) {
+        dspark_build_window((DSparkEngine *)eng->dspark_engine, dsp_hidden3, n_tokens, start_pos);
+        free(dsp_hidden3);
+        dsp_hidden3 = NULL;
+    }
 
     // SMELT: do NOT count prefill tokens for warmup statistics.
     // Prefill uses hash-routing for layers 0-2 (routing_counts all 0), so

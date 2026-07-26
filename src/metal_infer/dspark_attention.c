@@ -24,16 +24,35 @@ static void attn_rms_norm(const float *x, const float *w, float *out, int dim) {
 }
 
 // RoPE (partial YaRN on last 64 dims of HEAD_DIM=512 vector)
+// Frequencies match DSV4YarnRoPE / reference freqs_cis (base 1e4, factor 16,
+// beta 32/1, orig_max 65536) — the backbone shares the target model's YaRN
+// table. (Previously plain theta=1e7 — wrong base, no YaRN scaling.)
 #define ROPE_DIM_A 64
 #define NOPE_DIM_A 448
-#define ROPE_THETA_A 10000000.0f
+
+static inline void yarn_freqs(int pos, int i, float *fc, float *fs) {
+    const float base = 10000.0f, factor = 16.0f, beta_fast = 32.0f, beta_slow = 1.0f;
+    const float orig_max = 65536.0f, PI = 3.14159265358979323846f;
+    float cd_fast = ROPE_DIM_A * logf(orig_max / (beta_fast * 2.0f * PI)) / (2.0f * logf(base));
+    float cd_slow = ROPE_DIM_A * logf(orig_max / (beta_slow * 2.0f * PI)) / (2.0f * logf(base));
+    int low = (int)fmaxf(0.0f, floorf(cd_fast));
+    int high = (int)fminf((float)(ROPE_DIM_A - 1), ceilf(cd_slow));
+    float freq = 1.0f / powf(base, (2.0f * i) / ROPE_DIM_A);
+    float ramp;
+    if (low == high) ramp = (i <= low) ? 0.0f : 1.0f;
+    else ramp = fminf(1.0f, fmaxf(0.0f, ((float)i - low) / (float)(high - low)));
+    float smooth = 1.0f - ramp;
+    freq = freq / factor * (1.0f - smooth) + freq * smooth;
+    *fc = cosf(pos * freq);
+    *fs = sinf(pos * freq);
+}
 
 static void attn_apply_rope(float *vec, int pos) {
     float *rp = vec + NOPE_DIM_A;
     int nh = ROPE_DIM_A / 2;
     for (int i = 0; i < nh; i++) {
-        float theta = (float)pos * powf(ROPE_THETA_A, -2.0f * i / ROPE_DIM_A);
-        float c = cosf(theta), s = sinf(theta);
+        float c, s;
+        yarn_freqs(pos, i, &c, &s);
         float x0 = rp[i], x1 = rp[i + nh];
         rp[i]      = x0 * c - x1 * s;
         rp[i + nh] = x0 * s + x1 * c;
@@ -44,12 +63,18 @@ static void attn_inverse_rope(float *vec, int pos) {
     float *rp = vec + NOPE_DIM_A;
     int nh = ROPE_DIM_A / 2;
     for (int i = 0; i < nh; i++) {
-        float theta = (float)pos * powf(ROPE_THETA_A, -2.0f * i / ROPE_DIM_A);
-        float c = cosf(theta), s = sinf(theta);
+        float c, s;
+        yarn_freqs(pos, i, &c, &s);
         float x0 = rp[i], x1 = rp[i + nh];
         rp[i]      =  x0 * c + x1 * s;
         rp[i + nh] = -x0 * s + x1 * c;
     }
+}
+
+// Public wrapper for dspark_engine.c (main_kv window entries).
+void dspark_rope_yarn(float *vec, int pos, int inverse) {
+    if (inverse) attn_inverse_rope(vec, pos);
+    else         attn_apply_rope(vec, pos);
 }
 
 void dspark_attention_forward(
@@ -146,6 +171,22 @@ void dspark_attention_forward(
             attn_apply_rope(q_full + h * HEAD_DIM, start_pos + 1 + k);
         }
 
+        // DSPARK_DUMP_DIR: dump attention intermediates (layer 0, pos 0 only)
+        static int attn_dumped = 0;
+        const char *adump = getenv("DSPARK_DUMP_DIR");
+        if (adump && !attn_dumped && layer_idx == 0 && k == 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_q_full.bin", adump);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(q_full, sizeof(float), (size_t)N_HEADS * HEAD_DIM, f); fclose(f); }
+            snprintf(path, sizeof(path), "%s/attn_kv0.bin", adump);
+            f = fopen(path, "wb"); if (f) { fwrite(draft_kvs, sizeof(float), KV_LORA_RANK, f); fclose(f); }
+            if (main_len > 0 && main_kvs_f32) {
+                snprintf(path, sizeof(path), "%s/attn_mkv.bin", adump);
+                f = fopen(path, "wb"); if (f) { fwrite(main_kvs_f32, sizeof(float), KV_LORA_RANK, f); fclose(f); }
+            }
+            attn_dumped = 1;
+        }
+
         // SDPA per head
         int total_kv = main_len + k + 1;
         float *scores = (float *)alloca(total_kv * sizeof(float));
@@ -199,6 +240,12 @@ void dspark_attention_forward(
         // O-proj: grouped wo_a → wo_b
         // wo_a: [O_GROUPS*O_LORA_RANK=8192, group_in_dim=4096]
         // Each group g processes heads [g*8..(g+1)*8] concatenated → [8*512=4096]
+        if (adump && attn_dumped == 1 && layer_idx == 0 && k == 0) {
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/attn_o_concat.bin", adump);
+            FILE *f = fopen(path, "wb"); if (f) { fwrite(o_concat, sizeof(float), (size_t)N_HEADS * HEAD_DIM, f); fclose(f); }
+            attn_dumped = 2;
+        }
         int group_in = heads_per_group * HEAD_DIM;  // 4096
         for (int g = 0; g < O_GROUPS; g++) {
             float *group_input = o_concat + g * group_in;

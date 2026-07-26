@@ -169,6 +169,7 @@ typedef struct {
     uint16_t *main_kv;    // [DSPARK_WINDOW_SIZE, KV_LORA_RANK] f16 — from target
     uint16_t *draft_kv;   // [DSPARK_BLOCK_SIZE, KV_LORA_RANK] f16 — from draft tokens
     int main_len;         // current entries in main window (0..DSPARK_WINDOW_SIZE)
+    int main_pos;         // monotonically increasing write cursor (slot = main_pos % window)
     int draft_len;        // current draft entries (0..DSPARK_BLOCK_SIZE)
 } DSparkKVCache;
 
@@ -286,6 +287,9 @@ int dspark_markov_sample(
     uint32_t *draft_tokens
 );
 
+// Public YaRN RoPE helper (dspark_attention.c) for main_kv window entries.
+void dspark_rope_yarn(float *vec, int pos, int inverse);
+
 // --- KV Cache management ---
 
 // Update DSpark's main_kv window from target's latest KV cache entry.
@@ -295,6 +299,15 @@ void dspark_update_main_kv(DSparkEngine *eng, const uint16_t *target_kv_entry, i
 
 // Reset DSpark state (call at start of each new sequence).
 void dspark_reset(DSparkEngine *eng);
+
+// Build the main_kv context window for prefill positions (reference:
+// DSparkAttention start_pos==0 branch). hidden3 is [3, n_tokens, DIM] —
+// mean-pooled target hidden states from layers 40/41/42 for EVERY prefill
+// position (slot s = target layer 40+s). For each position, computes
+// main_x = main_norm(main_proj(concat3)) then per draft layer
+// kv_norm(wkv(main_x)) with RoPE at (start_pos + p), appended to the
+// layer's window. start_pos = sequence position of hidden3 position 0.
+void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, int start_pos);
 
 // --- Target integration helpers ---
 
