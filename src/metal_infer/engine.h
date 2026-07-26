@@ -371,6 +371,11 @@ typedef struct {
     void *buf_attn_norm_gpu[N_LAYERS];  // id<MTLBuffer> [DIM] f32  (ffn pre-norm)
     void *buf_gate_proj_gpu[N_LAYERS];  // id<MTLBuffer> [N_EXPERTS*DIM] f32  (router weights)
 
+    // Persistent shared-expert weight buffers (created lazily, reused every
+    // token): [gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b].
+    // Previously 9 MTLBuffer objects were created PER LAYER PER TOKEN.
+    void *buf_shared_w[N_LAYERS][9];
+
     // Expert I/O
     int packed_fd[N_LAYERS];     // per-layer packed expert file descriptors
     uint8_t *expert_buf[6];      // 2MB-aligned expert data buffers

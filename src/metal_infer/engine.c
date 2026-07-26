@@ -1882,15 +1882,22 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             const QuantWeight *qw_g = &eng->shared[layer].gate;
             const QuantWeight *qw_u = &eng->shared[layer].up;
             const QuantWeight *qw_d = &eng->shared[layer].down;
-            id bw_g = [d newBufferWithBytesNoCopy:(void*)qw_g->packed length:(size_t)qw_g->out_dim*(qw_g->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-            id bs_g = [d newBufferWithBytes:(void*)qw_g->scales length:(size_t)qw_g->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-            id bb_g = [d newBufferWithBytes:(void*)qw_g->biases length:(size_t)qw_g->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-            id bw_u = [d newBufferWithBytesNoCopy:(void*)qw_u->packed length:(size_t)qw_u->out_dim*(qw_u->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-            id bs_u = [d newBufferWithBytes:(void*)qw_u->scales length:(size_t)qw_u->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-            id bb_u = [d newBufferWithBytes:(void*)qw_u->biases length:(size_t)qw_u->out_dim*SE_NG_GU*sizeof(float) options:MTLResourceStorageModeShared];
-            id bw_d = [d newBufferWithBytesNoCopy:(void*)qw_d->packed length:(size_t)qw_d->out_dim*(qw_d->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared deallocator:nil];
-            id bs_d = [d newBufferWithBytes:(void*)qw_d->scales length:(size_t)qw_d->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
-            id bb_d = [d newBufferWithBytes:(void*)qw_d->biases length:(size_t)qw_d->out_dim*SE_NG_D*sizeof(float) options:MTLResourceStorageModeShared];
+            // Persistent weight buffers (created once per layer, reused every token).
+            // newBufferWithBytes (copy) because native_loader data is not guaranteed
+            // page-aligned — one-time cost, then zero per-token allocation.
+            if (!eng->buf_shared_w[layer][0]) {
+                id<MTLBuffer> *sb = (id<MTLBuffer> *)eng->buf_shared_w[layer];
+                const QuantWeight *qws[3] = {qw_g, qw_u, qw_d};
+                const int ngs[3] = {SE_NG_GU, SE_NG_GU, SE_NG_D};
+                for (int i = 0; i < 3; i++) {
+                    sb[i*3+0] = [d newBufferWithBytes:(void*)qws[i]->packed length:(size_t)qws[i]->out_dim*(qws[i]->in_dim/8)*sizeof(uint32_t) options:MTLResourceStorageModeShared];
+                    sb[i*3+1] = [d newBufferWithBytes:(void*)qws[i]->scales length:(size_t)qws[i]->out_dim*ngs[i]*sizeof(float) options:MTLResourceStorageModeShared];
+                    sb[i*3+2] = [d newBufferWithBytes:(void*)qws[i]->biases length:(size_t)qws[i]->out_dim*ngs[i]*sizeof(float) options:MTLResourceStorageModeShared];
+                }
+            }
+            id bw_g = (id)eng->buf_shared_w[layer][0], bs_g = (id)eng->buf_shared_w[layer][1], bb_g = (id)eng->buf_shared_w[layer][2];
+            id bw_u = (id)eng->buf_shared_w[layer][3], bs_u = (id)eng->buf_shared_w[layer][4], bb_u = (id)eng->buf_shared_w[layer][5];
+            id bw_d = (id)eng->buf_shared_w[layer][6], bs_d = (id)eng->buf_shared_w[layer][7], bb_d = (id)eng->buf_shared_w[layer][8];
             // Encoder 1: gate projection
             {
                 id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
