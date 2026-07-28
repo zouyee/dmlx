@@ -119,6 +119,10 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_mla_sdpa_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_decode_bfloat"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_f32out = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out"] error:&err]);
     eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out_grp8"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_bf16out_batch = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_bf16out_batch"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_f32out_batch = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out_batch"] error:&err]);
+    eng->pipe_dequant_matvec_affine_f32in_f32out_batch = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_f32in_f32out_batch"] error:&err]);
+    eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8_batch = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_affine_bf16in_f32out_grp8_batch"] error:&err]);
     eng->pipe_mla_sdpa_prefill_bfloat = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mla_sdpa_prefill_bfloat"] error:&err]);
     eng->pipe_bf16_to_f16_row = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f16_row"] error:&err]);
     eng->pipe_limited_swiglu  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"limited_swiglu"] error:&err]);
@@ -1383,6 +1387,10 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     P.mla_sdpa_decode_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_bfloat;
     P.dequant_matvec_affine_bf16in_f32out = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out;
     P.dequant_matvec_affine_bf16in_f32out_grp8 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8;
+    P.dequant_matvec_affine_bf16in_bf16out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out_batch;
+    P.dequant_matvec_affine_bf16in_f32out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_batch;
+    P.dequant_matvec_affine_f32in_f32out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_f32in_f32out_batch;
+    P.dequant_matvec_affine_bf16in_f32out_grp8_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8_batch;
     P.mla_sdpa_prefill_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_prefill_bfloat;
     P.bf16_to_f16_row = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f16_row;
 
@@ -1411,6 +1419,25 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
     // Encoder 1: mhc_pre_split_weighted_sum_norm → post/comb/normed_bf16/attn_input on GPU
     // Encoders 2..N: Q chain + KV chain + SDPA (reads normed_bf16 from GPU, no CPU roundtrip)
     // Eliminates CB-A wait (32ms/token) by merging two CB boundaries into one.
+    if (eng->b2_active) {
+        // Batched-attn fast path: mhc_pre(attn) + mla_attention were computed
+        // for the whole chunk by forward_layer_attn_batch. Read this token's
+        // pre-computed outputs (attn_out, attn_input, normed) from the b2_*
+        // arena. post_w/comb_w stay on GPU in b2_post_w/b2_comb_w and are read
+        // by cb2cmd2's mhc_post encoder via the b2_post_w source branch.
+        int t = eng->b2_tok;
+        float *wo_p  = (float *)[(id<MTLBuffer>)eng->b2_wo_out   contents];
+        float *ain_p = (float *)[(id<MTLBuffer>)eng->b2_attn_in  contents];
+        uint16_t *nrm_p = (uint16_t *)[(id<MTLBuffer>)eng->b2_norm_bf16 contents];
+        memcpy(attn_out,  wo_p  + (size_t)t * DIM, DIM * sizeof(float));
+        memcpy(attn_input, ain_p + (size_t)t * DIM, DIM * sizeof(float));
+        memcpy(normed_bf16_direct, nrm_p + (size_t)t * DIM, DIM * sizeof(uint16_t));
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
+            memcpy(&normed[i], &u, 4);
+        }
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt1 = ts.tv_sec*1e9+ts.tv_nsec; }
+    } else
     {
         id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
 
@@ -1543,8 +1570,20 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
             [enc2 setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_post_bfloat];
             [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16  offset:0 atIndex:0];
             [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_res_bf16_in    offset:0 atIndex:1];
-            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_weights   offset:0 atIndex:2];
-            [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_comb_weights   offset:0 atIndex:3];
+            // Batched-attn: mhc_pre(attn) ran in the pre-pass, writing post/comb
+            // to b2_post_w/b2_comb_w (slot-strided). Per-token: buf_mhc_post/comb.
+            NSUInteger _pw_off, _cw_off;
+            id<MTLBuffer> _pw, _cw;
+            if (eng->b2_active) {
+                _pw = (id<MTLBuffer>)eng->b2_post_w; _cw = (id<MTLBuffer>)eng->b2_comb_w;
+                _pw_off = (NSUInteger)eng->b2_tok * (size_t)MHC_MULT * sizeof(float);
+                _cw_off = (NSUInteger)eng->b2_tok * (size_t)MHC_MULT * MHC_MULT * sizeof(float);
+            } else {
+                _pw = (id<MTLBuffer>)eng->buf_mhc_post_weights; _cw = (id<MTLBuffer>)eng->buf_mhc_comb_weights;
+                _pw_off = 0; _cw_off = 0;
+            }
+            [enc2 setBuffer:_pw offset:_pw_off atIndex:2];
+            [enc2 setBuffer:_cw offset:_cw_off atIndex:3];
             [enc2 setBuffer:(id<MTLBuffer>)eng->buf_mhc_post_res_out   offset:0 atIndex:4];
             uint hc2 = MHC_MULT, dim2 = DIM;
             [enc2 setBytes:&hc2 length:4 atIndex:5]; [enc2 setBytes:&dim2 length:4 atIndex:6];
@@ -2091,7 +2130,125 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
     return 0;
 }
 
-// Batch forward pass for N tokens (proper transformer order: all tokens per layer).
+// Lazily allocate the batch2 MLA arena (residual + mhc_pre attn outputs +
+// attention-internal slots) for n slots, slot-strided. Idempotent: no-op if
+// already allocated for the same n; reallocs if n changed. Called from
+// moe_infer_forward_batch when NATIVE_BATCH2=1.
+static int b2_arena_ensure(MoEInferEngine *eng, int n) {
+    if (n <= 0) return -1;
+    if (eng->b2_chunk == n && eng->b2_residual) return 0;
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    if (!d) return -1;
+    // Release any prior (smaller) allocation.
+    #define B2_RLS(f) do { if (eng->f) [(id<MTLBuffer>)eng->f release]; eng->f = NULL; } while (0)
+    if (eng->b2_chunk != n) {
+        B2_RLS(b2_residual); B2_RLS(b2_norm_bf16); B2_RLS(b2_attn_in);
+        B2_RLS(b2_post_w); B2_RLS(b2_comb_w);
+        B2_RLS(b2_q_a); B2_RLS(b2_q_res); B2_RLS(b2_q); B2_RLS(b2_q_n);
+        B2_RLS(b2_kv); B2_RLS(b2_kv_n); B2_RLS(b2_attn_scr);
+        B2_RLS(b2_concat); B2_RLS(b2_wo_out);
+    }
+    #define B2_ALLOC(field, bytes) \
+        if (!eng->field) { eng->field = (void *)[d newBufferWithLength:(bytes) options:MTLResourceStorageModeShared]; \
+                           if (!eng->field) { return -1; } }
+    B2_ALLOC(b2_residual,   (size_t)n * MHC_MULT * DIM * sizeof(float));
+    B2_ALLOC(b2_norm_bf16,  (size_t)n * DIM * sizeof(uint16_t));
+    B2_ALLOC(b2_attn_in,    (size_t)n * DIM * sizeof(float));
+    B2_ALLOC(b2_post_w,     (size_t)n * MHC_MULT * sizeof(float));
+    B2_ALLOC(b2_comb_w,     (size_t)n * MHC_MULT * MHC_MULT * sizeof(float));
+    B2_ALLOC(b2_q_a,        (size_t)n * Q_LORA_RANK * sizeof(uint16_t));
+    B2_ALLOC(b2_q_res,      (size_t)n * Q_LORA_RANK * sizeof(uint16_t));
+    B2_ALLOC(b2_q,          (size_t)n * N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    B2_ALLOC(b2_q_n,        (size_t)n * N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    B2_ALLOC(b2_kv,         (size_t)n * KV_LORA_RANK * sizeof(uint16_t));
+    B2_ALLOC(b2_kv_n,       (size_t)n * KV_LORA_RANK * sizeof(uint16_t));
+    B2_ALLOC(b2_attn_scr,   (size_t)n * N_HEADS * HEAD_DIM * sizeof(uint16_t));
+    B2_ALLOC(b2_concat,     (size_t)n * O_GROUPS * O_LORA_RANK * sizeof(float));
+    B2_ALLOC(b2_wo_out,     (size_t)n * DIM * sizeof(float));
+    #undef B2_ALLOC
+    #undef B2_RLS
+    eng->b2_chunk = n;
+    return 0;
+}
+
+// Batched mhc_pre(attn) + mla_attention for one (layer, chunk). Uploads N
+// residuals to b2_residual, dispatches mhc_pre(attn) per token into the arena
+// (normed/attn_in/post_w/comb_w), then mla_attention_decode_batch_bf16 into
+// b2_wo_out. One CB commit+wait. Returns 0 on success, -2 if cached packed
+// weights missing (caller falls back to per-token forward_layer).
+static int forward_layer_attn_batch(MoEInferEngine *eng, int layer, int n_tok, int start_pos,
+                                    const float *hidden_batch) {
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    id<MTLCommandQueue> q = (id<MTLCommandQueue>)eng->queue;
+    // Ensure this layer's KV cache GPU buffer exists (mirrors forward_layer's
+    // lazy init) and reflect the post-chunk length for any future reader.
+    KVCache *kvc = &eng->kv_cache[layer];
+    if (!kvc->kv) {
+        size_t kvc_size = (size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t);
+        id<MTLBuffer> kvbuf = [d newBufferWithLength:kvc_size options:MTLResourceStorageModeShared];
+        if (!kvbuf) return -1;
+        kvc->kv_gpu_buf = (void *)kvbuf;
+        kvc->kv = (uint16_t *)[kvbuf contents];
+        memset(kvc->kv, 0, kvc_size);
+        kvc->len = 0;
+    }
+    kvc->len = start_pos + n_tok;
+    // Upload N residuals to b2_residual (CPU memcpy before encoding → all visible).
+    float *res = (float *)[(id<MTLBuffer>)eng->b2_residual contents];
+    for (int t = 0; t < n_tok; t++)
+        memcpy(res + (size_t)t * MHC_MULT * DIM,
+               hidden_batch + (size_t)t * MHC_MULT * DIM,
+               (size_t)MHC_MULT * DIM * sizeof(float));
+
+    id<MTLCommandBuffer> cb = [q commandBufferWithUnretainedReferences];
+    // Per-token mhc_pre(attn): read b2_residual[t], write b2_norm_bf16[t]/
+    // b2_attn_in[t]/b2_post_w[t]/b2_comb_w[t]. Same kernel as forward_layer's
+    // encoder 1, just slot-strided outputs.
+    const size_t res_stride  = (size_t)MHC_MULT * DIM * sizeof(float);
+    const size_t norm_stride = (size_t)DIM * sizeof(uint16_t);
+    const size_t ain_stride  = (size_t)DIM * sizeof(float);
+    const size_t post_stride  = (size_t)MHC_MULT * sizeof(float);
+    const size_t comb_stride  = (size_t)MHC_MULT * MHC_MULT * sizeof(float);
+    for (int t = 0; t < n_tok; t++) {
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_mhc_pre_split_weighted_sum_norm];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_fn[layer]   offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_base[layer] offset:0 atIndex:1];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_attn_hc_scale[layer] offset:0 atIndex:2];
+        [e setBuffer:(id<MTLBuffer>)eng->b2_residual  offset:(NSUInteger)(t * res_stride) atIndex:3];
+        [e setBuffer:(id<MTLBuffer>)eng->b2_post_w    offset:(NSUInteger)(t * post_stride) atIndex:4];
+        [e setBuffer:(id<MTLBuffer>)eng->b2_comb_w    offset:(NSUInteger)(t * comb_stride) atIndex:5];
+        [e setBuffer:(id<MTLBuffer>)eng->b2_attn_in   offset:(NSUInteger)(t * ain_stride)  atIndex:6];
+        [e setBuffer:(id<MTLBuffer>)eng->buf_input_norm_gpu[layer] offset:0 atIndex:7];
+        [e setBuffer:(id<MTLBuffer>)eng->b2_norm_bf16 offset:(NSUInteger)(t * norm_stride) atIndex:8];
+        [e dispatchThreadgroups:MTLSizeMake(1,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+        [e endEncoding];
+    }
+    // Commit the mhc_pre(attn) CB before the batched mla function reads b2_norm_bf16.
+    [cb commit]; [cb waitUntilCompleted];
+
+    // Build MlaPipes view (subset sufficient for mla_attention_decode_batch_bf16).
+    MlaPipes P; memset(&P, 0, sizeof(P));
+    P.dev = d; P.queue = q;
+    P.dequant_matvec_affine_v2 = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_v2;
+    P.rope_tail_interleaved_bf16 = (id<MTLComputePipelineState>)eng->pipe_rope_tail_bf16;
+    P.rms_norm_rows_bf16in_bf16out = (id<MTLComputePipelineState>)eng->pipe_rms_norm_rows_bf16in_bf16out;
+    P.mla_sdpa_decode_bfloat = (id<MTLComputePipelineState>)eng->pipe_mla_sdpa_bfloat;
+    P.bf16_to_f16_row = (id<MTLComputePipelineState>)eng->pipe_bf16_to_f16_row;
+    P.dequant_matvec_affine_bf16in_bf16out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_bf16out_batch;
+    P.dequant_matvec_affine_bf16in_f32out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_batch;
+    P.dequant_matvec_affine_f32in_f32out_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_f32in_f32out_batch;
+    P.dequant_matvec_affine_bf16in_f32out_grp8_batch = (id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine_bf16in_f32out_grp8_batch;
+
+    int r = mla_attention_decode_batch_bf16(&P, &eng->attn[layer], n_tok, start_pos,
+            eng->b2_norm_bf16, eng->kv_cache[layer].kv_gpu_buf,
+            eng->b2_q_a, eng->b2_q_res, eng->b2_q, eng->b2_q_n,
+            eng->b2_kv, eng->b2_kv_n, eng->b2_attn_scr, eng->b2_concat, eng->b2_wo_out);
+    if (r != 0) return r;   // -2 → caller falls back to per-token
+    return 0;
+}
+
+
 // Each token starts from its embed in hidden_batch[t * MHC_MULT * DIM].
 // After this call, hidden_batch[t] contains the post-layer-42 residual for token t.
 // KV caches are built up correctly for each layer: token 0 first, then token 1, etc.
@@ -2104,6 +2261,28 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
     eng->in_batch++;  // disable predictive prefetch for the whole batch pass
     const int phase_time_batch = (getenv("NATIVE_PHASE_TIME") != NULL);
     double batch_dwait_ms = 0;  // per-layer deferred-wait total (MoE GPU tail)
+
+    // Phase B-1 batched MLA attention (NATIVE_BATCH2=1): batch the 5 projection
+    // GEMMs + 3 RMS-norms across chunk tokens. Default OFF (per-token fallback).
+    // Chunk size NATIVE_BATCH2_CHUNK (default 16). Arena lazily allocated once.
+    // Only batch when n_tokens >= NATIVE_BATCH2_MIN_TOKENS (default 32): batching
+    // wins on long prefill (weight/dispatch amortization) but has overhead on short
+    // prompts (the benchmark's 5-token tok/s regressed ~1.6% without this gate).
+    int b2_min = 32;
+    { const char *m = getenv("NATIVE_BATCH2_MIN_TOKENS"); if (m) { int v = atoi(m); if (v > 0) b2_min = v; } }
+    const int b2_on = (getenv("NATIVE_BATCH2") != NULL && n_tokens >= b2_min);
+    int b2_chunk = 16;
+    if (b2_on) {
+        const char *cs = getenv("NATIVE_BATCH2_CHUNK");
+        if (cs) { int v = atoi(cs); if (v > 0) b2_chunk = v; }
+        if (b2_chunk > n_tokens) b2_chunk = n_tokens;
+        if (b2_chunk < 1) b2_chunk = 1;
+        if (b2_arena_ensure(eng, b2_chunk) != 0) {
+            fprintf(stderr, "[b2] arena alloc failed (chunk=%d) — falling back to per-token\n", b2_chunk);
+            eng->b2_active = 0;  // force fallback below by clearing b2_on semantics
+            // (b2_on stays as the flag; forward_layer_attn_batch will return -2 → fallback)
+        }
+    }
 
     // Lazy-allocate the cross-token expert dedup pool (gather6/MXFP4 mode only).
     // First batch forward pays one ~645MB aligned alloc; decode-only processes
@@ -2194,15 +2373,31 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
         // the deferred wait+release below, when no GPU work is in flight, so
         // no drain races live GPU work (ac6e291/13a433a pattern).
         NSAutoreleasePool *tok_pool = [[NSAutoreleasePool alloc] init];
-        for (int t = 0; t < n_tokens; t++) {
-            float *hidden_t = hidden_batch + (size_t)t * (MHC_MULT * DIM);
-            if (token_ids != NULL) eng->current_token_id = (int)token_ids[t];
+        // Process tokens in chunks. NATIVE_BATCH2: per chunk, run the batched
+        // mhc_pre(attn)+mla pre-pass once (forward_layer_attn_batch), then the
+        // per-token forward_layer loop reads pre-computed attn outputs via
+        // eng->b2_active/b2_tok. Per-token fallback when b2_on=0 or pre-pass -2.
+        for (int cs = 0; cs < n_tokens; cs += b2_chunk) {
+            int chunk_sz = b2_chunk;
+            if (cs + chunk_sz > n_tokens) chunk_sz = n_tokens - cs;
+            int b2_this_chunk = 0;
+            if (b2_on) {
+                int r = forward_layer_attn_batch(eng, layer, chunk_sz, start_pos + cs,
+                                                 hidden_batch + (size_t)cs * (MHC_MULT * DIM));
+                if (r == 0) { eng->b2_active = 1; b2_this_chunk = 1; }
+                else if (r == -2) { eng->b2_active = 0; }  // cached weights missing → per-token
+                else { [tok_pool drain]; eng->in_batch--; return -1; }
+            }
+        for (int t = 0; t < chunk_sz; t++) {
+            int gt = cs + t;
+            float *hidden_t = hidden_batch + (size_t)gt * (MHC_MULT * DIM);
+            if (token_ids != NULL) eng->current_token_id = (int)token_ids[gt];
             // Batch prefill deferred state management:
-            // The previous token (t-1) may have left deferred.active=true with its GPU output
+            // The previous token (gt-1) may have left deferred.active=true with its GPU output
             // in buf_residual_gpu. We must:
             //   1. Wait for GPU to finish (correctness barrier)
-            //   2. Read GPU output back to hidden_batch[t-1] — the correct layer-N output for
-            //      token t-1, which token t-1 needs as input for layer N+1
+            //   2. Read GPU output back to hidden_batch[gt-1] — the correct layer-N output for
+            //      token gt-1, which token gt-1 needs as input for layer N+1
             //   3. Do NOT overwrite hidden_t (current token's input for this layer)
             // Then forward_layer will sync hidden_t → buf_residual_gpu for this token.
             if (eng->deferred.active && eng->deferred.cmd_experts) {
@@ -2213,9 +2408,9 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
                 [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
                 eng->deferred.cmd_experts = NULL;
                 eng->deferred.active = false;
-                if (eng->deferred.gpu_combined && t > 0) {
+                if (eng->deferred.gpu_combined && gt > 0) {
                     float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
-                    float *prev = hidden_batch + (size_t)(t - 1) * (MHC_MULT * DIM);
+                    float *prev = hidden_batch + (size_t)(gt - 1) * (MHC_MULT * DIM);
                     memcpy(prev, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
                 }
                 eng->deferred.gpu_combined = false;
@@ -2224,11 +2419,15 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             // nothing is in flight now, so draining its autoreleased CBs is safe.
             [tok_pool drain];
             tok_pool = [[NSAutoreleasePool alloc] init];
-            if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + t) != 0) {
+            eng->b2_tok = t;  // chunk-local index (read by forward_layer when b2_active)
+            if (moe_infer_forward_layer(eng, layer, hidden_t, start_pos + gt) != 0) {
                 [tok_pool drain];
+                eng->b2_active = 0;
                 eng->in_batch--;
                 return -1;
             }
+        }
+        eng->b2_active = 0;  // end of chunk — restore per-token semantics
         }
         // After all tokens in this layer: drain deferred for the last token
         // and update its hidden with the GPU's final output.
@@ -3022,6 +3221,24 @@ void moe_infer_deinit(MoEInferEngine *eng) {
     }
     free(eng->batch_eids);
     free(eng->batch_pool);
+    // Free batch2 MLA attention-internal arena (NULL until first NATIVE_BATCH2
+    // forward; lazily allocated by b2_arena_ensure in moe_infer_forward_batch).
+    #define B2_RELEASE(field) do { if (eng->field) [(id<MTLBuffer>)eng->field release]; eng->field = NULL; } while (0)
+    B2_RELEASE(b2_q_a);
+    B2_RELEASE(b2_q_res);
+    B2_RELEASE(b2_q);
+    B2_RELEASE(b2_q_n);
+    B2_RELEASE(b2_kv);
+    B2_RELEASE(b2_kv_n);
+    B2_RELEASE(b2_attn_scr);
+    B2_RELEASE(b2_concat);
+    B2_RELEASE(b2_wo_out);
+    B2_RELEASE(b2_attn_in);
+    B2_RELEASE(b2_norm_bf16);
+    B2_RELEASE(b2_post_w);
+    B2_RELEASE(b2_comb_w);
+    B2_RELEASE(b2_residual);
+    #undef B2_RELEASE
     // Free expert memory cache
     if (eng->expert_cache_n_experts > 0) {
         for (int layer = 0; layer < N_LAYERS; layer++) {

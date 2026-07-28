@@ -1501,6 +1501,182 @@ kernel void dequant_matvec_affine_bf16in_bf16out(
     out[tid] = (bfloat)acc;
 }
 
+// dequant_matvec_affine_bf16in_bf16out_batch: N-token batched variant of the
+// above. One thread per (token, output row): tok = tid/out_dim, row = tid%out_dim.
+// The weight row is shared across all tokens (L2-resident), x is offset by
+// tok*in_dim. Per-row accumulation order is identical to the per-token kernel
+// (same g/p/i loop) → bit-exact vs N independent dequant_matvec_affine_bf16in_bf16out
+// dispatches. Used for wq_a, wq_b, wkv across a chunk of n_tok tokens.
+kernel void dequant_matvec_affine_bf16in_bf16out_batch(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // [n_tok, in_dim] bfloat
+    device bfloat*         out      [[buffer(4)]],  // [n_tok, out_dim] bfloat
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tok    [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tok * out_dim;
+    if (tid >= total) return;
+    uint tok = tid / out_dim;
+    uint row = tid - tok * out_dim;          // tid % out_dim
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + row * packed_cols;       // shared across tok
+    device const float*    sc = scales   + row * num_groups;
+    device const float*    bi = biases   + row * num_groups;
+    device const bfloat*   xt = x + (size_t)tok * in_dim;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(xt[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = (bfloat)acc;                  // [tok, row]
+}
+
+// dequant_matvec_affine_bf16in_f32out_batch: N-token batched variant of
+// dequant_matvec_affine_bf16in_f32out (f32 output). Same indexing/accumulation
+// → bit-exact. Used for wo_b across a chunk.
+kernel void dequant_matvec_affine_bf16in_f32out_batch(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // [n_tok, in_dim] bfloat
+    device float*          out      [[buffer(4)]],  // [n_tok, out_dim] f32
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tok    [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tok * out_dim;
+    if (tid >= total) return;
+    uint tok = tid / out_dim;
+    uint row = tid - tok * out_dim;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + row * packed_cols;
+    device const float*    sc = scales   + row * num_groups;
+    device const float*    bi = biases   + row * num_groups;
+    device const bfloat*   xt = x + (size_t)tok * in_dim;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(xt[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
+// dequant_matvec_affine_f32in_f32out_batch: N-token batched variant of the
+// f32-in / f32-out affine matvec (mirrors dequant_matvec_affine_v2's I/O dtypes
+// but with the naive 1-thread-per-(tok,row) layout, no shared-memory tiling).
+// Used for wo_b across a chunk: input bconcat is f32 (from wo_a grp8 f32 out),
+// output bout is f32. Bit-exact vs N per-token v2-style dispatches (same
+// per-row g/p/i accumulation order).
+kernel void dequant_matvec_affine_f32in_f32out_batch(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const float*    x        [[buffer(3)]],  // [n_tok, in_dim] f32
+    device float*          out      [[buffer(4)]],  // [n_tok, out_dim] f32
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tok    [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint total = n_tok * out_dim;
+    if (tid >= total) return;
+    uint tok = tid / out_dim;
+    uint row = tid - tok * out_dim;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + row * packed_cols;
+    device const float*    sc = scales   + row * num_groups;
+    device const float*    bi = biases   + row * num_groups;
+    device const float*    xt = x + (size_t)tok * in_dim;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * xt[bx + p * 8 + i];
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
+// dequant_matvec_affine_bf16in_f32out_grp8_batch: N-token batched variant of
+// the grp8 wo_a kernel. Weight [8*out_g, in_dim] shared across tokens; input
+// x is [n_tok, 8, in_dim] grouped; output out is [n_tok, 8*out_g] concat.
+// tid → (tok, group, row): tok = tid/(8*out_g); rest = tid - tok*(8*out_g);
+// group = rest/out_g; row = rest - group*out_g. Per-row accumulation identical
+// to the per-token grp8 kernel → bit-exact.
+kernel void dequant_matvec_affine_bf16in_f32out_grp8_batch(
+    device const uint32_t* W_packed [[buffer(0)]],
+    device const float*    scales   [[buffer(1)]],
+    device const float*    biases   [[buffer(2)]],
+    device const bfloat*   x        [[buffer(3)]],  // [n_tok, 8, in_dim] grouped
+    device float*          out      [[buffer(4)]],  // [n_tok, 8*out_g] concat
+    constant uint&         out_g    [[buffer(5)]],  // O_LORA_RANK
+    constant uint&         in_dim   [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    constant uint&         n_tok    [[buffer(8)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    uint grp_total = 8 * out_g;
+    uint total = n_tok * grp_total;
+    if (tid >= total) return;
+    uint tok = tid / grp_total;
+    uint rest = tid - tok * grp_total;       // tid % (8*out_g)
+    uint group = rest / out_g;
+    uint row = rest - group * out_g;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 8;
+    uint packed_cols = in_dim / 8;
+    device const uint32_t* wr = W_packed + rest * packed_cols;     // row = rest (shared)
+    device const float*    sc = scales   + rest * num_groups;
+    device const float*    bi = biases   + rest * num_groups;
+    device const bfloat*   xg = x + (size_t)tok * (8 * in_dim) + (size_t)group * in_dim;
+    float acc = 0.0f;
+    for (uint g = 0; g < num_groups; g++) {
+        float scale = sc[g], bias = bi[g];
+        uint bp = g * packed_per_group, bx = g * group_size;
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t pw = wr[bp + p];
+            for (uint i = 0; i < 8; i++) {
+                float nib = (float)((pw >> (i * 4)) & 0xF);
+                acc += (scale * nib + bias) * float(xg[bx + p * 8 + i]);
+            }
+        }
+    }
+    out[tid] = acc;
+}
+
 // dequant_matvec_affine_bf16in_bf16out_v2: SIMD-parallel affine 4-bit matmul, bfloat in/out.
 // Optimized for MLA attention weights (wq_a, wq_b, wkv, wo_b):
 //   - wq_b [32768, 1024] gs=64: 16MB weight — biggest attention bottleneck

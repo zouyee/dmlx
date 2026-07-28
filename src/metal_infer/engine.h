@@ -295,6 +295,12 @@ typedef struct {
     void *pipe_bf16_to_f32;
     void *pipe_dequant_matvec_affine_bf16in_f32out;
     void *pipe_dequant_matvec_affine_bf16in_f32out_grp8;  // fused wo_a (8 groups, 1 dispatch)
+    // N-token batched affine dequant GEMMs (Phase B-1): naive 1-thread-per-(tok,row)
+    // layout, weight shared across tokens (L2-resident). Bit-exact vs per-token.
+    void *pipe_dequant_matvec_affine_bf16in_bf16out_batch;  // wq_a/wq_b/wkv
+    void *pipe_dequant_matvec_affine_bf16in_f32out_batch;
+    void *pipe_dequant_matvec_affine_f32in_f32out_batch;    // wo_b (f32 in/out)
+    void *pipe_dequant_matvec_affine_bf16in_f32out_grp8_batch; // wo_a (8 groups × N tok)
     void *pipe_mla_sdpa_prefill_bfloat; // batch prefill SDPA (Path B)
     void *pipe_bf16_to_f16_row;         // KV cache bf16→f16 conversion
     void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert
@@ -375,6 +381,50 @@ typedef struct {
     // token): [gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b].
     // Previously 9 MTLBuffer objects were created PER LAYER PER TOKEN.
     void *buf_shared_w[N_LAYERS][9];
+
+    // Batch2 stage-major scratch arena (slot-strided, lazily allocated).
+    // One MTLBuffer per type; slot s uses offset s * slot_stride_bytes.
+    // Enables batching the non-attention stages across N tokens with zero
+    // changes to mla_attention (attention stays per-token sequential CBs).
+    void *b2_residual;    // [N][MHC_MULT*DIM] f32 — residual slots
+    void *b2_norm_bf16;   // [N][DIM] bf16 — mhc_pre(attn) normed output
+    void *b2_post_w;      // [N][MHC_MULT] f32
+    void *b2_comb_w;      // [N][MHC_MULT*MHC_MULT] f32
+    void *b2_attn_out_bf16; // [N][DIM] bf16 — mhc_post(attn) input (attn out)
+    void *b2_ffn_in;      // [N][DIM] f32 — mhc_pre(ffn) collapsed input
+    void *b2_ffn_norm_bf16; // [N][DIM] bf16
+    void *b2_route_scores;  // [N][N_EXPERTS] f32
+    void *b2_route_sel;     // [N][N_ACTIVE] i32
+    void *b2_route_w;       // [N][N_ACTIVE] f32
+    void *b2_normed;        // [N][DIM] f32 — MoE kernel input
+    void *b2_gather_mid;    // [N][N_ACTIVE*INTERMEDIATE] f32
+    void *b2_expert_contig; // [N][N_ACTIVE*DIM] f32
+    void *b2_hidden_out;    // [N][DIM] f32 — MoE combine out / shared gate
+    void *b2_h_mid;         // [N][INTERMEDIATE] f32 — shared up out
+    void *b2_attn_out;      // [N][DIM] f32 — attention output / shared down out
+
+    // Batch2 MLA attention-internal scratch (slot-strided, lazily allocated by
+    // b2_arena_ensure in moe_infer_forward_batch when NATIVE_BATCH2=1).
+    // One MTLBuffer per type; slot s uses offset s * slot_stride_bytes.
+    // Holds the per-token intermediates the batched projection GEMMs (wq_a/wq_b/
+    // wkv/wo_a/wo_b) read/write across N tokens in one chunk. SDPA stays
+    // per-token sequential (cross-token KV causal dependency).
+    void *b2_q_a;           // [N][Q_LORA_RANK]      bf16 — wq_a out
+    void *b2_q_res;         // [N][Q_LORA_RANK]      bf16 — q_norm out (wq_b in)
+    void *b2_q;             // [N][N_HEADS*HEAD_DIM] bf16 — wq_b out
+    void *b2_q_n;           // [N][N_HEADS*HEAD_DIM] bf16 — head-norm + rope(Q)
+    void *b2_kv;            // [N][KV_LORA_RANK]     bf16 — wkv out
+    void *b2_kv_n;          // [N][KV_LORA_RANK]     bf16 — kv_norm + rope(KV)
+    void *b2_attn_scr;      // [N][N_HEADS*HEAD_DIM] bf16 — SDPA out + rope_inv
+    void *b2_concat;        // [N][O_GROUPS*O_LORA_RANK] f32 — wo_a grp8 out
+    void *b2_wo_out;        // [N][DIM]              f32 — wo_b out
+    void *b2_attn_in;       // [N][DIM]              f32 — mhc_pre(attn) attn_input (compressor)
+    int   b2_chunk;         // allocated slot count (env NATIVE_BATCH2_CHUNK, default 16)
+    // Batched-attn mode state (set by forward_batch's chunk loop, read by
+    // forward_layer to skip its merged_cb attn stage and read pre-computed
+    // outputs from the b2_* arena). b2_tok is the chunk-local token index.
+    int   b2_active;       // !=0 → forward_layer skips merged_cb, reads arena
+    int   b2_tok;          // chunk-local token index when b2_active
 
     // Expert I/O
     int packed_fd[N_LAYERS];     // per-layer packed expert file descriptors
@@ -624,6 +674,11 @@ int moe_infer_forward(MoEInferEngine *engine, float *hidden, int pos);
 // After return, KV caches for all layers contain all n_tokens entries.
 // token_ids: optional [n_tokens] token IDs for per-token hash routing (NULL = use current_token_id).
 int moe_infer_forward_batch(MoEInferEngine *engine, float *hidden_batch, int n_tokens, int start_pos, const int *token_ids);
+// Stage-major batched variant (NATIVE_BATCH2=1): batches the non-attention
+// stages across up to b2_chunk tokens per chunk. Attention and MoE stay
+// per-token sequential in v1. Bit-exact vs moe_infer_forward_batch by
+// construction (same kernels, same per-token math, slot-strided scratch).
+int moe_infer_forward_batch2(MoEInferEngine *engine, float *hidden_batch, int n_tokens, int start_pos, const int *token_ids);
 
 // Embed token_id into hidden state.
 // hidden_out: [MHC_MULT * DIM] — all MHC streams set to embed[token_id].
