@@ -37,11 +37,6 @@ typedef struct {
     id<MTLComputePipelineState> mla_sdpa_decode_bfloat;
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out;
     id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out_grp8; // fused wo_a
-    // N-token batched affine dequant GEMMs (Phase B-1, naive, bit-exact)
-    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_bf16out_batch;  // wq_a/wq_b/wkv
-    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out_batch;
-    id<MTLComputePipelineState> dequant_matvec_affine_f32in_f32out_batch;       // wo_b
-    id<MTLComputePipelineState> dequant_matvec_affine_bf16in_f32out_grp8_batch; // wo_a
     // Prefill batch SDPA (Path B: matches MLX simdgroup reduction order)
     id<MTLComputePipelineState> mla_sdpa_prefill_bfloat;
     // KV cache bf16→f16 conversion (used in CB1+CB2 merge to avoid CPU round-trip)
@@ -102,15 +97,3 @@ int mla_attention_prefill_bfloat(MlaPipes *pipes, const AttnWeights *aw,
                                   const uint16_t *x_batch, int n_tokens,
                                   uint16_t *kv_cache, int start_pos,
                                   float *out_batch);
-
-// N-token batched MLA attention (Phase B-1). Encodes the full MLA chain for
-// n_tok tokens of one chunk into external_cb (caller commits+waits once).
-// Bit-exact vs N independent mla_attention_decode_bf16 calls. Returns 0 on
-// success, -2 if cached packed weights unavailable (caller falls back to
-// per-token). Slot-strided b2_* arena buffers (one MTLBuffer per type).
-int mla_attention_decode_batch_bf16(MlaPipes *P, const AttnWeights *aw,
-                                    int n_tok, int start_pos,
-                                    void *x_in_gpu, void *kv_cache_gpu_buf,
-                                    void *b2_q_a_v, void *b2_q_res_v, void *b2_q_v, void *b2_q_n_v,
-                                    void *b2_kv_v, void *b2_kv_n_v, void *b2_attn_scr_v,
-                                    void *b2_concat_v, void *b2_wo_out_v);
