@@ -1,10 +1,6 @@
 // Zig bindings for the Metal inference engine.
 // Bridges MLX model loading to the C engine, providing kernel source via @embedFile.
 const std = @import("std");
-const c = @import("mlx").c;
-const array_mod = @import("mlx").array;
-
-const Array = array_mod.Array;
 
 const moe_metal_source = @embedFile("../models/moe_kernel.metal");
 
