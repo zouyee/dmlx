@@ -1775,7 +1775,15 @@ int moe_infer_forward_layer(MoEInferEngine *eng, int layer, float *hidden, int p
                 int eid = expert_ids[k];
                 if (eid >= 0 && eid < N_EXPERTS && eng->expert_mem_cache[layer][eid]) {
                     expert_data[k] = eng->expert_mem_cache[layer][eid];
+                    eng->smelt_hits++;
                 }
+                eng->smelt_total++;
+            }
+            if (getenv("NATIVE_PHASE_TIME") && eng->smelt_total >= 6 * 43 * 20) {
+                fprintf(stderr, "[smelt] hit-rate %.1f%% (%llu/%llu)\n",
+                        100.0 * (double)eng->smelt_hits / (double)eng->smelt_total,
+                        (unsigned long long)eng->smelt_hits, (unsigned long long)eng->smelt_total);
+                eng->smelt_hits = 0; eng->smelt_total = 0;
             }
         }
         prefetch_consume(eng, layer, expert_ids, expert_data);

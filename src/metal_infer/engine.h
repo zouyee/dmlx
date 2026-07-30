@@ -459,6 +459,11 @@ typedef struct {
     // Prediction
     ExpertPredictor predictor;
 
+    // SMELT hit-rate counters (decode phase): hits = selections served from
+    // the resident SMELT pool; printed every 500 layers' worth of routing.
+    uint64_t smelt_hits;
+    uint64_t smelt_total;
+
     // Weights (set via moe_infer_set_weights)
     const float *embed;
     int vocab_size;
