@@ -526,6 +526,18 @@ typedef struct {
     // DSpark speculative decoding engine (optional, set by caller after init)
     void *dspark_engine;   // DSparkEngine* — NULL if DSpark not active
     bool dspark_accumulate_enabled;  // Only accumulate hidden during real decode, not verification
+
+    // Quantized native embed/lm_head (4-bit affine, gs=64). embed_q is
+    // dequantized per-row on read (bit-exact); lm_head_q drives the GPU
+    // logits matvec. Set by moe_infer_set_head_quant; active when embed /
+    // lm_head (f32) are NULL.
+    QuantWeight embed_q;
+    QuantWeight lm_head_q;
+    void *lmh_w;      // packed weights (copied once)
+    void *lmh_sc;     // scales
+    void *lmh_bi;     // biases
+    void *lmh_x;      // [DIM] f32 input
+    void *lmh_out;    // [vocab] f32 logits output
 } MoEInferEngine;
 
 // ============================================================================
@@ -628,6 +640,9 @@ int moe_infer_forward_batch(MoEInferEngine *engine, float *hidden_batch, int n_t
 // Embed token_id into hidden state.
 // hidden_out: [MHC_MULT * DIM] — all MHC streams set to embed[token_id].
 void moe_infer_embed(MoEInferEngine *engine, int token_id, float *hidden_out);
+// Register quantized embed/lm_head (native 4-bit affine). When lm_head_q is
+// set and lm_head is NULL, logits go through the GPU dequant matvec.
+void moe_infer_set_head_quant(MoEInferEngine *eng, QuantWeight embed_q, QuantWeight lm_head_q);
 
 // Compress mHC residual [MHC_MULT, DIM] → [DIM] using simple mean.
 void moe_infer_compress_hc(MoEInferEngine *engine, const float *residual, float *out);

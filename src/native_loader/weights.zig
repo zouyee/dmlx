@@ -35,6 +35,11 @@ pub const AttnWeightPtrs = struct {
 pub const EngineWeights = struct {
     embed: []const f32,
     lm_head: []const f32,
+    // Quantized (native 4-bit affine) forms — kept packed by default to save
+    // 3.2GB RAM; the f32 dense forms are loaded only as fallback
+    // (DMLX_DENSE_HEAD=1 or packed tensors missing).
+    embed_q: QuantWeightPtrs = .{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 },
+    lm_head_q: QuantWeightPtrs = .{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 },
     final_norm: []const f32,
     input_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
     attn_norms: [64][]const f32 = [_][]const f32{&[_]f32{}} ** 64,
@@ -75,10 +80,10 @@ pub const EngineWeights = struct {
 pub const NativeWeightStore = struct {
     arena: std.heap.ArenaAllocator,
     weights: EngineWeights,
-    /// Dense F32 embed lookup table [vocab_size, hidden_size]
-    embed_f32: []f32,
-    /// Dense F32 lm_head table [vocab_size, hidden_size]
-    lm_head_f32: []f32,
+    /// Dense F32 embed lookup table [vocab_size, hidden_size] (empty when quantized)
+    embed_f32: []const f32,
+    /// Dense F32 lm_head table [vocab_size, hidden_size] (empty when quantized)
+    lm_head_f32: []const f32,
 
     pub fn deinit(self: *NativeWeightStore) void {
         self.arena.deinit();
@@ -148,17 +153,23 @@ pub fn loadAll(
     w.idx_comp_norm = [_][]const f32{&.{}} ** 64;
 
     // =========================================================================
-    // Embed tokens: affine-quantized U32 → dequant to dense F32
-    // shape: [vocab_size, hidden_size/8] U32 + [vocab_size, hidden_size/gs] BF16 scales/biases
+    // Embed tokens: keep native packed affine 4-bit (row dequant on read,
+    // bit-exact by construction). Dense f32 (2.1GB) only as fallback.
     // =========================================================================
-    const embed_f32 = try dequantAffineF32(a, idx, "model.embed_tokens", cfg.vocab_size, cfg.hidden_size, 64);
-    w.embed = embed_f32;
-
-    // =========================================================================
-    // LM head: same format as embed
-    // =========================================================================
-    const lm_head_f32 = try dequantAffineF32(a, idx, "lm_head", cfg.vocab_size, cfg.hidden_size, 64);
-    w.lm_head = lm_head_f32;
+    const empty_q = QuantWeightPtrs{ .packed_ptr = &[_]u32{}, .scales = &[_]f32{}, .biases = &[_]f32{}, .out_dim = 0, .in_dim = 0, .group_size = 64 };
+    const want_dense_head = std.c.getenv("DMLX_DENSE_HEAD") != null;
+    w.embed_q = loadQuantWeight(a, idx, "model.embed_tokens", 64) catch empty_q;
+    w.lm_head_q = loadQuantWeight(a, idx, "lm_head", 64) catch empty_q;
+    const need_dense = want_dense_head or w.embed_q.packed_ptr.len == 0 or w.lm_head_q.packed_ptr.len == 0;
+    if (need_dense) {
+        const embed_f32 = try dequantAffineF32(a, idx, "model.embed_tokens", cfg.vocab_size, cfg.hidden_size, 64);
+        w.embed = embed_f32;
+        const lm_head_f32 = try dequantAffineF32(a, idx, "lm_head", cfg.vocab_size, cfg.hidden_size, 64);
+        w.lm_head = lm_head_f32;
+    } else {
+        w.embed = &[_]f32{};
+        w.lm_head = &[_]f32{};
+    }
 
     // =========================================================================
     // Final norm (BF16 → F32)
@@ -303,8 +314,8 @@ pub fn loadAll(
     return NativeWeightStore{
         .arena = arena,
         .weights = w,
-        .embed_f32 = embed_f32,
-        .lm_head_f32 = lm_head_f32,
+        .embed_f32 = w.embed,
+        .lm_head_f32 = w.lm_head,
     };
 }
 

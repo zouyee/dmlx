@@ -2564,11 +2564,31 @@ void moe_infer_set_layer_hc(MoEInferEngine *eng, int layer,
 // ============================================================================
 
 void moe_infer_embed(MoEInferEngine *eng, int token_id, float *hidden_out) {
-    const float *row = eng->embed + (size_t)token_id * DIM;
-    if (getenv("MF_DBG") && token_id == 128822) {
-        fprintf(stderr, "[embed-dbg] tok=128822 embed[0..3]=[%.6f %.6f %.6f %.6f] norm_estimate=%.4f\n",
-            row[0], row[1], row[2], row[3],
-            sqrtf(row[0]*row[0] + row[1]*row[1] + row[2]*row[2]));
+    // Dequantize one row from the packed 4-bit affine embed table when the
+    // dense f32 table is absent (saves 1.6GB RAM). The row expression is
+    // identical to the loader's dequantAffineF32 — same f32 bits.
+    float rowbuf[DIM];
+    const float *row;
+    if (eng->embed != NULL) {
+        row = eng->embed + (size_t)token_id * DIM;
+    } else {
+        const QuantWeight *q = &eng->embed_q;
+        const uint32_t *pw_row = q->packed + (size_t)token_id * (q->in_dim / 8);
+        const int ng = q->in_dim / q->group_size;
+        const float *sc_row = q->scales + (size_t)token_id * ng;
+        const float *bi_row = q->biases + (size_t)token_id * ng;
+        const int ppg = q->group_size / 8;
+        for (int g = 0; g < ng; g++) {
+            const float scale = sc_row[g], bias = bi_row[g];
+            for (int p = 0; p < ppg; p++) {
+                uint32_t pw = pw_row[g * ppg + p];
+                for (int i = 0; i < 8; i++) {
+                    float nib = (float)((pw >> (i * 4)) & 0xF);
+                    rowbuf[g * q->group_size + p * 8 + i] = scale * nib + bias;
+                }
+            }
+        }
+        row = rowbuf;
     }
     for (int m = 0; m < MHC_MULT; m++) {
         for (int d = 0; d < DIM; d++) {
@@ -2585,6 +2605,25 @@ void moe_infer_embed(MoEInferEngine *eng, int token_id, float *hidden_out) {
     }
 }
 
+// Register quantized embed/lm_head (native 4-bit affine). Creates the
+// persistent GPU buffers for the logits matvec (one-time 530MB copy).
+void moe_infer_set_head_quant(MoEInferEngine *eng, QuantWeight embed_q, QuantWeight lm_head_q) {
+    eng->embed_q = embed_q;
+    eng->lm_head_q = lm_head_q;
+    if (!lm_head_q.packed || lm_head_q.out_dim <= 0) return;
+    id<MTLDevice> d = (id<MTLDevice>)eng->device;
+    size_t wbytes = (size_t)lm_head_q.out_dim * (lm_head_q.in_dim / 8) * sizeof(uint32_t);
+    size_t sbytes = (size_t)lm_head_q.out_dim * (lm_head_q.in_dim / lm_head_q.group_size) * sizeof(float);
+    eng->lmh_w  = (void *)[d newBufferWithBytes:(void *)lm_head_q.packed length:wbytes options:MTLResourceStorageModeShared];
+    eng->lmh_sc = (void *)[d newBufferWithBytes:(void *)lm_head_q.scales length:sbytes options:MTLResourceStorageModeShared];
+    eng->lmh_bi = (void *)[d newBufferWithBytes:(void *)lm_head_q.biases length:sbytes options:MTLResourceStorageModeShared];
+    eng->lmh_x  = (void *)[d newBufferWithLength:DIM * sizeof(float) options:MTLResourceStorageModeShared];
+    eng->lmh_out = (void *)[d newBufferWithLength:(size_t)lm_head_q.out_dim * sizeof(float) options:MTLResourceStorageModeShared];
+    if (!eng->lmh_w || !eng->lmh_sc || !eng->lmh_bi || !eng->lmh_x || !eng->lmh_out) {
+        fprintf(stderr, "[head-quant] GPU buffer alloc failed — logits path unavailable\n");
+    }
+}
+
 static void cpu_rms_norm(const float *x, const float *w, float *out, int dim, float eps) {
     double ss = 0.0;
     for (int i = 0; i < dim; i++) ss += (double)x[i] * x[i];
@@ -2593,14 +2632,37 @@ static void cpu_rms_norm(const float *x, const float *w, float *out, int dim, fl
 }
 
 int moe_infer_get_logits(MoEInferEngine *eng, const float *hidden, float *logits_out) {
-    if (!eng->final_norm || !eng->lm_head || !logits_out) return -1;
+    if (!eng->final_norm || !logits_out) return -1;
+    if (!eng->lm_head && !eng->lm_head_q.packed) return -1;
     static float normed[DIM];
     cpu_rms_norm(hidden, eng->final_norm, normed, DIM, 1e-6f);
-    cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                eng->vocab_size, DIM,
-                1.0f, eng->lm_head, DIM,
-                normed, 1,
-                0.0f, logits_out, 1);
+    if (eng->lm_head) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                    eng->vocab_size, DIM,
+                    1.0f, eng->lm_head, DIM,
+                    normed, 1,
+                    0.0f, logits_out, 1);
+    } else {
+        // Quantized lm_head: GPU dequant matvec (530MB packed read instead of
+        // 2.1GB f32). Same (scale*nib+bias)*x expression per row.
+        memcpy([(id<MTLBuffer>)eng->lmh_x contents], normed, DIM * sizeof(float));
+        id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+        id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+        [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+        [e setBuffer:(id<MTLBuffer>)eng->lmh_w  offset:0 atIndex:0];
+        [e setBuffer:(id<MTLBuffer>)eng->lmh_sc offset:0 atIndex:1];
+        [e setBuffer:(id<MTLBuffer>)eng->lmh_bi offset:0 atIndex:2];
+        [e setBuffer:(id<MTLBuffer>)eng->lmh_x  offset:0 atIndex:3];
+        [e setBuffer:(id<MTLBuffer>)eng->lmh_out offset:0 atIndex:4];
+        uint od = (uint)eng->lm_head_q.out_dim, id_ = (uint)eng->lm_head_q.in_dim, gs = (uint)eng->lm_head_q.group_size;
+        [e setBytes:&od length:4 atIndex:5];
+        [e setBytes:&id_ length:4 atIndex:6];
+        [e setBytes:&gs length:4 atIndex:7];
+        [e dispatchThreads:MTLSizeMake(od, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        [e endEncoding];
+        [cb commit]; [cb waitUntilCompleted];
+        memcpy(logits_out, [(id<MTLBuffer>)eng->lmh_out contents], (size_t)eng->vocab_size * sizeof(float));
+    }
     if (getenv("MF_DBG")) {
         int max_i = 0;
         for (int i=1;i<eng->vocab_size;i++) if (logits_out[i]>logits_out[max_i]) max_i=i;

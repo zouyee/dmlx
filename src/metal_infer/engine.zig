@@ -25,6 +25,8 @@ extern fn moe_infer_set_weights(
     gate_biases: [*c][*c]const f32,
 ) void;
 
+extern fn moe_infer_set_head_quant(engine: *Engine, embed_q: CQuantWeight, lm_head_q: CQuantWeight) void;
+
 extern fn moe_infer_forward(engine: *Engine, hidden: [*c]f32, pos: c_int) c_int;
 extern fn moe_infer_forward_layer(engine: *Engine, layer: c_int, hidden: [*c]f32, pos: c_int) c_int;
 extern fn moe_infer_forward_batch(engine: *Engine, hidden_batch: [*c]f32, n_tokens: c_int, start_pos: c_int, token_ids: [*c]const c_int) c_int;
@@ -186,7 +188,12 @@ pub fn setWeights(engine: *Engine, w: anytype) void {
         gp_arr[i] = w.gate_projs[i].ptr;
         if (w.gate_biases[i]) |b| gb_arr[i] = b.ptr;
     }
-    moe_infer_set_weights(engine, w.embed.ptr, @intCast(w.embed.len / 4096), w.lm_head.ptr, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr, &gb_arr);
+    const dense_head = w.embed.len > 0;
+    const vocab_size: i32 = if (dense_head) @intCast(w.embed.len / 4096) else if (@hasField(@TypeOf(w), "embed_q")) w.embed_q.out_dim else 0;
+    moe_infer_set_weights(engine, if (dense_head) w.embed.ptr else null, vocab_size, if (dense_head) w.lm_head.ptr else null, w.final_norm.ptr, &in_arr, &an_arr, &gp_arr, &gb_arr);
+    if (!dense_head and @hasField(@TypeOf(w), "embed_q")) {
+        moe_infer_set_head_quant(engine, cqw(w.embed_q), cqw(w.lm_head_q));
+    }
 
     // Per-layer MLA attention + mHC weights.
     for (0..@intCast(w.n_layers)) |i| {
