@@ -55,7 +55,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     // Start the accept loop in an async fiber.
     _ = io.async(acceptLoop, .{ allocator, io, &server_state, server_config });
 
-    if (server_config.native) {
+    if (server_state.is_native) {
         // ------------------------------------------------------------------
         // Native (MLX-free) engine loop
         // ------------------------------------------------------------------
@@ -63,8 +63,11 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
         nativeEngineLoop(&server_state);
     } else {
         // ------------------------------------------------------------------
-        // MLX engine loop
+        // MLX engine loop (LEGACY — kept for non-DSV4 models and reference
+        // comparisons. The native MLX-free engine is the default for DSV4;
+        // this path is reached only via --mlx. Not performance-maintained.)
         // ------------------------------------------------------------------
+        std.log.info("MLX (legacy) mode: starting MLX engine loop", .{});
         const mc = server_state.vtable.config;
         _ = memory_mod.autoMaxKvSize;
         const clamped_max_seq = 8192;

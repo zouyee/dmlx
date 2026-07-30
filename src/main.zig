@@ -73,7 +73,7 @@ const ServerCommand = struct {
     expert_parallel: usize = 6, // Number of parallel pread threads (Flash-MoE mode)
     metal_moe: bool = false, // Use Metal MoE kernels instead of MLX switch_mlp
     metal_full: bool = false, // Full-metal engine (attention + mHC + MoE in engine.c)
-    native: bool = false, // MLX-free native engine (no MLX runtime)
+    native: bool = true, // MLX-free native engine (default; --mlx forces legacy MLX path)
     dspark_dir: ?[]const u8 = null, // DSpark Markov Head weights dir (speculative decoding)
     distributed: bool = false,
 };
@@ -448,6 +448,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--native")) {
             cmd.native = true;
+        } else if (std.mem.eql(u8, flag, "--mlx")) {
+            cmd.native = false;
         } else if (std.mem.eql(u8, flag, "--dspark")) {
             cmd.dspark_dir = try allocator.dupe(u8, args[i + 1]);
         } else if (std.mem.eql(u8, flag, "--distributed")) {
@@ -524,6 +526,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.metal_full = true;
         } else if (std.mem.eql(u8, flag, "--native")) {
             cmd.native = true;
+        } else if (std.mem.eql(u8, flag, "--mlx")) {
+            cmd.native = false;
         } else if (std.mem.eql(u8, flag, "--dspark")) {
             cmd.dspark_dir = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--distributed")) {

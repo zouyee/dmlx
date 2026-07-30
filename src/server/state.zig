@@ -147,12 +147,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         root.tokenizer.ChatTemplate.initDeepSeek(allocator);
 
     // ------------------------------------------------------------------
-    // Native path (MLX-free)
+    // Native path (MLX-free) — default. Non-DSV4 architectures degrade to
+    // the legacy MLX path with a warning instead of failing.
     // ------------------------------------------------------------------
-    if (config.native) {
-        if (!std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
-            return error.UnsupportedArchitectureForNative;
-        }
+    if (config.native and std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
         const packed_dir = config.expert_packed_dir orelse return error.MissingExpertPackedDir;
         if (config.metal_moe) {
             std.log.warn("Native mode: --metal-moe is ignored (native uses engine.c internal MoE)", .{});
@@ -214,9 +212,12 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         std.log.info("Native mode: engine ready (vocab={d}, layers={d})", .{ ne.config.vocab_size, ne.config.num_hidden_layers });
         return server_state;
     }
+    if (config.native) {
+        std.log.warn("'{s}' is not supported by the native engine — falling back to legacy MLX path", .{arch_name});
+    }
 
     // ------------------------------------------------------------------
-    // MLX path (original)
+    // MLX path (legacy)
     // ------------------------------------------------------------------
     const stream = c.c.mlx_default_gpu_stream_new();
     _ = c.c.mlx_set_default_stream(stream);
