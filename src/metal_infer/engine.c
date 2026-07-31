@@ -60,6 +60,11 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_gather_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather_down"] error:&err]);
     eng->pipe_gather6_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_gate_up_swiglu"] error:&err]);
     eng->pipe_gather6_down    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_down"] error:&err]);
+    eng->pipe_gather6_gate_up_2b = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_gate_up_swiglu_2b"] error:&err]);
+    eng->pipe_gather6_down_2b    = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"gather6_down_2b"] error:&err]);
+    if (!eng->pipe_gather6_gate_up_2b || !eng->pipe_gather6_down_2b)
+        fprintf(stderr, "Metal engine: WARNING int2_gs64 gather6 pipelines missing: %s\n",
+                err ? [[err localizedDescription] UTF8String] : "?");
     eng->pipe_int8_gate_up_swiglu = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"fused_gate_up_swiglu_int8_e8m0"] error:&err]);
     eng->pipe_int8_dequant_matvec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"dequant_matvec_int8_e8m0"] error:&err]);
     eng->pipe_rms_norm_sum_sq = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"rms_norm_sum_sq"] error:&err]);
@@ -1023,21 +1028,25 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                     if (slot) {
                         if (!*slot)
                             *slot = (void *)[d newBufferWithBytesNoCopy:ptr
-                                                                 length:EXPERT_SIZE
+                                                                 length:eng->active_expert_size
                                                                 options:MTLResourceStorageModeShared
                                                             deallocator:nil];
                         blob_bufs[k] = (id<MTLBuffer>)*slot;
                     } else {
                         blob_bufs[k] = [d newBufferWithBytesNoCopy:ptr
-                                                            length:EXPERT_SIZE
+                                                            length:eng->active_expert_size
                                                            options:MTLResourceStorageModeShared
                                                        deallocator:nil];
                     }
                 }
                 // Encoder 1: fused gate+up+SwiGLU for all K experts
+                if (eng->expert_format_2b) {
+                    static int logged_2b = 0;
+                    if (!logged_2b) { logged_2b = 1; fprintf(stderr, "[2b] gather6 int2_gs64 kernels dispatched\n"); }
+                }
                 {
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                    [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather6_gate_up];
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)(eng->expert_format_2b ? eng->pipe_gather6_gate_up_2b : eng->pipe_gather6_gate_up)];
                     for (int k = 0; k < 6; k++) [enc setBuffer:blob_bufs[k] offset:0 atIndex:k];
                     [enc setBuffer:eng->buf_normed offset:0 atIndex:6];
                     [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:7];
@@ -1047,7 +1056,7 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
                 // Encoder 2: down_proj for all K experts → contiguous [K×DIM]
                 {
                     id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-                    [enc setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_gather6_down];
+                    [enc setComputePipelineState:(id<MTLComputePipelineState>)(eng->expert_format_2b ? eng->pipe_gather6_down_2b : eng->pipe_gather6_down)];
                     for (int k = 0; k < 6; k++) [enc setBuffer:blob_bufs[k] offset:0 atIndex:k];
                     [enc setBuffer:(id<MTLBuffer>)eng->buf_gather_mid offset:0 atIndex:6];
                     [enc setBuffer:(id<MTLBuffer>)eng->buf_expert_contiguous offset:0 atIndex:7];
@@ -2352,6 +2361,25 @@ MoEInferEngine *moe_infer_init(const char *packed_dir,
     if (!eng) return NULL;
 
     if (init_metal(eng, kernel_src, kernel_src_len) != 0) { free(eng); return NULL; }
+
+    // Detect int2_gs64 (2-bit) expert format: packed_dir/manifest.json with
+    // "expert_format": "int2_gs64". Minimal text scan, no JSON parser needed.
+    if (!eng->use_affine_experts) {
+        char mpath[4096];
+        snprintf(mpath, sizeof(mpath), "%s/manifest.json", packed_dir);
+        int mfd = open(mpath, O_RDONLY);
+        if (mfd >= 0) {
+            char mbuf[4097] = {0};
+            ssize_t mn = read(mfd, mbuf, 4096);
+            close(mfd);
+            if (mn > 0 && strstr(mbuf, "int2_gs64")) {
+                eng->expert_format_2b = 1;
+                eng->active_expert_size = EXPERT_SIZE_2B;
+                fprintf(stderr, "Metal engine: int2_gs64 expert format detected (2-bit, expert_size=%d)\n",
+                        EXPERT_SIZE_2B);
+            }
+        }
+    }
 
     char path[4096];
     for (int l = 0; l < N_LAYERS; l++) {

@@ -118,6 +118,7 @@ typedef struct {
 // Layout per expert: [GATE_W: 4MB][GATE_S: 256KB][UP_W: 4MB][UP_S: 256KB][DOWN_W: 4MB][DOWN_S: 256KB]
 // Bias planes (GATE_B/UP_B/DOWN_B) are reserved but not present in the actual files.
 #define EXPERT_SIZE 13369344  // bytes per expert (~12.75 MB)
+#define EXPERT_SIZE_2B 7471104  // bytes per expert, int2_gs64 format (~7.1 MB)
 #define GATE_W_OFF  0
 #define GATE_S_OFF  4194304
 #define UP_W_OFF    4456448
@@ -233,6 +234,8 @@ typedef struct {
     // Gather6 MoE kernels: pointer-array variant for non-contiguous expert blobs
     void *pipe_gather6_gate_up;         // gather6_gate_up_swiglu
     void *pipe_gather6_down;            // gather6_down
+    void *pipe_gather6_gate_up_2b;      // gather6_gate_up_swiglu_2b (int2_gs64)
+    void *pipe_gather6_down_2b;         // gather6_down_2b (int2_gs64)
     // Persistent whole-blob NoCopy wrappers for the fixed pread/prefetch buffers,
     // so gather6 reuses stable GPU page mappings across tokens instead of
     // remapping 6×13.4MB fresh every layer.
@@ -431,6 +434,7 @@ typedef struct {
     void *buf_gather_down_s[N_LAYERS];   // alias
     bool gather_mode;                    // true = use gather kernels instead of per-expert
     bool use_affine_experts;             // true = experts are in affine_v2 format (bf16 scale+bias, gs=64)
+    int  expert_format_2b;               // 1 = packed dir is int2_gs64 (2-bit) format
     size_t active_expert_size;           // EXPERT_SIZE or AFFINE_EXPERT_SIZE based on format
 
     // Remapping table: expert_id → pool_slot (position in SMELT pool).

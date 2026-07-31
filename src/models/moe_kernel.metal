@@ -4017,3 +4017,179 @@ kernel void fused_gate_up_swiglu_int8_e8m0(
         out[row] = act * u_c;
     }
 }
+
+// ============================================================================
+// Gather6 MoE kernels — 2-bit (int2 gs=64, E8M0 scale + BF16 bias) variant
+// ============================================================================
+//
+// Blob layout per expert (EXPERT_SIZE_2B = 7,471,104 bytes):
+//   gate_w @0        (2097152 B)  [2048,4096] int2, 16 values per uint32
+//   gate_s @2097152  (131072 B)   [2048×64] E8M0 bytes
+//   gate_b @2228224  (262144 B)   [2048×64] BF16
+//   up_w   @2490368  (2097152 B)
+//   up_s   @4587520  (131072 B)
+//   up_b   @4718592  (262144 B)
+//   down_w @4980736  (2097152 B)  [4096,2048] int2
+//   down_s @7077888  (131072 B)   [4096×32] E8M0
+//   down_b @7208960  (262144 B)   [4096×32] BF16
+// int2 packing: value i at bits [2i, 2i+2) of each uint32, row-major.
+// dequant: val = q * exp2(sbyte-127) + bf16(bias).
+// Structure mirrors gather6_gate_up_swiglu / gather6_down (gs=32 → gs=64,
+// nibble LUT → 2-bit + affine bias).
+
+kernel void gather6_gate_up_swiglu_2b(
+    device const uint32_t* blob0    [[buffer(0)]],   // packed expert blob, slot 0
+    device const uint32_t* blob1    [[buffer(1)]],   // slot 1
+    device const uint32_t* blob2    [[buffer(2)]],   // slot 2
+    device const uint32_t* blob3    [[buffer(3)]],   // slot 3
+    device const uint32_t* blob4    [[buffer(4)]],   // slot 4
+    device const uint32_t* blob5    [[buffer(5)]],   // slot 5
+    device const float*    x        [[buffer(6)]],   // [IN_DIM=4096] shared input
+    device float*          out      [[buffer(7)]],   // [6 × INTERMEDIATE] output (after SwiGLU)
+    uint3 tgid       [[threadgroup_position_in_grid]],
+    uint3 lid3       [[thread_position_in_threadgroup]],
+    uint simd_lane   [[thread_index_in_simdgroup]],
+    uint simd_group  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint INTERMEDIATE   = 2048;
+    const uint IN_DIM         = 4096;
+    const uint GS             = 64;
+    const uint PACKED_COLS    = IN_DIM / 16;      // 256 uint32 per row
+    const uint N_GROUPS       = IN_DIM / GS;      // 64 scale/bias groups per row
+    const uint PPG            = GS / 16;          // 4 packed words per group
+    const uint ROWS_PER_TG    = 8;
+    // Byte offsets within one expert blob (2-bit layout, see header comment)
+    const uint GATE_S_BYTE    = 2097152u;
+    const uint GATE_B_BYTE    = 2228224u;
+    const uint UP_W_U32       = 2490368u / 4u;    // 622592 uint32 elements
+    const uint UP_S_BYTE      = 4587520u;
+    const uint UP_B_BYTE      = 4718592u;
+
+    uint k_idx = tgid.y;
+    uint row = tgid.x * ROWS_PER_TG + simd_group;
+    uint lid = lid3.x;
+
+    // Uniform select of this slot's blob (tgid.y is constant per threadgroup)
+    device const uint32_t* blob = blob0;
+    switch (k_idx) {
+        case 1: blob = blob1; break;
+        case 2: blob = blob2; break;
+        case 3: blob = blob3; break;
+        case 4: blob = blob4; break;
+        case 5: blob = blob5; break;
+        default: break;
+    }
+    device const uint32_t* g_row = blob + row * PACKED_COLS;
+    device const uint32_t* u_row = blob + UP_W_U32 + row * PACKED_COLS;
+    // Scale (1 B/group) and bias (2 B/group) byte bases for this row
+    const uint gs_byte_base = GATE_S_BYTE + row * N_GROUPS;
+    const uint gb_byte_base = GATE_B_BYTE + row * N_GROUPS * 2;
+    const uint us_byte_base = UP_S_BYTE   + row * N_GROUPS;
+    const uint ub_byte_base = UP_B_BYTE   + row * N_GROUPS * 2;
+
+    // Cache x in shared memory — reused for all K experts via Y-dim parallelism
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < IN_DIM; i += 256) x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= INTERMEDIATE) return;
+
+    float ga = 0.0f, ua = 0.0f;
+    for (uint g = simd_lane; g < N_GROUPS; g += 32) {
+        uint sidx = gs_byte_base + g;
+        float gsf = exp2((float)(uint8_t)((blob[sidx >> 2] >> ((sidx & 3) << 3)) & 0xFF) - 127.0f);
+        sidx = us_byte_base + g;
+        float usf = exp2((float)(uint8_t)((blob[sidx >> 2] >> ((sidx & 3) << 3)) & 0xFF) - 127.0f);
+        uint bidx = gb_byte_base + g * 2;
+        float gbf = as_type<float>(((blob[bidx >> 2] >> ((bidx & 3) << 3)) & 0xFFFFu) << 16);
+        bidx = ub_byte_base + g * 2;
+        float ubf = as_type<float>(((blob[bidx >> 2] >> ((bidx & 3) << 3)) & 0xFFFFu) << 16);
+        uint bp = g * PPG, bx = g * GS;
+        for (uint p = 0; p < PPG; p++) {
+            uint32_t gpw = g_row[bp+p], upw = u_row[bp+p];
+            uint xb = bx + p*16;
+            for (uint i = 0; i < 16; i++) {
+                ga += (gbf + (float)((gpw >> (2*i)) & 0x3) * gsf) * x_shared[xb+i];
+                ua += (ubf + (float)((upw >> (2*i)) & 0x3) * usf) * x_shared[xb+i];
+            }
+        }
+    }
+    float gv = simd_sum(ga), uv = simd_sum(ua);
+    if (simd_lane == 0) {
+        const float lim = 10.0f;
+        float gc = min(gv, lim), uc = min(max(uv, -lim), lim);
+        out[k_idx * INTERMEDIATE + row] = (bfloat)((gc / (1.0f + exp(-gc))) * uc);
+    }
+}
+
+// gather6_down_2b: down projection from 6 independent 2-bit expert blobs.
+// DOWN_W @4980736 B, DOWN_S @7077888 B, DOWN_B @7208960 B within each blob.
+// Dispatch: MTLSizeMake(DIM/8, K=6, 1) threadgroups × 256 threads.
+kernel void gather6_down_2b(
+    device const uint32_t* blob0    [[buffer(0)]],   // packed expert blob, slot 0
+    device const uint32_t* blob1    [[buffer(1)]],   // slot 1
+    device const uint32_t* blob2    [[buffer(2)]],   // slot 2
+    device const uint32_t* blob3    [[buffer(3)]],   // slot 3
+    device const uint32_t* blob4    [[buffer(4)]],   // slot 4
+    device const uint32_t* blob5    [[buffer(5)]],   // slot 5
+    device const float*    x_mid    [[buffer(6)]],   // [6 × INTERMEDIATE] gate*up results
+    device float*          out      [[buffer(7)]],   // [6 × DIM]
+    uint3 tgid       [[threadgroup_position_in_grid]],
+    uint3 lid3       [[thread_position_in_threadgroup]],
+    uint simd_lane   [[thread_index_in_simdgroup]],
+    uint simd_group  [[simdgroup_index_in_threadgroup]]
+) {
+    const uint DIM            = 4096;
+    const uint INTERMEDIATE   = 2048;
+    const uint GS             = 64;
+    const uint PACKED_COLS    = INTERMEDIATE / 16;  // 128 uint32 per row
+    const uint N_GROUPS       = INTERMEDIATE / GS;  // 32
+    const uint PPG            = GS / 16;            // 4
+    const uint ROWS_PER_TG    = 8;
+    const uint DOWN_W_U32     = 4980736u / 4u;      // 1245184
+    const uint DOWN_S_BYTE    = 7077888u;
+    const uint DOWN_B_BYTE    = 7208960u;
+
+    uint k_idx = tgid.y;
+    uint row = tgid.x * ROWS_PER_TG + simd_group;
+    uint lid = lid3.x;
+    // Uniform select of this slot's blob (tgid.y is constant per threadgroup)
+    device const uint32_t* blob = blob0;
+    switch (k_idx) {
+        case 1: blob = blob1; break;
+        case 2: blob = blob2; break;
+        case 3: blob = blob3; break;
+        case 4: blob = blob4; break;
+        case 5: blob = blob5; break;
+        default: break;
+    }
+    device const uint32_t* w_row = blob + DOWN_W_U32 + row * PACKED_COLS;
+    const uint s_byte_base = DOWN_S_BYTE + row * N_GROUPS;
+    const uint b_byte_base = DOWN_B_BYTE + row * N_GROUPS * 2;
+
+    // Load this expert's intermediate output (gate×up result) into shared memory
+    threadgroup float x_shared[2048];
+    device const float* my_xmid = x_mid + k_idx * INTERMEDIATE;
+    for (uint i = lid; i < INTERMEDIATE; i += 256) x_shared[i] = my_xmid[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (row >= DIM) return;
+
+    float acc = 0.0f;
+    for (uint g = simd_lane; g < N_GROUPS; g += 32) {
+        uint sidx = s_byte_base + g;
+        float sf = exp2((float)(uint8_t)((blob[sidx >> 2] >> ((sidx & 3) << 3)) & 0xFF) - 127.0f);
+        uint bidx = b_byte_base + g * 2;
+        float bf = as_type<float>(((blob[bidx >> 2] >> ((bidx & 3) << 3)) & 0xFFFFu) << 16);
+        uint bp = g * PPG, bx = g * GS;
+        for (uint p = 0; p < PPG; p++) {
+            uint32_t pw = w_row[bp+p];
+            uint xb = bx + p*16;
+            for (uint i = 0; i < 16; i++) {
+                acc += (bf + (float)((pw >> (2*i)) & 0x3) * sf) * x_shared[xb+i];
+            }
+        }
+    }
+    float g6d_sum = simd_sum(acc);  // collective: must be executed by ALL lanes
+    if (simd_lane == 0) out[k_idx * DIM + row] = (bfloat)g6d_sum;
+}
