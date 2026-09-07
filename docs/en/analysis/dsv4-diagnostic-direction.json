@@ -1,0 +1,45 @@
+{
+  "claims": {
+    "authoritative_candidate": false,
+    "exclusive_gpu_time": false,
+    "scheduling_slack_measured": false,
+    "unblocks_task_2_2": false,
+    "wall_time_percentage": false
+  },
+  "decision": "ATTENTION_INVESTIGATION",
+  "expert_io_scope": {
+    "batch_pool_hits": 0,
+    "bytes_avoided": 12513705984,
+    "bytes_read": 70269272064,
+    "bytes_requested": 70269272064,
+    "cold_misses": 5256,
+    "hot_hits": 936,
+    "io_wait_ms": 6261.5,
+    "measurement_scope": "critical_path_routed_expert_resolution",
+    "pread_calls": 5256,
+    "prefetch_hits": 0,
+    "short_reads": 0
+  },
+  "median_sampled_duration_ns": {
+    "attention": 766191749,
+    "routed_moe": 598527293
+  },
+  "rejection_reasons": [],
+  "schema_version": 1,
+  "source_sha256": "0fdbb0eaa75370a5950365cacf90d0ed7242e7aa78e6d59892ddabad3980a6ea",
+  "standard_run_sampled_duration_ns": [
+    {
+      "attention": 766191749,
+      "routed_moe": 598527293
+    },
+    {
+      "attention": 736419337,
+      "routed_moe": 552114250
+    },
+    {
+      "attention": 822806324,
+      "routed_moe": 618970462
+    }
+  ],
+  "target": "production scalar merged attention command buffer"
+}

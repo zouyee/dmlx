@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "decision_scope": "normal_scalar_merged_attention_compute_stage_duration_mass",
+  "binary_sha256": "9fd2e119bff3e8c3d6819f203767c88003754a8fccc27b3aec86034f29efb00e",
+  "configuration": {
+    "engine": "native",
+    "model": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit",
+    "packed_experts": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts",
+    "NATIVE_SMELT_N": "20",
+    "NATIVE_TELEMETRY": "1",
+    "NATIVE_ATTENTION_STAGE_TIME": "1",
+    "MF_STAGE_TIME": "unset",
+    "temperature": 0,
+    "max_tokens": 5,
+    "lifecycle": "serial_clean_start_one_request_per_server"
+  },
+  "stage_order": ["mhc_pre", "wq_a", "q_rms", "wq_b", "q_head_rms", "q_rope", "wkv", "kv_rms", "kv_rope", "kv_update", "sdpa", "inv_q_rope", "wo_a", "wo_b"],
+  "runs": [
+    {
+      "ordinal": 1,
+      "raw_log_sha256": "d4c6fb24bcf6b4af3f6b9d7a0634842174185eb9eec4e0a1585266f7b2f4efc0",
+      "response_content": "Paris.",
+      "status": "available",
+      "stages": [
+        ["mhc_pre",321471657,430],["wq_a",64917622,430],["q_rms",4729090,430],["wq_b",104494537,430],["q_head_rms",4031127,430],["q_rope",2028542,430],["wkv",66701125,430],["kv_rms",3736541,430],["kv_rope",2110824,430],["kv_update",1633152,430],["sdpa",3315713,430],["inv_q_rope",1808586,430],["wo_a",96977579,430],["wo_b",80477706,430]
+      ]
+    },
+    {
+      "ordinal": 2,
+      "raw_log_sha256": "0540e83b92b29aef62dfc88613d5c0428557c68bfa65c9dc80a7df6efd6e298b",
+      "response_content": "Paris.",
+      "status": "available",
+      "stages": [
+        ["mhc_pre",296851880,430],["wq_a",58953290,430],["q_rms",4403334,430],["wq_b",97068966,430],["q_head_rms",3895960,430],["q_rope",1893877,430],["wkv",61178097,430],["kv_rms",3570539,430],["kv_rope",2010626,430],["kv_update",1517827,430],["sdpa",3033981,430],["inv_q_rope",1667158,430],["wo_a",88769125,430],["wo_b",74379134,430]
+      ]
+    },
+    {
+      "ordinal": 3,
+      "raw_log_sha256": "3d8b254161cffdd7db6eefb60fb8a5b4e246078053453cdfb0e70593412dc2de",
+      "response_content": "Paris.",
+      "status": "available",
+      "stages": [
+        ["mhc_pre",284568941,430],["wq_a",54807874,430],["q_rms",4172147,430],["wq_b",93537629,430],["q_head_rms",3570298,430],["q_rope",1786175,430],["wkv",57633342,430],["kv_rms",3252283,430],["kv_rope",1879409,430],["kv_update",1427828,430],["sdpa",2938544,430],["inv_q_rope",1576237,430],["wo_a",83218796,430],["wo_b",69633461,430]
+      ]
+    }
+  ],
+  "decision": {
+    "hypothesis": "wq_b has the largest stable sampled stage-duration mass",
+    "result": "DISPROVEN",
+    "observed_largest_each_run": ["mhc_pre", "mhc_pre", "mhc_pre"],
+    "authority": "diagnostic_only_no_kernel_optimization_authorized"
+  }
+}

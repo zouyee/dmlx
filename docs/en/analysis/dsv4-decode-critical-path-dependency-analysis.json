@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "kind": "dsv4_decode_critical_path_dependency_analysis",
+  "date": "2026-09-05",
+  "analyzed_source": "src/metal_infer/engine.c (working tree used for the r5 collection; scalar decode path)",
+  "method": "static read of every waitUntilCompleted on the decode critical path and the CPU consumers of each GPU-written buffer",
+  "families": {
+    "cpu_gpu_readback_or_sync": {
+      "feasible": true,
+      "stage_dependencies": {
+        "attention_cb": {
+          "wait": "[merged_cb waitUntilCompleted] at engine.c:5169",
+          "cpu_consumers": [
+            "attn_out truncate+upload to buf_mhc_attn_out_bf16 (engine.c:5235-5272)",
+            "normed for compressor/indexer state (future tokens only) and re-uploads (engine.c:5199-5206, 5756, 5596)"
+          ],
+          "first_later_consumer": "CB2CMD2 Enc2 mhc_post_bfloat binding buf_mhc_attn_out_bf16 (engine.c:5293)",
+          "ownership_transfer": "replace CPU truncate+upload with a GPU kernel writing buf_mhc_attn_out_bf16 directly; merged_cb and cb2cmd2 are same-queue, so in-queue ordering transfers ownership without any CPU wait; compressor/indexer outputs have no same-token consumer (comp state is for future tokens; comp_allowed is dead) and can be double-buffered or deferred",
+          "removable": true
+        },
+        "cb2cmd2_cb": {
+          "wait": "[cb2cmd2 waitUntilCompleted] at engine.c:5406",
+          "cpu_consumers": [
+            "routing scores / gpu_route_selected readback feeding CPU expert selection and pread dispatch (engine.c:5442, 5523-5560) — inherent to the CPU-managed expert-cache design",
+            "residual/ffn_input/post_ffn/comb_ffn/normed readbacks (engine.c:5413-5423) that exist only because cb3 inputs are CPU-uploaded (engine.c:6041-6044)"
+          ],
+          "first_later_consumer": "CPU expert selection consuming buf_routing_scores/buf_gpu_route_selected (engine.c:5442, 5523-5529); the remaining buffers' first later consumers are GPU encoders (shared-expert CB and cb3)",
+          "ownership_transfer": "keep buf_residual_gpu/buf_mhc_ffn_in/buf_mhc_post/comb_weights GPU-resident through cb3 (removes all non-routing readbacks); the routing readback stays until expert residency moves GPU-side",
+          "removable": true
+        },
+        "shared_expert_cb": {
+          "wait": "[cb waitUntilCompleted] at engine.c:5858",
+          "cpu_consumers": ["bdown_overlap = [bdown contents] (engine.c:5868) then scalar ffn_out[j] += bdown_overlap[j] (engine.c:5981-5983)"],
+          "first_later_consumer": "the CPU scalar add into ffn_out, which then feeds cb3 via upload",
+          "ownership_transfer": "fuse the shared-expert add into the routed-MoE moe_combine or into cb3 as a GPU kernel (all operands GPU-resident), eliminating the wait and the CPU add",
+          "removable": true
+        },
+        "routed_moe_cb": {
+          "wait": "[cb waitUntilCompleted] at engine.c:4641",
+          "cpu_consumers": ["memcpy(ffn_out, [buf_hidden contents]) (engine.c:5978) followed by re-upload to buf_ffn_out_f32 (engine.c:6041)"],
+          "first_later_consumer": "cb3 encoder mhc_post_ffn_expand4 reading buf_ffn_out_f32 (engine.c:6057-6069)",
+          "ownership_transfer": "with a GPU-side shared-expert add, buf_hidden feeds cb3 directly — a full GPU→GPU chain with no CPU wait or round trip",
+          "removable": true
+        },
+        "cb3_cb": {
+          "wait": "[cb3 waitUntilCompleted] at engine.c:6080",
+          "cpu_consumers": ["residual readback (engine.c:6082-6085) re-uploaded at the next layer (engine.c:4988)"],
+          "first_later_consumer": "next layer's mhc_pre encoder reading the residual (currently via CPU round trip)",
+          "ownership_transfer": "cb3 already writes buf_residual_gpu in place; the existing deferred-cb3 machinery (engine.c:4957-4972, gpu_residual_current) lets the next layer bind buf_residual_gpu directly — the readback is a pure round trip",
+          "removable": true
+        }
+      }
+    },
+    "routed_moe_kernel_or_cb": {
+      "feasible": true,
+      "note": "protocol requires no named removable dependency for this family; budget is the capped ROUTED_MOE_CB union"
+    },
+    "lm_head_top1": {
+      "feasible": true,
+      "note": "protocol requires no named removable dependency for this family"
+    },
+    "new_mhc_algorithm": {
+      "feasible": false,
+      "note": "frozen deterministic zero: no non-disturbing host-observable mHC-only interval exists inside the merged attention CB"
+    }
+  }
+}

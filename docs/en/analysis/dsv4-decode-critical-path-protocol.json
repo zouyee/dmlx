@@ -1,0 +1,121 @@
+{
+  "schema_version": 2,
+  "status": "frozen_before_implementation",
+  "native_only": true,
+  "model": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit",
+  "packed_experts": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts",
+  "smelt_n": 20,
+  "max_rss_bytes_exclusive": 47244640256,
+  "full_preload_forbidden": true,
+  "concurrent_servers_forbidden": true,
+  "timeline": {
+    "compile_option": "decode_timeline_probe",
+    "runtime_env": "DSV4_DECODE_TIMELINE_ENABLE",
+    "boolean_values": {"unset":"off","0":"off","1":"on","other":"initialization_error"},
+    "stages": ["token_forward","attention_cb","dsa_cpu","cb2cmd2_cb","io_exposed_wait","shared_expert_cb","routed_moe_cb","cb3_cb","logits_cb","token_sample"],
+    "abi_version": 2,
+    "abi_v2_note": "ABI v2 inserts dsa_cpu (id 2) and renumbers later stages; v1 captures must be rejected explicitly",
+    "clock": "mach_continuous_time_converted_to_ns",
+    "bounded_preallocated_storage": true,
+    "overflow_invalidates": true,
+    "incomplete_command_invalidates": true,
+    "exclusive_gpu_time_claim": false
+  },
+  "required_provenance": ["binary_sha256","git_head","dirty_workspace_sha256","model_identity","tokenizer_identity","packed_manifest_identity","protocol_sha256","collector_sha256","routing_seed_identity","pid","executable_identity","environment","lifecycle","rss_series"],
+  "overhead_order": ["off1","on1","off2","on2"],
+  "warmup_process": {
+    "label": "warmup0",
+    "protocol_version_note": "v3: one non-gated warmup process runs before off1 with the identical native/packed/N=20 server shape and the standard+long+correctness workloads, timeline off, so no gated child runs on a cold page cache; its evidence is source-bound but excluded from runs, the gate, and diagnostic counts",
+    "timeline_enabled": false,
+    "gated": false
+  },
+  "overhead_gates": {
+    "standard_median_ratio_range": [0.95,1.05],
+    "long_decode_ratio_range": [0.95,1.05],
+    "pair_footprint_absolute_delta_max_bytes": 268435456,
+    "memory_gate_metric_note": "v4: each memory sample records rss_bytes (total resident, provenance only) and footprint_bytes (proc_pid_rusage RUSAGE_INFO_V4 ri_phys_footprint); the pair-delta gate uses footprint_bytes only, because total RSS on macOS is confounded by file-mapped page cache attribution across serial children (measured: total RSS varied by 8.4 GiB across two identical boots while phys_footprint varied by <=1.7 MiB)",
+    "long_operand_note": "v5: the long operand is the median throughput of three sequential 100-token requests (each retaining exactly 100 completion tokens), mirroring the standard operand's median-of-three; the single-request operand could not resolve the 5% gate (cross-round spread -6.5%..+8.8% vs ~2-4% true probe overhead)"
+  },
+  "diagnostic_processes": 3,
+  "exact_q4_sidecars": 3,
+  "diagnosis_sidecar_contract": {
+    "order": ["diagnosis1","exact_q4_sidecar1","diagnosis2","exact_q4_sidecar2","diagnosis3","exact_q4_sidecar3"],
+    "pairing": [
+      {"pair_label":"diagnosis1_exact_q4_sidecar1","diagnosis":"diagnosis1","sidecar":"exact_q4_sidecar1"},
+      {"pair_label":"diagnosis2_exact_q4_sidecar2","diagnosis":"diagnosis2","sidecar":"exact_q4_sidecar2"},
+      {"pair_label":"diagnosis3_exact_q4_sidecar3","diagnosis":"diagnosis3","sidecar":"exact_q4_sidecar3"}
+    ],
+    "same_frozen_binary": true,
+    "same_restored_routing_seed": true,
+    "same_workload_identity": true,
+    "native_only": true,
+    "smelt_n": 20,
+    "packed_experts_required": true,
+    "same_process_forbidden": true,
+    "diagnosis": {
+      "timeline_enabled": true,
+      "native_exact_q4_capture_enabled": false,
+      "counts_toward_diagnostic_processes": true
+    },
+    "sidecar": {
+      "timeline_enabled": false,
+      "native_exact_q4_capture_env": {"NATIVE_EXACT_Q4_CAPTURE":"1"},
+      "purpose": ["exact_q4_expert_io_binding","correctness_binding"],
+      "counts_toward_diagnostic_processes": false
+    },
+    "binding_fields": ["source_hashes","pair_label"],
+    "gates": {
+      "independent_cleanup_before": true,
+      "independent_verify_none_before": true,
+      "independent_cleanup_after": true,
+      "independent_verify_none_after": true,
+      "required_provenance": ["pid","executable_identity","environment","rss_series","lifecycle"],
+      "short_reads": 0,
+      "pending_owners": 0
+    }
+  },
+  "required_retained_token_coverage": 1.0,
+  "accounting": {
+    "envelope_stage": "token_forward",
+    "envelope_excluded_from_attribution": true,
+    "child_stages": ["attention_cb","cb2cmd2_cb","io_exposed_wait","shared_expert_cb","routed_moe_cb","cb3_cb","logits_cb","token_sample"],
+    "overlap_rule": "interval_union_count_once",
+    "unclassified_ns": "token_forward_ns_minus_clipped_child_union_ns",
+    "unclassified_ratio_max": 0.05,
+    "negative_unclassified_invalidates": true
+  },
+  "candidate_budget": {
+    "token_denominator": "token_forward_ns",
+    "per_process_aggregate": "median_retained_token_ratio",
+    "cross_process_aggregate": "minimum_of_three_process_medians",
+    "dependency_infeasible_budget": 0,
+    "families": {
+      "routed_moe_kernel_or_cb": {"eligible_stages":["routed_moe_cb"],"recoverable_cap":0.20},
+      "cpu_gpu_readback_or_sync": {"eligible_stages":["attention_cb","cb2cmd2_cb","shared_expert_cb","routed_moe_cb","cb3_cb"],"recoverable_cap":0.50,"requires_named_removable_dependency":true},
+      "lm_head_top1": {"eligible_stages":["logits_cb","token_sample"],"recoverable_cap":0.50},
+      "new_mhc_algorithm": {"eligible_stages":[],"recoverable_cap":0.0,"deterministic_reason":"no_non_disturbing_host_observable_mhc_only_interval_inside_merged_attention"}
+    },
+    "tie_break": ["higher_cross_process_minimum","candidate_family_order"],
+    "required_artifact_fields": ["source_hashes","retained_token_counts","union_numerator_ns","cap","process_medians","cross_process_minimum","dependency_feasibility","threshold_result"]
+  },
+  "candidate_families": ["routed_moe_kernel_or_cb","cpu_gpu_readback_or_sync","lm_head_top1","new_mhc_algorithm"],
+  "excluded": ["dynamic_expert_admission","predictive_prefetch","batching","dspark","smelt_n_above_20","full_preload","route_change","quantization_change","previously_rejected_mhc_mapping"],
+  "candidate_predicted_wall_reduction_min": 0.05,
+  "promotion_order": ["fixed1","candidate1","fixed2","candidate2"],
+  "promotion": {
+    "pairwise_standard_wins": true,
+    "pairwise_long_wins": true,
+    "standard_median_ratio_min": 1.05,
+    "long_median_ratio_min": 1.05,
+    "itl_p50_non_regression": true,
+    "itl_p95_ratio_max": 1.02,
+    "request_p95_ratio_max": 1.02,
+    "expert_requested_bytes_per_token_non_increase": true,
+    "expert_read_bytes_per_token_non_increase": true,
+    "short_reads": 0,
+    "pending_owners": 0,
+    "correctness": ["paris","arithmetic","e2e_7_of_7","route_and_state_parity"],
+    "candidate_remains_default_off": true
+  },
+  "failure_default": "existing_fixed_hot_scalar_native_path"
+}

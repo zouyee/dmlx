@@ -1,0 +1,62 @@
+{
+  "capacity": 4096,
+  "content_sha256": "3208de63395496867008d4fb2e7205c6523030d71b15d97af9da779823eddd47",
+  "enabled": true,
+  "identity": {
+    "binary_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "device_name": "Apple M4 Pro",
+    "device_registry_id": 123456,
+    "git_commit": "fixture-commit",
+    "os_version": "macOS fixture",
+    "pid": 4242,
+    "process_start_ns": 1000000000,
+    "worktree_dirty": false
+  },
+  "overflow_count": 0,
+  "samples": [
+    {
+      "gpu_end_s": 1.5,
+      "gpu_start_s": 1.25,
+      "kind": 1,
+      "layer": 0,
+      "post_commit_ns": 110,
+      "post_wait_ns": 300,
+      "pre_commit_ns": 100,
+      "reason": 0,
+      "request_id": 7,
+      "sequence": 0,
+      "token_index": 0,
+      "valid": 1
+    },
+    {
+      "gpu_end_s": 0.0,
+      "gpu_start_s": 0.0,
+      "kind": 2,
+      "layer": 0,
+      "post_commit_ns": 410,
+      "post_wait_ns": 700,
+      "pre_commit_ns": 400,
+      "reason": 1,
+      "request_id": 7,
+      "sequence": 1,
+      "token_index": 0,
+      "valid": 0
+    },
+    {
+      "gpu_end_s": 0.0,
+      "gpu_start_s": 0.0,
+      "kind": 1,
+      "layer": 1,
+      "post_commit_ns": 810,
+      "post_wait_ns": 900,
+      "pre_commit_ns": 800,
+      "reason": 2,
+      "request_id": 7,
+      "sequence": 2,
+      "token_index": 1,
+      "valid": 0
+    }
+  ],
+  "schema_version": 1,
+  "total_seen": 3
+}
