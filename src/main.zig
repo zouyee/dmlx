@@ -12,6 +12,7 @@ const std = @import("std");
 const root = @import("root.zig");
 const c = @import("mlx").c;
 const memory = @import("memory.zig");
+const cli_flags = @import("cli_flags.zig");
 const safetensors_reader = @import("mlx").safetensors_reader;
 const quantize_mod = @import("mlx").quantize;
 
@@ -185,6 +186,7 @@ pub fn main(init: std.process.Init) !void {
         const cmd = try parseServerArgs(allocator, args[2..]);
         defer {
             allocator.free(cmd.model_path);
+            if (cmd.expert_packed_dir) |d| allocator.free(d);
             if (cmd.kv_cold_dir) |d| allocator.free(d);
             if (cmd.prompt_cache_file) |f| allocator.free(f);
             if (cmd.dspark_dir) |d| allocator.free(d);
@@ -365,13 +367,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
     var i: usize = 0;
     while (i < args.len) {
         const flag = args[i];
-        // Boolean flags don't consume a value
-        const is_bool = std.mem.eql(u8, flag, "--smelt") or
-            std.mem.eql(u8, flag, "--mlock-backbone") or
-            std.mem.eql(u8, flag, "--metal-moe") or
-            std.mem.eql(u8, flag, "--metal-full") or
-            std.mem.eql(u8, flag, "--native") or
-            std.mem.eql(u8, flag, "--distributed");
+        // Boolean flags don't consume a value.
+        const is_bool = cli_flags.isBooleanFlag(flag, false);
         if (!is_bool and i + 1 >= args.len) break;
         const value = if (!is_bool) args[i + 1] else "";
 
@@ -479,14 +476,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
     var i: usize = 0;
     while (i < args.len) {
         const flag = args[i];
-        // Boolean flags don't consume a value
-        const is_bool = std.mem.eql(u8, flag, "--smelt") or
-            std.mem.eql(u8, flag, "--mlock-backbone") or
-            std.mem.eql(u8, flag, "--metal-moe") or
-            std.mem.eql(u8, flag, "--metal-full") or
-            std.mem.eql(u8, flag, "--native") or
-            std.mem.eql(u8, flag, "--distributed") or
-            std.mem.eql(u8, flag, "--raw");
+        // Boolean flags don't consume a value.
+        const is_bool = cli_flags.isBooleanFlag(flag, true);
         if (!is_bool and i + 1 >= args.len) break;
         const value = if (!is_bool) args[i + 1] else "";
 

@@ -1,0 +1,737 @@
+{
+  "comparison": {
+    "bounded_lru": {
+      "correctness": {
+        "all_pass": true,
+        "runs": [
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          },
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          }
+        ]
+      },
+      "long_diagnostic_tokens_per_second": {
+        "coefficient_of_variation": 0.014772833844399298,
+        "count": 2,
+        "max": 1.141555,
+        "median": 1.1249365,
+        "min": 1.108318,
+        "spread": 0.03323700000000018,
+        "values": [
+          1.141555,
+          1.108318
+        ]
+      },
+      "metrics": {
+        "bytes_per_completion_token": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2168507596.8,
+            "median": 2168507596.8,
+            "min": 2168507596.8,
+            "spread": 0.0,
+            "values": [
+              2168507596.8,
+              2168507596.8
+            ]
+          },
+          "values": [
+            2168507596.8,
+            2168507596.8
+          ]
+        },
+        "cache_admissions": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2433.0,
+            "median": 2433.0,
+            "min": 2433.0,
+            "spread": 0.0,
+            "values": [
+              2433.0,
+              2433.0
+            ]
+          },
+          "values": [
+            2433.0,
+            2433.0
+          ]
+        },
+        "cache_evictions": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2433.0,
+            "median": 2433.0,
+            "min": 2433.0,
+            "spread": 0.0,
+            "values": [
+              2433.0,
+              2433.0
+            ]
+          },
+          "values": [
+            2433.0,
+            2433.0
+          ]
+        },
+        "cold_misses": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2433.0,
+            "median": 2433.0,
+            "min": 2433.0,
+            "spread": 0.0,
+            "values": [
+              2433.0,
+              2433.0
+            ]
+          },
+          "values": [
+            2433.0,
+            2433.0
+          ]
+        },
+        "expert_bytes_read": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 32527613952.0,
+            "median": 32527613952.0,
+            "min": 32527613952.0,
+            "spread": 0.0,
+            "values": [
+              32527613952.0,
+              32527613952.0
+            ]
+          },
+          "values": [
+            32527613952.0,
+            32527613952.0
+          ]
+        },
+        "expert_io_wait_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.013913391996360389,
+            "count": 2,
+            "max": 5616.046,
+            "median": 5538.98,
+            "min": 5461.914,
+            "spread": 154.13200000000052,
+            "values": [
+              5616.046,
+              5461.914
+            ]
+          },
+          "values": [
+            5616.046,
+            5461.914
+          ]
+        },
+        "expert_pread_calls": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2433.0,
+            "median": 2433.0,
+            "min": 2433.0,
+            "spread": 0.0,
+            "values": [
+              2433.0,
+              2433.0
+            ]
+          },
+          "values": [
+            2433.0,
+            2433.0
+          ]
+        },
+        "hit_rate": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 0.6070736434108527,
+            "median": 0.6070736434108527,
+            "min": 0.6070736434108527,
+            "spread": 0.0,
+            "values": [
+              0.6070736434108527,
+              0.6070736434108527
+            ]
+          },
+          "values": [
+            0.6070736434108527,
+            0.6070736434108527
+          ]
+        },
+        "hot_hits": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 3759.0,
+            "median": 3759.0,
+            "min": 3759.0,
+            "spread": 0.0,
+            "values": [
+              3759.0,
+              3759.0
+            ]
+          },
+          "values": [
+            3759.0,
+            3759.0
+          ]
+        },
+        "itl_p50_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.004503262694935863,
+            "count": 2,
+            "max": 726.0085,
+            "median": 722.7537500000001,
+            "min": 719.499,
+            "spread": 6.509500000000003,
+            "values": [
+              726.0085,
+              719.499
+            ]
+          },
+          "values": [
+            726.0085,
+            719.499
+          ]
+        },
+        "itl_p95_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.02574146058851919,
+            "count": 2,
+            "max": 847.1809000000001,
+            "median": 825.9205,
+            "min": 804.6600999999999,
+            "spread": 42.52080000000012,
+            "values": [
+              847.1809000000001,
+              804.6600999999999
+            ]
+          },
+          "values": [
+            847.1809000000001,
+            804.6600999999999
+          ]
+        },
+        "metadata_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 88088.0,
+            "median": 88088.0,
+            "min": 88088.0,
+            "spread": 0.0,
+            "values": [
+              88088.0,
+              88088.0
+            ]
+          },
+          "values": [
+            88088.0,
+            88088.0
+          ]
+        },
+        "peak_rss_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.003125175775157793,
+            "count": 2,
+            "max": 19284639744.0,
+            "median": 19224559616.0,
+            "min": 19164479488.0,
+            "spread": 120160256.0,
+            "values": [
+              19164479488.0,
+              19284639744.0
+            ]
+          },
+          "values": [
+            19164479488.0,
+            19284639744.0
+          ]
+        },
+        "resident_expert_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 20963131392.0,
+            "median": 20963131392.0,
+            "min": 20963131392.0,
+            "spread": 0.0,
+            "values": [
+              20963131392.0,
+              20963131392.0
+            ]
+          },
+          "values": [
+            20963131392.0,
+            20963131392.0
+          ]
+        },
+        "resident_slots": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 1568.0,
+            "median": 1568.0,
+            "min": 1568.0,
+            "spread": 0.0,
+            "values": [
+              1568.0,
+              1568.0
+            ]
+          },
+          "values": [
+            1568.0,
+            1568.0
+          ]
+        }
+      },
+      "sources": [
+        {
+          "canonical_run_sha256": "d2693d9a2804a9a2d0628942c5644ef70b6335090ca74f98d2edf36781bfb484",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-cache-promotion-lru-run1.json",
+          "sha256": "549ec01482222991ac40e86d42c4f9c272264e6799cb5978229d0c88864ff3db",
+          "timestamp_utc": "2026-08-15T00:56:12.133344+00:00"
+        },
+        {
+          "canonical_run_sha256": "c61e81325054a39a2315fd481fd182935d46ea1b1b3c0892cf9cc76c37b2b3bd",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-cache-promotion-lru-run2.json",
+          "sha256": "1d703be193a7805d697e3db14419050ddcbc23b70bc0585731355ec8f4b9eeb5",
+          "timestamp_utc": "2026-08-15T01:06:02.081831+00:00"
+        }
+      ],
+      "standard_tokens_per_second": {
+        "coefficient_of_variation": 0.00868020706875053,
+        "count": 2,
+        "max": 0.680901,
+        "median": 0.6750415000000001,
+        "min": 0.669182,
+        "spread": 0.011718999999999924,
+        "values": [
+          0.669182,
+          0.680901
+        ]
+      }
+    },
+    "fixed_hot": {
+      "correctness": {
+        "all_pass": true,
+        "runs": [
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          },
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          }
+        ]
+      },
+      "long_diagnostic_tokens_per_second": {
+        "coefficient_of_variation": 0.05785418501538604,
+        "count": 2,
+        "max": 1.964998,
+        "median": 1.857532,
+        "min": 1.750066,
+        "spread": 0.21493200000000012,
+        "values": [
+          1.750066,
+          1.964998
+        ]
+      },
+      "metrics": {
+        "bytes_per_completion_token": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 4684618137.6,
+            "median": 4684618137.6,
+            "min": 4684618137.6,
+            "spread": 0.0,
+            "values": [
+              4684618137.6,
+              4684618137.6
+            ]
+          },
+          "values": [
+            4684618137.6,
+            4684618137.6
+          ]
+        },
+        "cache_admissions": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "cache_evictions": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "cold_misses": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 5256.0,
+            "median": 5256.0,
+            "min": 5256.0,
+            "spread": 0.0,
+            "values": [
+              5256.0,
+              5256.0
+            ]
+          },
+          "values": [
+            5256.0,
+            5256.0
+          ]
+        },
+        "expert_bytes_read": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 70269272064.0,
+            "median": 70269272064.0,
+            "min": 70269272064.0,
+            "spread": 0.0,
+            "values": [
+              70269272064.0,
+              70269272064.0
+            ]
+          },
+          "values": [
+            70269272064.0,
+            70269272064.0
+          ]
+        },
+        "expert_io_wait_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.016946827224811296,
+            "count": 2,
+            "max": 6130.127,
+            "median": 6027.972,
+            "min": 5925.817,
+            "spread": 204.3100000000004,
+            "values": [
+              6130.127,
+              5925.817
+            ]
+          },
+          "values": [
+            6130.127,
+            5925.817
+          ]
+        },
+        "expert_pread_calls": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 5256.0,
+            "median": 5256.0,
+            "min": 5256.0,
+            "spread": 0.0,
+            "values": [
+              5256.0,
+              5256.0
+            ]
+          },
+          "values": [
+            5256.0,
+            5256.0
+          ]
+        },
+        "hit_rate": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 0.1511627906976744,
+            "median": 0.1511627906976744,
+            "min": 0.1511627906976744,
+            "spread": 0.0,
+            "values": [
+              0.1511627906976744,
+              0.1511627906976744
+            ]
+          },
+          "values": [
+            0.1511627906976744,
+            0.1511627906976744
+          ]
+        },
+        "hot_hits": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 936.0,
+            "median": 936.0,
+            "min": 936.0,
+            "spread": 0.0,
+            "values": [
+              936.0,
+              936.0
+            ]
+          },
+          "values": [
+            936.0,
+            936.0
+          ]
+        },
+        "itl_p50_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.013366344510671866,
+            "count": 2,
+            "max": 398.0465,
+            "median": 392.79625,
+            "min": 387.546,
+            "spread": 10.500499999999988,
+            "values": [
+              398.0465,
+              387.546
+            ]
+          },
+          "values": [
+            398.0465,
+            387.546
+          ]
+        },
+        "itl_p95_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0010928763297259384,
+            "count": 2,
+            "max": 474.13019999999995,
+            "median": 473.6126,
+            "min": 473.095,
+            "spread": 1.035199999999918,
+            "values": [
+              474.13019999999995,
+              473.095
+            ]
+          },
+          "values": [
+            474.13019999999995,
+            473.095
+          ]
+        },
+        "metadata_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 88088.0,
+            "median": 88088.0,
+            "min": 88088.0,
+            "spread": 0.0,
+            "values": [
+              88088.0,
+              88088.0
+            ]
+          },
+          "values": [
+            88088.0,
+            88088.0
+          ]
+        },
+        "peak_rss_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.2780698512610819,
+            "count": 2,
+            "max": 21078016000.0,
+            "median": 16492068864.0,
+            "min": 11906121728.0,
+            "spread": 9171894272.0,
+            "values": [
+              11906121728.0,
+              21078016000.0
+            ]
+          },
+          "values": [
+            11906121728.0,
+            21078016000.0
+          ]
+        },
+        "resident_expert_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 20963131392.0,
+            "median": 20963131392.0,
+            "min": 20963131392.0,
+            "spread": 0.0,
+            "values": [
+              20963131392.0,
+              20963131392.0
+            ]
+          },
+          "values": [
+            20963131392.0,
+            20963131392.0
+          ]
+        },
+        "resident_slots": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 1568.0,
+            "median": 1568.0,
+            "min": 1568.0,
+            "spread": 0.0,
+            "values": [
+              1568.0,
+              1568.0
+            ]
+          },
+          "values": [
+            1568.0,
+            1568.0
+          ]
+        }
+      },
+      "sources": [
+        {
+          "canonical_run_sha256": "c1e2e19022b0c7516ad4367df700676d0dae40dc8af05bb6efe911f19fbe4c98",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-cache-promotion-fixed-run1.json",
+          "sha256": "049319ff116eea3a1e07b0e50b32a44b038e06db901402f63e147d40251d570c",
+          "timestamp_utc": "2026-08-15T00:50:18.056413+00:00"
+        },
+        {
+          "canonical_run_sha256": "88b41a3226c60957dc19e74e8c394614a49ea88774180837266419d079d170b4",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-cache-promotion-fixed-run2.json",
+          "sha256": "8c5c2ef247757c1774447d1d7e914a9ca09472d40ed8964bd4bcf5c3caaba904",
+          "timestamp_utc": "2026-08-15T01:00:04.713320+00:00"
+        }
+      ],
+      "standard_tokens_per_second": {
+        "coefficient_of_variation": 0.025157011366426407,
+        "count": 2,
+        "max": 1.238016,
+        "median": 1.2076354999999999,
+        "min": 1.177255,
+        "spread": 0.060761000000000065,
+        "values": [
+          1.177255,
+          1.238016
+        ]
+      }
+    }
+  },
+  "configuration": {
+    "NATIVE_SMELT_N": 20,
+    "machine": {
+      "hardware": "Apple M4 Pro",
+      "memory": "48GB"
+    },
+    "model_fingerprint": "807672b318f49dd74567d69a603dbf35434c8d71c900f246150d79a18bc1b6d0",
+    "model_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit",
+    "packed_experts_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts",
+    "repeats_per_group": 2,
+    "warmup": {
+      "initial_requests": 5,
+      "rewarm_requests": 4
+    },
+    "workspace_revision": "9a7e1ef"
+  },
+  "decision": {
+    "failed_gates": [
+      "lru_minimum_standard_tps",
+      "paired_reproducible_improvement",
+      "median_standard_improvement"
+    ],
+    "promote_experimental_cache_defaults": false,
+    "selected_default": "fixed_hot_n20"
+  },
+  "gates": {
+    "correctness_all_runs": true,
+    "lru_minimum_standard_tps": false,
+    "matching_cache_geometry": true,
+    "median_standard_improvement": false,
+    "no_io_bytes_direction_regression": true,
+    "paired_reproducible_improvement": false,
+    "safe_peak_rss": true
+  },
+  "generated_utc": "2026-08-15T01:06:04.440747+00:00",
+  "kind": "dmlx-cache-default-promotion",
+  "policy": {
+    "maximum_peak_rss_bytes": 47244640256,
+    "minimum_lru_standard_tps": 2.0,
+    "stretch_standard_tps": 2.5
+  },
+  "schema_version": 1,
+  "stretch": {
+    "lru_standard_tps_2_5_achieved": false
+  }
+}

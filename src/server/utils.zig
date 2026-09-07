@@ -2,8 +2,15 @@
 const std = @import("std");
 
 /// Escape a string for JSON embedding.
+///
+/// Generated token text may contain partial UTF-8 sequences (byte-level BPE
+/// tokens split at a max_tokens boundary). JSON must be valid Unicode, so
+/// invalid bytes are replaced with U+FFFD instead of being copied verbatim.
 pub fn jsonEscapeInto(list: *std.ArrayList(u8), allocator: std.mem.Allocator, text: []const u8) !void {
-    for (text) |ch| {
+    var i: usize = 0;
+    while (i < text.len) {
+        const ch = text[i];
+        i += 1;
         switch (ch) {
             '"' => try list.appendSlice(allocator, "\\\""),
             '\\' => try list.appendSlice(allocator, "\\\\"),
@@ -17,8 +24,24 @@ pub fn jsonEscapeInto(list: *std.ArrayList(u8), allocator: std.mem.Allocator, te
                     var buf: [6]u8 = undefined;
                     const s = try std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{ch});
                     try list.appendSlice(allocator, s);
-                } else {
+                } else if (ch < 0x80) {
                     try list.append(allocator, ch);
+                } else {
+                    const seq_len = std.unicode.utf8ByteSequenceLength(ch) catch {
+                        try list.appendSlice(allocator, "\xEF\xBF\xBD");
+                        continue;
+                    };
+                    if (i - 1 + seq_len <= text.len) {
+                        const seq = text[i - 1 ..][0..seq_len];
+                        if (std.unicode.utf8Decode(seq)) |_| {
+                            try list.appendSlice(allocator, seq);
+                            i += seq_len - 1;
+                        } else |_| {
+                            try list.appendSlice(allocator, "\xEF\xBF\xBD");
+                        }
+                    } else {
+                        try list.appendSlice(allocator, "\xEF\xBF\xBD");
+                    }
                 }
             },
         }

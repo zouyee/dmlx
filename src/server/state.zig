@@ -129,6 +129,12 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     // 2. Detect architecture
     const arch_name = detectArchitecture(config_content);
     std.log.info("Detected architecture: {s}", .{arch_name});
+    if (config.native and std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
+        const packed_dir = config.expert_packed_dir orelse
+            return error.MissingExpertPackedDir;
+        try native_engine_mod.validatePackedExpertDir(allocator, packed_dir);
+        std.log.info("Native packed experts validated before tokenizer/model load: {s}", .{packed_dir});
+    }
     const model_name = try allocator.dupe(u8, arch_name);
 
     // 3. Load tokenizer (shared between native and MLX paths)
