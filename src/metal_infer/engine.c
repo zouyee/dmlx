@@ -4950,26 +4950,29 @@ static int moe_infer_forward_layer_impl(
     // `hidden` is the mHC-expanded residual: [MHC_MULT, DIM] contiguous, in place.
     float *residual = hidden;
 
-    // Track whether the deferred readback already put the correct data into buf_residual_gpu.
-    // If deferred gpu_combined was true → GPU wrote buf_residual_gpu → we read it to CPU residual
-    // → buf_residual_gpu still has correct data → no need to sync.
-    // In all other cases (no deferred, deferred with gpu_combined=false, batch path after clear)
-    // → residual has data that is NOT yet in buf_residual_gpu → must sync.
+    // Track whether buf_residual_gpu already holds the correct residual for
+    // this layer (written by the previous layer's deferred cb3 on the GPU).
+    // If deferred gpu_combined was true → GPU wrote buf_residual_gpu → no sync.
+    // In all other cases (layer 0 of a token, batch path after clear, embed was
+    // the last writer) → residual has data that is NOT yet in buf_residual_gpu
+    // → must sync.
     bool gpu_residual_current = false;
 
-    // === Wait for deferred cb3 from previous layer (deferred mhc_post_ffn) ===
-    // cb3(N-1) wrote buf_residual_gpu. We wait here, then read residual back to CPU.
-    // Metal queue is serial: CB-A(N) will execute after cb3(N-1) anyway, but we
-    // need the CPU-side residual[] update before using it in CB-A's mhc_pre.
+    // === Drain deferred cb3 handle from previous layer (deferred mhc_post_ffn) ===
+    // Production path: NO waitUntilCompleted, NO readback. cb3(N-1) wrote
+    // buf_residual_gpu; the command queue is serial, so it completes before any
+    // of this layer's CBs execute — the GPU buffer is already the correct
+    // residual and CPU residual[] is intentionally left stale. Configurations
+    // that need the residual on the CPU (debug_capture / MF_DBG / DSpark
+    // accumulate on layers 40-42) drain synchronously at the cb3 commit site
+    // and never arm the deferred slot. The batch scalar-fallback loop drains
+    // the deferred slot itself (wait + readback into the previous token's
+    // hidden) before calling into this function.
     if (eng->deferred.active && eng->deferred.cmd_experts) {
-        [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
         [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
         eng->deferred.cmd_experts = NULL;
         eng->deferred.active = false;
         if (eng->deferred.gpu_combined) {
-            // Read updated residual from buf_residual_gpu → CPU residual[]
-            float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
-            memcpy(residual, gpu_res, MHC_MULT * DIM * sizeof(float));
             eng->deferred.gpu_combined = false;
             gpu_residual_current = true;  // buf_residual_gpu already has correct data
         }
@@ -4987,9 +4990,9 @@ static int moe_infer_forward_layer_impl(
         0);
 
     // Sync CPU residual → buf_residual_gpu only when needed (not already current).
-    // Skip when deferred gpu readback just provided the data (it's already correct in GPU buf).
-    // Always sync for: layer 0 (no deferred), batch path (deferred cleared without readback),
-    // or when embed was the last writer.
+    // Skip when the previous layer's deferred cb3 left the correct data in the
+    // GPU buffer. Always sync for: layer 0 of a token (no deferred), the batch
+    // path (deferred cleared without readback), or when embed was the last writer.
     if (!gpu_residual_current && eng->buf_residual_gpu) {
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents],
                residual, (size_t)MHC_MULT * DIM * sizeof(float));
@@ -6073,8 +6076,11 @@ static int moe_infer_forward_layer_impl(
             exact_q4_moe_encode_begin = moe_infer_monotonic_ns();
         // buf_ffn_out_f32 already holds the ffn output (written by the GPU add
         // above, committed earlier on this queue — ordering is by commit).
-        // IMPORTANT: Upload post-attention residual to GPU — mhc_post_ffn needs it
-        memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents], residual, MHC_MULT * DIM * sizeof(float));
+        // buf_residual_gpu already holds the post-attention residual: cb2cmd2's
+        // Enc3 (bf16_to_f32_vec from buf_mhc_post_res_out) wrote it, and the
+        // CPU residual[] read back from the same bf16 buffer converts
+        // bit-identically (float(bfloat) == u<<16, exact), so the former CPU
+        // re-upload here was a bit-exact no-op and is removed.
         // buf_mhc_post_weights/comb_weights already hold correct FFN values from cb2cmd2.
         // (The previous uninitialized post/comb upload was a latent bug masked by commandBuffer
         //  retaining the correct buffer state from cb2cmd2's kernel output.)
@@ -6110,26 +6116,52 @@ static int moe_infer_forward_layer_impl(
         [cb3 commit];
         const uint64_t timeline_cb3_post_commit = decode_timeline_recording
             ? moe_infer_decode_timeline_now_ns() : 0u;
-        [cb3 waitUntilCompleted];
+        // Consumers that need the residual on the CPU right after this layer:
+        // debug_capture (LAYER_OUTPUT record below), MF_DBG dumps, and the
+        // DSpark target-hidden accumulate in moe_infer_forward (layers 40-42).
+        const bool need_cpu_residual =
+            eng->debug_capture || getenv("MF_DBG") ||
+            (eng->dspark_engine && eng->dspark_accumulate_enabled &&
+             (layer == 40 || layer == 41 || layer == 42));
+        if (need_cpu_residual) {
+            // Synchronous drain, matching the pre-deferred behavior: wait for
+            // cb3 and read the new residual back into CPU residual[].
+            [cb3 waitUntilCompleted];
+            memcpy(residual, [(id<MTLBuffer>)eng->buf_residual_gpu contents],
+                   (size_t)MHC_MULT * DIM * sizeof(float));
+            if (eng->deferred.cmd_experts) {
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+            }
+            eng->deferred.cmd_experts  = NULL;
+            eng->deferred.active       = false;
+            eng->deferred.gpu_combined = false;
+        } else {
+            // Production path: no wait, no readback. Arm the deferred slot so
+            // the residual stays GPU-resident — the next layer's drain binds
+            // buf_residual_gpu directly, and the moe_infer_forward /
+            // forward_batch end-of-layer drains perform the single wait +
+            // readback at the token/layer boundary where a CPU consumer
+            // (logits, next token's hidden) actually needs the value.
+            // mhc_post_ffn_expand4 rounds its output through bfloat
+            // (float(bfloat(acc)), same rounding the old 3-encoder cb3 had),
+            // so the GPU-resident residual is bit-identical to the value the
+            // removed CPU round trip used to carry.
+            if (eng->deferred.cmd_experts) {
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
+                [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
+            }
+            eng->deferred.cmd_experts  = [cb3 retain];
+            eng->deferred.active       = true;
+            eng->deferred.gpu_combined = true;
+        }
         const uint64_t timeline_cb3_post_wait = decode_timeline_recording
             ? moe_infer_decode_timeline_now_ns() : 0u;
-        // Read residual from GPU buffer (cb3 wrote buf_residual_gpu)
-        {
-            float *gpu_res = (float *)[(id<MTLBuffer>)eng->buf_residual_gpu contents];
-            memcpy(residual, gpu_res, (size_t)MHC_MULT * DIM * sizeof(float));
-        }
         if (decode_timeline_recording) decode_timeline_record(
             eng, (uint16_t)layer, DMLX_DECODE_TIMELINE_CB3_CB,
             timeline_cb3_begin, timeline_cb3_encode_done,
             timeline_cb3_pre_commit, timeline_cb3_post_commit,
             timeline_cb3_post_wait, moe_infer_decode_timeline_now_ns());
-        if (eng->deferred.cmd_experts) {
-            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts waitUntilCompleted];
-            [(id<MTLCommandBuffer>)eng->deferred.cmd_experts release];
-        }
-        eng->deferred.cmd_experts  = NULL;
-        eng->deferred.active       = false;
-        eng->deferred.gpu_combined = false;
     }
     if (layer == 0 && getenv("MF_DBG")) {
         double fn=0; for(int z=0;z<DIM;z++) fn+=(double)ffn_out[z]*ffn_out[z];
