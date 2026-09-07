@@ -4643,7 +4643,19 @@ static int moe_forward_layer(MoEInferEngine *eng, int layer_idx,
         const uint64_t gpu_post_commit_ns = gpu_timestamp_recording
             ? moe_infer_monotonic_ns() : 0u;
 #endif
-        [cb waitUntilCompleted];
+        // Production: no wait. Every CPU-side consumer of the state this CB
+        // reads (pread/prefetch/SMELT backing buffers, buf_gather_expert_ids,
+        // blob wrapper release) runs after the NEXT layer's routing readback,
+        // whose cb2cmd2 waitUntilCompleted transitively waits for this CB on
+        // the serial queue; the last layer is covered by the token-end cb3
+        // drain. Diagnostic modes still wait because they read GPUEndTime.
+#if DMLX_GPU_TIMESTAMP_PROBE
+        if (time_en || gpu_timestamp_recording) {
+#else
+        if (time_en) {
+#endif
+            [cb waitUntilCompleted];
+        }
         const uint64_t timeline_routed_post_wait = decode_timeline_recording
             ? moe_infer_decode_timeline_now_ns() : 0u;
         if (decode_timeline_recording) decode_timeline_record(
