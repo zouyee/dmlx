@@ -1,0 +1,2353 @@
+{
+  "schema_version": 1,
+  "protocol": "dsv4-mhc-pre-parallel-screen-protocol.json",
+  "collection_command": "python3 scripts/mhc_pre_parallel_screen.py --collect",
+  "verification_command": "python3 scripts/mhc_pre_parallel_screen.py",
+  "compile_command": "clang -Wall -Wextra -Werror -framework Metal -framework Foundation -fobjc-arc scripts/mhc_pre_parallel_gpu_test.m -o /tmp/mhc_pre_parallel_gpu_test",
+  "build_identity": {
+    "harness_source_sha256": "4ff6e0ce31160ec70b75dd5349e6231671e63027110d960d15b5091ed210c0bd",
+    "harness_metal_sha256": "27c40f036ff991602357166d57b13f564c9d5b5177a43fb78fb0fc7ca57e6d06",
+    "production_kernel_sha256": "2d5da4c66e7087ce35bd14be91aa81ab279de33ea270484fc06eb93c184d5aaf"
+  },
+  "runs": [
+    {
+      "schema_version": 1,
+      "process_ordinal": 1,
+      "process_id": 94437,
+      "oracle_status": "PASS",
+      "harness_source_sha256": "4ff6e0ce31160ec70b75dd5349e6231671e63027110d960d15b5091ed210c0bd",
+      "harness_metal_sha256": "27c40f036ff991602357166d57b13f564c9d5b5177a43fb78fb0fc7ca57e6d06",
+      "production_kernel_sha256": "2d5da4c66e7087ce35bd14be91aa81ab279de33ea270484fc06eb93c184d5aaf",
+      "topology": "1cb/1encoder/1dispatch/1commit/1wait/1x256",
+      "events": [
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 1192334
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 1043708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 0,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 942958
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 1042792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 935334
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 1,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 1219125
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 934917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 1196542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 2,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 1048208
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 456666
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 429250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 3,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 379417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 421625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 369916
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 4,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 457542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 385834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 401750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 5,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 372917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 408917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 372375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 6,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 317958
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 372708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 328000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 7,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 408000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 344333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 446542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 8,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 400917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 463667
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 433416
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 9,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 362375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 10,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 421125
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 10,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 344042
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 10,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 414375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 11,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 330041
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 11,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 471333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 11,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 388375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 12,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 402292
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 12,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 386417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 12,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 317625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 13,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 396834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 13,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 352833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 13,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 446875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 14,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 371750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 14,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 462875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 14,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 433292
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 15,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 456333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 15,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 395792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 15,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 337041
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 16,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 372834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 16,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 318292
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 16,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 408625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 17,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 317875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 17,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 401125
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 17,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 389792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 18,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 440500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 18,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 396792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 18,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 355916
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 19,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 444542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 19,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 361792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 19,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 471917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 20,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 383459
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 20,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 405083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 1,
+          "iteration": 20,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 386417
+        }
+      ]
+    },
+    {
+      "schema_version": 1,
+      "process_ordinal": 2,
+      "process_id": 94441,
+      "oracle_status": "PASS",
+      "harness_source_sha256": "4ff6e0ce31160ec70b75dd5349e6231671e63027110d960d15b5091ed210c0bd",
+      "harness_metal_sha256": "27c40f036ff991602357166d57b13f564c9d5b5177a43fb78fb0fc7ca57e6d06",
+      "production_kernel_sha256": "2d5da4c66e7087ce35bd14be91aa81ab279de33ea270484fc06eb93c184d5aaf",
+      "topology": "1cb/1encoder/1dispatch/1commit/1wait/1x256",
+      "events": [
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 424250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 362500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 0,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 467000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 362292
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 466875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 1,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 418333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 467041
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 418209
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 2,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 399000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 459333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 416959
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 3,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 546708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 407250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 469833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 4,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 428291
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 476875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 430083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 5,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 361958
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 430125
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 362166
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 6,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 474208
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 403625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 520666
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 7,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 490417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 552541
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 498291
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 8,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 429875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 471708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 362958
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 9,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 477333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 10,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 396875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 10,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 466625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 10,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 458250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 11,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 490833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 11,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 460416
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 11,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 406542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 12,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 482333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 12,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 426000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 12,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 552083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 13,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 422417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 13,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 560750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 13,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 483458
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 14,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 476709
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 14,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 436833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 14,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 375458
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 15,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 432000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 15,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 376417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 15,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 517042
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 16,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 398583
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 16,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 581833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 16,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 539625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 17,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 546333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 17,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 542417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 17,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 448417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 18,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 418250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 18,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 416084
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 18,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 467000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 19,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 408708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 19,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 466958
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 19,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 466167
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 20,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 529500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 20,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 486834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 2,
+          "iteration": 20,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 484708
+        }
+      ]
+    },
+    {
+      "schema_version": 1,
+      "process_ordinal": 3,
+      "process_id": 94442,
+      "oracle_status": "PASS",
+      "harness_source_sha256": "4ff6e0ce31160ec70b75dd5349e6231671e63027110d960d15b5091ed210c0bd",
+      "harness_metal_sha256": "27c40f036ff991602357166d57b13f564c9d5b5177a43fb78fb0fc7ca57e6d06",
+      "production_kernel_sha256": "2d5da4c66e7087ce35bd14be91aa81ab279de33ea270484fc06eb93c184d5aaf",
+      "topology": "1cb/1encoder/1dispatch/1commit/1wait/1x256",
+      "events": [
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": null
+        },
+        {
+          "phase": "warmup",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": null
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241875
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 301291
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 0,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290959
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 299166
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 1,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290000
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 2,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 3,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 289917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297209
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 289584
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 4,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 292666
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 242500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 5,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 299417
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 6,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290916
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 7,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 244708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 8,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 300833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240208
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297541
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 9,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 10,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 298458
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 10,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291834
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 10,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 242792
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 11,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290708
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 11,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241083
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 11,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 297041
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 12,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 12,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 301125
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 12,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 289625
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 13,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 296791
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 13,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290583
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 13,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241333
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 14,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291791
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 14,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 242042
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 14,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 298667
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 15,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 15,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 296917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 15,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 292375
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 16,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 298250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 16,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290042
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 16,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 241916
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 17,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 291500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 17,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240542
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 17,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 296833
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 18,
+          "step": 0,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 240750
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 18,
+          "step": 1,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 298917
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 18,
+          "step": 2,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 292709
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 19,
+          "step": 0,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 300250
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 19,
+          "step": 1,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 290416
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 19,
+          "step": 2,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 243667
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 20,
+          "step": 0,
+          "arm": "simdgroup_per_row_wave8",
+          "duration_ns": 293166
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 20,
+          "step": 1,
+          "arm": "eight_lane_per_row",
+          "duration_ns": 243500
+        },
+        {
+          "phase": "measured",
+          "process_ordinal": 3,
+          "iteration": 20,
+          "step": 2,
+          "arm": "serial_one_lane_per_row",
+          "duration_ns": 298209
+        }
+      ]
+    }
+  ],
+  "medians_ns": [
+    {
+      "serial_one_lane_per_row": 446875,
+      "simdgroup_per_row_wave8": 396834,
+      "eight_lane_per_row": 355916
+    },
+    {
+      "serial_one_lane_per_row": 477333,
+      "simdgroup_per_row_wave8": 459333,
+      "eight_lane_per_row": 403625
+    },
+    {
+      "serial_one_lane_per_row": 298209,
+      "simdgroup_per_row_wave8": 290959,
+      "eight_lane_per_row": 241333
+    }
+  ],
+  "candidates": {
+    "simdgroup_per_row_wave8": {
+      "ratios": [
+        {
+          "numerator": 396834,
+          "denominator": 446875,
+          "decimal": 0.8880201398601398
+        },
+        {
+          "numerator": 51037,
+          "denominator": 53037,
+          "decimal": 0.9622904764598299
+        },
+        {
+          "numerator": 290959,
+          "denominator": 298209,
+          "decimal": 0.9756881918386099
+        }
+      ],
+      "viable": false,
+      "exact_product_score": {
+        "numerator": 1964285241262274,
+        "denominator": 2355941494603125,
+        "decimal": 0.8337580732636877
+      }
+    },
+    "eight_lane_per_row": {
+      "ratios": [
+        {
+          "numerator": 32356,
+          "denominator": 40625,
+          "decimal": 0.7964553846153846
+        },
+        {
+          "numerator": 403625,
+          "denominator": 477333,
+          "decimal": 0.8455836910500636
+        },
+        {
+          "numerator": 241333,
+          "denominator": 298209,
+          "decimal": 0.8092747033121066
+        }
+      ],
+      "viable": false,
+      "exact_product_score": {
+        "numerator": 25213874299492,
+        "denominator": 46262123894025,
+        "decimal": 0.5450219786115031
+      }
+    }
+  },
+  "result": "REJECTED",
+  "authority": "standalone_mapping_recommendation_only_no_production_authority"
+}

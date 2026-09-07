@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_remeasurement",
+  "subject": "standalone_mhc_pre_dense_dot_operational_candidate",
+  "production_code_changes_allowed": false,
+  "arms": ["full_fused", "dense_dot_only_with_precomputed_norm", "phase_b_only"],
+  "topology_per_sample": {"command_buffers":1,"compute_encoders":1,"dispatches":1,"commits":1,"waits":1,"threadgroups":1,"threads_per_threadgroup":256},
+  "timing": "MTLCounterSamplingPointAtStageBoundary_GPUTimestamp",
+  "warmups_per_arm": 10,
+  "measured_repetitions_per_arm": 21,
+  "arm_order": "rotating_interleaved_by_repetition",
+  "estimator": "per_arm_median_of_21_raw_gpu_durations_then_dot_median_divided_by_full_median",
+  "independent_process_runs": 3,
+  "support_rule": "retain_operational_candidate_only_if_all_three_process_ratios_gte_0.70",
+  "threshold": 0.70,
+  "invalidity": ["nonpositive_timestamp_pair","nonfinite_full_output","nonrepeatable_full_output","cpu_oracle_mismatch","missing_or_duplicate_process_identity","missing_raw_sample","topology_mismatch","source_hash_mismatch"],
+  "authority": "isolated_arm_operational_candidate_only_non_additive_no_causal_ownership_no_production_speedup_or_kernel_implementation_authority"
+}

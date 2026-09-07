@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "protocol": "dsv4-mhc-pre-investigation-protocol.json",
+  "device": "Apple M4 Pro",
+  "result": "OPERATIONAL_CANDIDATE_RETAINED",
+  "replay_command": "clang -Wall -Wextra -Werror -framework Metal -framework Foundation -fobjc-arc scripts/mhc_pre_gpu_test.m -o /tmp/mhc_pre_gpu_test && /tmp/mhc_pre_gpu_test",
+  "verifier_command": "python3 scripts/verify_mhc_pre_evidence.py",
+  "build_identity": {
+    "harness_sha256": "8bcef0446e226f64d140b18fcf1a304ebe25ed3a34c7c7ee493b94aa7859844a",
+    "production_kernel_sha256": "2d5da4c66e7087ce35bd14be91aa81ab279de33ea270484fc06eb93c184d5aaf"
+  },
+  "runs": [
+    {"ordinal":1,"process_id":33933,"oracle_status":"PASS","full_raw_ns":[437959,502000,447042,478166,630375,438209,436000,436875,482750,491834,496709,470708,437041,491292,497500,498250,499250,456041,437750,448041,480958],"dot_raw_ns":[400583,587584,440333,450125,458417,401041,400708,400875,439791,456375,457416,401250,420834,445166,450666,458167,459250,400834,401209,401000,440416],"phase_b_raw_ns":[14958,16875,14333,16250,301291,14666,14625,14625,16042,16542,16292,16333,14500,14791,15709,16584,16375,16583,14541,14750,16708],"full_median_ns":478166,"dot_median_ns":440333,"phase_b_median_ns":16042,"dot_full_ratio":0.920879},
+    {"ordinal":2,"process_id":33961,"oracle_status":"PASS","full_raw_ns":[586375,501083,505166,504459,560917,590750,520042,501833,501541,566791,582917,587042,561709,511125,554458,954042,590542,588042,866542,567666,591375],"dot_raw_ns":[461041,461083,464500,461750,510542,540209,464917,461667,461750,510750,539708,539125,463417,461291,546459,611292,539917,550833,498375,520708,546833],"phase_b_raw_ns":[16625,16625,16625,18375,18167,19125,16541,16708,16292,18042,18833,18542,16500,17084,16583,18625,19000,18875,18250,18959,19250],"full_median_ns":566791,"dot_median_ns":510542,"phase_b_median_ns":18167,"dot_full_ratio":0.900759},
+    {"ordinal":3,"process_id":33962,"oracle_status":"PASS","full_raw_ns":[508875,482458,511542,870167,444042,450083,827458,444584,671042,441750,444625,545917,497833,589041,580250,441625,460625,794250,416333,576042,444916],"dot_raw_ns":[497875,708083,496625,463417,406375,483916,496667,444625,446417,406167,406000,764584,417875,517584,416209,408125,407375,430166,464917,452250,406084],"phase_b_raw_ns":[14375,17417,15458,14542,14333,14250,17708,15542,14334,14458,14167,14417,16500,14334,14417,17333,13083,14333,15000,207750,14709],"full_median_ns":497833,"dot_median_ns":446417,"phase_b_median_ns":14458,"dot_full_ratio":0.896720}
+  ],
+  "decision": {
+    "threshold": 0.70,
+    "all_processes_pass": true,
+    "scope": "isolated-arm operational candidate evidence; separately compiled variant durations are non-additive and are not fused-duration fractions or causal ownership",
+    "numerical_validation": "internal CPU reference passed for 24 isolated dots and production fused post/comb/attn_input/normed outputs in every process",
+    "authority": "no production speedup or kernel implementation authorization"
+  }
+}

@@ -1,0 +1,83 @@
+{
+  "schema_version": 1,
+  "decision": "NOT_PROVEN",
+  "task": "1.1 Collect three-process fixed-hot clean-start baseline",
+  "protocol_sha256": "fdd5cb981a7ea4d2fe7b07ce7fa37f6b78581cb9ae38f70ae6aee31a7b54ef79",
+  "runs": [
+    {
+      "id": "run1",
+      "benchmark_sha256": "259378ecf463d79ead990dbd221e055e5c65cb8afb4a9e5c24fab8913e096760",
+      "raw_sha256": "e1afb608ecf1b5a51fa59146c91ce97e2bcfaba6762f38784e3a55ab9f4f8454",
+      "standard_median_tok_s": 1.241372,
+      "long_decode_tok_s": 1.972701,
+      "peak_rss_bytes": 10374496256,
+      "cold_misses": 5256,
+      "hot_hits": 936,
+      "requested_bytes": 70269272064,
+      "read_bytes": 70269272064,
+      "short_reads": 0,
+      "io_wait_ms": 5935.027,
+      "paris_pass": true,
+      "e2e": "7/7"
+    },
+    {
+      "id": "run2",
+      "benchmark_sha256": "77261aa8482a2e986000d372f82192253861d5a801e5aa686a76cbc1e696723f",
+      "raw_sha256": "bf7723c33688ac0dfc628097a375a45ba679fcce54f172d11bf72985797aa583",
+      "standard_median_tok_s": 1.236011,
+      "long_decode_tok_s": 1.854194,
+      "peak_rss_bytes": 18460475392,
+      "cold_misses": 5256,
+      "hot_hits": 936,
+      "requested_bytes": 70269272064,
+      "read_bytes": 70269272064,
+      "short_reads": 0,
+      "io_wait_ms": 5917.597,
+      "paris_pass": true,
+      "e2e": "7/7"
+    },
+    {
+      "id": "run3",
+      "benchmark_sha256": "7292e018e6d06de5e91d7bd832a5dab533367b6f0acd70d46e3168d287b905ef",
+      "raw_sha256": "a85819f3f5dd841509a971ade9dd749b9b0250889ab933ab9729ed8f06ecadae",
+      "standard_median_tok_s": 1.185289,
+      "long_decode_tok_s": 1.970453,
+      "peak_rss_bytes": 19017236480,
+      "cold_misses": 5256,
+      "hot_hits": 936,
+      "requested_bytes": 70269272064,
+      "read_bytes": 70269272064,
+      "short_reads": 0,
+      "io_wait_ms": 6015.977,
+      "paris_pass": true,
+      "e2e": "7/7"
+    }
+  ],
+  "gates": {
+    "correctness": "PASS",
+    "throughput_and_request_wall": "PASS",
+    "peak_rss_below_44_gib": "PASS",
+    "expert_io_totals": "PASS",
+    "zero_short_reads": "PASS",
+    "exact_q4_complete_no_overflow": "PASS",
+    "frozen_binary_model_tokenizer_packed_tool_hashes": "NOT_PROVEN",
+    "three_independent_process_identities": "NOT_PROVEN",
+    "same_backed_up_and_restored_routing_stats_seed": "NOT_PROVEN",
+    "clean_start_serial_lifecycle_per_run": "NOT_PROVEN",
+    "no_residual_server_bound_to_run_lifecycle": "NOT_PROVEN"
+  },
+  "failed_required_evidence": [
+    "source_hashes",
+    "process_identity",
+    "routing_stats_seed_identity_and_restore_events",
+    "cleanup_and_process_lifecycle"
+  ],
+  "rationale": "R2.3 makes missing, overflowed, or incomplete evidence invalid and forbids replacing it with a favorable subset. Current filesystem hashes cannot retroactively prove the binary, model, tokenizer, packed experts, or tools used by historical runs; timestamps and matching counters cannot prove independent clean-start processes or seed restoration.",
+  "dependency_effect": {
+    "task_2_1": "BLOCKED_BY_REJECTED_DEPENDENCY",
+    "task_3_1": "BLOCKED_BY_REJECTED_DEPENDENCY",
+    "task_4_1": "BLOCKED_BY_REJECTED_DEPENDENCY"
+  },
+  "default_decision": "keep_fixed_hot_default",
+  "rerun_or_sample_replacement_authorized": false
+}

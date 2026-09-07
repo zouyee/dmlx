@@ -962,6 +962,428 @@ kernel void gather_down(
 }
 
 // ============================================================================
+// Wave-4 bucket input gather — stable expert bucket rows -> contiguous [M,H]
+// ============================================================================
+//
+// NativeActivationPairGPU deliberately mirrors NativeActivationPair's 16-byte
+// C ABI. The host validates the complete bucket index and every token id before
+// dispatch. The defensive device-side token check prevents malformed metadata
+// from reading beyond [B,H] even if this kernel is invoked independently.
+//
+// One threadgroup copies a 256-column tile for one bucket row. The row token is
+// initialized cooperatively before the barrier; row/column tail masking occurs
+// only after every lane has crossed that barrier. This permits safe row-tail
+// over-dispatch in the standalone kernel tests.
+struct NativeActivationPairGPU {
+    uint token_id;
+    uint expert_id;
+    uint route_rank;
+    float weight;
+};
+
+kernel void bucket_gather_f32(
+    device const float* source_rows [[buffer(0)]], // [batch_tokens, hidden_dim]
+    device const NativeActivationPairGPU* bucketed_pairs [[buffer(1)]],
+    device float* gathered_rows [[buffer(2)]],     // [bucket_count, hidden_dim]
+    constant uint& bucket_start [[buffer(3)]],
+    constant uint& bucket_count [[buffer(4)]],
+    constant uint& batch_tokens [[buffer(5)]],
+    constant uint& hidden_dim [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint row = tgid.y;
+    threadgroup uint source_token;
+    if (lid == 0u) {
+        source_token = row < bucket_count
+            ? bucketed_pairs[bucket_start + row].token_id
+            : UINT_MAX;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint column = tgid.x * 256u + lid;
+    if (row >= bucket_count || column >= hidden_dim ||
+        source_token >= batch_tokens) {
+        return;
+    }
+    gathered_rows[(size_t)row * hidden_dim + column] =
+        source_rows[(size_t)source_token * hidden_dim + column];
+}
+
+// ============================================================================
+// Wave-4 multi-token MXFP4 gate/up + limited SwiGLU
+// ============================================================================
+//
+// One Y grid row is one activation in an expert bucket. A 256-thread group
+// cooperatively stages that token's input once, then eight SIMD groups compute
+// eight output rows. Invalid/tail token groups initialize shared memory to zero
+// and cross the barrier before returning. E8M0 uses the required bias=127 via
+// fp8_e8m0_to_float; accumulation intentionally mirrors the established scalar
+// kernel rather than introducing an FMA rewrite.
+kernel void bucket_mxfp4_gate_up_swiglu(
+    device const uint32_t* gate_W [[buffer(0)]],
+    device const uint8_t* gate_s [[buffer(1)]],
+    device const uint32_t* up_W [[buffer(2)]],
+    device const uint8_t* up_s [[buffer(3)]],
+    device const float* input_rows [[buffer(4)]], // [bucket_count, in_dim]
+    device float* output_rows [[buffer(5)]],      // [bucket_count, out_dim]
+    constant uint& bucket_count [[buffer(6)]],
+    constant uint& out_dim [[buffer(7)]],
+    constant uint& in_dim [[buffer(8)]],
+    constant uint& group_size [[buffer(9)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint token = tgid.y;
+    const bool token_valid = token < bucket_count;
+    threadgroup float input_shared[4096];
+    for (uint column = lid; column < in_dim; column += 256u) {
+        input_shared[column] = token_valid
+            ? input_rows[(size_t)token * in_dim + column]
+            : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid.x * 8u + simd_group;
+    if (!token_valid || row >= out_dim) return;
+
+    const uint packed_cols = in_dim / 8u;
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8u;
+    device const uint32_t* gate_row = gate_W + (size_t)row * packed_cols;
+    device const uint32_t* up_row = up_W + (size_t)row * packed_cols;
+    device const uint8_t* gate_scale = gate_s + (size_t)row * num_groups;
+    device const uint8_t* up_scale = up_s + (size_t)row * num_groups;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint group = simd_lane; group < num_groups; group += 32u) {
+        const float gate_sf = fp8_e8m0_to_float(gate_scale[group]);
+        const float up_sf = fp8_e8m0_to_float(up_scale[group]);
+        const uint packed_base = group * packed_per_group;
+        const uint input_base = group * group_size;
+        for (uint packed_index = 0u;
+             packed_index < packed_per_group;
+             ++packed_index) {
+            const uint32_t gate_word = gate_row[packed_base + packed_index];
+            const uint32_t up_word = up_row[packed_base + packed_index];
+            const uint column = input_base + packed_index * 8u;
+            for (uint nibble = 0u; nibble < 8u; ++nibble) {
+                const uint shift = nibble * 4u;
+                const float input = input_shared[column + nibble];
+                gate_acc += NIBBLE_TO_FLOAT[(gate_word >> shift) & 0xfu] *
+                    gate_sf * input;
+                up_acc += NIBBLE_TO_FLOAT[(up_word >> shift) & 0xfu] *
+                    up_sf * input;
+            }
+        }
+    }
+
+    const float gate_value = simd_sum(gate_acc);
+    const float up_value = simd_sum(up_acc);
+    if (simd_lane == 0u) {
+        const float limit = 10.0f;
+        const float gate_clamped = min(gate_value, limit);
+        const float up_clamped = min(max(up_value, -limit), limit);
+        output_rows[(size_t)token * out_dim + row] = (bfloat)(
+            (gate_clamped / (1.0f + exp(-gate_clamped))) * up_clamped);
+    }
+}
+
+// ============================================================================
+// Wave-4 multi-token MXFP4 down projection
+// ============================================================================
+// One Y grid row is one bucket activation. Geometry and barrier discipline
+// match bucket_mxfp4_gate_up_swiglu; output is BF16-rounded into f32 exactly
+// like dequant_matvec_4bit/gather6_down.
+kernel void bucket_mxfp4_down(
+    device const uint32_t* weights [[buffer(0)]],
+    device const uint8_t* scales [[buffer(1)]],
+    device const float* input_rows [[buffer(2)]], // [bucket_count, in_dim]
+    device float* output_rows [[buffer(3)]],      // [bucket_count, out_dim]
+    constant uint& bucket_count [[buffer(4)]],
+    constant uint& out_dim [[buffer(5)]],
+    constant uint& in_dim [[buffer(6)]],
+    constant uint& group_size [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint token = tgid.y;
+    const bool token_valid = token < bucket_count;
+    threadgroup float input_shared[4096];
+    for (uint column = lid; column < in_dim; column += 256u) {
+        input_shared[column] = token_valid
+            ? input_rows[(size_t)token * in_dim + column]
+            : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid.x * 8u + simd_group;
+    if (!token_valid || row >= out_dim) return;
+
+    const uint packed_cols = in_dim / 8u;
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8u;
+    device const uint32_t* weight_row =
+        weights + (size_t)row * packed_cols;
+    device const uint8_t* row_scales =
+        scales + (size_t)row * num_groups;
+    float accumulator = 0.0f;
+    for (uint group = simd_lane; group < num_groups; group += 32u) {
+        const float scale = fp8_e8m0_to_float(row_scales[group]);
+        const uint packed_base = group * packed_per_group;
+        const uint input_base = group * group_size;
+        for (uint packed_index = 0u;
+             packed_index < packed_per_group;
+             ++packed_index) {
+            const uint32_t word = weight_row[packed_base + packed_index];
+            const uint column = input_base + packed_index * 8u;
+            for (uint nibble = 0u; nibble < 8u; ++nibble) {
+                accumulator += NIBBLE_TO_FLOAT[
+                    (word >> (nibble * 4u)) & 0xfu] * scale *
+                    input_shared[column + nibble];
+            }
+        }
+    }
+    const float sum = simd_sum(accumulator);
+    if (simd_lane == 0u) {
+        output_rows[(size_t)token * out_dim + row] = (bfloat)sum;
+    }
+}
+
+// ============================================================================
+// Task 4.5 grouped bucket MXFP4 kernels — up to six unique experts/dispatch
+// ============================================================================
+//
+// Consecutive stable expert buckets are encoded in groups of at most six.  The
+// six independent expert blobs mirror gather6, while tgid.y traverses all rows
+// in the group.  group_counts maps each row to a uniform expert slot; bucket
+// rows remain in their global stable order, so deterministic combine is
+// unchanged.  Invalid rows initialize shared memory and cross the barrier
+// before returning.
+kernel void bucket6_mxfp4_gate_up_swiglu(
+    device const uint32_t* blob0 [[buffer(0)]],
+    device const uint32_t* blob1 [[buffer(1)]],
+    device const uint32_t* blob2 [[buffer(2)]],
+    device const uint32_t* blob3 [[buffer(3)]],
+    device const uint32_t* blob4 [[buffer(4)]],
+    device const uint32_t* blob5 [[buffer(5)]],
+    device const float* input_rows [[buffer(6)]], // [pair_count, 4096]
+    device float* output_rows [[buffer(7)]],      // [pair_count, 2048]
+    constant uint& group_base [[buffer(8)]],
+    constant uint* group_counts [[buffer(9)]],    // [6]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint flat_row = tgid.y;
+    uint slot = 6u;
+    uint remaining = flat_row;
+    for (uint candidate = 0u; candidate < 6u; ++candidate) {
+        if (remaining < group_counts[candidate]) {
+            slot = candidate;
+            break;
+        }
+        remaining -= group_counts[candidate];
+    }
+    const bool token_valid = slot < 6u;
+    const uint bucket_row = group_base + flat_row;
+    threadgroup float input_shared[4096];
+    for (uint column = lid; column < 4096u; column += 256u) {
+        input_shared[column] = token_valid
+            ? input_rows[(size_t)bucket_row * 4096u + column]
+            : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid.x * 8u + simd_group;
+    if (!token_valid || row >= 2048u) return;
+
+    device const uint32_t* blob = blob0;
+    switch (slot) {
+        case 1u: blob = blob1; break;
+        case 2u: blob = blob2; break;
+        case 3u: blob = blob3; break;
+        case 4u: blob = blob4; break;
+        case 5u: blob = blob5; break;
+        default: break;
+    }
+    const uint packed_cols = 4096u / 8u;
+    const uint num_groups = 4096u / 32u;
+    const uint packed_per_group = 32u / 8u;
+    const uint gate_scale_byte = 4194304u + row * num_groups;
+    const uint up_weight_u32 = 4456448u / 4u;
+    const uint up_scale_byte = 8650752u + row * num_groups;
+    device const uint32_t* gate_row = blob + (size_t)row * packed_cols;
+    device const uint32_t* up_row = blob + up_weight_u32 +
+        (size_t)row * packed_cols;
+
+    float gate_acc = 0.0f;
+    float up_acc = 0.0f;
+    for (uint group = simd_lane; group < num_groups; group += 32u) {
+        const uint gate_index = gate_scale_byte + group;
+        const uint up_index = up_scale_byte + group;
+        const float gate_scale = exp2((float)(uint8_t)(
+            (blob[gate_index >> 2u] >> ((gate_index & 3u) << 3u)) & 0xffu) -
+            127.0f);
+        const float up_scale = exp2((float)(uint8_t)(
+            (blob[up_index >> 2u] >> ((up_index & 3u) << 3u)) & 0xffu) -
+            127.0f);
+        const uint packed_base = group * packed_per_group;
+        const uint input_base = group * 32u;
+        for (uint packed = 0u; packed < packed_per_group; ++packed) {
+            const uint32_t gate_word = gate_row[packed_base + packed];
+            const uint32_t up_word = up_row[packed_base + packed];
+            const uint column = input_base + packed * 8u;
+            for (uint nibble = 0u; nibble < 8u; ++nibble) {
+                const uint shift = nibble * 4u;
+                const float input = input_shared[column + nibble];
+                gate_acc += NIBBLE_TO_FLOAT[(gate_word >> shift) & 0xfu] *
+                    gate_scale * input;
+                up_acc += NIBBLE_TO_FLOAT[(up_word >> shift) & 0xfu] *
+                    up_scale * input;
+            }
+        }
+    }
+    const float gate_value = simd_sum(gate_acc);
+    const float up_value = simd_sum(up_acc);
+    if (simd_lane == 0u) {
+        const float gate_clamped = min(gate_value, 10.0f);
+        const float up_clamped = min(max(up_value, -10.0f), 10.0f);
+        output_rows[(size_t)bucket_row * 2048u + row] = (bfloat)(
+            (gate_clamped / (1.0f + exp(-gate_clamped))) * up_clamped);
+    }
+}
+
+kernel void bucket6_mxfp4_down(
+    device const uint32_t* blob0 [[buffer(0)]],
+    device const uint32_t* blob1 [[buffer(1)]],
+    device const uint32_t* blob2 [[buffer(2)]],
+    device const uint32_t* blob3 [[buffer(3)]],
+    device const uint32_t* blob4 [[buffer(4)]],
+    device const uint32_t* blob5 [[buffer(5)]],
+    device const float* input_rows [[buffer(6)]], // [pair_count, 2048]
+    device float* output_rows [[buffer(7)]],      // [pair_count, 4096]
+    constant uint& group_base [[buffer(8)]],
+    constant uint* group_counts [[buffer(9)]],    // [6]
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    const uint flat_row = tgid.y;
+    uint slot = 6u;
+    uint remaining = flat_row;
+    for (uint candidate = 0u; candidate < 6u; ++candidate) {
+        if (remaining < group_counts[candidate]) {
+            slot = candidate;
+            break;
+        }
+        remaining -= group_counts[candidate];
+    }
+    const bool token_valid = slot < 6u;
+    const uint bucket_row = group_base + flat_row;
+    threadgroup float input_shared[2048];
+    for (uint column = lid; column < 2048u; column += 256u) {
+        input_shared[column] = token_valid
+            ? input_rows[(size_t)bucket_row * 2048u + column]
+            : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = tgid.x * 8u + simd_group;
+    if (!token_valid || row >= 4096u) return;
+
+    device const uint32_t* blob = blob0;
+    switch (slot) {
+        case 1u: blob = blob1; break;
+        case 2u: blob = blob2; break;
+        case 3u: blob = blob3; break;
+        case 4u: blob = blob4; break;
+        case 5u: blob = blob5; break;
+        default: break;
+    }
+    const uint packed_cols = 2048u / 8u;
+    const uint num_groups = 2048u / 32u;
+    const uint packed_per_group = 32u / 8u;
+    const uint down_weight_u32 = 8912896u / 4u;
+    const uint scale_byte = 13107200u + row * num_groups;
+    device const uint32_t* weight_row = blob + down_weight_u32 +
+        (size_t)row * packed_cols;
+
+    float accumulator = 0.0f;
+    for (uint group = simd_lane; group < num_groups; group += 32u) {
+        const uint scale_index = scale_byte + group;
+        const float scale = exp2((float)(uint8_t)(
+            (blob[scale_index >> 2u] >> ((scale_index & 3u) << 3u)) & 0xffu) -
+            127.0f);
+        const uint packed_base = group * packed_per_group;
+        const uint input_base = group * 32u;
+        for (uint packed = 0u; packed < packed_per_group; ++packed) {
+            const uint32_t word = weight_row[packed_base + packed];
+            const uint column = input_base + packed * 8u;
+            for (uint nibble = 0u; nibble < 8u; ++nibble) {
+                accumulator += NIBBLE_TO_FLOAT[
+                    (word >> (nibble * 4u)) & 0xfu] * scale *
+                    input_shared[column + nibble];
+            }
+        }
+    }
+    const float sum = simd_sum(accumulator);
+    if (simd_lane == 0u) {
+        output_rows[(size_t)bucket_row * 4096u + row] = (bfloat)sum;
+    }
+}
+
+// ============================================================================
+// Wave-4 deterministic bucket-order combine
+// ============================================================================
+// One thread owns one [token, hidden] element and visits the six routes in
+// scalar route-rank order. inverse_mapping translates token-major source rows
+// to bucket-order expert outputs. The shared branch is added only after the
+// routed sum, matching the scalar ffn_out += shared_out ordering. No atomics
+// are used, so expert bucket permutation cannot change accumulation order.
+kernel void bucket_combine_f32(
+    device const float* bucket_outputs [[buffer(0)]], // [pair_count, hidden_dim]
+    device const NativeActivationPairGPU* activation_pairs [[buffer(1)]],
+    device const uint* inverse_mapping [[buffer(2)]],
+    device const float* shared_outputs [[buffer(3)]], // [batch_tokens, hidden_dim]
+    device float* combined_outputs [[buffer(4)]],     // [batch_tokens, hidden_dim]
+    constant uint& batch_tokens [[buffer(5)]],
+    constant uint& pair_count [[buffer(6)]],
+    constant uint& hidden_dim [[buffer(7)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]]
+) {
+    const uint token = tgid.y;
+    const uint column = tgid.x * 256u + lid;
+    if (token >= batch_tokens || column >= hidden_dim) return;
+
+    float routed = 0.0f;
+    for (uint rank = 0u; rank < 6u; ++rank) {
+        const uint source = token * 6u + rank;
+        if (source >= pair_count) return;
+        const NativeActivationPairGPU pair = activation_pairs[source];
+        const uint bucket_row = inverse_mapping[source];
+        // Host validation guarantees this branch is never taken in engine use;
+        // keep standalone dispatches from reading malformed metadata.
+        if (bucket_row >= pair_count || pair.token_id != token ||
+            pair.route_rank != rank) {
+            return;
+        }
+        routed += bucket_outputs[(size_t)bucket_row * hidden_dim + column] *
+            pair.weight;
+    }
+    combined_outputs[(size_t)token * hidden_dim + column] = routed +
+        shared_outputs[(size_t)token * hidden_dim + column];
+}
+
+// ============================================================================
 // Gather6 MoE kernels — pointer-array variant for non-contiguous expert blobs
 // ============================================================================
 //
@@ -1189,6 +1611,8 @@ kernel void dequant_matvec_affine_v2(
     const uint num_groups = in_dim / group_size;
     const uint packed_per_group = group_size / 8;
     const uint packed_cols = in_dim / 8;
+    device const float *x_row = x + (size_t)tgpig.y * in_dim;
+    device float *out_row = out + (size_t)tgpig.y * out_dim;
 
     const int row0 = (int)tgpig.x * NR0;
     const short ix = tiisg / TPG, il = tiisg % TPG;
@@ -1210,8 +1634,8 @@ kernel void dequant_matvec_affine_v2(
 
     for (int gg = g0; gg < (int)num_groups; gg += NSG * NQ) {
         uint xb = (uint)gg * group_size + (uint)il * 8;
-        float xv0 = x[xb+0], xv1 = x[xb+1], xv2 = x[xb+2], xv3 = x[xb+3];
-        float xv4 = x[xb+4], xv5 = x[xb+5], xv6 = x[xb+6], xv7 = x[xb+7];
+        float xv0 = x_row[xb+0], xv1 = x_row[xb+1], xv2 = x_row[xb+2], xv3 = x_row[xb+3];
+        float xv4 = x_row[xb+4], xv5 = x_row[xb+5], xv6 = x_row[xb+6], xv7 = x_row[xb+7];
 
         for (short row = 0; row < NR0; row++) {
             int r = row0 + row;
@@ -1252,7 +1676,7 @@ kernel void dequant_matvec_affine_v2(
         const int d = row0 + row;
         if (d >= (int)out_dim) continue;
         float tot = simd_sum(shmem_f32[row][tiisg]);
-        if (tiisg == 0 && sgitg == 0) out[d] = (bfloat)tot;
+        if (tiisg == 0 && sgitg == 0) out_row[d] = (bfloat)tot;
     }
 }
 
@@ -1269,8 +1693,9 @@ kernel void dequant_matvec_affine(
     constant uint&         out_dim  [[buffer(5)]],
     constant uint&         in_dim   [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
+    const uint tid = gid.x;
     if (tid >= out_dim) return;
     uint num_groups = in_dim / group_size;
     uint packed_per_group = group_size / 8;
@@ -1279,6 +1704,8 @@ kernel void dequant_matvec_affine(
     device const uint32_t* wr = W_packed + tid * packed_cols;
     device const float*    sc = scales   + tid * num_groups;
     device const float*    bi = biases   + tid * num_groups;
+    device const float*    x_row = x + (size_t)gid.y * in_dim;
+    device float*          out_row = out + (size_t)gid.y * out_dim;
 
     float acc = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
@@ -1291,11 +1718,11 @@ kernel void dequant_matvec_affine(
             uint x_base = bx + p * 8;
             for (uint i = 0; i < 8; i++) {
                 float nib = (float)((pw >> (i * 4)) & 0xF);
-                acc += (scale * nib + bias) * x[x_base + i];
+                acc += (scale * nib + bias) * x_row[x_base + i];
             }
         }
     }
-    out[tid] = acc;
+    out_row[tid] = acc;
 }
 
 // dequant_matvec_affine_bf16out: same as dequant_matvec_affine but output is bfloat.
@@ -1442,15 +1869,18 @@ kernel void dequant_matvec_affine_bf16in_f32out_grp8(
     constant uint&         out_g    [[buffer(5)]],  // rows per group (O_LORA_RANK)
     constant uint&         in_dim   [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    uint num_groups = in_dim / group_size;
-    uint packed_per_group = group_size / 8;
-    uint packed_cols = in_dim / 8;
+    const uint tid = gid.x;
+    const uint num_groups = in_dim / group_size;
+    const uint packed_per_group = group_size / 8;
+    const uint packed_cols = in_dim / 8;
     device const uint32_t* wr = W_packed + tid * packed_cols;
     device const float*    sc = scales   + tid * num_groups;
     device const float*    bi = biases   + tid * num_groups;
-    device const bfloat*   xg = x + (tid / out_g) * in_dim;
+    device const bfloat*   xg = x + (size_t)gid.y * 8u * in_dim +
+        (tid / out_g) * in_dim;
+    device float* out_row = out + (size_t)gid.y * 8u * out_g;
     float acc = 0.0f;
     for (uint g = 0; g < num_groups; g++) {
         float scale = sc[g], bias = bi[g];
@@ -1463,7 +1893,7 @@ kernel void dequant_matvec_affine_bf16in_f32out_grp8(
             }
         }
     }
-    out[tid] = acc;
+    out_row[tid] = acc;
 }
 
 // dequant_matvec_affine_bf16in_bf16out: affine 4bit matmul with bfloat input AND output.
@@ -1472,14 +1902,17 @@ kernel void dequant_matvec_affine_bf16in_bf16out(
     device const uint32_t* W_packed [[buffer(0)]],
     device const float*    scales   [[buffer(1)]],
     device const float*    biases   [[buffer(2)]],
-    device const bfloat*   x        [[buffer(3)]],  // bfloat input
-    device bfloat*         out      [[buffer(4)]],  // bfloat output
+    device const bfloat*   x        [[buffer(3)]],  // [batch, in_dim] bfloat input
+    device bfloat*         out      [[buffer(4)]],  // [batch, out_dim] bfloat output
     constant uint&         out_dim  [[buffer(5)]],
     constant uint&         in_dim   [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
+    const uint tid = gid.x;
     if (tid >= out_dim) return;
+    device const bfloat* xr = x + (size_t)gid.y * in_dim;
+    device bfloat* out_row = out + (size_t)gid.y * out_dim;
     uint num_groups = in_dim / group_size;
     uint packed_per_group = group_size / 8;
     uint packed_cols = in_dim / 8;
@@ -1494,11 +1927,11 @@ kernel void dequant_matvec_affine_bf16in_bf16out(
             uint32_t pw = wr[bp + p];
             for (uint i = 0; i < 8; i++) {
                 float nib = (float)((pw >> (i * 4)) & 0xF);
-                acc += (scale * nib + bias) * float(x[bx + p * 8 + i]);
+                acc += (scale * nib + bias) * float(xr[bx + p * 8 + i]);
             }
         }
     }
-    out[tid] = (bfloat)acc;
+    out_row[tid] = (bfloat)acc;
 }
 
 // dequant_matvec_affine_bf16in_bf16out_v2: SIMD-parallel affine 4-bit matmul, bfloat in/out.
@@ -1635,23 +2068,26 @@ kernel void rms_norm_rows_bf16in_bf16out(
 // rope_tail_interleaved_bf16: RoPE with bfloat input AND bfloat output.
 // Used in the full bf16 attention chain for Q (and optionally K) RoPE.
 kernel void rope_tail_interleaved_bf16(
-    device bfloat*         q          [[buffer(0)]],  // in-place [n_heads, head_dim]
-    device const float*    cos_vals   [[buffer(1)]],  // [half_rope]
-    device const float*    sin_vals   [[buffer(2)]],  // [half_rope]
+    device bfloat*         q          [[buffer(0)]],  // in-place [batch,n_heads,head_dim]
+    device const float*    cos_vals   [[buffer(1)]],  // [batch,half_rope]
+    device const float*    sin_vals   [[buffer(2)]],  // [batch,half_rope]
     constant uint&         n_heads    [[buffer(3)]],
     constant uint&         head_dim   [[buffer(4)]],
     constant uint&         n_nope     [[buffer(5)]],
     constant uint&         n_rope     [[buffer(6)]],
     constant uint&         inverse    [[buffer(7)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
     uint half_rope = n_rope / 2;
+    const uint tid = gid.x;
     if (tid >= n_heads * half_rope) return;
     uint head = tid / half_rope, ic = tid % half_rope;
-    uint j0 = head * head_dim + n_nope + 2 * ic;
+    uint row_base = gid.y * n_heads * head_dim;
+    uint j0 = row_base + head * head_dim + n_nope + 2 * ic;
     uint j1 = j0 + 1;
-    float cos_v = cos_vals[ic];
-    float sin_v = inverse ? -sin_vals[ic] : sin_vals[ic];
+    uint rope_index = gid.y * half_rope + ic;
+    float cos_v = cos_vals[rope_index];
+    float sin_v = inverse ? -sin_vals[rope_index] : sin_vals[rope_index];
     float x0 = float(q[j0]);
     float x1 = float(q[j1]);
     q[j0] = (bfloat)(x0 * cos_v - x1 * sin_v);
@@ -2039,25 +2475,31 @@ kernel void mhc_pre_bfloat(
 // comb: [HC*HC] f32
 // out_residual: [HC, DIM] bfloat (can alias residual for in-place)
 kernel void mhc_post_bfloat(
-    device const bfloat* x            [[buffer(0)]],  // [DIM] bfloat
-    device const bfloat* residual     [[buffer(1)]],  // [HC, DIM] bfloat
-    device const float*  post         [[buffer(2)]],  // [HC] f32
-    device const float*  comb         [[buffer(3)]],  // [HC*HC] f32 (row-major [k][m])
-    device bfloat*       out_residual [[buffer(4)]],  // [HC, DIM] bfloat
+    device const bfloat* x            [[buffer(0)]],  // [B, DIM] bfloat
+    device const bfloat* residual     [[buffer(1)]],  // [B, HC, DIM] bfloat
+    device const float*  post         [[buffer(2)]],  // [B, HC] f32
+    device const float*  comb         [[buffer(3)]],  // [B, HC*HC] f32 (row-major [k][m])
+    device bfloat*       out_residual [[buffer(4)]],  // [B, HC, DIM] bfloat
     constant uint&       hc           [[buffer(5)]],
     constant uint&       dim          [[buffer(6)]],
-    uint tid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]]
 ) {
-    if (tid >= dim) return;
-    uint d = tid;
-    float xv = float(x[d]);
+    if (gid.x >= dim) return;
+    const uint row = gid.y;
+    const uint d = gid.x;
+    const uint x_base = row * dim;
+    const uint residual_base = row * hc * dim;
+    const uint coefficient_base = row * hc;
+    const uint comb_base = row * hc * hc;
+    float xv = float(x[x_base + d]);
     for (uint m = 0; m < hc; m++) {
-        float acc = post[m] * xv;
+        float acc = post[coefficient_base + m] * xv;
         for (uint k = 0; k < hc; k++) {
             // comb[k][m] = comb[k*hc + m]
-            acc += comb[k * hc + m] * float(residual[k * dim + d]);
+            acc += comb[comb_base + k * hc + m] *
+                float(residual[residual_base + k * dim + d]);
         }
-        out_residual[m * dim + d] = (bfloat)acc;
+        out_residual[residual_base + m * dim + d] = (bfloat)acc;
     }
 }
 
@@ -3604,55 +4046,168 @@ kernel void mla_sdpa_prefill_bfloat(
 #undef PREFILL_HD
 #undef PREFILL_SLOTS
 
+// ===========================================================================
+// mla_sdpa_batch_f16_kv: Wave-2 chunk-local causal MLA SDPA.
+//
+// Q and output are chunk-local BF16 [batch_tokens, n_heads, 512]. KV is the
+// complete visible f16 cache [committed_tokens + batch_tokens, 512]. Query row
+// b may read exactly global KV rows [0, committed_tokens + b]. One 32-thread
+// simdgroup handles each [query, head] pair; all pairs are submitted in one
+// batched dispatch. The sink contributes only to the softmax denominator.
+// ===========================================================================
+
+#define MLA_BATCH_HD 512
+#define MLA_BATCH_FLOAT4_SLOTS 4
+
+kernel void mla_sdpa_batch_f16_kv(
+    device const bfloat* q                [[buffer(0)]],
+    device const half*   kv               [[buffer(1)]],
+    device const float*  sinks            [[buffer(2)]],
+    device       bfloat* out              [[buffer(3)]],
+    constant uint&       batch_tokens     [[buffer(4)]],
+    constant uint&       committed_tokens [[buffer(5)]],
+    constant uint&       n_heads          [[buffer(6)]],
+    constant float&      scale            [[buffer(7)]],
+    uint tg_id [[threadgroup_position_in_grid]],
+    uint tiisg [[thread_index_in_simdgroup]]
+) {
+    const uint query = tg_id / n_heads;
+    const uint head = tg_id % n_heads;
+    if (query >= batch_tokens || head >= n_heads) return;
+
+    // Preserve the scalar decode kernel's exact per-query expression shape.
+    // Batching comes from one dispatch over [query, head] threadgroups rather
+    // than packing several queries into one high-register-pressure kernel.
+    const uint NW = 32u;
+    const uint q_stride = n_heads * MLA_BATCH_HD;
+    device const bfloat* qh = q +
+        (size_t)query * q_stride + (size_t)head * MLA_BATCH_HD;
+
+    float4 qv[MLA_BATCH_FLOAT4_SLOTS];
+    for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+        const uint base = (ii * NW + tiisg) * 4u;
+        qv[ii] = float4(
+            float(qh[base + 0u]), float(qh[base + 1u]),
+            float(qh[base + 2u]), float(qh[base + 3u]));
+    }
+
+    float4 so[MLA_BATCH_FLOAT4_SLOTS];
+    for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+        so[ii] = float4(0.0f);
+    }
+
+    float S = 0.0f;
+    float M = -FLT_MAX / 2.0f;
+    const uint n_kv = committed_tokens + query + 1u;
+    for (uint k = 0u; k < n_kv; ++k) {
+        device const half* kvk = kv + (size_t)k * MLA_BATCH_HD;
+        float mqk = 0.0f;
+        for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+            const uint base = (ii * NW + tiisg) * 4u;
+            const float4 kv4 = float4(
+                float(kvk[base + 0u]), float(kvk[base + 1u]),
+                float(kvk[base + 2u]), float(kvk[base + 3u]));
+            mqk += dot(qv[ii], kv4);
+        }
+        const float score = simd_sum(mqk) * scale;
+        const float m_new = max(M, score);
+        const float ms = exp(M - m_new);
+        const float vs = exp(score - m_new);
+        S = S * ms + vs;
+        M = m_new;
+
+        for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+            const uint base = (ii * NW + tiisg) * 4u;
+            const float4 kv4 = float4(
+                float(kvk[base + 0u]), float(kvk[base + 1u]),
+                float(kvk[base + 2u]), float(kvk[base + 3u]));
+            so[ii] = so[ii] * ms + kv4 * vs;
+        }
+    }
+
+    {
+        const float sink = sinks[head];
+        const float m_new = max(M, sink);
+        const float ms = exp(M - m_new);
+        const float vs = exp(sink - m_new);
+        S = S * ms + vs;
+        M = m_new;
+        for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+            so[ii] *= ms;
+        }
+    }
+
+    const float inv_s = S > 0.0f ? 1.0f / S : 0.0f;
+    device bfloat* oh = out +
+        (size_t)query * q_stride + (size_t)head * MLA_BATCH_HD;
+    for (uint ii = 0u; ii < MLA_BATCH_FLOAT4_SLOTS; ++ii) {
+        const float4 value = so[ii] * inv_s;
+        const uint base = (ii * NW + tiisg) * 4u;
+        oh[base + 0u] = (bfloat)value.x;
+        oh[base + 1u] = (bfloat)value.y;
+        oh[base + 2u] = (bfloat)value.z;
+        oh[base + 3u] = (bfloat)value.w;
+    }
+}
+
+#undef MLA_BATCH_HD
+#undef MLA_BATCH_FLOAT4_SLOTS
+
 // ============================================================================
-// moe_route_gpu: unified GPU MoE routing (replaces cpu_moe_route).
-// Single dispatch: sqrtsoftplus + SMELT penalty + bitonic top-6 + L1-normalize.
-// 256 threads x 1 threadgroup, one thread per expert.
+// moe_route_gpu: deterministic batched GPU MoE routing.
+// One 256-thread threadgroup per token: sqrtsoftplus + SMELT penalty +
+// bitonic top-6 + L1-normalize. Equal scores prefer the lower expert ID,
+// matching the scalar left-to-right `>` scan exactly.
 // ============================================================================
 kernel void moe_route_gpu(
-    device const float*   logits        [[buffer(0)]],  // [256] gate logits (f32)
-    device const float*   bias          [[buffer(1)]],  // [256] e_score_correction_bias
+    device const float*   logits        [[buffer(0)]],  // [B,256] gate logits
+    device const float*   bias          [[buffer(1)]],  // [256] correction bias
     device const uint8_t* cached        [[buffer(2)]],  // [256] 1=in SMELT pool
-    device int32_t*       selected      [[buffer(3)]],  // [6]  output: top-6 expert IDs
-    device float*         weights       [[buffer(4)]],  // [6]  output: routing weights
+    device int32_t*       selected      [[buffer(3)]],  // [B,6] top-6 IDs
+    device float*         weights       [[buffer(4)]],  // [B,6] route weights
     constant float&       smelt_penalty [[buffer(5)]],
     constant uint&        has_bias      [[buffer(6)]],
     constant uint&        has_smelt     [[buffer(7)]],
+    uint token [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
     const uint N = 256u, K = 6u;
     const float ROUTE_SCALE = 1.5f;
+    device const float* token_logits = logits + (size_t)token * N;
+    device int32_t* token_selected = selected + (size_t)token * K;
+    device float* token_weights = weights + (size_t)token * K;
 
-    // sqrtsoftplus score (matches MLX DSV4Gate scoring_func=sqrtsoftplus)
-    float l = logits[tid];
+    // DSV4Gate applies correction bias before sqrtsoftplus. SMELT changes
+    // selection only and never changes the normalized route weight.
+    float l = token_logits[tid] + (has_bias ? bias[tid] : 0.0f);
     float sp = l > 0.0f ? l + log(1.0f + exp(-l)) : log(1.0f + exp(l));
     float score = sqrt(sp);
+    float choice = score;
+    if (has_smelt && !cached[tid]) choice -= smelt_penalty;
 
-    // biased score for top-K selection only
-    float biased = score;
-    if (has_bias)  biased += bias[tid];
-    if (has_smelt && !cached[tid]) biased -= smelt_penalty;
-
-    threadgroup float   tg_scores[256];
+    threadgroup float   tg_choice[256];
     threadgroup float   tg_raw[256];
     threadgroup int32_t tg_idx[256];
     threadgroup float   ksum[8];
 
-    tg_scores[tid] = biased;
-    tg_raw[tid]    = score;
-    tg_idx[tid]    = (int32_t)tid;
+    tg_choice[tid] = choice;
+    tg_raw[tid] = score;
+    tg_idx[tid] = (int32_t)tid;
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Bitonic sort descending
+    // Bitonic sort descending by (choice, -expert_id).
     for (uint k = 2u; k <= N; k <<= 1u) {
         for (uint j = k >> 1u; j > 0u; j >>= 1u) {
             uint other = tid ^ j;
             if (other > tid) {
-                int32_t ai = tg_idx[tid], bi2 = tg_idx[other];
-                float sa = tg_scores[(uint)ai], sb2 = tg_scores[(uint)bi2];
-                bool ascending = ((tid & k) == 0u);
-                if (ascending ? sa < sb2 : sa > sb2) {
-                    tg_idx[tid] = bi2; tg_idx[other] = ai;
+                int32_t ai = tg_idx[tid], bi = tg_idx[other];
+                float sa = tg_choice[(uint)ai], sb = tg_choice[(uint)bi];
+                bool a_better = sa > sb || (sa == sb && ai < bi);
+                bool b_better = sb > sa || (sa == sb && bi < ai);
+                bool descending = (tid & k) == 0u;
+                if ((descending && b_better) || (!descending && a_better)) {
+                    tg_idx[tid] = bi;
+                    tg_idx[other] = ai;
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3660,7 +4215,7 @@ kernel void moe_route_gpu(
     }
 
     if (tid < K) {
-        selected[tid] = tg_idx[tid];
+        token_selected[tid] = tg_idx[tid];
         ksum[tid] = tg_raw[(uint)tg_idx[tid]];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3673,7 +4228,7 @@ kernel void moe_route_gpu(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (tid < K) weights[tid] = ksum[tid];
+    if (tid < K) token_weights[tid] = ksum[tid];
 }
 
 // ============================================================================

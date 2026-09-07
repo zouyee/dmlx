@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_baseline_and_implementation",
+  "model": "DeepSeek-V4-Flash-4bit",
+  "native_only": true,
+  "smelt_n": 20,
+  "resident_slots": 1568,
+  "resident_payload_bytes": 20963131392,
+  "full_preload_forbidden": true,
+  "concurrent_servers_forbidden": true,
+  "environment_contract": {
+    "boolean_values": {"unset":"off","0":"off","1":"on","other":"initialization_error"},
+    "candidate_env": "NATIVE_EXPERIMENTAL_CACHE_DIRECT_IO",
+    "candidate_requires": {"NATIVE_EXPERIMENTAL_CACHE":"1"},
+    "candidate_incompatible_on": [
+      "NATIVE_PREFETCH",
+      "NATIVE_BATCH_PREFILL",
+      "NATIVE_BATCH_MLA",
+      "NATIVE_EXPERT_BUCKETS",
+      "NATIVE_BATCH_EXPERT_KERNELS",
+      "NATIVE_DSPARK_BATCH_VERIFY",
+      "configured_dspark_path"
+    ]
+  },
+  "baseline": {
+    "processes": 3,
+    "policy": "fixed_hot",
+    "clean_start_each_process": true,
+    "same_routing_stats_seed": true,
+    "flags_required_off": [
+      "NATIVE_PREFETCH",
+      "NATIVE_EXPERIMENTAL_CACHE",
+      "NATIVE_EXPERIMENTAL_CACHE_DIRECT_IO",
+      "NATIVE_BATCH_PREFILL",
+      "NATIVE_BATCH_MLA",
+      "NATIVE_EXPERT_BUCKETS",
+      "NATIVE_BATCH_EXPERT_KERNELS",
+      "NATIVE_DSPARK_BATCH_VERIFY",
+      "configured_dspark_path"
+    ],
+    "required": [
+      "correctness","throughput","request_wall","peak_rss","cold_misses","hot_hits",
+      "requested_bytes","read_bytes","short_reads","io_wait","exact_q4_events",
+      "source_hashes","process_identity","cleanup"
+    ]
+  },
+  "candidate_table": [
+    "actual_route_next_layer_prefetch",
+    "previous_token_prefetch",
+    "copy_after_read_lru",
+    "direct_to_victim_lru",
+    "demand_io_scheduling"
+  ],
+  "sole_implementable_candidate": "direct_to_victim_lru",
+  "direct_failure_model": {
+    "slot_states": ["RESIDENT(eid)","RESERVED(incoming_eid,generation)","INVALID"],
+    "reservation_precondition": "all_prior_gpu_and_background_io_owners_for_slot_complete",
+    "before_overwrite": ["remove_victim_lookup","remove_victim_position_membership","set_reverse_slot_owner_to_reserved"],
+    "during_read": "incoming_lookup_and_position_absent",
+    "success_precondition": "read_bytes_equals_13369344_and_error_code_zero",
+    "success_publication_order": ["relocate_or_create_wrapper","set_reverse_owner_incoming","set_incoming_position","publish_incoming_lookup_last"],
+    "success_counters": {"direct_admissions_increment":1,"evictions_increment":1,"invalidations_increment":0,"admission_copy_bytes_increment":0},
+    "short_or_error": "invalidate_slot_poison_cache_abort_current_and_future_requests_until_teardown",
+    "failure_counters": {"invalidations_increment":1,"direct_admissions_increment":0,"evictions_increment":0},
+    "in_process_recovery": false,
+    "no_victim": "scratch_serve_without_admission",
+    "no_victim_counters": {"scratch_fallbacks_increment":1,"admissions_increment":0,"evictions_increment":0},
+    "promotion_requires_zero_scratch_fallbacks": true,
+    "conservation": "resident_plus_reserved_plus_invalid_equals_physical_slots"
+  },
+  "promotion_order": ["fixed1","direct1","fixed2","direct2"],
+  "promotion": {
+    "run_throughput_field": "standard_median_tok_s",
+    "baseline_aggregate": "median(fixed1.standard_median_tok_s,fixed2.standard_median_tok_s)",
+    "candidate_aggregate": "median(direct1.standard_median_tok_s,direct2.standard_median_tok_s)",
+    "candidate_over_baseline_ratio_min": 1.05,
+    "pairwise_throughput": ["direct1>fixed1","direct2>fixed2"],
+    "long_decode_run_field": "long_decode_tok_s",
+    "long_decode_aggregate": "median(direct1.long_decode_tok_s,direct2.long_decode_tok_s)>=median(fixed1.long_decode_tok_s,fixed2.long_decode_tok_s)",
+    "itl_p50": "median(direct_run_p50)<=median(fixed_run_p50)",
+    "itl_p95": {"comparison":"median(direct_run_p95)/median(fixed_run_p95)<=1.02","zero_baseline":"pass_only_if_candidate_is_zero"},
+    "exposed_wait_p95": {"comparison":"median(direct_run_p95)/median(fixed_run_p95)<=1.02","zero_baseline":"pass_only_if_candidate_is_zero"},
+    "requested_bytes_per_token": "direct<=fixed_for_each_pair_and_two_run_median",
+    "read_bytes_per_token": "direct<=fixed_for_each_pair_and_two_run_median",
+    "peak_rss_bytes_max": 47244640256,
+    "successful_replacement_admissions_equal_evictions": true,
+    "admission_copy_bytes": 0,
+    "scratch_fallbacks": 0,
+    "invalidations": 0,
+    "short_reads": 0,
+    "pending_io_owners_at_end": 0,
+    "correctness_required": true,
+    "e2e_required": "7/7"
+  },
+  "failure_decision": "REJECTED_keep_fixed_hot_default",
+  "authority": "candidate_remains_default_off_even_if_promotion_passes_pending_separate_default_enable_decision"
+}

@@ -1,0 +1,73 @@
+{
+  "schema_version": 1,
+  "status": "frozen_before_implementation_and_measurement",
+  "subject": "standalone_mhc_pre_parallel_dense_dot_candidate_screen",
+  "production_code_changes_allowed": false,
+  "kernel_source": "separate_harness_owned_metal_file_no_production_source_or_metallib_compilation",
+  "arms": [
+    "serial_one_lane_per_row",
+    "simdgroup_per_row_wave8",
+    "eight_lane_per_row"
+  ],
+  "input_contract": {
+    "weights": "f32[24,16384]",
+    "residual": "f32[16384]",
+    "norm": "precomputed_f32",
+    "output": "normalized_f32[24]"
+  },
+  "topology_per_sample": {
+    "command_buffers": 1,
+    "compute_encoders": 1,
+    "dispatches": 1,
+    "commits": 1,
+    "waits": 1,
+    "threadgroups": 1,
+    "threads_per_threadgroup": 256
+  },
+  "timing": "MTLCounterSamplingPointAtStageBoundary_GPUTimestamp",
+  "warmups_per_arm": 10,
+  "measured_repetitions_per_arm": 21,
+  "arm_order": {
+    "process_ordinal": "one_based_1_to_3",
+    "warmup_formula": "arm_index=(process_ordinal-1+iteration+step)%3",
+    "measured_formula": "arm_index=(process_ordinal-1+iteration+step)%3",
+    "retention": "retain_every_warmup_and_measured_event",
+    "event_fields": ["phase","process_ordinal","iteration","step","arm","duration_ns"],
+    "warmup_duration_ns": null
+  },
+  "independent_process_runs": 3,
+  "correctness": {
+    "reference": "scalar_increasing_index_cpu_f32",
+    "all_24_outputs_finite": true,
+    "bitwise_repeatable_within_arm": true,
+    "max_absolute_error": 0.05
+  },
+  "estimator": "per_process_per_arm_median_of_21_raw_gpu_durations",
+  "candidate_ratio": "candidate_median_divided_by_serial_median",
+  "viability_rule": "candidate_ratio_lte_0.80_in_all_three_processes",
+  "selection_rule": {
+    "exactly_one_viable": "recommend_that_candidate",
+    "both_viable_score": "exact_rational_product_of_three_unrounded_median_ratios",
+    "both_viable_selection": "recommend_lower_exact_rational_score",
+    "tie": "absolute_exact_rational_score_difference_lte_1_over_100_yields_NOT_PROVEN",
+    "neither_viable": "REJECTED"
+  },
+  "invalidity": [
+    "nonpositive_timestamp_pair",
+    "nonfinite_output",
+    "nonrepeatable_output",
+    "cpu_oracle_mismatch",
+    "missing_or_duplicate_process_identity",
+    "missing_raw_sample",
+    "topology_mismatch",
+    "source_hash_mismatch"
+  ],
+  "required_evidence_identity": [
+    "harness_source_sha256",
+    "harness_metal_sha256",
+    "production_kernel_sha256",
+    "distinct_process_id",
+    "per_process_oracle_status"
+  ],
+  "authority": "test_only_standalone_mapping_recommendation_no_production_correctness_speedup_kernel_implementation_or_downstream_task_authority"
+}

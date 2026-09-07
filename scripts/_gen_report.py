@@ -8,10 +8,157 @@ The script reads the existing report at <output_md> to extract the previous
 benchmark data (commit, prefill, steady-state, throughput) and uses it as
 the "previous" comparison baseline in the new report.
 """
-import sys, re, os
+import sys, re, os, json
+from datetime import datetime, timezone
 
 perf_file, e2e_file, report_path = sys.argv[1], sys.argv[2], sys.argv[3]
 env = os.environ
+
+
+def _format_seconds_from_ms(value):
+    return "unknown (not measured)" if value is None else f"{value / 1000.0:.3f} s"
+
+
+def _format_unknown(value, suffix=""):
+    return "unknown (not measured)" if value is None else f"{value}{suffix}"
+
+
+def render_native_artifact(artifact_path, output_path):
+    """Render the native report exclusively from a validated schema-v1 artifact."""
+    with open(artifact_path, encoding="utf-8") as handle:
+        artifact = json.load(handle)
+    if artifact.get("schema_version") != 1:
+        raise ValueError("native benchmark report requires schema_version 1")
+
+    run = artifact["run"]
+    phases = artifact["phases"]
+    metrics = artifact["metrics"]
+    standard = phases["standard_decode"]
+    diagnostic = phases["long_decode_diagnostic"]
+    diagnostic_run = diagnostic["run"]
+    correctness = phases["correctness"]
+    itl = metrics["itl_ms"]
+    expert_io = metrics["expert_io"]
+    dispatch = metrics["dispatch"]
+
+    standard_rows = "\n".join(
+        f"| {item['run_index']} | {item['prompt_tokens']} | {item['completion_tokens']} | "
+        f"{item['wall_seconds']:.3f} | {item['tokens_per_second']:.3f} |"
+        for item in standard["runs"]
+    )
+    median_tps = standard["median_tokens_per_second"]
+    artifact_link = os.path.relpath(artifact_path, os.path.dirname(output_path))
+    report_generated_utc = datetime.now(timezone.utc).isoformat()
+    benchmark_timestamp = run["timestamp_utc"]
+    benchmark_date = run.get("date_local") or benchmark_timestamp[:10]
+    run_environment = run.get("environment", {})
+    smelt_n = run_environment.get("NATIVE_SMELT_N")
+    warmup = run.get("warmup", {})
+    machine = run.get("machine", {})
+    e2e_total = correctness["e2e_pass"] + correctness["e2e_fail"]
+
+    report = f"""---
+report_generated_utc: {report_generated_utc}
+benchmark_run_date: {benchmark_date}
+benchmark_timestamp_utc: {benchmark_timestamp}
+commit: {run.get('workspace_revision') or 'unknown'}
+branch: {run.get('branch') or 'unknown'}
+artifact: {artifact_link}
+schema_version: 1
+---
+
+# dmlx Native Performance Benchmark
+
+> Machine-readable source of truth: [`{artifact_link}`](./{artifact_link}). Values below are rounded for display; the artifact retains measured precision and JSON `null` for unavailable metrics.
+
+## Reproducible result
+
+| Phase | Classification | Prompt / completion tokens | HTTP wall time | Effective completion throughput |
+|---|---|---:|---:|---:|
+| Standard short-run median | Standard; median of 3 | 5 / 5 per run | See runs below | **{median_tps:.3f} tok/s** |
+| Long decode | Diagnostic only; excluded from standard median | {diagnostic_run['prompt_tokens']} / {diagnostic_run['completion_tokens']} | {diagnostic_run['wall_seconds']:.3f} s | **{diagnostic_run['tokens_per_second']:.3f} tok/s** |
+
+The throughput rows use HTTP request wall time. Engine-scoped first-token latency, decode-phase timing, ITL, expert-I/O, and routed-MoE geometry below come from opt-in server telemetry attached to exactly the three standard requests. True HTTP TTFT and an independently bounded prefill phase remain unavailable because telemetry begins after tokenization. The 100-token result remains diagnostic and is not mixed into the standard median.
+
+### Standard 5-token runs
+
+| Run | Prompt tokens | Completion tokens | Wall time (s) | Effective tok/s |
+|---:|---:|---:|---:|---:|
+{standard_rows}
+
+## Measurement coverage
+
+| Metric | Value |
+|---|---|
+| Startup to health-ready | {_format_seconds_from_ms(metrics.get('startup_ms'))} |
+| Full benchmark wall time | {_format_seconds_from_ms(metrics.get('end_to_end_wall_ms'))} |
+| Performance-phase wall time | {_format_seconds_from_ms(metrics.get('performance_phase_wall_ms'))} |
+| TTFT (HTTP request received → first response token) | {_format_seconds_from_ms(metrics.get('ttft_ms'))} |
+| Independently bounded prefill latency | {_format_seconds_from_ms(metrics.get('prefill_ms'))} |
+| Unqualified first-token latency | {_format_seconds_from_ms(metrics.get('first_token_ms'))} |
+| Engine first-token latency (after tokenization) | {_format_seconds_from_ms(metrics.get('engine_first_token_ms'))} |
+| Decode phase (median per standard request) | {_format_seconds_from_ms(metrics.get('steady_state_decode_ms'))} |
+| ITL p50 / p95 / max | {_format_unknown(itl.get('p50'), ' ms')} / {_format_unknown(itl.get('p95'), ' ms')} / {_format_unknown(itl.get('max'), ' ms')} |
+| Peak RSS | {_format_unknown(metrics.get('peak_rss_bytes'), ' bytes')} |
+| Workspace high-water | {_format_unknown(dispatch.get('workspace_high_water_bytes'), ' bytes')} |
+| Expert `pread` calls / bytes / I/O wait | {_format_unknown(expert_io.get('pread_calls'))} / {_format_unknown(expert_io.get('bytes_read'), ' bytes')} / {_format_unknown(expert_io.get('io_wait_ms'), ' ms')} |
+| Expert short reads | {_format_unknown(expert_io.get('short_reads'))} |
+| Expert hot / prefetch / batch-pool / cold | {_format_unknown(expert_io.get('hot_hits'))} / {_format_unknown(expert_io.get('prefetch_hits'))} / {_format_unknown(expert_io.get('batch_pool_hits'))} / {_format_unknown(expert_io.get('cold_misses'))} |
+| Routed-MoE dispatches / command buffers | {_format_unknown(dispatch.get('dispatches'))} / {_format_unknown(dispatch.get('command_buffers'))} |
+| Routed-MoE threadgroups / active-lane proxy | {_format_unknown(dispatch.get('threadgroups'))} / {_format_unknown(dispatch.get('active_lane_utilization_proxy'))} |
+
+Unavailable metrics are intentionally reported as **unknown**, not zero. This artifact records workspace high-water and peak RSS when measured; complete attention GPU-stage timing and hardware occupancy remain unavailable in schema v1.
+
+## Correctness gates
+
+| Gate | Result |
+|---|---|
+| Paris prompt | {'PASS' if correctness['paris_pass'] else 'FAIL'} |
+| 7-prompt E2E | **{correctness['e2e_pass']}/{e2e_total} PASS**, {correctness['e2e_fail']} FAIL |
+| Unit tests | {run.get('unit_tests') or 'unknown'} |
+
+## Run configuration
+
+| Parameter | Value |
+|---|---|
+| Mode | {run.get('mode') or 'unknown'} |
+| Model | `{run.get('model_path') or 'unknown'}` |
+| Packed experts | `{run.get('packed_experts_path') or 'unknown'}` |
+| Hardware | {machine.get('hardware') or 'unknown'}, {machine.get('memory') or 'unknown'} |
+| `NATIVE_SMELT_N` | {smelt_n if smelt_n is not None else 'unknown'} |
+| `NATIVE_TELEMETRY` | {run_environment.get('NATIVE_TELEMETRY') if run_environment.get('NATIVE_TELEMETRY') is not None else 'unknown'} |
+| `NATIVE_BATCH_PREFILL` | {run_environment.get('NATIVE_BATCH_PREFILL', 'unknown')} |
+| `NATIVE_BATCH_MLA` | {run_environment.get('NATIVE_BATCH_MLA', 'unknown')} |
+| `NATIVE_EXPERT_BUCKETS` | {run_environment.get('NATIVE_EXPERT_BUCKETS', 'unknown')} |
+| `NATIVE_BATCH_EXPERT_KERNELS` | {run_environment.get('NATIVE_BATCH_EXPERT_KERNELS', 'unknown')} |
+| `NATIVE_DSPARK_BATCH_VERIFY` | {run_environment.get('NATIVE_DSPARK_BATCH_VERIFY', 'unknown')} |
+| Warmup | {warmup.get('initial_requests', 'unknown')} initial + {warmup.get('rewarm_requests', 'unknown')} re-warm requests |
+| Standard measured requests | {run.get('measured_requests', 'unknown')} |
+| Command | `{run.get('command') or 'unknown'}` |
+
+## Provenance
+
+- Benchmark run date (machine-local): **{benchmark_date}**
+- Benchmark timestamp (UTC): **{benchmark_timestamp}**
+- Report generation timestamp (UTC): **{report_generated_utc}**
+- Workspace revision: `{run.get('workspace_revision') or 'unknown'}`
+- Artifact schema: `1`
+
+This report does not reuse older headline throughput, latency, or memory values as current native results. Only measurements present in the linked artifact are treated as current.
+"""
+
+    with open(output_path, "w", encoding="utf-8") as handle:
+        handle.write(report)
+    print(
+        f"Native artifact: standard={median_tps:.3f} tok/s | "
+        f"long diagnostic={diagnostic_run['tokens_per_second']:.3f} tok/s | "
+        f"E2E={correctness['e2e_pass']}/{e2e_total}"
+    )
+
+
+if perf_file.endswith(".json"):
+    render_native_artifact(perf_file, report_path)
+    raise SystemExit(0)
 
 
 # --- Parse previous report to get baseline data ---

@@ -1,9 +1,9 @@
 #!/bin/bash
 # Fast (~2s) standalone Metal kernel test loop for the attention kernels.
 # Runtime-compiles src/models/moe_kernel.metal and checks each new kernel
-# (dequant_matvec_affine, rms_norm_rows, rope_tail_interleaved, mla_sdpa_decode)
-# against a CPU reference. Use during S7/S8 kernel development instead of the
-# ~50s server load.
+# (dequant/rms/rope/SDPA, barrier-safe bucket gather, multi-token MXFP4 gate/up)
+# against a CPU reference. Use during S7/S8/Wave-4 kernel development instead
+# of the ~50s server load.
 #
 # Usage: bash scripts/run_kernel_tests.sh
 set -euo pipefail

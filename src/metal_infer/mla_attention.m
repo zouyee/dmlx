@@ -210,7 +210,16 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
 
 // Thin wrapper for enc_dequant_matvec_* using pre-cached buffers.
 // These shadow the helpers below so the bf16 function can use cached buffers.
+static id<MTLComputeCommandEncoder> attention_stage_encoder(
+    MoEInferEngine *engine, id<MTLCommandBuffer> cb, DmlxAttentionStage stage) {
+    if (!moe_infer_attention_stage_recording_enabled(engine))
+        return [cb computeCommandEncoder];
+    return (__bridge id<MTLComputeCommandEncoder>)
+        moe_infer_attention_stage_encoder(engine, (__bridge void *)cb, stage);
+}
+
 static void enc_dq_bf16_cached(MlaPipes *P, id<MTLCommandBuffer> cb,
+                               MoEInferEngine *stage_engine, DmlxAttentionStage stage,
                                id<MTLBuffer> bw, id<MTLBuffer> bs, id<MTLBuffer> bb,
                                int out_dim, int in_dim, int group_size,
                                id<MTLBuffer> x, id<MTLBuffer> out,
@@ -219,7 +228,7 @@ static void enc_dq_bf16_cached(MlaPipes *P, id<MTLCommandBuffer> cb,
     // performance due to high TG-scheduling overhead (e.g. wq_b needs 16384 TGs vs 128
     // for naive). Apple GPU L2 cache (32-64MB) absorbs non-coalesced reads for these
     // relatively small matrices. Always use naive 1-thread-per-row dispatch here.
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> e = attention_stage_encoder(stage_engine, cb, stage);
     [e setComputePipelineState:pipe];
     [e setBuffer:bw offset:0 atIndex:0];
     [e setBuffer:bs offset:0 atIndex:1];
@@ -231,6 +240,73 @@ static void enc_dq_bf16_cached(MlaPipes *P, id<MTLCommandBuffer> cb,
     [e setBytes:&id_ length:4 atIndex:6];
     [e setBytes:&gs  length:4 atIndex:7];
     [e dispatchThreads:MTLSizeMake(out_dim, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+}
+
+// Batch rows share one weight matrix and one encoder dispatch. The underlying
+// kernel uses grid y as the input/output row; scalar callers continue to use
+// the same pipeline with a y dimension of one.
+static void enc_dq_bf16_cached_batch(MlaPipes *P, id<MTLCommandBuffer> cb,
+                                     id<MTLBuffer> bw, id<MTLBuffer> bs, id<MTLBuffer> bb,
+                                     int out_dim, int in_dim, int group_size,
+                                     id<MTLBuffer> workspace,
+                                     NSUInteger x_offset, NSUInteger out_offset,
+                                     uint batch_rows) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->dequant_matvec_affine_bf16in_bf16out];
+    [e setBuffer:bw offset:0 atIndex:0];
+    [e setBuffer:bs offset:0 atIndex:1];
+    [e setBuffer:bb offset:0 atIndex:2];
+    [e setBuffer:workspace offset:x_offset atIndex:3];
+    [e setBuffer:workspace offset:out_offset atIndex:4];
+    uint od = (uint)out_dim, id_ = (uint)in_dim, gs = (uint)group_size;
+    [e setBytes:&od length:4 atIndex:5];
+    [e setBytes:&id_ length:4 atIndex:6];
+    [e setBytes:&gs length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake((NSUInteger)out_dim, batch_rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+}
+
+static void enc_rms_norm_rows_bf16_batch_offset(
+    MlaPipes *P, id<MTLCommandBuffer> cb,
+    id<MTLBuffer> workspace, NSUInteger input_offset,
+    id<MTLBuffer> weight, NSUInteger output_offset,
+    uint n_rows, uint row_dim, int has_weight) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->rms_norm_rows_bf16in_bf16out];
+    [e setBuffer:workspace offset:input_offset atIndex:0];
+    [e setBuffer:(weight ? weight : workspace) offset:0 atIndex:1];
+    [e setBuffer:workspace offset:output_offset atIndex:2];
+    uint rd = row_dim;
+    float eps = 1e-6f;
+    uint hw = has_weight ? 1u : 0u;
+    [e setBytes:&rd length:4 atIndex:3];
+    [e setBytes:&eps length:4 atIndex:4];
+    [e setBytes:&hw length:4 atIndex:5];
+    [e dispatchThreadgroups:MTLSizeMake(n_rows, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [e endEncoding];
+}
+
+static void enc_rope_bf16_batch_offset(
+    MlaPipes *P, id<MTLCommandBuffer> cb, id<MTLBuffer> workspace,
+    NSUInteger values_offset, NSUInteger cos_offset, NSUInteger sin_offset,
+    uint batch_rows, uint n_heads, uint inverse) {
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:P->rope_tail_interleaved_bf16];
+    [e setBuffer:workspace offset:values_offset atIndex:0];
+    [e setBuffer:workspace offset:cos_offset atIndex:1];
+    [e setBuffer:workspace offset:sin_offset atIndex:2];
+    uint nh = n_heads, hd = HEAD_DIM, nd = QK_NOPE_DIM, rd = QK_ROPE_DIM;
+    [e setBytes:&nh length:4 atIndex:3];
+    [e setBytes:&hd length:4 atIndex:4];
+    [e setBytes:&nd length:4 atIndex:5];
+    [e setBytes:&rd length:4 atIndex:6];
+    [e setBytes:&inverse length:4 atIndex:7];
+    const uint half = QK_ROPE_DIM / 2;
+    [e dispatchThreads:MTLSizeMake(n_heads * half, batch_rows, 1)
+        threadsPerThreadgroup:MTLSizeMake(half, 1, 1)];
     [e endEncoding];
 }
 
@@ -374,9 +450,10 @@ static void enc_dequant_matvec_bf16in_bf16out(MlaPipes *P, id<MTLCommandBuffer> 
 }
 
 static void enc_rms_norm_rows_bf16in_bf16out(MlaPipes *P, id<MTLCommandBuffer> cb,
+                                             MoEInferEngine *stage_engine, DmlxAttentionStage stage,
                                              id<MTLBuffer> x, id<MTLBuffer> weight, id<MTLBuffer> out,
                                              uint n_rows, uint row_dim, int has_weight) {
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> e = attention_stage_encoder(stage_engine, cb, stage);
     [e setComputePipelineState:P->rms_norm_rows_bf16in_bf16out];
     [e setBuffer:x offset:0 atIndex:0];
     [e setBuffer:(weight ? weight : x) offset:0 atIndex:1];
@@ -389,9 +466,11 @@ static void enc_rms_norm_rows_bf16in_bf16out(MlaPipes *P, id<MTLCommandBuffer> c
     [e endEncoding];
 }
 
-static void enc_rope_bf16(MlaPipes *P, id<MTLCommandBuffer> cb, id<MTLBuffer> q,
+static void enc_rope_bf16(MlaPipes *P, id<MTLCommandBuffer> cb,
+                          MoEInferEngine *stage_engine, DmlxAttentionStage stage,
+                          id<MTLBuffer> q,
                           id<MTLBuffer> cosb, id<MTLBuffer> sinb, uint n_heads, uint inverse) {
-    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    id<MTLComputeCommandEncoder> e = attention_stage_encoder(stage_engine, cb, stage);
     [e setComputePipelineState:P->rope_tail_interleaved_bf16];
     [e setBuffer:q offset:0 atIndex:0];
     [e setBuffer:cosb offset:0 atIndex:1];
@@ -697,11 +776,48 @@ int mla_attention_decode(MlaPipes *P, const AttnWeights *aw,
     return 0;
 }
 
+int mla_attention_select_bf16_identity(
+    bool has_persistent_kv, bool has_external_cb, bool stage_time,
+    DmlxMlaPathIdentity *out_identity) {
+    if (out_identity) memset(out_identity, 0, sizeof(*out_identity));
+    if (!out_identity || (!has_persistent_kv && has_external_cb)) return -1;
+    DmlxMlaPathIdentity candidate = {0};
+    if (has_persistent_kv) {
+        candidate.flags = DMLX_MLA_PATH_PERSISTENT_KV;
+        if (has_external_cb) {
+            candidate.flags |= DMLX_MLA_PATH_EXTERNAL_CB_REQUESTED;
+            if (stage_time) {
+                candidate.path = DMLX_MLA_PATH_PERSISTENT_INTERNAL_SPLIT;
+                candidate.flags |= DMLX_MLA_PATH_STAGE_TIME_SPLIT;
+            } else {
+                candidate.path = DMLX_MLA_PATH_PERSISTENT_EXTERNAL;
+                candidate.flags |= DMLX_MLA_PATH_EXTERNAL_CB_USED;
+            }
+        } else {
+            candidate.path = DMLX_MLA_PATH_PERSISTENT_INTERNAL;
+        }
+    } else {
+        candidate.path = DMLX_MLA_PATH_FALLBACK_TEMP_KV;
+        candidate.flags = DMLX_MLA_PATH_FALLBACK;
+    }
+    *out_identity = candidate;
+    return 0;
+}
+
 // --- BF16 variant of mla_attention_decode ---
 int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                               const uint16_t *x, uint16_t *kv_cache, int cache_len,
                               int pos, float *out, void *kv_cache_gpu_buf, void *x_gpu_buf,
-                              void *external_cb1, void *out_gpu_buf) {
+                              void *external_cb1, void *out_gpu_buf,
+                              DmlxMlaPathIdentity *out_identity,
+                              MoEInferEngine *stage_engine) {
+    if (out_identity) memset(out_identity, 0, sizeof(*out_identity));
+    if (!out_identity || (!kv_cache_gpu_buf && external_cb1)) return -1;
+    const int stage_time = getenv("MF_STAGE_TIME") != NULL;
+    DmlxMlaPathIdentity identity_candidate;
+    if (mla_attention_select_bf16_identity(
+            kv_cache_gpu_buf != NULL, external_cb1 != NULL, stage_time != 0,
+            &identity_candidate) != 0) return -1;
     @autoreleasepool {
     id<MTLDevice> d = P->dev;
     int half = QK_ROPE_DIM / 2;
@@ -710,7 +826,6 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     // MF_STAGE_TIME: split the merged CB into per-stage CBs (commit+wait each)
     // and print per-stage GPU wait times. Same kernels, same order — numerics
     // unchanged, only extra syncs. Caller (engine.c) must gate its own commit.
-    const int stage_time = getenv("MF_STAGE_TIME") != NULL;
 
     // === Get (or create) persistent GPU buffers for fixed attention weights ===
     AttnBufCache *abc = attn_buf_cache_get(d, aw);
@@ -745,32 +860,32 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                                              : [P->queue commandBuffer];
         // Q chain — use cached weight buffers when available (wq_a, wq_b, wkv may be nil if memory-limited)
         if (abc && abc->wq_a_pack) {
-            enc_dq_bf16_cached(P, cb1, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
+            enc_dq_bf16_cached(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_WQ_A, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
                                aw->wq_a.out_dim, aw->wq_a.in_dim, aw->wq_a.group_size, bx, bq_a,
                                P->dequant_matvec_affine_bf16in_bf16out);
         } else {
             enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_a, bx, bq_a);
         }
-        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_Q_RMS, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
         if (abc && abc->wq_b_pack) {
-            enc_dq_bf16_cached(P, cb1, abc->wq_b_pack, abc->wq_b_sc, abc->wq_b_bi,
+            enc_dq_bf16_cached(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_WQ_B, abc->wq_b_pack, abc->wq_b_sc, abc->wq_b_bi,
                                aw->wq_b.out_dim, aw->wq_b.in_dim, aw->wq_b.group_size, bq_res, bq,
                                P->dequant_matvec_affine_bf16in_bf16out);
         } else {
             enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wq_b, bq_res, bq);
         }
-        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
-        enc_rope_bf16(P, cb1, bq_n, bcos, bsin, N_HEADS, 0);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_Q_HEAD_RMS, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
+        enc_rope_bf16(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_Q_ROPE, bq_n, bcos, bsin, N_HEADS, 0);
         // KV chain
         if (abc && abc->wkv_pack) {
-            enc_dq_bf16_cached(P, cb1, abc->wkv_pack, abc->wkv_sc, abc->wkv_bi,
+            enc_dq_bf16_cached(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_WKV, abc->wkv_pack, abc->wkv_sc, abc->wkv_bi,
                                aw->wkv.out_dim, aw->wkv.in_dim, aw->wkv.group_size, bx, bkv,
                                P->dequant_matvec_affine_bf16in_bf16out);
         } else {
             enc_dequant_matvec_bf16in_bf16out(P, cb1, &aw->wkv, bx, bkv);
         }
-        enc_rms_norm_rows_bf16in_bf16out(P, cb1, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
-        enc_rope_bf16(P, cb1, bkv_n, bcos, bsin, 1, 0);
+        enc_rms_norm_rows_bf16in_bf16out(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_KV_RMS, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
+        enc_rope_bf16(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_KV_ROPE, bkv_n, bcos, bsin, 1, 0);
 
         // === KV cache update + SDPA: merged into CB1 when kv_cache_gpu_buf is available ===
         // This eliminates the CPU round-trip (GPU→CPU→GPU) between CB1 and CB2,
@@ -782,7 +897,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             // GPU bf16→f16 conversion: write bkv_n into kvcache[cache_len-1] as f16.
             // Avoids CPU round-trip (GPU→CPU→GPU) saving ~1 waitUntilCompleted per layer.
             {
-                id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+                id<MTLComputeCommandEncoder> e = attention_stage_encoder(
+                    stage_engine, cb1, DMLX_ATTENTION_STAGE_KV_UPDATE);
                 [e setComputePipelineState:P->bf16_to_f16_row];
                 [e setBuffer:bkv_n                 offset:0 atIndex:0];
                 [e setBuffer:bkvcache_persistent   offset:0 atIndex:1];
@@ -796,7 +912,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             }
             // SDPA reads the full kvcache (including the new row just written)
             {
-                id<MTLComputeCommandEncoder> e = [cb1 computeCommandEncoder];
+                id<MTLComputeCommandEncoder> e = attention_stage_encoder(
+                    stage_engine, cb1, DMLX_ATTENTION_STAGE_SDPA);
                 [e setComputePipelineState:P->mla_sdpa_decode_bfloat];
                 [e setBuffer:bq_n                 offset:0 atIndex:0];
                 [e setBuffer:bkvcache_persistent  offset:0 atIndex:1];
@@ -811,7 +928,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
                 [e endEncoding];
             }
-            enc_rope_bf16(P, cb1, battn_scr, bcos, bsin, N_HEADS, 1);
+            enc_rope_bf16(P, cb1, stage_engine, DMLX_ATTENTION_STAGE_INV_Q_ROPE, battn_scr, bcos, bsin, N_HEADS, 1);
             if (!external_cb1 || stage_time) {
                 double s0 = 0;
                 if (stage_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); s0 = ts.tv_sec*1e9+ts.tv_nsec; }
@@ -851,7 +968,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
                 [e dispatchThreadgroups:MTLSizeMake(N_HEADS,1,1) threadsPerThreadgroup:MTLSizeMake(32,1,1)];
                 [e endEncoding];
             }
-            enc_rope_bf16(P, cb2, battn_scr, bcos, bsin, N_HEADS, 1);
+            enc_rope_bf16(P, cb2, NULL, 0, battn_scr, bcos, bsin, N_HEADS, 1);
             [cb2 commit]; [cb2 waitUntilCompleted];
         }
         id<MTLBuffer> battn = battn_scr;  // alias for code below
@@ -863,7 +980,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     int heads_per_group = N_HEADS / O_GROUPS;
     int group_feat = heads_per_group * HEAD_DIM;
     float *concat = (abc && abc->scr_concat) ? NULL : malloc((size_t)O_GROUPS * O_LORA_RANK * sizeof(float));
-    if (!abc && !concat) return -1;
+    if (!(abc && abc->scr_concat) && !concat) return -1;
 
     id<MTLBuffer> bog_arr[O_GROUPS];
     id<MTLBuffer> bconcat = (abc && abc->scr_concat) ? abc->scr_concat
@@ -886,7 +1003,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             // concat layout straight into bconcat — replaces 8 blits + 8
             // matvec dispatches + the concat blit. Per-row accumulation is
             // identical to the per-group path (bit-exact).
-            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
+            id<MTLComputeCommandEncoder> e = attention_stage_encoder(
+                stage_engine, cb3, DMLX_ATTENTION_STAGE_WO_A);
             [e setComputePipelineState:P->dequant_matvec_affine_bf16in_f32out_grp8];
             [e setBuffer:abc->wo_a_pack_all offset:0 atIndex:0];
             [e setBuffer:abc->wo_a_sc_all   offset:0 atIndex:1];
@@ -942,7 +1060,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
             // known correctness issues on some prompts) → f32 dense
             // (DMLX_WOA_F32=1 or packed unavailable).
             if (!use_f32_woa && abc && abc->wo_a_pack[g]) {
-                enc_dq_bf16_cached(P, cb3, abc->wo_a_pack[g], abc->wo_a_sc[g], abc->wo_a_bi[g],
+                enc_dq_bf16_cached(P, cb3, NULL, 0, abc->wo_a_pack[g], abc->wo_a_sc[g], abc->wo_a_bi[g],
                                    O_LORA_RANK, group_feat, 64, bgv, bog_arr[g],
                                    P->dequant_matvec_affine_bf16in_f32out);
             } else if (use_q8_woa && abc && abc->wo_a_q8_gpu[g]) {
@@ -982,7 +1100,8 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
 
         // --- Part 3: wo_b output projection (coalesced v2 kernel) ---
         if (abc && abc->wo_b_pack) {
-            id<MTLComputeCommandEncoder> e = [cb3 computeCommandEncoder];
+            id<MTLComputeCommandEncoder> e = attention_stage_encoder(
+                stage_engine, cb3, DMLX_ATTENTION_STAGE_WO_B);
             [e setComputePipelineState:P->dequant_matvec_affine_v2];
             [e setBuffer:abc->wo_b_pack offset:0 atIndex:0];
             [e setBuffer:abc->wo_b_sc   offset:0 atIndex:1];
@@ -1016,6 +1135,7 @@ int mla_attention_decode_bf16(MlaPipes *P, const AttnWeights *aw,
     }
     if (!abc || !abc->scr_concat) free(concat);
     } // end @autoreleasepool
+    *out_identity = identity_candidate;
     return 0;
 }
 
@@ -1365,6 +1485,591 @@ int mla_attention_decode_mixed(MlaPipes *P, const AttnWeights *aw,
 }
 
 // ============================================================================
+// Persistent no-copy Metal view for NativeBatchWorkspace. The parent owns one
+// retained MTLBuffer for its full lifetime; complete-v2 subworkspaces borrow it
+// and add metal_buffer_offset instead of creating per-stage wrappers.
+// ============================================================================
+static void mla_workspace_release_metal_buffer(void *opaque) {
+    if (!opaque) return;
+#if __has_feature(objc_arc)
+    CFBridgingRelease(opaque);
+#else
+    [(id<MTLBuffer>)opaque release];
+#endif
+}
+
+static id<MTLBuffer> mla_workspace_metal_buffer(
+    id<MTLDevice> device, NativeBatchWorkspace *workspace) {
+    if (!device || !workspace || !workspace->storage ||
+        workspace->allocated_bytes == 0u ||
+        workspace->allocated_bytes > (uint64_t)NSUIntegerMax ||
+        workspace->metal_buffer_offset > (uint64_t)NSUIntegerMax) {
+        return nil;
+    }
+    if (workspace->metal_buffer) {
+        id<MTLBuffer> existing =
+            (__bridge id<MTLBuffer>)workspace->metal_buffer;
+        const uint64_t length = (uint64_t)existing.length;
+        if (existing.device != device ||
+            workspace->metal_buffer_offset > length ||
+            workspace->allocated_bytes >
+                length - workspace->metal_buffer_offset) {
+            return nil;
+        }
+        return existing;
+    }
+    if (workspace->metal_buffer_offset != 0u ||
+        workspace->metal_buffer_release ||
+        workspace->metal_buffer_creations == UINT64_MAX) {
+        return nil;
+    }
+    id<MTLBuffer> created = [device
+        newBufferWithBytesNoCopy:workspace->storage
+        length:(NSUInteger)workspace->allocated_bytes
+        options:MTLResourceStorageModeShared
+        deallocator:nil];
+    if (!created) return nil;
+#if __has_feature(objc_arc)
+    workspace->metal_buffer = (__bridge_retained void *)created;
+#else
+    workspace->metal_buffer = (void *)created;
+#endif
+    workspace->metal_buffer_release = mla_workspace_release_metal_buffer;
+    workspace->metal_buffer_creations++;
+    return created;
+}
+
+// ============================================================================
+// mla_attention_q_batch — Task 2.2 batched pre-RoPE Q chain.
+//
+// One command buffer contains exactly four dispatches for every B:
+//   [B,DIM] -> wq_a -> [B,Q_LORA_RANK]
+//            -> q_norm
+//            -> wq_b -> [B,N_HEADS,HEAD_DIM]
+//            -> per-head norm
+// The Q RoPE belongs to Task 2.3 because it consumes explicit positions.
+// ============================================================================
+int mla_attention_q_batch(MlaPipes *P, const AttnWeights *aw,
+                          const uint16_t *hidden, uint16_t *q_output,
+                          uint32_t batch_tokens, NativeBatchWorkspace *workspace,
+                          MLAAttentionMetrics *metrics) {
+    @autoreleasepool {
+        if (metrics) memset(metrics, 0, sizeof(*metrics));
+        if (!P || !P->dev || !P->queue ||
+            !P->dequant_matvec_affine_bf16in_bf16out ||
+            !P->rms_norm_rows_bf16in_bf16out ||
+            !aw || !hidden || !q_output || !workspace ||
+            batch_tokens == 0u || batch_tokens > workspace->capacity_tokens ||
+            workspace->self_cookie != (uintptr_t)workspace || !workspace->storage ||
+            aw->wq_a.out_dim != Q_LORA_RANK || aw->wq_a.in_dim != DIM ||
+            aw->wq_b.out_dim != N_HEADS * HEAD_DIM || aw->wq_b.in_dim != Q_LORA_RANK) {
+            return NATIVE_BATCH_INVALID_ARGUMENT;
+        }
+
+        const uint64_t hidden_bytes_u64 =
+            (uint64_t)batch_tokens * DIM * sizeof(uint16_t);
+        const uint64_t q_a_bytes =
+            (uint64_t)batch_tokens * Q_LORA_RANK * sizeof(uint16_t);
+        const uint64_t q_bytes =
+            (uint64_t)batch_tokens * N_HEADS * HEAD_DIM * sizeof(uint16_t);
+        const uint64_t scratch_bytes = hidden_bytes_u64 + q_a_bytes * 2u + q_bytes * 2u;
+        void *scratch = moe_infer_batch_workspace_reserve(
+            workspace, scratch_bytes, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+        if (!scratch) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+
+        AttnBufCache *abc = attn_buf_cache_get(P->dev, aw);
+        if (!abc || !abc->wq_a_pack || !abc->wq_a_sc || !abc->wq_a_bi ||
+            !abc->wq_b_pack || !abc->wq_b_sc || !abc->wq_b_bi ||
+            !abc->q_norm_buf) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+
+        const size_t hidden_bytes = (size_t)hidden_bytes_u64;
+        const size_t q_size = (size_t)q_bytes;
+        const NSUInteger storage_hidden_offset =
+            (NSUInteger)((uint8_t *)scratch - (uint8_t *)workspace->storage);
+        const NSUInteger metal_base = (NSUInteger)workspace->metal_buffer_offset;
+        const NSUInteger hidden_offset = metal_base + storage_hidden_offset;
+        const NSUInteger q_a_offset = hidden_offset + hidden_bytes;
+        const NSUInteger q_res_offset = q_a_offset + (NSUInteger)q_a_bytes;
+        const NSUInteger q_offset = q_res_offset + (NSUInteger)q_a_bytes;
+        const NSUInteger q_norm_offset = q_offset + (NSUInteger)q_bytes;
+        memcpy((uint8_t *)workspace->storage + storage_hidden_offset,
+               hidden, hidden_bytes);
+
+        // The bounded arena is page-aligned by workspace_init. Standalone
+        // calls lazily create one persistent view; complete-v2 subworkspaces
+        // borrow the parent view and use offsets into it.
+        id<MTLBuffer> batch_buffer =
+            mla_workspace_metal_buffer(P->dev, workspace);
+        if (!batch_buffer) return NATIVE_BATCH_INVALID_STATE;
+
+        id<MTLCommandBuffer> cb = [P->queue commandBuffer];
+        if (!cb) return NATIVE_BATCH_INVALID_STATE;
+        enc_dq_bf16_cached_batch(
+            P, cb, abc->wq_a_pack, abc->wq_a_sc, abc->wq_a_bi,
+            aw->wq_a.out_dim, aw->wq_a.in_dim, aw->wq_a.group_size,
+            batch_buffer, hidden_offset, q_a_offset, batch_tokens);
+        enc_rms_norm_rows_bf16_batch_offset(
+            P, cb, batch_buffer, q_a_offset, abc->q_norm_buf, q_res_offset,
+            batch_tokens, Q_LORA_RANK, 1);
+        enc_dq_bf16_cached_batch(
+            P, cb, abc->wq_b_pack, abc->wq_b_sc, abc->wq_b_bi,
+            aw->wq_b.out_dim, aw->wq_b.in_dim, aw->wq_b.group_size,
+            batch_buffer, q_res_offset, q_offset, batch_tokens);
+        enc_rms_norm_rows_bf16_batch_offset(
+            P, cb, batch_buffer, q_offset, nil, q_norm_offset,
+            batch_tokens * N_HEADS, HEAD_DIM, 0);
+
+        struct timespec start, finish;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        [cb commit];
+        [cb waitUntilCompleted];
+        clock_gettime(CLOCK_MONOTONIC, &finish);
+        if (cb.status == MTLCommandBufferStatusError) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+        memcpy(q_output,
+               (uint8_t *)workspace->storage +
+                   (q_norm_offset - metal_base),
+               q_size);
+
+        if (metrics) {
+            const int64_t elapsed_ns =
+                (int64_t)(finish.tv_sec - start.tv_sec) * 1000000000ll +
+                (int64_t)(finish.tv_nsec - start.tv_nsec);
+            metrics->q_ns = elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0u;
+            metrics->dispatches = 4u;
+            metrics->workspace_high_water_bytes = workspace->high_water_bytes;
+        }
+        return NATIVE_BATCH_OK;
+    }
+}
+
+static bool mla_align_workspace(uint64_t value, uint64_t *aligned) {
+    const uint64_t mask = NATIVE_BATCH_WORKSPACE_ALIGNMENT - 1u;
+    if (!aligned || value > UINT64_MAX - mask) return false;
+    *aligned = (value + mask) & ~mask;
+    return true;
+}
+
+static bool mla_u64_add(uint64_t left, uint64_t right, uint64_t *sum) {
+    if (!sum || right > UINT64_MAX - left) return false;
+    *sum = left + right;
+    return true;
+}
+
+static bool mla_u64_multiply(uint64_t left, uint64_t right, uint64_t *product) {
+    if (!product || (left != 0u && right > UINT64_MAX / left)) return false;
+    *product = left * right;
+    return true;
+}
+
+static bool mla_workspace_next(
+    uint64_t offset, uint64_t size_bytes, uint64_t *next_offset) {
+    uint64_t end = 0u;
+    return mla_u64_add(offset, size_bytes, &end) &&
+        mla_align_workspace(end, next_offset);
+}
+
+static bool mla_ranges_overlap(
+    const void *left, uint64_t left_bytes,
+    const void *right, uint64_t right_bytes) {
+    if (!left || !right || left_bytes == 0u || right_bytes == 0u) return false;
+    const uintptr_t left_start = (uintptr_t)left;
+    const uintptr_t right_start = (uintptr_t)right;
+    if (left_bytes > UINTPTR_MAX - left_start ||
+        right_bytes > UINTPTR_MAX - right_start) {
+        return true;
+    }
+    const uintptr_t left_end = left_start + (uintptr_t)left_bytes;
+    const uintptr_t right_end = right_start + (uintptr_t)right_bytes;
+    return left_start < right_end && right_start < left_end;
+}
+
+int mla_attention_kv_rope_batch(MoEInferEngine *engine,
+                                MlaPipes *P, const AttnWeights *aw,
+                                const MLAPrefillBatchArgs *args,
+                                MLAAttentionMetrics *metrics) {
+    @autoreleasepool {
+        if (!engine || !P || !P->dev || !P->queue ||
+            !P->dequant_matvec_affine_bf16in_bf16out ||
+            !P->rms_norm_rows_bf16in_bf16out || !P->rope_tail_interleaved_bf16 ||
+            !aw || !args || !args->hidden || !args->positions ||
+            !args->workspace || !args->kv_transaction || !args->kv.kv_data ||
+            args->batch_tokens == 0u || args->layer >= N_LAYERS ||
+            args->batch_tokens > args->workspace->capacity_tokens ||
+            args->workspace->self_cookie != (uintptr_t)args->workspace ||
+            !args->workspace->storage ||
+            args->kv_transaction->self_cookie != (uintptr_t)args->kv_transaction ||
+            args->kv_transaction->owner_engine == 0u ||
+            args->kv_transaction->active != 1u ||
+            args->kv_transaction->generation == 0u ||
+            args->kv_transaction->phase < NATIVE_BATCH_PHASE_PREFILL ||
+            args->kv_transaction->phase > NATIVE_BATCH_PHASE_DECODE ||
+            args->kv.generation != args->kv_transaction->generation ||
+            args->kv.layer != args->layer ||
+            args->kv.start_position != args->kv_transaction->start_position ||
+            args->kv.row_count != args->batch_tokens ||
+            args->kv.row_stride_bytes != KV_LORA_RANK * sizeof(uint16_t) ||
+            args->kv_transaction->staged_tokens != args->batch_tokens ||
+            aw->wkv.out_dim != KV_LORA_RANK || aw->wkv.in_dim != DIM) {
+            return NATIVE_BATCH_INVALID_ARGUMENT;
+        }
+        const int view_status = moe_infer_kv_transaction_validate_layer_view(
+            engine, args->kv_transaction, args->layer, &args->kv);
+        if (view_status != NATIVE_BATCH_OK) return view_status;
+        if (args->positions[0] != args->kv.start_position ||
+            args->positions[0] >= MAX_SEQ_LEN ||
+            args->batch_tokens > (uint32_t)MAX_SEQ_LEN - args->positions[0]) {
+            return NATIVE_BATCH_INVALID_POSITION;
+        }
+        for (uint32_t row = 1; row < args->batch_tokens; ++row) {
+            if (args->positions[row] != args->positions[0] + row) {
+                return NATIVE_BATCH_INVALID_POSITION;
+            }
+        }
+
+        uint64_t hidden_bytes = 0u, kv_bytes = 0u, rope_bytes = 0u;
+        if (!mla_u64_multiply(args->batch_tokens,
+                (uint64_t)DIM * sizeof(uint16_t), &hidden_bytes) ||
+            !mla_u64_multiply(args->batch_tokens,
+                (uint64_t)KV_LORA_RANK * sizeof(uint16_t), &kv_bytes) ||
+            !mla_u64_multiply(args->batch_tokens,
+                (uint64_t)(QK_ROPE_DIM / 2) * sizeof(float), &rope_bytes)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        // A GPU staging view addresses the full layer cache, so validate its
+        // absolute destination before reserving workspace or encoding commands.
+        id<MTLBuffer> staged_gpu = (__bridge id<MTLBuffer>)args->kv.kv_gpu_buffer;
+        uint64_t destination_u64 = 0u;
+        if (!mla_u64_multiply(args->kv.start_position,
+                args->kv.row_stride_bytes, &destination_u64) ||
+            destination_u64 > (uint64_t)NSUIntegerMax) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+        const NSUInteger destination = (NSUInteger)destination_u64;
+        if (staged_gpu &&
+            (destination > staged_gpu.length ||
+             (NSUInteger)kv_bytes > staged_gpu.length - destination)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        const uint64_t hidden_rel = 0u;
+        uint64_t kv_rel = 0u;
+        uint64_t kv_norm_rel = 0u;
+        uint64_t cos_rel = 0u;
+        uint64_t sin_rel = 0u;
+        uint64_t scratch_bytes = 0u;
+        if (!mla_workspace_next(hidden_rel, hidden_bytes, &kv_rel) ||
+            !mla_workspace_next(kv_rel, kv_bytes, &kv_norm_rel) ||
+            !mla_workspace_next(kv_norm_rel, kv_bytes, &cos_rel) ||
+            !mla_workspace_next(cos_rel, rope_bytes, &sin_rel) ||
+            !mla_u64_add(sin_rel, rope_bytes, &scratch_bytes)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+        void *scratch = moe_infer_batch_workspace_reserve(
+            args->workspace, scratch_bytes, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+        if (!scratch) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+
+        AttnBufCache *abc = attn_buf_cache_get(P->dev, aw);
+        if (!abc || !abc->wkv_pack || !abc->wkv_sc || !abc->wkv_bi ||
+            !abc->kv_norm_buf) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+
+        const NSUInteger storage_base =
+            (NSUInteger)((uint8_t *)scratch -
+                (uint8_t *)args->workspace->storage);
+        const NSUInteger metal_base =
+            (NSUInteger)args->workspace->metal_buffer_offset;
+        const NSUInteger hidden_offset = metal_base + storage_base +
+            (NSUInteger)hidden_rel;
+        const NSUInteger kv_offset = metal_base + storage_base +
+            (NSUInteger)kv_rel;
+        const NSUInteger kv_norm_offset = metal_base + storage_base +
+            (NSUInteger)kv_norm_rel;
+        const NSUInteger cos_offset = metal_base + storage_base +
+            (NSUInteger)cos_rel;
+        const NSUInteger sin_offset = metal_base + storage_base +
+            (NSUInteger)sin_rel;
+        uint8_t *workspace_storage = (uint8_t *)args->workspace->storage;
+        memcpy(workspace_storage + storage_base + (NSUInteger)hidden_rel,
+               args->hidden, (size_t)hidden_bytes);
+        float *cos_values = (float *)(workspace_storage + storage_base +
+            (NSUInteger)cos_rel);
+        float *sin_values = (float *)(workspace_storage + storage_base +
+            (NSUInteger)sin_rel);
+        for (uint32_t row = 0; row < args->batch_tokens; ++row) {
+            yarn_cos_sin((int)args->positions[row],
+                         cos_values + (size_t)row * (QK_ROPE_DIM / 2),
+                         sin_values + (size_t)row * (QK_ROPE_DIM / 2));
+        }
+
+        id<MTLBuffer> batch_buffer =
+            mla_workspace_metal_buffer(P->dev, args->workspace);
+        if (!batch_buffer) return NATIVE_BATCH_INVALID_STATE;
+        id<MTLCommandBuffer> cb = [P->queue commandBuffer];
+        if (!cb) return NATIVE_BATCH_INVALID_STATE;
+        enc_dq_bf16_cached_batch(
+            P, cb, abc->wkv_pack, abc->wkv_sc, abc->wkv_bi,
+            aw->wkv.out_dim, aw->wkv.in_dim, aw->wkv.group_size,
+            batch_buffer, hidden_offset, kv_offset, args->batch_tokens);
+        enc_rms_norm_rows_bf16_batch_offset(
+            P, cb, batch_buffer, kv_offset, abc->kv_norm_buf, kv_norm_offset,
+            args->batch_tokens, KV_LORA_RANK, 1);
+        enc_rope_bf16_batch_offset(
+            P, cb, batch_buffer, kv_norm_offset, cos_offset, sin_offset,
+            args->batch_tokens, 1u, 0u);
+
+        struct timespec start, finish;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        [cb commit];
+        [cb waitUntilCompleted];
+        clock_gettime(CLOCK_MONOTONIC, &finish);
+        if (cb.status == MTLCommandBufferStatusError) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+
+        // The projection/RoPE kernels produce BF16, while the native cache and
+        // scalar decode path consume IEEE f16. Convert only after GPU completion
+        // and write into the authenticated engine-derived destination. When a
+        // shared GPU cache exists kv_data aliases its contents, so this one CPU
+        // write updates the exact physical cache without a BF16 blit.
+        const uint16_t *kv_bf16 = (const uint16_t *)(
+            workspace_storage + storage_base + (NSUInteger)kv_norm_rel);
+        uint16_t *kv_f16 = (uint16_t *)args->kv.kv_data;
+        const size_t kv_elements =
+            (size_t)args->batch_tokens * KV_LORA_RANK;
+        for (size_t index = 0; index < kv_elements; ++index) {
+            const uint32_t bits = (uint32_t)kv_bf16[index] << 16;
+            float value;
+            memcpy(&value, &bits, sizeof(value));
+            kv_f16[index] = f32_to_f16(value);
+        }
+        if (metrics) {
+            const int64_t elapsed_ns =
+                (int64_t)(finish.tv_sec - start.tv_sec) * 1000000000ll +
+                (int64_t)(finish.tv_nsec - start.tv_nsec);
+            metrics->kv_rope_ns = elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0u;
+            metrics->dispatches += 3u;
+            metrics->workspace_high_water_bytes = args->workspace->high_water_bytes;
+        }
+        return NATIVE_BATCH_OK;
+    }
+}
+
+// ============================================================================
+// mla_attention_sdpa_batch — Task 2.4 chunk-local causal SDPA stage.
+//
+// Owned workspace layout (every start offset is 256-byte aligned):
+//   q_work[B,N_HEADS,HEAD_DIM] BF16
+//   kv_work[start+B,HEAD_DIM]   f16
+//   cos[B,QK_ROPE_DIM/2]       f32
+//   sin[B,QK_ROPE_DIM/2]       f32
+//   output[B,N_HEADS,HEAD_DIM] BF16
+// Exactly two compute dispatches share one command buffer: Q RoPE in-place,
+// then causal SDPA. No stage matrix is allocated outside this workspace.
+// ============================================================================
+int mla_attention_sdpa_batch(MoEInferEngine *engine,
+                             MlaPipes *P, const AttnWeights *aw,
+                             const MLAPrefillBatchArgs *args,
+                             const uint16_t *q_input,
+                             uint16_t *sdpa_output,
+                             MLAAttentionMetrics *metrics) {
+    @autoreleasepool {
+        if (!engine || !P || !P->dev || !P->queue ||
+            !P->rope_tail_interleaved_bf16 || !P->mla_sdpa_batch_f16_kv ||
+            !aw || !aw->attn_sink || !args || !args->positions ||
+            !args->workspace || !args->kv_transaction || !args->kv.kv_data ||
+            !q_input || !sdpa_output ||
+            args->batch_tokens == 0u || args->layer >= N_LAYERS ||
+            args->batch_tokens > args->workspace->capacity_tokens ||
+            args->workspace->self_cookie != (uintptr_t)args->workspace ||
+            !args->workspace->storage ||
+            args->kv_transaction->self_cookie != (uintptr_t)args->kv_transaction ||
+            args->kv_transaction->owner_engine == 0u ||
+            args->kv_transaction->active != 1u ||
+            args->kv_transaction->generation == 0u ||
+            args->kv.generation != args->kv_transaction->generation ||
+            args->kv.layer != args->layer ||
+            args->kv.start_position != args->kv_transaction->start_position ||
+            args->kv.row_count != args->batch_tokens ||
+            args->kv.row_stride_bytes != KV_LORA_RANK * sizeof(uint16_t) ||
+            args->kv_transaction->staged_tokens != args->batch_tokens) {
+            return NATIVE_BATCH_INVALID_ARGUMENT;
+        }
+
+        const int view_status = moe_infer_kv_transaction_validate_layer_view(
+            engine, args->kv_transaction, args->layer, &args->kv);
+        if (view_status != NATIVE_BATCH_OK) return view_status;
+
+        const uint32_t committed = args->kv.start_position;
+        if (args->positions[0] != committed || committed >= MAX_SEQ_LEN ||
+            args->batch_tokens > (uint32_t)MAX_SEQ_LEN - committed) {
+            return NATIVE_BATCH_INVALID_POSITION;
+        }
+        for (uint32_t row = 1u; row < args->batch_tokens; ++row) {
+            if (args->positions[row] != committed + row) {
+                return NATIVE_BATCH_INVALID_POSITION;
+            }
+        }
+        uint64_t visible_rows = 0u;
+        if (!mla_u64_add((uint64_t)committed,
+                (uint64_t)args->batch_tokens, &visible_rows)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        uint64_t q_bytes = 0u;
+        uint64_t kv_bytes = 0u;
+        uint64_t rope_bytes = 0u;
+        if (!mla_u64_multiply(
+                args->batch_tokens,
+                (uint64_t)N_HEADS * HEAD_DIM * sizeof(uint16_t), &q_bytes) ||
+            !mla_u64_multiply(
+                visible_rows,
+                (uint64_t)KV_LORA_RANK * sizeof(uint16_t), &kv_bytes) ||
+            !mla_u64_multiply(
+                args->batch_tokens,
+                (uint64_t)(QK_ROPE_DIM / 2) * sizeof(float), &rope_bytes)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        const uint16_t *full_kv = engine->kv_cache[args->layer].kv;
+        if (!full_kv ||
+            mla_ranges_overlap(q_input, q_bytes, sdpa_output, q_bytes) ||
+            mla_ranges_overlap(full_kv, kv_bytes, sdpa_output, q_bytes) ||
+            mla_ranges_overlap(
+                args->workspace->storage, args->workspace->allocated_bytes,
+                q_input, q_bytes) ||
+            mla_ranges_overlap(
+                args->workspace->storage, args->workspace->allocated_bytes,
+                sdpa_output, q_bytes) ||
+            mla_ranges_overlap(
+                args->workspace->storage, args->workspace->allocated_bytes,
+                full_kv, kv_bytes)) {
+            return NATIVE_BATCH_INVALID_ARGUMENT;
+        }
+
+        // If the authoritative cache is shared with Metal, validate the entire
+        // visible prefix before reserving workspace or encoding either dispatch.
+        id<MTLBuffer> cache_gpu =
+            (__bridge id<MTLBuffer>)engine->kv_cache[args->layer].kv_gpu_buf;
+        if (cache_gpu && (NSUInteger)kv_bytes > cache_gpu.length) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        const uint64_t q_rel = 0u;
+        uint64_t kv_rel = 0u;
+        uint64_t cos_rel = 0u;
+        uint64_t sin_rel = 0u;
+        uint64_t output_rel = 0u;
+        uint64_t scratch_bytes = 0u;
+        if (!mla_workspace_next(q_rel, q_bytes, &kv_rel) ||
+            !mla_workspace_next(kv_rel, kv_bytes, &cos_rel) ||
+            !mla_workspace_next(cos_rel, rope_bytes, &sin_rel) ||
+            !mla_workspace_next(sin_rel, rope_bytes, &output_rel) ||
+            !mla_u64_add(output_rel, q_bytes, &scratch_bytes)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+        void *scratch = moe_infer_batch_workspace_reserve(
+            args->workspace, scratch_bytes, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+        if (!scratch) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+
+        // Sink weights are immutable per layer and live in the persistent
+        // attention-weight cache. The hot SDPA stage must not allocate an
+        // unaccounted buffer on every chunk.
+        AttnBufCache *abc = attn_buf_cache_get(P->dev, aw);
+        if (!abc || !abc->attn_sink_buf) return NATIVE_BATCH_INVALID_STATE;
+
+        const NSUInteger storage_base = (NSUInteger)(
+            (uint8_t *)scratch - (uint8_t *)args->workspace->storage);
+        const NSUInteger metal_base =
+            (NSUInteger)args->workspace->metal_buffer_offset;
+        const NSUInteger q_offset = metal_base + storage_base +
+            (NSUInteger)q_rel;
+        const NSUInteger kv_offset = metal_base + storage_base +
+            (NSUInteger)kv_rel;
+        const NSUInteger cos_offset = metal_base + storage_base +
+            (NSUInteger)cos_rel;
+        const NSUInteger sin_offset = metal_base + storage_base +
+            (NSUInteger)sin_rel;
+        const NSUInteger output_offset = metal_base + storage_base +
+            (NSUInteger)output_rel;
+
+        uint8_t *workspace_bytes = (uint8_t *)args->workspace->storage;
+        memcpy(workspace_bytes + storage_base + (NSUInteger)q_rel,
+               q_input, (size_t)q_bytes);
+        memcpy(workspace_bytes + storage_base + (NSUInteger)kv_rel,
+               full_kv, (size_t)kv_bytes);
+        float *cos_values = (float *)(workspace_bytes + storage_base +
+            (NSUInteger)cos_rel);
+        float *sin_values = (float *)(workspace_bytes + storage_base +
+            (NSUInteger)sin_rel);
+        for (uint32_t row = 0u; row < args->batch_tokens; ++row) {
+            yarn_cos_sin(
+                (int)args->positions[row],
+                cos_values + (size_t)row * (QK_ROPE_DIM / 2),
+                sin_values + (size_t)row * (QK_ROPE_DIM / 2));
+        }
+
+        id<MTLBuffer> batch_buffer =
+            mla_workspace_metal_buffer(P->dev, args->workspace);
+        if (!batch_buffer) return NATIVE_BATCH_INVALID_STATE;
+
+        id<MTLCommandBuffer> cb = [P->queue commandBuffer];
+        if (!cb) return NATIVE_BATCH_INVALID_STATE;
+        enc_rope_bf16_batch_offset(
+            P, cb, batch_buffer, q_offset, cos_offset, sin_offset,
+            args->batch_tokens, N_HEADS, 0u);
+        {
+            id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+            [encoder setComputePipelineState:P->mla_sdpa_batch_f16_kv];
+            [encoder setBuffer:batch_buffer offset:q_offset atIndex:0];
+            [encoder setBuffer:batch_buffer offset:kv_offset atIndex:1];
+            [encoder setBuffer:abc->attn_sink_buf offset:0 atIndex:2];
+            [encoder setBuffer:batch_buffer offset:output_offset atIndex:3];
+            const uint32_t batch_tokens = args->batch_tokens;
+            const uint32_t n_heads = N_HEADS;
+            const float scale = 1.0f / sqrtf((float)HEAD_DIM);
+            [encoder setBytes:&batch_tokens length:sizeof(batch_tokens) atIndex:4];
+            [encoder setBytes:&committed length:sizeof(committed) atIndex:5];
+            [encoder setBytes:&n_heads length:sizeof(n_heads) atIndex:6];
+            [encoder setBytes:&scale length:sizeof(scale) atIndex:7];
+            const uint32_t query_rows = args->batch_tokens;
+            [encoder dispatchThreadgroups:MTLSizeMake(
+                    (NSUInteger)query_rows * N_HEADS, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [encoder endEncoding];
+        }
+
+        struct timespec start, finish;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        [cb commit];
+        [cb waitUntilCompleted];
+        clock_gettime(CLOCK_MONOTONIC, &finish);
+        if (cb.status == MTLCommandBufferStatusError) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+        memcpy(sdpa_output,
+               workspace_bytes + storage_base + (NSUInteger)output_rel,
+               (size_t)q_bytes);
+
+        if (metrics) {
+            const int64_t elapsed_ns =
+                (int64_t)(finish.tv_sec - start.tv_sec) * 1000000000ll +
+                (int64_t)(finish.tv_nsec - start.tv_nsec);
+            metrics->sdpa_ns += elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0u;
+            metrics->dispatches += 2u;
+            metrics->workspace_high_water_bytes =
+                args->workspace->high_water_bytes;
+        }
+        return NATIVE_BATCH_OK;
+    }
+}
+
+// ============================================================================
 // mla_attention_prefill_bfloat — batch prefill for N tokens, bf16 end-to-end.
 //
 // Processes all n_tokens through the Q and KV chains (bf16), fills kv_cache,
@@ -1410,16 +2115,16 @@ int mla_attention_prefill_bfloat(MlaPipes *P, const AttnWeights *aw,
           enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wq_a, bx, bq_a);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rms_norm_rows_bf16in_bf16out(P, cb, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
+          enc_rms_norm_rows_bf16in_bf16out(P, cb, NULL, 0, bq_a, bqn_w, bq_res, 1, Q_LORA_RANK, 1);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
           enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wq_b, bq_res, bq);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rms_norm_rows_bf16in_bf16out(P, cb, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
+          enc_rms_norm_rows_bf16in_bf16out(P, cb, NULL, 0, bq, NULL, bq_n, N_HEADS, HEAD_DIM, 0);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rope_bf16(P, cb, bq_n, bcos, bsin, N_HEADS, 0);
+          enc_rope_bf16(P, cb, NULL, 0, bq_n, bcos, bsin, N_HEADS, 0);
           [cb commit]; [cb waitUntilCompleted]; }
 
         // Copy q_n[t] into bq_all at offset t * N_HEADS * HEAD_DIM
@@ -1445,10 +2150,10 @@ int mla_attention_prefill_bfloat(MlaPipes *P, const AttnWeights *aw,
           enc_dequant_matvec_bf16in_bf16out(P, cb, &aw->wkv, bx, bkv);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rms_norm_rows_bf16in_bf16out(P, cb, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
+          enc_rms_norm_rows_bf16in_bf16out(P, cb, NULL, 0, bkv, bkvn_w, bkv_n, 1, KV_LORA_RANK, 1);
           [cb commit]; [cb waitUntilCompleted]; }
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rope_bf16(P, cb, bkv_n, bcos, bsin, 1, 0);
+          enc_rope_bf16(P, cb, NULL, 0, bkv_n, bcos, bsin, 1, 0);
           [cb commit]; [cb waitUntilCompleted]; }
 
         // Write into kv_cache at row (start_pos + t)
@@ -1548,7 +2253,7 @@ int mla_attention_prefill_bfloat(MlaPipes *P, const AttnWeights *aw,
         id<MTLBuffer> battn_t = mkbuf(d, src_ptr, (size_t)N_HEADS * HEAD_DIM * sizeof(uint16_t));
 
         { id<MTLCommandBuffer> cb = [P->queue commandBuffer];
-          enc_rope_bf16(P, cb, battn_t, bcos, bsin, N_HEADS, 1); // inverse RoPE
+          enc_rope_bf16(P, cb, NULL, 0, battn_t, bcos, bsin, N_HEADS, 1); // inverse RoPE
           [cb commit]; [cb waitUntilCompleted]; }
 
         // wo_a (grouped dense f32 @ bf16 attn) → concat (f32) → wo_b → out_t
@@ -1589,4 +2294,1000 @@ int mla_attention_prefill_bfloat(MlaPipes *P, const AttnWeights *aw,
     free(cosv_all);
     free(sinv_all);
     return 0;
+}
+
+// ============================================================================
+// Wave-2 Task 2.5 — bounded packed output projection and transactional v2
+// layer boundary. Kept separate from the legacy prefill function above so the
+// scalar path and production routing remain byte-for-byte unchanged.
+// ============================================================================
+
+typedef struct {
+    uint64_t q_stage;
+    uint64_t q_handoff;
+    uint64_t kv_stage;
+    uint64_t sdpa_stage;
+    uint64_t sdpa_handoff;
+    uint64_t output_stage;
+    uint64_t mhc_post_stage;
+    uint64_t kv_backup;
+    uint64_t residual_backup;
+    uint64_t output_backup;
+    uint64_t capture_backup;
+    uint64_t comp_state_kv_backup;
+    uint64_t comp_state_score_backup;
+    uint64_t comp_append_backup;
+    uint64_t idx_state_kv_backup;
+    uint64_t idx_state_score_backup;
+    uint64_t idx_append_backup;
+    uint64_t allowed_scratch;
+    uint64_t normed_scratch;
+    uint64_t recurrent_scratch;
+    uint64_t total;
+} MLAV2WorkspacePlan;
+
+typedef struct {
+    CompressorState original;
+    float *state_kv;
+    float *state_score;
+    float *comp_append;
+    float *idx_state_kv;
+    float *idx_state_score;
+    float *idx_append;
+    uint32_t comp_append_rows;
+    uint32_t idx_append_rows;
+} MLACompressorSnapshot;
+
+static uint16_t mla_f32_to_bf16(float value) {
+    uint32_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static float mla_bf16_to_f32(uint16_t value) {
+    const uint32_t bits = (uint32_t)value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static uint32_t mla_order_signature_append(
+    uint32_t signature, uint32_t row, uint32_t stage) {
+    const uint32_t event = (row << 8u) | stage;
+    signature ^= event;
+    return signature * UINT32_C(16777619);
+}
+
+static bool mla_plan_region(uint64_t *cursor, uint64_t bytes) {
+    uint64_t aligned = 0u;
+    if (!cursor || !mla_align_workspace(*cursor, &aligned) ||
+        bytes > UINT64_MAX - aligned) {
+        return false;
+    }
+    *cursor = aligned + bytes;
+    return true;
+}
+
+static bool mla_kv_stage_bytes(uint32_t rows, uint64_t *out) {
+    uint64_t hidden = 0u, kv = 0u, rope = 0u;
+    uint64_t kv_rel = 0u, kv_norm_rel = 0u, cos_rel = 0u, sin_rel = 0u;
+    return out &&
+        mla_u64_multiply(rows,
+            (uint64_t)DIM * sizeof(uint16_t), &hidden) &&
+        mla_u64_multiply(rows,
+            (uint64_t)KV_LORA_RANK * sizeof(uint16_t), &kv) &&
+        mla_u64_multiply(rows,
+            (uint64_t)(QK_ROPE_DIM / 2) * sizeof(float), &rope) &&
+        mla_workspace_next(0u, hidden, &kv_rel) &&
+        mla_workspace_next(kv_rel, kv, &kv_norm_rel) &&
+        mla_workspace_next(kv_norm_rel, kv, &cos_rel) &&
+        mla_workspace_next(cos_rel, rope, &sin_rel) &&
+        mla_u64_add(sin_rel, rope, out);
+}
+
+static bool mla_sdpa_stage_bytes(uint32_t rows, uint32_t committed, uint64_t *out) {
+    uint64_t visible_rows = 0u, q = 0u, kv = 0u, rope = 0u;
+    uint64_t kv_rel = 0u, cos_rel = 0u, sin_rel = 0u, output_rel = 0u;
+    return out &&
+        mla_u64_add((uint64_t)committed, (uint64_t)rows, &visible_rows) &&
+        mla_u64_multiply(rows,
+            (uint64_t)N_HEADS * HEAD_DIM * sizeof(uint16_t), &q) &&
+        mla_u64_multiply(visible_rows,
+            (uint64_t)KV_LORA_RANK * sizeof(uint16_t), &kv) &&
+        mla_u64_multiply(rows,
+            (uint64_t)(QK_ROPE_DIM / 2) * sizeof(float), &rope) &&
+        mla_workspace_next(0u, q, &kv_rel) &&
+        mla_workspace_next(kv_rel, kv, &cos_rel) &&
+        mla_workspace_next(cos_rel, rope, &sin_rel) &&
+        mla_workspace_next(sin_rel, rope, &output_rel) &&
+        mla_u64_add(output_rel, q, out);
+}
+
+static bool mla_output_stage_bytes(uint32_t rows, uint64_t *out) {
+    uint64_t attn = 0u, rope = 0u, concat = 0u, projected = 0u;
+    uint64_t cos_rel = 0u, sin_rel = 0u, concat_rel = 0u, projected_rel = 0u;
+    return out &&
+        mla_u64_multiply(rows,
+            (uint64_t)N_HEADS * HEAD_DIM * sizeof(uint16_t), &attn) &&
+        mla_u64_multiply(rows,
+            (uint64_t)(QK_ROPE_DIM / 2) * sizeof(float), &rope) &&
+        mla_u64_multiply(rows,
+            (uint64_t)O_GROUPS * O_LORA_RANK * sizeof(float), &concat) &&
+        mla_u64_multiply(rows,
+            (uint64_t)DIM * sizeof(float), &projected) &&
+        mla_workspace_next(0u, attn, &cos_rel) &&
+        mla_workspace_next(cos_rel, rope, &sin_rel) &&
+        mla_workspace_next(sin_rel, rope, &concat_rel) &&
+        mla_workspace_next(concat_rel, concat, &projected_rel) &&
+        mla_u64_add(projected_rel, projected, out);
+}
+
+int mla_attention_kv_stage_workspace_bytes(uint32_t rows, uint64_t *out_bytes) {
+    return mla_kv_stage_bytes(rows, out_bytes)
+        ? NATIVE_BATCH_OK : NATIVE_BATCH_CAPACITY_EXCEEDED;
+}
+
+int mla_attention_sdpa_stage_workspace_bytes(
+    uint32_t rows, uint32_t committed, uint64_t *out_bytes) {
+    return mla_sdpa_stage_bytes(rows, committed, out_bytes)
+        ? NATIVE_BATCH_OK : NATIVE_BATCH_CAPACITY_EXCEEDED;
+}
+
+int mla_attention_workspace_region_end(
+    uint64_t offset, uint64_t size_bytes, uint64_t *out_end) {
+    return out_end && mla_workspace_next(offset, size_bytes, out_end)
+        ? NATIVE_BATCH_OK : NATIVE_BATCH_CAPACITY_EXCEEDED;
+}
+
+static bool mla_mhc_post_stage_bytes(uint32_t rows, uint64_t *out) {
+    uint64_t attention = 0u, residual_f32 = 0u, post = 0u, comb = 0u;
+    uint64_t residual_bf16 = 0u;
+    uint64_t residual_rel = 0u, post_rel = 0u, comb_rel = 0u;
+    uint64_t residual_bf16_rel = 0u, output_bf16_rel = 0u;
+    return out &&
+        mla_u64_multiply(rows,
+            (uint64_t)DIM * sizeof(uint16_t), &attention) &&
+        mla_u64_multiply(rows,
+            (uint64_t)MHC_MULT * DIM * sizeof(float), &residual_f32) &&
+        mla_u64_multiply(rows,
+            (uint64_t)MHC_MULT * sizeof(float), &post) &&
+        mla_u64_multiply(rows,
+            (uint64_t)MHC_MULT * MHC_MULT * sizeof(float), &comb) &&
+        mla_u64_multiply(rows,
+            (uint64_t)MHC_MULT * DIM * sizeof(uint16_t), &residual_bf16) &&
+        mla_workspace_next(0u, attention, &residual_rel) &&
+        mla_workspace_next(residual_rel, residual_f32, &post_rel) &&
+        mla_workspace_next(post_rel, post, &comb_rel) &&
+        mla_workspace_next(comb_rel, comb, &residual_bf16_rel) &&
+        mla_workspace_next(
+            residual_bf16_rel, residual_bf16, &output_bf16_rel) &&
+        mla_u64_add(output_bf16_rel, residual_bf16, out);
+}
+
+static bool mla_build_v2_plan(
+    const MoEInferEngine *engine,
+    const MLAPrefillBatchArgs *args,
+    const MLARecurrentBatchState *state,
+    MLAV2WorkspacePlan *plan) {
+    if (!engine || !args || !state || !plan || args->layer >= N_LAYERS) return false;
+    memset(plan, 0, sizeof(*plan));
+    const uint32_t rows = args->batch_tokens;
+    const CompressorState *cs = &engine->comp_state[args->layer];
+    if (!mla_u64_multiply(rows,
+            (uint64_t)(DIM + 2u * Q_LORA_RANK +
+                       2u * N_HEADS * HEAD_DIM) * sizeof(uint16_t),
+            &plan->q_stage) ||
+        !mla_u64_multiply(rows,
+            (uint64_t)N_HEADS * HEAD_DIM * sizeof(uint16_t),
+            &plan->q_handoff) ||
+        !mla_kv_stage_bytes(rows, &plan->kv_stage) ||
+        !mla_sdpa_stage_bytes(rows, args->kv.start_position, &plan->sdpa_stage) ||
+        !mla_u64_multiply(rows,
+            (uint64_t)N_HEADS * HEAD_DIM * sizeof(uint16_t),
+            &plan->sdpa_handoff) ||
+        !mla_output_stage_bytes(rows, &plan->output_stage) ||
+        !mla_mhc_post_stage_bytes(rows, &plan->mhc_post_stage) ||
+        !mla_u64_multiply(rows,
+            (uint64_t)KV_LORA_RANK * sizeof(uint16_t), &plan->kv_backup) ||
+        !mla_u64_multiply(rows,
+            (uint64_t)MHC_MULT * DIM * sizeof(float), &plan->residual_backup) ||
+        !mla_u64_multiply(rows,
+            (uint64_t)DIM * sizeof(uint16_t), &plan->output_backup)) {
+        return false;
+    }
+    plan->capture_backup = state->attention_capture
+        ? plan->output_backup : 0u;
+
+    if (cs->state_kv) {
+        uint64_t state_elements = 0u;
+        if (!mla_u64_multiply(2u, (uint64_t)cs->ratio, &state_elements) ||
+            !mla_u64_multiply(
+                state_elements, (uint64_t)cs->out_dim, &state_elements) ||
+            !mla_u64_multiply(state_elements, sizeof(float),
+                              &plan->comp_state_kv_backup)) {
+            return false;
+        }
+        plan->comp_state_score_backup = plan->comp_state_kv_backup;
+        const uint32_t append_rows = cs->n_comp < MAX_COMP_BLOCKS
+            ? (uint32_t)fmin((double)rows, (double)(MAX_COMP_BLOCKS - cs->n_comp)) : 0u;
+        if (!mla_u64_multiply(append_rows,
+                (uint64_t)COMP_HEAD_DIM * sizeof(float),
+                &plan->comp_append_backup)) return false;
+        if (cs->idx_state_kv) {
+            plan->idx_state_kv_backup = (uint64_t)8u * 256u * sizeof(float);
+            plan->idx_state_score_backup = plan->idx_state_kv_backup;
+            const uint32_t idx_rows = cs->n_idx_comp < MAX_COMP_BLOCKS
+                ? (uint32_t)fmin((double)rows,
+                    (double)(MAX_COMP_BLOCKS - cs->n_idx_comp)) : 0u;
+            if (!mla_u64_multiply(idx_rows,
+                    (uint64_t)IDX_HEAD_DIM * sizeof(float),
+                    &plan->idx_append_backup)) return false;
+        }
+    }
+    plan->allowed_scratch = MAX_COMP_BLOCKS * sizeof(bool);
+    plan->normed_scratch = (uint64_t)DIM * sizeof(float);
+    plan->recurrent_scratch =
+        (uint64_t)(2u * CSA_OUT_DIM + COMP_HEAD_DIM) * sizeof(float);
+
+    uint64_t cursor = 0u;
+#define MLA_ADD_PLAN(field) do { if (!mla_plan_region(&cursor, plan->field)) return false; } while (0)
+    MLA_ADD_PLAN(q_stage);
+    MLA_ADD_PLAN(q_handoff);
+    MLA_ADD_PLAN(kv_stage);
+    MLA_ADD_PLAN(sdpa_stage);
+    MLA_ADD_PLAN(sdpa_handoff);
+    MLA_ADD_PLAN(output_stage);
+    MLA_ADD_PLAN(mhc_post_stage);
+    MLA_ADD_PLAN(kv_backup);
+    MLA_ADD_PLAN(residual_backup);
+    MLA_ADD_PLAN(output_backup);
+    MLA_ADD_PLAN(capture_backup);
+    MLA_ADD_PLAN(comp_state_kv_backup);
+    MLA_ADD_PLAN(comp_state_score_backup);
+    MLA_ADD_PLAN(comp_append_backup);
+    MLA_ADD_PLAN(idx_state_kv_backup);
+    MLA_ADD_PLAN(idx_state_score_backup);
+    MLA_ADD_PLAN(idx_append_backup);
+    MLA_ADD_PLAN(allowed_scratch);
+    MLA_ADD_PLAN(normed_scratch);
+    MLA_ADD_PLAN(recurrent_scratch);
+#undef MLA_ADD_PLAN
+    plan->total = cursor;
+    return true;
+}
+
+void mla_recurrent_batch_state_init(
+    MLARecurrentBatchState *state,
+    float *residual_rows,
+    const float *post_rows,
+    const float *comb_rows,
+    uint16_t *attention_capture,
+    uint32_t capacity_tokens) {
+    if (!state) return;
+    *state = (MLARecurrentBatchState){
+        .residual_rows = residual_rows,
+        .post_rows = post_rows,
+        .comb_rows = comb_rows,
+        .attention_capture = attention_capture,
+        .capacity_tokens = capacity_tokens,
+        .inject_failure_after_row = UINT32_MAX,
+        .self_cookie = (uintptr_t)state,
+    };
+}
+
+int mla_attention_prefill_batch_workspace_bytes(
+    const MoEInferEngine *engine,
+    const MLAPrefillBatchArgs *args,
+    const MLARecurrentBatchState *state,
+    uint64_t *out_bytes) {
+    MLAV2WorkspacePlan plan;
+    if (!out_bytes || !mla_build_v2_plan(engine, args, state, &plan)) {
+        return NATIVE_BATCH_INVALID_ARGUMENT;
+    }
+    *out_bytes = plan.total;
+    return NATIVE_BATCH_OK;
+}
+
+static int mla_attention_output_batch_internal(
+    MlaPipes *P,
+    const AttnWeights *aw,
+    const uint32_t *positions,
+    const uint16_t *sdpa_input,
+    uint16_t *attention_output,
+    float *projected_output,
+    uint32_t batch_tokens,
+    NativeBatchWorkspace *workspace,
+    MLAAttentionMetrics *metrics) {
+    @autoreleasepool {
+        if (!P || !P->dev || !P->queue ||
+            !P->rope_tail_interleaved_bf16 ||
+            !P->dequant_matvec_affine_bf16in_f32out_grp8 ||
+            !P->dequant_matvec_affine_v2 || !aw || !positions ||
+            !sdpa_input || (!attention_output && !projected_output) || !workspace ||
+            batch_tokens == 0u || batch_tokens > workspace->capacity_tokens ||
+            workspace->self_cookie != (uintptr_t)workspace || !workspace->storage ||
+            !aw->wo_a.packed || !aw->wo_a.scales || !aw->wo_a.biases ||
+            aw->wo_a.out_dim != O_GROUPS * O_LORA_RANK ||
+            aw->wo_a.in_dim != (N_HEADS / O_GROUPS) * HEAD_DIM ||
+            !aw->wo_b.packed || !aw->wo_b.scales || !aw->wo_b.biases ||
+            aw->wo_b.out_dim != DIM ||
+            aw->wo_b.in_dim != O_GROUPS * O_LORA_RANK) {
+            return NATIVE_BATCH_INVALID_ARGUMENT;
+        }
+        for (uint32_t row = 1u; row < batch_tokens; ++row) {
+            if (positions[row] != positions[0] + row) {
+                return NATIVE_BATCH_INVALID_POSITION;
+            }
+        }
+
+        uint64_t scratch_bytes = 0u;
+        if (!mla_output_stage_bytes(batch_tokens, &scratch_bytes)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+        void *scratch = moe_infer_batch_workspace_reserve(
+            workspace, scratch_bytes, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+        if (!scratch) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+
+        const uint64_t attn_bytes =
+            (uint64_t)batch_tokens * N_HEADS * HEAD_DIM * sizeof(uint16_t);
+        const uint64_t rope_bytes =
+            (uint64_t)batch_tokens * (QK_ROPE_DIM / 2) * sizeof(float);
+        const uint64_t concat_bytes =
+            (uint64_t)batch_tokens * O_GROUPS * O_LORA_RANK * sizeof(float);
+        uint64_t cos_rel = 0u, sin_rel = 0u, concat_rel = 0u, projected_rel = 0u;
+        if (!mla_workspace_next(0u, attn_bytes, &cos_rel) ||
+            !mla_workspace_next(cos_rel, rope_bytes, &sin_rel) ||
+            !mla_workspace_next(sin_rel, rope_bytes, &concat_rel) ||
+            !mla_workspace_next(concat_rel, concat_bytes, &projected_rel)) {
+            return NATIVE_BATCH_CAPACITY_EXCEEDED;
+        }
+
+        AttnBufCache *abc = attn_buf_cache_get(P->dev, aw);
+        if (!abc || !abc->wo_a_pack_all || !abc->wo_a_sc_all ||
+            !abc->wo_a_bi_all || !abc->wo_b_pack || !abc->wo_b_sc ||
+            !abc->wo_b_bi) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+
+        const NSUInteger storage_base = (NSUInteger)(
+            (uint8_t *)scratch - (uint8_t *)workspace->storage);
+        const NSUInteger metal_base =
+            (NSUInteger)workspace->metal_buffer_offset;
+        const NSUInteger attn_offset = metal_base + storage_base;
+        const NSUInteger cos_offset = metal_base + storage_base +
+            (NSUInteger)cos_rel;
+        const NSUInteger sin_offset = metal_base + storage_base +
+            (NSUInteger)sin_rel;
+        const NSUInteger concat_offset = metal_base + storage_base +
+            (NSUInteger)concat_rel;
+        const NSUInteger projected_offset = metal_base + storage_base +
+            (NSUInteger)projected_rel;
+        uint8_t *bytes = (uint8_t *)workspace->storage;
+        memcpy(bytes + storage_base, sdpa_input, (size_t)attn_bytes);
+        float *cos_values = (float *)(bytes + storage_base +
+            (NSUInteger)cos_rel);
+        float *sin_values = (float *)(bytes + storage_base +
+            (NSUInteger)sin_rel);
+        for (uint32_t row = 0u; row < batch_tokens; ++row) {
+            yarn_cos_sin((int)positions[row],
+                cos_values + (size_t)row * (QK_ROPE_DIM / 2),
+                sin_values + (size_t)row * (QK_ROPE_DIM / 2));
+        }
+
+        id<MTLBuffer> batch_buffer =
+            mla_workspace_metal_buffer(P->dev, workspace);
+        if (!batch_buffer) return NATIVE_BATCH_INVALID_STATE;
+        id<MTLCommandBuffer> cb = [P->queue commandBuffer];
+        if (!cb) return NATIVE_BATCH_INVALID_STATE;
+
+        enc_rope_bf16_batch_offset(P, cb, batch_buffer,
+            attn_offset, cos_offset, sin_offset,
+            batch_tokens, N_HEADS, 1u);
+        {
+            id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+            [encoder setComputePipelineState:
+                P->dequant_matvec_affine_bf16in_f32out_grp8];
+            [encoder setBuffer:abc->wo_a_pack_all offset:0 atIndex:0];
+            [encoder setBuffer:abc->wo_a_sc_all offset:0 atIndex:1];
+            [encoder setBuffer:abc->wo_a_bi_all offset:0 atIndex:2];
+            [encoder setBuffer:batch_buffer offset:attn_offset atIndex:3];
+            [encoder setBuffer:batch_buffer offset:concat_offset atIndex:4];
+            const uint32_t out_g = O_LORA_RANK;
+            const uint32_t in_dim = (N_HEADS / O_GROUPS) * HEAD_DIM;
+            const uint32_t group_size = aw->wo_a.group_size;
+            [encoder setBytes:&out_g length:sizeof(out_g) atIndex:5];
+            [encoder setBytes:&in_dim length:sizeof(in_dim) atIndex:6];
+            [encoder setBytes:&group_size length:sizeof(group_size) atIndex:7];
+            [encoder dispatchThreads:MTLSizeMake(
+                    O_GROUPS * O_LORA_RANK, batch_tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [encoder endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> encoder = [cb computeCommandEncoder];
+            [encoder setComputePipelineState:P->dequant_matvec_affine_v2];
+            [encoder setBuffer:abc->wo_b_pack offset:0 atIndex:0];
+            [encoder setBuffer:abc->wo_b_sc offset:0 atIndex:1];
+            [encoder setBuffer:abc->wo_b_bi offset:0 atIndex:2];
+            [encoder setBuffer:batch_buffer offset:concat_offset atIndex:3];
+            [encoder setBuffer:batch_buffer offset:projected_offset atIndex:4];
+            const uint32_t out_dim = aw->wo_b.out_dim;
+            const uint32_t in_dim = aw->wo_b.in_dim;
+            const uint32_t group_size = aw->wo_b.group_size;
+            [encoder setBytes:&out_dim length:sizeof(out_dim) atIndex:5];
+            [encoder setBytes:&in_dim length:sizeof(in_dim) atIndex:6];
+            [encoder setBytes:&group_size length:sizeof(group_size) atIndex:7];
+            [encoder setThreadgroupMemoryLength:256 atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(
+                    (out_dim + 1u) / 2u, batch_tokens, 1)
+                threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+            [encoder endEncoding];
+        }
+
+        struct timespec start, finish;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        [cb commit];
+        [cb waitUntilCompleted];
+        clock_gettime(CLOCK_MONOTONIC, &finish);
+        if (cb.status == MTLCommandBufferStatusError) {
+            return NATIVE_BATCH_INVALID_STATE;
+        }
+        const float *projected = (const float *)(bytes + storage_base +
+            (NSUInteger)projected_rel);
+        const size_t projected_elements = (size_t)batch_tokens * DIM;
+        if (projected_output) {
+            memcpy(projected_output, projected,
+                projected_elements * sizeof(float));
+        }
+        if (attention_output) {
+            for (size_t index = 0u; index < projected_elements; ++index) {
+                attention_output[index] = mla_f32_to_bf16(projected[index]);
+            }
+        }
+        if (metrics) {
+            const int64_t elapsed_ns =
+                (int64_t)(finish.tv_sec - start.tv_sec) * 1000000000ll +
+                (int64_t)(finish.tv_nsec - start.tv_nsec);
+            metrics->output_ns += elapsed_ns > 0 ? (uint64_t)elapsed_ns : 0u;
+            metrics->dispatches += 3u;
+            metrics->workspace_high_water_bytes = workspace->high_water_bytes;
+        }
+        return NATIVE_BATCH_OK;
+    }
+}
+
+int mla_attention_output_batch(
+    MlaPipes *P,
+    const AttnWeights *aw,
+    const uint32_t *positions,
+    const uint16_t *sdpa_input,
+    uint16_t *attention_output,
+    uint32_t batch_tokens,
+    NativeBatchWorkspace *workspace,
+    MLAAttentionMetrics *metrics) {
+    return mla_attention_output_batch_internal(P, aw, positions, sdpa_input,
+        attention_output, NULL, batch_tokens, workspace, metrics);
+}
+
+static uint8_t *mla_take_region(uint8_t *base, uint64_t *cursor, uint64_t bytes) {
+    uint64_t aligned = 0u;
+    if (!base || !cursor || !mla_align_workspace(*cursor, &aligned) ||
+        bytes > UINT64_MAX - aligned) {
+        return NULL;
+    }
+    *cursor = aligned + bytes;
+    return base + aligned;
+}
+
+static NativeBatchWorkspace mla_subworkspace(
+    const NativeBatchWorkspace *parent,
+    void *storage,
+    uint64_t bytes,
+    uint32_t capacity) {
+    const uint64_t local_offset = (uint64_t)(
+        (uint8_t *)storage - (uint8_t *)parent->storage);
+    NativeBatchWorkspace result = {
+        .capacity_tokens = capacity,
+        .arena_epoch = parent->arena_epoch,
+        .budget_bytes = bytes,
+        .allocated_bytes = bytes,
+        .storage = storage,
+        .metal_buffer = parent->metal_buffer,
+        .metal_buffer_offset = parent->metal_buffer_offset + local_offset,
+    };
+    result.self_cookie = (uintptr_t)&result;
+    return result;
+}
+
+static void mla_snapshot_compressor(
+    const CompressorState *cs,
+    const MLAV2WorkspacePlan *plan,
+    uint8_t *base,
+    uint64_t *cursor,
+    MLACompressorSnapshot *snapshot) {
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->original = *cs;
+#define MLA_SNAPSHOT(member, source, bytes) do { \
+    if ((bytes) != 0u) { \
+        snapshot->member = (float *)mla_take_region(base, cursor, (bytes)); \
+        memcpy(snapshot->member, (source), (size_t)(bytes)); \
+    } \
+} while (0)
+    MLA_SNAPSHOT(state_kv, cs->state_kv, plan->comp_state_kv_backup);
+    MLA_SNAPSHOT(state_score, cs->state_score, plan->comp_state_score_backup);
+    snapshot->comp_append_rows = plan->comp_append_backup /
+        ((uint64_t)COMP_HEAD_DIM * sizeof(float));
+    MLA_SNAPSHOT(comp_append,
+        cs->comp_kv ? cs->comp_kv + (size_t)cs->n_comp * COMP_HEAD_DIM : NULL,
+        plan->comp_append_backup);
+    MLA_SNAPSHOT(idx_state_kv, cs->idx_state_kv, plan->idx_state_kv_backup);
+    MLA_SNAPSHOT(idx_state_score, cs->idx_state_score, plan->idx_state_score_backup);
+    snapshot->idx_append_rows = plan->idx_append_backup /
+        ((uint64_t)IDX_HEAD_DIM * sizeof(float));
+    MLA_SNAPSHOT(idx_append,
+        cs->idx_comp_kv ? cs->idx_comp_kv + (size_t)cs->n_idx_comp * IDX_HEAD_DIM : NULL,
+        plan->idx_append_backup);
+#undef MLA_SNAPSHOT
+}
+
+static void mla_restore_compressor(
+    CompressorState *cs, const MLACompressorSnapshot *snapshot) {
+    if (!snapshot->original.state_kv) {
+        free(cs->state_kv);
+        free(cs->state_score);
+        free(cs->comp_kv);
+        free(cs->idx_state_kv);
+        free(cs->idx_state_score);
+        free(cs->idx_comp_kv);
+        *cs = snapshot->original;
+        return;
+    }
+    if (snapshot->state_kv) {
+        memcpy(snapshot->original.state_kv, snapshot->state_kv,
+            (size_t)2u * snapshot->original.ratio *
+            snapshot->original.out_dim * sizeof(float));
+    }
+    if (snapshot->state_score) {
+        memcpy(snapshot->original.state_score, snapshot->state_score,
+            (size_t)2u * snapshot->original.ratio *
+            snapshot->original.out_dim * sizeof(float));
+    }
+    if (snapshot->comp_append) {
+        memcpy(snapshot->original.comp_kv +
+                (size_t)snapshot->original.n_comp * COMP_HEAD_DIM,
+            snapshot->comp_append,
+            (size_t)snapshot->comp_append_rows * COMP_HEAD_DIM * sizeof(float));
+    }
+    if (snapshot->idx_state_kv) {
+        memcpy(snapshot->original.idx_state_kv, snapshot->idx_state_kv,
+            (size_t)8u * 256u * sizeof(float));
+    }
+    if (snapshot->idx_state_score) {
+        memcpy(snapshot->original.idx_state_score, snapshot->idx_state_score,
+            (size_t)8u * 256u * sizeof(float));
+    }
+    if (snapshot->idx_append) {
+        memcpy(snapshot->original.idx_comp_kv +
+                (size_t)snapshot->original.n_idx_comp * IDX_HEAD_DIM,
+            snapshot->idx_append,
+            (size_t)snapshot->idx_append_rows * IDX_HEAD_DIM * sizeof(float));
+    }
+    *cs = snapshot->original;
+}
+
+static int mla_mhc_post_batch_exact(
+    MoEInferEngine *engine,
+    MlaPipes *P,
+    const uint16_t *attention_output,
+    MLARecurrentBatchState *state,
+    uint32_t batch_tokens,
+    NativeBatchWorkspace *workspace) {
+    if (!engine || !P || !P->dev || !P->queue || !attention_output ||
+        !state || !state->residual_rows ||
+        !state->post_rows || !state->comb_rows || !workspace ||
+        batch_tokens == 0u || batch_tokens > workspace->capacity_tokens ||
+        workspace->self_cookie != (uintptr_t)workspace || !workspace->storage ||
+        !P->f32_to_bf16_vec || !P->mhc_post_bfloat ||
+        !P->bf16_to_f32_vec) {
+        return NATIVE_BATCH_INVALID_ARGUMENT;
+    }
+
+    uint64_t scratch_bytes = 0u;
+    if (!mla_mhc_post_stage_bytes(batch_tokens, &scratch_bytes)) {
+        return NATIVE_BATCH_CAPACITY_EXCEEDED;
+    }
+    void *scratch = moe_infer_batch_workspace_reserve(
+        workspace, scratch_bytes, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+    if (!scratch) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+
+    const uint64_t attention_bytes =
+        (uint64_t)batch_tokens * DIM * sizeof(uint16_t);
+    const uint64_t residual_f32_bytes =
+        (uint64_t)batch_tokens * MHC_MULT * DIM * sizeof(float);
+    const uint64_t post_bytes =
+        (uint64_t)batch_tokens * MHC_MULT * sizeof(float);
+    const uint64_t comb_bytes =
+        (uint64_t)batch_tokens * MHC_MULT * MHC_MULT * sizeof(float);
+    const uint64_t residual_bf16_bytes =
+        (uint64_t)batch_tokens * MHC_MULT * DIM * sizeof(uint16_t);
+    uint64_t residual_rel = 0u, post_rel = 0u, comb_rel = 0u;
+    uint64_t residual_bf16_rel = 0u, output_bf16_rel = 0u;
+    if (!mla_workspace_next(0u, attention_bytes, &residual_rel) ||
+        !mla_workspace_next(residual_rel, residual_f32_bytes, &post_rel) ||
+        !mla_workspace_next(post_rel, post_bytes, &comb_rel) ||
+        !mla_workspace_next(comb_rel, comb_bytes, &residual_bf16_rel) ||
+        !mla_workspace_next(residual_bf16_rel, residual_bf16_bytes,
+            &output_bf16_rel)) {
+        return NATIVE_BATCH_CAPACITY_EXCEEDED;
+    }
+
+    const NSUInteger storage_base = (NSUInteger)(
+        (uint8_t *)scratch - (uint8_t *)workspace->storage);
+    const NSUInteger metal_base =
+        (NSUInteger)workspace->metal_buffer_offset + storage_base;
+    uint8_t *bytes = (uint8_t *)workspace->storage + storage_base;
+    memcpy(bytes, attention_output, (size_t)attention_bytes);
+    memcpy(bytes + (NSUInteger)residual_rel, state->residual_rows,
+        (size_t)residual_f32_bytes);
+    memcpy(bytes + (NSUInteger)post_rel, state->post_rows,
+        (size_t)post_bytes);
+    memcpy(bytes + (NSUInteger)comb_rel, state->comb_rows,
+        (size_t)comb_bytes);
+
+    id<MTLBuffer> batch_buffer =
+        mla_workspace_metal_buffer(P->dev, workspace);
+    if (!batch_buffer) return NATIVE_BATCH_INVALID_STATE;
+    id<MTLCommandBuffer> command =
+        [P->queue commandBuffer];
+    if (!command) return NATIVE_BATCH_INVALID_STATE;
+
+    {
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return NATIVE_BATCH_INVALID_STATE;
+        [encoder setComputePipelineState:
+            P->f32_to_bf16_vec];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)residual_rel atIndex:0];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)residual_bf16_rel atIndex:1];
+        const uint32_t count = batch_tokens * MHC_MULT * DIM;
+        [encoder setBytes:&count length:sizeof(count) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [encoder endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return NATIVE_BATCH_INVALID_STATE;
+        [encoder setComputePipelineState:
+            P->mhc_post_bfloat];
+        [encoder setBuffer:batch_buffer offset:metal_base atIndex:0];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)residual_bf16_rel atIndex:1];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)post_rel atIndex:2];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)comb_rel atIndex:3];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)output_bf16_rel atIndex:4];
+        const uint32_t hc = MHC_MULT;
+        const uint32_t dim = DIM;
+        [encoder setBytes:&hc length:sizeof(hc) atIndex:5];
+        [encoder setBytes:&dim length:sizeof(dim) atIndex:6];
+        [encoder dispatchThreads:MTLSizeMake(DIM, batch_tokens, 1u)
+            threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [encoder endEncoding];
+    }
+    {
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        if (!encoder) return NATIVE_BATCH_INVALID_STATE;
+        [encoder setComputePipelineState:
+            P->bf16_to_f32_vec];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)output_bf16_rel atIndex:0];
+        [encoder setBuffer:batch_buffer
+                    offset:metal_base + (NSUInteger)residual_rel atIndex:1];
+        const uint32_t count = batch_tokens * MHC_MULT * DIM;
+        [encoder setBytes:&count length:sizeof(count) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(count, 1u, 1u)
+            threadsPerThreadgroup:MTLSizeMake(256u, 1u, 1u)];
+        [encoder endEncoding];
+    }
+
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status != MTLCommandBufferStatusCompleted) {
+        return NATIVE_BATCH_INVALID_STATE;
+    }
+    memcpy(state->residual_rows, bytes + (NSUInteger)residual_rel,
+        (size_t)residual_f32_bytes);
+    return NATIVE_BATCH_OK;
+}
+
+int mla_attention_prefill_batch_v2(
+    MoEInferEngine *engine,
+    MlaPipes *P,
+    const AttnWeights *aw,
+    const MLAPrefillBatchArgs *args,
+    MLARecurrentBatchState *state,
+    MLAAttentionMetrics *metrics) {
+    if (metrics) memset(metrics, 0, sizeof(*metrics));
+    if (!engine || !P || !aw || !args || !args->hidden ||
+        !args->attention_output || !args->positions || !args->workspace ||
+        !args->kv_transaction || !state ||
+        state->self_cookie != (uintptr_t)state || !state->residual_rows ||
+        !state->post_rows || !state->comb_rows || state->reserved != 0u ||
+        ((state->pre_state_snapshots == NULL) !=
+         (state->post_state_snapshots == NULL)) ||
+        args->batch_tokens == 0u || args->batch_tokens > state->capacity_tokens ||
+        state->completed_tokens != 0u || args->layer >= N_LAYERS) {
+        return NATIVE_BATCH_INVALID_ARGUMENT;
+    }
+    if (args->batch_tokens > args->workspace->capacity_tokens) {
+        return NATIVE_BATCH_CAPACITY_EXCEEDED;
+    }
+    if (args->workspace->self_cookie != (uintptr_t)args->workspace ||
+        !args->workspace->storage || args->workspace->used_bytes != 0u) {
+        return NATIVE_BATCH_INVALID_STATE;
+    }
+    const int view_rc = moe_infer_kv_transaction_validate_layer_view(
+        engine, args->kv_transaction, args->layer, &args->kv);
+    if (view_rc != NATIVE_BATCH_OK) return view_rc;
+    // Only an authenticated engine-owned view permits touching caller memory.
+    // This ordering protects poisoned positions pointers on stale/forged views.
+    for (uint32_t row = 0u; row < args->batch_tokens; ++row) {
+        if (args->positions[row] != args->kv.start_position + row) {
+            return NATIVE_BATCH_INVALID_POSITION;
+        }
+    }
+
+    MLAV2WorkspacePlan plan;
+    if (!mla_build_v2_plan(engine, args, state, &plan)) {
+        return NATIVE_BATCH_CAPACITY_EXCEEDED;
+    }
+    void *all = moe_infer_batch_workspace_reserve(
+        args->workspace, plan.total, NATIVE_BATCH_WORKSPACE_ALIGNMENT);
+    if (!all) return NATIVE_BATCH_CAPACITY_EXCEEDED;
+    // One parent Metal view spans every stage arena; subworkspaces below only
+    // borrow it with offsets and never create or release wrappers themselves.
+    if (!mla_workspace_metal_buffer(P->dev, args->workspace)) {
+        return NATIVE_BATCH_INVALID_STATE;
+    }
+
+    uint8_t *base = (uint8_t *)all;
+    uint64_t cursor = 0u;
+#define MLA_REGION(name) uint8_t *name = mla_take_region(base, &cursor, plan.name)
+    MLA_REGION(q_stage);
+    MLA_REGION(q_handoff);
+    MLA_REGION(kv_stage);
+    MLA_REGION(sdpa_stage);
+    MLA_REGION(sdpa_handoff);
+    MLA_REGION(output_stage);
+    MLA_REGION(mhc_post_stage);
+    MLA_REGION(kv_backup);
+    MLA_REGION(residual_backup);
+    MLA_REGION(output_backup);
+    MLA_REGION(capture_backup);
+#undef MLA_REGION
+    memcpy(kv_backup, args->kv.kv_data, (size_t)plan.kv_backup);
+    memcpy(residual_backup, state->residual_rows, (size_t)plan.residual_backup);
+    memcpy(output_backup, args->attention_output, (size_t)plan.output_backup);
+    if (plan.capture_backup != 0u) {
+        memcpy(capture_backup, state->attention_capture,
+               (size_t)plan.capture_backup);
+    }
+
+    MLACompressorSnapshot compressor_snapshot;
+    mla_snapshot_compressor(&engine->comp_state[args->layer], &plan,
+                            base, &cursor, &compressor_snapshot);
+    bool *allowed = (bool *)mla_take_region(
+        base, &cursor, plan.allowed_scratch);
+    float *normed = (float *)mla_take_region(
+        base, &cursor, plan.normed_scratch);
+    float *recurrent_scratch = (float *)mla_take_region(
+        base, &cursor, plan.recurrent_scratch);
+    const size_t recurrent_scratch_floats =
+        (size_t)(plan.recurrent_scratch / sizeof(float));
+
+    NativeBatchWorkspace q_ws = mla_subworkspace(
+        args->workspace, q_stage, plan.q_stage, args->batch_tokens);
+    q_ws.self_cookie = (uintptr_t)&q_ws;
+    NativeBatchWorkspace kv_ws = mla_subworkspace(
+        args->workspace, kv_stage, plan.kv_stage, args->batch_tokens);
+    kv_ws.self_cookie = (uintptr_t)&kv_ws;
+    NativeBatchWorkspace sdpa_ws = mla_subworkspace(
+        args->workspace, sdpa_stage, plan.sdpa_stage, args->batch_tokens);
+    sdpa_ws.self_cookie = (uintptr_t)&sdpa_ws;
+    NativeBatchWorkspace output_ws = mla_subworkspace(
+        args->workspace, output_stage, plan.output_stage, args->batch_tokens);
+    output_ws.self_cookie = (uintptr_t)&output_ws;
+    NativeBatchWorkspace mhc_post_ws = mla_subworkspace(
+        args->workspace, mhc_post_stage, plan.mhc_post_stage,
+        args->batch_tokens);
+    mhc_post_ws.self_cookie = (uintptr_t)&mhc_post_ws;
+
+    MLAAttentionMetrics stage = {0};
+    int rc = mla_attention_q_batch(P, aw, (const uint16_t *)args->hidden,
+        (uint16_t *)q_handoff, args->batch_tokens, &q_ws, &stage);
+    if (rc == NATIVE_BATCH_OK) {
+        MLAPrefillBatchArgs local = *args;
+        local.workspace = &kv_ws;
+        MLAAttentionMetrics kv_metrics = {0};
+        rc = mla_attention_kv_rope_batch(engine, P, aw, &local, &kv_metrics);
+        stage.kv_rope_ns += kv_metrics.kv_rope_ns;
+        stage.dispatches += kv_metrics.dispatches;
+    }
+    if (rc == NATIVE_BATCH_OK) {
+        MLAPrefillBatchArgs local = *args;
+        local.workspace = &sdpa_ws;
+        MLAAttentionMetrics sdpa_metrics = {0};
+        rc = mla_attention_sdpa_batch(engine, P, aw, &local,
+            (const uint16_t *)q_handoff, (uint16_t *)sdpa_handoff,
+            &sdpa_metrics);
+        stage.sdpa_ns += sdpa_metrics.sdpa_ns;
+        stage.dispatches += sdpa_metrics.dispatches;
+    }
+    if (rc == NATIVE_BATCH_OK) {
+        MLAAttentionMetrics output_metrics = {0};
+        rc = mla_attention_output_batch_internal(P, aw, args->positions,
+            (const uint16_t *)sdpa_handoff, NULL, (float *)q_handoff,
+            args->batch_tokens, &output_ws, &output_metrics);
+        stage.output_ns += output_metrics.output_ns;
+        stage.dispatches += output_metrics.dispatches;
+    }
+
+    if (rc == NATIVE_BATCH_OK) {
+        const uint16_t *hidden = (const uint16_t *)args->hidden;
+        const float *projected = (const float *)q_handoff;
+        uint32_t order_signature = UINT32_C(2166136261);
+        for (uint32_t row = 0u; row < args->batch_tokens; ++row) {
+            if (state->pre_state_snapshots &&
+                moe_infer_capture_state_snapshot(
+                    engine, (int)args->layer,
+                    (int)args->positions[row],
+                    &state->pre_state_snapshots[row]) != NATIVE_BATCH_OK) {
+                rc = NATIVE_BATCH_INVALID_STATE;
+                break;
+            }
+            for (uint32_t dim = 0u; dim < DIM; ++dim) {
+                normed[dim] = mla_bf16_to_f32(
+                    hidden[(size_t)row * DIM + dim]);
+            }
+            // This loop is the required recurrent prefix scan. Its order is
+            // deliberately scalar and matches moe_infer_forward_layer.
+            if (engine->compress_ratio[args->layer] > 0u) {
+                if (moe_infer_compressor_step_bounded(
+                        engine, (int)args->layer,
+                        (int)args->positions[row], normed,
+                        recurrent_scratch, recurrent_scratch_floats) != 0) {
+                    rc = NATIVE_BATCH_INVALID_STATE;
+                    break;
+                }
+            }
+            order_signature = mla_order_signature_append(
+                order_signature, row, 1u);
+            if (engine->compress_ratio[args->layer] == 4u &&
+                engine->comp_state[args->layer].n_comp > 0u) {
+                if (moe_infer_indexer_step_bounded(
+                        engine, (int)args->layer,
+                        (int)args->positions[row], normed, allowed,
+                        recurrent_scratch, recurrent_scratch_floats) != 0) {
+                    rc = NATIVE_BATCH_INVALID_STATE;
+                    break;
+                }
+            }
+            order_signature = mla_order_signature_append(
+                order_signature, row, 2u);
+            if (args->kv_transaction->phase == NATIVE_BATCH_PHASE_VERIFY &&
+                moe_infer_kv_transaction_record_recurrent_row(
+                    engine, args->kv_transaction, args->layer, row) !=
+                    NATIVE_BATCH_OK) {
+                rc = NATIVE_BATCH_INVALID_STATE;
+                break;
+            }
+            if (state->post_state_snapshots &&
+                moe_infer_capture_state_snapshot(
+                    engine, (int)args->layer,
+                    (int)args->positions[row] + 1,
+                    &state->post_state_snapshots[row]) != NATIVE_BATCH_OK) {
+                rc = NATIVE_BATCH_INVALID_STATE;
+                break;
+            }
+
+            // wo_b left this row unrounded in projected. Only after both
+            // recurrent operators do we materialize the rollback-covered BF16
+            // output/capture checkpoint consumed by mHC-post.
+            const float *projected_row = projected + (size_t)row * DIM;
+            uint16_t *attention_row = (uint16_t *)args->attention_output +
+                (size_t)row * DIM;
+            for (uint32_t dim = 0u; dim < DIM; ++dim) {
+                attention_row[dim] = mla_f32_to_bf16(projected_row[dim]);
+            }
+            if (state->attention_capture) {
+                memcpy(state->attention_capture + (size_t)row * DIM,
+                    attention_row, (size_t)DIM * sizeof(uint16_t));
+            }
+            order_signature = mla_order_signature_append(
+                order_signature, row, 3u);
+
+            // The attention mHC-post is row-independent once the recurrent
+            // prefix scan above has consumed this row's pre-attention input.
+            // Record the semantic row order here; all rows are then executed
+            // by the same Metal BF16 kernel as scalar decode in one dispatch.
+            order_signature = mla_order_signature_append(
+                order_signature, row, 4u);
+            if (state->inject_failure_after_row == row) {
+                rc = NATIVE_BATCH_INVALID_STATE;
+                break;
+            }
+        }
+        if (rc == NATIVE_BATCH_OK) {
+            rc = mla_mhc_post_batch_exact(
+                engine,
+                P,
+                (const uint16_t *)args->attention_output,
+                state,
+                args->batch_tokens,
+                &mhc_post_ws);
+        }
+        stage.operator_order_signature = order_signature;
+    }
+
+    if (rc == NATIVE_BATCH_OK) {
+        const int original_length = engine->kv_cache[args->layer].len;
+        engine->kv_cache[args->layer].len =
+            (int)args->kv.start_position + (int)args->batch_tokens;
+        rc = moe_infer_kv_transaction_mark_layer_staged(
+            engine, args->kv_transaction, args->layer, args->batch_tokens);
+        if (rc != NATIVE_BATCH_OK) {
+            engine->kv_cache[args->layer].len = original_length;
+        }
+    }
+
+    if (rc != NATIVE_BATCH_OK) {
+        memcpy(args->kv.kv_data, kv_backup, (size_t)plan.kv_backup);
+        memcpy(state->residual_rows, residual_backup,
+               (size_t)plan.residual_backup);
+        memcpy(args->attention_output, output_backup,
+               (size_t)plan.output_backup);
+        if (plan.capture_backup != 0u) {
+            memcpy(state->attention_capture, capture_backup,
+                   (size_t)plan.capture_backup);
+        }
+        mla_restore_compressor(&engine->comp_state[args->layer],
+                               &compressor_snapshot);
+        state->completed_tokens = 0u;
+    } else {
+        if (state->capture) {
+            for (uint32_t row = 0u; row < args->batch_tokens; ++row) {
+                state->capture(state->capture_context, args->layer,
+                    args->positions[row],
+                    (const uint16_t *)args->attention_output +
+                        (size_t)row * DIM,
+                    DIM);
+            }
+        }
+        state->completed_tokens = args->batch_tokens;
+    }
+
+    if (metrics) {
+        *metrics = stage;
+        metrics->workspace_high_water_bytes =
+            args->workspace->high_water_bytes;
+    }
+    return rc;
+}
+
+int mla_attention_prefill_batch(
+    MlaPipes *P,
+    const AttnWeights *aw,
+    const MLAPrefillBatchArgs *args,
+    MLAAttentionMetrics *metrics) {
+    (void)P;
+    (void)aw;
+    (void)args;
+    if (metrics) memset(metrics, 0, sizeof(*metrics));
+    // Never hide a token loop or silently omit recurrent state. Callers must
+    // opt into the explicit v2 boundary above.
+    return NATIVE_BATCH_INVALID_STATE;
 }

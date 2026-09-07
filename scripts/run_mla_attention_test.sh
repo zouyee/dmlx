@@ -12,10 +12,13 @@ PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_DIR}"
 python3 scripts/gen_attn_golden.py "${1:-7}"
 BIN="$(mktemp -t mat.XXXXXX)"
-clang -framework Metal -framework Foundation -fobjc-arc \
-    -I src/metal_infer \
+clang -framework Metal -framework Foundation -framework Accelerate \
+    -Wno-deprecated-declarations -I src/metal_infer -x objective-c \
     scripts/mla_attention_test.m src/metal_infer/mla_attention.m \
-    -o "${BIN}"
+    src/metal_infer/engine.c src/metal_infer/routing_trace.c \
+    src/metal_infer/mhc.c src/metal_infer/mach_compat.c \
+    src/metal_infer/dspark_engine.c src/metal_infer/dspark_attention.c \
+    src/metal_infer/batch_oracle.c -o "${BIN}"
 "${BIN}"
 rc=$?
 rm -f "${BIN}"

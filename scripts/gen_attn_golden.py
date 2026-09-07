@@ -157,11 +157,14 @@ def main():
 
     # dump
     hidden.tofile(os.path.join(OUT, "hidden.bin"))
-    for nm in ["wq_a", "wq_b", "wkv", "wo_b"]:
+    for nm in ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]:
         dump_quant(OUT, P + nm)
-    # wo_a: export as DENSE f32 (loader pre-dequantizes it).
-    # Layout: [O_GROUPS*O_LORA_RANK, group_feat] = [8192, 4096] f32.
+    # Dense wo_a remains only as an independent CPU oracle fixture. The native
+    # Task-2.5 path loads wo_a.{packed,sc,bi} and never defaults to this matrix.
     wo_a.astype(np.float32).tofile(os.path.join(OUT, "wo_a_dense.bin"))
+    # Independent Task-2.5 CPU oracle fixture. Production continues to use the
+    # packed affine wo_b path; this dense copy is test-only.
+    wo_b.astype(np.float32).tofile(os.path.join(OUT, "wo_b_dense.bin"))
     q_norm.tofile(os.path.join(OUT, "q_norm.bin"))
     kv_norm.tofile(os.path.join(OUT, "kv_norm.bin"))
     attn_sink.tofile(os.path.join(OUT, "attn_sink.bin"))
