@@ -1,0 +1,205 @@
+batch oracle config: model=/Users/zouyee/models/DeepSeek-V4-Flash-4bit packed=/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts NATIVE_SMELT_N=20 max_generated_tokens=0
+batch oracle comparator self-test: PASS
+check_expert_io_invariants self-test: PASS
+batch oracle path: enabled (expert buckets=1 kernels=1 hard-fallback=9>8)
+warning: mlx-c not found via -Dmlx_prefix, MLX_C_PREFIX, or pkg-config; falling back to /opt/homebrew
+real batch oracle: model=/Users/zouyee/models/DeepSeek-V4-Flash-4bit packed=/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts NATIVE_SMELT_N=20 max_generated_tokens=0
+info: native_loader: building safetensors index from /Users/zouyee/models/DeepSeek-V4-Flash-4bit
+info: native_loader: index ready, 2481 tensors, starting weight load...
+info: native_loader: layer 1/43
+info: native_loader: layer 6/43
+info: native_loader: layer 11/43
+info: native_loader: layer 16/43
+info: native_loader: layer 21/43
+info: native_loader: layer 26/43
+info: native_loader: layer 31/43
+info: native_loader: layer 36/43
+info: native_loader: layer 41/43
+info: native_loader: layer 43/43
+info: native_loader: layer 0 loaded ok, attn_sink.len=64
+info: native_loader: loaded in 1382ms
+Metal: dequant_matvec_affine_bf16in_bf16out_v2 compiled OK
+Metal: matvec_f32_bf16in_simd compiled OK
+Metal engine: initialized
+Metal engine: 43 expert files opened
+info: native_engine: telemetry disabled (NATIVE_TELEMETRY)
+info: native_engine: batch flags prefill=0 mla=0 buckets=1 expert_kernels=1 dspark_verify=0 max_prefill=8 max_verify=5 workspace_mb=256
+info: native_engine: chunk planner smelt_n=20 physical_gib=48 incremental_budget_mib=9704 hard_batch=8 pool_slots=48
+info: native_engine: routing trace disabled (NATIVE_ROUTING_TRACE)
+info: native_engine: SMELT preloading 20 experts/layer (11.3 GB) — please wait...
+[smelt] Init: warmup=0 tokens, cache=20 experts/layer, penalty=0
+[smelt] load_stats: loaded from /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K historical selections)
+info: native_engine: Phase 2 — hot experts loaded from stats (natural routing, N=20)
+[smelt] Warmup complete (0 tokens). Preloading experts per layer...
+[smelt] Total preload: 19.5 GB (hash layers: all 256, score layers: top-20)
+[smelt] L0 (hash): loaded 256/256 experts
+[smelt] L5 (score) top-20 experts: [0(×0),1(×0),2(×0),3(×0),4(×0),5(×0),6(×0),7(×0)...]
+[smelt] Done. 19.5 GB preloaded, routing bias penalty=0
+[smelt] Created 9408 persistent Shared GPU buffers for cached experts
+[smelt] GPU routing flags: 20/256 experts marked cached (union of all score layers)
+info: native_engine: SMELT ready — 20 experts/layer in RAM (routing-stats based)
+info: native_engine: initialized (layers=43, vocab=129280)
+GPU batch routing oracle: PASS B=1 pairs=6
+GPU batch routing oracle: PASS B=2 pairs=12
+GPU batch routing oracle: PASS B=3 pairs=18
+GPU batch routing oracle: PASS B=5 pairs=30
+GPU batch routing oracle: PASS tie-breaking
+chunk partition oracle: PASS scalar-sized chunks=[1,1,1,1,1,1,1] argmax=7 max_abs=0.000000 max_rel=0.000000
+chunk partition oracle: PASS batch-2-tail chunks=[2,2,2,1] argmax=7 max_abs=0.000000 max_rel=0.000000
+chunk partition oracle: PASS odd-3-tail chunks=[3,3,1] argmax=7 max_abs=0.000000 max_rel=0.000000
+chunk partition oracle: PASS max-5-tail chunks=[5,2] argmax=7 max_abs=0.000000 max_rel=0.000000
+chunk partition oracle: wrote schema-v1 result /var/folders/w2/t790g90s0bn2rk3symm2ykj40000gn/T/dmlx_batch_oracle.XXXXXX.json.1Ht5MaweVd
+Task 4.5 enabled path: PASS scalar_layer_calls=0 batched_moe_layers=688
+[batch-moe] chunk=9 exceeds supported/configured capacity (hard=8 configured=16); using scalar fallback
+Task 4.5 >8 hard fallback: PASS chunk=9 configured_capacity=16 scalar_layer_delta=387 batched_moe_delta=0
+[smelt] save_stats: saved to /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K total selections)
+Task 4.4 combine host wrapper: PASS B=1
+Task 4.4 combine host wrapper: PASS B=2
+Task 4.4 combine host wrapper: PASS B=3
+Task 4.4 combine host wrapper: PASS B=5
+Task 4.4 shared host wrapper: PASS B=1 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=2 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=3 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=5 max_abs=0.000e+00
+Task 4.4 host wrappers: PASS (B=1,2,3,5,rollback,retry,lifecycle)
+model_manifest_sha256=807672b318f49dd74567d69a603dbf35434c8d71c900f246150d79a18bc1b6d0
+tokenizer_sha256=8421075aceec0741baf15179b6c337f443f9029e53ea88d8c1e909dd0d69b70b
+partition PASS: scalar-sized chunks=[1, 1, 1, 1, 1, 1, 1] token=6 argmax=7 max_abs=0 max_rel=0
+partition PASS: batch-2-tail chunks=[2, 2, 2, 1] token=6 argmax=7 max_abs=0 max_rel=0
+partition PASS: odd-3-tail chunks=[3, 3, 1] token=6 argmax=7 max_abs=0 max_rel=0
+partition PASS: max-5-tail chunks=[5, 2] token=6 argmax=7 max_abs=0 max_rel=0
+golden fixture PASS: fingerprints match; full_logits=129280 max_abs=0 max_rel=0
+batch oracle path: production-v2 (prefill=1 mla=1 buckets=1 kernels=1)
+warning: mlx-c not found via -Dmlx_prefix, MLX_C_PREFIX, or pkg-config; falling back to /opt/homebrew
+real batch oracle: model=/Users/zouyee/models/DeepSeek-V4-Flash-4bit packed=/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts NATIVE_SMELT_N=20 max_generated_tokens=0
+info: native_loader: building safetensors index from /Users/zouyee/models/DeepSeek-V4-Flash-4bit
+info: native_loader: index ready, 2481 tensors, starting weight load...
+info: native_loader: layer 1/43
+info: native_loader: layer 6/43
+info: native_loader: layer 11/43
+info: native_loader: layer 16/43
+info: native_loader: layer 21/43
+info: native_loader: layer 26/43
+info: native_loader: layer 31/43
+info: native_loader: layer 36/43
+info: native_loader: layer 41/43
+info: native_loader: layer 43/43
+info: native_loader: layer 0 loaded ok, attn_sink.len=64
+info: native_loader: loaded in 1387ms
+Metal: dequant_matvec_affine_bf16in_bf16out_v2 compiled OK
+Metal: matvec_f32_bf16in_simd compiled OK
+Metal engine: initialized
+Metal engine: 43 expert files opened
+info: native_engine: telemetry disabled (NATIVE_TELEMETRY)
+info: native_engine: batch flags prefill=1 mla=1 buckets=1 expert_kernels=1 dspark_verify=0 max_prefill=8 max_verify=5 workspace_mb=256
+info: native_engine: chunk planner smelt_n=20 physical_gib=48 incremental_budget_mib=9704 hard_batch=8 pool_slots=48
+info: native_engine: routing trace disabled (NATIVE_ROUTING_TRACE)
+info: native_engine: SMELT preloading 20 experts/layer (11.3 GB) — please wait...
+[smelt] Init: warmup=0 tokens, cache=20 experts/layer, penalty=0
+[smelt] load_stats: loaded from /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K historical selections)
+info: native_engine: Phase 2 — hot experts loaded from stats (natural routing, N=20)
+[smelt] Warmup complete (0 tokens). Preloading experts per layer...
+[smelt] Total preload: 19.5 GB (hash layers: all 256, score layers: top-20)
+[smelt] L0 (hash): loaded 256/256 experts
+[smelt] L5 (score) top-20 experts: [0(×0),1(×0),2(×0),3(×0),4(×0),5(×0),6(×0),7(×0)...]
+[smelt] Done. 19.5 GB preloaded, routing bias penalty=0
+[smelt] Created 9408 persistent Shared GPU buffers for cached experts
+[smelt] GPU routing flags: 20/256 experts marked cached (union of all score layers)
+info: native_engine: SMELT ready — 20 experts/layer in RAM (routing-stats based)
+info: native_engine: initialized (layers=43, vocab=129280)
+GPU batch routing oracle: PASS B=1 pairs=6
+GPU batch routing oracle: PASS B=2 pairs=12
+GPU batch routing oracle: PASS B=3 pairs=18
+GPU batch routing oracle: PASS B=5 pairs=30
+GPU batch routing oracle: PASS tie-breaking
+production-v2 oracle: executed start=0 B=1
+production-v2 counter proof: PASS chunks=1 scalar_delta=0 batched_moe_delta=43
+production-v2 logits: PASS single-B=1 argmax=201 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=2
+production-v2 counter proof: PASS chunks=1 scalar_delta=0 batched_moe_delta=43
+production-v2 logits: PASS single-B=2 argmax=20 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=3
+production-v2 counter proof: PASS chunks=1 scalar_delta=0 batched_moe_delta=43
+production-v2 logits: PASS single-B=3 argmax=223 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=5
+production-v2 counter proof: PASS chunks=1 scalar_delta=0 batched_moe_delta=43
+production-v2 logits: PASS single-B=5 argmax=20 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=8
+production-v2 counter proof: PASS chunks=1 scalar_delta=0 batched_moe_delta=43
+production-v2 logits: PASS single-B=8 argmax=223 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=2
+production-v2 oracle: executed start=2 B=8
+production-v2 counter proof: PASS chunks=2 scalar_delta=0 batched_moe_delta=86
+production-v2 logits: PASS partition-2-8 argmax=80 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=5
+production-v2 oracle: executed start=5 B=5
+production-v2 counter proof: PASS chunks=2 scalar_delta=0 batched_moe_delta=86
+production-v2 logits: PASS partition-5-5 argmax=80 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: executed start=0 B=3
+production-v2 oracle: executed start=3 B=3
+production-v2 oracle: executed start=6 B=3
+production-v2 oracle: executed start=9 B=1
+production-v2 counter proof: PASS chunks=4 scalar_delta=0 batched_moe_delta=172
+production-v2 logits: PASS partition-3-3-3-1 argmax=80 max_abs=0.000000 max_rel=0.000000
+production-v2 oracle: PASS B=1,2,3,5,8 partitions=[2,8]/[5,5]/[3,3,3,1] nonzero_starts=true
+[smelt] save_stats: saved to /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K total selections)
+batch oracle path: disabled (expert buckets=0 kernels=0)
+warning: mlx-c not found via -Dmlx_prefix, MLX_C_PREFIX, or pkg-config; falling back to /opt/homebrew
+real batch oracle: model=/Users/zouyee/models/DeepSeek-V4-Flash-4bit packed=/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts NATIVE_SMELT_N=20 max_generated_tokens=0
+info: native_loader: building safetensors index from /Users/zouyee/models/DeepSeek-V4-Flash-4bit
+info: native_loader: index ready, 2481 tensors, starting weight load...
+info: native_loader: layer 1/43
+info: native_loader: layer 6/43
+info: native_loader: layer 11/43
+info: native_loader: layer 16/43
+info: native_loader: layer 21/43
+info: native_loader: layer 26/43
+info: native_loader: layer 31/43
+info: native_loader: layer 36/43
+info: native_loader: layer 41/43
+info: native_loader: layer 43/43
+info: native_loader: layer 0 loaded ok, attn_sink.len=64
+info: native_loader: loaded in 1397ms
+Metal: dequant_matvec_affine_bf16in_bf16out_v2 compiled OK
+Metal: matvec_f32_bf16in_simd compiled OK
+Metal engine: initialized
+Metal engine: 43 expert files opened
+info: native_engine: telemetry disabled (NATIVE_TELEMETRY)
+info: native_engine: batch flags prefill=0 mla=0 buckets=0 expert_kernels=0 dspark_verify=0 max_prefill=8 max_verify=5 workspace_mb=256
+info: native_engine: chunk planner smelt_n=20 physical_gib=48 incremental_budget_mib=9704 hard_batch=1 pool_slots=0
+info: native_engine: routing trace disabled (NATIVE_ROUTING_TRACE)
+info: native_engine: SMELT preloading 20 experts/layer (11.3 GB) — please wait...
+[smelt] Init: warmup=0 tokens, cache=20 experts/layer, penalty=0
+[smelt] load_stats: loaded from /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K historical selections)
+info: native_engine: Phase 2 — hot experts loaded from stats (natural routing, N=20)
+[smelt] Warmup complete (0 tokens). Preloading experts per layer...
+[smelt] Total preload: 19.5 GB (hash layers: all 256, score layers: top-20)
+[smelt] L0 (hash): loaded 256/256 experts
+[smelt] L5 (score) top-20 experts: [0(×0),1(×0),2(×0),3(×0),4(×0),5(×0),6(×0),7(×0)...]
+[smelt] Done. 19.5 GB preloaded, routing bias penalty=0
+[smelt] Created 9408 persistent Shared GPU buffers for cached experts
+[smelt] GPU routing flags: 20/256 experts marked cached (union of all score layers)
+info: native_engine: SMELT ready — 20 experts/layer in RAM (routing-stats based)
+info: native_engine: initialized (layers=43, vocab=129280)
+GPU batch routing oracle: PASS B=1 pairs=6
+GPU batch routing oracle: PASS B=2 pairs=12
+GPU batch routing oracle: PASS B=3 pairs=18
+GPU batch routing oracle: PASS B=5 pairs=30
+GPU batch routing oracle: PASS tie-breaking
+real batch oracle: PASS chunks=[1] tokens=1
+real batch oracle: PASS chunks=[2] tokens=2
+real batch oracle: PASS chunks=[3] tokens=3
+real batch oracle: PASS chunks=[5] tokens=5
+real batch oracle: PASS chunks=[5,2] tokens=7
+Task 4.5 disabled path: PASS scalar_layer_calls=774 batched_moe_layers=0
+real batch oracle: PASS (B=1,2,3,5,tail=5+2)
+[smelt] save_stats: saved to /Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts/.smelt_routing_stats.bin (0.0K total selections)
+Task 4.4 combine host wrapper: PASS B=1
+Task 4.4 combine host wrapper: PASS B=2
+Task 4.4 combine host wrapper: PASS B=3
+Task 4.4 combine host wrapper: PASS B=5
+Task 4.4 shared host wrapper: PASS B=1 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=2 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=3 max_abs=0.000e+00
+Task 4.4 shared host wrapper: PASS B=5 max_abs=0.000e+00
+Task 4.4 host wrappers: PASS (B=1,2,3,5,rollback,retry,lifecycle)

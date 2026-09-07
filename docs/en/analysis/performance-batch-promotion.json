@@ -1,0 +1,922 @@
+{
+  "comparison": {
+    "candidate_vs_scalar": {
+      "long_diagnostic_tokens_per_second_delta_percent": -63.02854620026115,
+      "metrics": {
+        "engine_first_token_ms": {
+          "candidate_delta_percent": 72.11655689937156,
+          "candidate_median": 3869.5950000000003,
+          "scalar_median": 2248.241
+        },
+        "expert_bytes_read": {
+          "candidate_delta_percent": 6.8493150684931505,
+          "candidate_median": 75082235904.0,
+          "scalar_median": 70269272064.0
+        },
+        "expert_bytes_requested": {
+          "candidate_delta_percent": 6.8493150684931505,
+          "candidate_median": 75082235904.0,
+          "scalar_median": 70269272064.0
+        },
+        "expert_io_wait_ms": {
+          "candidate_delta_percent": 65.14547269732954,
+          "candidate_median": 9493.332999999999,
+          "scalar_median": 5748.467000000001
+        },
+        "expert_pread_calls": {
+          "candidate_delta_percent": 6.8493150684931505,
+          "candidate_median": 5616.0,
+          "scalar_median": 5256.0
+        },
+        "itl_p50_ms": {
+          "candidate_delta_percent": 269.32307020558125,
+          "candidate_median": 1429.46125,
+          "scalar_median": 387.049
+        },
+        "itl_p95_ms": {
+          "candidate_delta_percent": 619.2535791509551,
+          "candidate_median": 3353.662225,
+          "scalar_median": 466.2698
+        },
+        "moe_command_buffers": {
+          "candidate_delta_percent": -37.5,
+          "candidate_median": 645.0,
+          "scalar_median": 1032.0
+        },
+        "moe_dispatches": {
+          "candidate_delta_percent": -8.720930232558139,
+          "candidate_median": 2826.0,
+          "scalar_median": 3096.0
+        },
+        "peak_rss_bytes": {
+          "candidate_delta_percent": 28.82693228439782,
+          "candidate_median": 23827496960.0,
+          "scalar_median": 18495741952.0
+        },
+        "prefill_ms": {
+          "candidate_delta_percent": null,
+          "candidate_median": null,
+          "scalar_median": null
+        },
+        "steady_state_decode_ms": {
+          "candidate_delta_percent": 319.4697820196269,
+          "candidate_median": 6729.2474999999995,
+          "scalar_median": 1604.2269999999999
+        },
+        "ttft_ms": {
+          "candidate_delta_percent": null,
+          "candidate_median": null,
+          "scalar_median": null
+        },
+        "verification_ms": {
+          "candidate_delta_percent": null,
+          "candidate_median": 13655.183,
+          "scalar_median": 0.0
+        },
+        "workspace_high_water_bytes": {
+          "candidate_delta_percent": null,
+          "candidate_median": 4082176.0,
+          "scalar_median": null
+        }
+      },
+      "standard_tokens_per_second_delta_percent": -63.416653199992545,
+      "verification_baseline": {
+        "candidate_mean_batch_ms": 2275.8638333333333,
+        "gain_percent": -183.73339101428084,
+        "method": "scalar median decode_ms / 4 inter-token intervals * candidate_count / verification_batches",
+        "scalar_equivalent_ms": 802.1134999999999
+      }
+    },
+    "fully_batched": {
+      "correctness": {
+        "all_pass": true,
+        "runs": [
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          },
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          }
+        ]
+      },
+      "long_diagnostic_tokens_per_second": {
+        "coefficient_of_variation": 0.01976108265937485,
+        "count": 2,
+        "max": 0.704092,
+        "median": 0.690448,
+        "min": 0.676804,
+        "spread": 0.02728800000000009,
+        "values": [
+          0.676804,
+          0.704092
+        ]
+      },
+      "metrics": {
+        "engine_first_token_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0009889923880922933,
+            "count": 2,
+            "max": 3873.422,
+            "median": 3869.5950000000003,
+            "min": 3865.768,
+            "spread": 7.653999999999996,
+            "values": [
+              3873.422,
+              3865.768
+            ]
+          },
+          "values": [
+            3873.422,
+            3865.768
+          ]
+        },
+        "expert_bytes_read": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 75082235904.0,
+            "median": 75082235904.0,
+            "min": 75082235904.0,
+            "spread": 0.0,
+            "values": [
+              75082235904.0,
+              75082235904.0
+            ]
+          },
+          "values": [
+            75082235904.0,
+            75082235904.0
+          ]
+        },
+        "expert_bytes_requested": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 75082235904.0,
+            "median": 75082235904.0,
+            "min": 75082235904.0,
+            "spread": 0.0,
+            "values": [
+              75082235904.0,
+              75082235904.0
+            ]
+          },
+          "values": [
+            75082235904.0,
+            75082235904.0
+          ]
+        },
+        "expert_io_wait_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0037765450764236192,
+            "count": 2,
+            "max": 9529.185,
+            "median": 9493.332999999999,
+            "min": 9457.481,
+            "spread": 71.70399999999972,
+            "values": [
+              9529.185,
+              9457.481
+            ]
+          },
+          "values": [
+            9529.185,
+            9457.481
+          ]
+        },
+        "expert_pread_calls": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 5616.0,
+            "median": 5616.0,
+            "min": 5616.0,
+            "spread": 0.0,
+            "values": [
+              5616.0,
+              5616.0
+            ]
+          },
+          "values": [
+            5616.0,
+            5616.0
+          ]
+        },
+        "itl_p50_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.03730793681885394,
+            "count": 2,
+            "max": 1482.7915,
+            "median": 1429.46125,
+            "min": 1376.131,
+            "spread": 106.66049999999996,
+            "values": [
+              1482.7915,
+              1376.131
+            ]
+          },
+          "values": [
+            1482.7915,
+            1376.131
+          ]
+        },
+        "itl_p95_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.009676175721602358,
+            "count": 2,
+            "max": 3386.11285,
+            "median": 3353.662225,
+            "min": 3321.2116,
+            "spread": 64.90124999999989,
+            "values": [
+              3386.11285,
+              3321.2116
+            ]
+          },
+          "values": [
+            3386.11285,
+            3321.2116
+          ]
+        },
+        "moe_command_buffers": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 645.0,
+            "median": 645.0,
+            "min": 645.0,
+            "spread": 0.0,
+            "values": [
+              645.0,
+              645.0
+            ]
+          },
+          "values": [
+            645.0,
+            645.0
+          ]
+        },
+        "moe_dispatches": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 2826.0,
+            "median": 2826.0,
+            "min": 2826.0,
+            "spread": 0.0,
+            "values": [
+              2826.0,
+              2826.0
+            ]
+          },
+          "values": [
+            2826.0,
+            2826.0
+          ]
+        },
+        "peak_rss_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.015424443810316197,
+            "count": 2,
+            "max": 24195022848.0,
+            "median": 23827496960.0,
+            "min": 23459971072.0,
+            "spread": 735051776.0,
+            "values": [
+              23459971072.0,
+              24195022848.0
+            ]
+          },
+          "values": [
+            23459971072.0,
+            24195022848.0
+          ]
+        },
+        "prefill_ms": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        },
+        "steady_state_decode_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.014989417464582756,
+            "count": 2,
+            "max": 6830.115,
+            "median": 6729.2474999999995,
+            "min": 6628.38,
+            "spread": 201.73499999999967,
+            "values": [
+              6830.115,
+              6628.38
+            ]
+          },
+          "values": [
+            6830.115,
+            6628.38
+          ]
+        },
+        "ttft_ms": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        },
+        "verification_accepted": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "verification_batches": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 6.0,
+            "median": 6.0,
+            "min": 6.0,
+            "spread": 0.0,
+            "values": [
+              6.0,
+              6.0
+            ]
+          },
+          "values": [
+            6.0,
+            6.0
+          ]
+        },
+        "verification_candidates": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 12.0,
+            "median": 12.0,
+            "min": 12.0,
+            "spread": 0.0,
+            "values": [
+              12.0,
+              12.0
+            ]
+          },
+          "values": [
+            12.0,
+            12.0
+          ]
+        },
+        "verification_mean_batch_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 6.254035555578858e-05,
+            "count": 2,
+            "max": 2276.0061666666666,
+            "median": 2275.8638333333333,
+            "min": 2275.7215,
+            "spread": 0.28466666666645324,
+            "values": [
+              2276.0061666666666,
+              2275.7215
+            ]
+          },
+          "values": [
+            2276.0061666666666,
+            2275.7215
+          ]
+        },
+        "verification_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 6.254035555585518e-05,
+            "count": 2,
+            "max": 13656.037,
+            "median": 13655.183,
+            "min": 13654.329,
+            "spread": 1.7080000000005384,
+            "values": [
+              13656.037,
+              13654.329
+            ]
+          },
+          "values": [
+            13656.037,
+            13654.329
+          ]
+        },
+        "workspace_high_water_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 4082176.0,
+            "median": 4082176.0,
+            "min": 4082176.0,
+            "spread": 0.0,
+            "values": [
+              4082176.0,
+              4082176.0
+            ]
+          },
+          "values": [
+            4082176.0,
+            4082176.0
+          ]
+        }
+      },
+      "sources": [
+        {
+          "canonical_run_sha256": "b0fc264df2e336a23a66773d0e5951e1a53617dc5df821168c7ae22578539c81",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-batched-run1.json",
+          "sha256": "a62da982afd747f60942ed6a28267552dfc9fe1ffeaf2114f0fa7de170cd8002",
+          "timestamp_utc": "2026-08-14T14:08:20.945752+00:00"
+        },
+        {
+          "canonical_run_sha256": "6ab910a1aa94d303475e496c9d520901359244fc100addc4ffbf25c29a2c5b1e",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-batched-run2.json",
+          "sha256": "9b14bbec32a3d8f5ac537f2642839d282b4060b5387a1ae37a725476c6c73219",
+          "timestamp_utc": "2026-08-14T14:20:04.125462+00:00"
+        }
+      ],
+      "standard_tokens_per_second": {
+        "coefficient_of_variation": 0.010286180287953585,
+        "count": 2,
+        "max": 0.475718,
+        "median": 0.4708745,
+        "min": 0.466031,
+        "spread": 0.009687000000000001,
+        "values": [
+          0.466031,
+          0.475718
+        ]
+      }
+    },
+    "scalar": {
+      "correctness": {
+        "all_pass": true,
+        "runs": [
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          },
+          {
+            "e2e_fail": 0,
+            "e2e_pass": 7,
+            "paris_pass": true,
+            "unit_tests": "PASS (430+)"
+          }
+        ]
+      },
+      "long_diagnostic_tokens_per_second": {
+        "coefficient_of_variation": 0.03274910824081074,
+        "count": 2,
+        "max": 1.928676,
+        "median": 1.8675165,
+        "min": 1.806357,
+        "spread": 0.12231900000000007,
+        "values": [
+          1.806357,
+          1.928676
+        ]
+      },
+      "metrics": {
+        "engine_first_token_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.031649631867757926,
+            "count": 2,
+            "max": 2319.397,
+            "median": 2248.241,
+            "min": 2177.085,
+            "spread": 142.3119999999999,
+            "values": [
+              2177.085,
+              2319.397
+            ]
+          },
+          "values": [
+            2177.085,
+            2319.397
+          ]
+        },
+        "expert_bytes_read": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 70269272064.0,
+            "median": 70269272064.0,
+            "min": 70269272064.0,
+            "spread": 0.0,
+            "values": [
+              70269272064.0,
+              70269272064.0
+            ]
+          },
+          "values": [
+            70269272064.0,
+            70269272064.0
+          ]
+        },
+        "expert_bytes_requested": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 70269272064.0,
+            "median": 70269272064.0,
+            "min": 70269272064.0,
+            "spread": 0.0,
+            "values": [
+              70269272064.0,
+              70269272064.0
+            ]
+          },
+          "values": [
+            70269272064.0,
+            70269272064.0
+          ]
+        },
+        "expert_io_wait_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.016017835711677558,
+            "count": 2,
+            "max": 5840.545,
+            "median": 5748.467000000001,
+            "min": 5656.389,
+            "spread": 184.15599999999995,
+            "values": [
+              5656.389,
+              5840.545
+            ]
+          },
+          "values": [
+            5656.389,
+            5840.545
+          ]
+        },
+        "expert_pread_calls": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 5256.0,
+            "median": 5256.0,
+            "min": 5256.0,
+            "spread": 0.0,
+            "values": [
+              5256.0,
+              5256.0
+            ]
+          },
+          "values": [
+            5256.0,
+            5256.0
+          ]
+        },
+        "itl_p50_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.01723812747223219,
+            "count": 2,
+            "max": 393.721,
+            "median": 387.049,
+            "min": 380.377,
+            "spread": 13.343999999999994,
+            "values": [
+              380.377,
+              393.721
+            ]
+          },
+          "values": [
+            380.377,
+            393.721
+          ]
+        },
+        "itl_p95_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.019013133597758216,
+            "count": 2,
+            "max": 475.13505,
+            "median": 466.2698,
+            "min": 457.40455,
+            "spread": 17.730500000000006,
+            "values": [
+              457.40455,
+              475.13505
+            ]
+          },
+          "values": [
+            457.40455,
+            475.13505
+          ]
+        },
+        "moe_command_buffers": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 1032.0,
+            "median": 1032.0,
+            "min": 1032.0,
+            "spread": 0.0,
+            "values": [
+              1032.0,
+              1032.0
+            ]
+          },
+          "values": [
+            1032.0,
+            1032.0
+          ]
+        },
+        "moe_dispatches": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.0,
+            "count": 2,
+            "max": 3096.0,
+            "median": 3096.0,
+            "min": 3096.0,
+            "spread": 0.0,
+            "values": [
+              3096.0,
+              3096.0
+            ]
+          },
+          "values": [
+            3096.0,
+            3096.0
+          ]
+        },
+        "peak_rss_bytes": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.2380253000623178,
+            "count": 2,
+            "max": 22898196480.0,
+            "median": 18495741952.0,
+            "min": 14093287424.0,
+            "spread": 8804909056.0,
+            "values": [
+              14093287424.0,
+              22898196480.0
+            ]
+          },
+          "values": [
+            14093287424.0,
+            22898196480.0
+          ]
+        },
+        "prefill_ms": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        },
+        "steady_state_decode_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": 0.018737996555350373,
+            "count": 2,
+            "max": 1634.287,
+            "median": 1604.2269999999999,
+            "min": 1574.167,
+            "spread": 60.12000000000012,
+            "values": [
+              1574.167,
+              1634.287
+            ]
+          },
+          "values": [
+            1574.167,
+            1634.287
+          ]
+        },
+        "ttft_ms": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        },
+        "verification_accepted": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "verification_batches": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "verification_candidates": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "verification_mean_batch_ms": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        },
+        "verification_ms": {
+          "availability": "measured",
+          "statistics": {
+            "coefficient_of_variation": null,
+            "count": 2,
+            "max": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "spread": 0.0,
+            "values": [
+              0.0,
+              0.0
+            ]
+          },
+          "values": [
+            0.0,
+            0.0
+          ]
+        },
+        "workspace_high_water_bytes": {
+          "availability": "unavailable",
+          "statistics": null,
+          "values": [
+            null,
+            null
+          ]
+        }
+      },
+      "sources": [
+        {
+          "canonical_run_sha256": "4189c0f26b502d945468a08961e9bdc352ded9dd930bed8804af009219468f37",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-scalar-run1.json",
+          "sha256": "dbdc7a7ae1d4b4b69fc6c9212eb6c9754fcc2eb1447ee2f32d36ddd4b971eb3b",
+          "timestamp_utc": "2026-08-14T14:00:28.727791+00:00"
+        },
+        {
+          "canonical_run_sha256": "5c9e2473103127e1563ea266a1c6e1223fe8c20183a9c9ce2c56ad2fb51b3ffc",
+          "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-scalar-run2.json",
+          "sha256": "0d7f22df1dc7ab4c52409ba9176956e7541a6209b67c6b9aaab3be54bbac3315",
+          "timestamp_utc": "2026-08-14T14:12:20.333913+00:00"
+        }
+      ],
+      "standard_tokens_per_second": {
+        "coefficient_of_variation": 0.025646244973304894,
+        "count": 2,
+        "max": 1.320138,
+        "median": 1.287128,
+        "min": 1.254118,
+        "spread": 0.06601999999999997,
+        "values": [
+          1.320138,
+          1.254118
+        ]
+      }
+    }
+  },
+  "configuration": {
+    "NATIVE_SMELT_N": 20,
+    "machine": {
+      "hardware": "Apple M4 Pro",
+      "memory": "48GB"
+    },
+    "model_fingerprint": "807672b318f49dd74567d69a603dbf35434c8d71c900f246150d79a18bc1b6d0",
+    "model_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit",
+    "packed_experts_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts",
+    "repeats_per_group": 2,
+    "warmup": {
+      "initial_requests": 5,
+      "rewarm_requests": 4
+    },
+    "workspace_revision": "9a7e1ef"
+  },
+  "decision": {
+    "failed_gates": [
+      "material_prefill_gain",
+      "material_verification_gain",
+      "no_material_standard_regression",
+      "no_material_steady_decode_regression"
+    ],
+    "promote_fully_batched_defaults": false,
+    "selected_defaults": "scalar_off"
+  },
+  "gates": {
+    "batch_oracle": true,
+    "correctness_all_runs": true,
+    "material_prefill_gain": false,
+    "material_verification_gain": false,
+    "no_material_standard_regression": false,
+    "no_material_steady_decode_regression": false,
+    "safe_peak_rss": true
+  },
+  "generated_utc": "2026-08-14T15:06:40.339076+00:00",
+  "kind": "dmlx-batch-default-promotion",
+  "oracle": {
+    "model_fingerprint": "807672b318f49dd74567d69a603dbf35434c8d71c900f246150d79a18bc1b6d0",
+    "source": {
+      "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-oracle.json",
+      "sha256": "b3370bbf6084c3ff536a1f0db1878395ea32bd6ceeb863a0a2fc85016212bb0c"
+    },
+    "status": "PASS",
+    "suites": {
+      "production_v2_b1_b2_b3_b5_b8_and_partitions": true,
+      "scalar_final_logits_and_partitions": true,
+      "scalar_rollback_path": true
+    }
+  },
+  "policy": {
+    "material_gain_percent": 5.0,
+    "maximum_peak_rss_bytes": 47244640256,
+    "maximum_regression_percent": 5.0,
+    "unavailable_metrics_fail_required_gain": true
+  },
+  "schema_version": 1
+}

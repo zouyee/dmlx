@@ -1,0 +1,39 @@
+{
+  "command": "NATIVE_SMELT_N=20 bash scripts/run_batch_oracle.sh",
+  "configuration": {
+    "NATIVE_SMELT_N": 20,
+    "fingerprint_method": "sha256(config content + model index content + indexed model artifact contents + sorted packed artifact contents)",
+    "model_fingerprint": "807672b318f49dd74567d69a603dbf35434c8d71c900f246150d79a18bc1b6d0",
+    "model_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit",
+    "packed_experts_path": "/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts",
+    "tokenizer_sha256": "8421075aceec0741baf15179b6c337f443f9029e53ea88d8c1e909dd0d69b70b"
+  },
+  "generated_utc": "2026-08-14T15:06:40.050612+00:00",
+  "kind": "dmlx-batch-oracle-validation",
+  "schema_version": 1,
+  "sources": {
+    "fixture": {
+      "path": "/Users/zouyee/work/code/dmlx/tests/fixtures/dsv4_native_logits.json",
+      "sha256": "0cf36a5abf6cb61cd996cf1b576eee0d6f44eff313f6a59aa3866c0e32d9a912"
+    },
+    "log": {
+      "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-oracle-run.log",
+      "sha256": "4aa458a37eab374e679c651f802f4e346be96d2991ed285bd8e1e19ac4ded9d5"
+    },
+    "result": {
+      "path": "/Users/zouyee/work/code/dmlx/docs/en/analysis/performance-promotion-oracle-result.json",
+      "sha256": "5b47ceaefc24c990e3615dcae7a7602f49bc7564e218758320cbce0658cde432"
+    },
+    "runner": {
+      "path": "/Users/zouyee/work/code/dmlx/scripts/run_batch_oracle.sh",
+      "sha256": "c0099bf623e45df74cd0821334d3c5e9ea3478446323ac326a31ea91d6e5186b"
+    }
+  },
+  "status": "PASS",
+  "suites": {
+    "production_v2_b1_b2_b3_b5_b8_and_partitions": true,
+    "scalar_final_logits_and_partitions": true,
+    "scalar_rollback_path": true
+  },
+  "workspace_revision": "9a7e1ef"
+}
