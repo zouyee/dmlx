@@ -5495,12 +5495,21 @@ static int moe_infer_forward_layer_impl(
             ? moe_infer_decode_timeline_now_ns() : 0u;
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt2 = ts.tv_sec*1e9+ts.tv_nsec; }
 
-        // CPU readback
-        uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
-        for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
-        memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in      contents], DIM * sizeof(float));
-        memcpy(post_ffn,  [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
-        memcpy(comb_ffn,  [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
+        // CPU readbacks — drain paths only (batch/prepared, MF_STAGE_TIME,
+        // debug_capture, MF_DBG). On the scalar production path these values
+        // stay GPU-resident: cb2cmd2's Enc3 already expanded
+        // buf_mhc_post_res_out into buf_residual_gpu bit-identically, cb3
+        // binds buf_mhc_post_weights/buf_mhc_comb_weights directly below, and
+        // ffn_input has no CPU consumer at all. CPU residual[] is left stale
+        // here; consumers that need it (debug_capture / MF_DBG / DSpark
+        // layers 40-42) drain synchronously at the cb3 commit site below.
+        if (merged_cb_cpu_drain) {
+            uint16_t *res2_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_post_res_out contents];
+            for (int i = 0; i < MHC_MULT * DIM; i++) { uint32_t u = ((uint32_t)res2_out[i]) << 16; memcpy(&residual[i], &u, 4); }
+            memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in      contents], DIM * sizeof(float));
+            memcpy(post_ffn,  [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
+            memcpy(comb_ffn,  [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
+        }
         // ffn-normed expansion: needed on the CPU only by the batch/prepared
         // path (prepared->normed) and MF_DBG dumps. The scalar path's
         // same-token consumers (buf_normed, buf_mhc_attn_in) were filled by
