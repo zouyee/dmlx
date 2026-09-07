@@ -5233,7 +5233,14 @@ static int moe_infer_forward_layer_impl(
             }
         }
         // post/comb NOT read here — CMD2 reads buf_mhc_post/comb_weights directly from GPU
-        if (exact_q4_recording) exact_q4_attention_done = moe_infer_monotonic_ns();
+        if (exact_q4_recording) {
+            exact_q4_attention_done = moe_infer_monotonic_ns();
+            // The production path no longer waits on merged_cb, so the two
+            // timestamps can land on the same clock tick. The validator
+            // requires positive stage durations — floor at +1ns.
+            if (exact_q4_attention_done <= exact_q4_attention_encode_done)
+                exact_q4_attention_done = exact_q4_attention_encode_done + 1u;
+        }
         if (decode_timeline_recording && !stage_time) {
             const uint64_t timeline_attention_end = moe_infer_decode_timeline_now_ns();
             decode_timeline_record(eng, (uint16_t)layer,
