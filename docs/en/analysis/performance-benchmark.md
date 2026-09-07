@@ -1,100 +1,90 @@
 ---
-date: 2026-07-30
-Commit: 62a3ee8 (main)
-model: DeepSeek-V4-Flash-4bit (~141GB on disk, 33 shards)
-hardware: Apple M4 Pro, 48GB
-mode: serve, smelt 0.15 + stream, ExpertCache 10240MB, temperature=0
-build: zig build -Doptimize=ReleaseFast
-generated_by: scripts/run_benchmark.sh
-total_time: ?s (perf 136s + e2e 91s)
+report_generated_utc: 2026-08-26T09:41:59.607374+00:00
+benchmark_run_date: 2026-08-26
+benchmark_timestamp_utc: 2026-08-26T09:41:59.440236+00:00
+commit: 9a7e1ef
+branch: main
+artifact: performance-benchmark.json
+schema_version: 1
 ---
 
-# dmlx Performance Benchmark Report
+# dmlx Native Performance Benchmark
 
----
+> Machine-readable source of truth: [`performance-benchmark.json`](./performance-benchmark.json). Values below are rounded for display; the artifact retains measured precision and JSON `null` for unavailable metrics.
 
-## 1. Token Generation Latency (Serve Mode)
+## Reproducible result
 
-**Native engine results**:
-- Sequential decode (median of 3): **1.268 tok/s**
-- Long decode (100-token run): **1.648 tok/s**
-- Paris correctness: PASS (see E2E below)
-- (Per-token latency table requires MLX-era "Token step" server logs,
-  which the native engine does not emit.)
+| Phase | Classification | Prompt / completion tokens | HTTP wall time | Effective completion throughput |
+|---|---|---:|---:|---:|
+| Standard short-run median | Standard; median of 3 | 5 / 5 per run | See runs below | **1.019 tok/s** |
+| Long decode | Diagnostic only; excluded from standard median | 12 / 100 | 70.647 s | **1.415 tok/s** |
 
-### HTTP End-to-End Latency
+The throughput rows use HTTP request wall time. Engine-scoped first-token latency, decode-phase timing, ITL, expert-I/O, and routed-MoE geometry below come from opt-in server telemetry attached to exactly the three standard requests. True HTTP TTFT and an independently bounded prefill phase remain unavailable because telemetry begins after tokenization. The 100-token result remains diagnostic and is not mixed into the standard median.
 
-| Test | Tokens | TTFR (s) | Total (s) | Effective tok/s |
-|------|--------|----------|-----------|-----------------|
-| 30-token | 30 | ? | ? | — |
-| 100-token | 100 | ? | ? | — |
+### Standard 5-token runs
 
-### Comparison with Previous Version (c79fc6b → 62a3ee8)
+| Run | Prompt tokens | Completion tokens | Wall time (s) | Effective tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 5 | 5 | 4.846 | 1.032 |
+| 2 | 5 | 5 | 4.907 | 1.019 |
+| 3 | 5 | 5 | 4.977 | 1.005 |
 
-| Metric | Previous (c79fc6b) | Current (62a3ee8) | Change |
-|--------|-------------------------|-------------------|--------|
-| Prefill | 0.0ms | **0.0ms** | — |
-| Steady-state avg | 0.0ms | **0.0ms** | — |
-| Throughput | ~0.0 tok/s | **~1.3 tok/s** | — |
-| Perf phase | 138s | **136s** | **+1%** |
+## Measurement coverage
 
-Note: Previous data auto-extracted from prior report. Both runs use ReleaseFast.
+| Metric | Value |
+|---|---|
+| Startup to health-ready | 8.463 s |
+| Full benchmark wall time | 297.000 s |
+| Performance-phase wall time | 158.000 s |
+| TTFT (HTTP request received → first response token) | unknown (not measured) |
+| Independently bounded prefill latency | unknown (not measured) |
+| Unqualified first-token latency | unknown (not measured) |
+| Engine first-token latency (after tokenization) | 2.763 s |
+| Decode phase (median per standard request) | 2.099 s |
+| ITL p50 / p95 / max | 524.6055 ms / 591.33555 ms / 607.505 ms |
+| Peak RSS | 17504600064 bytes |
+| Workspace high-water | unknown (not measured) |
+| Expert `pread` calls / bytes / I/O wait | 5256 / 70269272064 bytes / 6261.5 ms |
+| Expert short reads | 0 |
+| Expert hot / prefetch / batch-pool / cold | 936 / 0 / 0 / 5256 |
+| Routed-MoE dispatches / command buffers | 3096 / 1032 |
+| Routed-MoE threadgroups / active-lane proxy | 4771968 / 1.0 |
 
----
+Unavailable metrics are intentionally reported as **unknown**, not zero. This artifact records workspace high-water and peak RSS when measured; complete attention GPU-stage timing and hardware occupancy remain unavailable in schema v1.
 
-## 2. Server Configuration & Resources
+## Correctness gates
+
+| Gate | Result |
+|---|---|
+| Paris prompt | PASS |
+| 7-prompt E2E | **7/7 PASS**, 0 FAIL |
+| Unit tests | PASS (430+) |
+
+## Run configuration
 
 | Parameter | Value |
-|-----------|-------|
-| Mode | serve (HTTP API) |
-| SMELT strategy | stream |
-| SMELT experts | 0.15 (preloaded) |
-| Expert cache | 10240 MB |
-| mlock backbone | false |
-| Temperature | 0 (greedy) |
-| Startup time | ?s (incl. warmup) |
-| Server RSS | ? MB |
-| Port | 18090 |
+|---|---|
+| Mode | native |
+| Model | `/Users/zouyee/models/DeepSeek-V4-Flash-4bit` |
+| Packed experts | `/Users/zouyee/models/DeepSeek-V4-Flash-4bit/packed_experts` |
+| Hardware | Apple M4 Pro, 48GB |
+| `NATIVE_SMELT_N` | 20 |
+| `NATIVE_TELEMETRY` | 1 |
+| `NATIVE_BATCH_PREFILL` | 0 |
+| `NATIVE_BATCH_MLA` | 0 |
+| `NATIVE_EXPERT_BUCKETS` | 0 |
+| `NATIVE_BATCH_EXPERT_KERNELS` | 0 |
+| `NATIVE_DSPARK_BATCH_VERIFY` | 0 |
+| Warmup | 5 initial + 4 re-warm requests |
+| Standard measured requests | 3 |
+| Command | `NATIVE_SMELT_N=20 NATIVE_EXPERIMENTAL_CACHE=0 NATIVE_BATCH_PREFILL=0 NATIVE_BATCH_MLA=0 NATIVE_EXPERT_BUCKETS=0 NATIVE_BATCH_EXPERT_KERNELS=0 NATIVE_DSPARK_BATCH_VERIFY=0 DSPARK_DIR='' SKIP_PURGE=0 bash scripts/run_benchmark.sh --native /Users/zouyee/models/DeepSeek-V4-Flash-4bit` |
 
----
+## Provenance
 
-## 3. 7-Prompt End-to-End Test (Serve Mode)
+- Benchmark run date (machine-local): **2026-08-26**
+- Benchmark timestamp (UTC): **2026-08-26T09:41:59.440236+00:00**
+- Report generation timestamp (UTC): **2026-08-26T09:41:59.607374+00:00**
+- Workspace revision: `9a7e1ef`
+- Artifact schema: `1`
 
-| # | Result | Model Output (truncated) |
-|---|--------|--------------------------|
-| P1 | ✅ | 4 |
-| P2 | ✅ | The capital of France is **Paris**. |
-| P3 | ✅ | 0 |
-| P4 | ✅ | yes |
-| P5 | ✅ | 9 |
-| P6 | ✅ | 5 |
-| P7 | ✅ | The capital of France is Paris. |
-
-**7/7 PASS, 0 FAIL**
-
----
-
-## 4. Unit Tests
-
-```
-zig build test → PASS (430+)
-```
-
----
-
-## 5. Key Performance Metrics
-
-| Metric | Previous (c79fc6b) | Current (62a3ee8) | Change |
-|--------|-------------------------|-------------------|--------|
-| Prefill latency | 0.0ms | **0.0ms** | — |
-| Steady-state ITL | 0.0ms | **0.0ms** | — |
-| Steady-state tok/s | ~0.0 | **~1.3** | — |
-| Cache hit rate | — | **N/A (Trust OS, no custom cache)** | — |
-| 100-token HTTP total | — | **?s** | — |
-| Server RSS | — | **? MB** | — |
-| Startup time | — | **?s** | — |
-| 7-Prompt pass rate | 7/7 | **7/7** | — |
-
----
-
-*Generated by `scripts/run_benchmark.sh` on 2026-07-30*
+This report does not reuse older headline throughput, latency, or memory values as current native results. Only measurements present in the linked artifact are treated as current.

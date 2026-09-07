@@ -4,10 +4,10 @@
 
 > **284B-parameter DeepSeek V4 Flash on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
 
-dmlx is a high-performance LLM inference engine for Apple Silicon, built in Zig 0.16 on Apple's MLX Metal backend. It delivers **18-26 tok/s** on hardware that can't even load the model with other tools.
+dmlx runs frontier Mixture-of-Experts models on Apple Silicon through a native C/Metal inference path with packed expert streaming. The latest reproducible DeepSeek V4 native result is **1.174 tok/s** for the standard short-run median and **1.848 tok/s** for the separately classified 100-token diagnostic on an M4 Pro 48GB; see the [machine-readable artifact](docs/en/analysis/performance-benchmark.json).
 
 ```
-284B params → 4-bit quantized (40GB) → SMELT 20% (8GB) → runs on 48GB Mac
+284B parameters → packed Q4 experts on SSD → bounded SMELT N=20 hot cache → runs within 48GB
 ```
 
 ---
@@ -45,28 +45,23 @@ curl http://localhost:8080/v1/chat/completions \
 
 ## Performance
 
-**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash 4-bit (284B, 33 shards) | **Mode**: Native (MLX-free engine, packed experts)
+**Hardware**: M4 Pro 48GB | **Model**: DeepSeek-V4-Flash-4bit | **Mode**: native, packed experts, `NATIVE_SMELT_N=20`
 
-| Metric | Value |
-|--------|-------|
-| Throughput (steady-state) | **~1.1 tok/s** (99.2s/100tok) |
-| 30-token latency (warm) | **~23.2s** |
-| Steady-state ITL | ~887 ms |
-| Memory usage | ~2.5 GB (Trust OS) |
-| 7-prompt correctness | **7/7 PASS** |
+| Metric | Current measured value |
+|---|---:|
+| Standard short-run effective throughput | **1.174 tok/s** (median of 3 requests, 5 completion tokens each) |
+| Long-decode effective throughput | **1.848 tok/s** (100 completion tokens, 54.103 s; diagnostic only) |
+| Startup to health-ready | **6.163 s** |
+| True HTTP TTFT / independently bounded prefill | **unknown — not measured** |
+| Engine first-token latency (after tokenization) | **2.498 s** median |
+| Steady-state ITL p50 / p95 / max | **428.721 / 471.672 / 472.575 ms** |
+| Critical-path expert I/O | **5,271 `pread` calls; 70,469,812,224 bytes; 6,350.424 ms wait; 0 short reads** |
+| Peak RSS | **unknown — not measured** |
+| Correctness | **Paris PASS; 7/7 E2E PASS** |
 
-> **Native mode (`--native`) is the recommended default for DeepSeek V4 Flash 4-bit.** It bypasses the MLX runtime entirely, running attention + mHC + MoE entirely in C/Metal. Packed experts are required (`scripts/repack_experts.py`). See [analysis](docs/analysis/dsv4-first-class-support-plan.md).
+These throughput values use HTTP request wall time. The 100-token run is explicitly excluded from the standard median and must not be presented as the standard benchmark. Exact run values, configuration, null fields, and timestamps are in [`performance-benchmark.json`](docs/en/analysis/performance-benchmark.json); the readable report is [`performance-benchmark.md`](docs/en/analysis/performance-benchmark.md).
 
-<details>
-<summary><b>Optimization history</b></summary>
-
-| Metric | Initial (cached) | Current (Trust OS + packed) | Notes |
-|--------|-----------------|---------------------------|-------|
-| Client 100-token | 193s | **99.2s** | +94% faster |
-| First-request TTFR | 113s | **23.2s** | +388% faster |
-| Server RSS | 4.7GB | **2.5GB** | -47% memory |
-| E2E correctness | 7/7 | **7/7** | maintained |
-
+> **Native mode (`--native`) is the recommended path for DeepSeek V4 Flash 4-bit.** It runs attention, mHC, and MoE through the native C/Metal engine. Packed experts are required, and the safe default is `NATIVE_SMELT_N=20`.
 
 ---
 
@@ -74,7 +69,7 @@ curl http://localhost:8080/v1/chat/completions \
 
 | | mlx-lm (Python) | dmlx (Zig) |
 |---|---|---|
-| DeepSeek V4 on 48GB | OOM | **8GB via SMELT** |
+| DeepSeek V4 on 48GB | OOM | **bounded N=20 cache + SSD expert streaming** |
 | KV cache strategies | 1 fixed | 6 runtime-switchable |
 | Max context (48GB) | RAM-limited | **128K+ (RAM+SSD)** |
 | Binary size | ~500MB+ (Python stack) | ~10MB static binary |
@@ -91,7 +86,7 @@ curl http://localhost:8080/v1/chat/completions \
 Full model (568GB BF16)
   │
   ├─ Layer 1: MoE Expert Streaming    138GB → 10GB   (load only active 6/256 experts)
-  ├─ Layer 2: 4-bit Quant + SMELT      40GB →  8GB   (partial expert preloading)
+  ├─ Layer 2: Exact Q4 + SMELT N=20       ~11GB hot expert cache (safe 48GB default)
   ├─ Layer 3: CSA/HCA Attention         KV cache 9.5× smaller than V3
   ├─ Layer 4: 6 KV Cache Strategies     Standard|Rotating|Quantized|Paged|Tiered
   └─ Layer 5: Zero-Copy Loading         137s → 46s startup (mmap + batched I/O)
@@ -108,16 +103,15 @@ Source: src/models/expert_stream.zig | src/models/expert_cache.zig
 </details>
 
 <details>
-<summary><b>Layer 2: SMELT — Selective Model Expert Loading (40GB → 8GB)</b></summary>
+<summary><b>Layer 2: SMELT — Bounded Hot Expert Residency</b></summary>
 
-| Mode | Experts Preloaded | Memory | Use Case |
-|------|-------------------|--------|----------|
-| Full 4-bit | 256 (100%) | ~40 GB | 96GB+ Mac |
-| SMELT 30% | ~77 | ~10 GB | 64GB Mac |
-| **SMELT 20%** | **~51** | **~8 GB** | **48GB Mac** |
-| SMELT 15% | ~38 | ~6 GB | Memory-tight |
+| Configuration | Approximate expert-cache memory | Use case |
+|---|---:|---|
+| Full 256-expert preload | ~147 GB across 43 layers | **Prohibited on 48GB** |
+| `NATIVE_SMELT_N=51` | ~28 GB | Near the machine limit; diagnostic only |
+| **`NATIVE_SMELT_N=20`** | **~11 GB** | **Safe default for 48GB** |
 
-SMELT preloads frequently-used experts and applies routing bias to avoid loading unused ones. Cache misses fall back to on-demand streaming.
+SMELT keeps a bounded hot set resident and loads cold misses from packed expert files. Native mode must provide `--expert-packed-dir`; full preload is not a supported 48GB configuration.
 </details>
 
 <details>
@@ -194,13 +188,16 @@ make benchmark    # Full benchmark (build + unit tests + perf + 7-prompt e2e + r
 make check        # Everything: build + test + verify + benchmark
 ```
 
-The benchmark script is the single source of truth for performance and correctness:
+The native benchmark emits both the human-readable report and the authoritative schema-v1 JSON artifact:
 
 ```bash
-bash scripts/run_benchmark.sh                              # defaults: 0.20 experts, Trust OS (cache=0)
-bash scripts/run_benchmark.sh ~/models/DeepSeek-V4-Flash-4bit 0.15 0  # custom smelt fraction
+NATIVE_SMELT_N=20 bash scripts/run_benchmark.sh
+
+# Optional alternate artifact location
+BENCHMARK_JSON=/tmp/dmlx-benchmark.json NATIVE_SMELT_N=20 bash scripts/run_benchmark.sh
 ```
-Packed experts are auto-detected from `<model_path>/packed_experts/`. Generate with `scripts/repack_experts.py`.
+
+The standard result is always the median of three 5-token requests. The 100-token request is a separate diagnostic. Packed experts are required at `<model_path>/packed_experts/`, and the script performs a clean ReleaseFast build before measurement.
 
 **As a Zig dependency** (`build.zig.zon`):
 
