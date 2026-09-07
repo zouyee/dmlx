@@ -859,6 +859,7 @@ typedef struct {
     void *buf_mhc_post_res_out;  // [MHC_MULT*DIM] u16  — mhc_post result (bf16)
     void *buf_mhc_ffn_post_out;  // [MHC_MULT*DIM] u16  — mhc_post result for FFN sublayer (bf16)
     void *buf_ffn_out_f32;        // [DIM] f32              — ffn output in f32 for mhc_post_ffn_expand4
+    void *buf_combine_one;        // [1] f32 = 1.0f         — unit weight for K=1 moe_combine add
 
     // Persistent GPU buffers for per-layer mHC weights (uploaded once at set_layer_hc)
     // Avoids 1.5MB newBufferWithBytes per forward_layer call (was main OOM source)

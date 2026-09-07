@@ -2963,6 +2963,9 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->buf_mhc_post_res_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
     eng->buf_mhc_ffn_post_out  = (void *)[d newBufferWithLength:MHC_MULT * DIM * sizeof(uint16_t)      options:MTLResourceStorageModeShared];
     eng->buf_ffn_out_f32        = (void *)[d newBufferWithLength:DIM * sizeof(float)                        options:MTLResourceStorageModeShared];
+    {   const float one = 1.0f;   // unit weight for the K=1 moe_combine GPU add
+        eng->buf_combine_one      = (void *)[d newBufferWithBytes:&one length:sizeof(float)                 options:MTLResourceStorageModeShared];
+    }
     (void)MIX3_size;
 
     // GPU-resident residual buffer (Path B)
@@ -5702,9 +5705,6 @@ static int moe_infer_forward_layer_impl(
         const bool observe_io = telemetry != NULL || trace;
         uint64_t io_started_ns = observe_io && n_miss > 0 ? moe_infer_monotonic_ns() : 0;
         int io_status = 0;
-        // Task 2.2: when n_miss > 0, shared expert CB runs in the read window
-        // and its result pointer is deferred here; += applied after moe_forward_layer.
-        float *bdown_overlap = NULL;
         uint32_t ordinals[NUM_IO_THREADS] = {0};
         uint8_t owned[NUM_IO_THREADS] = {0};
         bool instrument_io = false;
@@ -5713,15 +5713,16 @@ static int moe_infer_forward_layer_impl(
             // --- In-layer overlap (Task 2.2) ---
             // Submit cold preads asynchronously, then run the shared expert CB in
             // the read window, then join before the cold-dependent routed CB.
-            // Safety: shared CB commits+waits before moe_forward_layer is called,
-            // so buf_hidden (used as scratch by both CBs) is never written
+            // Safety: the shared CB commits before moe_forward_layer's CBs on the
+            // same queue, and command buffers execute in commit order, so
+            // buf_hidden (used as scratch by both CBs) is never written
             // concurrently. See docs/en/analysis/q2-layer-transaction-partition.md §5.
             //
-            // ORDERING NOTE: moe_forward_layer writes buf_hidden (moe_combine result)
-            // and the caller then memcpy's ffn_out = buf_hidden. The shared expert
-            // down-output (buf_attn_out) must be added AFTER that memcpy, not before.
-            // We commit+wait the shared CB here in the window, save the result pointer
-            // (bdown_overlap), and do the += below after moe_forward_layer returns.
+            // ORDERING NOTE: moe_forward_layer writes buf_hidden (moe_combine
+            // result). The shared expert down-output (buf_attn_out) is summed
+            // with buf_hidden on the GPU after moe_forward_layer returns (see
+            // the K=1 moe_combine dispatch below), so the shared CB only needs
+            // to be committed here — no wait, no CPU readback.
             instrument_io = exact_q4_recording_active(eng);
             for (int index = 0; instrument_io && index < n_miss; ++index) {
                 if (!exact_q4_reserve_physical_read(
@@ -5748,7 +5749,8 @@ static int moe_infer_forward_layer_impl(
         // Shared expert is independent of routed-expert residency. With misses
         // it overlaps the read window; on an all-hot layer it still must run
         // exactly once before the routed result is published.
-        // Result pointer is applied after moe_forward_layer below.
+        // Its down-output (buf_attn_out) is summed with the routed result on
+        // the GPU after moe_forward_layer below.
         if (eng->shared[layer].gate.packed != NULL) {
                 const int SE_GS = 64;
                 const int SE_NG_GU = DIM / SE_GS;
@@ -5855,17 +5857,15 @@ static int moe_infer_forward_layer_impl(
                     [cb commit];
                     const uint64_t timeline_shared_post_commit = decode_timeline_recording
                         ? moe_infer_decode_timeline_now_ns() : 0u;
-                    [cb waitUntilCompleted];
-                    const uint64_t timeline_shared_post_wait = decode_timeline_recording
-                        ? moe_infer_decode_timeline_now_ns() : 0u;
+                    // No waitUntilCompleted: the GPU add consuming buf_attn_out
+                    // is committed later on the same queue, so commit order
+                    // alone guarantees the shared CB finishes first.
                     if (decode_timeline_recording) decode_timeline_record(
                         eng, (uint16_t)layer, DMLX_DECODE_TIMELINE_SHARED_EXPERT_CB,
                         timeline_shared_begin, timeline_shared_encode_done,
                         timeline_shared_pre_commit, timeline_shared_post_commit,
-                        timeline_shared_post_wait, timeline_shared_post_wait);
+                        timeline_shared_post_commit, timeline_shared_post_commit);
                 }
-                // Save pointer for deferred += after moe_forward_layer (see below).
-            bdown_overlap = (float *)[bdown contents];
             if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt5 = ts.tv_sec*1e9+ts.tv_nsec; }
         }
 
@@ -5889,7 +5889,6 @@ static int moe_infer_forward_layer_impl(
             if (io_status == 0) {
                 for (int i = 0; i < n_miss; i++) expert_data[miss_map[i]] = miss_bufs[i];
             }
-            /* bdown_overlap set above when shared CB ran in window, stays NULL otherwise */
         } /* end if (n_miss > 0) */
         if (n_miss == 0 && decode_timeline_recording) {
             const uint64_t now = moe_infer_decode_timeline_now_ns();
@@ -5974,14 +5973,48 @@ static int moe_infer_forward_layer_impl(
         if (tl) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ti2 = ts.tv_sec*1e9+ts.tv_nsec;
             fprintf(stderr, "[MOE-IO] L%d io=%.2fms moe=%.2fms\n", layer, (ti1-ti0)/1e6, (ti2-ti1)/1e6); }
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt4 = ts.tv_sec*1e9+ts.tv_nsec; }
-        memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_hidden contents], DIM * sizeof(float));
-        // Task 2.2: apply deferred shared expert result when it was computed in
-        // the read window (n_miss > 0 path). bdown_overlap is non-NULL only when
-        // the overlap shared CB ran and its result is waiting in buf_attn_out.
-        if (bdown_overlap) {
-            for (int j = 0; j < DIM; j++) ffn_out[j] += bdown_overlap[j];
-            if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt5 = ts.tv_sec*1e9+ts.tv_nsec; }
+        // GPU-resident sum: buf_ffn_out_f32 = buf_hidden (routed moe_combine
+        // output) + buf_attn_out (shared expert down-output). Reuses
+        // moe_combine with K=1 and a unit weight: out = residual + 1.0f*expert
+        // is an f32 add of the same two operands in the same order as the
+        // former CPU scalar loop, so the result is bit-identical. This CB is
+        // committed after both the shared-expert CB and moe_forward_layer's
+        // routed CB on the same queue, so commit order enforces the
+        // producer->consumer ordering with no CPU sync or readback.
+        {
+            id<MTLCommandBuffer> cb_add = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+            if (eng->shared[layer].gate.packed != NULL) {
+                id<MTLComputeCommandEncoder> e = [cb_add computeCommandEncoder];
+                [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_moe_combine];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_attn_out    offset:0 atIndex:0];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_combine_one offset:0 atIndex:1];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_hidden      offset:0 atIndex:2];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_ffn_out_f32 offset:0 atIndex:3];
+                uint kv = 1, hd = DIM;
+                [e setBytes:&kv length:4 atIndex:4];
+                [e setBytes:&hd length:4 atIndex:5];
+                [e dispatchThreadgroups:MTLSizeMake((DIM+255)/256,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            } else {
+                // No shared expert: ffn_out is just the routed combine result.
+                id<MTLBlitCommandEncoder> blit = [cb_add blitCommandEncoder];
+                [blit copyFromBuffer:(id<MTLBuffer>)eng->buf_hidden
+                        sourceOffset:0
+                            toBuffer:(id<MTLBuffer>)eng->buf_ffn_out_f32
+                     destinationOffset:0
+                                size:(size_t)DIM * sizeof(float)];
+                [blit endEncoding];
+            }
+            [cb_add commit];
+            // Debug capture / MF_DBG still consume ffn_out on the CPU; pay the
+            // readback only when one of them is active.
+            if (eng->debug_capture || getenv("MF_DBG")) {
+                [cb_add waitUntilCompleted];
+                memcpy(ffn_out, [(id<MTLBuffer>)eng->buf_ffn_out_f32 contents],
+                       DIM * sizeof(float));
+            }
         }
+        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt5 = ts.tv_sec*1e9+ts.tv_nsec; }
     }
     emit_debug_capture(
         eng,
@@ -6029,17 +6062,17 @@ static int moe_infer_forward_layer_impl(
     }
 
     // Shared expert CB is now executed in the read window above (Task 2.2).
-    // When n_miss > 0 it ran before io_pool_wait_dependency; when n_miss == 0
-    // it ran in the else branch. Either way ffn_out already incorporates the
-    // shared expert contribution before reaching cb3.
+    // Its down-output was summed with the routed result into buf_ffn_out_f32
+    // by the GPU add committed after moe_forward_layer, so cb3's ffn input is
+    // already GPU-resident — no CPU round-trip here.
 
     // mHC post (FFN) — ds4 kernel_dsv4_hc_expand4: single pure-f32 dispatch.
     // Replaces 3-encoder f32→bf16 + mhc_post_bfloat + bf16→f32 with 1 encoder.
     {
         if (exact_q4_recording)
             exact_q4_moe_encode_begin = moe_infer_monotonic_ns();
-        // Write ffn_out and post-attention residual to GPU buffers
-        memcpy([(id<MTLBuffer>)eng->buf_ffn_out_f32 contents], ffn_out, DIM * sizeof(float));
+        // buf_ffn_out_f32 already holds the ffn output (written by the GPU add
+        // above, committed earlier on this queue — ordering is by commit).
         // IMPORTANT: Upload post-attention residual to GPU — mhc_post_ffn needs it
         memcpy([(id<MTLBuffer>)eng->buf_residual_gpu contents], residual, MHC_MULT * DIM * sizeof(float));
         // buf_mhc_post_weights/comb_weights already hold correct FFN values from cb2cmd2.
@@ -10974,6 +11007,7 @@ void moe_infer_deinit(MoEInferEngine *eng) {
         if (eng->buf_weights[l])   { [(id<MTLBuffer>)eng->buf_weights[l]   release]; eng->buf_weights[l]   = NULL; }
         if (eng->buf_zero_resid[l]){ [(id<MTLBuffer>)eng->buf_zero_resid[l] release]; eng->buf_zero_resid[l] = NULL; }
     }
+    if (eng->buf_combine_one) { [(id<MTLBuffer>)eng->buf_combine_one release]; eng->buf_combine_one = NULL; }
     // Release persistent NoCopy blob wrappers (were leaked before this fix).
     for (int k = 0; k < N_ACTIVE; ++k) {
         if (eng->blob_wrap_pread[k])  { [(id<MTLBuffer>)eng->blob_wrap_pread[k]  release]; eng->blob_wrap_pread[k]  = NULL; }
