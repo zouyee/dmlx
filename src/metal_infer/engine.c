@@ -2889,6 +2889,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->pipe_limited_swiglu  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"limited_swiglu"] error:&err]);
     eng->pipe_f32_to_bf16_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"f32_to_bf16_vec"] error:&err]);
     eng->pipe_bf16_to_f32_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bf16_to_f32_vec"] error:&err]);
+    eng->pipe_f32_to_bf16_trunc_vec = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"f32_to_bf16_trunc_vec"] error:&err]);
     eng->pipe_bucket_gather_f32 = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bucket_gather_f32"] error:&err]);
     eng->pipe_bucket_mxfp4_gate_up = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bucket_mxfp4_gate_up_swiglu"] error:&err]);
     eng->pipe_bucket_mxfp4_down = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"bucket_mxfp4_down"] error:&err]);
@@ -2933,6 +2934,7 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     eng->buf_hidden    = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     eng->buf_h_mid     = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     eng->buf_normed    = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
+    eng->buf_comp_normed = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     eng->buf_attn_out  = (void *)[d newBufferWithLength:buf_size options:MTLResourceStorageModeShared];
     eng->buf_routing_scores = (void *)[d newBufferWithLength:N_EXPERTS * sizeof(float) options:MTLResourceStorageModeShared];
     eng->buf_norm_sum_sq    = (void *)[d newBufferWithLength:sizeof(float) options:MTLResourceStorageModeShared];
@@ -5096,6 +5098,18 @@ static int moe_infer_forward_layer_impl(
     if (!kvc->kv_gpu_buf || kvc->len >= MAX_SEQ_LEN) return -1;
     const int previous_kvc_len = kvc->len;
     kvc->len += 1;
+    // Scalar decode production path: NO waitUntilCompleted on merged_cb.
+    // Its outputs stay GPU-resident — attn_out is truncated to bf16 by the
+    // f32_to_bf16_trunc_vec encoder at the head of cb2cmd2 (same queue,
+    // in-order), and the attn-normed vector is read back at the cb2cmd2
+    // routing wait below (zero extra syncs) to feed the compressor/indexer.
+    // Consumers that still need these values on the CPU at the merged_cb
+    // point drain synchronously: the batch/prepared path (unchanged
+    // behavior), MF_STAGE_TIME (staged CBs already synchronized),
+    // debug_capture (ATTENTION_OUTPUT record), and MF_DBG dumps.
+    const bool merged_cb_cpu_drain =
+        prepared != NULL || getenv("MF_STAGE_TIME") ||
+        eng->debug_capture || getenv("MF_DBG");
     {
         id<MTLCommandBuffer> merged_cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
         if (!merged_cb) {
@@ -5172,7 +5186,15 @@ static int moe_infer_forward_layer_impl(
             ? moe_infer_monotonic_ns() : 0u;
 #endif
         if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptB = ts.tv_sec*1e9+ts.tv_nsec; }
-        [merged_cb waitUntilCompleted];
+        // phase_time / gpu_timestamp_recording read GPUEndTime below and also
+        // require completion; they are diagnostic-only modes.
+#if DMLX_GPU_TIMESTAMP_PROBE
+        if (merged_cb_cpu_drain || phase_time || gpu_timestamp_recording) {
+#else
+        if (merged_cb_cpu_drain || phase_time) {
+#endif
+            [merged_cb waitUntilCompleted];
+        }
         timeline_attention_post_wait = decode_timeline_recording
             ? moe_infer_decode_timeline_now_ns() : 0u;
         if (moe_infer_attention_stage_recording_enabled(eng))
@@ -5193,19 +5215,22 @@ static int moe_infer_forward_layer_impl(
             if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); ptB = ptC = ts.tv_sec*1e9+ts.tv_nsec; }
         }
 
-        // Read attn_out from GPU buffer (written by wo_b in merged_cb)
-        memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));
-        if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt1 = ts.tv_sec*1e9+ts.tv_nsec; }
-
-        // CPU reads after merged CB completes:
-        // - attn_input (for compressor/indexer)
-        // - normed (for compressor/indexer + routing)
-        memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
-        uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
-        memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
-        for (int i = 0; i < DIM; i++) {
-            uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
-            memcpy(&normed[i], &u, 4);
+        // CPU reads after merged CB completes (drain paths only — the scalar
+        // production path keeps all three values GPU-resident):
+        // - attn_out (debug_capture ATTENTION_OUTPUT; GPU trunc kernel writes
+        //   buf_mhc_attn_out_bf16 on the production path)
+        // - attn_input (diagnostics only; no CPU consumer)
+        // - attn-normed → normed (compressor/indexer at the old site below)
+        if (merged_cb_cpu_drain) {
+            memcpy(attn_out, [(id<MTLBuffer>)eng->buf_attn_out contents], DIM * sizeof(float));
+            if (phase_time) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); pt1 = ts.tv_sec*1e9+ts.tv_nsec; }
+            memcpy(attn_input, [(id<MTLBuffer>)eng->buf_mhc_attn_in     contents], DIM * sizeof(float));
+            uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
+            memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
+            for (int i = 0; i < DIM; i++) {
+                uint32_t u = ((uint32_t)normed_bf16_direct[i]) << 16;
+                memcpy(&normed[i], &u, 4);
+            }
         }
         // post/comb NOT read here — CMD2 reads buf_mhc_post/comb_weights directly from GPU
         if (exact_q4_recording) exact_q4_attention_done = moe_infer_monotonic_ns();
@@ -5226,20 +5251,34 @@ static int moe_infer_forward_layer_impl(
 
     // Compressor step (before attention, for layers with compress_ratio > 0)
     // Note: now runs AFTER merged CB-A+CB1. Compressor state updates are for future tokens.
-    if (eng->compress_ratio[layer] > 0) {
-        moe_infer_compressor_step(eng, layer, pos, normed);
+    // Drain paths (batch/prepared, MF_STAGE_TIME, debug_capture, MF_DBG) keep the
+    // original program point with the attn-normed readback above. The scalar
+    // production path runs these steps at the cb2cmd2 routing wait instead —
+    // buf_mhc_attn_norm_bf16 is read back there anyway-adjacent (zero extra
+    // syncs) and both steps only mutate future-token state (comp_state), which
+    // no consumer touches between the two program points within this token.
+    if (merged_cb_cpu_drain) {
+        if (eng->compress_ratio[layer] > 0) {
+            moe_infer_compressor_step(eng, layer, pos, normed);
+        }
+
+        // Indexer step (ratio=4 layers only — select which comp blocks to attend)
+        static bool comp_allowed[MAX_COMP_BLOCKS];
+        bool has_comp_selection = false;
+        if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
+            has_comp_selection = moe_infer_indexer_step(eng, layer, pos, normed, NULL, comp_allowed);
+        }
+        (void)has_comp_selection;
     }
 
-    // Indexer step (ratio=4 layers only — select which comp blocks to attend)
-    static bool comp_allowed[MAX_COMP_BLOCKS];
-    bool has_comp_selection = false;
-    if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
-        has_comp_selection = moe_infer_indexer_step(eng, layer, pos, normed, NULL, comp_allowed);
-    }
-
-    // Truncate attn_out to bf16 (matches MLX precision)
-    for (int i = 0; i < DIM; i++) {
-        uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
+    // Truncate attn_out to bf16 for the debug capture below (matches MLX
+    // precision). Only the capture consumes the CPU copy — the GPU trunc
+    // kernel at the head of cb2cmd2 produces buf_mhc_attn_out_bf16
+    // bit-identically (u >> 16) on every path.
+    if (eng->debug_capture) {
+        for (int i = 0; i < DIM; i++) {
+            uint32_t u; memcpy(&u, &attn_out[i], 4); u &= 0xFFFF0000U; memcpy(&attn_out[i], &u, 4);
+        }
     }
     emit_debug_capture(
         eng,
@@ -5257,9 +5296,11 @@ static int moe_infer_forward_layer_impl(
     // CB2's post/comb outputs are NOT read by CPU (CMD2 overwrites them immediately).
     // Saves 1 GPU sync/layer = ~13ms × 43 = ~560ms/token.
     {
-        // attn_out → bf16 (CPU, tiny: DIM elements)
-        uint16_t *attn_out_buf = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 contents];
-        for (int i = 0; i < DIM; i++) { uint32_t u; memcpy(&u, &attn_out[i], 4); attn_out_buf[i] = (uint16_t)(u >> 16); }
+        // attn_out → bf16 now runs on the GPU: the f32_to_bf16_trunc_vec
+        // encoder at the head of cb2cmd2 below reads buf_attn_out (wo_b
+        // output, committed in merged_cb earlier on this serial queue) and
+        // writes buf_mhc_attn_out_bf16 with bit-exact truncation (u >> 16),
+        // replacing the former CPU readback + truncate + upload.
         // NOTE: post/comb NOT written here — CMD2 (mhc_pre_ffn) overwrites buf_mhc_post_weights/comb
         // so any CPU memcpy of post/comb before CMD2 is wasted work.
 
@@ -5272,6 +5313,18 @@ static int moe_infer_forward_layer_impl(
                 timeline_dsa_begin, timeline_dsa_begin, timeline_cb2_begin);
         }
         id<MTLCommandBuffer> cb2cmd2 = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+
+        // Enc 0: attn_out f32 → bf16 truncation (GPU-side, u >> 16 semantics)
+        {
+            id<MTLComputeCommandEncoder> e = [cb2cmd2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_f32_to_bf16_trunc_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_attn_out          offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_out_bf16 offset:0 atIndex:1];
+            uint n = DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
 
         // --- CB2 section: mhc_post(attn) ---
         // Enc 1: f32→bf16 for residual
@@ -5403,6 +5456,34 @@ static int moe_infer_forward_layer_impl(
             use_gpu_routing = true;
         }
 
+        // Enc 8+9: ffn-normed bf16 → f32 expansion into the two same-token
+        // consumers, replacing the former CPU readback + expand + re-upload:
+        //   buf_normed      — routed-expert input (expert CBs, committed later)
+        //   buf_mhc_attn_in — shared-expert input (shared CB, committed later)
+        // bf16_to_f32_vec (float(bfloat) == u<<16) is bit-identical to the CPU
+        // expansion loop it replaces. buf_mhc_attn_in's previous contents
+        // (mhc_pre attn_input) have no remaining consumer at this point.
+        {
+            id<MTLComputeCommandEncoder> e = [cb2cmd2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_normed            offset:0 atIndex:1];
+            uint n = DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+        {
+            id<MTLComputeCommandEncoder> e = [cb2cmd2 computeCommandEncoder];
+            [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 offset:0 atIndex:0];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_in       offset:0 atIndex:1];
+            uint n = DIM;
+            [e setBytes:&n length:4 atIndex:2];
+            [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+            [e endEncoding];
+        }
+
         const uint64_t timeline_cb2_encode_done = decode_timeline_recording
             ? moe_infer_decode_timeline_now_ns() : 0u;
         const uint64_t timeline_cb2_pre_commit = timeline_cb2_encode_done;
@@ -5420,11 +5501,41 @@ static int moe_infer_forward_layer_impl(
         memcpy(ffn_input, [(id<MTLBuffer>)eng->buf_mhc_ffn_in      contents], DIM * sizeof(float));
         memcpy(post_ffn,  [(id<MTLBuffer>)eng->buf_mhc_post_weights contents], MHC_MULT * sizeof(float));
         memcpy(comb_ffn,  [(id<MTLBuffer>)eng->buf_mhc_comb_weights contents], MHC_MULT * MHC_MULT * sizeof(float));
-        uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 contents];
-        memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
-        for (int i = 0; i < DIM; i++) {
-            uint32_t u = ((uint32_t)bf16_out[i]) << 16;
-            memcpy(&normed[i], &u, 4);
+        // ffn-normed expansion: needed on the CPU only by the batch/prepared
+        // path (prepared->normed) and MF_DBG dumps. The scalar path's
+        // same-token consumers (buf_normed, buf_mhc_attn_in) were filled by
+        // the Enc 8+9 GPU conversions above, bit-identically.
+        if (prepared || getenv("MF_DBG")) {
+            uint16_t *bf16_out = (uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_ffn_norm_bf16 contents];
+            memcpy(normed_bf16_direct, bf16_out, DIM * sizeof(uint16_t));
+            for (int i = 0; i < DIM; i++) {
+                uint32_t u = ((uint32_t)bf16_out[i]) << 16;
+                memcpy(&normed[i], &u, 4);
+            }
+        }
+        // Scalar production path: the attn-normed vector (merged_cb mhc_pre
+        // output) was never read back — drain it here, at the cb2cmd2 wait
+        // that stays for routing, adding zero syncs. Compressor/indexer run at
+        // this point instead of their pre-cb2cmd2 site; both mutate only
+        // future-token state (comp_state), and no consumer reads comp_state
+        // between the old and new program points within this token (the
+        // batch/prepared copies happen below, after this block).
+        if (!merged_cb_cpu_drain) {
+            static float attn_normed[DIM];
+            const uint16_t *an = (const uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
+            for (int i = 0; i < DIM; i++) {
+                uint32_t u = ((uint32_t)an[i]) << 16;
+                memcpy(&attn_normed[i], &u, 4);
+            }
+            if (eng->compress_ratio[layer] > 0) {
+                moe_infer_compressor_step(eng, layer, pos, attn_normed);
+            }
+            static bool comp_allowed[MAX_COMP_BLOCKS];
+            bool has_comp_selection = false;
+            if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
+                has_comp_selection = moe_infer_indexer_step(eng, layer, pos, attn_normed, NULL, comp_allowed);
+            }
+            (void)has_comp_selection;
         }
         if (decode_timeline_recording) {
             decode_timeline_record(eng, (uint16_t)layer,
@@ -5597,12 +5708,11 @@ static int moe_infer_forward_layer_impl(
             eng->current_token_id);
     }
 
-    // Expert I/O + MoE. The expert kernel reads buf_normed as input, so load
-    // the ffn-normed vector into it. MoE combine writes the pure routed-expert
-    // sum (zero residual) to buf_hidden.
+    // Expert I/O + MoE. The expert kernel reads buf_normed as input — cb2cmd2's
+    // Enc 8 (bf16_to_f32_vec from buf_mhc_ffn_norm_bf16) already wrote the
+    // ffn-normed vector there, bit-identical to the former CPU re-upload.
+    // MoE combine writes the pure routed-expert sum (zero residual) to buf_hidden.
     {
-        float *bn = (float *)[(id<MTLBuffer>)eng->buf_normed contents];
-        memcpy(bn, normed, DIM * sizeof(float));
         IOPool *io = (IOPool *)eng->io_pool;
         const int tl = (getenv("NATIVE_TIME_LAYERS") != NULL);
         double ti0=0, ti1=0, ti2=0;
@@ -5758,7 +5868,9 @@ static int moe_infer_forward_layer_impl(
                 const int SE_GS = 64;
                 const int SE_NG_GU = DIM / SE_GS;
                 const int SE_NG_D  = INTERMEDIATE / SE_GS;
-                memcpy([(id<MTLBuffer>)eng->buf_mhc_attn_in contents], normed, DIM*sizeof(float));
+                // buf_mhc_attn_in already holds the ffn-normed vector: cb2cmd2's
+                // Enc 9 (bf16_to_f32_vec from buf_mhc_ffn_norm_bf16) wrote it,
+                // bit-identical to the former CPU re-upload here.
                 id<MTLBuffer> bx    = (id<MTLBuffer>)eng->buf_mhc_attn_in;
                 id<MTLBuffer> bgate = (id<MTLBuffer>)eng->buf_hidden;
                 id<MTLBuffer> bup   = (id<MTLBuffer>)eng->buf_h_mid;
@@ -10679,7 +10791,7 @@ static void moe_infer_compressor_step_impl(
     // and scratch contract remain independent of token count. Scalar callers
     // retain the existing GPU path.
     if (!bounded_scratch && eng->comp_wkv_gpu_w[layer]) {
-        memcpy([(id<MTLBuffer>)eng->buf_normed contents], attn_normed, DIM * sizeof(float));
+        memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
         id<MTLBuffer> kv_buf = (id<MTLBuffer>)eng->comp_out_gpu[layer];
         id<MTLBuffer> gate_buf = (id<MTLBuffer>)eng->comp_out2_gpu[layer];
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
@@ -10690,7 +10802,7 @@ static void moe_infer_compressor_step_impl(
             [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_w[layer] offset:0 atIndex:0];
             [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_s[layer] offset:0 atIndex:1];
             [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_b[layer] offset:0 atIndex:2];
-            [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
             [e setBuffer:kv_buf offset:0 atIndex:4];
             uint od = eng->comp_wkv[layer].out_dim, id_ = eng->comp_wkv[layer].in_dim, gs = eng->comp_wkv[layer].group_size;
             [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
@@ -10704,7 +10816,7 @@ static void moe_infer_compressor_step_impl(
             [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_w[layer] offset:0 atIndex:0];
             [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_s[layer] offset:0 atIndex:1];
             [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_b[layer] offset:0 atIndex:2];
-            [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+            [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
             [e setBuffer:gate_buf offset:0 atIndex:4];
             uint od = eng->comp_wgate[layer].out_dim, id_ = eng->comp_wgate[layer].in_dim, gs = eng->comp_wgate[layer].group_size;
             [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
@@ -10872,7 +10984,7 @@ static bool moe_infer_indexer_step_impl(
         // Bounded batch recurrence uses CPU projection and caller-owned scratch;
         // scalar callers retain the existing persistent GPU scratch path.
         if (!bounded_scratch && eng->idx_comp_wkv_gpu_w[layer]) {
-            memcpy([(id<MTLBuffer>)eng->buf_normed contents], attn_normed, DIM * sizeof(float));
+            memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
             id<MTLBuffer> kv_buf = (id<MTLBuffer>)eng->idx_comp_out_gpu[layer];
             id<MTLBuffer> gate_buf = (id<MTLBuffer>)eng->idx_comp_out2_gpu[layer];
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
@@ -10883,7 +10995,7 @@ static bool moe_infer_indexer_step_impl(
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_w[layer] offset:0 atIndex:0];
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_s[layer] offset:0 atIndex:1];
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_b[layer] offset:0 atIndex:2];
-                [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
                 [e setBuffer:kv_buf offset:0 atIndex:4];
                 uint od = eng->idx_comp_wkv[layer].out_dim, id_ = eng->idx_comp_wkv[layer].in_dim, gs = eng->idx_comp_wkv[layer].group_size;
                 [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
@@ -10897,7 +11009,7 @@ static bool moe_infer_indexer_step_impl(
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_w[layer] offset:0 atIndex:0];
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_s[layer] offset:0 atIndex:1];
                 [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_b[layer] offset:0 atIndex:2];
-                [e setBuffer:(id<MTLBuffer>)eng->buf_normed offset:0 atIndex:3];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
                 [e setBuffer:gate_buf offset:0 atIndex:4];
                 uint od = eng->idx_comp_wgate[layer].out_dim, id_ = eng->idx_comp_wgate[layer].in_dim, gs = eng->idx_comp_wgate[layer].group_size;
                 [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];

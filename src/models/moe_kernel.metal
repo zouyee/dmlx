@@ -2725,6 +2725,20 @@ kernel void f32_to_bf16_vec(
     dst[tid] = bfloat(src[tid]);
 }
 
+// f32_to_bf16_trunc_vec: convert n f32 values → bfloat by TRUNCATING the
+// mantissa (bit-exact with the CPU `u >> 16` idiom), NOT round-to-nearest.
+// Used for attn_out → buf_mhc_attn_out_bf16, matching MLX's truncation.
+// Dispatch: (n + 255) / 256 threadgroups × 256 threads.
+kernel void f32_to_bf16_trunc_vec(
+    device const float*   src [[buffer(0)]],
+    device ushort*        dst [[buffer(1)]],
+    constant uint&        n   [[buffer(2)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid >= n) return;
+    dst[tid] = ushort(as_type<uint>(src[tid]) >> 16);
+}
+
 // bf16_to_f32_vec: convert n bfloat values → f32 (for residual writeback).
 // Dispatch: (n + 255) / 256 threadgroups × 256 threads.
 kernel void bf16_to_f32_vec(

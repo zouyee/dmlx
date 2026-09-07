@@ -792,6 +792,7 @@ typedef struct {
     void *pipe_limited_swiglu;          // in-place SwiGLU for shared expert
     void *pipe_f32_to_bf16_vec;         // residual f32→bf16 on GPU
     void *pipe_bf16_to_f32_vec;         // residual bf16→f32 writeback
+    void *pipe_f32_to_bf16_trunc_vec;   // attn_out f32→bf16 truncation (u>>16)
     void *pipe_moe_route_gpu;           // GPU top-K routing (sqrtsoftplus+bitonic+normalize)
     // Wave-4 opt-in primitives consumed by forwardBatch only when both expert
     // bucket flags are enabled in the immutable startup batch config.
@@ -814,6 +815,7 @@ typedef struct {
     void *buf_hidden;            // [DIM] current hidden state
     void *buf_h_mid;             // [DIM] after attention + residual
     void *buf_normed;            // [DIM] after RMSNorm
+    void *buf_comp_normed;       // [DIM] compressor/indexer attn-normed upload scratch
     void *buf_attn_out;          // [DIM] o_proj output
     void *buf_routing_scores;    // [N_EXPERTS] gate logits
     void *buf_expert_mid[6];         // [INTERMEDIATE] gate+up output per expert
