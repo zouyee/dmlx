@@ -4,7 +4,7 @@
 
 > **284B-parameter DeepSeek V4 Flash on a 48GB MacBook Pro. No cloud. No GPU cluster. Just your laptop.**
 
-dmlx runs frontier Mixture-of-Experts models on Apple Silicon through a native C/Metal inference path with packed expert streaming. The latest reproducible DeepSeek V4 native result is **1.174 tok/s** for the standard short-run median and **1.848 tok/s** for the separately classified 100-token diagnostic on an M4 Pro 48GB; see the [machine-readable artifact](docs/en/analysis/performance-benchmark.json).
+dmlx runs frontier Mixture-of-Experts models on Apple Silicon through a native C/Metal inference path with packed expert streaming. The latest reproducible DeepSeek V4 native result is **1.236 tok/s** for the standard short-run median and **1.950 tok/s** for the separately classified 100-token diagnostic on an M4 Pro 48GB; see the [machine-readable artifact](docs/en/analysis/performance-benchmark.json).
 
 ```
 284B parameters → packed Q4 experts on SSD → bounded SMELT N=20 hot cache → runs within 48GB
@@ -49,8 +49,8 @@ curl http://localhost:8080/v1/chat/completions \
 
 | Metric | Current measured value |
 |---|---:|
-| Standard short-run effective throughput | **1.174 tok/s** (median of 3 requests, 5 completion tokens each) |
-| Long-decode effective throughput | **1.848 tok/s** (100 completion tokens, 54.103 s; diagnostic only) |
+| Standard short-run effective throughput | **1.236 tok/s** (median of 3 requests, 5 completion tokens each) |
+| Long-decode effective throughput | **1.950 tok/s** (100 completion tokens, 51.292 s; diagnostic only) |
 | Startup to health-ready | **6.163 s** |
 | True HTTP TTFT / independently bounded prefill | **unknown — not measured** |
 | Engine first-token latency (after tokenization) | **2.498 s** median |
