@@ -201,6 +201,25 @@ def main():
                     layer_files[fname] = {"shape": shape, "dtype": dtype, "bytes": nbytes}
                     print(f"  {full_key}: {shape} {dtype} → {fname} ({nbytes/1024:.0f}KB)")
 
+        # Shared expert weights (FP8 → raw bytes, like attention)
+        for se_key in ["ffn.shared_experts.w1", "ffn.shared_experts.w2", "ffn.shared_experts.w3"]:
+            for suffix in ["weight", "scale"]:
+                full_key = f"mtp.{layer_idx}.{se_key}.{suffix}"
+                data, dtype, shape = extract_tensor(full_key, handles, headers, shard_paths)
+                if data is not None:
+                    short = se_key.split(".")[-1]
+                    fname = f"shared_{short}_{suffix}.bin"
+                    out_path = layer_dir / fname
+                    if isinstance(data, np.ndarray):
+                        data.tofile(str(out_path))
+                        nbytes = data.nbytes
+                    else:
+                        with open(out_path, 'wb') as f:
+                            f.write(data)
+                        nbytes = len(data)
+                    layer_files[fname] = {"shape": shape, "dtype": dtype, "bytes": nbytes}
+                    print(f"  {full_key}: {shape} {dtype} → {fname} ({nbytes/1024:.0f}KB)")
+
         # Attention sink + norms (F32/BF16 → f32)
         for norm_key in ["attn.attn_sink", "attn.q_norm.weight", "attn.kv_norm.weight",
                          "attn_norm.weight", "ffn_norm.weight"]:
