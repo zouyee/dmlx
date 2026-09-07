@@ -30,10 +30,17 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <Accelerate/Accelerate.h>
+
+static bool dspark_fail_next_commit_allocation = false;
+
+void dspark_test_fail_next_commit_allocation(void) {
+    dspark_fail_next_commit_allocation = true;
+}
 
 // Forward declarations for dspark_attention.c
 extern void dspark_attention_forward(
@@ -539,28 +546,68 @@ void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, 
 // from the drafting step) and set buf_main_hidden to the hidden of the last
 // accepted position — the correct context for the next draft. Rejected
 // positions are rolled back by omission (cursors only advance for accepted).
-void dspark_commit_accepted(DSparkEngine *eng, const float *hidden3, int n_batch, int n_accepted, int start_pos) {
-    if (!eng || !eng->initialized || !hidden3) return;
-    if (n_accepted < 0 || n_accepted >= n_batch) return;
-    float *mh = (float *)malloc(3 * DIM * sizeof(float));
-    float *main_x = (float *)malloc(DIM * sizeof(float));
-    if (!mh || !main_x) { free(mh); free(main_x); return; }
+int dspark_commit_accepted(DSparkEngine *eng, const float *hidden3,
+                           int n_batch, int n_accepted, int start_pos) {
+    if (!eng || !hidden3 || n_batch <= 0 ||
+        n_batch > DSPARK_BLOCK_SIZE + 1 ||
+        n_accepted < 0 || n_accepted >= n_batch || start_pos < 0 ||
+        n_accepted > INT_MAX - start_pos) {
+        return DSPARK_COMMIT_INVALID_ARGUMENT;
+    }
+
+    // `initialized` is only a lifecycle marker: older loaders intentionally
+    // logged missing weights/KV allocations as warnings. Establish every
+    // dependency used below before allocating scratch or changing a cursor.
+    const bool main_projection_ready = eng->head.main_proj_f32 ||
+        (eng->head.main_proj.weight && eng->head.main_proj.scale &&
+         eng->head.main_proj.out_dim == DIM &&
+         eng->head.main_proj.in_dim == 3 * DIM &&
+         eng->head.main_proj.block_size == 128);
+    if (!eng->initialized || !eng->buf_main_hidden ||
+        !eng->head.main_norm || !main_projection_ready) {
+        return DSPARK_COMMIT_INVALID_STATE;
+    }
+    for (int l = 0; l < DSPARK_N_LAYERS; ++l) {
+        const DSparkAttnWeights *aw = &eng->layers[l].attn;
+        const DSparkKVCache *kvc = &eng->kv_cache[l];
+        if (!aw->wkv_f32 || !aw->kv_norm || !kvc->main_kv ||
+            kvc->main_len < 0 || kvc->main_len > DSPARK_WINDOW_SIZE ||
+            kvc->main_pos < 0 || n_accepted > INT_MAX - kvc->main_pos) {
+            return DSPARK_COMMIT_INVALID_STATE;
+        }
+    }
+
+    if (dspark_fail_next_commit_allocation) {
+        dspark_fail_next_commit_allocation = false;
+        return DSPARK_COMMIT_ALLOCATION_FAILED;
+    }
+    float *scratch = (float *)malloc((size_t)4 * DIM * sizeof(float));
+    if (!scratch) return DSPARK_COMMIT_ALLOCATION_FAILED;
+    float *mh = scratch;
+    float *main_x = scratch + 3 * DIM;
+
     // Backfill main_kv for accepted draft positions (batch index j = draft
-    // position j, sequence position start_pos + j).
+    // position j, sequence position start_pos + j). After the complete
+    // preflight and sole allocation above, this region has no fallible step.
     for (int j = 1; j <= n_accepted; j++) {
-        for (int s = 0; s < 3; s++)
-            memcpy(mh + s * DIM, hidden3 + ((size_t)s * n_batch + j) * DIM, DIM * sizeof(float));
+        for (int s = 0; s < 3; s++) {
+            memcpy(mh + s * DIM,
+                   hidden3 + ((size_t)s * n_batch + j) * DIM,
+                   DIM * sizeof(float));
+        }
         dspark_compute_main_x(eng, mh, main_x);
         dspark_write_main_kv(eng, main_x, start_pos + j);
     }
     // buf_main_hidden = hidden of the last accepted batch position (index
     // n_accepted) — the context from which the correction/bonus token was
     // sampled, and the right conditioning for the next draft.
-    for (int s = 0; s < 3; s++)
+    for (int s = 0; s < 3; s++) {
         memcpy(eng->buf_main_hidden + s * DIM,
-               hidden3 + ((size_t)s * n_batch + n_accepted) * DIM, DIM * sizeof(float));
-    free(mh);
-    free(main_x);
+               hidden3 + ((size_t)s * n_batch + n_accepted) * DIM,
+               DIM * sizeof(float));
+    }
+    free(scratch);
+    return DSPARK_COMMIT_OK;
 }
 
 // ============================================================================
@@ -695,6 +742,55 @@ moe_cleanup:
     (void)0;  // no heap allocations in GPU path
 }
 
+static int dspark_target_embed_row(
+    const MoEInferEngine *target,
+    int token_id,
+    float row_out[DIM]) {
+    if (!target || token_id < 0 || token_id >= target->vocab_size || !row_out) {
+        return -1;
+    }
+    if (target->embed) {
+        const float *row = target->embed + (size_t)token_id * DIM;
+        for (int d = 0; d < DIM; ++d) {
+            uint32_t bits;
+            memcpy(&bits, &row[d], sizeof(bits));
+            bits &= UINT32_C(0xFFFF0000);
+            memcpy(&row_out[d], &bits, sizeof(bits));
+        }
+        return 0;
+    }
+
+    const QuantWeight *quant = &target->embed_q;
+    if (!quant->packed || !quant->scales || !quant->biases ||
+        quant->in_dim != DIM || quant->group_size <= 0 ||
+        DIM % quant->group_size != 0 || quant->group_size % 8 != 0) {
+        return -1;
+    }
+    const int groups = DIM / quant->group_size;
+    const int packed_per_group = quant->group_size / 8;
+    const uint32_t *packed_row = quant->packed + (size_t)token_id * (DIM / 8);
+    const float *scale_row = quant->scales + (size_t)token_id * groups;
+    const float *bias_row = quant->biases + (size_t)token_id * groups;
+    for (int group = 0; group < groups; ++group) {
+        const float scale = scale_row[group];
+        const float bias = bias_row[group];
+        for (int packed = 0; packed < packed_per_group; ++packed) {
+            const uint32_t word = packed_row[group * packed_per_group + packed];
+            for (int lane = 0; lane < 8; ++lane) {
+                float value = scale * (float)((word >> (lane * 4)) & 0xFu) + bias;
+                uint32_t bits;
+                memcpy(&bits, &value, sizeof(bits));
+                bits &= UINT32_C(0xFFFF0000);
+                memcpy(
+                    &row_out[group * quant->group_size + packed * 8 + lane],
+                    &bits,
+                    sizeof(bits));
+            }
+        }
+    }
+    return 0;
+}
+
 // ============================================================================
 // dspark_forward — Main DSpark 3-layer forward pass
 // ============================================================================
@@ -710,10 +806,22 @@ int dspark_forward(
     if (!eng || !eng->initialized) return 0;
     MoEInferEngine *target = (MoEInferEngine *)eng->target_engine;
 
-    // Safety: skip if critical weights not loaded
-    if (!eng->head.main_proj.weight || !eng->head.markov_w1 || !eng->layers[0].hc_attn_fn) {
-        fprintf(stderr, "[dspark] forward skipped: weights not loaded (main_proj=%p, markov=%p, hc=%p)\n",
-                (void*)eng->head.main_proj.weight, (void*)eng->head.markov_w1, (void*)eng->layers[0].hc_attn_fn);
+    // Safety: skip if critical weights not loaded. The production target uses
+    // affine-4bit embedding/lm_head, so dense pointers are optional.
+    if (!eng->head.main_proj.weight || !eng->head.markov_w1 ||
+        !eng->layers[0].hc_attn_fn ||
+        (!target->embed && !target->embed_q.packed) ||
+        (!target->lm_head && !target->lm_head_q.packed)) {
+        fprintf(stderr,
+                "[dspark] forward skipped: weights not loaded "
+                "(main_proj=%p, markov=%p, hc=%p, embed=%p/%p, head=%p/%p)\n",
+                (void *)eng->head.main_proj.weight,
+                (void *)eng->head.markov_w1,
+                (void *)eng->layers[0].hc_attn_fn,
+                (void *)target->embed,
+                (void *)target->embed_q.packed,
+                (void *)target->lm_head,
+                (void *)target->lm_head_q.packed);
         return 0;
     }
 
@@ -785,9 +893,13 @@ int dspark_forward(
     float *draft_hidden = eng->buf_draft_hidden; // [bs * MHC_MULT * DIM]
     for (int k = 0; k < bs; k++) {
         int tok = (k == 0) ? anchor_token_id : (int)eng->noise_token_id;
-        const float *emb_row = target->embed + (size_t)tok * DIM;
+        float emb_row[DIM];
+        if (dspark_target_embed_row(target, tok, emb_row) != 0) {
+            fprintf(stderr, "[dspark] target embedding unavailable for token %d\n", tok);
+            return 0;
+        }
         float *res_k = draft_hidden + (size_t)k * MHC_MULT * DIM;
-        // Initialize all MHC_MULT streams with the embedding only
+        // Initialize all MHC_MULT streams with the embedding only.
         for (int m = 0; m < MHC_MULT; m++) {
             float *dst = res_k + m * DIM;
             memcpy(dst, emb_row, DIM * sizeof(float));
@@ -971,17 +1083,18 @@ int dspark_forward(
         hyper_head_compress(eng->head.hc_head_fn, eng->head.hc_head_base,
                            eng->head.hc_head_scale, res_k, compressed);
 
-        // final RMSNorm
-        float final_normed[DIM];
-        rms_norm_cpu(compressed, eng->head.final_norm, final_normed, DIM);
-
-        // lm_head matmul → logits
+        // Target logits supports both dense and affine-4bit lm_head. Calling
+        // the public helper preserves the exact final RMSNorm and quantized
+        // Metal matvec used by ordinary native decode.
         float *logits_k = draft_logits + (size_t)k * vocab;
-        cblas_sgemv(CblasRowMajor, CblasNoTrans,
-                    vocab, DIM, 1.0f, target->lm_head, DIM,
-                    final_normed, 1, 0.0f, logits_k, 1);
+        if (moe_infer_get_logits(target, compressed, logits_k) != 0) {
+            fprintf(stderr, "[dspark] target lm_head unavailable\n");
+            return 0;
+        }
 
         if (dump_dir && !dumped && k == 0) {
+            float final_normed[DIM];
+            rms_norm_cpu(compressed, eng->head.final_norm, final_normed, DIM);
             char path[1024];
             snprintf(path, sizeof(path), "%s/final_residual.bin", dump_dir);
             FILE *f = fopen(path, "wb"); if (f) { fwrite(res_k, sizeof(float), (size_t)MHC_MULT * DIM, f); fclose(f); }

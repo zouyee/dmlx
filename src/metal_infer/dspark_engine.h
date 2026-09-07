@@ -314,7 +314,23 @@ void dspark_build_window(DSparkEngine *eng, const float *hidden3, int n_tokens, 
 // in the window from the drafting step) and set buf_main_hidden to the
 // hidden of the last accepted position — the correct context for the next
 // draft (rejected positions are rolled back by omission).
-void dspark_commit_accepted(DSparkEngine *eng, const float *hidden3, int n_batch, int n_accepted, int start_pos);
+// Commit accepted draft positions after a verify batch. Every projection,
+// norm, KV destination and scratch allocation is validated before mutation.
+// Typed status is preserved by the target-engine C wrapper and Zig binding.
+typedef enum DSparkCommitStatus {
+    DSPARK_COMMIT_OK = 0,
+    DSPARK_COMMIT_INVALID_ARGUMENT = -1,
+    DSPARK_COMMIT_ALLOCATION_FAILED = -2,
+    DSPARK_COMMIT_INVALID_STATE = -3,
+} DSparkCommitStatus;
+
+int dspark_commit_accepted(DSparkEngine *eng, const float *hidden3,
+                           int n_batch, int n_accepted, int start_pos);
+
+// Deterministic one-shot fault injection for the standalone transaction test.
+// Production callers never enable it; the next otherwise-valid commit fails
+// before allocation or state mutation.
+void dspark_test_fail_next_commit_allocation(void);
 
 // --- Target integration helpers ---
 
