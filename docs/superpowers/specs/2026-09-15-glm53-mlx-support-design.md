@@ -36,9 +36,11 @@ mlx-vlm 参考实现确认 GLM-5.3-Flash 与 dmlx 已有 DSV4 实现高度同族
 - q/k 经 RMSNorm + scale 调整
 - gated delta rule 循环：`A_log` 衰减、`dt_bias`、gate lower_bound=-5
 - 输出 `o_norm(out) * sigmoid(gate)` → `o_proj`
-- **decode**：逐 token 更新 SSM 状态（纯 MLX ops）
+- **decode**：逐 token 更新 SSM 状态（纯 MLX ops，无专用 kernel）
 - **prefill**：naive O(L) 逐 token 循环（正确性优先，已知慢，接受）
 - 状态：conv window（k-1）+ SSM recurrent state，新增 `GlmKdaCache`（见 §5）
+
+**为什么本期不写专用 kernel**（回应评审问题）：mlx-vlm 的 `gated_delta_update` 专用 kernel 面向 GPU-bound 数据中心吞吐（chunked prefill scan）；本机是 SSD I/O-bound（DSV4 decode wall ~360ms/token）。纯 MLX ops 的 decode 开销估算：SSM 状态 ~4MB/层（fp32，[64,128,128]）× 34 层，dispatch ~2-5ms/token + 状态流量 ~5ms/token，合计 <10ms/token，淹没在 I/O 噪声里。prefill naive 循环 100-token 约 +0.5-1s，一次性可接受。**触发条件**：M3 oracle 对齐后 profile，若 KDA MLX 路径实测 >20ms/token（如 lazy eval 图碎片化导致状态反复物化），再下沉 fused Metal kernel——届时数学已被 oracle 锁定，有金标准可对。
 
 ## 4. 新增/改动文件
 
