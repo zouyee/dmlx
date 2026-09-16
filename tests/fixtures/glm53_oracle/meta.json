@@ -1,0 +1,98 @@
+{
+  "input_ids": [
+    [
+      17,
+      42,
+      314,
+      2718,
+      7,
+      99,
+      1234
+    ]
+  ],
+  "model_dir": "/Users/zouyee/models/GLM-5.3-Flash-MLX-mixed-4_8bit",
+  "command": "scripts/glm53_oracle_dump.py /Users/zouyee/models/GLM-5.3-Flash-MLX-mixed-4_8bit tests/fixtures/glm53_oracle --self-check",
+  "mlx_version": "0.32.2",
+  "mlx_vlm_version": "0.7.1",
+  "numpy_version": "2.5.3",
+  "tensors": {
+    "embed": {
+      "shape": [
+        1,
+        7,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "layer0_kda_out": {
+      "shape": [
+        1,
+        7,
+        4,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "layer3_mla_out": {
+      "shape": [
+        1,
+        7,
+        4,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "layer3_indexer_topk": {
+      "shape": [
+        1,
+        7,
+        2051
+      ],
+      "dtype": "int32"
+    },
+    "layer10_moe_out": {
+      "shape": [
+        1,
+        7,
+        4,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "layer30_kda_out": {
+      "shape": [
+        1,
+        7,
+        4,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "layer43_mla_out": {
+      "shape": [
+        1,
+        7,
+        4,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "hidden_final": {
+      "shape": [
+        1,
+        7,
+        4096
+      ],
+      "dtype": "float32"
+    },
+    "logits": {
+      "shape": [
+        1,
+        7,
+        154880
+      ],
+      "dtype": "float32"
+    }
+  },
+  "self_check_logits_cosine": 0.9999999999999999
+}
