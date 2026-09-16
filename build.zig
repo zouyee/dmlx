@@ -409,6 +409,29 @@ pub fn build(b: *std.Build) void {
     batch_oracle_test_step.dependOn(&run_batch_capture_test.step);
     batch_oracle_test_step.dependOn(&run_batch_model_test.step);
 
+    // --- GLM-5.3 oracle alignment harness (pure Zig + mlx-c, no Metal C) ---
+    // Dumps embed / layer0_kda_out segments of the 7-token fixture to
+    // artifacts/glm53_oracle/*.bin for scripts/compare_glm53_oracle.py.
+    const glm53_oracle_dump = b.addExecutable(.{
+        .name = "glm53-oracle-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_glm53_oracle_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    glm53_oracle_dump.root_module.addImport("mlx", mlx_z_module);
+    const run_glm53_oracle_dump = b.addRunArtifact(glm53_oracle_dump);
+    if (b.args) |args| {
+        run_glm53_oracle_dump.addArgs(args);
+    }
+    const run_glm53_oracle_dump_step = b.step(
+        "run-glm53-oracle-dump",
+        "Dump GLM-5.3 oracle segments (embed, layer0_kda_out) to artifacts/glm53_oracle",
+    );
+    run_glm53_oracle_dump_step.dependOn(&run_glm53_oracle_dump.step);
+
     // --- Wave-5 bounded phase-aware chunk planner table tests (pure Zig) ---
     const native_chunk_planner_tests = b.addTest(.{
         .root_module = b.createModule(.{
