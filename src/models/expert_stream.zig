@@ -64,6 +64,7 @@ pub const LayerExpertMeta = struct {
     /// Shape of one expert slice: [intermediate_size, packed_hidden] for weight
     expert_row_bytes: usize, // bytes per expert row in the fused tensor
     expert_scale_row_bytes: usize, // bytes per expert row in scales tensor
+    /// 保留供 GLM 接入使用（当前 loadExpertSlicesCached 忽略 row_bytes，由 TensorIndex 自算）
     expert_bias_row_bytes: usize = 0, // bytes per expert row in biases tensor
     n_experts: usize,
 };
@@ -107,10 +108,14 @@ pub const ExpertStreamProvider = struct {
 
     // Temporal expert prediction (flash-moe pattern)
     pred_experts: [][]u32 = &.{},
-    pred_topk: usize = 6,
+    pred_topk: usize = 6, // GLM-5.3 接入时设为 8，默认 6 为 DSV4
     pred_valid: bool = false,
     pred_hits: u64 = 0,
     pred_misses: u64 = 0,
+
+    // Reusable DyMoE skip set (sized max(n_experts) across layers), avoids
+    // per-call heap allocation in the streamingForward hot path.
+    skip_set_buf: []bool = &.{},
 
     // Diagnostic counters
     total_bytes_read: u64 = 0,
@@ -150,6 +155,7 @@ pub const ExpertStreamProvider = struct {
         }
         for (self.pred_experts) |row| self.allocator.free(row);
         if (self.pred_experts.len > 0) self.allocator.free(self.pred_experts);
+        if (self.skip_set_buf.len > 0) self.allocator.free(self.skip_set_buf);
         if (self.preload_provider) |provider| {
             provider.deinit();
             self.allocator.destroy(provider);
@@ -296,6 +302,23 @@ pub const ExpertStreamProvider = struct {
 
         // Allocate warmup-learned DyMoE counters (n_layers × per-layer n_experts)
         const n_layers = provider.layer_meta.len;
+        var dymoe_rows: usize = 0;
+        var pred_rows: usize = 0;
+        errdefer {
+            if (provider.dymoe_top5_count) |t5| {
+                for (0..dymoe_rows) |i| allocator.free(t5[i]);
+                allocator.free(t5);
+            }
+            if (provider.dymoe_total_count) |tt| {
+                for (0..dymoe_rows) |i| allocator.free(tt[i]);
+                allocator.free(tt);
+            }
+            if (provider.pred_experts.len > 0) {
+                for (0..pred_rows) |i| allocator.free(provider.pred_experts[i]);
+                allocator.free(provider.pred_experts);
+            }
+            if (provider.skip_set_buf.len > 0) allocator.free(provider.skip_set_buf);
+        }
         if (strategy == .stream and provider.dymoe_max_skip > 0) {
             provider.dymoe_top5_count = try allocator.alloc([]u32, n_layers);
             provider.dymoe_total_count = try allocator.alloc([]u32, n_layers);
@@ -305,16 +328,23 @@ pub const ExpertStreamProvider = struct {
                 provider.dymoe_total_count.?[i] = try allocator.alloc(u32, n_experts);
                 @memset(provider.dymoe_top5_count.?[i], 0);
                 @memset(provider.dymoe_total_count.?[i], 0);
+                dymoe_rows += 1;
             }
         }
 
-        // Temporal prediction rows (n_layers × PRED_WIDTH)
         if (strategy == .stream) {
+            // Temporal prediction rows (n_layers × PRED_WIDTH)
             provider.pred_experts = try allocator.alloc([]u32, n_layers);
             for (0..n_layers) |i| {
                 provider.pred_experts[i] = try allocator.alloc(u32, ExpertStreamProvider.PRED_WIDTH);
                 @memset(provider.pred_experts[i], 0);
+                pred_rows += 1;
             }
+
+            // Reusable skip set, sized for the largest layer
+            var max_experts: usize = 0;
+            for (provider.layer_meta) |m| max_experts = @max(max_experts, m.n_experts);
+            provider.skip_set_buf = try allocator.alloc(bool, max_experts);
         }
 
         return provider;
@@ -613,8 +643,7 @@ pub const ExpertStreamProvider = struct {
         var load_ids_buf = try self.allocator.alloc(u32, unique_ids.len);
         defer self.allocator.free(load_ids_buf);
         var load_ids_len: usize = 0;
-        var skip_set = try self.allocator.alloc(bool, meta.n_experts);
-        defer self.allocator.free(skip_set);
+        const skip_set = self.skip_set_buf[0..meta.n_experts];
         @memset(skip_set, false);
         var dymoe_skipped: usize = 0;
 
@@ -710,7 +739,8 @@ pub const ExpertStreamProvider = struct {
 
         // pread packed path has no biases storage; biased (affine-quantized)
         // models must take the PartialTensorReader path below.
-        const use_pread = self.pread_loader != null and self.pread_loader.?.hasLayer(layer_idx) and meta.gate_biases_name == null;
+        const use_pread = self.pread_loader != null and
+            preadAllowed(self.pread_loader.?.hasLayer(layer_idx), meta.gate_biases_name);
         var pread_ok = false;
         if (use_pread) {
             const loader = self.pread_loader.?;
@@ -926,6 +956,22 @@ pub const ExpertStreamProvider = struct {
 };
 
 // ── Tests ──
+
+/// Whether the packed pread path may serve a layer.
+/// pread packed blobs have no biases storage, so biased (affine-quantized)
+/// layers must take the PartialTensorReader path instead.
+/// 若配置只给部分 biases 名字属病态配置，生产 meta 由代码生成保证三者同源。
+fn preadAllowed(has_packed_layer: bool, gate_biases_name: ?[]const u8) bool {
+    return has_packed_layer and gate_biases_name == null;
+}
+
+test "preadAllowed: biases 为 null 时 pread 保持原语义" {
+    // 无 packed layer → 不可用；有 packed layer 且 biases null → 可用（DSV4 行为）
+    try std.testing.expect(!preadAllowed(false, null));
+    try std.testing.expect(preadAllowed(true, null));
+    // biases 非 null（affine 量化）→ pread 被禁用
+    try std.testing.expect(!preadAllowed(true, "language_model.model.layers.5.mlp.switch_mlp.gate_proj.biases"));
+}
 
 test "TokenStepMetrics: struct has correct fields" {
     // Verify that TokenStepMetrics can be constructed with all expected fields
