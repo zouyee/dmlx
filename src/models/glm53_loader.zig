@@ -31,7 +31,7 @@ pub const Glm53Config = struct {
     n_routed_experts: u32 = 288,
     num_experts_per_tok: u32 = 8,
     n_shared_experts: u32 = 1,
-    norm_topk_prob: bool = true,
+    norm_topk_prob: bool = true, // assumes scoring_func=sigmoid（GLM-5.3 固定）
     routed_scaling_factor: f32 = 2.5,
     swiglu_limit: f32 = 10.0,
     rms_norm_eps: f32 = 1e-5,
@@ -123,8 +123,7 @@ fn nestedBool(text: ?std.json.ObjectMap, top: std.json.ObjectMap, key: []const u
 
 fn toU32(v: ?i64, default: u32) u32 {
     const n = v orelse return default;
-    if (n < 0) return default;
-    return @intCast(n);
+    return std.math.cast(u32, n) orelse default;
 }
 
 fn toF32(v: ?f64, default: f32) f32 {
@@ -186,36 +185,40 @@ pub fn parseGlm53Config(allocator: std.mem.Allocator, json_text: []const u8) !Gl
     cfg.index_kpool_always_select_tail = nestedBool(text, obj, "index_kpool_always_select_tail") orelse cfg.index_kpool_always_select_tail;
     cfg.index_kpool_compress = nestedBool(text, obj, "index_kpool_compress") orelse cfg.index_kpool_compress;
 
-    // eos_token_id: integer or array of integers.
-    if (text) |t| {
-        if (t.get("eos_token_id")) |eos_val| {
-            switch (eos_val) {
-                .integer => |n| {
-                    if (n >= 0) {
-                        const ids = try allocator.alloc(u32, 1);
-                        ids[0] = @intCast(n);
-                        cfg.eos_token_ids = ids;
+    // eos_token_id: integer or array of integers; text_config 优先，回退顶层。
+    const eos_val: ?std.json.Value = blk: {
+        if (text) |t| {
+            if (t.get("eos_token_id")) |v| break :blk v;
+        }
+        break :blk obj.get("eos_token_id");
+    };
+    if (eos_val) |val| {
+        switch (val) {
+            .integer => |n| {
+                if (std.math.cast(u32, n)) |id| {
+                    const ids = try allocator.alloc(u32, 1);
+                    ids[0] = id;
+                    cfg.eos_token_ids = ids;
+                }
+            },
+            .array => |arr| {
+                var list = std.ArrayList(u32).empty;
+                defer list.deinit(allocator);
+                for (arr.items) |item| {
+                    const n: ?i64 = switch (item) {
+                        .integer => |v| v,
+                        .float => |f| @intFromFloat(f),
+                        else => null,
+                    };
+                    if (n) |v| {
+                        if (std.math.cast(u32, v)) |id| try list.append(allocator, id);
                     }
-                },
-                .array => |arr| {
-                    var list = std.ArrayList(u32).empty;
-                    defer list.deinit(allocator);
-                    for (arr.items) |item| {
-                        const n: ?i64 = switch (item) {
-                            .integer => |v| v,
-                            .float => |f| @intFromFloat(f),
-                            else => null,
-                        };
-                        if (n) |v| {
-                            if (v >= 0) try list.append(allocator, @intCast(v));
-                        }
-                    }
-                    if (list.items.len > 0) {
-                        cfg.eos_token_ids = try list.toOwnedSlice(allocator);
-                    }
-                },
-                else => {},
-            }
+                }
+                if (list.items.len > 0) {
+                    cfg.eos_token_ids = try list.toOwnedSlice(allocator);
+                }
+            },
+            else => {},
         }
     }
 
@@ -311,6 +314,19 @@ test "parseGlm53Config: 缺省字段回退默认 + 顶层回退" {
     try std.testing.expectEqual(@as(usize, 0), cfg.eos_token_ids.len);
     try std.testing.expect(!cfg.isFullAttention(0));
     try std.testing.expectEqual(@as(u8, 4), cfg.quant_bits_default);
+}
+
+test "parseGlm53Config: eos_token_id 顶层回退" {
+    const allocator = std.testing.allocator;
+    const json_text =
+        \\{"model_type":"glm5_next","eos_token_id":[154820,154827],
+        \\  "text_config":{"num_hidden_layers":45}}
+    ;
+    var cfg = try parseGlm53Config(allocator, json_text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 2), cfg.eos_token_ids.len);
+    try std.testing.expectEqual(@as(u32, 154820), cfg.eos_token_ids[0]);
+    try std.testing.expectEqual(@as(u32, 154827), cfg.eos_token_ids[1]);
 }
 
 test "parseGlm53Config: 非 glm5 model_type 拒绝" {
