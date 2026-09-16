@@ -78,8 +78,10 @@ fn loadQuantized(index: *safetensors_reader.TensorIndex, allocator: std.mem.Allo
 }
 
 fn dumpBin(allocator: std.mem.Allocator, out_dir: []const u8, name: []const u8, arr: Array) !void {
+    std.debug.assert(arr.dtype() == .float32);
     try arr.eval();
     const sh = arr.shape();
+    std.debug.assert(sh.len <= 8);
     const data = try arr.dataSlice(f32);
 
     var dir_buf: [1024]u8 = undefined;
@@ -159,7 +161,10 @@ pub fn main(init: std.process.Init) !void {
 
     const stream = c.c.mlx_default_gpu_stream_new();
     const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
-    const dummy_stream = ctx.stream.inner;
+    // LIFO: declared before every Array/index defer below, so the stream is
+    // released only after all arrays and the weight index are freed.
+    defer ctx.deinit();
+    const stream_raw = ctx.stream.inner;
 
     var index = try safetensors_reader.loadOrBuildIndex(allocator, model_dir);
     defer index.deinit();
@@ -198,7 +203,7 @@ pub fn main(init: std.process.Init) !void {
     // === layer0 KDA segment ===
     // residual = repeat(embed, hc_mult) on axis 2 — matches the oracle's
     // mx.repeat(h[:, :, None], hc_mult, axis=2).
-    const residual = try dsv4.expandToMHC(ctx, embed, hc_mult, dummy_stream); // [1, L, 4, hidden] bf16
+    const residual = try dsv4.expandToMHC(ctx, embed, hc_mult, stream_raw); // [1, L, 4, hidden] bf16
     defer residual.deinit();
 
     const p = "language_model.model.layers.0";
@@ -219,19 +224,19 @@ pub fn main(init: std.process.Init) !void {
     defer res_f32.deinit();
     const hc_fn_f32 = try ops.astype(ctx, hc_fn, .float32);
     defer hc_fn_f32.deinit();
-    const mixes = try dsv4.mhcPreNormFn(ctx, res_f32, hc_fn_f32, null, cfg.rms_norm_eps, dummy_stream);
+    const mixes = try dsv4.mhcPreNormFn(ctx, res_f32, hc_fn_f32, null, cfg.rms_norm_eps, stream_raw);
     defer mixes.deinit();
-    const splits = try dsv4.mhcPreSplitMixes(ctx, mixes, hc_scale, hc_base, hc_mult, 2.0, cfg.hc_eps, dummy_stream);
+    const splits = try dsv4.mhcPreSplitMixes(ctx, mixes, hc_scale, hc_base, hc_mult, 2.0, cfg.hc_eps, stream_raw);
     const pre_mix = splits[0];
     const post_mix = splits[1];
     const comb_mix = splits[2];
     defer pre_mix.deinit();
     defer post_mix.deinit();
     defer comb_mix.deinit();
-    const comb_norm = try dsv4.sinkhornNormalize(ctx, comb_mix, cfg.hc_sinkhorn_iters, cfg.hc_eps, dummy_stream);
+    const comb_norm = try dsv4.sinkhornNormalize(ctx, comb_mix, cfg.hc_sinkhorn_iters, cfg.hc_eps, stream_raw);
     defer comb_norm.deinit();
 
-    const collapsed = try dsv4.mhcPreApplyMix(ctx, residual, pre_mix, dummy_stream); // [1, L, hidden] bf16
+    const collapsed = try dsv4.mhcPreApplyMix(ctx, residual, pre_mix, stream_raw); // [1, L, hidden] bf16
     defer collapsed.deinit();
     const collapsed_f32 = try ops.astype(ctx, collapsed, .float32);
     defer collapsed_f32.deinit();
@@ -309,7 +314,7 @@ pub fn main(init: std.process.Init) !void {
     defer kda_out.deinit();
 
     // HC expand (apply_branch post): post * out + comb^T @ residual.
-    const out = try dsv4.mhcPost(ctx, kda_out, residual, post_mix, comb_norm, dummy_stream);
+    const out = try dsv4.mhcPost(ctx, kda_out, residual, post_mix, comb_norm, stream_raw);
     defer out.deinit();
 
     try dumpBin(allocator, out_dir, "layer0_kda_out", out);

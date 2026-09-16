@@ -7,7 +7,8 @@ The .bin format written by src/test_glm53_oracle_dump.zig:
 Usage:
     python3 scripts/compare_glm53_oracle.py A.npy B.bin [--threshold T]
 
-Prints shape/cos/max_abs_err and exits non-zero when cos < threshold.
+Prints shape/cos/max_abs_err and exits non-zero when the comparison fails:
+exit 2 on shape mismatch, exit 1 on cos < threshold.
 Default threshold 0.999 (bf16 compute-vs-f32 tolerance; pass --threshold
 0.9999 for FP32_KEEP segments, 0.998 only when bf16 quantization noise is
 explicitly expected).
@@ -55,7 +56,7 @@ def main():
     print(f"B {args.bin}: shape={b.shape}")
     if a.shape != b.shape:
         print("FAIL: shape mismatch")
-        sys.exit(1)
+        sys.exit(2)
 
     av, bv = a.ravel(), b.ravel()
     cos = float(av @ bv / (np.linalg.norm(av) * np.linalg.norm(bv)))
