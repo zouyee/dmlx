@@ -2,6 +2,8 @@
 ///
 /// Faithful port of mlx-vlm `Glm5NextLinearAttention` +
 /// `gated_delta.py` naive ops path (`gated_delta_ops`), single batch.
+/// Deliberately f32 throughout; oracle tolerance verified vs a float64
+/// numpy reference (scripts/glm53_kda_ref.py, abs tol 1e-5).
 ///
 /// Per decode step:
 ///   qkv = silu(depthwise_conv1d(qkv_proj(x), k=4))        // windowed conv cache
@@ -137,6 +139,10 @@ pub const GlmKDA = struct {
     }
 
     /// One decode token. x: [1, hidden]. Returns [1, hidden]. Advances cache.
+    ///
+    /// The SSM state is evaluated eagerly every step; callers MUST also eval the
+    /// returned output each step (decode path depends on it) so lazy graphs do
+    /// not accumulate across tokens.
     pub fn forward(self: *GlmKDA, x: Array, cache: *GlmKdaCache) !Array {
         const H: i32 = @intCast(self.num_heads);
         const D: i32 = @intCast(self.head_dim);
@@ -211,9 +217,13 @@ pub const GlmKDA = struct {
         defer q_norm.deinit();
         const k_norm = try self.rmsNormNoWeight(k_resh, eps);
         defer k_norm.deinit();
-        const q = try ops.multiply(ctx, q_norm, try ops.scalarF32(ctx, scale * scale));
+        const q_scale = try ops.scalarF32(ctx, scale * scale);
+        defer q_scale.deinit();
+        const q = try ops.multiply(ctx, q_norm, q_scale);
         defer q.deinit();
-        const k = try ops.multiply(ctx, k_norm, try ops.scalarF32(ctx, scale));
+        const k_scale = try ops.scalarF32(ctx, scale);
+        defer k_scale.deinit();
+        const k = try ops.multiply(ctx, k_norm, k_scale);
         defer k.deinit();
 
         // 3. fbg split: f_a [D], b_raw [H], g_a [D].
@@ -289,6 +299,9 @@ pub const GlmKDA = struct {
         const s_new = try ops.add(ctx, s_decayed, k_delta);
         cache.ssm_state.deinit();
         cache.ssm_state = s_new;
+        // Force materialization each step so the recurrent lazy graph stays O(1)
+        // deep across a decode loop (same convention as deepseek_v4.zig).
+        try cache.ssm_state.eval();
 
         const q_b = try ops.reshape(ctx, q, &[_]i32{ H, 1, D });
         defer q_b.deinit();
@@ -318,7 +331,6 @@ pub const GlmKDA = struct {
 
         var outs = try std.ArrayList(Array).initCapacity(allocator, @intCast(L));
         defer outs.deinit(allocator);
-        errdefer for (outs.items) |o| o.deinit();
 
         var t: i32 = 0;
         while (t < L) : (t += 1) {
@@ -329,8 +341,8 @@ pub const GlmKDA = struct {
             const out_t = try self.forward(x_flat, cache);
             errdefer out_t.deinit();
             const out_exp = try ops.expandDims(self.ctx, out_t, 1);
+            outs.appendAssumeCapacity(out_exp);
             out_t.deinit();
-            try outs.append(allocator, out_exp);
         }
         defer for (outs.items) |o| o.deinit();
         return shape_mod.concatenateAxis(self.ctx, outs.items, 1);
@@ -507,4 +519,30 @@ test "GlmKDA.prefill: 逐 token 循环等价" {
     try std.testing.expectEqual(@as(i32, 1), oshape[0]);
     try std.testing.expectEqual(@as(i32, 3), oshape[1]);
     try std.testing.expectEqual(@as(i32, 8), oshape[2]);
+    try out.eval();
+
+    // Reference: fresh module + cache, manual per-token forward loop.
+    var kda_ref = try makeTestModule(allocator, ctx, dims);
+    defer kda_ref.deinit();
+    var cache_ref = try GlmKdaCache.init(allocator, dims.conv_kernel, 3 * dims.heads * dims.head_dim, dims.heads, dims.head_dim);
+    defer cache_ref.deinit();
+
+    var ref_buf: [24]f32 = undefined;
+    var t: i32 = 0;
+    while (t < 3) : (t += 1) {
+        const x_t = try ops.slice(ctx, x, &[_]i32{ 0, t, 0 }, &[_]i32{ 1, t + 1, 8 }, &[_]i32{ 1, 1, 1 });
+        defer x_t.deinit();
+        const x_flat = try ops.reshape(ctx, x_t, &[_]i32{ 1, 8 });
+        defer x_flat.deinit();
+        const out_t = try kda_ref.forward(x_flat, &cache_ref);
+        defer out_t.deinit();
+        try out_t.eval();
+        const row = try out_t.dataSlice(f32);
+        @memcpy(ref_buf[@intCast(t * 8)..@intCast((t + 1) * 8)], row);
+    }
+
+    const got = try out.dataSlice(f32);
+    for (ref_buf, got) |e, g| {
+        try std.testing.expectApproxEqAbs(e, g, 1e-5);
+    }
 }
