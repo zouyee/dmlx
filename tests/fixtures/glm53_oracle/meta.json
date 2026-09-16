@@ -11,7 +11,7 @@
     ]
   ],
   "model_dir": "/Users/zouyee/models/GLM-5.3-Flash-MLX-mixed-4_8bit",
-  "command": "scripts/glm53_oracle_dump.py /Users/zouyee/models/GLM-5.3-Flash-MLX-mixed-4_8bit tests/fixtures/glm53_oracle --self-check",
+  "command": "/private/tmp/glm53_oracle_venv/bin/python scripts/glm53_oracle_dump.py /Users/zouyee/models/GLM-5.3-Flash-MLX-mixed-4_8bit tests/fixtures/glm53_oracle --self-check",
   "mlx_version": "0.32.2",
   "mlx_vlm_version": "0.7.1",
   "numpy_version": "2.5.3",
@@ -94,5 +94,24 @@
       "dtype": "float32"
     }
   },
-  "self_check_logits_cosine": 0.9999999999999999
+  "self_check_scope": "kda_kernel_vs_naive",
+  "self_check_cosines": {
+    "embed": 1.0000000000000002,
+    "layer0_kda_out": 0.9999998218836124,
+    "layer3_mla_out": 0.9999982739185225,
+    "layer3_indexer_topk": 1.0,
+    "layer10_moe_out": 0.9999964618852047,
+    "layer30_kda_out": 0.9992826616907601,
+    "layer43_mla_out": 0.9960793188309087,
+    "hidden_final": 0.9867227398735483,
+    "logits": 0.993833805090558
+  },
+  "self_check_topk_equal": true,
+  "self_check_thresholds": {
+    "layer0_kda_out": 0.9999,
+    "layer3_mla_out": 0.9999,
+    "layer3_indexer_topk": "exact",
+    "logits": 0.99
+  },
+  "self_check_note": "kernel-vs-naive KDA logits cosine ~0.994 is expected: per-layer bf16 accumulation-order differences (~2e-7 at layer 0) compound over 34 KDA layers; early-layer gates catch semantic mismatches."
 }

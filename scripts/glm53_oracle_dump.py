@@ -21,6 +21,26 @@ LanguageModel directly, remaps the checkpoint's KDA keys (forget_gate.*,
 fused conv1d) that the installed sanitize() does not cover, derives per-module
 quantization from the packed weight shapes, and never calls mx.eval on the
 full parameter set.
+
+Reproduce the environment (the system python's brew-installed mlx is broken
+— `import mlx.core` raises ModuleNotFoundError: mlx._reprlib_fix — do not
+use it):
+
+    python3 -m venv /tmp/glm53_oracle_venv
+    /tmp/glm53_oracle_venv/bin/pip install "mlx==0.32.2" "mlx-vlm==0.7.1" numpy
+    /tmp/glm53_oracle_venv/bin/python scripts/glm53_oracle_dump.py \
+        ~/models/GLM-5.3-Flash-MLX-mixed-4_8bit \
+        tests/fixtures/glm53_oracle --self-check
+
+Self-check scope: with --self-check the second forward pass forces the KDA
+gated_delta_update naive path (use_kernel=False, via monkeypatch of
+mlx_vlm.models.glm5_next.language.gated_delta_update), so the check compares
+the Metal KDA kernel against the naive ops implementation, not just
+environment determinism. Thresholds are tiered: layer-0/layer-3 attention
+outputs must match at cosine >= 0.9999 and the layer-3 indexer topk must be
+bit-identical (a semantic mismatch surfaces there immediately), while final
+logits are gated at >= 0.99 because per-layer bf16 accumulation-order
+differences (~2e-7) compound over 34 KDA layers to ~0.994 at the logits.
 """
 
 import argparse
@@ -108,12 +128,19 @@ def build_model(model_path):
     text_config = TextConfig.from_dict(config["text_config"])
     model = LanguageModel(text_config)
 
-    index = json.loads((model_path / "model.safetensors.index.json").read_text())[
-        "weight_map"
-    ]
+    index_path = model_path / "model.safetensors.index.json"
+    try:
+        index = json.loads(index_path.read_text())["weight_map"]
+    except (OSError, ValueError, KeyError) as e:
+        raise RuntimeError(f"failed to read weight index {index_path}: {e}") from e
     weights = {}
     for shard in sorted(set(index.values())):
-        for key, value in mx.load(str(model_path / shard)).items():
+        shard_path = model_path / shard
+        try:
+            loaded = mx.load(str(shard_path))
+        except Exception as e:
+            raise RuntimeError(f"failed to load shard {shard_path}: {e}") from e
+        for key, value in loaded.items():
             if key.startswith("language_model."):
                 weights[key] = value
     remap_kda_weights(weights, text_config)
@@ -122,6 +149,13 @@ def build_model(model_path):
     weights = {
         key[len("language_model.") :]: value for key, value in weights.items()
     }
+    from mlx.utils import tree_flatten
+
+    consumed = {k for k, _ in tree_flatten(model.parameters())}
+    leftover = sorted(set(weights) - consumed)
+    print(f"checkpoint keys not consumed by the model: {len(leftover)}", flush=True)
+    for key in leftover[:10]:
+        print(f"  leftover: {key}", flush=True)
     model.load_weights(list(weights.items()), strict=True)
     model.eval()
     return model, weights
@@ -147,8 +181,8 @@ def run_forward(model, weights):
 
     h = mx.repeat(h[:, :, None], text.config.hc_mult, axis=2)
     topk = None
-    layers = list(text.layers)
-    for i, layer in enumerate(layers):
+    for i in range(len(text.layers)):
+        layer = text.layers[i]
         if layer.is_linear:
             h = layer.attn_hc.apply_branch(
                 h, layer.input_layernorm, layer.self_attn, None, None
@@ -168,7 +202,6 @@ def run_forward(model, weights):
         if i == MOE_DUMP_LAYER:
             dumps[f"layer{MOE_DUMP_LAYER}_moe_out"] = h
         mx.eval(h)
-        layers[i] = None
         text.layers[i] = None
         drop_keys(weights, f"model.layers.{i}.")
         gc.collect()
@@ -180,6 +213,21 @@ def run_forward(model, weights):
     dumps["logits"] = logits
     mx.eval(logits)
     return dumps
+
+
+def force_naive_kda():
+    """Monkeypatch glm5_next's gated_delta_update to use_kernel=False, i.e.
+    the composable ops path instead of the fused Metal kernel."""
+    import mlx_vlm.models.glm5_next.language as language
+
+    original = language.gated_delta_update
+
+    def naive(*args, **kwargs):
+        kwargs["use_kernel"] = False
+        return original(*args, **kwargs)
+
+    language.gated_delta_update = naive
+    return original
 
 
 def cosine(a, b):
@@ -195,7 +243,7 @@ def main():
     parser.add_argument(
         "--self-check",
         action="store_true",
-        help="run a second forward pass and require logits cosine >= 0.9999",
+        help="rerun with the naive KDA path and compare against the kernel run",
     )
     args = parser.parse_args()
 
@@ -211,7 +259,7 @@ def main():
     args.model_dir = args.model_dir.expanduser()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
-    command = " ".join(sys.argv)
+    command = f"{sys.executable} " + " ".join(sys.argv)
 
     t0 = time.time()
     model, weights = build_model(args.model_dir)
@@ -251,20 +299,59 @@ def main():
     }
 
     if args.self_check:
-        logits_ref = np.array(dumps["logits"].astype(mx.float32))
+        ref = {
+            name: np.array(tensor.astype(mx.float32))
+            for name, tensor in dumps.items()
+        }
+        topk_ref = np.array(dumps["layer3_indexer_topk"].astype(mx.int32))
         del dumps, model, weights
         gc.collect()
         mx.clear_cache()
         model2, weights2 = build_model(args.model_dir)
+        force_naive_kda()
         t0 = time.time()
         dumps2 = run_forward(model2, weights2)
-        print(f"forward pass 2 in {time.time() - t0:.1f}s", flush=True)
-        logits2 = np.array(dumps2["logits"].astype(mx.float32))
-        cos = cosine(logits_ref, logits2)
-        print(f"self-check logits cosine: {cos:.8f}", flush=True)
-        if cos < 0.9999:
-            sys.exit(f"self-check FAILED: logits cosine {cos:.8f} < 0.9999")
-        meta["self_check_logits_cosine"] = cos
+        print(f"forward pass 2 (naive KDA) in {time.time() - t0:.1f}s", flush=True)
+
+        # bf16 rounding-order differences between the fused Metal KDA kernel
+        # and the naive ops path are tiny per layer (layer0 output cosine
+        # ~0.9999998) but compound over 34 KDA layers and the hyper-connection
+        # residual streams; logits cosine lands around 0.994. Gate the early
+        # layers tightly (where a semantic mismatch would show up immediately)
+        # and the final logits loosely.
+        failures = []
+        cosines = {}
+        for name, a in ref.items():
+            b = np.array(dumps2[name].astype(mx.float32))
+            cos = cosine(a, b)
+            cosines[name] = cos
+            print(f"self-check {name}: cosine {cos:.8f}", flush=True)
+        topk2 = np.array(dumps2["layer3_indexer_topk"].astype(mx.int32))
+        topk_equal = bool((topk_ref == topk2).all())
+        print(f"self-check layer3_indexer_topk equal: {topk_equal}", flush=True)
+        if not topk_equal:
+            failures.append("layer3_indexer_topk mismatch")
+        for name in ("layer0_kda_out", "layer3_mla_out"):
+            if cosines[name] < 0.9999:
+                failures.append(f"{name} cosine {cosines[name]:.8f} < 0.9999")
+        if cosines["logits"] < 0.99:
+            failures.append(f"logits cosine {cosines['logits']:.8f} < 0.99")
+        if failures:
+            sys.exit("self-check FAILED: " + "; ".join(failures))
+        meta["self_check_scope"] = "kda_kernel_vs_naive"
+        meta["self_check_cosines"] = cosines
+        meta["self_check_topk_equal"] = topk_equal
+        meta["self_check_thresholds"] = {
+            "layer0_kda_out": 0.9999,
+            "layer3_mla_out": 0.9999,
+            "layer3_indexer_topk": "exact",
+            "logits": 0.99,
+        }
+        meta["self_check_note"] = (
+            "kernel-vs-naive KDA logits cosine ~0.994 is expected: per-layer "
+            "bf16 accumulation-order differences (~2e-7 at layer 0) compound "
+            "over 34 KDA layers; early-layer gates catch semantic mismatches."
+        )
 
     (args.out_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n")
     print("done", flush=True)
