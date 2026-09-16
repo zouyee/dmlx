@@ -57,14 +57,21 @@ pub const LayerExpertMeta = struct {
     gate_scales_name: ?[]const u8,
     up_scales_name: ?[]const u8,
     down_scales_name: ?[]const u8,
+    /// Biases tensors (MLX affine quantization). null for mxfp4 (no biases).
+    gate_biases_name: ?[]const u8 = null,
+    up_biases_name: ?[]const u8 = null,
+    down_biases_name: ?[]const u8 = null,
     /// Shape of one expert slice: [intermediate_size, packed_hidden] for weight
     expert_row_bytes: usize, // bytes per expert row in the fused tensor
     expert_scale_row_bytes: usize, // bytes per expert row in scales tensor
+    expert_bias_row_bytes: usize = 0, // bytes per expert row in biases tensor
     n_experts: usize,
 };
 
 /// Unified expert provider supporting both preload and streaming strategies.
 pub const ExpertStreamProvider = struct {
+    const PRED_WIDTH = 8; // max topk among supported models (DSV4: 6, GLM-5.3: 8)
+
     allocator: std.mem.Allocator,
     index: *TensorIndex,
     ctx: EagerContext,
@@ -95,11 +102,12 @@ pub const ExpertStreamProvider = struct {
     dymoe_total_skipped: u64 = 0,
     dymoe_total_opportunities: u64 = 0,
     dymoe_warmup_done: bool = false,
-    dymoe_top5_count: ?[][256]u32 = null, // per-layer: how often in positions 0-4
-    dymoe_total_count: ?[][256]u32 = null, // per-layer: total selections
+    dymoe_top5_count: ?[][]u32 = null, // per-layer: how often in positions 0-4
+    dymoe_total_count: ?[][]u32 = null, // per-layer: total selections
 
     // Temporal expert prediction (flash-moe pattern)
-    pred_experts: [43][6]u32 = [_][6]u32{[_]u32{0} ** 6} ** 43,
+    pred_experts: [][]u32 = &.{},
+    pred_topk: usize = 6,
     pred_valid: bool = false,
     pred_hits: u64 = 0,
     pred_misses: u64 = 0,
@@ -120,7 +128,7 @@ pub const ExpertStreamProvider = struct {
             const tt = self.dymoe_total_count.?;
             var total_skippable: usize = 0;
             for (0..self.layer_meta.len) |li| {
-                for (0..256) |ei| {
+                for (0..t5[li].len) |ei| {
                     if (tt[li][ei] > 0 and t5[li][ei] == 0) {
                         total_skippable += 1;
                     }
@@ -132,8 +140,16 @@ pub const ExpertStreamProvider = struct {
     }
 
     pub fn deinit(self: *ExpertStreamProvider) void {
-        if (self.dymoe_top5_count) |t5| self.allocator.free(t5);
-        if (self.dymoe_total_count) |tt| self.allocator.free(tt);
+        if (self.dymoe_top5_count) |t5| {
+            for (t5) |row| self.allocator.free(row);
+            self.allocator.free(t5);
+        }
+        if (self.dymoe_total_count) |tt| {
+            for (tt) |row| self.allocator.free(row);
+            self.allocator.free(tt);
+        }
+        for (self.pred_experts) |row| self.allocator.free(row);
+        if (self.pred_experts.len > 0) self.allocator.free(self.pred_experts);
         if (self.preload_provider) |provider| {
             provider.deinit();
             self.allocator.destroy(provider);
@@ -160,6 +176,9 @@ pub const ExpertStreamProvider = struct {
             if (meta.gate_scales_name) |n| self.allocator.free(n);
             if (meta.up_scales_name) |n| self.allocator.free(n);
             if (meta.down_scales_name) |n| self.allocator.free(n);
+            if (meta.gate_biases_name) |n| self.allocator.free(n);
+            if (meta.up_biases_name) |n| self.allocator.free(n);
+            if (meta.down_biases_name) |n| self.allocator.free(n);
         }
         self.allocator.free(self.layer_meta);
     }
@@ -275,14 +294,26 @@ pub const ExpertStreamProvider = struct {
             },
         }
 
-        // Allocate warmup-learned DyMoE counters (43 layers × 256 experts)
+        // Allocate warmup-learned DyMoE counters (n_layers × per-layer n_experts)
+        const n_layers = provider.layer_meta.len;
         if (strategy == .stream and provider.dymoe_max_skip > 0) {
-            const n_layers = provider.layer_meta.len;
-            provider.dymoe_top5_count = try allocator.alloc([256]u32, n_layers);
-            provider.dymoe_total_count = try allocator.alloc([256]u32, n_layers);
+            provider.dymoe_top5_count = try allocator.alloc([]u32, n_layers);
+            provider.dymoe_total_count = try allocator.alloc([]u32, n_layers);
             for (0..n_layers) |i| {
-                provider.dymoe_top5_count.?[i] = [_]u32{0} ** 256;
-                provider.dymoe_total_count.?[i] = [_]u32{0} ** 256;
+                const n_experts = provider.layer_meta[i].n_experts;
+                provider.dymoe_top5_count.?[i] = try allocator.alloc(u32, n_experts);
+                provider.dymoe_total_count.?[i] = try allocator.alloc(u32, n_experts);
+                @memset(provider.dymoe_top5_count.?[i], 0);
+                @memset(provider.dymoe_total_count.?[i], 0);
+            }
+        }
+
+        // Temporal prediction rows (n_layers × PRED_WIDTH)
+        if (strategy == .stream) {
+            provider.pred_experts = try allocator.alloc([]u32, n_layers);
+            for (0..n_layers) |i| {
+                provider.pred_experts[i] = try allocator.alloc(u32, ExpertStreamProvider.PRED_WIDTH);
+                @memset(provider.pred_experts[i], 0);
             }
         }
 
@@ -353,6 +384,9 @@ pub const ExpertStreamProvider = struct {
         gate_scales_name: ?[]const u8,
         up_scales_name: ?[]const u8,
         down_scales_name: ?[]const u8,
+        gate_biases_name: ?[]const u8,
+        up_biases_name: ?[]const u8,
+        down_biases_name: ?[]const u8,
         expert_ids: []const u32,
         layer_idx: usize,
         gate_w: *Array,
@@ -361,6 +395,9 @@ pub const ExpertStreamProvider = struct {
         gate_s: *?Array,
         up_s: *?Array,
         down_s: *?Array,
+        gate_b: *?Array,
+        up_b: *?Array,
+        down_b: *?Array,
     ) !void {
         var gate_ctx = ProjectionLoadCtx{ .provider = self, .tensor_name = gate_name, .expert_ids = expert_ids, .layer_idx = layer_idx };
         var up_ctx = ProjectionLoadCtx{ .provider = self, .tensor_name = up_name, .expert_ids = expert_ids, .layer_idx = layer_idx };
@@ -390,6 +427,10 @@ pub const ExpertStreamProvider = struct {
             if (gate_scales_name) |n| gate_s.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
             if (up_scales_name) |n| up_s.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
             if (down_scales_name) |n| down_s.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
+            // Biases (MLX affine quantization): same read path as scales
+            if (gate_biases_name) |n| gate_b.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
+            if (up_biases_name) |n| up_b.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
+            if (down_biases_name) |n| down_b.* = try self.loadExpertSlicesCached(n, expert_ids, layer_idx, 0);
         }
 
         const t1 = std.c.mach_absolute_time();
@@ -572,7 +613,9 @@ pub const ExpertStreamProvider = struct {
         var load_ids_buf = try self.allocator.alloc(u32, unique_ids.len);
         defer self.allocator.free(load_ids_buf);
         var load_ids_len: usize = 0;
-        var skip_set: [256]bool = [_]bool{false} ** 256;
+        var skip_set = try self.allocator.alloc(bool, meta.n_experts);
+        defer self.allocator.free(skip_set);
+        @memset(skip_set, false);
         var dymoe_skipped: usize = 0;
 
         // Warmup phase: record expert positions for skip mask learning.
@@ -582,7 +625,7 @@ pub const ExpertStreamProvider = struct {
                 const shape = indices_u32.shape();
                 const topk: usize = @intCast(shape[ndims - 1]);
                 for (indices_data, 0..) |eid, i| {
-                    if (eid < 256) {
+                    if (eid < self.dymoe_total_count.?[layer_idx].len) {
                         self.dymoe_total_count.?[layer_idx][eid] += 1;
                         if (i % topk < topk - 1) { // positions 0-4 = top-5
                             self.dymoe_top5_count.?[layer_idx][eid] += 1;
@@ -624,10 +667,10 @@ pub const ExpertStreamProvider = struct {
         const actual_load_ids = load_ids_buf[0..load_ids_len];
 
         // Temporal prediction: check hit rate vs previous token's experts
-        if (self.pred_valid and actual_load_ids.len <= 6) {
+        if (self.pred_valid and layer_idx < self.pred_experts.len and actual_load_ids.len <= self.pred_topk) {
             var hits: u32 = 0;
             for (actual_load_ids) |eid| {
-                for (self.pred_experts[layer_idx][0..6]) |pe| {
+                for (self.pred_experts[layer_idx][0..self.pred_topk]) |pe| {
                     if (eid == pe) {
                         hits += 1;
                         break;
@@ -638,8 +681,10 @@ pub const ExpertStreamProvider = struct {
             self.pred_misses += @as(u32, @intCast(actual_load_ids.len)) - hits;
         }
         // Record for next token prediction
-        for (actual_load_ids, 0..) |eid, i| {
-            if (i < 6) self.pred_experts[layer_idx][i] = eid;
+        if (layer_idx < self.pred_experts.len) {
+            for (actual_load_ids, 0..) |eid, i| {
+                if (i < self.pred_experts[layer_idx].len) self.pred_experts[layer_idx][i] = eid;
+            }
         }
 
         // Log skip info (only layer 0 to avoid spam)
@@ -659,8 +704,13 @@ pub const ExpertStreamProvider = struct {
         var gate_s: ?Array = null;
         var up_s: ?Array = null;
         var down_s: ?Array = null;
+        var gate_b: ?Array = null;
+        var up_b: ?Array = null;
+        var down_b: ?Array = null;
 
-        const use_pread = self.pread_loader != null and self.pread_loader.?.hasLayer(layer_idx);
+        // pread packed path has no biases storage; biased (affine-quantized)
+        // models must take the PartialTensorReader path below.
+        const use_pread = self.pread_loader != null and self.pread_loader.?.hasLayer(layer_idx) and meta.gate_biases_name == null;
         var pread_ok = false;
         if (use_pread) {
             const loader = self.pread_loader.?;
@@ -690,6 +740,9 @@ pub const ExpertStreamProvider = struct {
                 meta.gate_scales_name,
                 meta.up_scales_name,
                 meta.down_scales_name,
+                meta.gate_biases_name,
+                meta.up_biases_name,
+                meta.down_biases_name,
                 actual_load_ids,
                 layer_idx,
                 &gate_w,
@@ -698,6 +751,9 @@ pub const ExpertStreamProvider = struct {
                 &gate_s,
                 &up_s,
                 &down_s,
+                &gate_b,
+                &up_b,
+                &down_b,
             );
         }
 
@@ -707,6 +763,9 @@ pub const ExpertStreamProvider = struct {
         defer if (gate_s) |a| a.deinit();
         defer if (up_s) |a| a.deinit();
         defer if (down_s) |a| a.deinit();
+        defer if (gate_b) |a| a.deinit();
+        defer if (up_b) |a| a.deinit();
+        defer if (down_b) |a| a.deinit();
 
         // 4. Build remap: original_expert_id → mini_fused_row_index
         //    Skipped experts map to index 0 (their scores will be zeroed)
@@ -719,7 +778,7 @@ pub const ExpertStreamProvider = struct {
         const remap_arr = try Array.fromData(self.allocator, i32, remap_data, &[_]i32{@intCast(meta.n_experts)});
         defer remap_arr.deinit();
 
-        // 4. Remap indices: map original expert IDs [0, 256) to local indices [0, n_unique)
+        // 4. Remap indices: map original expert IDs [0, n_experts) to local indices [0, n_unique)
         // Use manual remap to avoid mlx_take 2D layout issues
         // (see .kiro/specs/stream-mode-correctness/design.md - H1)
         const remap_readback = try remap_arr.dataSlice(i32);
@@ -796,11 +855,11 @@ pub const ExpertStreamProvider = struct {
             .up_proj = up_w,
             .down_proj = down_w,
             .gate_proj_scales = gate_s,
-            .gate_proj_biases = null,
+            .gate_proj_biases = gate_b,
             .up_proj_scales = up_s,
-            .up_proj_biases = null,
+            .up_proj_biases = up_b,
             .down_proj_scales = down_s,
-            .down_proj_biases = null,
+            .down_proj_biases = down_b,
             .is_quantized = self.is_quantized,
             .quant_group_size = self.quant_group_size,
             .quant_bits = self.quant_bits,
@@ -887,6 +946,26 @@ test "TokenStepMetrics: struct has correct fields" {
     try std.testing.expectEqual(@as(u64, 3), metrics.cache_misses);
     try std.testing.expectEqual(@as(usize, 4096), metrics.cache_memory_bytes);
     try std.testing.expectEqual(@as(usize, 43), metrics.layers_processed);
+}
+
+test "LayerExpertMeta: biases 名字与字节数" {
+    const meta = LayerExpertMeta{
+        .gate_proj_name = "language_model.model.layers.5.mlp.switch_mlp.gate_proj.weight",
+        .up_proj_name = "language_model.model.layers.5.mlp.switch_mlp.up_proj.weight",
+        .down_proj_name = "language_model.model.layers.5.mlp.switch_mlp.down_proj.weight",
+        .gate_scales_name = "language_model.model.layers.5.mlp.switch_mlp.gate_proj.scales",
+        .up_scales_name = "language_model.model.layers.5.mlp.switch_mlp.up_proj.scales",
+        .down_scales_name = "language_model.model.layers.5.mlp.switch_mlp.down_proj.scales",
+        .gate_biases_name = "language_model.model.layers.5.mlp.switch_mlp.gate_proj.biases",
+        .up_biases_name = "language_model.model.layers.5.mlp.switch_mlp.up_proj.biases",
+        .down_biases_name = "language_model.model.layers.5.mlp.switch_mlp.down_proj.biases",
+        .expert_row_bytes = 2048 * 4096 / 2, // 4bit packed
+        .expert_scale_row_bytes = 2048 * (4096 / 64) * 2, // bf16 scales
+        .expert_bias_row_bytes = 2048 * (4096 / 64) * 2, // bf16 biases
+        .n_experts = 288,
+    };
+    try std.testing.expectEqual(@as(usize, 288), meta.n_experts);
+    try std.testing.expect(meta.gate_biases_name != null);
 }
 
 // ExpertCache test moved to expert_cache.zig (P2.1: cache removed from stream provider)
