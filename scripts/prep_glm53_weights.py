@@ -191,7 +191,8 @@ def hardlink_tree(src_dir, dst_dir):
             continue
         d = os.path.join(dst_dir, name)
         if os.path.exists(d):
-            if os.stat(d).st_ino == os.stat(s).st_ino:
+            sd, ss = os.stat(d), os.stat(s)
+            if (sd.st_dev, sd.st_ino) == (ss.st_dev, ss.st_ino):
                 continue
             os.remove(d)
         os.link(s, d)
@@ -199,20 +200,29 @@ def hardlink_tree(src_dir, dst_dir):
     return n
 
 
-def infer_quant(weight_shape, scales_shape):
-    """Infer (bits, group_size) for an affine-quantized weight, or None."""
+def infer_quant_candidates(weight_shape, scales_shape):
+    """Return all (bits, group_size) candidates consistent with the shapes.
+
+    Shape-only inference is ambiguous: a 4bit g64 tensor (packed*32/4 values,
+    group 64) also satisfies bits=8 with group 32. Returning every consistent
+    candidate lets callers treat a single candidate as authoritative and use
+    config.json values to disambiguate otherwise.
+    """
     packed = weight_shape[-1]
     groups = scales_shape[-1]
+    out = []
     for bits in (8, 4, 2):
-        in_features = packed * 32 // bits
         if packed * 32 % bits:
             continue
+        in_features = packed * 32 // bits
         if in_features % groups == 0 and in_features // groups in (32, 64, 128):
-            return bits, in_features // groups
-    return None
+            out.append((bits, in_features // groups))
+    return out
 
 
 def run_prep(src_dir, dst_dir):
+    if os.path.realpath(src_dir) == os.path.realpath(dst_dir):
+        raise SystemExit("src and dst must be different directories")
     key_to_shard, _ = scan_shards(src_dir)
     ops = build_transform_plan()
     validate_sources(key_to_shard, ops)
@@ -242,9 +252,10 @@ def run_prep(src_dir, dst_dir):
                 return {"bits": e["bits"], "group_size": e["group_size"]}
         return dict(default_quant)
 
+    conv_info = None
     for op in ops:
+        src_bases = [sk[: -len(".weight")] for sk in op["sources"]["weight"]]
         if op["kind"] == "concat":
-            src_bases = [sk[: -len(".weight")] for sk in op["sources"]["weight"]]
             qs = [quant_for(b) for b in src_bases]
             if any(q != qs[0] for q in qs):
                 raise SystemExit(
@@ -267,20 +278,25 @@ def run_prep(src_dir, dst_dir):
             produced[k] = shard_name
             stats["produced_tensors"] += 1
             base, _, suffix = k.rpartition(".")
+            if op["kind"] == "rename" and base.endswith("self_attn.qkv_conv"):
+                conv_info = {"name": "self_attn.qkv_conv.weight",
+                             "shape": list(v.shape), "layout": "[C,K,1]"}
             if suffix == "weight" and f"{base}.scales" in out:
-                src_bases = [sk[: -len(".weight")]
-                             for sk in op["sources"]["weight"]]
                 q = quant_for(base, src_bases)
-                # sanity: packed U32 must be consistent with bits/in-features
-                q_inf = infer_quant(v.shape, out[f"{base}.scales"].shape)
-                if q_inf and (q_inf[0], q_inf[1]) != (q["bits"], q["group_size"]):
-                    print(f"  WARN quant mismatch {base}: config={q} shape-inferred={q_inf}")
+                # consistency check: config value must be shape-compatible; a
+                # unique shape-inferred candidate must match it exactly
+                cands = infer_quant_candidates(v.shape, out[f"{base}.scales"].shape)
+                cfg_pair = (q["bits"], q["group_size"])
+                if cands and cfg_pair not in cands:
+                    print(f"  WARN quant mismatch {base}: config={q} "
+                          f"not in shape-consistent candidates={cands}")
                 quant_info[base] = q
         stats["concat_ops" if op["kind"] == "concat" else "rename_ops"] += 1
         print(f"  [{op['kind']}] layer {op['layer']:2d} -> {shard_name}: "
               + ", ".join(f"{k.rpartition('.')[2]}={tuple(v.shape)}" for k, v in out.items()))
 
     # Existing quantized tensors: record bits/group_size in the manifest too.
+    src_shapes = ShapeReader(src_dir, key_to_shard)
     for k in list(key_to_shard):
         if not k.endswith(".scales") or k in consumed:
             continue
@@ -288,7 +304,12 @@ def run_prep(src_dir, dst_dir):
         wk = f"{base}.weight"
         if wk in consumed or wk not in key_to_shard:
             continue
-        quant_info[base] = quant_for(base)
+        q = quant_for(base)
+        cands = infer_quant_candidates(src_shapes.shape(wk), src_shapes.shape(k))
+        if cands and (q["bits"], q["group_size"]) not in cands:
+            print(f"  WARN quant mismatch {base}: config={q} "
+                  f"not in shape-consistent candidates={cands}")
+        quant_info[base] = q
 
     # Rewrite the index: unchanged keys -> original shard; produced -> new shard.
     weight_map = {}
@@ -308,6 +329,7 @@ def run_prep(src_dir, dst_dir):
         "first_k_dense_replace": FIRST_K_DENSE,
         "n_routed_experts": N_ROUTED_EXPERTS,
         "quant": dict(sorted(quant_info.items())),
+        "conv": conv_info,
         "fp32_keep_patterns": list(FP32_KEEP_PATTERNS),
         "stats": {
             **stats,
@@ -322,8 +344,27 @@ def run_prep(src_dir, dst_dir):
     print(json.dumps(manifest["stats"], indent=2))
 
 
-def load_key(loader, key):
-    return loader.get(key)
+class ShapeReader:
+    """Zero-copy shape lookup via safetensors headers (no tensor decode)."""
+
+    def __init__(self, root, key_to_shard):
+        self.root = root
+        self.key_to_shard = key_to_shard
+        self._handles = {}
+
+    def shape(self, key):
+        shard = self.key_to_shard[key]
+        if shard not in self._handles:
+            self._handles[shard] = safe_open(
+                os.path.join(self.root, shard), framework="numpy")
+        return tuple(self._handles[shard].get_slice(key).get_shape())
+
+    def dtype(self, key):
+        shard = self.key_to_shard[key]
+        if shard not in self._handles:
+            self._handles[shard] = safe_open(
+                os.path.join(self.root, shard), framework="numpy")
+        return self._handles[shard].get_slice(key).get_dtype()
 
 
 def run_verify(src_dir, dst_dir):
@@ -334,6 +375,7 @@ def run_verify(src_dir, dst_dir):
         dst_map = json.load(f)["weight_map"]
     src_loader = ShardLoader(src_dir, src_map)
     dst_loader = ShardLoader(dst_dir, dst_map)
+    dst_shapes = ShapeReader(dst_dir, dst_map)
     with open(os.path.join(dst_dir, "dmlx_manifest.json")) as f:
         manifest = json.load(f)
     ok = True
@@ -350,73 +392,73 @@ def run_verify(src_dir, dst_dir):
             if k not in dst_map:
                 check(f"layer {i} {proj}", False, "missing")
                 continue
-            t = load_key(dst_loader, k)
-            check(f"layer {i} {proj}", t.shape[0] == N_ROUTED_EXPERTS,
-                  f"shape={tuple(t.shape)}")
+            shape = dst_shapes.shape(k)
+            check(f"layer {i} {proj}", shape[0] == N_ROUTED_EXPERTS,
+                  f"shape={shape}")
 
     print("check 2: concat products are bit-exact vs sources")
     rng = random.Random(0)
     moe_layer = rng.choice([i for i in range(FIRST_K_DENSE, N_LAYERS)])
     p = f"{LAYER_PREFIX}.{moe_layer}"
-    merged = load_key(dst_loader, f"{p}.mlp.shared_experts.gate_up_proj.weight")
-    g = load_key(src_loader, f"{p}.mlp.shared_experts.gate_proj.weight")
-    u = load_key(src_loader, f"{p}.mlp.shared_experts.up_proj.weight")
+    merged = dst_loader.get(f"{p}.mlp.shared_experts.gate_up_proj.weight")
+    g = src_loader.get(f"{p}.mlp.shared_experts.gate_proj.weight")
+    u = src_loader.get(f"{p}.mlp.shared_experts.up_proj.weight")
     rows = g.shape[0]
     check("shared gate_up (gate half)", mx.array_equal(merged[:rows], g))
     check("shared gate_up (up half)", mx.array_equal(merged[rows:], u))
     # expert stack slice vs itself through the index (layout round-trip)
     ek = f"{p}.mlp.switch_mlp.gate_proj.weight"
-    stack_dst = load_key(dst_loader, ek)
-    stack_src = load_key(src_loader, ek)
+    stack_dst = dst_loader.get(ek)
+    stack_src = src_loader.get(ek)
     check("expert stack expert 7 slice bit-exact",
           mx.array_equal(stack_dst[7], stack_src[7]),
           f"layer {moe_layer} expert 7")
     kda_layer = rng.choice([i for i in range(N_LAYERS) if is_kda(i)])
     p = f"{LAYER_PREFIX}.{kda_layer}"
-    qkv = load_key(dst_loader, f"{p}.self_attn.qkv_proj.weight")
+    qkv = dst_loader.get(f"{p}.self_attn.qkv_proj.weight")
     off = 0
     for proj in ("q_proj", "k_proj", "v_proj"):
-        src_t = load_key(src_loader, f"{p}.self_attn.{proj}.weight")
+        src_t = src_loader.get(f"{p}.self_attn.{proj}.weight")
         r = src_t.shape[0]
         check(f"qkv_proj[{proj}] layer {kda_layer}",
               mx.array_equal(qkv[off:off + r], src_t))
         off += r
-    fbg = load_key(dst_loader, f"{p}.self_attn.fbg_a_proj.weight")
+    fbg = dst_loader.get(f"{p}.self_attn.fbg_a_proj.weight")
     off = 0
     for sk in (f"{p}.self_attn.forget_gate.f_a_proj.weight",
                f"{p}.self_attn.b_proj.weight",
                f"{p}.self_attn.g_a_proj.weight"):
-        src_t = load_key(src_loader, sk)
+        src_t = src_loader.get(sk)
         r = src_t.shape[0]
         check(f"fbg_a_proj[{sk.rpartition('.')[0].rpartition('.')[2]}] layer {kda_layer}",
               mx.array_equal(fbg[off:off + r], src_t))
         off += r
-    conv_dst = load_key(dst_loader, f"{p}.self_attn.qkv_conv.weight")
-    conv_src = load_key(src_loader, f"{p}.self_attn.conv1d.weight")
+    conv_dst = dst_loader.get(f"{p}.self_attn.qkv_conv.weight")
+    conv_src = src_loader.get(f"{p}.self_attn.conv1d.weight")
     check(f"qkv_conv rename bit-exact layer {kda_layer}",
           mx.array_equal(conv_dst, conv_src))
 
     print("check 3: MLA qkv_a_proj matches sources; embed_q/unembed_out sane")
     for i in FULL_ATTN_LAYERS:
         p = f"{LAYER_PREFIX}.{i}"
-        merged = load_key(dst_loader, f"{p}.self_attn.qkv_a_proj.weight")
-        qa = load_key(src_loader, f"{p}.self_attn.q_a_proj.weight")
-        kva = load_key(src_loader, f"{p}.self_attn.kv_a_proj_with_mqa.weight")
+        merged = dst_loader.get(f"{p}.self_attn.qkv_a_proj.weight")
+        qa = src_loader.get(f"{p}.self_attn.q_a_proj.weight")
+        kva = src_loader.get(f"{p}.self_attn.kv_a_proj_with_mqa.weight")
         check(f"layer {i} qkv_a bit-exact",
               mx.array_equal(merged[: qa.shape[0]], qa)
               and mx.array_equal(merged[qa.shape[0]:], kva))
         # value-level agreement after dequantize (cos >= 0.9999 per half)
         qi = manifest["quant"].get(f"{p}.self_attn.qkv_a_proj")
         if qi:
-            w = load_key(dst_loader, f"{p}.self_attn.qkv_a_proj.weight")
-            s = load_key(dst_loader, f"{p}.self_attn.qkv_a_proj.scales")
-            b = load_key(dst_loader, f"{p}.self_attn.qkv_a_proj.biases")
+            w = dst_loader.get(f"{p}.self_attn.qkv_a_proj.weight")
+            s = dst_loader.get(f"{p}.self_attn.qkv_a_proj.scales")
+            b = dst_loader.get(f"{p}.self_attn.qkv_a_proj.biases")
             deq = mx.dequantize(w, s, b, group_size=qi["group_size"], bits=qi["bits"])
             src_deq = []
             for proj in ("q_a_proj", "kv_a_proj_with_mqa"):
-                w2 = load_key(src_loader, f"{p}.self_attn.{proj}.weight")
-                s2 = load_key(src_loader, f"{p}.self_attn.{proj}.scales")
-                b2 = load_key(src_loader, f"{p}.self_attn.{proj}.biases")
+                w2 = src_loader.get(f"{p}.self_attn.{proj}.weight")
+                s2 = src_loader.get(f"{p}.self_attn.{proj}.scales")
+                b2 = src_loader.get(f"{p}.self_attn.{proj}.biases")
                 src_deq.append(mx.dequantize(w2, s2, b2,
                                              group_size=qi["group_size"],
                                              bits=qi["bits"]))
@@ -427,19 +469,19 @@ def run_verify(src_dir, dst_dir):
             check(f"layer {i} qkv_a dequant cos >= 0.9999", cos >= 0.9999, f"cos={cos:.6f}")
         for proj in ("embed_q", "unembed_out"):
             k = f"{p}.self_attn.{proj}.weight"
-            t = load_key(dst_loader, k)
+            shape = dst_shapes.shape(k)
             qi = manifest["quant"].get(f"{p}.self_attn.{proj}")
             check(f"layer {i} {proj} present+quant-recorded",
-                  t.shape[0] == 64 and qi is not None,
-                  f"shape={tuple(t.shape)} quant={qi}")
+                  shape[0] == 64 and qi is not None,
+                  f"shape={shape} quant={qi}")
 
     print("check 4: fp32/bf16 keep-list tensors present and unquantized")
     n_keep = 0
     for k in dst_map:
         if any(pat in k for pat in FP32_KEEP_PATTERNS):
-            t = load_key(dst_loader, k)
-            good = t.dtype in (mx.float32, mx.bfloat16)
-            check(k, good, f"dtype={t.dtype}")
+            dt = dst_shapes.dtype(k)
+            good = dt in ("F32", "BF16")
+            check(k, good, f"dtype={dt}")
             n_keep += 1
             if not good:
                 break
