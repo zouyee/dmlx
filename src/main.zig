@@ -593,6 +593,10 @@ fn detectModelType(config_json: []const u8) []const u8 {
 /// Detect the appropriate chat template based on model architecture in config.json.
 /// Qwen2 → ChatML, Llama-3 → Llama3, Mistral → ChatML, Gemma → ChatML, default → ChatML.
 fn detectChatTemplate(allocator: std.mem.Allocator, config_json: []const u8) root.tokenizer.ChatTemplate {
+    // GLM-5.x (model_type "glm5_next") → GLM template
+    if (std.mem.indexOf(u8, config_json, "\"glm5_next\"") != null) {
+        return root.tokenizer.ChatTemplate.initGlm(allocator);
+    }
     // Check architectures field
     const arch_key = "\"architectures\"";
     if (std.mem.indexOf(u8, config_json, arch_key)) |idx| {

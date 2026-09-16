@@ -149,6 +149,8 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     // 4. Chat template
     const chat_template = if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM"))
         root.tokenizer.ChatTemplate.initDeepSeek(allocator)
+    else if (std.mem.indexOf(u8, config_content, "\"glm5_next\"") != null)
+        root.tokenizer.ChatTemplate.initGlm(allocator)
     else
         root.tokenizer.ChatTemplate.initDeepSeek(allocator);
 

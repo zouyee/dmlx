@@ -15,12 +15,14 @@ pub const ChatTemplateType = enum {
     deepseek,
     chatml,
     llama3,
+    glm,
     raw, // No formatting, just concatenate messages
 
     pub fn fromString(name: []const u8) ChatTemplateType {
         if (std.mem.eql(u8, name, "deepseek")) return .deepseek;
         if (std.mem.eql(u8, name, "chatml")) return .chatml;
         if (std.mem.eql(u8, name, "llama3")) return .llama3;
+        if (std.mem.eql(u8, name, "glm")) return .glm;
         return .raw;
     }
 };
@@ -70,6 +72,15 @@ pub const ChatTemplate = struct {
         };
     }
 
+    pub fn initGlm(allocator: std.mem.Allocator) ChatTemplate {
+        return .{
+            .allocator = allocator,
+            .template_type = .glm,
+            .bos_token = "[gMASK]<sop>",
+            .eos_token = "<|endoftext|>",
+        };
+    }
+
     /// Apply chat template to a list of messages.
     /// Returns allocated string that caller must free.
     pub fn apply(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool) ![]const u8 {
@@ -80,6 +91,7 @@ pub const ChatTemplate = struct {
             .deepseek => try self.applyDeepSeek(messages, add_generation_prompt, &result),
             .chatml => try self.applyChatML(messages, add_generation_prompt, &result),
             .llama3 => try self.applyLlama3(messages, add_generation_prompt, &result),
+            .glm => try self.applyGlm(messages, add_generation_prompt, &result),
             .raw => try self.applyRaw(messages, add_generation_prompt, &result),
         }
 
@@ -160,6 +172,37 @@ pub const ChatTemplate = struct {
         }
     }
 
+    fn applyGlm(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
+        // Matches GLM-5.x chat_template.jinja (no tools, no reasoning params,
+        // pure conversation path):
+        //   [gMASK]<sop><|system|>Reasoning Effort: Max
+        //   system:    <|system|>{content}
+        //   user:      <|user|>{content}
+        //   assistant: <|assistant|><think></think>{content}
+        //   generation prompt: <|assistant|><think>
+        // reasoning_effort undefined in jinja defaults to 'max', so the
+        // "Reasoning Effort: Max" system block is unconditional.
+        try result.appendSlice(self.allocator, self.bos_token);
+        try result.appendSlice(self.allocator, "<|system|>Reasoning Effort: Max");
+
+        for (messages) |msg| {
+            if (std.mem.eql(u8, msg.role, "system")) {
+                try result.appendSlice(self.allocator, "<|system|>");
+                try result.appendSlice(self.allocator, msg.content);
+            } else if (std.mem.eql(u8, msg.role, "user")) {
+                try result.appendSlice(self.allocator, "<|user|>");
+                try result.appendSlice(self.allocator, msg.content);
+            } else if (std.mem.eql(u8, msg.role, "assistant")) {
+                try result.appendSlice(self.allocator, "<|assistant|><think></think>");
+                try result.appendSlice(self.allocator, std.mem.trim(u8, msg.content, " \n\t\r"));
+            }
+        }
+
+        if (add_generation_prompt) {
+            try result.appendSlice(self.allocator, "<|assistant|><think>");
+        }
+    }
+
     fn applyRaw(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
         for (messages) |msg| {
             try result.appendSlice(self.allocator, msg.content);
@@ -170,3 +213,45 @@ pub const ChatTemplate = struct {
         }
     }
 };
+
+test "applyGlm: system+user+generation prompt" {
+    const allocator = std.testing.allocator;
+    var tpl = ChatTemplate.initGlm(allocator);
+    const msgs = [_]ChatMessage{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "Hi" },
+    };
+    const out = try tpl.apply(&msgs, true);
+    defer allocator.free(out);
+    try std.testing.expect(std.mem.startsWith(u8, out, "[gMASK]<sop>"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "<|system|>Reasoning Effort: Max") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<|system|>You are helpful.") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "<|assistant|><think>"));
+}
+
+test "applyGlm: multi-turn with assistant history" {
+    const allocator = std.testing.allocator;
+    var tpl = ChatTemplate.initGlm(allocator);
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "Hi" },
+        .{ .role = "assistant", .content = "Hello!" },
+        .{ .role = "user", .content = "How are you?" },
+    };
+    const out = try tpl.apply(&msgs, true);
+    defer allocator.free(out);
+    const expected = "[gMASK]<sop><|system|>Reasoning Effort: Max" ++
+        "<|user|>Hi<|assistant|><think></think>Hello!" ++
+        "<|user|>How are you?<|assistant|><think>";
+    try std.testing.expectEqualStrings(expected, out);
+}
+
+test "applyGlm: no generation prompt" {
+    const allocator = std.testing.allocator;
+    var tpl = ChatTemplate.initGlm(allocator);
+    const msgs = [_]ChatMessage{
+        .{ .role = "user", .content = "Hi" },
+    };
+    const out = try tpl.apply(&msgs, false);
+    defer allocator.free(out);
+    try std.testing.expectEqualStrings("[gMASK]<sop><|system|>Reasoning Effort: Max<|user|>Hi", out);
+}
