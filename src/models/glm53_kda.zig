@@ -331,6 +331,7 @@ pub const GlmKDA = struct {
 
         var outs = try std.ArrayList(Array).initCapacity(allocator, @intCast(L));
         defer outs.deinit(allocator);
+        defer for (outs.items) |o| o.deinit();
 
         var t: i32 = 0;
         while (t < L) : (t += 1) {
@@ -344,7 +345,6 @@ pub const GlmKDA = struct {
             outs.appendAssumeCapacity(out_exp);
             out_t.deinit();
         }
-        defer for (outs.items) |o| o.deinit();
         return shape_mod.concatenateAxis(self.ctx, outs.items, 1);
     }
 };
