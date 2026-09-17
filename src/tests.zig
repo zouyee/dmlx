@@ -67,6 +67,7 @@ pub const expert_dedup_verification_tests = @import("tests/expert_dedup_verifica
 pub const prefix_cache_tests = @import("engine/prefix_cache.zig");
 pub const glm53_loader_tests = @import("models/glm53_loader.zig");
 pub const glm53_kda_tests = @import("models/glm53_kda.zig");
+pub const glm53_attention_tests = @import("models/glm53_attention.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -138,4 +139,5 @@ test {
     _ = prefix_cache_tests;
     _ = glm53_loader_tests;
     _ = glm53_kda_tests;
+    _ = glm53_attention_tests;
 }

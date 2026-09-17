@@ -520,6 +520,11 @@ pub fn main(init: std.process.Init) !void {
     defer h.deinit();
 
     // === layers 0-2: KDA attention branch + dense MLP branch ===
+    // Hardcoded topology per the GLM-5.3-Flash config; assert so a config
+    // change fails loudly instead of silently running the wrong branch kinds.
+    std.debug.assert(!cfg.isFullAttention(0) and !cfg.isFullAttention(1) and !cfg.isFullAttention(2));
+    std.debug.assert(cfg.isFullAttention(3));
+    std.debug.assert(!cfg.isMoE(0) and !cfg.isMoE(1) and !cfg.isMoE(2));
     for (0..3) |li| {
         const h_next = try kdaAttnBranch(ctx, &index, allocator, &cfg, @intCast(li), h, stream_raw);
         h.deinit();

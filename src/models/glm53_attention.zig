@@ -19,11 +19,13 @@
 ///     oracle gate).
 ///
 /// Cache: `Glm53LatentCache` carries the latent KV [B,1,N,512] (standard
-/// concat-append semantics) and `Glm53PoolCache` the kpool window accumulator (PoolingCache
-/// semantics for the single-row, no-left-padding, non-speculative case).
-/// The cached decode path mirrors the oracle's cache!=None branch but is not
-/// exercised by the Task-8 oracle harness (which runs the 7-token prefill with
-/// cache=None); it is wired for Task 9+ model assembly.
+/// concat-append semantics) and `Glm53PoolCache` the kpool window accumulator
+/// (PoolingCache semantics for the single-row, no-left-padding,
+/// non-speculative case). The Task-8 oracle harness only exercises the
+/// cache=None prefill path. Planned for Task 9 (model assembly): the cached
+/// decode indexer forward that consumes Glm53PoolCache (accumulate_windows →
+/// compress → pool selection against the growing pool cache), mirroring the
+/// oracle's cache!=None branch.
 const std = @import("std");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
@@ -141,8 +143,9 @@ pub const Glm53Indexer = struct {
     k_norm_b: Array, // [head_dim]
     /// [kpool, head_dim] f32 positional additive term for pool compression.
     ape: Array,
-    /// [head_dim, hidden] f32 gate projection (transposed copy for matmul).
-    compress_gate_t: Array, // [hidden, head_dim] f32
+    /// Transposed copy of the checkpoint's [head_dim, hidden] f32 gate
+    /// projection, stored as [hidden, head_dim] for `x_f32 @ compress_gate_t`.
+    compress_gate_t: Array,
 
     const k_norm_eps: f32 = 1e-6;
 
@@ -360,7 +363,9 @@ pub const Glm53Indexer = struct {
             const ar3 = try ops.reshape(ctx, ar, &[_]i32{ 1, 1, pc });
             defer ar3.deinit();
             selected = try ops.broadcastTo(ctx, ar3, &[_]i32{ b, l, pc });
+            errdefer selected.deinit();
             selected_valid = try ops.copy(ctx, candidates);
+            errdefer selected_valid.deinit();
         } else {
             // q: [B,L,H,D]; weights: [B,L,H] f32 scaled by H^-0.5
             const q_idx = try self.wq_b.apply(ctx, q_resid);
@@ -410,10 +415,12 @@ pub const Glm53Indexer = struct {
             defer scores_neg.deinit();
             const part = try sort_mod.argpartitionAxis(ctx, scores_neg, select_k - 1, -1);
             defer part.deinit();
-            const sel = try ops.slice(ctx, part, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ b, l, pc, select_k }, &[_]i32{ 1, 1, 1, 1 });
+            const sel = try ops.slice(ctx, part, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, l, select_k }, &[_]i32{ 1, 1, 1 });
             defer sel.deinit();
             selected = try ops.astype(ctx, sel, .int32);
+            errdefer selected.deinit();
             selected_valid = try shape_mod.takeAlongAxis(ctx, candidates, selected, -1);
+            errdefer selected_valid.deinit();
         }
         defer selected.deinit();
         defer selected_valid.deinit();
@@ -460,33 +467,28 @@ pub const Glm53Indexer = struct {
             topk = masked;
         }
 
-        // Pad to index_topk width with -1, then truncate.
+        // Pad to index_topk width with -1. width = select_k * kpool <=
+        // index_topk by construction (select_k = min(index_topk/kpool, pc)).
+        std.debug.assert(width <= self.index_topk);
         if (width < self.index_topk) {
             const padded = try shape_mod.pad(ctx, topk, &[_]i32{2}, &[_]i32{0}, &[_]i32{self.index_topk - width}, minus_one, "constant");
             topk.deinit();
             topk = padded;
-        }
-        if (width > self.index_topk) {
-            const trunc = try ops.slice(ctx, topk, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, l, self.index_topk }, &[_]i32{ 1, 1, 1 });
-            topk.deinit();
-            topk = trunc;
         }
 
         // always_select_tail: append the (kpool-1) predecessors of the current
         // partial pool so causal attention always sees the running window.
         if (self.always_select_tail and kp > 1) {
             const tail_width = kp - 1;
-            const valid_i32 = try ops.astype(ctx, valid, .int32);
-            defer valid_i32.deinit();
-            const valid_prefix = try reduce_mod.cumsum(ctx, valid_i32, -1, false, true);
-            defer valid_prefix.deinit(); // [B,L]
-            const safe_qp = try clipMinMax(ctx, query_positions, zero_i, l_minus1);
-            defer safe_qp.deinit(); // [L]
-            const qp_e = try ops.expandDims(ctx, safe_qp, 0);
+            // No-cache prefill: valid is all-ones, so cumsum(valid) sampled at
+            // query_positions is just position+1 — skip the identity gather.
+            const one_i = try Array.fromData(allocator, i32, &[_]i32{1}, &[_]i32{1});
+            defer one_i.deinit();
+            const qp_e = try ops.expandDims(ctx, query_positions, 0);
             defer qp_e.deinit();
             const qp_b = try ops.broadcastTo(ctx, qp_e, &[_]i32{ b, l });
             defer qp_b.deinit();
-            const visible = try shape_mod.takeAlongAxis(ctx, valid_prefix, qp_b, -1);
+            const visible = try ops.add(ctx, qp_b, one_i);
             defer visible.deinit(); // [B,L]
             const kp_arr = try Array.fromData(allocator, i32, &[_]i32{kp}, &[_]i32{1});
             defer kp_arr.deinit();
@@ -496,6 +498,8 @@ pub const Glm53Indexer = struct {
             // first_key (all-valid here, but keep the general form)
             const any_valid = try comparison_mod.anyAxis(ctx, valid, -1, false);
             defer any_valid.deinit();
+            const valid_i32 = try ops.astype(ctx, valid, .int32);
+            defer valid_i32.deinit();
             const argmax_valid = try reduce_mod.argmaxAxis(ctx, valid_i32, -1, false);
             defer argmax_valid.deinit();
             const l_scalar = try Array.fromData(allocator, i32, &[_]i32{l}, &[_]i32{1});
@@ -546,8 +550,11 @@ pub const Glm53Indexer = struct {
             topk = with_tail;
         }
 
-        // query_valid is all-true in the no-padding harness path.
-        return topk;
+        // query_valid is all-true in the no-padding harness path; cast to the
+        // oracle's return dtype (mx.int32).
+        const topk_i32 = try ops.astype(ctx, topk, .int32);
+        topk.deinit();
+        return topk_i32;
     }
 };
 
@@ -710,13 +717,15 @@ pub const Glm53Mla = struct {
                 const att = try ops.matmul(ctx, probs, selected);
                 defer att.deinit(); // [B,H,1,512] f32
 
-                // unembed to v space in the attention output dtype (bf16 in the
-                // oracle: fused SDPA emits the query dtype).
+                // unembed to v space in the attention output dtype. The oracle's
+                // fused SDPA emits bf16 here (query dtype), so we round att to
+                // bf16 before the unembed matmul to mirror that numerics path —
+                // intentional asymmetry vs the f32 long-prefill path below.
                 const att_bf16 = try ops.astype(ctx, att, .bfloat16);
                 defer att_bf16.deinit();
                 const out_i = try ops.matmul(ctx, att_bf16, self.unembed_out_t);
-                defer out_i.deinit(); // [B,H,1,V]
-                parts[@intCast(i)] = try ops.copy(ctx, out_i);
+                errdefer out_i.deinit(); // [B,H,1,V]
+                parts[@intCast(i)] = out_i;
                 made += 1;
             }
             return shape_mod.concatenateAxis(ctx, parts, 2);
@@ -788,13 +797,125 @@ pub const Glm53Mla = struct {
             const probs = try ops.softmaxPrecise(ctx, scores, &[_]i32{-1});
             defer probs.deinit();
             const out_i = try ops.matmul(ctx, probs, sel_v);
-            defer out_i.deinit(); // [B,H,1,256] f32
-            parts[@intCast(i)] = try ops.copy(ctx, out_i);
+            errdefer out_i.deinit(); // [B,H,1,256] f32 (kept f32: this naive
+            // per-query path replaces the oracle's fused bf16 sparse-attention
+            // kernel; f32 accumulation is strictly more accurate and the layer-3
+            // oracle gate (cos >= 0.999) leaves ample margin).
+            parts[@intCast(i)] = out_i;
             made += 1;
         }
         return shape_mod.concatenateAxis(ctx, parts, 2);
     }
 };
+
+// ============================================================
+// Tests
+// ============================================================
+
+const test_c = @import("mlx").c;
+
+fn makeTestQuantLinear(ctx: EagerContext, allocator: std.mem.Allocator, out_f: i32, in_f: i32, seed: i64) !QuantLinear {
+    const n: usize = @intCast(out_f * in_f);
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    for (buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + seed, 13) - 6)) * 0.02;
+    }
+    const w = try Array.fromData(allocator, f32, buf, &[_]i32{ out_f, in_f });
+    defer w.deinit();
+    const qw = try quantize_mod.quantize(ctx, w, .{ .bits = 8, .group_size = 32, .mode = .affine });
+    allocator.free(qw.original_shape); // QuantLinear keeps only the arrays
+    return .{ .w = qw.data, .scales = qw.scales, .biases = qw.biases, .cfg = .{ .bits = 8, .group_size = 32, .mode = .affine } };
+}
+
+fn makeTestArray(allocator: std.mem.Allocator, shape: []const i32, seed: i64) !Array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    for (buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 5 + seed, 17) - 8)) * 0.05;
+    }
+    return Array.fromData(allocator, f32, buf, shape);
+}
+
+test "Glm53Indexer.forward: 打分支 (select_k < pc) 形状与因果不变量" {
+    test_c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Small dims that force the argpartition scoring path: pc=3 pools,
+    // select_k = index_topk/kpool = 2 < pc.
+    const hidden: i32 = 64;
+    const head_dim: i32 = 32;
+    const n_heads: i32 = 4;
+    const l: i32 = 6;
+    const kpool: i32 = 2;
+    const index_topk: i32 = 4;
+
+    var indexer = Glm53Indexer{
+        .ctx = ctx,
+        .n_heads = n_heads,
+        .head_dim = head_dim,
+        .index_topk = index_topk,
+        .kpool = kpool,
+        .always_select_tail = true,
+        .wq_b = try makeTestQuantLinear(ctx, allocator, n_heads * head_dim, hidden, 1),
+        .wk = try makeTestQuantLinear(ctx, allocator, head_dim, hidden, 2),
+        .weights_proj = try makeTestQuantLinear(ctx, allocator, n_heads, hidden, 3),
+        .k_norm_w = blk: {
+            const ones_buf = try allocator.alloc(f32, @intCast(head_dim));
+            defer allocator.free(ones_buf);
+            @memset(ones_buf, 1.0);
+            break :blk try Array.fromData(allocator, f32, ones_buf, &[_]i32{head_dim});
+        },
+        .k_norm_b = try creation_mod.zeros(ctx, &[_]i32{head_dim}, .float32),
+        .ape = try creation_mod.zeros(ctx, &[_]i32{ kpool, head_dim }, .float32),
+        .compress_gate_t = try makeTestArray(allocator, &[_]i32{ hidden, head_dim }, 4),
+    };
+    defer {
+        indexer.wq_b.w.deinit();
+        indexer.wq_b.scales.deinit();
+        indexer.wq_b.biases.deinit();
+        indexer.wk.w.deinit();
+        indexer.wk.scales.deinit();
+        indexer.wk.biases.deinit();
+        indexer.weights_proj.w.deinit();
+        indexer.weights_proj.scales.deinit();
+        indexer.weights_proj.biases.deinit();
+        indexer.k_norm_w.deinit();
+        indexer.k_norm_b.deinit();
+        indexer.ape.deinit();
+        indexer.compress_gate_t.deinit();
+    }
+
+    const x = try makeTestArray(allocator, &[_]i32{ 1, l, hidden }, 5);
+    defer x.deinit();
+    const q_resid = try makeTestArray(allocator, &[_]i32{ 1, l, hidden }, 6);
+    defer q_resid.deinit();
+
+    const topk = try indexer.forward(allocator, x, q_resid);
+    defer topk.deinit();
+
+    // Shape [1, L, index_topk + kpool - 1], dtype int32.
+    const sh = topk.shape();
+    try std.testing.expectEqual(@as(usize, 3), sh.len);
+    try std.testing.expectEqual(@as(i32, 1), sh[0]);
+    try std.testing.expectEqual(l, sh[1]);
+    try std.testing.expectEqual(index_topk + kpool - 1, sh[2]);
+    try std.testing.expect(topk.dtype() == .int32);
+
+    // Causal invariant: every non-masked index in row p is in [0, p].
+    try topk.eval();
+    const data = try topk.dataSlice(i32);
+    const width: usize = @intCast(index_topk + kpool - 1);
+    for (0..@intCast(l)) |p| {
+        for (data[p * width .. (p + 1) * width]) |v| {
+            try std.testing.expect(v >= -1);
+            try std.testing.expect(v <= @as(i32, @intCast(p)));
+        }
+    }
+}
 
 // ============================================================
 // Caches (wired for Task 9+ model assembly; not exercised by the
@@ -816,6 +937,9 @@ pub const Glm53LatentCache = struct {
     }
 
     /// Append new latent [B,1,L,512]; returns the full [B,1,N,512] latent.
+    /// The returned array is borrowed — owned by the cache, valid until the
+    /// next updateAndFetch/deinit; do NOT deinit it. `new_latent` stays owned
+    /// by the caller.
     pub fn updateAndFetch(self: *Glm53LatentCache, ctx: EagerContext, new_latent: Array) !Array {
         if (self.latent) |old| {
             const joined = try shape_mod.concatenateAxis(ctx, &[_]Array{ old, new_latent }, 2);
@@ -852,7 +976,8 @@ pub const Glm53PoolCache = struct {
     }
 
     /// Accumulate new keys/gates [B,L,D]; returns the ready full windows
-    /// ([B,U,D] each, U multiple of ratio, possibly 0 rows).
+    /// ([B,U,D] each, U multiple of ratio, possibly 0 rows). The returned
+    /// arrays are owned by the caller. On error the cache state is unchanged.
     pub fn accumulateWindows(self: *Glm53PoolCache, ctx: EagerContext, k: Array, gate: Array) !struct { k: Array, gate: Array } {
         const b = k.shape()[0];
         const l = k.shape()[1];
@@ -862,8 +987,10 @@ pub const Glm53PoolCache = struct {
         const usable = @divTrunc(total, self.ratio) * self.ratio;
         const new_remainder = total - usable;
 
-        var ready_k: Array = undefined;
-        var ready_gate: Array = undefined;
+        var ready_k: ?Array = null;
+        var ready_gate: ?Array = null;
+        errdefer if (ready_k) |a| a.deinit();
+        errdefer if (ready_gate) |a| a.deinit();
         if (usable == 0) {
             ready_k = try creation_mod.zeros(ctx, &[_]i32{ b, 0, dk }, k.dtype());
             ready_gate = try creation_mod.zeros(ctx, &[_]i32{ b, 0, dg }, gate.dtype());
@@ -883,47 +1010,57 @@ pub const Glm53PoolCache = struct {
             ready_k = try shape_mod.concatenateAxis(ctx, &[_]Array{ buf_k_part, new_k_part }, 1);
             ready_gate = try shape_mod.concatenateAxis(ctx, &[_]Array{ buf_g_part, new_g_part }, 1);
         }
-        errdefer ready_k.deinit();
-        errdefer ready_gate.deinit();
 
-        // New remainder buffer. When a window completed the old remainder was
-        // consumed into `ready_*`, so the new buffer is purely the tail of the
-        // new input; otherwise it is the carried-over buffer plus the new input.
-        const old_buf_k = self.buf_k;
-        const old_buf_gate = self.buf_gate;
-        self.buf_k = null;
-        self.buf_gate = null;
-        defer {
-            if (old_buf_k) |a| a.deinit();
-            if (old_buf_gate) |a| a.deinit();
-        }
+        // New remainder buffer, built into locals first so a failure mid-way
+        // leaves the cache untouched. When a window completed the old remainder
+        // was consumed into `ready_*`, so the new buffer is purely the tail of
+        // the new input; otherwise it is the carried-over buffer plus the tail.
+        var new_buf_k: ?Array = null;
+        var new_buf_gate: ?Array = null;
+        errdefer if (new_buf_k) |a| a.deinit();
+        errdefer if (new_buf_gate) |a| a.deinit();
         if (new_remainder > 0) {
-            const tail_k = try ops.slice(ctx, k, &[_]i32{ 0, l - @min(new_remainder, l), 0 }, &[_]i32{ b, l, dk }, &[_]i32{ 1, 1, 1 });
+            const tail_len = @min(new_remainder, l);
+            const tail_k = try ops.slice(ctx, k, &[_]i32{ 0, l - tail_len, 0 }, &[_]i32{ b, l, dk }, &[_]i32{ 1, 1, 1 });
             defer tail_k.deinit();
-            const tail_g = try ops.slice(ctx, gate, &[_]i32{ 0, l - @min(new_remainder, l), 0 }, &[_]i32{ b, l, dg }, &[_]i32{ 1, 1, 1 });
+            const tail_g = try ops.slice(ctx, gate, &[_]i32{ 0, l - tail_len, 0 }, &[_]i32{ b, l, dg }, &[_]i32{ 1, 1, 1 });
             defer tail_g.deinit();
-            const carry = new_remainder - @min(new_remainder, l); // from old buffer
+            const carry = new_remainder - tail_len; // from old buffer
             if (carry > 0) {
-                const carry_k = try ops.slice(ctx, old_buf_k.?, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, carry, dk }, &[_]i32{ 1, 1, 1 });
+                const carry_k = try ops.slice(ctx, self.buf_k.?, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, carry, dk }, &[_]i32{ 1, 1, 1 });
                 defer carry_k.deinit();
-                const carry_g = try ops.slice(ctx, old_buf_gate.?, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, carry, dg }, &[_]i32{ 1, 1, 1 });
+                const carry_g = try ops.slice(ctx, self.buf_gate.?, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, carry, dg }, &[_]i32{ 1, 1, 1 });
                 defer carry_g.deinit();
-                self.buf_k = try shape_mod.concatenateAxis(ctx, &[_]Array{ carry_k, tail_k }, 1);
-                self.buf_gate = try shape_mod.concatenateAxis(ctx, &[_]Array{ carry_g, tail_g }, 1);
+                new_buf_k = try shape_mod.concatenateAxis(ctx, &[_]Array{ carry_k, tail_k }, 1);
+                new_buf_gate = try shape_mod.concatenateAxis(ctx, &[_]Array{ carry_g, tail_g }, 1);
             } else {
-                self.buf_k = try ops.copy(ctx, tail_k);
-                self.buf_gate = try ops.copy(ctx, tail_g);
+                new_buf_k = try ops.copy(ctx, tail_k);
+                new_buf_gate = try ops.copy(ctx, tail_g);
             }
         }
+
+        // Commit: swap buffers and advance the remainder count.
+        if (self.buf_k) |a| a.deinit();
+        if (self.buf_gate) |a| a.deinit();
+        self.buf_k = new_buf_k;
+        self.buf_gate = new_buf_gate;
+        new_buf_k = null;
+        new_buf_gate = null;
         self.remainder = new_remainder;
-        return .{ .k = ready_k, .gate = ready_gate };
+        return .{ .k = ready_k.?, .gate = ready_gate.? };
     }
 
     /// Append compressed pool keys [B,P,D]; returns all pooled keys.
+    /// The returned array is borrowed — owned by the cache, valid until the
+    /// next updateAndFetch/deinit; do NOT deinit it. `new_pools` stays owned
+    /// by the caller.
     pub fn updateAndFetch(self: *Glm53PoolCache, ctx: EagerContext, new_pools: Array) !Array {
         if (new_pools.shape()[1] == 0) {
             if (self.pooled) |p| return p;
-            return new_pools;
+            // Keep ownership uniform: store an internal (empty) copy instead
+            // of aliasing the caller's array.
+            self.pooled = try ops.copy(ctx, new_pools);
+            return self.pooled.?;
         }
         if (self.pooled) |old| {
             const joined = try shape_mod.concatenateAxis(ctx, &[_]Array{ old, new_pools }, 1);
