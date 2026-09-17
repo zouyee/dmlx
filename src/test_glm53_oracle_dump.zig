@@ -125,7 +125,7 @@ pub fn main(init: std.process.Init) !void {
         model_dir = try std.fs.path.join(allocator, &.{ home, "models/GLM-5.3-Flash-MLX-mixed-4_8bit-dmlx" });
     }
 
-    var layer_filter: ?[]u32 = null;
+    var layer_filter: ?[]const u32 = null;
     if (layers_arg) |la| {
         var list = std.ArrayList(u32).empty;
         var it = std.mem.splitScalar(u8, la, ',');
@@ -139,7 +139,7 @@ pub fn main(init: std.process.Init) !void {
     // Early-stop for cheap segment reruns: segments through layer N only need
     // layers 0..N. embed-only runs no layers (empty filter skips every layer).
     const no_layers = [_]u32{};
-    if (std.mem.eql(u8, seg, "embed")) layer_filter = @constCast(&no_layers);
+    if (std.mem.eql(u8, seg, "embed")) layer_filter = &no_layers;
     const stop_after: ?u32 = if (std.mem.eql(u8, seg, "layer0_kda_out"))
         0
     else if (std.mem.eql(u8, seg, "layer3_mla_out") or std.mem.eql(u8, seg, "layer3_indexer_topk"))
@@ -159,14 +159,24 @@ pub fn main(init: std.process.Init) !void {
     var index = try safetensors_reader.loadOrBuildIndex(allocator, model_dir);
     defer index.deinit();
 
+    // Expert row reads via PartialTensorReader's pread fallback (FdPool).
+    // mmap zero-copy is deliberately NOT used here: it mis-evaluates managed
+    // payload arrays in GPU ops on this path (NaN in MoE down proj, verified
+    // 2026-09-17) and production expert streaming disables mmap for the same
+    // class of reason ("VM page fault storms", see expert_stream.zig).
+    var fd_pool = safetensors_reader.FdPool.init(allocator);
+    defer fd_pool.deinit();
+    try fd_pool.openAll(&index);
+    var reader = safetensors_reader.PartialTensorReader.init(allocator, &index, &fd_pool);
+
     var dctx = DumpCtx{ .allocator = allocator, .out_dir = out_dir, .ectx = ctx };
-    _ = &dctx;
 
     const model = glm53.Glm53Model{
         .allocator = allocator,
         .ctx = ctx,
         .cfg = &cfg,
         .index = &index,
+        .reader = &reader,
         .stream = ctx.stream.inner,
     };
 
