@@ -410,8 +410,8 @@ pub fn build(b: *std.Build) void {
     batch_oracle_test_step.dependOn(&run_batch_model_test.step);
 
     // --- GLM-5.3 oracle alignment harness (pure Zig + mlx-c, no Metal C) ---
-    // Dumps embed / layer0_kda_out / layer3_mla_out / layer3_indexer_topk
-    // segments of the 7-token fixture to artifacts/glm53_oracle/*.bin for
+    // Dumps embed / per-layer branch outputs / hidden_final / logits segments
+    // of the 7-token fixture to artifacts/glm53_oracle/*.bin for
     // scripts/compare_glm53_oracle.py.
     const glm53_oracle_dump = b.addExecutable(.{
         .name = "glm53-oracle-dump",
@@ -429,7 +429,7 @@ pub fn build(b: *std.Build) void {
     }
     const run_glm53_oracle_dump_step = b.step(
         "run-glm53-oracle-dump",
-        "Dump GLM-5.3 oracle segments (embed, layer0_kda_out, layer3_mla_out, layer3_indexer_topk) to artifacts/glm53_oracle",
+        "Dump GLM-5.3 oracle segments (embed, per-layer kda/mla/moe outs, indexer topk, hidden_final, logits) to artifacts/glm53_oracle",
     );
     run_glm53_oracle_dump_step.dependOn(&run_glm53_oracle_dump.step);
 
