@@ -354,18 +354,20 @@ pub const Glm53Indexer = struct {
         defer candidates.deinit(); // [B,L,PC]
 
         const select_k = @min(@divTrunc(self.index_topk, kp), pc);
-        var selected: Array = undefined;
-        var selected_valid: Array = undefined;
+        // Unified ownership: both are released exactly once by these defers,
+        // on the success and the error path alike.
+        var selected_opt: ?Array = null;
+        var selected_valid_opt: ?Array = null;
+        defer if (selected_opt) |a| a.deinit();
+        defer if (selected_valid_opt) |a| a.deinit();
         if (select_k == pc) {
             // Select every pool; validity carries the mask.
             const ar = try creation_mod.arange(ctx, 0, @floatFromInt(pc), 1, .int32);
             defer ar.deinit();
             const ar3 = try ops.reshape(ctx, ar, &[_]i32{ 1, 1, pc });
             defer ar3.deinit();
-            selected = try ops.broadcastTo(ctx, ar3, &[_]i32{ b, l, pc });
-            errdefer selected.deinit();
-            selected_valid = try ops.copy(ctx, candidates);
-            errdefer selected_valid.deinit();
+            selected_opt = try ops.broadcastTo(ctx, ar3, &[_]i32{ b, l, pc });
+            selected_valid_opt = try ops.copy(ctx, candidates);
         } else {
             // q: [B,L,H,D]; weights: [B,L,H] f32 scaled by H^-0.5
             const q_idx = try self.wq_b.apply(ctx, q_resid);
@@ -417,13 +419,11 @@ pub const Glm53Indexer = struct {
             defer part.deinit();
             const sel = try ops.slice(ctx, part, &[_]i32{ 0, 0, 0 }, &[_]i32{ b, l, select_k }, &[_]i32{ 1, 1, 1 });
             defer sel.deinit();
-            selected = try ops.astype(ctx, sel, .int32);
-            errdefer selected.deinit();
-            selected_valid = try shape_mod.takeAlongAxis(ctx, candidates, selected, -1);
-            errdefer selected_valid.deinit();
+            selected_opt = try ops.astype(ctx, sel, .int32);
+            selected_valid_opt = try shape_mod.takeAlongAxis(ctx, candidates, selected_opt.?, -1);
         }
-        defer selected.deinit();
-        defer selected_valid.deinit();
+        const selected = selected_opt.?;
+        const selected_valid = selected_valid_opt.?;
 
         // Restore chronological pool order; invalid slots go last.
         const pc_scalar = try Array.fromData(allocator, i32, &[_]i32{pc}, &[_]i32{1});
@@ -724,8 +724,7 @@ pub const Glm53Mla = struct {
                 const att_bf16 = try ops.astype(ctx, att, .bfloat16);
                 defer att_bf16.deinit();
                 const out_i = try ops.matmul(ctx, att_bf16, self.unembed_out_t);
-                errdefer out_i.deinit(); // [B,H,1,V]
-                parts[@intCast(i)] = out_i;
+                parts[@intCast(i)] = out_i; // [B,H,1,V]; freed by the parts defer below
                 made += 1;
             }
             return shape_mod.concatenateAxis(ctx, parts, 2);
@@ -796,11 +795,11 @@ pub const Glm53Mla = struct {
             defer scores.deinit();
             const probs = try ops.softmaxPrecise(ctx, scores, &[_]i32{-1});
             defer probs.deinit();
+            // [B,H,1,256] f32 (kept f32: this naive per-query path replaces the
+            // oracle's fused bf16 sparse-attention kernel; f32 accumulation is
+            // strictly more accurate and the layer-3 oracle gate (cos >= 0.999)
+            // leaves ample margin). Freed by the parts defer below.
             const out_i = try ops.matmul(ctx, probs, sel_v);
-            errdefer out_i.deinit(); // [B,H,1,256] f32 (kept f32: this naive
-            // per-query path replaces the oracle's fused bf16 sparse-attention
-            // kernel; f32 accumulation is strictly more accurate and the layer-3
-            // oracle gate (cos >= 0.999) leaves ample margin).
             parts[@intCast(i)] = out_i;
             made += 1;
         }
