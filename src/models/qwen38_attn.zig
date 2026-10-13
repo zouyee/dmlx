@@ -222,14 +222,21 @@ pub const Qwen38Attn = struct {
             try ops.expandDims(ctx, v_resh, 2);
         defer v_t.deinit();
 
-        const k_all = if (cache.keys) |ck| blk: {
-            defer ck.deinit();
-            break :blk try shape_mod.concatenateAxis(ctx, &[_]Array{ ck, k_t }, 2);
-        } else try ops.copy(ctx, k_t);
-        const v_all = if (cache.values) |cv| blk: {
-            defer cv.deinit();
-            break :blk try shape_mod.concatenateAxis(ctx, &[_]Array{ cv, v_t }, 2);
-        } else try ops.copy(ctx, v_t);
+        // Build new cache arrays first; only on full success swap them in, so
+        // any failure path leaves the old cache untouched (no leak, no
+        // dangling pointer, no double-free).
+        const k_all = if (cache.keys) |ck|
+            try shape_mod.concatenateAxis(ctx, &[_]Array{ ck, k_t }, 2)
+        else
+            try ops.copy(ctx, k_t);
+        errdefer k_all.deinit();
+        const v_all = if (cache.values) |cv|
+            try shape_mod.concatenateAxis(ctx, &[_]Array{ cv, v_t }, 2)
+        else
+            try ops.copy(ctx, v_t);
+        errdefer v_all.deinit();
+        if (cache.keys) |*ck| ck.deinit();
+        if (cache.values) |*cv| cv.deinit();
         cache.keys = k_all;
         cache.values = v_all;
         try cache.keys.?.eval();
