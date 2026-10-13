@@ -224,21 +224,25 @@ pub const Qwen38Attn = struct {
 
         // Build new cache arrays first; only on full success swap them in, so
         // any failure path leaves the old cache untouched (no leak, no
-        // dangling pointer, no double-free).
-        const k_all = if (cache.keys) |ck|
-            try shape_mod.concatenateAxis(ctx, &[_]Array{ ck, k_t }, 2)
-        else
-            try ops.copy(ctx, k_t);
-        errdefer k_all.deinit();
-        const v_all = if (cache.values) |cv|
-            try shape_mod.concatenateAxis(ctx, &[_]Array{ cv, v_t }, 2)
-        else
-            try ops.copy(ctx, v_t);
-        errdefer v_all.deinit();
-        if (cache.keys) |*ck| ck.deinit();
-        if (cache.values) |*cv| cv.deinit();
-        cache.keys = k_all;
-        cache.values = v_all;
+        // dangling pointer, no double-free). The errdefers are scoped to this
+        // block: once the swap completes, later failures must not free the
+        // arrays now owned by the cache.
+        {
+            const k_all = if (cache.keys) |ck|
+                try shape_mod.concatenateAxis(ctx, &[_]Array{ ck, k_t }, 2)
+            else
+                try ops.copy(ctx, k_t);
+            errdefer k_all.deinit();
+            const v_all = if (cache.values) |cv|
+                try shape_mod.concatenateAxis(ctx, &[_]Array{ cv, v_t }, 2)
+            else
+                try ops.copy(ctx, v_t);
+            errdefer v_all.deinit();
+            if (cache.keys) |*ck| ck.deinit();
+            if (cache.values) |*cv| cv.deinit();
+            cache.keys = k_all;
+            cache.values = v_all;
+        }
         try cache.keys.?.eval();
         try cache.values.?.eval();
 
