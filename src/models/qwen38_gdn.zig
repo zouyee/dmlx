@@ -3,7 +3,8 @@
 //! Port of Qwen3-Next `Qwen3NextGatedDeltaNet` single-batch naive path.
 //! Differs from GlmKDA: asymmetric heads (key Hk / value Hv, kv-group
 //! broadcast), separate in_proj_qkv / in_proj_a / in_proj_b / in_proj_z
-//! projections, softplus decay, l2norm q/k, silu output gate.
+//! projections, softplus decay, rms_norm q/k (equals l2norm up to rounding),
+//! silu output gate.
 //! f32 throughout; cross-checked against scripts/qwen38_gdn_ref.py.
 const std = @import("std");
 const c = @import("mlx").c;
@@ -45,7 +46,6 @@ pub const Qwen38GDN = struct {
     head_dim: usize,
     conv_kernel: usize = 4,
     norm_eps: f32 = 1e-6,
-    l2_eps: f32 = 1e-6,
 
     // Weights (MLX Linear layout: [out_features, in_features]).
     in_proj_qkv: Array,
@@ -122,19 +122,64 @@ pub const Qwen38GDN = struct {
         return ops.matmul(self.ctx, x, w_t);
     }
 
-    /// Weight-less l2norm over the last dim: x / max(||x||_2, eps).
-    fn l2Norm(self: *const Qwen38GDN, x: Array) !Array {
-        const sq = try math_mod.square(self.ctx, x);
+    /// Weight-less rms_norm matching mx.fast.rms_norm(x, None, eps): f32
+    /// internally, output rounded back to the input dtype. The oracle uses
+    /// this for q/k normalization (q,k = rms_norm(x) * head_dim^-0.5 scale),
+    /// which equals l2norm up to rounding — but the rounding points matter
+    /// for oracle alignment, so replicate them exactly.
+    fn rmsNormNoWeight(self: *const Qwen38GDN, x: Array) !Array {
+        const ctx = self.ctx;
+        const x_f32 = try ops.astype(ctx, x, .float32);
+        defer x_f32.deinit();
+        const sq = try math_mod.square(ctx, x_f32);
         defer sq.deinit();
-        const ss = try reduce_mod.sumAxis(self.ctx, sq, -1, true);
-        defer ss.deinit();
-        const norm = try ops.sqrt(self.ctx, ss);
-        defer norm.deinit();
-        const eps_arr = try ops.scalarF32(self.ctx, self.l2_eps);
+        const ms = try reduce_mod.meanAxis(ctx, sq, -1, true);
+        defer ms.deinit();
+        const eps_arr = try ops.scalarF32(ctx, 1e-6);
         defer eps_arr.deinit();
-        const clipped = try math_mod.maximum(self.ctx, norm, eps_arr);
-        defer clipped.deinit();
-        return ops.divide(self.ctx, x, clipped);
+        const ms_eps = try ops.add(ctx, ms, eps_arr);
+        defer ms_eps.deinit();
+        const rms = try ops.sqrt(ctx, ms_eps);
+        defer rms.deinit();
+        const y = try ops.divide(ctx, x_f32, rms);
+        defer y.deinit();
+        return ops.astype(ctx, y, x.dtype());
+    }
+
+    /// f32-accumulated depthwise causal conv over [K, QKV] window, output
+    /// rounded to the input dtype (matches nn.Conv1d's fused kernel).
+    fn convAccum(self: *const Qwen38GDN, conv_input: Array, qkv_dim: i32, kernel: i32) !Array {
+        const ctx = self.ctx;
+        const w_f32 = try ops.astype(ctx, self.conv1d, .float32);
+        defer w_f32.deinit();
+        const x_f32 = try ops.astype(ctx, conv_input, .float32);
+        defer x_f32.deinit();
+
+        var acc = blk: {
+            const x_0 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0 }, &[_]i32{ 1, qkv_dim }, &[_]i32{ 1, 1 });
+            defer x_0.deinit();
+            const w_0_s = try ops.slice(ctx, w_f32, &[_]i32{ 0, 0, 0 }, &[_]i32{ qkv_dim, 1, 1 }, &[_]i32{ 1, 1, 1 });
+            defer w_0_s.deinit();
+            const w_0 = try ops.reshape(ctx, w_0_s, &[_]i32{qkv_dim});
+            defer w_0.deinit();
+            break :blk try ops.multiply(ctx, x_0, w_0);
+        };
+        var j: i32 = 1;
+        while (j < kernel) : (j += 1) {
+            const x_j = try ops.slice(ctx, x_f32, &[_]i32{ j, 0 }, &[_]i32{ j + 1, qkv_dim }, &[_]i32{ 1, 1 });
+            defer x_j.deinit();
+            const w_j_s = try ops.slice(ctx, w_f32, &[_]i32{ 0, j, 0 }, &[_]i32{ qkv_dim, j + 1, 1 }, &[_]i32{ 1, 1, 1 });
+            defer w_j_s.deinit();
+            const w_j = try ops.reshape(ctx, w_j_s, &[_]i32{qkv_dim});
+            defer w_j.deinit();
+            const term = try ops.multiply(ctx, x_j, w_j);
+            defer term.deinit();
+            const acc_new = try ops.add(ctx, acc, term);
+            acc.deinit();
+            acc = acc_new;
+        }
+        defer acc.deinit();
+        return ops.astype(ctx, acc, conv_input.dtype());
     }
 
     /// softplus(x) = log1p(exp(-|x|)) + max(x, 0), numerically stable.
@@ -173,37 +218,15 @@ pub const Qwen38GDN = struct {
         const K: i32 = @intCast(self.conv_kernel);
 
         // 1. qkv projection + depthwise causal conv (k=4) + silu.
+        // Conv accumulates in f32 and rounds back to the input dtype, matching
+        // nn.Conv1d's fused kernel; the cache window keeps the input dtype.
         const qkv_lin = try self.linear(x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases, self.qkv_quant);
         defer qkv_lin.deinit();
 
         const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin }, 0);
         defer conv_input.deinit(); // [K, QKV]
 
-        var conv_acc = blk: {
-            const x_0 = try ops.slice(ctx, conv_input, &[_]i32{ 0, 0 }, &[_]i32{ 1, QKV }, &[_]i32{ 1, 1 });
-            defer x_0.deinit();
-            const w_0_s = try ops.slice(ctx, self.conv1d, &[_]i32{ 0, 0, 0 }, &[_]i32{ QKV, 1, 1 }, &[_]i32{ 1, 1, 1 });
-            defer w_0_s.deinit();
-            const w_0 = try ops.reshape(ctx, w_0_s, &[_]i32{QKV});
-            defer w_0.deinit();
-            break :blk try ops.multiply(ctx, x_0, w_0);
-        };
-        {
-            var j: i32 = 1;
-            while (j < K) : (j += 1) {
-                const x_j = try ops.slice(ctx, conv_input, &[_]i32{ j, 0 }, &[_]i32{ j + 1, QKV }, &[_]i32{ 1, 1 });
-                defer x_j.deinit();
-                const w_j_s = try ops.slice(ctx, self.conv1d, &[_]i32{ 0, j, 0 }, &[_]i32{ QKV, j + 1, 1 }, &[_]i32{ 1, 1, 1 });
-                defer w_j_s.deinit();
-                const w_j = try ops.reshape(ctx, w_j_s, &[_]i32{QKV});
-                defer w_j.deinit();
-                const term = try ops.multiply(ctx, x_j, w_j);
-                defer term.deinit();
-                const acc_new = try ops.add(ctx, conv_acc, term);
-                conv_acc.deinit();
-                conv_acc = acc_new;
-            }
-        }
+        const conv_acc = try self.convAccum(conv_input, QKV, K);
         defer conv_acc.deinit();
 
         // Advance conv window: keep last K-1 rows.
@@ -217,7 +240,9 @@ pub const Qwen38GDN = struct {
         const qkv = try activations.silu(ctx, conv_acc);
         defer qkv.deinit(); // [1, QKV]
 
-        // 2. split q/k/v; l2norm q,k per head; scale q by 1/sqrt(D).
+        // 2. split q/k/v; weight-less rms_norm per head (f32 internally, output
+        // rounded to input dtype); then scale q by D^-1 and k by D^-0.5
+        // (mlx-lm: q = inv^2 * rms_norm(q), k = inv * rms_norm(k)).
         const qkv_flat = try ops.reshape(ctx, qkv, &[_]i32{QKV});
         defer qkv_flat.deinit();
         const q_parts = try ops.slice(ctx, qkv_flat, &[_]i32{0}, &[_]i32{PK}, &[_]i32{1});
@@ -234,15 +259,18 @@ pub const Qwen38GDN = struct {
         const v = try ops.reshape(ctx, v_parts, &[_]i32{ HV, D });
         defer v.deinit();
 
-        const q_norm = try self.l2Norm(q_resh);
-        defer q_norm.deinit();
-        const k_norm = try self.l2Norm(k_resh);
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const scale_arr = try ops.scalarF32(ctx, scale);
-        defer scale_arr.deinit();
-        const q = try ops.multiply(ctx, q_norm, scale_arr);
+        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        const q_rn = try self.rmsNormNoWeight(q_resh);
+        defer q_rn.deinit();
+        const k_rn = try self.rmsNormNoWeight(k_resh);
+        defer k_rn.deinit();
+        const q_scale = try ops.scalarF32(ctx, inv_scale * inv_scale);
+        defer q_scale.deinit();
+        const k_scale = try ops.scalarF32(ctx, inv_scale);
+        defer k_scale.deinit();
+        const q = try ops.multiply(ctx, q_rn, q_scale);
         defer q.deinit();
-        const k = k_norm; // rename for symmetry
+        const k = try ops.multiply(ctx, k_rn, k_scale);
         defer k.deinit();
 
         // 3. per-head gates: a (decay input), b (beta), z (output gate).
@@ -253,14 +281,18 @@ pub const Qwen38GDN = struct {
         const z = try self.linear(x, self.in_proj_z, self.z_scales, self.z_biases, self.z_quant);
         defer z.deinit(); // [1, HV*D]
 
-        // g = exp(-exp(A_log) * softplus(a + dt_bias))  [HV]
+        // g = exp(-exp(A_log_f32) * softplus(a + dt_bias))  [HV]
+        // (mlx-lm compute_g: A_log cast to f32; a + dt_bias and softplus run
+        // in the activation dtype.)
         const a_flat = try ops.reshape(ctx, a, &[_]i32{HV});
         defer a_flat.deinit();
         const a_dt = try ops.add(ctx, a_flat, self.dt_bias);
         defer a_dt.deinit();
         const sp = try self.softplus(a_dt);
         defer sp.deinit();
-        const e_a_log = try ops.exp(ctx, self.A_log);
+        const a_log_f32 = try ops.astype(ctx, self.A_log, .float32);
+        defer a_log_f32.deinit();
+        const e_a_log = try ops.exp(ctx, a_log_f32);
         defer e_a_log.deinit();
         const g_pre = try ops.multiply(ctx, e_a_log, sp);
         defer g_pre.deinit();
@@ -323,19 +355,30 @@ pub const Qwen38GDN = struct {
         defer q_b2.deinit();
         const sq = try ops.multiply(ctx, cache.ssm_state, q_b2);
         defer sq.deinit();
-        const y = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv]
+        const y_f32 = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv] f32
+        defer y_f32.deinit();
+        // gated_delta_update returns y.astype(q.dtype): round before the norm.
+        const y = try ops.astype(ctx, y_f32, qkv.dtype());
         defer y.deinit();
 
-        // 6. gated RMSNorm: rmsnorm(y * silu(z)) * norm_w -> out_proj.
+        // 6. gated RMSNorm (mlx-lm Qwen3NextRMSNormGated + _precise_swiglu):
+        // norm first in f32, then gate in f32, round to input dtype —
+        // silu(z_f32) * rmsnorm(y, norm_w)_f32 -> astype(x.dtype) -> out_proj.
+        const y_normed = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
+        defer y_normed.deinit();
+        const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
+        defer y_normed_f32.deinit();
         const z_resh = try ops.reshape(ctx, z, &[_]i32{ HV, D });
         defer z_resh.deinit();
-        const z_act = try activations.silu(ctx, z_resh);
+        const z_f32 = try ops.astype(ctx, z_resh, .float32);
+        defer z_f32.deinit();
+        const z_act = try activations.silu(ctx, z_f32);
         defer z_act.deinit();
-        const y_gated = try ops.multiply(ctx, y, z_act);
+        const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
+        defer y_gated_f32.deinit();
+        const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
         defer y_gated.deinit();
-        const y_normed = try fast_mod.rmsNorm(ctx, y_gated, self.norm_w, self.norm_eps);
-        defer y_normed.deinit();
-        const y_flat = try ops.reshape(ctx, y_normed, &[_]i32{ 1, PV });
+        const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, PV });
         defer y_flat.deinit();
 
         return self.linear(y_flat, self.out_proj, self.o_scales, self.o_biases, self.o_quant);
@@ -488,13 +531,14 @@ test "Qwen38GDN.step: numpy reference cross-check" {
     try out.eval();
     try cache.ssm_state.eval();
 
-    // Reference values from scripts/qwen38_gdn_ref.py (Task 2 Step 3 output).
-    const expected_out = [_]f32{ -0.000908, -0.002161, -0.001194, -0.001672, 0.005465, -0.000532, -0.002023, 0.004240 };
+    // Reference values from scripts/qwen38_gdn_ref.py (rms_norm q/k with
+    // eps-inside-sqrt, norm-then-gate — matching mlx-lm's modules).
+    const expected_out = [_]f32{ -0.000802, -0.001897, -0.001004, -0.001422, 0.004621, -0.000405, -0.001701, 0.003579 };
     const got_out = try out.dataSlice(f32);
     for (expected_out, got_out) |e, o| {
         try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
-    const expected_state = [_]f32{ 0.000000, -0.000234, -0.000027, 0.000156, 0.000000, 0.001830, 0.000214, -0.001216, 0.000000, -0.000555, -0.000065, 0.000369, 0.000000, -0.000260, -0.000030, 0.000173, 0.000000, 0.001114, 0.000130, -0.000740, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.001975, 0.000231, -0.001312, 0.000000, 0.000231, 0.000027, -0.000153, 0.000000, -0.001176, -0.000138, 0.000781, 0.000000, 0.000092, 0.000011, -0.000061, 0.000000, -0.000360, -0.000042, 0.000239, 0.000000, 0.000952, 0.000111, -0.000633, 0.000107, -0.000419, 0.001109, 0.002728, -0.000009, 0.000037, -0.000098, -0.000241, 0.000074, -0.000289, 0.000764, 0.001881, -0.000022, 0.000088, -0.000232, -0.000570, -0.000011, 0.000044, -0.000116, -0.000284, 0.000049, -0.000190, 0.000503, 0.001236, 0.000000, 0.000000, 0.000000, 0.000000, 0.000086, -0.000337, 0.000891, 0.002192, 0.000010, -0.000039, 0.000104, 0.000256, -0.000057, 0.000223, -0.000590, -0.001452, 0.000004, -0.000017, 0.000046, 0.000114, -0.000017, 0.000068, -0.000181, -0.000444 };
+    const expected_state = [_]f32{ 0.000000, -0.000220, -0.000026, 0.000146, 0.000000, 0.001723, 0.000201, -0.001145, 0.000000, -0.000522, -0.000061, 0.000347, 0.000000, -0.000245, -0.000029, 0.000163, 0.000000, 0.001049, 0.000123, -0.000697, 0.000000, 0.000000, 0.000000, 0.000000, 0.000000, 0.001859, 0.000217, -0.001235, 0.000000, 0.000217, 0.000025, -0.000144, 0.000000, -0.001107, -0.000129, 0.000736, 0.000000, 0.000087, 0.000010, -0.000058, 0.000000, -0.000339, -0.000040, 0.000225, 0.000000, 0.000896, 0.000105, -0.000596, 0.000103, -0.000401, 0.001062, 0.002613, -0.000009, 0.000035, -0.000094, -0.000231, 0.000071, -0.000277, 0.000732, 0.001802, -0.000021, 0.000084, -0.000222, -0.000546, -0.000011, 0.000042, -0.000111, -0.000272, 0.000046, -0.000182, 0.000481, 0.001184, 0.000000, 0.000000, 0.000000, 0.000000, 0.000082, -0.000322, 0.000853, 0.002100, 0.000010, -0.000038, 0.000099, 0.000245, -0.000055, 0.000214, -0.000565, -0.001391, 0.000004, -0.000017, 0.000044, 0.000109, -0.000017, 0.000065, -0.000173, -0.000425 };
     const got_state = try cache.ssm_state.dataSlice(f32);
     try std.testing.expectEqual(@as(usize, 96), got_state.len);
     for (expected_state, got_state) |e, o| {

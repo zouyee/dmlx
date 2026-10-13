@@ -33,10 +33,6 @@ def softplus(x):
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
 
 
-def l2norm(x, eps):
-    return x / np.maximum(np.sqrt((x * x).sum(-1, keepdims=True)), eps)
-
-
 def rmsnorm(x, eps, weight=None):
     y = x / np.sqrt(np.mean(x * x, axis=-1, keepdims=True) + eps)
     return y if weight is None else y * weight
@@ -64,8 +60,8 @@ q = qkv[: HK * D].reshape(HK, D)
 k = qkv[HK * D : 2 * HK * D].reshape(HK, D)
 v = qkv[2 * HK * D :].reshape(HV, D)
 
-q = l2norm(q, 1e-6) * D ** -0.5
-k = l2norm(k, 1e-6)
+q = rmsnorm(q, 1e-6) * D ** -1.0
+k = rmsnorm(k, 1e-6) * D ** -0.5
 
 a = x @ in_proj_a.T
 b = x @ in_proj_b.T
@@ -84,7 +80,7 @@ d = (v - kv) * beta[:, None]
 S = S + d[:, :, None] * kb[:, None, :]
 y = (S * qb[:, None, :]).sum(-1)
 
-yn = rmsnorm(y * silu(z.reshape(HV, D)), 1e-6, norm_w)
+yn = rmsnorm(y, 1e-6, norm_w) * silu(z.reshape(HV, D))
 out = yn.reshape(-1) @ out_proj.T
 
 print("out:", " ".join(f"{v:.6f}" for v in out))

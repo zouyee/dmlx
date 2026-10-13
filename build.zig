@@ -423,6 +423,14 @@ pub fn build(b: *std.Build) void {
         }),
     });
     glm53_oracle_dump.root_module.addImport("mlx", mlx_z_module);
+    // glm53.zig transitively imports expert_stream → metal_moe (moe_metal_forward).
+    glm53_oracle_dump.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    glm53_oracle_dump.root_module.linkFramework("Metal", .{});
+    glm53_oracle_dump.root_module.linkFramework("Foundation", .{});
     const run_glm53_oracle_dump = b.addRunArtifact(glm53_oracle_dump);
     if (b.args) |args| {
         run_glm53_oracle_dump.addArgs(args);
@@ -432,6 +440,39 @@ pub fn build(b: *std.Build) void {
         "Dump GLM-5.3 oracle segments (embed, per-layer kda/mla/moe outs, indexer topk, hidden_final, logits) to artifacts/glm53_oracle",
     );
     run_glm53_oracle_dump_step.dependOn(&run_glm53_oracle_dump.step);
+
+    // --- Qwen3.8 oracle alignment harness (pure Zig + mlx-c, no Metal C) ---
+    // Dumps embed / per-layer gdn/attn/mlp outs / hidden_final / logits
+    // segments for the fixed prompt to artifacts/qwen38_oracle_zig/*.bin for
+    // scripts/compare_qwen38_oracle.py.
+    const qwen38_oracle_dump = b.addExecutable(.{
+        .name = "qwen38-oracle-dump",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_qwen38_oracle_dump.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qwen38_oracle_dump.root_module.addImport("mlx", mlx_z_module);
+    // qwen38.zig imports glm53.zig for WeightSource/QuantParts, which
+    // transitively imports expert_stream → metal_moe (moe_metal_forward).
+    qwen38_oracle_dump.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    qwen38_oracle_dump.root_module.linkFramework("Metal", .{});
+    qwen38_oracle_dump.root_module.linkFramework("Foundation", .{});
+    const run_qwen38_oracle_dump = b.addRunArtifact(qwen38_oracle_dump);
+    if (b.args) |args| {
+        run_qwen38_oracle_dump.addArgs(args);
+    }
+    const run_qwen38_oracle_dump_step = b.step(
+        "run-qwen38-oracle",
+        "Dump Qwen3.8 oracle segments (embed, per-layer gdn/attn/mlp outs, hidden_final, logits) to artifacts/qwen38_oracle_zig",
+    );
+    run_qwen38_oracle_dump_step.dependOn(&run_qwen38_oracle_dump.step);
 
     // --- Wave-5 bounded phase-aware chunk planner table tests (pure Zig) ---
     const native_chunk_planner_tests = b.addTest(.{

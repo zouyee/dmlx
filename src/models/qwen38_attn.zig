@@ -195,32 +195,36 @@ pub const Qwen38Attn = struct {
         defer v_resh.deinit();
 
         // Per-head RMSNorm, then partial RoPE (dims = rotary_dims).
+        // mx.fast.rope treats axis -2 as the sequence position, so transpose
+        // to [1, heads, L, D] BEFORE rope (oracle order: norm -> transpose ->
+        // rope); [1, L, H, D] would rotate over the head axis instead.
         const q_n = try fast_mod.rmsNorm(ctx, q_raw, self.q_norm, self.rms_norm_eps);
         defer q_n.deinit();
         const k_n = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm, self.rms_norm_eps);
         defer k_n.deinit();
-        const rd: i32 = @intCast(self.rotary_dims);
-        const q_r = try fast_mod.rope(ctx, q_n, rd, false, self.rope_theta, 1.0, offset, null);
-        defer q_r.deinit();
-        const k_r = try fast_mod.rope(ctx, k_n, rd, false, self.rope_theta, 1.0, offset, null);
-        defer k_r.deinit();
 
-        // Transpose to [1, heads, L, D] and append to cache.
-        const q_t = if (prefill)
-            try ops.transposeAxes(ctx, q_r, &[_]i32{ 0, 2, 1, 3 })
+        // Transpose to [1, heads, L, D].
+        const q_t0 = if (prefill)
+            try ops.transposeAxes(ctx, q_n, &[_]i32{ 0, 2, 1, 3 })
         else
-            try ops.expandDims(ctx, q_r, 2); // [1, H, 1, D]
-        defer q_t.deinit();
-        const k_t = if (prefill)
-            try ops.transposeAxes(ctx, k_r, &[_]i32{ 0, 2, 1, 3 })
+            try ops.expandDims(ctx, q_n, 2); // [1, H, 1, D]
+        defer q_t0.deinit();
+        const k_t0 = if (prefill)
+            try ops.transposeAxes(ctx, k_n, &[_]i32{ 0, 2, 1, 3 })
         else
-            try ops.expandDims(ctx, k_r, 2);
-        defer k_t.deinit();
+            try ops.expandDims(ctx, k_n, 2);
+        defer k_t0.deinit();
         const v_t = if (prefill)
             try ops.transposeAxes(ctx, v_resh, &[_]i32{ 0, 2, 1, 3 })
         else
             try ops.expandDims(ctx, v_resh, 2);
         defer v_t.deinit();
+
+        const rd: i32 = @intCast(self.rotary_dims);
+        const q_t = try fast_mod.rope(ctx, q_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        defer q_t.deinit();
+        const k_t = try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        defer k_t.deinit();
 
         // Build new cache arrays first; only on full success swap them in, so
         // any failure path leaves the old cache untouched (no leak, no

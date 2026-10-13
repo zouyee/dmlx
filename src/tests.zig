@@ -69,6 +69,10 @@ pub const glm53_loader_tests = @import("models/glm53_loader.zig");
 pub const glm53_kda_tests = @import("models/glm53_kda.zig");
 pub const glm53_attention_tests = @import("models/glm53_attention.zig");
 pub const glm53_tests = @import("models/glm53.zig");
+pub const qwen38_loader_tests = @import("models/qwen38_loader.zig");
+pub const qwen38_gdn_tests = @import("models/qwen38_gdn.zig");
+pub const qwen38_attn_tests = @import("models/qwen38_attn.zig");
+pub const qwen38_tests = @import("models/qwen38.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -142,4 +146,8 @@ test {
     _ = glm53_kda_tests;
     _ = glm53_attention_tests;
     _ = glm53_tests;
+    _ = qwen38_loader_tests;
+    _ = qwen38_gdn_tests;
+    _ = qwen38_attn_tests;
+    _ = qwen38_tests;
 }
