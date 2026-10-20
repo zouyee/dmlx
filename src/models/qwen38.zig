@@ -437,6 +437,173 @@ pub const Qwen38Model = struct {
 };
 
 // ============================================================
+// Serving model: resident weights + per-layer decode caches
+// ============================================================
+
+/// Resident serving model: all weights live in a map (loaded once, borrowed
+/// via WeightSource.fromMap COW copies); dense model — no expert streaming.
+/// Per-layer caches (GDN conv+ssm state / attention KV) are internal — the
+/// engine's KVCacheStrategy array is unused.
+///
+/// LIMITATION: caches are not reset between requests. forwardTokens treats
+/// any L>1 input as a fresh prefill and resets state; the engine's decode
+/// calls are always L=1.
+pub const Qwen38ServingModel = struct {
+    allocator: std.mem.Allocator,
+    ctx: EagerContext,
+    cfg: *const qwen38_loader.Qwen38Config,
+    ws: WeightSource,
+    ws_backing: WeightSource.MapBacked,
+    weights: std.StringHashMap(Array), // resident weights, owned by caller
+    caches: []Qwen38LayerCache,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ctx: EagerContext,
+        cfg: *const qwen38_loader.Qwen38Config,
+        weights: std.StringHashMap(Array),
+    ) !Qwen38ServingModel {
+        const caches = try allocator.alloc(Qwen38LayerCache, cfg.num_hidden_layers);
+        errdefer allocator.free(caches);
+        for (caches, 0..) |*lc, i| {
+            if (cfg.isFullAttention(@intCast(i))) {
+                lc.* = .{ .attn = .{} };
+            } else {
+                lc.* = .{ .gdn = try qwen38_gdn.Qwen38GdnCache.init(
+                    allocator,
+                    cfg.linear_conv_kernel_dim,
+                    (2 * cfg.linear_num_key_heads + cfg.linear_num_value_heads) * cfg.linear_key_head_dim,
+                    cfg.linear_num_value_heads,
+                    cfg.linear_value_head_dim,
+                ) };
+            }
+        }
+        var self = Qwen38ServingModel{
+            .allocator = allocator,
+            .ctx = ctx,
+            .cfg = cfg,
+            .ws = undefined,
+            .ws_backing = undefined,
+            .weights = weights,
+            .caches = caches,
+        };
+        self.ws = WeightSource.fromMap(&self.weights, ctx, &self.ws_backing);
+        return self;
+    }
+
+    pub fn deinit(self: *Qwen38ServingModel) void {
+        for (self.caches) |*lc| lc.deinit();
+        self.allocator.free(self.caches);
+        // weights map entries are owned by the caller (registry adapter).
+    }
+
+    /// Reset all per-layer decode state (fresh request).
+    pub fn reset(self: *Qwen38ServingModel) !void {
+        const cfg = self.cfg;
+        for (self.caches) |*lc| lc.deinit();
+        for (self.caches, 0..) |*lc, i| {
+            if (cfg.isFullAttention(@intCast(i))) {
+                lc.* = .{ .attn = .{} };
+            } else {
+                lc.* = .{ .gdn = try qwen38_gdn.Qwen38GdnCache.init(
+                    self.allocator,
+                    cfg.linear_conv_kernel_dim,
+                    (2 * cfg.linear_num_key_heads + cfg.linear_num_value_heads) * cfg.linear_key_head_dim,
+                    cfg.linear_num_value_heads,
+                    cfg.linear_value_head_dim,
+                ) };
+            }
+        }
+    }
+
+    /// ids: [L] u32 token ids → logits [1, L, vocab] f32. L>1 = prefill
+    /// (resets state first); L=1 = cached decode step.
+    pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
+        const allocator = self.allocator;
+        const cfg = self.cfg;
+        const ctx = self.ctx;
+        var nbuf: [256]u8 = undefined;
+
+        if (ids.len > 1) try self.reset();
+
+        const ids_i32 = try allocator.alloc(i32, ids.len);
+        defer allocator.free(ids_i32);
+        for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+
+        const emb = try embedTokensWs(ctx, self.ws, allocator, cfg, ids_i32);
+        defer emb.deinit();
+        var h = try ops.copy(ctx, emb); // bf16
+        defer h.deinit();
+
+        var layer: u32 = 0;
+        while (layer < cfg.num_hidden_layers) : (layer += 1) {
+            var pbuf: [96]u8 = undefined;
+            const p = fmtName(&pbuf, "language_model.model.layers.{d}", .{layer});
+
+            // Attention sub-block (mirrors Qwen38Model.forward).
+            const ln1 = try loadNormWeight(ctx, self.ws, fmtName(&nbuf, "{s}.input_layernorm.weight", .{p}));
+            defer ln1.deinit();
+            const normed1 = blk: {
+                const h_f32 = try ops.astype(ctx, h, .float32);
+                defer h_f32.deinit();
+                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, ln1, cfg.rms_norm_eps);
+                defer n_f32.deinit();
+                break :blk try ops.astype(ctx, n_f32, .bfloat16);
+            };
+            defer normed1.deinit();
+            const attn_out = if (cfg.isFullAttention(layer))
+                try attnBranch(ctx, self.ws, allocator, cfg, layer, normed1, &self.caches[layer].attn)
+            else
+                try gdnBranch(ctx, self.ws, allocator, cfg, layer, normed1, &self.caches[layer].gdn);
+            defer attn_out.deinit();
+            {
+                const next = try ops.add(ctx, h, attn_out);
+                h.deinit();
+                h = next;
+                try h.eval();
+            }
+
+            // MLP sub-block.
+            const ln2 = try loadNormWeight(ctx, self.ws, fmtName(&nbuf, "{s}.post_attention_layernorm.weight", .{p}));
+            defer ln2.deinit();
+            const normed2 = blk: {
+                const h_f32 = try ops.astype(ctx, h, .float32);
+                defer h_f32.deinit();
+                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, ln2, cfg.rms_norm_eps);
+                defer n_f32.deinit();
+                break :blk try ops.astype(ctx, n_f32, .bfloat16);
+            };
+            defer normed2.deinit();
+            const mlp_out = try mlpBranch(ctx, self.ws, cfg, layer, normed2);
+            defer mlp_out.deinit();
+            {
+                const next = try ops.add(ctx, h, mlp_out);
+                h.deinit();
+                h = next;
+                try h.eval();
+            }
+        }
+
+        // Final norm → bf16 → lm_head (mirrors Qwen38Model.forward).
+        const h_f32 = try ops.astype(ctx, h, .float32);
+        defer h_f32.deinit();
+        const norm_w = try loadNormWeight(ctx, self.ws, "language_model.model.norm.weight");
+        defer norm_w.deinit();
+        const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, norm_w, cfg.rms_norm_eps);
+        defer hidden_final_f32.deinit();
+        const hidden_final = try ops.astype(ctx, hidden_final_f32, .bfloat16);
+        defer hidden_final.deinit();
+
+        const hidden: i32 = @intCast(cfg.hidden_size);
+        var head_q = try self.ws.quantized("language_model.lm_head", hidden);
+        defer head_q.deinit();
+        const logits = try head_q.linear().apply(ctx, hidden_final);
+        try logits.eval();
+        return logits;
+    }
+};
+
+// ============================================================
 // Tests
 // ============================================================
 
@@ -446,4 +613,6 @@ test "Qwen38Model: module surface compiles" {
     try std.testing.expect(cfg.isFullAttention(3) == false); // empty full_attn_layers
     try std.testing.expectEqual(@as(usize, 64), cfg.rotaryDims());
     _ = WeightSource.fromIndex;
+    _ = Qwen38ServingModel.init;
+    _ = Qwen38ServingModel.forwardTokens;
 }

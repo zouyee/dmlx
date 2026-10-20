@@ -110,7 +110,7 @@ pub const WeightSource = struct {
         return .{ .ctx = index, .tensorFn = fromIndexFn };
     }
 
-    const MapBacked = struct {
+    pub const MapBacked = struct {
         map: *const std.StringHashMap(Array),
         ectx: EagerContext,
     };

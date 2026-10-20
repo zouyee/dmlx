@@ -53,6 +53,8 @@ pub const ServerState = struct {
     vtable_serial: bool = false,
     native_engine: ?*native_engine_mod.NativeEngine = null,
     is_native: bool = false,
+    /// Model EOS stop tokens (e.g. Qwen3.5 multi-EOS list). Owned.
+    stop_tokens: []const u32 = &.{},
 
     // Server V2: engine loop and request queue
     request_queue: engine.RequestQueue,
@@ -99,6 +101,9 @@ pub const ServerState = struct {
         }
         if (self.model_pool) |*pool| {
             pool.deinit();
+        }
+        if (self.stop_tokens.len > 0) {
+            self.allocator.free(self.stop_tokens);
         }
         if (!self.is_native) {
             const cpu_stream = c.c.mlx_default_cpu_stream_new();
@@ -154,6 +159,8 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         root.tokenizer.ChatTemplate.initDeepSeek(allocator)
     else if (std.mem.indexOf(u8, config_content, "\"glm5_next\"") != null)
         root.tokenizer.ChatTemplate.initGlm(allocator)
+    else if (std.mem.indexOf(u8, config_content, "\"qwen3_5\"") != null)
+        root.tokenizer.ChatTemplate.initChatML(allocator)
     else
         root.tokenizer.ChatTemplate.initDeepSeek(allocator);
 
@@ -290,9 +297,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         }
     }
 
-    // GLM-5.3 keeps its caches internal (KDA/MLA state in the serving model);
-    // skip the engine KV-cache array entirely.
+    // GLM-5.3 / Qwen3.8 keep their caches internal (KDA/MLA / GDN+attn state
+    // in the serving model); skip the engine KV-cache array entirely.
     const is_glm53 = std.mem.eql(u8, arch_name, "Glm5NextForConditionalGeneration");
+    const is_internal_cache = is_glm53 or std.mem.eql(u8, arch_name, "Qwen3_5ForConditionalGeneration");
 
     // 5. Create KV caches using model config + auto max_kv_size
     const mc = vtable.config;
@@ -301,7 +309,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
 
     var caches: []kvcache.KVCacheStrategy = undefined;
 
-    if (is_glm53) {
+    if (is_internal_cache) {
         caches = &[_]kvcache.KVCacheStrategy{};
     } else if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
         var dsv4_config = try dsv4_loader.parseDSV4Config(allocator, config_content);
@@ -402,6 +410,17 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         arch_name, mc.num_layers, mc.num_kv_heads, mc.head_dim, effective_max_seq,
     });
 
+    // Qwen3.5: multi-EOS stop tokens from the model config (engine stops on
+    // any of them).
+    var stop_tokens: []const u32 = &.{};
+    if (std.mem.eql(u8, arch_name, "Qwen3_5ForConditionalGeneration")) {
+        var qwen_cfg = try model_registry_mod.Qwen38ConfigFromJson(allocator, config_content);
+        defer qwen_cfg.deinit();
+        if (qwen_cfg.eos_token_ids.len > 0) {
+            stop_tokens = try allocator.dupe(u32, qwen_cfg.eos_token_ids);
+        }
+    }
+
     var server_state = ServerState{
         .allocator = allocator,
         .io = io,
@@ -423,7 +442,8 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         else
             null,
         .dsv4_model = dsv4_model,
-        .vtable_serial = is_glm53,
+        .vtable_serial = is_internal_cache,
+        .stop_tokens = stop_tokens,
         .running = true,
         .request_queue = undefined,
         .engine_loop = null,

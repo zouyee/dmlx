@@ -134,6 +134,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         .top_p = server_config.top_p,
         .seed = seed,
         .stop_strings = req.stop,
+        .stop_tokens = state.stop_tokens,
         .streaming = false,
         .model_name = req.model,
         .guided_json_schema = if (req.response_format) |rf| blk: {

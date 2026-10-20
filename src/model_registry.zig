@@ -28,6 +28,8 @@ const llava_loader = @import("models/llava_loader.zig");
 const hf_config = @import("hf_config.zig");
 const glm53_loader = @import("models/glm53_loader.zig");
 const glm53 = @import("models/glm53.zig");
+const qwen38_loader = @import("models/qwen38_loader.zig");
+const qwen38 = @import("models/qwen38.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -73,6 +75,7 @@ pub const model_registry = std.StaticStringMap(ModelLoader).initComptime(.{
     .{ "Phi3ForCausalLM", llamaLoader }, // Phi-3 uses LLaMA-like arch
     .{ "LlavaForConditionalGeneration", llavaLoader },
     .{ "Glm5NextForConditionalGeneration", glm53Loader },
+    .{ "Qwen3_5ForConditionalGeneration", qwen38Loader },
 });
 
 /// All architecture names known to the registry.
@@ -88,6 +91,7 @@ pub const supported_architectures = [_][]const u8{
     "Phi3ForCausalLM",
     "LlavaForConditionalGeneration",
     "Glm5NextForConditionalGeneration",
+    "Qwen3_5ForConditionalGeneration",
 };
 
 // ============================================================
@@ -97,6 +101,11 @@ pub const supported_architectures = [_][]const u8{
 /// Convenience re-export for the CLI chat path.
 pub fn Glm53ConfigFromJson(allocator: std.mem.Allocator, config_json: []const u8) !glm53_loader.Glm53Config {
     return glm53_loader.parseGlm53Config(allocator, config_json);
+}
+
+/// Convenience re-export for the CLI chat path.
+pub fn Qwen38ConfigFromJson(allocator: std.mem.Allocator, config_json: []const u8) !qwen38_loader.Qwen38Config {
+    return qwen38_loader.parseQwen38Config(allocator, config_json);
 }
 
 pub const RegistryError = error{
@@ -112,7 +121,8 @@ pub fn getLoader(arch_name: []const u8) RegistryError!ModelLoader {
             "LlamaForCausalLM, DeepseekV4ForCausalLM, MistralForCausalLM, " ++
             "Qwen2ForCausalLM, Qwen3ForCausalLM, GemmaForCausalLM, " ++
             "Glm4ForCausalLM, PhiForCausalLM, Phi3ForCausalLM, " ++
-            "LlavaForConditionalGeneration", .{arch_name});
+            "LlavaForConditionalGeneration, Glm5NextForConditionalGeneration, " ++
+            "Qwen3_5ForConditionalGeneration", .{arch_name});
         return RegistryError.UnsupportedArchitecture;
     };
 }
@@ -559,6 +569,126 @@ fn glm53Loader(
 }
 
 // ============================================================
+// VTable adapter: Qwen3.8 (qwen3_5)
+// ============================================================
+
+/// Wraps a heap-allocated `Qwen38ServingModel` behind the `ModelVTable`
+/// interface. Qwen3.8 keeps its caches internal (GDN conv/ssm state,
+/// attention KV) — the engine's KVCacheStrategy array is unused.
+/// `start_pos` is tracked for interface parity only.
+pub const Qwen38VTableAdapter = struct {
+    model: *qwen38.Qwen38ServingModel,
+    stream: c.c.mlx_stream,
+    start_pos: usize,
+    cfg: *qwen38_loader.Qwen38Config,
+    /// Resident weights — kept alive for the model's lifetime.
+    weights: std.StringHashMap(Array),
+    allocator: std.mem.Allocator,
+
+    fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = mask;
+        _ = caches;
+        try input.eval();
+        const shape = input.shape();
+        const len: usize = @intCast(shape[1]);
+        const ids_u32 = try input.dataSlice(u32);
+        const ids = try self.allocator.dupe(u32, ids_u32);
+        defer self.allocator.free(ids);
+        const logits = try self.model.forwardTokens(ids);
+        self.start_pos += len;
+        return logits;
+    }
+
+    fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        self.model.deinit();
+        allocator.destroy(self.model);
+        var it = self.weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        self.weights.deinit();
+        self.cfg.deinit();
+        allocator.destroy(self.cfg);
+        allocator.destroy(self);
+    }
+};
+
+fn qwen38Loader(
+    allocator: std.mem.Allocator,
+    config_json: []const u8,
+    model_path: []const u8,
+    ctx: EagerContext,
+    stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
+) anyerror!ModelVTable {
+    _ = io;
+    _ = smelt; // dense model — no expert streaming
+    const cfg_ptr = try allocator.create(qwen38_loader.Qwen38Config);
+    errdefer allocator.destroy(cfg_ptr);
+    cfg_ptr.* = try qwen38_loader.parseQwen38Config(allocator, config_json);
+
+    var idx = try safetensors_reader.loadOrBuildIndex(allocator, model_path);
+    defer idx.deinit();
+
+    // Resident weights: every language_model.* tensor (dense model — nothing
+    // is streamed).
+    var weights = std.StringHashMap(Array).init(allocator);
+    errdefer {
+        var it0 = weights.iterator();
+        while (it0.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        weights.deinit();
+    }
+    {
+        var it = idx.entries.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, name, "language_model.")) continue;
+            const key_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(key_copy);
+            const arr = try idx.loadTensor(name);
+            try weights.put(key_copy, arr);
+        }
+    }
+    std.log.info("Qwen3.8 weights resident: {d} tensors", .{weights.count()});
+
+    const model_ptr = try allocator.create(qwen38.Qwen38ServingModel);
+    errdefer allocator.destroy(model_ptr);
+    model_ptr.* = try qwen38.Qwen38ServingModel.init(allocator, ctx, cfg_ptr, weights);
+
+    const adapter = try allocator.create(Qwen38VTableAdapter);
+    errdefer allocator.destroy(adapter);
+    adapter.* = .{
+        .model = model_ptr,
+        .stream = stream,
+        .start_pos = 0,
+        .cfg = cfg_ptr,
+        .weights = weights,
+        .allocator = allocator,
+    };
+
+    return ModelVTable{
+        .forward = &Qwen38VTableAdapter.forward,
+        .deinit = &Qwen38VTableAdapter.deinitFn,
+        .config = ModelConfig{
+            .num_layers = cfg_ptr.num_hidden_layers,
+            .num_kv_heads = 1, // caches are internal; engine KV array unused
+            .head_dim = cfg_ptr.head_dim,
+            .vocab_size = cfg_ptr.vocab_size,
+            .hidden_size = cfg_ptr.hidden_size,
+            .compress_ratios = &.{},
+        },
+        .ptr = adapter,
+    };
+}
+
+// ============================================================
 // VTable adapter: Gemma (uses LLaMA loader — architecturally similar)
 // ============================================================
 
@@ -680,7 +810,7 @@ fn llavaLoader(
 // Tests
 // ============================================================
 
-test "registry contains all ten architectures" {
+test "registry contains all registered architectures" {
     const expected = [_][]const u8{
         "LlamaForCausalLM",
         "DeepseekV4ForCausalLM",
@@ -692,6 +822,8 @@ test "registry contains all ten architectures" {
         "PhiForCausalLM",
         "Phi3ForCausalLM",
         "LlavaForConditionalGeneration",
+        "Glm5NextForConditionalGeneration",
+        "Qwen3_5ForConditionalGeneration",
     };
     for (expected) |arch| {
         try std.testing.expect(model_registry.get(arch) != null);

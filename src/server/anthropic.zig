@@ -99,6 +99,7 @@ pub fn handleAnthropicMessages(
         .top_k = server_config.top_k,
         .top_p = server_config.top_p,
         .seed = seed,
+        .stop_tokens = state.stop_tokens,
         .streaming = false,
         .model_name = req.model,
         .api_format = .anthropic,
