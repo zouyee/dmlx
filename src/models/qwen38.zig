@@ -75,6 +75,33 @@ pub fn finalLogitsWs(ctx: EagerContext, ws: WeightSource, cfg: *const qwen38_loa
 }
 
 // ============================================================
+// Vision token rejection (text-only serving path)
+// ============================================================
+
+/// Vision token id range from the checkpoint's config/tokenizer:
+/// 248053 <|vision_start|>, 248054 <|vision_end|>, 248055 <|vision_pad|>,
+/// 248056 <|image_pad|>, 248057 <|video_pad|>.
+pub const vision_token_lo: u32 = 248053;
+pub const vision_token_hi: u32 = 248057;
+
+pub const VisionError = error{VisionInputNotSupported};
+
+/// Reject prompts containing vision tokens: the text-only path has no vision
+/// tower, so feeding these through the text embedding would produce garbage.
+pub fn rejectVisionTokens(ids: []const u32) VisionError!void {
+    for (ids) |t| {
+        if (t >= vision_token_lo and t <= vision_token_hi) {
+            // warn under `zig build test` (the runner fails tests on err logs).
+            if (@import("builtin").is_test)
+                std.log.warn("qwen38: vision input not supported (token id {d})", .{t})
+            else
+                std.log.err("qwen38: vision input not supported (token id {d} in vision range [{d}, {d}])", .{ t, vision_token_lo, vision_token_hi });
+            return VisionError.VisionInputNotSupported;
+        }
+    }
+}
+
+// ============================================================
 // Per-layer decode state
 // ============================================================
 
@@ -532,6 +559,7 @@ pub const Qwen38ServingModel = struct {
         const ctx = self.ctx;
         var nbuf: [256]u8 = undefined;
 
+        try rejectVisionTokens(ids);
         if (ids.len > 1) try self.reset();
 
         const ids_i32 = try allocator.alloc(i32, ids.len);
@@ -623,4 +651,42 @@ test "Qwen38Model: module surface compiles" {
     _ = WeightSource.fromIndex;
     _ = Qwen38ServingModel.init;
     _ = Qwen38ServingModel.forwardTokens;
+}
+
+test "rejectVisionTokens: vision range rejected, text ids pass" {
+    // Text ids (incl. eos and im_start/im_end) pass through.
+    try rejectVisionTokens(&[_]u32{ 248044, 248045, 248046, 100, 0, 248320 - 1 });
+    try rejectVisionTokens(&[_]u32{});
+    // Every id in the vision range is rejected.
+    var t: u32 = vision_token_lo;
+    while (t <= vision_token_hi) : (t += 1) {
+        try std.testing.expectError(VisionError.VisionInputNotSupported, rejectVisionTokens(&[_]u32{ 97063, t }));
+    }
+    // Boundary check: ids just outside the range pass.
+    try rejectVisionTokens(&[_]u32{ vision_token_lo - 1, vision_token_hi + 1 });
+}
+
+test "Qwen38ServingModel.forwardTokens: vision token rejected before any weight access" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    // Zero-layer config + empty weights: any forward past the vision check
+    // would fail on the missing embed_tokens weight, so a clean
+    // VisionInputNotSupported proves the check fires first. Covers both the
+    // prefill (L>1) and decode (L=1) paths.
+    var cfg = qwen38_loader.Qwen38Config{ .allocator = allocator, .num_hidden_layers = 0 };
+    defer cfg.deinit();
+    const weights = std.StringHashMap(Array).init(allocator);
+    var model = try Qwen38ServingModel.init(allocator, ctx, &cfg, weights);
+    defer model.deinit();
+
+    try std.testing.expectError(
+        VisionError.VisionInputNotSupported,
+        model.forwardTokens(&[_]u32{248056}), // <|image_pad|>, decode path
+    );
+    try std.testing.expectError(
+        VisionError.VisionInputNotSupported,
+        model.forwardTokens(&[_]u32{ 100, 248053, 200 }), // <|vision_start|>, prefill path
+    );
 }

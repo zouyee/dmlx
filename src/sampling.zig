@@ -87,18 +87,20 @@ pub fn topKSampler(logits: Array, allocator: std.mem.Allocator, temperature: f32
         };
     }
 
-    // Partial sort to find top k (simple selection for small vocab)
-    // For vocab_size ~ 100k, full sort is acceptable on CPU
-    std.sort.insertion(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
+    // Partial selection of top-k: a full O(n²) insertion sort over a ~250k
+    // vocab takes minutes per token; only the k highest are ever read.
+    const top = try allocator.alloc(ScoredToken, k_actual);
+    defer allocator.free(top);
+    selectTopK(scored, top);
 
     // Softmax over top-k
     var top_probs = try allocator.alloc(f32, k_actual);
     defer allocator.free(top_probs);
 
-    const max_score: f32 = scored[0].score;
+    const max_score: f32 = top[0].score;
     var sum_exp: f32 = 0;
     for (0..k_actual) |i| {
-        top_probs[i] = @exp(scored[i].score - max_score);
+        top_probs[i] = @exp(top[i].score - max_score);
         sum_exp += top_probs[i];
     }
     for (0..k_actual) |i| {
@@ -106,7 +108,7 @@ pub fn topKSampler(logits: Array, allocator: std.mem.Allocator, temperature: f32
     }
 
     const idx = sampleFromProbs(top_probs, k_actual, rand);
-    return scored[idx].token;
+    return top[idx].token;
 }
 
 /// Top-P (nucleus) sampling: keep tokens with cumulative probability <= p.
@@ -130,8 +132,9 @@ pub fn topPSampler(logits: Array, allocator: std.mem.Allocator, temperature: f32
         };
     }
 
-    // Sort descending by score
-    std.sort.insertion(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
+    // Sort descending by score (stable block sort — O(n log n); insertion
+    // sort is O(n²) and takes minutes per token on a ~250k vocab).
+    std.sort.block(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
 
     // Compute softmax probabilities
     var probs = try allocator.alloc(f32, vocab_size);
@@ -198,19 +201,20 @@ pub fn topKTopPSampler(
         };
     }
 
-    std.sort.insertion(ScoredToken, scored[0..vocab_size], {}, scoredGreater);
-
-    // Apply top-k first
+    // Apply top-k first (partial selection — see topKSampler).
     const k_actual = @min(k, vocab_size);
+    const top = try allocator.alloc(ScoredToken, k_actual);
+    defer allocator.free(top);
+    selectTopK(scored, top);
 
     // Compute probs over top-k
     var probs = try allocator.alloc(f32, k_actual);
     defer allocator.free(probs);
 
-    const max_score: f32 = scored[0].score;
+    const max_score: f32 = top[0].score;
     var sum_exp: f32 = 0;
     for (0..k_actual) |i| {
-        probs[i] = @exp(scored[i].score - max_score);
+        probs[i] = @exp(top[i].score - max_score);
         sum_exp += probs[i];
     }
     for (0..k_actual) |i| {
@@ -238,7 +242,7 @@ pub fn topKTopPSampler(
     }
 
     const idx = sampleFromProbs(probs[0..cutoff], cutoff, rand);
-    return scored[idx].token;
+    return top[idx].token;
 }
 
 // ------------------------------------------------------------------
@@ -252,6 +256,22 @@ const ScoredToken = struct {
 
 fn scoredGreater(_: void, a: ScoredToken, b: ScoredToken) bool {
     return a.score > b.score;
+}
+
+/// Fill `top` (capacity k) with the k highest-scored entries of `scored`,
+/// descending. Stable: ties keep the lower token id first, matching a stable
+/// full sort. O(n*k) vs O(n²) for the previous full insertion sort.
+fn selectTopK(scored: []const ScoredToken, top: []ScoredToken) void {
+    var top_len: usize = 0;
+    for (scored) |s| {
+        var pos: usize = 0;
+        while (pos < top_len and top[pos].score >= s.score) : (pos += 1) {}
+        if (pos >= top.len) continue;
+        if (top_len < top.len) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = s;
+    }
 }
 
 /// Sample an index from a probability distribution using uniform random.
