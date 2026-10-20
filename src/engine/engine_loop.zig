@@ -153,6 +153,11 @@ pub const EngineConfig = struct {
     /// Direct DSV4 model pointer. When set, the engine uses the native
     /// DSV4 generation path instead of the VTable.
     dsv4_model: ?*dsv4_mod.DSV4Model = null,
+    /// When set, requests are processed serially through the VTable with
+    /// per-request caches passed through as-is (the model keeps its own
+    /// internal state — e.g. GLM-5.3's KDA/MLA caches — and the batched
+    /// KV-cache merge path is bypassed).
+    vtable_serial: bool = false,
     /// Maximum number of requests to batch together in the decode phase.
     max_batch_size: usize = 8,
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
@@ -173,6 +178,7 @@ pub const EngineLoop = struct {
     layer_config: ?LayerConfig,
     num_layers: usize,
     dsv4_model: ?*dsv4_mod.DSV4Model,
+    vtable_serial: bool,
     running: std.atomic.Value(bool),
     /// Batch KV caches for batched decode (one BatchKVCache per layer).
     /// Lazily initialized on first prefill via BatchKVCache.merge().
@@ -205,6 +211,7 @@ pub const EngineLoop = struct {
             .layer_config = config.layer_config,
             .num_layers = config.num_layers,
             .dsv4_model = config.dsv4_model,
+            .vtable_serial = config.vtable_serial,
             .running = std.atomic.Value(bool).init(true),
             .batch_caches = null,
             .max_batch_size = config.max_batch_size,
@@ -252,7 +259,7 @@ pub const EngineLoop = struct {
                     req.completion.deliverError(self.io, "Request cancelled");
                     continue;
                 }
-                if (self.dsv4_model != null) {
+                if (self.dsv4_model != null or self.vtable_serial) {
                     new_requests[dsv4_requests] = req;
                     dsv4_requests += 1;
                 } else {
@@ -302,16 +309,19 @@ pub const EngineLoop = struct {
         var owns_caches = true;
         var prefix_hit = false;
 
-        // Try prefix cache first.
-        if (self.prefix_cache) |*pc| {
-            if (pc.lookup(req.prompt_tokens)) |maybe_cloned| {
-                if (maybe_cloned) |cloned| {
-                    caches = cloned;
-                    prefix_hit = true;
-                    std.log.info("[Engine] Prefix cache hit for request {d}, skipping prefill", .{req.id});
+        // Try prefix cache first (not for vtable_serial models — their state
+        // is internal and cannot be restored from a KV snapshot).
+        if (!self.vtable_serial) {
+            if (self.prefix_cache) |*pc| {
+                if (pc.lookup(req.prompt_tokens)) |maybe_cloned| {
+                    if (maybe_cloned) |cloned| {
+                        caches = cloned;
+                        prefix_hit = true;
+                        std.log.info("[Engine] Prefix cache hit for request {d}, skipping prefill", .{req.id});
+                    }
+                } else |err| {
+                    std.log.warn("[Engine] Prefix cache lookup failed: {}", .{err});
                 }
-            } else |err| {
-                std.log.warn("[Engine] Prefix cache lookup failed: {}", .{err});
             }
         }
 

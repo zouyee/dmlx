@@ -991,6 +991,7 @@ extern fn moe_infer_embed(engine: *Engine, token_id: c_int, hidden_out: [*c]f32)
 extern fn moe_infer_compress_hc(engine: *Engine, residual: [*c]const f32, out: [*c]f32) void;
 extern fn hyper_head_compress(attn_fn: [*c]const f32, attn_base: [*c]const f32, attn_scale: [*c]const f32, residual: [*c]const f32, out: [*c]f32) void;
 extern fn moe_infer_get_logits(engine: *Engine, hidden: [*c]const f32, logits_out: [*c]f32) c_int;
+extern fn moe_infer_get_argmax(engine: *Engine, hidden: [*c]const f32, idx_out: *u32, val_out: *f32) c_int;
 extern fn moe_infer_set_layer_compressor(engine: *Engine, layer: c_int, compress_ratio: u32, comp_wkv: CQuantWeight, comp_wgate: CQuantWeight, comp_ape: ?[*]const f32, comp_norm: ?[*]const f32) void;
 extern fn moe_infer_set_layer_indexer(engine: *Engine, layer: c_int, idx_wq_b: CQuantWeight, idx_weights_proj: CQuantWeight, idx_comp_wkv: CQuantWeight, idx_comp_wgate: CQuantWeight, idx_comp_ape: ?[*]const f32, idx_comp_norm: ?[*]const f32) void;
 
@@ -1073,6 +1074,14 @@ pub fn hyperHeadCompress(attn_fn: [*c]const f32, attn_base: [*c]const f32, attn_
 pub fn getLogits(engine: *Engine, hidden: [*c]const f32, logits_out: [*c]f32) !void {
     const rc = moe_infer_get_logits(engine, hidden, logits_out);
     if (rc != 0) return error.GetLogitsFailed;
+}
+
+/// GPU greedy argmax over the logits: encodes the same lm_head matvec plus a
+/// two-stage reduction and reads back only 8 bytes. Fails (caller falls back
+/// to getLogits + CPU scan) when the GPU argmax path is unavailable.
+pub fn getArgmax(engine: *Engine, hidden: [*c]const f32, idx_out: *u32, val_out: *f32) !void {
+    const rc = moe_infer_get_argmax(engine, hidden, idx_out, val_out);
+    if (rc != 0) return error.GetArgmaxFailed;
 }
 
 pub fn init(packed_dir: []const u8) !*Engine {

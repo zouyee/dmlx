@@ -572,6 +572,8 @@ fn runChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand) !void {
 
     if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         try runDeepSeekV4Chat(allocator, io, cmd, ctx, stream, config_content);
+    } else if (std.mem.eql(u8, model_type, "glm5_next")) {
+        try runGlm53Chat(allocator, io, cmd, ctx, stream, config_content);
     } else {
         try runLlamaChat(allocator, io, cmd, ctx, stream, config_content);
     }
@@ -806,6 +808,78 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     if (generated_ids.len == 0) {
         std.debug.print("\n(no output generated)\n", .{});
     }
+}
+
+/// GLM-5.3 (glm5_next) chat via the registry loader + generation API.
+/// Caches are internal to the serving model; stop tokens from text_config.
+fn runGlm53Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx: EagerContext, stream: c.c.mlx_stream, config_content: []const u8) !void {
+    var glm_cfg = try root.model_registry.Glm53ConfigFromJson(allocator, config_content);
+    defer glm_cfg.deinit();
+
+    const tokenizer_path = try std.fs.path.join(allocator, &[_][]const u8{ cmd.model_path, "tokenizer.json" });
+    defer allocator.free(tokenizer_path);
+    var tokenizer_backend = root.tokenizer.BpeTokenizer.init(allocator);
+    defer tokenizer_backend.deinit();
+    try tokenizer_backend.loadFromFile(io, tokenizer_path);
+    const tokenizer = tokenizer_backend.asStrategy();
+
+    var chat_template = detectChatTemplate(allocator, config_content);
+
+    const smelt_strategy: root.deepseek_v4_loader.SmeltConfig.LoadMode = if (std.mem.eql(u8, cmd.smelt_strategy, "stream"))
+        .stream
+    else
+        .preload;
+    const loader = root.model_registry.getLoader("Glm5NextForConditionalGeneration") catch unreachable;
+    var vtable = try loader(allocator, config_content, cmd.model_path, ctx, stream, io, .{
+        .enabled = cmd.smelt,
+        .load_fraction = cmd.smelt_experts,
+        .load_mode = smelt_strategy,
+        .cache_budget_mb = cmd.smelt_cache_mb,
+        .mlock_backbone = cmd.mlock_backbone,
+        .packed_dir = cmd.expert_packed_dir,
+        .max_parallel = cmd.expert_parallel,
+    });
+    defer vtable.deinit(vtable.ptr, allocator);
+
+    var prompt_tokens: []u32 = undefined;
+    if (cmd.raw) {
+        prompt_tokens = try tokenizer.encode(cmd.prompt, true, allocator);
+    } else {
+        var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
+        defer messages.deinit(allocator);
+        if (cmd.system_prompt.len > 0) {
+            try messages.append(allocator, .{ .role = "system", .content = cmd.system_prompt });
+        }
+        try messages.append(allocator, .{ .role = "user", .content = cmd.prompt });
+        const prompt_text = try chat_template.apply(messages.items, true);
+        defer allocator.free(prompt_text);
+        prompt_tokens = try tokenizer.encode(prompt_text, false, allocator);
+    }
+    defer allocator.free(prompt_tokens);
+
+    const seed = cmd.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
+    const gen_config = root.generation.GenerateConfig{
+        .max_tokens = cmd.max_tokens,
+        .temperature = cmd.temperature,
+        .top_k = cmd.top_k,
+        .top_p = cmd.top_p,
+        .stop_tokens = glm_cfg.eos_token_ids,
+        .seed = seed,
+    };
+
+    std.debug.print("Starting generation...\n", .{});
+    const new_tokens = try root.generation.generate(
+        vtable,
+        prompt_tokens,
+        gen_config,
+        &[_]root.kvcache.KVCacheStrategy{},
+        ctx,
+    );
+    defer allocator.free(new_tokens);
+
+    const output_text = try tokenizer.decode(new_tokens, allocator);
+    defer allocator.free(output_text);
+    std.debug.print("\n{s}\n", .{output_text});
 }
 
 fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx: EagerContext, stream: c.c.mlx_stream, config_content: []const u8) !void {

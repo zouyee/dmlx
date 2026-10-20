@@ -55,11 +55,6 @@ typedef struct {
     id<MTLBuffer> scr_bgv[8];    // [group_feat] bf16 ×8  — wo_a group inputs
     id<MTLBuffer> scr_cos;       // [QK_ROPE_DIM/2] f32  — RoPE cos (persistent, memcpy per pos)
     id<MTLBuffer> scr_sin;       // [QK_ROPE_DIM/2] f32  — RoPE sin (persistent, memcpy per pos)
-    // Persistent KV cache buffer: GPU-accessible Shared memory.
-    // The kv_cache CPU pointer passed to mla_attention_decode_bf16 MUST alias [kvcache_buf contents].
-    // With this buffer, we can blit bkv_n directly into the cache within CB1, enabling
-    // CB1+CB2 merge (eliminating 1 GPU sync = ~8ms/layer = 344ms/token).
-    id<MTLBuffer> kvcache_buf;   // [MAX_SEQ_LEN * KV_LORA_RANK] f16 — full KV cache
     // Validated: points to the AttnWeights that seeded this entry (pointer identity)
     const void *owner;
 } AttnBufCache;
@@ -200,7 +195,6 @@ static AttnBufCache *attn_buf_cache_get(id<MTLDevice> d, const AttnWeights *aw) 
             c->scr_bgv[g] = MKSCR((size_t)group_feat * sizeof(uint16_t));
         }
     }
-    c->kvcache_buf = MKSCR((size_t)MAX_SEQ_LEN * KV_LORA_RANK * sizeof(uint16_t));
     c->scr_cos = MKSCR((size_t)(QK_ROPE_DIM / 2) * sizeof(float));
     c->scr_sin = MKSCR((size_t)(QK_ROPE_DIM / 2) * sizeof(float));
     #undef MKSCR
@@ -315,19 +309,28 @@ static void yarn_cos_sin(int pos, float *cos_out, float *sin_out) {
     const float base = 10000.0f, factor = 16.0f, beta_fast = 32.0f, beta_slow = 1.0f;
     const float orig_max = 65536.0f, PI = 3.14159265358979323846f;
     int half = QK_ROPE_DIM / 2;
-    float cd_fast = QK_ROPE_DIM * logf(orig_max / (beta_fast * 2.0f * PI)) / (2.0f * logf(base));
-    float cd_slow = QK_ROPE_DIM * logf(orig_max / (beta_slow * 2.0f * PI)) / (2.0f * logf(base));
-    int low = (int)fmaxf(0.0f, floorf(cd_fast));
-    int high = (int)fminf((float)(QK_ROPE_DIM - 1), ceilf(cd_slow));
+    // Adjusted frequencies are position-independent; compute once. Concurrent
+    // first-touch would write identical values, so a plain flag is safe here.
+    static float freq_cache[QK_ROPE_DIM / 2];
+    static int freq_ready = 0;
+    if (!freq_ready) {
+        float cd_fast = QK_ROPE_DIM * logf(orig_max / (beta_fast * 2.0f * PI)) / (2.0f * logf(base));
+        float cd_slow = QK_ROPE_DIM * logf(orig_max / (beta_slow * 2.0f * PI)) / (2.0f * logf(base));
+        int low = (int)fmaxf(0.0f, floorf(cd_fast));
+        int high = (int)fminf((float)(QK_ROPE_DIM - 1), ceilf(cd_slow));
+        for (int i = 0; i < half; i++) {
+            float freq = 1.0f / powf(base, (2.0f * i) / QK_ROPE_DIM);
+            float ramp;
+            if (low == high) ramp = (i <= low) ? 0.0f : 1.0f;
+            else ramp = fminf(1.0f, fmaxf(0.0f, ((float)i - low) / (float)(high - low)));
+            float smooth = 1.0f - ramp;
+            freq_cache[i] = freq / factor * (1.0f - smooth) + freq * smooth;
+        }
+        freq_ready = 1;
+    }
     for (int i = 0; i < half; i++) {
-        float freq = 1.0f / powf(base, (2.0f * i) / QK_ROPE_DIM);
-        float ramp;
-        if (low == high) ramp = (i <= low) ? 0.0f : 1.0f;
-        else ramp = fminf(1.0f, fmaxf(0.0f, ((float)i - low) / (float)(high - low)));
-        float smooth = 1.0f - ramp;
-        freq = freq / factor * (1.0f - smooth) + freq * smooth;
-        cos_out[i] = cosf(pos * freq);
-        sin_out[i] = sinf(pos * freq);
+        cos_out[i] = cosf(pos * freq_cache[i]);
+        sin_out[i] = sinf(pos * freq_cache[i]);
     }
 }
 
@@ -3041,6 +3044,9 @@ int mla_attention_prefill_batch_v2(
         }
     }
 
+    // The plan sizes and the recurrent loop below read/snapshot comp_state —
+    // materialize any deferred async tails from scalar decode first.
+    moe_infer_comp_async_flush(engine);
     MLAV2WorkspacePlan plan;
     if (!mla_build_v2_plan(engine, args, state, &plan)) {
         return NATIVE_BATCH_CAPACITY_EXCEEDED;

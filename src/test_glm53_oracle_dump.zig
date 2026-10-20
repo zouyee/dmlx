@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         .allocator = allocator,
         .ctx = ctx,
         .cfg = &cfg,
-        .index = &index,
+        .ws = glm53.WeightSource.fromIndex(&index),
         .reader = &reader,
         .stream = ctx.stream.inner,
     };

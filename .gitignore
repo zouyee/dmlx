@@ -63,3 +63,5 @@ test_mlx_take_zero
 __pycache__/
 *.pyc
 zig-pkg/
+
+.worktrees/

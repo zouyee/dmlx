@@ -532,7 +532,7 @@ git commit -m "feat(glm53): KDA 线性注意力模块（gated delta rule，MLX o
 ## Task 7: oracle 对齐 harness（Zig 侧）
 
 **Files:**
-- Create: `src/tests/glm53_oracle_test.zig`（或挂入现有 golden 框架，照 `src/tests/golden_test.zig` 模式）
+- Create: `src/test_glm53_oracle_dump.zig`（可执行 harness，`zig build run-glm53-oracle-dump`；实际交付名，替代原拟的 `src/tests/glm53_oracle_test.zig`）
 - Create: `scripts/compare_glm53_oracle.py`（npy vs Zig dump bin 的 cos 计算）
 
 - [ ] **Step 1: Zig dump 二进制**
@@ -556,7 +556,7 @@ Expected: cos ≥ 0.999。不达标时的排查顺序：①权重名映射（pre
 - [ ] **Step 4: Commit**
 
 ```bash
-git add src/tests/glm53_oracle_test.zig scripts/compare_glm53_oracle.py
+git add src/test_glm53_oracle_dump.zig scripts/compare_glm53_oracle.py build.zig
 git commit -m "test(glm53): oracle 对齐 harness"
 ```
 

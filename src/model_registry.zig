@@ -26,6 +26,8 @@ const deepseek_v4 = @import("models/deepseek_v4.zig");
 const deepseek_v4_loader = @import("models/deepseek_v4_loader.zig");
 const llava_loader = @import("models/llava_loader.zig");
 const hf_config = @import("hf_config.zig");
+const glm53_loader = @import("models/glm53_loader.zig");
+const glm53 = @import("models/glm53.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -70,6 +72,7 @@ pub const model_registry = std.StaticStringMap(ModelLoader).initComptime(.{
     .{ "PhiForCausalLM", llamaLoader }, // Phi uses LLaMA-like arch
     .{ "Phi3ForCausalLM", llamaLoader }, // Phi-3 uses LLaMA-like arch
     .{ "LlavaForConditionalGeneration", llavaLoader },
+    .{ "Glm5NextForConditionalGeneration", glm53Loader },
 });
 
 /// All architecture names known to the registry.
@@ -84,11 +87,17 @@ pub const supported_architectures = [_][]const u8{
     "PhiForCausalLM",
     "Phi3ForCausalLM",
     "LlavaForConditionalGeneration",
+    "Glm5NextForConditionalGeneration",
 };
 
 // ============================================================
 // Public lookup helper
 // ============================================================
+
+/// Convenience re-export for the CLI chat path.
+pub fn Glm53ConfigFromJson(allocator: std.mem.Allocator, config_json: []const u8) !glm53_loader.Glm53Config {
+    return glm53_loader.parseGlm53Config(allocator, config_json);
+}
 
 pub const RegistryError = error{
     UnsupportedArchitecture,
@@ -364,6 +373,186 @@ fn deepseekV4Loader(
             .vocab_size = dsv4_config.vocab_size,
             .hidden_size = dsv4_config.hidden_size,
             .compress_ratios = dsv4_config.compress_ratios,
+        },
+        .ptr = adapter,
+    };
+}
+
+// ============================================================
+// VTable adapter: GLM-5.3 (glm5_next)
+// ============================================================
+
+/// Wraps a heap-allocated `Glm53ServingModel` behind the `ModelVTable`
+/// interface. GLM-5.3 keeps its caches internal (KDA conv/ssm state, MLA
+/// latent + indexer history) — the engine's KVCacheStrategy array is unused.
+/// `start_pos` is tracked for interface parity only.
+pub const Glm53VTableAdapter = struct {
+    model: *glm53.Glm53ServingModel,
+    stream: c.c.mlx_stream,
+    start_pos: usize,
+    cfg: *glm53_loader.Glm53Config,
+    /// Resident backbone weights — kept alive for the model's lifetime.
+    weights: std.StringHashMap(Array),
+    index: *safetensors_reader.TensorIndex,
+    fd_pool: *safetensors_reader.FdPool,
+    reader: *safetensors_reader.PartialTensorReader,
+    stream_provider: ?*expert_stream.ExpertStreamProvider,
+    layer_meta: ?[]expert_stream.LayerExpertMeta,
+    allocator: std.mem.Allocator,
+
+    fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
+        const self: *Glm53VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = mask;
+        _ = caches;
+        try input.eval();
+        const shape = input.shape();
+        const len: usize = @intCast(shape[1]);
+        const ids_u32 = try input.dataSlice(u32);
+        const ids = try self.allocator.dupe(u32, ids_u32);
+        defer self.allocator.free(ids);
+        const logits = try self.model.forwardTokens(ids);
+        self.start_pos += len;
+        return logits;
+    }
+
+    fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
+        const self: *Glm53VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        self.model.deinit();
+        allocator.destroy(self.model);
+        if (self.stream_provider) |sp| {
+            sp.deinit();
+            allocator.destroy(sp);
+        }
+        if (self.layer_meta) |lm| allocator.free(lm);
+        // PartialTensorReader has no deinit (borrows index + fd_pool).
+        allocator.destroy(self.reader);
+        self.fd_pool.deinit();
+        allocator.destroy(self.fd_pool);
+        self.index.deinit();
+        allocator.destroy(self.index);
+        var it = self.weights.iterator();
+        while (it.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        self.weights.deinit();
+        self.cfg.deinit();
+        allocator.destroy(self.cfg);
+        allocator.destroy(self);
+    }
+};
+
+fn glm53Loader(
+    allocator: std.mem.Allocator,
+    config_json: []const u8,
+    model_path: []const u8,
+    ctx: EagerContext,
+    stream: c.c.mlx_stream,
+    io: std.Io,
+    smelt: deepseek_v4_loader.SmeltConfig,
+) anyerror!ModelVTable {
+    _ = io;
+    const cfg_ptr = try allocator.create(glm53_loader.Glm53Config);
+    errdefer allocator.destroy(cfg_ptr);
+    cfg_ptr.* = try glm53_loader.parseGlm53Config(allocator, config_json);
+
+    const idx = try allocator.create(safetensors_reader.TensorIndex);
+    errdefer allocator.destroy(idx);
+    idx.* = try safetensors_reader.loadOrBuildIndex(allocator, model_path);
+
+    // Resident backbone: every language_model tensor except the stacked
+    // switch_mlp experts (~13.4 GiB; experts stream on demand).
+    var weights = std.StringHashMap(Array).init(allocator);
+    errdefer {
+        var it0 = weights.iterator();
+        while (it0.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.*.deinit();
+        }
+        weights.deinit();
+    }
+    {
+        var it = idx.entries.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, name, "language_model.")) continue;
+            if (std.mem.indexOf(u8, name, ".mlp.switch_mlp.") != null) continue;
+            const key_copy = try allocator.dupe(u8, name);
+            errdefer allocator.free(key_copy);
+            const arr = try idx.loadTensor(name);
+            try weights.put(key_copy, arr);
+        }
+    }
+    std.log.info("GLM-5.3 backbone resident: {d} tensors", .{weights.count()});
+
+    const pool = try allocator.create(safetensors_reader.FdPool);
+    errdefer allocator.destroy(pool);
+    pool.* = safetensors_reader.FdPool.init(allocator);
+    try pool.openAll(idx);
+
+    const rd = try allocator.create(safetensors_reader.PartialTensorReader);
+    errdefer allocator.destroy(rd);
+    rd.* = safetensors_reader.PartialTensorReader.init(allocator, idx, pool);
+
+    // Expert streaming (GLM: 4-bit affine gs=64 with biases — biases make the
+    // packed-pread path ineligible, so slices come from PartialTensorReader).
+    var sp: ?*expert_stream.ExpertStreamProvider = null;
+    var layer_meta: ?[]expert_stream.LayerExpertMeta = null;
+    if (smelt.enabled and smelt.load_mode == .stream) {
+        const meta = try glm53_loader.buildLayerExpertMeta(allocator, cfg_ptr, idx);
+        layer_meta = meta;
+        const sp_ptr = try allocator.create(expert_stream.ExpertStreamProvider);
+        sp_ptr.* = try expert_stream.ExpertStreamProvider.initWithStrategy(
+            allocator,
+            ctx,
+            idx,
+            .stream,
+            &.{}, // no preloaded experts
+            meta,
+            true, // quantized
+            64, // group_size
+            4, // bits
+            "affine",
+            cfg_ptr.swiglu_limit,
+            smelt.cache_budget_mb,
+            smelt.packed_dir,
+            smelt.max_parallel,
+        );
+        sp_ptr.pred_topk = 8; // GLM-5.3 routes top-8 (PRED_WIDTH)
+        sp = sp_ptr;
+        std.log.info("GLM-5.3 expert streaming enabled (affine gs=64 4-bit, top-8)", .{});
+    }
+
+    const model_ptr = try allocator.create(glm53.Glm53ServingModel);
+    errdefer allocator.destroy(model_ptr);
+    model_ptr.* = try glm53.Glm53ServingModel.init(allocator, ctx, cfg_ptr, stream, weights, rd, sp);
+
+    const adapter = try allocator.create(Glm53VTableAdapter);
+    errdefer allocator.destroy(adapter);
+    adapter.* = .{
+        .model = model_ptr,
+        .stream = stream,
+        .start_pos = 0,
+        .cfg = cfg_ptr,
+        .weights = weights,
+        .index = idx,
+        .fd_pool = pool,
+        .reader = rd,
+        .stream_provider = sp,
+        .layer_meta = layer_meta,
+        .allocator = allocator,
+    };
+
+    return ModelVTable{
+        .forward = &Glm53VTableAdapter.forward,
+        .deinit = &Glm53VTableAdapter.deinitFn,
+        .config = ModelConfig{
+            .num_layers = cfg_ptr.num_hidden_layers,
+            .num_kv_heads = 1, // MLA latent KV: [B, 1, N, kv_lora_rank]
+            .head_dim = cfg_ptr.kv_lora_rank,
+            .vocab_size = cfg_ptr.vocab_size,
+            .hidden_size = cfg_ptr.hidden_size,
+            .compress_ratios = &.{},
         },
         .ptr = adapter,
     };

@@ -48,6 +48,9 @@ pub const ServerState = struct {
     prefix_disk_cache: ?prefix_disk_mod.PrefixDiskCache,
     running: bool,
     dsv4_model: ?*dsv4_mod.DSV4Model = null,
+    /// GLM-5.3 (or any model with internal decode state): drive serially
+    /// through the vtable, bypassing the engine's KV-cache merge.
+    vtable_serial: bool = false,
     native_engine: ?*native_engine_mod.NativeEngine = null,
     is_native: bool = false,
 
@@ -287,6 +290,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         }
     }
 
+    // GLM-5.3 keeps its caches internal (KDA/MLA state in the serving model);
+    // skip the engine KV-cache array entirely.
+    const is_glm53 = std.mem.eql(u8, arch_name, "Glm5NextForConditionalGeneration");
+
     // 5. Create KV caches using model config + auto max_kv_size
     const mc = vtable.config;
     _ = memory_mod.autoMaxKvSize;
@@ -294,7 +301,9 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
 
     var caches: []kvcache.KVCacheStrategy = undefined;
 
-    if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
+    if (is_glm53) {
+        caches = &[_]kvcache.KVCacheStrategy{};
+    } else if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM")) {
         var dsv4_config = try dsv4_loader.parseDSV4Config(allocator, config_content);
         defer {
             var cfg = dsv4_config;
@@ -414,6 +423,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         else
             null,
         .dsv4_model = dsv4_model,
+        .vtable_serial = is_glm53,
         .running = true,
         .request_queue = undefined,
         .engine_loop = null,

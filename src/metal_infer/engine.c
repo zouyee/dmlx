@@ -2569,6 +2569,8 @@ static inline void capture_state_digests(
     uint64_t *kv_digest,
     uint64_t *compressor_digest,
     uint64_t *indexer_digest) {
+    // Digests hash comp_state — materialize deferred async tails first.
+    moe_infer_comp_async_flush(eng);
     MoeInferStateSnapshot snapshot;
     (void)moe_infer_capture_state_snapshot(
         eng,
@@ -2625,6 +2627,8 @@ static inline void emit_debug_capture(
     const int *expert_ids,
     size_t expert_count) {
     if (!eng->debug_capture) return;
+    // Capture digests hash comp_state — materialize deferred async tails first.
+    moe_infer_comp_async_flush(eng);
     MoeInferStateSnapshot snapshot;
     if (moe_infer_capture_state_snapshot(
             eng, layer,
@@ -2916,6 +2920,18 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
             eng->pipe_moe_route_gpu = NULL;
         }
     }
+    {
+        NSError *aerr = nil;
+        id<MTLFunction> fnp = [lib newFunctionWithName:@"argmax_partials"];
+        id<MTLFunction> fnf = [lib newFunctionWithName:@"argmax_final"];
+        eng->pipe_argmax_partials = fnp ? (void *)[d newComputePipelineStateWithFunction:fnp error:&aerr] : NULL;
+        eng->pipe_argmax_final    = fnf ? (void *)[d newComputePipelineStateWithFunction:fnf error:&aerr] : NULL;
+        if (!eng->pipe_argmax_partials || !eng->pipe_argmax_final) {
+            fprintf(stderr, "Metal: argmax kernels unavailable — greedy sampling falls back to CPU\n");
+            eng->pipe_argmax_partials = NULL;
+            eng->pipe_argmax_final = NULL;
+        }
+    }
     // mHC GPU kernels (f16/bfloat)
     eng->pipe_mhc_pre_f16   = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_pre_f16"] error:&err]);
     eng->pipe_mhc_post_f16  = (void *)([d newComputePipelineStateWithFunction:[lib newFunctionWithName:@"mhc_post_f16"] error:&err]);
@@ -2973,16 +2989,16 @@ static int init_metal(MoEInferEngine *eng, const char *kernel_src, unsigned long
     // GPU-resident residual buffer (Path B)
     eng->buf_residual_gpu = (void *)[d newBufferWithLength:(size_t)MHC_MULT * DIM * sizeof(float)
                                                     options:MTLResourceStorageModeShared];
-    // Persistent batch routing scratch. Scalar routing uses row zero; Task 3.2
-    // dispatches up to MAX_SEQ_LEN rows without allocating in a layer loop.
+    // Persistent batch routing scratch. Scalar routing uses row zero; batch
+    // prefill dispatches ≤ MAX_BATCH_ROUTE_TOKENS rows (validated at route time).
     eng->buf_gpu_route_selected = (void *)[d newBufferWithLength:
-        (size_t)MAX_SEQ_LEN * N_ACTIVE * sizeof(int32_t)
+        (size_t)MAX_BATCH_ROUTE_TOKENS * N_ACTIVE * sizeof(int32_t)
         options:MTLResourceStorageModeShared];
     eng->buf_gpu_route_weights = (void *)[d newBufferWithLength:
-        (size_t)MAX_SEQ_LEN * N_ACTIVE * sizeof(float)
+        (size_t)MAX_BATCH_ROUTE_TOKENS * N_ACTIVE * sizeof(float)
         options:MTLResourceStorageModeShared];
     eng->buf_batch_routing_scores = (void *)[d newBufferWithLength:
-        (size_t)MAX_SEQ_LEN * N_EXPERTS * sizeof(float)
+        (size_t)MAX_BATCH_ROUTE_TOKENS * N_EXPERTS * sizeof(float)
         options:MTLResourceStorageModeShared];
     eng->buf_batch_route_bias = (void *)[d newBufferWithLength:
         N_EXPERTS * sizeof(float) options:MTLResourceStorageModeShared];
@@ -4756,28 +4772,34 @@ static void cpu_moe_route(const float *logits, const float *bias, int n, int K,
 #define ROPE_N_CTX_ORIG 65536
 
 static void apply_rope_tail(float *q_or_k, int dim, int n_nope, int pos, float freq_scale) {
-    float corr_dims[2];
-    {
+    // Position-independent YaRN factors, computed once. Concurrent first-touch
+    // would write identical values, so a plain flag is safe here.
+    static float base_freq[ROPE_DIM / 2];  // powf(ROPE_THETA, -rel_i0 / ROPE_DIM)
+    static float yarn_ramp[ROPE_DIM / 2];
+    static int cache_ready = 0;
+    if (!cache_ready) {
         float beta_fast = 32.0f, beta_slow = 1.0f;
         float c0 = ROPE_DIM * logf(ROPE_N_CTX_ORIG / (beta_fast * 2.0f * M_PI)) / (2.0f * logf(ROPE_THETA));
         float c1 = ROPE_DIM * logf(ROPE_N_CTX_ORIG / (beta_slow * 2.0f * M_PI)) / (2.0f * logf(ROPE_THETA));
-        corr_dims[0] = fmaxf(0.0f, floorf(c0));
-        corr_dims[1] = fminf(ROPE_DIM - 1.0f, ceilf(c1));
+        float low = fmaxf(0.0f, floorf(c0));
+        float high = fminf(ROPE_DIM - 1.0f, ceilf(c1));
+        int n_half = ROPE_DIM / 2;
+        for (int ic = 0; ic < n_half; ic++) {
+            base_freq[ic] = powf(ROPE_THETA, -1.0f * (2 * ic) / ROPE_DIM);
+            yarn_ramp[ic] = 1.0f - fminf(1.0f, fmaxf(0.0f, ((float)ic - low) / fmaxf(0.001f, high - low)));
+        }
+        cache_ready = 1;
     }
 
     float theta_base = (float)pos;
-    float inv_ndims = -1.0f / ROPE_DIM;
     int n_half = ROPE_DIM / 2;
 
     for (int ic = 0; ic < n_half; ic++) {
-        int rel_i0 = 2 * ic;
-        float theta = theta_base * powf(ROPE_THETA, inv_ndims * rel_i0);
+        float theta = theta_base * base_freq[ic];
 
         // YaRN
-        float ramp_mix = 0.0f;
-        float low = corr_dims[0], high = corr_dims[1];
-        float yarn_ramp = 1.0f - fminf(1.0f, fmaxf(0.0f, ((float)rel_i0 / 2.0f - low) / fmaxf(0.001f, high - low)));
-        theta = theta * (1.0f - yarn_ramp) + theta / freq_scale * yarn_ramp;
+        float ramp = yarn_ramp[ic];
+        theta = theta * (1.0f - ramp) + theta / freq_scale * ramp;
 
         float cos_t = cosf(theta);
         float sin_t = sinf(theta);
@@ -4924,6 +4946,239 @@ static inline void emit_prepared_debug_capture(
         .expert_count = expert_count,
     };
     eng->debug_capture(eng->debug_capture_context, &record);
+}
+
+// ============================================================================
+// Async compressor/indexer pipeline (scalar decode, DMLX_COMPRESSOR_ASYNC).
+//
+// The scalar decode path encodes the compressor/indexer projection matvecs
+// into a dedicated command buffer that is committed on the serial queue
+// WITHOUT waitUntilCompleted. The CPU readback + comp_state update (the
+// "tail") is deferred to the next pre-existing synchronization point: the
+// next layer's cb2cmd2 routing wait (same queue, in-order, so the projection
+// CB is already complete and the harvest wait is a no-op), the token-end
+// deferred-cb3 wait, or an explicit moe_infer_comp_async_flush() at state
+// consumers (snapshots, rollback, batch/verify transactions, deinit).
+//
+// Safety argument: every deferred tail mutates only future-token state
+// (comp_state[layer] rolling rows and comp_kv/idx_comp_kv appends). Within
+// the layer loop no consumer reads comp_state for the current token — scalar
+// decode SDPA attends over the full raw KV (kvc->kv/kvc->len) and never
+// touches comp_kv. All out-of-loop readers flush first (see call sites of
+// moe_infer_comp_async_flush).
+// ============================================================================
+
+static void cpu_rms_norm(const float *x, const float *w, float *out, int dim, float eps);
+static void cpu_softmax_inplace(float *x, int n);
+
+static bool comp_async_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DMLX_COMPRESSOR_ASYNC");
+        cached = (env && env[0] == '0' && env[1] == '\0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+static bool indexer_skip_selection_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("DMLX_INDEXER_SKIP_SELECTION");
+        cached = (env && env[0] == '0' && env[1] == '\0') ? 0 : 1;
+    }
+    return cached != 0;
+}
+
+// Compressor CPU tail: steps after the kv/gate projections — positional bias,
+// rolling-state store, and (at block boundaries) softmax pooling + RMSNorm +
+// RoPE + comp_kv append + CSA overlap shift. Bit-identical to the tail of the
+// synchronous path; only its program point moved.
+static void moe_compressor_cpu_tail(MoEInferEngine *eng, int layer, int pos,
+                                    const float *kv_cur, float *gate_cur,
+                                    float *pooled) {
+    CompressorState *cs = &eng->comp_state[layer];
+    const uint32_t ratio = cs->ratio;
+    const uint32_t out_dim = cs->out_dim;
+    const uint32_t pos_mod = (uint32_t)pos % ratio;
+    // For CSA (ratio=4): store in upper half [ratio+pos_mod]; for HCA: at [pos_mod]
+    const uint32_t row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
+
+    // Add positional bias
+    if (eng->comp_ape[layer]) {
+        const float *ape_row = eng->comp_ape[layer] + (size_t)pos_mod * out_dim;
+        for (uint32_t j = 0; j < out_dim; j++) gate_cur[j] += ape_row[j];
+    }
+
+    // Store in rolling state
+    memcpy(cs->state_kv    + (size_t)row * out_dim, kv_cur,   out_dim * sizeof(float));
+    memcpy(cs->state_score + (size_t)row * out_dim, gate_cur, out_dim * sizeof(float));
+
+    // Check if we should emit a block
+    if (((uint32_t)pos + 1) % ratio != 0) return;
+    if (cs->n_comp >= MAX_COMP_BLOCKS) return;
+
+    const uint32_t head_dim = COMP_HEAD_DIM; // 512
+
+    // Per-dimension softmax pooling (matches ds4 compressor_pool_decode_state).
+    for (uint32_t j = 0; j < head_dim; j++) {
+        float max_score = -1e30f;
+        if (ratio == 4) {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float sp = cs->state_score[(size_t)r * out_dim + j];
+                float sc = cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j];
+                if (sp > max_score) max_score = sp;
+                if (sc > max_score) max_score = sc;
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float s = cs->state_score[(size_t)r * out_dim + j];
+                if (s > max_score) max_score = s;
+            }
+        }
+        float denom = 0.0f, sum = 0.0f;
+        if (ratio == 4) {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float wp = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
+                float wc = expf(cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j] - max_score);
+                denom += wp + wc;
+                sum += wp * cs->state_kv[(size_t)r * out_dim + j];
+                sum += wc * cs->state_kv[(size_t)(ratio + r) * out_dim + head_dim + j];
+            }
+        } else {
+            for (uint32_t r = 0; r < ratio; r++) {
+                float w = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
+                denom += w;
+                sum += w * cs->state_kv[(size_t)r * out_dim + j];
+            }
+        }
+        pooled[j] = denom > 0.0f ? sum / denom : 0.0f;
+    }
+
+    // RMSNorm
+    if (eng->comp_norm[layer]) {
+        cpu_rms_norm(pooled, eng->comp_norm[layer], pooled, (int)head_dim, 1e-6f);
+    }
+
+    // Apply YaRN tail RoPE at compressed position
+    const int comp_pos = (int)(((uint32_t)pos + 1) - ratio);
+    apply_rope_tail(pooled, (int)head_dim, QK_NOPE_DIM, comp_pos, 16.0f);
+
+    // Append to comp_kv
+    memcpy(cs->comp_kv + (size_t)cs->n_comp * head_dim, pooled, head_dim * sizeof(float));
+    cs->n_comp++;
+
+    // For CSA: shift overlap buffer
+    if (ratio == 4) {
+        for (uint32_t t = 0; t < ratio; t++) {
+            memcpy(cs->state_kv    + (size_t)t * out_dim,
+                   cs->state_kv    + (size_t)(ratio + t) * out_dim,
+                   out_dim * sizeof(float));
+            memcpy(cs->state_score + (size_t)t * out_dim,
+                   cs->state_score + (size_t)(ratio + t) * out_dim,
+                   out_dim * sizeof(float));
+        }
+    }
+}
+
+// Indexer compressor CPU tail: ape bias, rolling idx_state store, and at
+// 4-token boundaries the softmax pooling + RMSNorm + idx_comp_kv append +
+// overlap shift. Never touches the selection/mask outputs.
+static void moe_indexer_idx_cpu_tail(MoEInferEngine *eng, int layer, int pos,
+                                     const float *kv_cur, float *gate_cur,
+                                     float *weights_arr, float *pooled) {
+    CompressorState *cs = &eng->comp_state[layer];
+    const uint32_t idx_out_dim = 256;
+    const uint32_t idx_pos_mod = (uint32_t)pos % 4;
+    const uint32_t idx_row = 4 + idx_pos_mod;
+
+    if (eng->idx_comp_ape[layer]) {
+        const float *ape_row = eng->idx_comp_ape[layer] + (size_t)idx_pos_mod * idx_out_dim;
+        for (uint32_t j = 0; j < idx_out_dim; j++) gate_cur[j] += ape_row[j];
+    }
+
+    memcpy(cs->idx_state_kv    + (size_t)idx_row * idx_out_dim, kv_cur,   idx_out_dim * sizeof(float));
+    memcpy(cs->idx_state_score + (size_t)idx_row * idx_out_dim, gate_cur, idx_out_dim * sizeof(float));
+
+    if (((uint32_t)pos + 1) % 4 == 0 && cs->n_idx_comp < MAX_COMP_BLOCKS) {
+        for (int t = 0; t < 4; t++) {
+            float s = 0.0f;
+            for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
+                s += cs->idx_state_score[(size_t)t * idx_out_dim + d];
+            weights_arr[t] = s;
+        }
+        cpu_softmax_inplace(weights_arr, 4);
+        memset(pooled, 0, IDX_HEAD_DIM * sizeof(float));
+        for (int t = 0; t < 4; t++) {
+            for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
+                pooled[d] += weights_arr[t] * cs->idx_state_kv[(size_t)t * idx_out_dim + d];
+        }
+        if (eng->idx_comp_norm[layer])
+            cpu_rms_norm(pooled, eng->idx_comp_norm[layer], pooled, IDX_HEAD_DIM, 1e-6f);
+        memcpy(cs->idx_comp_kv + (size_t)cs->n_idx_comp * IDX_HEAD_DIM, pooled, IDX_HEAD_DIM * sizeof(float));
+        cs->n_idx_comp++;
+        // Shift CSA overlap buffer for indexer
+        for (int t = 0; t < 4; t++) {
+            memcpy(cs->idx_state_kv    + (size_t)t * idx_out_dim,
+                   cs->idx_state_kv    + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
+            memcpy(cs->idx_state_score + (size_t)t * idx_out_dim,
+                   cs->idx_state_score + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
+        }
+    }
+}
+
+// n_comp as it will be once this layer's pending async compressor tail is
+// applied. Used for indexer gating decisions that must not depend on whether
+// the deferred readback has landed yet.
+static uint32_t comp_async_effective_n_comp(const MoEInferEngine *eng, int layer) {
+    uint32_t n = eng->comp_state[layer].n_comp;
+    if (eng->comp_async_cb[layer]) {
+        const uint32_t ratio = eng->compress_ratio[layer];
+        const uint32_t p = (uint32_t)eng->comp_async_pos[layer];
+        if (ratio != 0u && (p + 1u) % ratio == 0u && n < MAX_COMP_BLOCKS) n += 1u;
+    }
+    return n;
+}
+
+static void comp_async_harvest(MoEInferEngine *eng) {
+    if (eng->comp_async_pending_count == 0u) return;
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        if (!eng->comp_async_cb[layer]) continue;
+        id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)eng->comp_async_cb[layer];
+        [cb waitUntilCompleted];
+        CompressorState *cs = &eng->comp_state[layer];
+        const uint32_t out_dim = cs->out_dim;
+        const int pos = eng->comp_async_pos[layer];
+        float *kv_cur   = (float *)alloca(out_dim * sizeof(float));
+        float *gate_cur = (float *)alloca(out_dim * sizeof(float));
+        float *pooled   = (float *)alloca(COMP_HEAD_DIM * sizeof(float));
+        memcpy(kv_cur,   [(id<MTLBuffer>)eng->comp_out_gpu[layer]  contents], out_dim * sizeof(float));
+        memcpy(gate_cur, [(id<MTLBuffer>)eng->comp_out2_gpu[layer] contents], out_dim * sizeof(float));
+        [cb release];
+        eng->comp_async_cb[layer] = NULL;
+        eng->comp_async_pending_count--;
+        moe_compressor_cpu_tail(eng, layer, pos, kv_cur, gate_cur, pooled);
+    }
+    for (int layer = 0; layer < N_LAYERS; layer++) {
+        if (!eng->idx_async_cb[layer]) continue;
+        id<MTLCommandBuffer> cb = (id<MTLCommandBuffer>)eng->idx_async_cb[layer];
+        [cb waitUntilCompleted];
+        const uint32_t idx_out_dim = 256;
+        const int pos = eng->idx_async_pos[layer];
+        float *kv_cur      = (float *)alloca(idx_out_dim * sizeof(float));
+        float *gate_cur    = (float *)alloca(idx_out_dim * sizeof(float));
+        float *weights_arr = (float *)alloca(4u * sizeof(float));
+        float *pooled      = (float *)alloca(IDX_HEAD_DIM * sizeof(float));
+        memcpy(kv_cur,   [(id<MTLBuffer>)eng->idx_comp_out_gpu[layer]  contents], idx_out_dim * sizeof(float));
+        memcpy(gate_cur, [(id<MTLBuffer>)eng->idx_comp_out2_gpu[layer] contents], idx_out_dim * sizeof(float));
+        [cb release];
+        eng->idx_async_cb[layer] = NULL;
+        eng->comp_async_pending_count--;
+        moe_indexer_idx_cpu_tail(eng, layer, pos, kv_cur, gate_cur, weights_arr, pooled);
+    }
+}
+
+void moe_infer_comp_async_flush(MoEInferEngine *eng) {
+    if (eng) comp_async_harvest(eng);
 }
 
 static int moe_infer_forward_layer_impl(
@@ -5092,7 +5347,8 @@ static int moe_infer_forward_layer_impl(
         if (!kvbuf || !kv_contents) return -1;
         kvc->kv_gpu_buf = (void *)kvbuf;
         kvc->kv = kv_contents;
-        memset(kvc->kv, 0, kvc_size);
+        // No memset: kvc->len bounds all reads; zeroing 64 MiB/layer here would
+        // touch every page into residency on the decode critical path.
         kvc->len = 0;
         if (exact_q4_recording) {
             exact_q4_host_events[exact_q4_host_event_count++] =
@@ -5277,6 +5533,9 @@ static int moe_infer_forward_layer_impl(
     // syncs) and both steps only mutate future-token state (comp_state), which
     // no consumer touches between the two program points within this token.
     if (merged_cb_cpu_drain) {
+        // The synchronous steps below read and mutate comp_state — apply any
+        // deferred async tails from earlier scalar-path tokens first.
+        moe_infer_comp_async_flush(eng);
         if (eng->compress_ratio[layer] > 0) {
             moe_infer_compressor_step(eng, layer, pos, normed);
         }
@@ -5549,6 +5808,11 @@ static int moe_infer_forward_layer_impl(
         // between the old and new program points within this token (the
         // batch/prepared copies happen below, after this block).
         if (!merged_cb_cpu_drain) {
+            // Harvest deferred compressor/indexer readbacks from earlier layers
+            // (and the previous token): their CBs were committed on this serial
+            // queue before this layer's cb2cmd2, which just completed — the
+            // harvest waits are no-ops, folded into the existing routing wait.
+            comp_async_harvest(eng);
             static float attn_normed[DIM];
             const uint16_t *an = (const uint16_t *)[(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 contents];
             for (int i = 0; i < DIM; i++) {
@@ -5558,12 +5822,23 @@ static int moe_infer_forward_layer_impl(
             if (eng->compress_ratio[layer] > 0) {
                 moe_infer_compressor_step(eng, layer, pos, attn_normed);
             }
-            static bool comp_allowed[MAX_COMP_BLOCKS];
-            bool has_comp_selection = false;
-            if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
-                has_comp_selection = moe_infer_indexer_step(eng, layer, pos, attn_normed, NULL, comp_allowed);
+            if (indexer_skip_selection_enabled()) {
+                // DMLX_INDEXER_SKIP_SELECTION (default on): the selection mask
+                // has no consumer on the scalar decode path (SDPA attends over
+                // the full raw KV), so skip it entirely and keep only the
+                // indexer idx_state maintenance.
+                if (eng->compress_ratio[layer] == 4 &&
+                    comp_async_effective_n_comp(eng, layer) > 0) {
+                    (void)moe_infer_indexer_step(eng, layer, pos, attn_normed, NULL, NULL);
+                }
+            } else {
+                static bool comp_allowed[MAX_COMP_BLOCKS];
+                bool has_comp_selection = false;
+                if (eng->compress_ratio[layer] == 4 && eng->comp_state[layer].n_comp > 0) {
+                    has_comp_selection = moe_infer_indexer_step(eng, layer, pos, attn_normed, NULL, comp_allowed);
+                }
+                (void)has_comp_selection;
             }
-            (void)has_comp_selection;
         }
         if (decode_timeline_recording) {
             decode_timeline_record(eng, (uint16_t)layer,
@@ -6505,6 +6780,10 @@ int moe_infer_forward(MoEInferEngine *eng, float *hidden, int pos) {
             eng->deferred.gpu_combined = false;
         }
     }
+    // Token boundary: apply deferred async compressor/indexer tails. Their CBs
+    // were committed before the last layer's cb3 waited above, so this never
+    // blocks; it guarantees comp_state is fully materialized between tokens.
+    comp_async_harvest(eng);
     } // end per-token @autoreleasepool
 
     if ((time_layers || getenv("NATIVE_PREFETCH_DEBUG")) && eng->predictor.valid) {
@@ -6803,11 +7082,12 @@ int moe_infer_forward_batch(MoEInferEngine *eng, float *hidden_batch, int n_toke
             }
         }
     }
+    // Materialize deferred async compressor/indexer tails from the scalar
+    // fallback loops above before the batch result is consumed.
+    comp_async_harvest(eng);
     eng->in_batch--;
     return 0;
 }
-
-// ============================================================================
 // Init / Deinit
 // ============================================================================
 
@@ -8377,7 +8657,7 @@ static int expert_bucket_route_validate(
     NativeExpertBucketWorkspace *view) {
     NativeExpertBucketWorkspacePlan plan;
     if (!logits || !expert_bucket_workspace_is_owned(view, &plan) ||
-        view->batch_tokens > MAX_SEQ_LEN || has_bias > 1u || has_smelt > 1u ||
+        view->batch_tokens > MAX_BATCH_ROUTE_TOKENS || has_bias > 1u || has_smelt > 1u ||
         (has_bias && !bias) || (has_smelt && !cached) ||
         !isfinite(smelt_penalty)) {
         return NATIVE_BATCH_INVALID_ARGUMENT;
@@ -9305,7 +9585,7 @@ static int moe_infer_prefill_v2_ensure_kv_storage(MoEInferEngine *eng) {
             cache->kv_gpu_buf = (void *)buffer;
             cache->kv = (uint16_t *)[buffer contents];
             if (!cache->kv) return NATIVE_BATCH_INVALID_STATE;
-            memset(cache->kv, 0, bytes);
+            // No memset: cache->len bounds all reads.
             cache->len = 0;
         }
         if (!cache->kv_gpu_buf) return NATIVE_BATCH_INVALID_STATE;
@@ -10094,6 +10374,9 @@ int moe_infer_kv_transaction_begin(
         eng->kv_active_transaction_owner != 0u) {
         return NATIVE_BATCH_INVALID_STATE;
     }
+    // The verify journal snapshots comp_state — materialize any deferred
+    // async compressor/indexer tails from scalar decode first.
+    moe_infer_comp_async_flush(eng);
 
     const uint32_t phase_limit = phase == NATIVE_BATCH_PHASE_PREFILL
         ? config->max_prefill_chunk
@@ -10434,12 +10717,12 @@ void moe_infer_reset_kv(MoEInferEngine *eng) {
             memset(cs->state_kv, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
         if (cs->state_score && cs->ratio > 0 && cs->out_dim > 0)
             memset(cs->state_score, 0, 2 * cs->ratio * cs->out_dim * sizeof(float));
-        if (cs->comp_kv)
-            memset(cs->comp_kv, 0, (size_t)MAX_COMP_BLOCKS * COMP_HEAD_DIM * sizeof(float));
+        // comp_kv / idx_comp_kv memsets removed: n_comp / n_idx_comp = 0 above
+        // already bounds all reads (appends write-then-increment), and the
+        // memsets wrote 1.7 GiB per request (43 layers × 40 MiB), also
+        // touching every calloc'd zero page into residency.
         if (cs->idx_state_kv)  memset(cs->idx_state_kv, 0, 8 * 256 * sizeof(float));
         if (cs->idx_state_score) memset(cs->idx_state_score, 0, 8 * 256 * sizeof(float));
-        if (cs->idx_comp_kv)
-            memset(cs->idx_comp_kv, 0, (size_t)MAX_COMP_BLOCKS * IDX_HEAD_DIM * sizeof(float));
     }
 }
 
@@ -10447,6 +10730,8 @@ void moe_infer_rollback_kv(MoEInferEngine *eng, int valid_len) {
     // Truncate KV cache for all layers to valid_len.
     // Used by speculative decoding when draft tokens are rejected.
     if (valid_len < 0) valid_len = 0;
+    // Deferred async compressor tails must land before n_comp is truncated.
+    moe_infer_comp_async_flush(eng);
     prefetch_drain(eng);
     for (int l = 0; l < N_LAYERS; l++) {
         if (eng->kv_cache[l].len > valid_len) {
@@ -10640,6 +10925,100 @@ int moe_infer_get_logits(MoEInferEngine *eng, const float *hidden, float *logits
     return 0;
 }
 
+// GPU greedy argmax: same final RMSNorm + quantized lm_head matvec as
+// moe_infer_get_logits, then a two-stage argmax reduction over lmh_out.
+// Only 8 bytes are read back. Tie-breaking is identical to the CPU linear
+// scan (strict `>`, first maximum wins).
+int moe_infer_get_argmax(MoEInferEngine *eng, const float *hidden,
+                         uint32_t *idx_out, float *val_out) {
+    const bool decode_timeline_recording = decode_timeline_active(eng);
+    const uint64_t timeline_logits_begin = decode_timeline_recording
+        ? moe_infer_decode_timeline_now_ns() : 0u;
+    uint64_t timeline_logits_encode_done = timeline_logits_begin;
+    uint64_t timeline_logits_pre_commit = timeline_logits_begin;
+    uint64_t timeline_logits_post_commit = timeline_logits_begin;
+    uint64_t timeline_logits_post_wait = timeline_logits_begin;
+    if (!eng->final_norm || !hidden || !idx_out || !val_out) return -1;
+    if (!eng->lm_head_q.packed) return -1;
+    if (!eng->pipe_argmax_partials || !eng->pipe_argmax_final) return -1;
+    if (!eng->lmh_w || !eng->lmh_sc || !eng->lmh_bi || !eng->lmh_x || !eng->lmh_out) return -1;
+
+    const uint argmax_groups = 256, argmax_tg = 256;
+    if (!eng->buf_argmax_partials) {
+        id<MTLDevice> d = (id<MTLDevice>)eng->device;
+        eng->buf_argmax_partials = (void *)[d newBufferWithLength:argmax_groups * 8 options:MTLResourceStorageModeShared];
+        eng->buf_argmax_out      = (void *)[d newBufferWithLength:8 options:MTLResourceStorageModeShared];
+        if (!eng->buf_argmax_partials || !eng->buf_argmax_out) return -1;
+    }
+
+    static float normed[DIM];
+    cpu_rms_norm(hidden, eng->final_norm, normed, DIM, 1e-6f);
+    memcpy([(id<MTLBuffer>)eng->lmh_x contents], normed, DIM * sizeof(float));
+
+    id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_w  offset:0 atIndex:0];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_sc offset:0 atIndex:1];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_bi offset:0 atIndex:2];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_x  offset:0 atIndex:3];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_out offset:0 atIndex:4];
+    uint od = (uint)eng->lm_head_q.out_dim, id_ = (uint)eng->lm_head_q.in_dim, gs = (uint)eng->lm_head_q.group_size;
+    [e setBytes:&od length:4 atIndex:5];
+    [e setBytes:&id_ length:4 atIndex:6];
+    [e setBytes:&gs length:4 atIndex:7];
+    [e dispatchThreads:MTLSizeMake(od, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+    const uint n = (uint)eng->vocab_size;
+    const uint total_threads = argmax_groups * argmax_tg;
+    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_argmax_partials];
+    [e setBuffer:(id<MTLBuffer>)eng->lmh_out offset:0 atIndex:0];
+    [e setBuffer:(id<MTLBuffer>)eng->buf_argmax_partials offset:0 atIndex:1];
+    [e setBytes:&n length:4 atIndex:2];
+    [e setBytes:&total_threads length:4 atIndex:3];
+    [e dispatchThreadgroups:MTLSizeMake(argmax_groups, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(argmax_tg, 1, 1)];
+
+    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_argmax_final];
+    [e setBuffer:(id<MTLBuffer>)eng->buf_argmax_partials offset:0 atIndex:0];
+    [e setBuffer:(id<MTLBuffer>)eng->buf_argmax_out offset:0 atIndex:1];
+    [e setBytes:&argmax_groups length:4 atIndex:2];
+    [e dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+      threadsPerThreadgroup:MTLSizeMake(argmax_tg, 1, 1)];
+    [e endEncoding];
+
+    if (decode_timeline_recording) {
+        timeline_logits_encode_done = moe_infer_decode_timeline_now_ns();
+        timeline_logits_pre_commit = timeline_logits_encode_done;
+    }
+    [cb commit];
+    if (decode_timeline_recording)
+        timeline_logits_post_commit = moe_infer_decode_timeline_now_ns();
+    [cb waitUntilCompleted];
+    if (decode_timeline_recording)
+        timeline_logits_post_wait = moe_infer_decode_timeline_now_ns();
+
+    const uint8_t *res = (const uint8_t *)[(id<MTLBuffer>)eng->buf_argmax_out contents];
+    uint32_t idx;
+    float val;
+    memcpy(&idx, res, 4);
+    memcpy(&val, res + 4, 4);
+    *idx_out = idx;
+    *val_out = val;
+
+    if (decode_timeline_recording) {
+        const uint64_t end_ns = moe_infer_decode_timeline_now_ns();
+        decode_timeline_record(eng, DMLX_DECODE_TIMELINE_NO_LAYER,
+            DMLX_DECODE_TIMELINE_LOGITS_CB, timeline_logits_begin,
+            timeline_logits_encode_done, timeline_logits_pre_commit,
+            timeline_logits_post_commit, timeline_logits_post_wait, end_ns);
+    }
+    if (getenv("MF_DBG")) {
+        fprintf(stderr, "[mf-dbg] gpu argmax=%u val=%.3f\n", idx, val);
+    }
+    return 0;
+}
+
 void moe_infer_compress_hc(MoEInferEngine *eng, const float *residual, float *out) {
     (void)eng;
     for (int d = 0; d < DIM; d++) {
@@ -10795,9 +11174,6 @@ static void moe_infer_compressor_step_impl(
     }
 
     const uint32_t out_dim = cs->out_dim;
-    const uint32_t pos_mod = (uint32_t)pos % ratio;
-    // For CSA (ratio=4): store in upper half [ratio+pos_mod]; for HCA: at [pos_mod]
-    const uint32_t row = (ratio == 4) ? (ratio + pos_mod) : pos_mod;
 
     const size_t recurrent_scratch_floats =
         (size_t)2u * out_dim + COMP_HEAD_DIM;
@@ -10819,9 +11195,68 @@ static void moe_infer_compressor_step_impl(
     // and scratch contract remain independent of token count. Scalar callers
     // retain the existing GPU path.
     if (!bounded_scratch && eng->comp_wkv_gpu_w[layer]) {
-        memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
         id<MTLBuffer> kv_buf = (id<MTLBuffer>)eng->comp_out_gpu[layer];
         id<MTLBuffer> gate_buf = (id<MTLBuffer>)eng->comp_out2_gpu[layer];
+        // Async path (DMLX_COMPRESSOR_ASYNC, default on): encode the attn-normed
+        // bf16→f32 expansion plus both projections, commit WITHOUT waiting, and
+        // defer the CPU readback + comp_state update to the next pre-existing
+        // sync point (comp_async_harvest). buf_mhc_attn_norm_bf16 was written
+        // by this layer's merged_cb (mhc_pre), already complete on this serial
+        // queue; the bf16_to_f32_vec expansion (u << 16) is bit-identical to
+        // the CPU expansion the sync path uploads into buf_comp_normed.
+        if (comp_async_enabled() && eng->comp_async_cb[layer] == NULL &&
+            eng->buf_mhc_attn_norm_bf16 && eng->buf_comp_normed &&
+            eng->pipe_bf16_to_f32_vec) {
+            id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+            [cb retain];
+            {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 offset:0 atIndex:0];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed        offset:0 atIndex:1];
+                uint n = DIM;
+                [e setBytes:&n length:4 atIndex:2];
+                [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            }
+            // kv projection
+            {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_w[layer] offset:0 atIndex:0];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_s[layer] offset:0 atIndex:1];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wkv_gpu_b[layer] offset:0 atIndex:2];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
+                [e setBuffer:kv_buf offset:0 atIndex:4];
+                uint od = eng->comp_wkv[layer].out_dim, id_ = eng->comp_wkv[layer].in_dim, gs = eng->comp_wkv[layer].group_size;
+                [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            }
+            // gate projection (same CB, different output buffer)
+            {
+                id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_w[layer] offset:0 atIndex:0];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_s[layer] offset:0 atIndex:1];
+                [e setBuffer:(id<MTLBuffer>)eng->comp_wgate_gpu_b[layer] offset:0 atIndex:2];
+                [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
+                [e setBuffer:gate_buf offset:0 atIndex:4];
+                uint od = eng->comp_wgate[layer].out_dim, id_ = eng->comp_wgate[layer].in_dim, gs = eng->comp_wgate[layer].group_size;
+                [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                [e endEncoding];
+            }
+            [cb commit];
+            eng->comp_async_cb[layer] = (void *)cb;
+            eng->comp_async_pos[layer] = pos;
+            eng->comp_async_pending_count++;
+            return;
+        }
+        // Sync fallbacks below share buf_comp_normed with in-flight async CBs
+        // and read rolling comp_state — drain any deferred work first.
+        if (eng->comp_async_pending_count) comp_async_harvest(eng);
+        memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
         id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
         // kv projection
         {
@@ -10855,94 +11290,17 @@ static void moe_infer_compressor_step_impl(
         memcpy(kv_cur, [kv_buf contents], out_dim * sizeof(float));
         memcpy(gate_cur, [gate_buf contents], out_dim * sizeof(float));
     } else {
-        // Fallback: CPU (when GPU buffers not allocated)
+        // Fallback: CPU (when GPU buffers not allocated). Shares rolling
+        // comp_state with deferred async tails — drain first.
+        if (!bounded_scratch && eng->comp_async_pending_count) comp_async_harvest(eng);
         cpu_affine_matvec_safe(kv_cur,   &eng->comp_wkv[layer],   attn_normed);
         cpu_affine_matvec_safe(gate_cur, &eng->comp_wgate[layer], attn_normed);
     }
 
-    // 2. Add positional bias
-    if (eng->comp_ape[layer]) {
-        const float *ape_row = eng->comp_ape[layer] + (size_t)pos_mod * out_dim;
-        for (uint32_t j = 0; j < out_dim; j++) gate_cur[j] += ape_row[j];
-    }
-
-    // 3. Store in rolling state
-    memcpy(cs->state_kv    + (size_t)row * out_dim, kv_cur,   out_dim * sizeof(float));
-    memcpy(cs->state_score + (size_t)row * out_dim, gate_cur, out_dim * sizeof(float));
-
-    // 4. Check if we should emit a block
-    if (((uint32_t)pos + 1) % ratio != 0) return;
-    if (cs->n_comp >= MAX_COMP_BLOCKS) return;
-
-    const uint32_t head_dim = COMP_HEAD_DIM; // 512
-
-    // 5 & 6. Per-dimension softmax pooling (matches ds4 compressor_pool_decode_state).
-    // For each dimension j: softmax across the ratio token scores, weighted sum of kv values.
-    // For CSA (ratio=4): state is [2*ratio, out_dim] where front half [0..ratio) is the
-    // overlap buffer and upper half [ratio..2*ratio) is current window.
-    // The score gate for each token-slot r is state_score[r * out_dim + j] for HCA,
-    // or state_score[(ratio+r) * out_dim + j] for the current CSA window.
-    // width = out_dim for HCA; out_dim = 2*head_dim for CSA (front and back halves
-    // per token: state_score[r*out_dim+j] is front-half score, +head_dim is back-half).
-    for (uint32_t j = 0; j < head_dim; j++) {
-        float max_score = -1e30f;
-        if (ratio == 4) {
-            // CSA: per-slot two half-scores (j and j+head_dim)
-            for (uint32_t r = 0; r < ratio; r++) {
-                float sp = cs->state_score[(size_t)r * out_dim + j];
-                float sc = cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j];
-                if (sp > max_score) max_score = sp;
-                if (sc > max_score) max_score = sc;
-            }
-        } else {
-            for (uint32_t r = 0; r < ratio; r++) {
-                float s = cs->state_score[(size_t)r * out_dim + j];
-                if (s > max_score) max_score = s;
-            }
-        }
-        float denom = 0.0f, sum = 0.0f;
-        if (ratio == 4) {
-            for (uint32_t r = 0; r < ratio; r++) {
-                float wp = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
-                float wc = expf(cs->state_score[(size_t)(ratio + r) * out_dim + head_dim + j] - max_score);
-                denom += wp + wc;
-                sum += wp * cs->state_kv[(size_t)r * out_dim + j];
-                sum += wc * cs->state_kv[(size_t)(ratio + r) * out_dim + head_dim + j];
-            }
-        } else {
-            for (uint32_t r = 0; r < ratio; r++) {
-                float w = expf(cs->state_score[(size_t)r * out_dim + j] - max_score);
-                denom += w;
-                sum += w * cs->state_kv[(size_t)r * out_dim + j];
-            }
-        }
-        pooled[j] = denom > 0.0f ? sum / denom : 0.0f;
-    }
-
-    // 7. RMSNorm
-    if (eng->comp_norm[layer]) {
-        cpu_rms_norm(pooled, eng->comp_norm[layer], pooled, (int)head_dim, 1e-6f);
-    }
-
-    // 8. Apply YaRN tail RoPE at compressed position
-    const int comp_pos = (int)(((uint32_t)pos + 1) - ratio);
-    apply_rope_tail(pooled, (int)head_dim, QK_NOPE_DIM, comp_pos, 16.0f);
-
-    // 9. Append to comp_kv
-    memcpy(cs->comp_kv + (size_t)cs->n_comp * head_dim, pooled, head_dim * sizeof(float));
-    cs->n_comp++;
-
-    // 10. For CSA: shift overlap buffer
-    if (ratio == 4) {
-        for (uint32_t t = 0; t < ratio; t++) {
-            memcpy(cs->state_kv    + (size_t)t * out_dim,
-                   cs->state_kv    + (size_t)(ratio + t) * out_dim,
-                   out_dim * sizeof(float));
-            memcpy(cs->state_score + (size_t)t * out_dim,
-                   cs->state_score + (size_t)(ratio + t) * out_dim,
-                   out_dim * sizeof(float));
-        }
-    }
+    // 2-10. Positional bias, rolling-state store, boundary pooling + RMSNorm +
+    // RoPE + comp_kv append (+ CSA overlap shift). Shared with the async path,
+    // which runs the identical tail at harvest time.
+    moe_compressor_cpu_tail(eng, layer, pos, kv_cur, gate_cur, pooled);
 }
 
 void moe_infer_compressor_step(MoEInferEngine *eng, int layer, int pos,
@@ -10963,6 +11321,8 @@ int moe_infer_compressor_step_bounded(
         ? eng->comp_state[layer].out_dim
         : (ratio == 4u ? CSA_OUT_DIM : HCA_OUT_DIM);
     if (scratch_floats < (size_t)2u * out_dim + COMP_HEAD_DIM) return -1;
+    // Bounded CPU recurrence must observe any deferred async tail first.
+    if (eng->comp_async_pending_count) comp_async_harvest(eng);
     moe_infer_compressor_step_impl(
         eng, layer, pos, attn_normed, scratch, scratch_floats);
     return 0;
@@ -10974,21 +11334,23 @@ static bool moe_infer_indexer_step_impl(
                               bool *allowed_out, float *bounded_scratch,
                               size_t bounded_scratch_floats) {
     CompressorState *cs = &eng->comp_state[layer];
-    const uint32_t n_comp = cs->n_comp;
+    // Effective n_comp includes this layer's pending async compressor tail so
+    // gating decisions match the synchronous path regardless of harvest timing.
+    const uint32_t n_comp = comp_async_effective_n_comp(eng, layer);
 
     if (n_comp == 0) return false;
 
     uint32_t top_k = 512;
     if (n_comp <= top_k) {
-        for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+        if (allowed_out) {
+            for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+        }
         return true;
     }
 
     // Run indexer's own compressor step (ratio=4, idx_out_dim=256)
     if (eng->idx_comp_wkv[layer].packed != NULL && cs->idx_state_kv != NULL) {
         const uint32_t idx_out_dim = 256;
-        const uint32_t idx_pos_mod = (uint32_t)pos % 4;
-        const uint32_t idx_row = 4 + idx_pos_mod;
 
         const size_t idx_scratch_floats =
             (size_t)2u * idx_out_dim + 4u + IDX_HEAD_DIM;
@@ -11012,9 +11374,70 @@ static bool moe_infer_indexer_step_impl(
         // Bounded batch recurrence uses CPU projection and caller-owned scratch;
         // scalar callers retain the existing persistent GPU scratch path.
         if (!bounded_scratch && eng->idx_comp_wkv_gpu_w[layer]) {
-            memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
             id<MTLBuffer> kv_buf = (id<MTLBuffer>)eng->idx_comp_out_gpu[layer];
             id<MTLBuffer> gate_buf = (id<MTLBuffer>)eng->idx_comp_out2_gpu[layer];
+            // Async path (DMLX_COMPRESSOR_ASYNC): same deferred-readback scheme
+            // as the compressor. Only taken when the selection result is not
+            // consumed synchronously (q_a_out == NULL); the idx_state update is
+            // applied at harvest. With q_a_out == NULL the selection output is
+            // the trivial all-allowed fill, independent of idx_comp_kv.
+            if (comp_async_enabled() && q_a_out == NULL &&
+                eng->idx_async_cb[layer] == NULL &&
+                eng->buf_mhc_attn_norm_bf16 && eng->buf_comp_normed &&
+                eng->pipe_bf16_to_f32_vec) {
+                id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
+                [cb retain];
+                {
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_bf16_to_f32_vec];
+                    [e setBuffer:(id<MTLBuffer>)eng->buf_mhc_attn_norm_bf16 offset:0 atIndex:0];
+                    [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed        offset:0 atIndex:1];
+                    uint n = DIM;
+                    [e setBytes:&n length:4 atIndex:2];
+                    [e dispatchThreads:MTLSizeMake(DIM,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [e endEncoding];
+                }
+                // kv projection
+                {
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_w[layer] offset:0 atIndex:0];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_s[layer] offset:0 atIndex:1];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wkv_gpu_b[layer] offset:0 atIndex:2];
+                    [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
+                    [e setBuffer:kv_buf offset:0 atIndex:4];
+                    uint od = eng->idx_comp_wkv[layer].out_dim, id_ = eng->idx_comp_wkv[layer].in_dim, gs = eng->idx_comp_wkv[layer].group_size;
+                    [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                    [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [e endEncoding];
+                }
+                // gate projection (same CB, different output buffer)
+                {
+                    id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+                    [e setComputePipelineState:(id<MTLComputePipelineState>)eng->pipe_dequant_matvec_affine];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_w[layer] offset:0 atIndex:0];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_s[layer] offset:0 atIndex:1];
+                    [e setBuffer:(id<MTLBuffer>)eng->idx_comp_wgate_gpu_b[layer] offset:0 atIndex:2];
+                    [e setBuffer:(id<MTLBuffer>)eng->buf_comp_normed offset:0 atIndex:3];
+                    [e setBuffer:gate_buf offset:0 atIndex:4];
+                    uint od = eng->idx_comp_wgate[layer].out_dim, id_ = eng->idx_comp_wgate[layer].in_dim, gs = eng->idx_comp_wgate[layer].group_size;
+                    [e setBytes:&od length:4 atIndex:5]; [e setBytes:&id_ length:4 atIndex:6]; [e setBytes:&gs length:4 atIndex:7];
+                    [e dispatchThreads:MTLSizeMake(od,1,1) threadsPerThreadgroup:MTLSizeMake(256,1,1)];
+                    [e endEncoding];
+                }
+                [cb commit];
+                eng->idx_async_cb[layer] = (void *)cb;
+                eng->idx_async_pos[layer] = pos;
+                eng->comp_async_pending_count++;
+                if (allowed_out) {
+                    for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+                }
+                return true;
+            }
+            // Sync fallbacks below share buf_comp_normed with in-flight async
+            // CBs and read idx/comp state — drain any deferred work first.
+            if (eng->comp_async_pending_count) comp_async_harvest(eng);
+            memcpy([(id<MTLBuffer>)eng->buf_comp_normed contents], attn_normed, DIM * sizeof(float));
             id<MTLCommandBuffer> cb = [(id<MTLCommandQueue>)eng->queue commandBufferWithUnretainedReferences];
             // kv projection
             {
@@ -11048,48 +11471,23 @@ static bool moe_infer_indexer_step_impl(
             memcpy(kv_cur, [kv_buf contents], idx_out_dim * sizeof(float));
             memcpy(gate_cur, [gate_buf contents], idx_out_dim * sizeof(float));
         } else {
+            if (!bounded_scratch && eng->comp_async_pending_count) comp_async_harvest(eng);
             cpu_affine_matvec_safe(kv_cur,   &eng->idx_comp_wkv[layer],   attn_normed);
             cpu_affine_matvec_safe(gate_cur, &eng->idx_comp_wgate[layer], attn_normed);
         }
 
-        if (eng->idx_comp_ape[layer]) {
-            const float *ape_row = eng->idx_comp_ape[layer] + (size_t)idx_pos_mod * idx_out_dim;
-            for (uint32_t j = 0; j < idx_out_dim; j++) gate_cur[j] += ape_row[j];
-        }
-
-        memcpy(cs->idx_state_kv    + (size_t)idx_row * idx_out_dim, kv_cur,   idx_out_dim * sizeof(float));
-        memcpy(cs->idx_state_score + (size_t)idx_row * idx_out_dim, gate_cur, idx_out_dim * sizeof(float));
-
-        if (((uint32_t)pos + 1) % 4 == 0 && cs->n_idx_comp < MAX_COMP_BLOCKS) {
-            for (int t = 0; t < 4; t++) {
-                float s = 0.0f;
-                for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
-                    s += cs->idx_state_score[(size_t)t * idx_out_dim + d];
-                weights_arr[t] = s;
-            }
-            cpu_softmax_inplace(weights_arr, 4);
-            memset(pooled, 0, IDX_HEAD_DIM * sizeof(float));
-            for (int t = 0; t < 4; t++) {
-                for (uint32_t d = 0; d < IDX_HEAD_DIM; d++)
-                    pooled[d] += weights_arr[t] * cs->idx_state_kv[(size_t)t * idx_out_dim + d];
-            }
-            if (eng->idx_comp_norm[layer])
-                cpu_rms_norm(pooled, eng->idx_comp_norm[layer], pooled, IDX_HEAD_DIM, 1e-6f);
-            memcpy(cs->idx_comp_kv + (size_t)cs->n_idx_comp * IDX_HEAD_DIM, pooled, IDX_HEAD_DIM * sizeof(float));
-            cs->n_idx_comp++;
-            // Shift CSA overlap buffer for indexer
-            for (int t = 0; t < 4; t++) {
-                memcpy(cs->idx_state_kv    + (size_t)t * idx_out_dim,
-                       cs->idx_state_kv    + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
-                memcpy(cs->idx_state_score + (size_t)t * idx_out_dim,
-                       cs->idx_state_score + (size_t)(4+t) * idx_out_dim, idx_out_dim * sizeof(float));
-            }
-        }
+        // idx_state rolling store + boundary pooling/append/shift. Shared with
+        // the async path, which runs the identical tail at harvest time.
+        moe_indexer_idx_cpu_tail(eng, layer, pos, kv_cur, gate_cur, weights_arr, pooled);
     }
 
     const uint32_t n_idx = cs->n_idx_comp;
-    if (n_idx == 0 || q_a_out == NULL) {
-        for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+    if (n_idx == 0 || q_a_out == NULL || allowed_out == NULL) {
+        // Selection discarded (allowed_out == NULL, DMLX_INDEXER_SKIP_SELECTION)
+        // or trivial: nothing below has a consumer in that case.
+        if (allowed_out) {
+            for (uint32_t c = 0; c < n_comp; c++) allowed_out[c] = true;
+        }
         return true;
     }
 
@@ -11149,6 +11547,8 @@ int moe_infer_indexer_step_bounded(
         layer < 0 || layer >= N_LAYERS || scratch_floats < required) {
         return -1;
     }
+    // Bounded CPU recurrence must observe any deferred async tail first.
+    if (eng->comp_async_pending_count) comp_async_harvest(eng);
     (void)moe_infer_indexer_step_impl(
         eng, layer, pos, attn_normed, NULL, allowed_out,
         scratch, scratch_floats);
@@ -11157,6 +11557,8 @@ int moe_infer_indexer_step_bounded(
 
 void moe_infer_deinit(MoEInferEngine *eng) {
     if (!eng || !eng->initialized) return;
+    // Drain deferred async compressor/indexer CBs before any buffer teardown.
+    moe_infer_comp_async_flush(eng);
     // No producer owner may outlive its I/O generation. Drain both pools before
     // aborting unclaimed records or freeing producer storage.
     prefetch_drain(eng);

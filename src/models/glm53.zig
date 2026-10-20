@@ -31,6 +31,7 @@ const glm53_loader = @import("glm53_loader.zig");
 const glm53_kda = @import("glm53_kda.zig");
 const glm53_attn = @import("glm53_attention.zig");
 const dsv4 = @import("deepseek_v4.zig");
+const expert_stream = @import("expert_stream.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -63,6 +64,74 @@ pub fn loadTensor(index: *safetensors_reader.TensorIndex, name: []const u8) !Arr
     };
 }
 
+/// Tensor lookup abstraction: safetensors-index-backed (Task 9 harness,
+/// every call reads fresh from disk) or resident-map-backed (serving: the
+/// backbone is loaded once; lookups return cheap COW copies via ops.copy).
+/// In both cases the caller owns the returned Array.
+pub const WeightSource = struct {
+    ctx: *anyopaque,
+    tensorFn: *const fn (ctx: *anyopaque, name: []const u8) anyerror!Array,
+
+    pub fn tensor(self: WeightSource, name: []const u8) !Array {
+        return self.tensorFn(self.ctx, name);
+    }
+
+    /// Affine-quantized Linear triple with bits/group_size derived from the
+    /// packed shapes (same derivation as scripts/glm53_oracle_dump.py).
+    pub fn quantized(self: WeightSource, prefix: []const u8, in_features: i32) !QuantParts {
+        var nbuf: [256]u8 = undefined;
+        const data = try self.tensor(fmtName(&nbuf, "{s}.weight", .{prefix}));
+        errdefer data.deinit();
+        const scales = try self.tensor(fmtName(&nbuf, "{s}.scales", .{prefix}));
+        errdefer scales.deinit();
+        const biases = try self.tensor(fmtName(&nbuf, "{s}.biases", .{prefix}));
+        errdefer biases.deinit();
+
+        const wshape = data.shape();
+        const sshape = scales.shape();
+        const packed_cols: i64 = wshape[wshape.len - 1];
+        const scale_cols: i64 = sshape[sshape.len - 1];
+        const bits: u8 = @intCast(@divTrunc(packed_cols * 32, in_features));
+        const group_size: i32 = @intCast(@divTrunc(in_features, scale_cols));
+        return .{
+            .data = data,
+            .scales = scales,
+            .biases = biases,
+            .cfg = .{ .bits = bits, .group_size = group_size, .mode = .affine },
+        };
+    }
+
+    fn fromIndexFn(ctx: *anyopaque, name: []const u8) anyerror!Array {
+        const index: *safetensors_reader.TensorIndex = @ptrCast(@alignCast(ctx));
+        return loadTensor(index, name);
+    }
+
+    pub fn fromIndex(index: *safetensors_reader.TensorIndex) WeightSource {
+        return .{ .ctx = index, .tensorFn = fromIndexFn };
+    }
+
+    const MapBacked = struct {
+        map: *const std.StringHashMap(Array),
+        ectx: EagerContext,
+    };
+
+    fn fromMapFn(ctx: *anyopaque, name: []const u8) anyerror!Array {
+        const mb: *MapBacked = @ptrCast(@alignCast(ctx));
+        const arr = mb.map.get(name) orelse {
+            std.log.err("resident weights: tensor missing: {s}", .{name});
+            return error.TensorNotFound;
+        };
+        // COW copy: the map keeps ownership, the caller gets a safe handle.
+        return ops.copy(mb.ectx, arr);
+    }
+
+    /// `backing` must outlive the WeightSource.
+    pub fn fromMap(map: *const std.StringHashMap(Array), ectx: EagerContext, backing: *MapBacked) WeightSource {
+        backing.* = .{ .map = map, .ectx = ectx };
+        return .{ .ctx = backing, .tensorFn = fromMapFn };
+    }
+};
+
 /// Weight names are fixed patterns well under 128 bytes (longest:
 /// "language_model.model.layers.43.self_attn.indexer.index_kpool_compress_gate"
 /// ≈ 75 chars). All name formatting uses stack buffers via this helper — no
@@ -75,26 +144,7 @@ fn fmtName(buf: []u8, comptime fmt: []const u8, args: anytype) []const u8 {
 /// Load an affine-quantized Linear triple, deriving bits/group_size from the
 /// packed shapes (same derivation as scripts/glm53_oracle_dump.py).
 pub fn loadQuantized(index: *safetensors_reader.TensorIndex, prefix: []const u8, in_features: i32) !QuantParts {
-    var nbuf: [256]u8 = undefined;
-    const data = try loadTensor(index, fmtName(&nbuf, "{s}.weight", .{prefix}));
-    errdefer data.deinit();
-    const scales = try loadTensor(index, fmtName(&nbuf, "{s}.scales", .{prefix}));
-    errdefer scales.deinit();
-    const biases = try loadTensor(index, fmtName(&nbuf, "{s}.biases", .{prefix}));
-    errdefer biases.deinit();
-
-    const wshape = data.shape();
-    const sshape = scales.shape();
-    const packed_cols: i64 = wshape[wshape.len - 1];
-    const scale_cols: i64 = sshape[sshape.len - 1];
-    const bits: u8 = @intCast(@divTrunc(packed_cols * 32, in_features));
-    const group_size: i32 = @intCast(@divTrunc(in_features, scale_cols));
-    return .{
-        .data = data,
-        .scales = scales,
-        .biases = biases,
-        .cfg = .{ .bits = bits, .group_size = group_size, .mode = .affine },
-    };
+    return WeightSource.fromIndex(index).quantized(prefix, in_features);
 }
 
 /// Load one expert's quantized projection (weight+scales+biases row slice)
@@ -158,7 +208,7 @@ pub const HcPre = struct {
 
 pub fn hcPre(
     ctx: EagerContext,
-    index: *safetensors_reader.TensorIndex,
+    ws: WeightSource,
     cfg: *const glm53_loader.Glm53Config,
     hc_prefix: []const u8,
     ln_name: []const u8,
@@ -166,13 +216,13 @@ pub fn hcPre(
     stream_raw: c.c.mlx_stream,
 ) !HcPre {
     var nbuf: [256]u8 = undefined;
-    const hc_fn = try loadTensor(index, fmtName(&nbuf, "{s}.fn", .{hc_prefix}));
+    const hc_fn = try ws.tensor(fmtName(&nbuf, "{s}.fn", .{hc_prefix}));
     defer hc_fn.deinit();
-    const hc_base = try loadTensor(index, fmtName(&nbuf, "{s}.base", .{hc_prefix}));
+    const hc_base = try ws.tensor(fmtName(&nbuf, "{s}.base", .{hc_prefix}));
     defer hc_base.deinit();
-    const hc_scale = try loadTensor(index, fmtName(&nbuf, "{s}.scale", .{hc_prefix}));
+    const hc_scale = try ws.tensor(fmtName(&nbuf, "{s}.scale", .{hc_prefix}));
     defer hc_scale.deinit();
-    const ln_w = try loadTensor(index, ln_name);
+    const ln_w = try ws.tensor(ln_name);
     defer ln_w.deinit();
 
     // HC pre: Python computes mixes from the f32 residual and applies the
@@ -208,12 +258,13 @@ pub fn hcPre(
 /// residual: [1, L, hc_mult, hidden]; returns the updated residual.
 pub fn kdaAttnBranch(
     ctx: EagerContext,
-    index: *safetensors_reader.TensorIndex,
+    ws: WeightSource,
     allocator: std.mem.Allocator,
     cfg: *const glm53_loader.Glm53Config,
     layer_idx: u32,
     residual: Array,
     stream_raw: c.c.mlx_stream,
+    kda_cache: ?*glm53_kda.GlmKdaCache,
 ) !Array {
     const hidden: i32 = @intCast(cfg.hidden_size);
     var pbuf: [64]u8 = undefined;
@@ -221,39 +272,39 @@ pub fn kdaAttnBranch(
     var nbuf: [256]u8 = undefined;
     var nbuf2: [256]u8 = undefined;
 
-    var pre = try hcPre(ctx, index, cfg, fmtName(&nbuf, "{s}.attn_hc", .{p}), fmtName(&nbuf2, "{s}.input_layernorm.weight", .{p}), residual, stream_raw);
+    var pre = try hcPre(ctx, ws, cfg, fmtName(&nbuf, "{s}.attn_hc", .{p}), fmtName(&nbuf2, "{s}.input_layernorm.weight", .{p}), residual, stream_raw);
     defer pre.deinit();
 
     // KDA weights (prep'd fused names; forget_gate.* keeps its prefix).
     var sabuf: [96]u8 = undefined;
     const sa = fmtName(&sabuf, "{s}.self_attn", .{p});
-    var qkv_q = try loadQuantized(index, fmtName(&nbuf, "{s}.qkv_proj", .{sa}), hidden);
+    var qkv_q = try ws.quantized(fmtName(&nbuf, "{s}.qkv_proj", .{sa}), hidden);
     defer qkv_q.deinit();
-    var fbg_q = try loadQuantized(index, fmtName(&nbuf, "{s}.fbg_a_proj", .{sa}), hidden);
+    var fbg_q = try ws.quantized(fmtName(&nbuf, "{s}.fbg_a_proj", .{sa}), hidden);
     defer fbg_q.deinit();
-    var o_q = try loadQuantized(index, fmtName(&nbuf, "{s}.o_proj", .{sa}), @intCast(cfg.linear_num_heads * cfg.linear_head_dim));
+    var o_q = try ws.quantized(fmtName(&nbuf, "{s}.o_proj", .{sa}), @intCast(cfg.linear_num_heads * cfg.linear_head_dim));
     defer o_q.deinit();
 
-    const qkv_conv = try loadTensor(index, fmtName(&nbuf, "{s}.qkv_conv.weight", .{sa}));
+    const qkv_conv = try ws.tensor(fmtName(&nbuf, "{s}.qkv_conv.weight", .{sa}));
     defer qkv_conv.deinit();
     const qkv_conv_f32 = try ops.astype(ctx, qkv_conv, .float32);
     defer qkv_conv_f32.deinit();
 
     // f_b/g_b are consumed unquantized by GlmKDA — dequantize at load.
-    var fb_q = try loadQuantized(index, fmtName(&nbuf, "{s}.forget_gate.f_b_proj", .{sa}), @intCast(cfg.linear_head_dim));
+    var fb_q = try ws.quantized(fmtName(&nbuf, "{s}.forget_gate.f_b_proj", .{sa}), @intCast(cfg.linear_head_dim));
     defer fb_q.deinit();
     const f_b = try quantize_mod.dequantizeAs(ctx, .{ .data = fb_q.data, .scales = fb_q.scales, .biases = fb_q.biases, .config = fb_q.cfg, .original_shape = &[_]i32{} }, .float32);
     defer f_b.deinit();
-    var gb_q = try loadQuantized(index, fmtName(&nbuf, "{s}.g_b_proj", .{sa}), @intCast(cfg.linear_head_dim));
+    var gb_q = try ws.quantized(fmtName(&nbuf, "{s}.g_b_proj", .{sa}), @intCast(cfg.linear_head_dim));
     defer gb_q.deinit();
     const g_b = try quantize_mod.dequantizeAs(ctx, .{ .data = gb_q.data, .scales = gb_q.scales, .biases = gb_q.biases, .config = gb_q.cfg, .original_shape = &[_]i32{} }, .float32);
     defer g_b.deinit();
 
-    const a_log = try loadTensor(index, fmtName(&nbuf, "{s}.forget_gate.A_log", .{sa}));
+    const a_log = try ws.tensor(fmtName(&nbuf, "{s}.forget_gate.A_log", .{sa}));
     defer a_log.deinit();
-    const dt_bias = try loadTensor(index, fmtName(&nbuf, "{s}.forget_gate.dt_bias", .{sa}));
+    const dt_bias = try ws.tensor(fmtName(&nbuf, "{s}.forget_gate.dt_bias", .{sa}));
     defer dt_bias.deinit();
-    const o_norm_w = try loadTensor(index, fmtName(&nbuf, "{s}.o_norm.weight", .{sa}));
+    const o_norm_w = try ws.tensor(fmtName(&nbuf, "{s}.o_norm.weight", .{sa}));
     defer o_norm_w.deinit();
     const o_norm_f32 = try ops.astype(ctx, o_norm_w, .float32);
     defer o_norm_f32.deinit();
@@ -287,10 +338,24 @@ pub fn kdaAttnBranch(
     };
     // Weight Arrays are owned by the defers above — do NOT call kda.deinit().
 
-    var cache = try glm53_kda.GlmKdaCache.init(allocator, cfg.linear_conv_kernel, 3 * cfg.linear_num_heads * cfg.linear_head_dim, cfg.linear_num_heads, cfg.linear_head_dim);
-    defer cache.deinit();
+    var tmp_cache: ?glm53_kda.GlmKdaCache = null;
+    defer if (tmp_cache) |*tc| tc.deinit();
+    const cache = kda_cache orelse blk: {
+        tmp_cache = try glm53_kda.GlmKdaCache.init(allocator, cfg.linear_conv_kernel, 3 * cfg.linear_num_heads * cfg.linear_head_dim, cfg.linear_num_heads, cfg.linear_head_dim);
+        break :blk &tmp_cache.?;
+    };
 
-    const kda_out = try kda.prefill(allocator, pre.normed, &cache); // [1, L, hidden] f32
+    const n = pre.normed.shape()[1];
+    const kda_out = if (n > 1)
+        try kda.prefill(allocator, pre.normed, cache) // [1, L, hidden] f32; advances cache
+    else blk: {
+        // Decode step: [1,1,hidden] -> GlmKDA.forward on [1,hidden].
+        const step_in = try ops.reshape(ctx, pre.normed, &[_]i32{ 1, @intCast(cfg.hidden_size) });
+        defer step_in.deinit();
+        const step_out = try kda.forward(step_in, cache);
+        defer step_out.deinit();
+        break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, @intCast(cfg.hidden_size) });
+    };
     defer kda_out.deinit();
     // HC expand (apply_branch post): post * out + comb^T @ residual.
     // NOTE: the harness deliberately keeps the residual in f32 across layers
@@ -303,7 +368,7 @@ pub fn kdaAttnBranch(
 /// Dense MLP branch (ffn_hc + post_attention_layernorm + SwiGLU MLP + expand).
 pub fn denseFfnBranch(
     ctx: EagerContext,
-    index: *safetensors_reader.TensorIndex,
+    ws: WeightSource,
     cfg: *const glm53_loader.Glm53Config,
     layer_idx: u32,
     residual: Array,
@@ -315,12 +380,12 @@ pub fn denseFfnBranch(
     var nbuf: [256]u8 = undefined;
     var nbuf2: [256]u8 = undefined;
 
-    var pre = try hcPre(ctx, index, cfg, fmtName(&nbuf, "{s}.ffn_hc", .{p}), fmtName(&nbuf2, "{s}.post_attention_layernorm.weight", .{p}), residual, stream_raw);
+    var pre = try hcPre(ctx, ws, cfg, fmtName(&nbuf, "{s}.ffn_hc", .{p}), fmtName(&nbuf2, "{s}.post_attention_layernorm.weight", .{p}), residual, stream_raw);
     defer pre.deinit();
 
-    var gate_up_q = try loadQuantized(index, fmtName(&nbuf, "{s}.mlp.gate_up_proj", .{p}), hidden);
+    var gate_up_q = try ws.quantized(fmtName(&nbuf, "{s}.mlp.gate_up_proj", .{p}), hidden);
     defer gate_up_q.deinit();
-    var down_q = try loadQuantized(index, fmtName(&nbuf, "{s}.mlp.down_proj", .{p}), @intCast(cfg.intermediate_size));
+    var down_q = try ws.quantized(fmtName(&nbuf, "{s}.mlp.down_proj", .{p}), @intCast(cfg.intermediate_size));
     defer down_q.deinit();
 
     const mlp = glm53_attn.Glm53Mlp{
@@ -340,12 +405,13 @@ pub const MlaBranchResult = struct { residual: Array, topk: Array };
 
 pub fn mlaAttnBranch(
     ctx: EagerContext,
-    index: *safetensors_reader.TensorIndex,
+    ws: WeightSource,
     allocator: std.mem.Allocator,
     cfg: *const glm53_loader.Glm53Config,
     layer_idx: u32,
     residual: Array,
     stream_raw: c.c.mlx_stream,
+    mla_cache: ?*glm53_attn.Glm53MlaCache,
 ) !MlaBranchResult {
     const hidden: i32 = @intCast(cfg.hidden_size);
     var pbuf: [64]u8 = undefined;
@@ -355,34 +421,34 @@ pub fn mlaAttnBranch(
     var sabuf: [96]u8 = undefined;
     const sa = fmtName(&sabuf, "{s}.self_attn", .{p});
 
-    var pre = try hcPre(ctx, index, cfg, fmtName(&nbuf, "{s}.attn_hc", .{p}), fmtName(&nbuf2, "{s}.input_layernorm.weight", .{p}), residual, stream_raw);
+    var pre = try hcPre(ctx, ws, cfg, fmtName(&nbuf, "{s}.attn_hc", .{p}), fmtName(&nbuf2, "{s}.input_layernorm.weight", .{p}), residual, stream_raw);
     defer pre.deinit();
 
-    var qkv_a_q = try loadQuantized(index, fmtName(&nbuf, "{s}.qkv_a_proj", .{sa}), hidden);
+    var qkv_a_q = try ws.quantized(fmtName(&nbuf, "{s}.qkv_a_proj", .{sa}), hidden);
     defer qkv_a_q.deinit();
-    var q_b_q = try loadQuantized(index, fmtName(&nbuf, "{s}.q_b_proj", .{sa}), @intCast(cfg.q_lora_rank));
+    var q_b_q = try ws.quantized(fmtName(&nbuf, "{s}.q_b_proj", .{sa}), @intCast(cfg.q_lora_rank));
     defer q_b_q.deinit();
-    var o_q = try loadQuantized(index, fmtName(&nbuf, "{s}.o_proj", .{sa}), @intCast(cfg.num_attention_heads * cfg.v_head_dim));
+    var o_q = try ws.quantized(fmtName(&nbuf, "{s}.o_proj", .{sa}), @intCast(cfg.num_attention_heads * cfg.v_head_dim));
     defer o_q.deinit();
 
-    const q_a_ln = try loadTensor(index, fmtName(&nbuf, "{s}.q_a_layernorm.weight", .{sa}));
+    const q_a_ln = try ws.tensor(fmtName(&nbuf, "{s}.q_a_layernorm.weight", .{sa}));
     defer q_a_ln.deinit();
     const q_a_ln_f32 = try ops.astype(ctx, q_a_ln, .float32);
     defer q_a_ln_f32.deinit();
-    const kv_a_ln = try loadTensor(index, fmtName(&nbuf, "{s}.kv_a_layernorm.weight", .{sa}));
+    const kv_a_ln = try ws.tensor(fmtName(&nbuf, "{s}.kv_a_layernorm.weight", .{sa}));
     defer kv_a_ln.deinit();
     const kv_a_ln_f32 = try ops.astype(ctx, kv_a_ln, .float32);
     defer kv_a_ln_f32.deinit();
 
     // Per-head MultiLinear weights: dequantize once, keep both orientations.
-    var embed_q_q = try loadQuantized(index, fmtName(&nbuf, "{s}.embed_q", .{sa}), @intCast(cfg.qk_nope_head_dim));
+    var embed_q_q = try ws.quantized(fmtName(&nbuf, "{s}.embed_q", .{sa}), @intCast(cfg.qk_nope_head_dim));
     defer embed_q_q.deinit();
     const embed_q_w = try quantize_mod.dequantizeAs(ctx, .{ .data = embed_q_q.data, .scales = embed_q_q.scales, .biases = embed_q_q.biases, .config = embed_q_q.cfg, .original_shape = &[_]i32{} }, .bfloat16);
     defer embed_q_w.deinit(); // [H, kv_lora, qk_nope]
     const embed_q_t = try ops.transposeAxes(ctx, embed_q_w, &[_]i32{ 0, 2, 1 });
     defer embed_q_t.deinit(); // [H, qk_nope, kv_lora]
 
-    var unembed_q = try loadQuantized(index, fmtName(&nbuf, "{s}.unembed_out", .{sa}), @intCast(cfg.kv_lora_rank));
+    var unembed_q = try ws.quantized(fmtName(&nbuf, "{s}.unembed_out", .{sa}), @intCast(cfg.kv_lora_rank));
     defer unembed_q.deinit();
     const unembed_w = try quantize_mod.dequantizeAs(ctx, .{ .data = unembed_q.data, .scales = unembed_q.scales, .biases = unembed_q.biases, .config = unembed_q.cfg, .original_shape = &[_]i32{} }, .bfloat16);
     defer unembed_w.deinit(); // [H, v_head, kv_lora]
@@ -392,27 +458,27 @@ pub fn mlaAttnBranch(
     // Indexer weights.
     var ixbuf: [112]u8 = undefined;
     const ix = fmtName(&ixbuf, "{s}.indexer", .{sa});
-    var wq_b_q = try loadQuantized(index, fmtName(&nbuf, "{s}.wq_b", .{ix}), @intCast(cfg.q_lora_rank));
+    var wq_b_q = try ws.quantized(fmtName(&nbuf, "{s}.wq_b", .{ix}), @intCast(cfg.q_lora_rank));
     defer wq_b_q.deinit();
-    var wk_q = try loadQuantized(index, fmtName(&nbuf, "{s}.wk", .{ix}), hidden);
+    var wk_q = try ws.quantized(fmtName(&nbuf, "{s}.wk", .{ix}), hidden);
     defer wk_q.deinit();
-    var weights_proj_q = try loadQuantized(index, fmtName(&nbuf, "{s}.weights_proj", .{ix}), hidden);
+    var weights_proj_q = try ws.quantized(fmtName(&nbuf, "{s}.weights_proj", .{ix}), hidden);
     defer weights_proj_q.deinit();
 
-    const k_norm_w = try loadTensor(index, fmtName(&nbuf, "{s}.k_norm.weight", .{ix}));
+    const k_norm_w = try ws.tensor(fmtName(&nbuf, "{s}.k_norm.weight", .{ix}));
     defer k_norm_w.deinit();
     const k_norm_w_f32 = try ops.astype(ctx, k_norm_w, .float32);
     defer k_norm_w_f32.deinit();
-    const k_norm_b = try loadTensor(index, fmtName(&nbuf, "{s}.k_norm.bias", .{ix}));
+    const k_norm_b = try ws.tensor(fmtName(&nbuf, "{s}.k_norm.bias", .{ix}));
     defer k_norm_b.deinit();
     const k_norm_b_f32 = try ops.astype(ctx, k_norm_b, .float32);
     defer k_norm_b_f32.deinit();
 
-    const ape = try loadTensor(index, fmtName(&nbuf, "{s}.index_kpool_compress_ape", .{ix}));
+    const ape = try ws.tensor(fmtName(&nbuf, "{s}.index_kpool_compress_ape", .{ix}));
     defer ape.deinit();
     const ape_f32 = try ops.astype(ctx, ape, .float32);
     defer ape_f32.deinit();
-    const compress_gate = try loadTensor(index, fmtName(&nbuf, "{s}.index_kpool_compress_gate", .{ix}));
+    const compress_gate = try ws.tensor(fmtName(&nbuf, "{s}.index_kpool_compress_gate", .{ix}));
     defer compress_gate.deinit();
     const compress_gate_f32 = try ops.astype(ctx, compress_gate, .float32);
     defer compress_gate_f32.deinit();
@@ -453,7 +519,11 @@ pub fn mlaAttnBranch(
         .indexer = indexer,
     };
 
-    const result = try mla.forward(allocator, pre.normed);
+    const n = pre.normed.shape()[1];
+    const result = if (n > 1 or mla_cache == null)
+        try mla.forward(allocator, pre.normed, mla_cache)
+    else
+        try mla.forwardStep(allocator, pre.normed, mla_cache.?);
     defer result.out.deinit();
     errdefer result.topk.deinit();
     const out = try dsv4.mhcPost(ctx, result.out, residual, pre.post_mix, pre.comb_norm, stream_raw);
@@ -573,6 +643,41 @@ pub const Glm53Moe = struct {
         return w.down.apply(ctx, h);
     }
 
+    /// Streaming MoE for serving: routed experts computed by the Task-4
+    /// ExpertStreamProvider (batched SwitchGLU, scores applied after), shared
+    /// expert added at the end — same math as `forward`, batched reduction.
+    pub fn forwardStreaming(
+        self: *const Glm53Moe,
+        allocator: std.mem.Allocator,
+        x: Array,
+        layer_idx: usize,
+        sp: *expert_stream.ExpertStreamProvider,
+    ) !Array {
+        const ctx = self.ctx;
+        const sh = x.shape();
+        const b = sh[0];
+        const l = sh[1];
+        const hidden = sh[2];
+        const n = b * l;
+
+        const shared_out = try self.shared.forward(x);
+        defer shared_out.deinit();
+
+        const x_flat = try ops.reshape(ctx, x, &[_]i32{ n, hidden });
+        defer x_flat.deinit();
+
+        var rte = try self.route(x_flat);
+        defer rte.indices.deinit();
+        defer rte.weights.deinit();
+
+        const routed = try sp.streamForward(layer_idx, x_flat, rte.indices, rte.weights);
+        defer routed.deinit(); // [N, hidden]
+        const routed3 = try ops.reshape(ctx, routed, &[_]i32{ b, l, hidden });
+        defer routed3.deinit();
+        _ = allocator;
+        return ops.add(ctx, routed3, shared_out);
+    }
+
     /// Full MoE: shared expert + sum_k w_k * expert_k(x). Expert weights are
     /// pulled from the provider per selected expert id (provider caches).
     /// x: [B, L, hidden]; returns [B, L, hidden].
@@ -640,6 +745,70 @@ pub const Glm53Moe = struct {
     }
 };
 
+/// Expert weight provider backed by on-demand pread row slices, one cache
+/// per MoE layer.
+pub const ReaderExpertProvider = struct {
+    reader: *safetensors_reader.PartialTensorReader,
+    ectx: EagerContext,
+    allocator: std.mem.Allocator,
+    cfg: *const glm53_loader.Glm53Config,
+    switch_prefix: []const u8, // "language_model.model.layers.{i}.mlp.switch_mlp"
+    cache: std.AutoHashMap(u32, QuantParts3),
+
+    const QuantParts3 = struct { gate: QuantParts, up: QuantParts, down: QuantParts };
+
+    fn loadFn(opaque_ctx: *anyopaque, e: u32) anyerror!ExpertWeights {
+        const self: *ReaderExpertProvider = @ptrCast(@alignCast(opaque_ctx));
+        const gop = try self.cache.getOrPut(e);
+        if (!gop.found_existing) {
+            errdefer self.cache.removeByPtr(gop.key_ptr);
+            gop.value_ptr.* = try self.loadOne(e);
+        }
+        const v = gop.value_ptr;
+        return .{ .gate = v.gate.linear(), .up = v.up.linear(), .down = v.down.linear() };
+    }
+
+    fn releaseAllFn(opaque_ctx: *anyopaque) void {
+        const self: *ReaderExpertProvider = @ptrCast(@alignCast(opaque_ctx));
+        var it = self.cache.valueIterator();
+        while (it.next()) |v| {
+            v.gate.deinit();
+            v.up.deinit();
+            v.down.deinit();
+        }
+        self.cache.clearRetainingCapacity();
+    }
+
+    fn loadOne(self: *ReaderExpertProvider, e: u32) !QuantParts3 {
+        const ids = [_]u32{e};
+        const cfg = self.cfg;
+        const reader = self.reader;
+        const ctx = self.ectx;
+        var result: QuantParts3 = undefined;
+        var done: usize = 0;
+        errdefer {
+            // Release whichever projections were fully built.
+            if (done > 0) result.gate.deinit();
+            if (done > 1) result.up.deinit();
+            if (done > 2) result.down.deinit();
+        }
+        inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
+            const in_f: i32 = if (pi == 2) @intCast(cfg.moe_intermediate_size) else @intCast(cfg.hidden_size);
+            var bb: [160]u8 = undefined;
+            const base = fmtName(&bb, "{s}.{s}", .{ self.switch_prefix, proj });
+            const qp = loadExpertQuant(reader, ctx, base, &ids, in_f);
+            switch (pi) {
+                0 => result.gate = try qp,
+                1 => result.up = try qp,
+                2 => result.down = try qp,
+                else => unreachable,
+            }
+            done += 1;
+        }
+        return result;
+    }
+};
+
 // ============================================================
 // Model assembly
 // ============================================================
@@ -657,76 +826,17 @@ pub const Glm53Model = struct {
     allocator: std.mem.Allocator,
     ctx: EagerContext,
     cfg: *const glm53_loader.Glm53Config,
-    index: *safetensors_reader.TensorIndex,
+    ws: WeightSource,
     /// Expert row reads go through this (mmap zero-copy / pread fallback).
     reader: *safetensors_reader.PartialTensorReader,
     stream: c.c.mlx_stream,
-
-    /// Expert weight provider backed by on-demand pread row slices, one cache
-    /// per MoE layer.
-    const SafetensorsExpertProvider = struct {
-        model: *const Glm53Model,
-        switch_prefix: []const u8, // "language_model.model.layers.{i}.mlp.switch_mlp"
-        cache: std.AutoHashMap(u32, QuantParts3),
-
-        const QuantParts3 = struct { gate: QuantParts, up: QuantParts, down: QuantParts };
-
-        fn loadFn(opaque_ctx: *anyopaque, e: u32) anyerror!ExpertWeights {
-            const self: *SafetensorsExpertProvider = @ptrCast(@alignCast(opaque_ctx));
-            const gop = try self.cache.getOrPut(e);
-            if (!gop.found_existing) {
-                errdefer self.cache.removeByPtr(gop.key_ptr);
-                gop.value_ptr.* = try self.loadOne(e);
-            }
-            const v = gop.value_ptr;
-            return .{ .gate = v.gate.linear(), .up = v.up.linear(), .down = v.down.linear() };
-        }
-
-        fn releaseAllFn(opaque_ctx: *anyopaque) void {
-            const self: *SafetensorsExpertProvider = @ptrCast(@alignCast(opaque_ctx));
-            var it = self.cache.valueIterator();
-            while (it.next()) |v| {
-                v.gate.deinit();
-                v.up.deinit();
-                v.down.deinit();
-            }
-            self.cache.clearRetainingCapacity();
-        }
-
-        fn loadOne(self: *SafetensorsExpertProvider, e: u32) !QuantParts3 {
-            const m = self.model;
-            const ids = [_]u32{e};
-            var result: QuantParts3 = undefined;
-            var done: usize = 0;
-            errdefer {
-                // Release whichever projections were fully built.
-                if (done > 0) result.gate.deinit();
-                if (done > 1) result.up.deinit();
-                if (done > 2) result.down.deinit();
-            }
-            inline for (.{ "gate_proj", "up_proj", "down_proj" }, 0..) |proj, pi| {
-                const in_f: i32 = if (pi == 2) @intCast(m.cfg.moe_intermediate_size) else @intCast(m.cfg.hidden_size);
-                var bb: [160]u8 = undefined;
-                const base = fmtName(&bb, "{s}.{s}", .{ self.switch_prefix, proj });
-                const qp = loadExpertQuant(m.reader, m.ctx, base, &ids, in_f);
-                switch (pi) {
-                    0 => result.gate = try qp,
-                    1 => result.up = try qp,
-                    2 => result.down = try qp,
-                    else => unreachable,
-                }
-                done += 1;
-            }
-            return result;
-        }
-    };
 
     /// embed_tokens lookup → [1, L, hidden] (pre-expansion, matches the
     /// oracle's `embed` dump point).
     fn embedTokens(self: *const Glm53Model, ids: []const i32) !Array {
         const ctx = self.ctx;
         const hidden: i32 = @intCast(self.cfg.hidden_size);
-        var embed_q = try loadQuantized(self.index, "language_model.model.embed_tokens", hidden);
+        var embed_q = try self.ws.quantized("language_model.model.embed_tokens", hidden);
         defer embed_q.deinit();
         const embed_w = try quantize_mod.dequantizeAs(ctx, .{
             .data = embed_q.data,
@@ -753,14 +863,14 @@ pub const Glm53Model = struct {
         defer h_f32.deinit();
         const mean_h = try reduce_mod.meanAxis(ctx, h_f32, 2, false);
         defer mean_h.deinit(); // [1, L, hidden]
-        const norm_w = try loadTensor(self.index, "language_model.model.norm.weight");
+        const norm_w = try self.ws.tensor("language_model.model.norm.weight");
         defer norm_w.deinit();
         const norm_w_f32 = try ops.astype(ctx, norm_w, .float32);
         defer norm_w_f32.deinit();
         const normed = try fast_mod.rmsNorm(ctx, mean_h, norm_w_f32, self.cfg.rms_norm_eps);
         defer normed.deinit();
 
-        var head_q = try loadQuantized(self.index, "language_model.lm_head", hidden);
+        var head_q = try self.ws.quantized("language_model.lm_head", hidden);
         defer head_q.deinit();
         return head_q.linear().apply(ctx, normed);
     }
@@ -800,7 +910,7 @@ pub const Glm53Model = struct {
             }
 
             if (cfg.isFullAttention(layer)) {
-                const res = try mlaAttnBranch(self.ctx, self.index, allocator, cfg, layer, h, self.stream);
+                const res = try mlaAttnBranch(self.ctx, self.ws, allocator, cfg, layer, h, self.stream, null);
                 h.deinit();
                 h = res.residual;
                 defer res.topk.deinit();
@@ -813,7 +923,7 @@ pub const Glm53Model = struct {
                     try hk.func(hk.ctx, name, h);
                 }
             } else {
-                const next = try kdaAttnBranch(self.ctx, self.index, allocator, cfg, layer, h, self.stream);
+                const next = try kdaAttnBranch(self.ctx, self.ws, allocator, cfg, layer, h, self.stream, null);
                 h.deinit();
                 h = next;
                 if (opts.hook) |hk| {
@@ -831,7 +941,7 @@ pub const Glm53Model = struct {
                     try hk.func(hk.ctx, name, h);
                 }
             } else {
-                const next = try denseFfnBranch(self.ctx, self.index, cfg, layer, h, self.stream);
+                const next = try denseFfnBranch(self.ctx, self.ws, cfg, layer, h, self.stream);
                 h.deinit();
                 h = next;
             }
@@ -853,7 +963,7 @@ pub const Glm53Model = struct {
             defer h_f32.deinit();
             const mean_h = try reduce_mod.meanAxis(self.ctx, h_f32, 2, false);
             defer mean_h.deinit();
-            const norm_w = try loadTensor(self.index, "language_model.model.norm.weight");
+            const norm_w = try self.ws.tensor("language_model.model.norm.weight");
             defer norm_w.deinit();
             const norm_w_f32 = try ops.astype(self.ctx, norm_w, .float32);
             defer norm_w_f32.deinit();
@@ -866,75 +976,274 @@ pub const Glm53Model = struct {
 
     /// Sparse MoE ffn branch (ffn_hc + post_attention_layernorm + MoE).
     fn moeFfnBranch(self: *const Glm53Model, layer_idx: u32, residual: Array) !Array {
-        const allocator = self.allocator;
-        const ctx = self.ctx;
-        const cfg = self.cfg;
-        const hidden: i32 = @intCast(cfg.hidden_size);
-        var pbuf: [64]u8 = undefined;
-        const p = fmtName(&pbuf, "language_model.model.layers.{d}", .{layer_idx});
-        var nbuf: [256]u8 = undefined;
-        var nbuf2: [256]u8 = undefined;
+        return moeFfnBranchImpl(self.ctx, self.ws, self.reader, null, self.allocator, self.cfg, layer_idx, residual, self.stream);
+    }
+};
 
-        var pre = try hcPre(ctx, self.index, cfg, fmtName(&nbuf, "{s}.ffn_hc", .{p}), fmtName(&nbuf2, "{s}.post_attention_layernorm.weight", .{p}), residual, self.stream);
-        defer pre.deinit();
+/// Sparse MoE ffn branch (ffn_hc + post_attention_layernorm + MoE).
+/// When `sp` is set (serving), routed experts go through the Task-4
+/// ExpertStreamProvider; otherwise per-expert rows are pread on demand via
+/// ReaderExpertProvider.
+fn moeFfnBranchImpl(
+    ctx: EagerContext,
+    ws: WeightSource,
+    reader: *safetensors_reader.PartialTensorReader,
+    sp: ?*expert_stream.ExpertStreamProvider,
+    allocator: std.mem.Allocator,
+    cfg: *const glm53_loader.Glm53Config,
+    layer_idx: u32,
+    residual: Array,
+    stream: c.c.mlx_stream,
+) !Array {
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    var pbuf: [64]u8 = undefined;
+    const p = fmtName(&pbuf, "language_model.model.layers.{d}", .{layer_idx});
+    var nbuf: [256]u8 = undefined;
+    var nbuf2: [256]u8 = undefined;
 
-        var mpbuf: [96]u8 = undefined;
-        const mlp_p = fmtName(&mpbuf, "{s}.mlp", .{p});
-        const gate_w = try loadTensor(self.index, fmtName(&nbuf, "{s}.gate.weight", .{mlp_p}));
-        defer gate_w.deinit();
-        const gate_w_f32 = try ops.astype(ctx, gate_w, .float32);
-        defer gate_w_f32.deinit();
-        const gate_w_t = try ops.transpose(ctx, gate_w_f32);
-        defer gate_w_t.deinit();
-        const gate_bias = try loadTensor(self.index, fmtName(&nbuf, "{s}.gate.e_score_correction_bias", .{mlp_p}));
-        defer gate_bias.deinit();
-        const gate_bias_f32 = try ops.astype(ctx, gate_bias, .float32);
-        defer gate_bias_f32.deinit();
+    var pre = try hcPre(ctx, ws, cfg, fmtName(&nbuf, "{s}.ffn_hc", .{p}), fmtName(&nbuf2, "{s}.post_attention_layernorm.weight", .{p}), residual, stream);
+    defer pre.deinit();
 
-        var shared_gate_up_q = try loadQuantized(self.index, fmtName(&nbuf, "{s}.shared_experts.gate_up_proj", .{mlp_p}), hidden);
-        defer shared_gate_up_q.deinit();
-        var shared_down_q = try loadQuantized(self.index, fmtName(&nbuf, "{s}.shared_experts.down_proj", .{mlp_p}), @intCast(cfg.moe_intermediate_size * cfg.n_shared_experts));
-        defer shared_down_q.deinit();
+    var mpbuf: [96]u8 = undefined;
+    const mlp_p = fmtName(&mpbuf, "{s}.mlp", .{p});
+    const gate_w = try ws.tensor(fmtName(&nbuf, "{s}.gate.weight", .{mlp_p}));
+    defer gate_w.deinit();
+    const gate_w_f32 = try ops.astype(ctx, gate_w, .float32);
+    defer gate_w_f32.deinit();
+    const gate_w_t = try ops.transpose(ctx, gate_w_f32);
+    defer gate_w_t.deinit();
+    const gate_bias = try ws.tensor(fmtName(&nbuf, "{s}.gate.e_score_correction_bias", .{mlp_p}));
+    defer gate_bias.deinit();
+    const gate_bias_f32 = try ops.astype(ctx, gate_bias, .float32);
+    defer gate_bias_f32.deinit();
 
-        const moe = Glm53Moe{
+    var shared_gate_up_q = try ws.quantized(fmtName(&nbuf, "{s}.shared_experts.gate_up_proj", .{mlp_p}), hidden);
+    defer shared_gate_up_q.deinit();
+    var shared_down_q = try ws.quantized(fmtName(&nbuf, "{s}.shared_experts.down_proj", .{mlp_p}), @intCast(cfg.moe_intermediate_size * cfg.n_shared_experts));
+    defer shared_down_q.deinit();
+
+    const moe = Glm53Moe{
+        .ctx = ctx,
+        .n_experts = @intCast(cfg.n_routed_experts),
+        .top_k = @intCast(cfg.num_experts_per_tok),
+        .scaling = cfg.routed_scaling_factor,
+        .norm_topk_prob = cfg.norm_topk_prob,
+        .swiglu_limit = cfg.swiglu_limit,
+        .gate_w_t = gate_w_t,
+        .gate_bias = gate_bias_f32,
+        .shared = .{
             .ctx = ctx,
-            .n_experts = @intCast(cfg.n_routed_experts),
-            .top_k = @intCast(cfg.num_experts_per_tok),
-            .scaling = cfg.routed_scaling_factor,
-            .norm_topk_prob = cfg.norm_topk_prob,
+            .gate_up_proj = shared_gate_up_q.linear(),
+            .down_proj = shared_down_q.linear(),
             .swiglu_limit = cfg.swiglu_limit,
-            .gate_w_t = gate_w_t,
-            .gate_bias = gate_bias_f32,
-            .shared = .{
-                .ctx = ctx,
-                .gate_up_proj = shared_gate_up_q.linear(),
-                .down_proj = shared_down_q.linear(),
-                .swiglu_limit = cfg.swiglu_limit,
-            },
-        };
+        },
+    };
 
+    const moe_out = if (sp) |provider|
+        try moe.forwardStreaming(allocator, pre.normed, layer_idx, provider)
+    else blk: {
         var spbuf: [160]u8 = undefined;
-        var provider = SafetensorsExpertProvider{
-            .model = self,
+        var provider = ReaderExpertProvider{
+            .reader = reader,
+            .ectx = ctx,
+            .allocator = allocator,
+            .cfg = cfg,
             .switch_prefix = fmtName(&spbuf, "{s}.switch_mlp", .{mlp_p}),
-            .cache = std.AutoHashMap(u32, SafetensorsExpertProvider.QuantParts3).init(allocator),
+            .cache = std.AutoHashMap(u32, ReaderExpertProvider.QuantParts3).init(allocator),
         };
         defer provider.cache.deinit();
-        defer SafetensorsExpertProvider.releaseAllFn(&provider);
-
-        const moe_out = try moe.forward(allocator, pre.normed, .{
+        defer ReaderExpertProvider.releaseAllFn(&provider);
+        break :blk try moe.forward(allocator, pre.normed, .{
             .ctx = &provider,
-            .loadFn = SafetensorsExpertProvider.loadFn,
-            .releaseAllFn = SafetensorsExpertProvider.releaseAllFn,
+            .loadFn = ReaderExpertProvider.loadFn,
+            .releaseAllFn = ReaderExpertProvider.releaseAllFn,
         });
-        defer moe_out.deinit();
-        // Evaluate before returning: the branch defers release the expert
-        // weights/provider cache, and the caller's hook evals the result only
-        // after those defers have run — the lazy graph must be materialized
-        // while its inputs are still alive.
-        const out = try dsv4.mhcPost(ctx, moe_out, residual, pre.post_mix, pre.comb_norm, self.stream);
-        try out.eval();
-        return out;
+    };
+    defer moe_out.deinit();
+    // Evaluate before returning: the branch defers release the expert
+    // weights/provider cache, and the caller's hook evals the result only
+    // after those defers have run — the lazy graph must be materialized
+    // while its inputs are still alive.
+    const out = try dsv4.mhcPost(ctx, moe_out, residual, pre.post_mix, pre.comb_norm, stream);
+    try out.eval();
+    return out;
+}
+
+// ============================================================
+// Serving model: resident backbone + per-layer decode caches
+// ============================================================
+
+/// embedTokens on a WeightSource (shared by the harness model and serving).
+pub fn embedTokensWs(ctx: EagerContext, ws: WeightSource, allocator: std.mem.Allocator, cfg: *const glm53_loader.Glm53Config, ids: []const i32) !Array {
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    var embed_q = try ws.quantized("language_model.model.embed_tokens", hidden);
+    defer embed_q.deinit();
+    const embed_w = try quantize_mod.dequantizeAs(ctx, .{
+        .data = embed_q.data,
+        .scales = embed_q.scales,
+        .biases = embed_q.biases,
+        .config = embed_q.cfg,
+        .original_shape = &[_]i32{},
+    }, .bfloat16);
+    defer embed_w.deinit();
+    try embed_w.eval();
+
+    const id_arr = try Array.fromData(allocator, i32, ids, &[_]i32{@intCast(ids.len)});
+    defer id_arr.deinit();
+    const rows = try shape_mod.takeAxis(ctx, embed_w, id_arr, 0);
+    defer rows.deinit();
+    return ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(ids.len), hidden });
+}
+
+/// hidden [1, L, hc_mult, hidden] → norm(mean(h, axis=2)) → lm_head logits.
+pub fn finalLogitsWs(ctx: EagerContext, ws: WeightSource, cfg: *const glm53_loader.Glm53Config, h: Array) !Array {
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    const h_f32 = try ops.astype(ctx, h, .float32);
+    defer h_f32.deinit();
+    const mean_h = try reduce_mod.meanAxis(ctx, h_f32, 2, false);
+    defer mean_h.deinit(); // [1, L, hidden]
+    const norm_w = try ws.tensor("language_model.model.norm.weight");
+    defer norm_w.deinit();
+    const norm_w_f32 = try ops.astype(ctx, norm_w, .float32);
+    defer norm_w_f32.deinit();
+    const normed = try fast_mod.rmsNorm(ctx, mean_h, norm_w_f32, cfg.rms_norm_eps);
+    defer normed.deinit();
+
+    var head_q = try ws.quantized("language_model.lm_head", hidden);
+    defer head_q.deinit();
+    return head_q.linear().apply(ctx, normed);
+}
+
+/// Per-layer decode state.
+pub const Glm53LayerCache = union(enum) {
+    kda: glm53_kda.GlmKdaCache,
+    mla: glm53_attn.Glm53MlaCache,
+
+    pub fn deinit(self: *Glm53LayerCache) void {
+        switch (self.*) {
+            .kda => |*kc| kc.deinit(),
+            .mla => |*mc| mc.deinit(),
+        }
+    }
+};
+
+/// Resident serving model: backbone weights live in a map (loaded once,
+/// borrowed via WeightSource.fromMap COW copies); MoE experts stream through
+/// the Task-4 ExpertStreamProvider (or per-call pread when smelt is off).
+/// Per-layer caches (KDA conv+ssm state / MLA latent + indexer history) are
+/// internal — the KVCacheStrategy array from the engine is unused.
+///
+/// LIMITATION: caches are not reset between requests. forwardTokens treats
+/// any L>1 input as a fresh prefill and resets state; the engine's decode
+/// calls are always L=1.
+pub const Glm53ServingModel = struct {
+    allocator: std.mem.Allocator,
+    ctx: EagerContext,
+    cfg: *const glm53_loader.Glm53Config,
+    stream: c.c.mlx_stream,
+    ws: WeightSource,
+    ws_backing: WeightSource.MapBacked,
+    weights: std.StringHashMap(Array), // resident backbone, owned
+    reader: *safetensors_reader.PartialTensorReader,
+    stream_provider: ?*expert_stream.ExpertStreamProvider,
+    caches: []Glm53LayerCache,
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ctx: EagerContext,
+        cfg: *const glm53_loader.Glm53Config,
+        stream: c.c.mlx_stream,
+        weights: std.StringHashMap(Array),
+        reader: *safetensors_reader.PartialTensorReader,
+        stream_provider: ?*expert_stream.ExpertStreamProvider,
+    ) !Glm53ServingModel {
+        const caches = try allocator.alloc(Glm53LayerCache, cfg.num_hidden_layers);
+        errdefer allocator.free(caches);
+        for (caches, 0..) |*lc, i| {
+            if (cfg.isFullAttention(@intCast(i))) {
+                lc.* = .{ .mla = .{} };
+            } else {
+                lc.* = .{ .kda = try glm53_kda.GlmKdaCache.init(allocator, cfg.linear_conv_kernel, 3 * cfg.linear_num_heads * cfg.linear_head_dim, cfg.linear_num_heads, cfg.linear_head_dim) };
+            }
+        }
+        var self = Glm53ServingModel{
+            .allocator = allocator,
+            .ctx = ctx,
+            .cfg = cfg,
+            .stream = stream,
+            .ws = undefined,
+            .ws_backing = undefined,
+            .weights = weights,
+            .reader = reader,
+            .stream_provider = stream_provider,
+            .caches = caches,
+        };
+        self.ws = WeightSource.fromMap(&self.weights, ctx, &self.ws_backing);
+        return self;
+    }
+
+    pub fn deinit(self: *Glm53ServingModel) void {
+        for (self.caches) |*lc| lc.deinit();
+        self.allocator.free(self.caches);
+        // weights map entries are owned by the caller (registry adapter).
+    }
+
+    /// Reset all per-layer decode state (fresh request).
+    pub fn reset(self: *Glm53ServingModel) !void {
+        for (self.caches) |*lc| lc.deinit();
+        for (self.caches, 0..) |*lc, i| {
+            if (self.cfg.isFullAttention(@intCast(i))) {
+                lc.* = .{ .mla = .{} };
+            } else {
+                lc.* = .{ .kda = try glm53_kda.GlmKdaCache.init(self.allocator, self.cfg.linear_conv_kernel, 3 * self.cfg.linear_num_heads * self.cfg.linear_head_dim, self.cfg.linear_num_heads, self.cfg.linear_head_dim) };
+            }
+        }
+    }
+
+    /// ids: [L] u32 token ids → logits [1, L, vocab] f32. L>1 = prefill
+    /// (resets state first); L=1 = cached decode step.
+    pub fn forwardTokens(self: *Glm53ServingModel, ids: []const u32) !Array {
+        const allocator = self.allocator;
+        const cfg = self.cfg;
+
+        if (ids.len > 1) try self.reset();
+
+        const ids_i32 = try allocator.alloc(i32, ids.len);
+        defer allocator.free(ids_i32);
+        for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+
+        const emb = try embedTokensWs(self.ctx, self.ws, allocator, cfg, ids_i32);
+        defer emb.deinit();
+        var h = try dsv4.expandToMHC(self.ctx, emb, cfg.hc_mult, self.stream);
+        defer h.deinit();
+
+        var layer: u32 = 0;
+        while (layer < cfg.num_hidden_layers) : (layer += 1) {
+            if (cfg.isFullAttention(layer)) {
+                const res = try mlaAttnBranch(self.ctx, self.ws, allocator, cfg, layer, h, self.stream, &self.caches[layer].mla);
+                h.deinit();
+                h = res.residual;
+                res.topk.deinit();
+            } else {
+                const next = try kdaAttnBranch(self.ctx, self.ws, allocator, cfg, layer, h, self.stream, &self.caches[layer].kda);
+                h.deinit();
+                h = next;
+            }
+            if (cfg.isMoE(layer)) {
+                const next = try moeFfnBranchImpl(self.ctx, self.ws, self.reader, self.stream_provider, allocator, cfg, layer, h, self.stream);
+                h.deinit();
+                h = next;
+            } else {
+                const next = try denseFfnBranch(self.ctx, self.ws, cfg, layer, h, self.stream);
+                h.deinit();
+                h = next;
+            }
+            try h.eval();
+        }
+
+        const logits = try finalLogitsWs(self.ctx, self.ws, cfg, h);
+        try logits.eval();
+        return logits;
     }
 };
 

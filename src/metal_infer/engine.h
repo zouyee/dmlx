@@ -44,14 +44,18 @@ extern "C" {
 #define ATTN_GROUP_SIZE 64 // affine quant group size for attention weights
 #define MOE_GROUP_SIZE 32  // mxfp4 quant group size for expert weights
 #define MHC_MULT 4         // mHC HyperConnection multiplier
-#define MAX_SEQ_LEN 4096   // max sequence length
+#define MAX_SEQ_LEN 65536  // max sequence length (matches YaRN orig_max 64K)
+// Max token rows dispatched through the persistent batch routing scratch.
+// Scalar routing uses row 0; chunked batch prefill stays ≤ max_prefill_chunk
+// (default 8). 64 gives headroom without sizing scratch for MAX_SEQ_LEN rows.
+#define MAX_BATCH_ROUTE_TOKENS 64
 
 // Compressor configuration constants
 #define COMP_HEAD_DIM    512   // main compressor output head_dim = HEAD_DIM
 #define IDX_HEAD_DIM     128   // indexer compressor output head_dim
 #define CSA_OUT_DIM     1024   // ratio=4 CSA: out_dim = head_dim * 2
 #define HCA_OUT_DIM      512   // ratio=128 HCA: out_dim = head_dim
-#define MAX_COMP_BLOCKS 8192   // max compressed blocks per layer per sequence
+#define MAX_COMP_BLOCKS 16384  // max compressed blocks per layer per sequence (CSA ratio=4 → 64K tokens)
 #define SWA_WINDOW       128   // sliding window size (sliding_window in config)
 
 // Per-layer streaming compressor runtime state.
@@ -825,9 +829,9 @@ typedef struct {
     void *buf_gather_mid;            // [N_ACTIVE × INTERMEDIATE] f32 — gather gate+up output
     void *buf_gather_out;            // [N_ACTIVE × DIM] f32 — gather down output
     void *buf_gather_expert_ids;     // [N_ACTIVE] uint32 — current expert IDs for gather dispatch
-    void *buf_gpu_route_selected;    // [MAX_SEQ_LEN × N_ACTIVE] int32 — GPU route IDs
-    void *buf_gpu_route_weights;     // [MAX_SEQ_LEN × N_ACTIVE] f32 — normalized weights
-    void *buf_batch_routing_scores;  // [MAX_SEQ_LEN × N_EXPERTS] f32 — persistent batch input
+    void *buf_gpu_route_selected;    // [MAX_BATCH_ROUTE_TOKENS × N_ACTIVE] int32 — GPU route IDs
+    void *buf_gpu_route_weights;     // [MAX_BATCH_ROUTE_TOKENS × N_ACTIVE] f32 — normalized weights
+    void *buf_batch_routing_scores;  // [MAX_BATCH_ROUTE_TOKENS × N_EXPERTS] f32 — persistent batch input
     void *buf_batch_route_bias;      // [N_EXPERTS] f32 — persistent batch bias scratch
     void *buf_cached_flags;          // [N_EXPERTS] uint8 — 1=cached in SMELT, 0=not
     void *buf_shared_gate;           // [INTERMEDIATE] shared expert gate
@@ -1061,6 +1065,16 @@ typedef struct {
     // Runtime compressor state
     CompressorState comp_state[N_LAYERS];
 
+    // Async compressor/indexer pipeline (DMLX_COMPRESSOR_ASYNC, scalar decode).
+    // One retained id<MTLCommandBuffer> per layer whose GPU projection output
+    // still needs the deferred CPU readback + comp_state update. Harvested at
+    // the next layer's cb2cmd2 wait or via moe_infer_comp_async_flush().
+    void *comp_async_cb[N_LAYERS];
+    int comp_async_pos[N_LAYERS];
+    void *idx_async_cb[N_LAYERS];
+    int idx_async_pos[N_LAYERS];
+    uint32_t comp_async_pending_count;
+
     // Layer config
     LayerConfig layers[N_LAYERS];
 
@@ -1147,6 +1161,12 @@ typedef struct {
     void *lmh_bi;     // biases
     void *lmh_x;      // [DIM] f32 input
     void *lmh_out;    // [vocab] f32 logits output
+
+    // GPU greedy argmax over lmh_out (two-stage reduction, 8-byte readback).
+    void *pipe_argmax_partials;
+    void *pipe_argmax_final;
+    void *buf_argmax_partials;  // [256] {uint32 idx, float val}
+    void *buf_argmax_out;       // [1]   {uint32 idx, float val}
 } MoEInferEngine;
 
 // ============================================================================
@@ -1800,6 +1820,13 @@ void moe_infer_compress_hc(MoEInferEngine *engine, const float *residual, float 
 // Returns 0 on success.
 int moe_infer_get_logits(MoEInferEngine *engine, const float *hidden, float *logits_out);
 
+// Apply final RMSNorm + lm_head matmul on GPU, then a two-stage GPU argmax
+// reduction. Reads back only 8 bytes (argmax index + value) instead of the
+// full logits vector. Requires the quantized lm_head path; returns non-zero
+// when unavailable (caller falls back to moe_infer_get_logits + CPU scan).
+int moe_infer_get_argmax(MoEInferEngine *engine, const float *hidden,
+                         uint32_t *idx_out, float *val_out);
+
 // Initialize gather mode using the SMELT preloaded expert pool.
 // Requires smelt_warmup_done=true and all N_EXPERTS cached for all layers.
 // Creates per-layer NoCopy Metal buffer views over the SMELT RAM pool.
@@ -1872,6 +1899,13 @@ void moe_infer_set_layer_indexer(MoEInferEngine *engine, int layer,
 // Run one token through the compressor. Emits a comp_kv block every `ratio` tokens.
 void moe_infer_compressor_step(MoEInferEngine *engine, int layer, int pos,
                                 const float *attn_normed);
+
+// Drain all deferred async compressor/indexer readbacks (DMLX_COMPRESSOR_ASYNC
+// scalar path): waits for any in-flight projection command buffers and applies
+// the deferred CPU comp_state updates. Must be called before any consumer that
+// reads comp_state outside the scalar decode layer loop (snapshots, rollback,
+// batch/verify transactions, deinit). No-op when nothing is pending.
+void moe_infer_comp_async_flush(MoEInferEngine *engine);
 
 // Bounded sequential variants used by the explicit Wave-2 chunk boundary.
 // They force recurrent projections through the CPU implementation so no

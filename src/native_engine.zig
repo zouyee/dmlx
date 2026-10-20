@@ -2035,7 +2035,7 @@ pub const NativeEngine = struct {
                 &hidden,
                 &compressed,
             );
-            try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
+            const next_token = try self.sampleGreedyToken(&compressed, sampler_config);
             const _t2 = if (_do_decode_time) std.c.mach_absolute_time() else 0;
             if (_do_decode_time) {
                 _t_forward_total += _t1 - _t0;
@@ -2047,7 +2047,6 @@ pub const NativeEngine = struct {
                 metal.decodeTimelineNowNs()
             else
                 0;
-            const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
             try decode_timeline.appendSample(self, sample_begin_ns);
             try decode_timeline.appendTokenForward(self, token_forward_begin_ns);
             try exact_q4.appendLogitsSample(self, logits_sample_begin_ns);
@@ -2334,13 +2333,12 @@ pub const NativeEngine = struct {
                 &hidden,
                 &compressed,
             );
-            try metal.getLogits(self.engine, &compressed, self.logits_buffer.ptr);
+            const next_token = try self.sampleGreedyToken(&compressed, sampler_config);
 
             const sample_begin_ns = if (decode_timeline.enabled)
                 metal.decodeTimelineNowNs()
             else
                 0;
-            const next_token = sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler_config);
             try decode_timeline.appendSample(self, sample_begin_ns);
             try decode_timeline.appendTokenForward(self, token_forward_begin_ns);
             try exact_q4.appendLogitsSample(self, logits_sample_begin_ns);
@@ -2453,6 +2451,20 @@ pub const NativeEngine = struct {
         }
         std.log.info("sampleFromLogits: max_idx={d} max_val={d:.4} logit[0]={d:.4} logit[304]={d:.4}", .{ max_idx, max_val, logits[0], logits[304] });
         return @intCast(max_idx);
+    }
+
+    /// Greedy next-token selection for the decode loop. Prefers the GPU
+    /// two-stage argmax (8-byte readback, no full logits readback); falls
+    /// back to getLogits + CPU scan when the GPU path is unavailable.
+    fn sampleGreedyToken(self: *NativeEngine, compressed: *const [DIM]f32, sampler: *sampling_mod.SamplerConfig) !u32 {
+        var idx: u32 = 0;
+        var val: f32 = 0;
+        if (metal.getArgmax(self.engine, compressed, &idx, &val)) {
+            std.log.info("sampleGreedyToken(gpu): max_idx={d} max_val={d:.4}", .{ idx, val });
+            return idx;
+        } else |_| {}
+        try metal.getLogits(self.engine, compressed, self.logits_buffer.ptr);
+        return sampleFromLogits(self.logits_buffer, self.config.vocab_size, sampler);
     }
 };
 

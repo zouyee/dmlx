@@ -293,48 +293,52 @@ pub const Glm53Indexer = struct {
         return .{ .pool_keys = pool_keys, .pool_indices = indices, .pool_valid = pool_valid };
     }
 
-    /// No-cache forward (oracle `cache is None` path): full prefill selection.
-    /// x: [B,L,hidden] (branch input, pre-norm output); q_resid: [B,L,q_lora_rank].
-    /// Returns topk indices [B, L, index_topk + tail_width] i32.
-    pub fn forward(self: *const Glm53Indexer, allocator: std.mem.Allocator, x: Array, q_resid: Array) !Array {
-        const ctx = self.ctx;
-        const xsh = x.shape();
-        const b = xsh[0];
-        const l = xsh[1];
-        const kp = self.kpool;
-        const d = self.head_dim;
+    /// wk + LayerNorm keys and the fp32 compress-gate projection for x.
+    /// x: [B,L,hidden] → k/gate [B,L,head_dim] (k dtype follows the projection).
+    pub const ProjectedKeys = struct { k: Array, gate: Array };
 
-        // k = k_norm(wk(x)); gate = x.f32 @ compress_gate_t
+    pub fn projectKeys(self: *const Glm53Indexer, x: Array) !ProjectedKeys {
+        const ctx = self.ctx;
         const k_proj = try self.wk.apply(ctx, x);
         defer k_proj.deinit();
         const k = try fast_mod.layerNorm(ctx, k_proj, self.k_norm_w, self.k_norm_b, k_norm_eps);
-        defer k.deinit(); // [B,L,D]
+        errdefer k.deinit(); // [B,L,D]
         const x_f32 = try ops.astype(ctx, x, .float32);
         defer x_f32.deinit();
         const gate_f32 = try ops.matmul(ctx, x_f32, self.compress_gate_t);
         defer gate_f32.deinit();
         const gate = try ops.astype(ctx, gate_f32, k.dtype());
-        defer gate.deinit();
+        errdefer gate.deinit();
+        return .{ .k = k, .gate = gate };
+    }
 
-        const valid = try creation_mod.ones(ctx, &[_]i32{ b, l }, .bool_);
-        defer valid.deinit();
+    /// Pool selection + expansion + always-select-tail, shared by the prefill
+    /// forward and the cached decode step. kv_len is the total key history
+    /// length; query_positions [Lq] i32 are the absolute positions of the
+    /// current queries; x/q_resid are the [B, Lq, ...] scoring inputs for
+    /// those queries only.
+    fn selectAndExpand(
+        self: *const Glm53Indexer,
+        allocator: std.mem.Allocator,
+        pooled: *const PooledStates,
+        kv_len: i32,
+        query_positions: Array,
+        x: Array,
+        q_resid: Array,
+    ) !Array {
+        const ctx = self.ctx;
+        const b = x.shape()[0];
+        const l = query_positions.shape()[0];
+        const kp = self.kpool;
+        const d = self.head_dim;
+        const pc = pooled.pool_indices.shape()[1];
 
-        var pooled = try self.pooledStates(allocator, k, gate, valid);
-        defer pooled.pool_keys.deinit();
-        defer pooled.pool_indices.deinit();
-        defer pooled.pool_valid.deinit();
-        const pc: i32 = @intCast(@divTrunc(l + kp - 1, kp));
-
-        // query_positions = arange(L) (kv_length == L with no cache)
-        const query_positions = try creation_mod.arange(ctx, 0, @floatFromInt(l), 1, .int32);
-        defer query_positions.deinit(); // [L]
-
-        // pool_end = clip(pool_indices[..., -1], 0, L-1)
+        // pool_end = clip(pool_indices[..., -1], 0, kv_len-1)
         const last_idx = try ops.slice(ctx, pooled.pool_indices, &[_]i32{ 0, 0, kp - 1 }, &[_]i32{ b, pc, kp }, &[_]i32{ 1, 1, 1 });
         defer last_idx.deinit();
         const pool_end2 = try ops.reshape(ctx, last_idx, &[_]i32{ b, pc });
         defer pool_end2.deinit();
-        const l_minus1 = try Array.fromData(allocator, i32, &[_]i32{l - 1}, &[_]i32{1});
+        const l_minus1 = try Array.fromData(allocator, i32, &[_]i32{kv_len - 1}, &[_]i32{1});
         defer l_minus1.deinit();
         const zero_i = try Array.fromData(allocator, i32, &[_]i32{0}, &[_]i32{1});
         defer zero_i.deinit();
@@ -480,8 +484,10 @@ pub const Glm53Indexer = struct {
         // partial pool so causal attention always sees the running window.
         if (self.always_select_tail and kp > 1) {
             const tail_width = kp - 1;
-            // No-cache prefill: valid is all-ones, so cumsum(valid) sampled at
+            // All-valid history (no padding): cumsum(valid) sampled at
             // query_positions is just position+1 — skip the identity gather.
+            const valid = try creation_mod.ones(ctx, &[_]i32{ b, kv_len }, .bool_);
+            defer valid.deinit();
             const one_i = try Array.fromData(allocator, i32, &[_]i32{1}, &[_]i32{1});
             defer one_i.deinit();
             const qp_e = try ops.expandDims(ctx, query_positions, 0);
@@ -550,11 +556,105 @@ pub const Glm53Indexer = struct {
             topk = with_tail;
         }
 
-        // query_valid is all-true in the no-padding harness path; cast to the
+        // query_valid is all-true in the no-padding path; cast to the
         // oracle's return dtype (mx.int32).
         const topk_i32 = try ops.astype(ctx, topk, .int32);
         topk.deinit();
         return topk_i32;
+    }
+
+    /// No-cache forward (oracle `cache is None` path): full prefill selection.
+    /// x: [B,L,hidden] (branch input, pre-norm output); q_resid: [B,L,q_lora_rank].
+    /// When `hist` is set, the projected k/gate are appended to its history
+    /// (prefill populates the decode-side indexer state).
+    /// Returns topk indices [B, L, index_topk + tail_width] i32.
+    pub fn forward(self: *const Glm53Indexer, allocator: std.mem.Allocator, x: Array, q_resid: Array, hist: ?*Glm53MlaCache) !Array {
+        const ctx = self.ctx;
+        const l = x.shape()[1];
+
+        var keys = try self.projectKeys(x);
+        defer keys.k.deinit();
+        defer keys.gate.deinit();
+
+        if (hist) |hc| try hc.appendKeys(ctx, keys.k, keys.gate);
+
+        const valid = try creation_mod.ones(ctx, &[_]i32{ x.shape()[0], l }, .bool_);
+        defer valid.deinit();
+        var pooled = try self.pooledStates(allocator, keys.k, keys.gate, valid);
+        defer pooled.pool_keys.deinit();
+        defer pooled.pool_indices.deinit();
+        defer pooled.pool_valid.deinit();
+
+        const query_positions = try creation_mod.arange(ctx, 0, @floatFromInt(l), 1, .int32);
+        defer query_positions.deinit(); // [L]
+        return self.selectAndExpand(allocator, &pooled, l, query_positions, x, q_resid);
+    }
+
+    /// Cached decode step: project the new token's keys, append to the
+    /// history, recompute pools over the full history (cheap at decode
+    /// lengths; semantically identical to the oracle's PoolingCache —
+    /// complete windows compress identically, the running partial window is
+    /// pool_valid=false in both and is covered by always-select-tail).
+    /// x/q_resid: [B,1,...]. Returns topk [B, 1, index_topk + tail_width].
+    pub fn forwardStep(self: *const Glm53Indexer, allocator: std.mem.Allocator, x: Array, q_resid: Array, cache: *Glm53MlaCache) !Array {
+        const ctx = self.ctx;
+        const b = x.shape()[0];
+
+        var keys = try self.projectKeys(x);
+        defer keys.k.deinit();
+        defer keys.gate.deinit();
+        try cache.appendKeys(ctx, keys.k, keys.gate);
+
+        const k_hist = cache.k_hist.?;
+        const gate_hist = cache.gate_hist.?;
+        const n = k_hist.shape()[1];
+
+        const valid = try creation_mod.ones(ctx, &[_]i32{ b, n }, .bool_);
+        defer valid.deinit();
+        var pooled = try self.pooledStates(allocator, k_hist, gate_hist, valid);
+        defer pooled.pool_keys.deinit();
+        defer pooled.pool_indices.deinit();
+        defer pooled.pool_valid.deinit();
+
+        const query_positions = try Array.fromData(allocator, i32, &[_]i32{n - 1}, &[_]i32{1});
+        defer query_positions.deinit();
+        return self.selectAndExpand(allocator, &pooled, n, query_positions, x, q_resid);
+    }
+};
+
+// ============================================================
+// MLA decode-side cache: latent KV + indexer k/gate history.
+// ============================================================
+
+pub const Glm53MlaCache = struct {
+    latent: Glm53LatentCache = .{},
+    k_hist: ?Array = null, // [B, N, index_head_dim]
+    gate_hist: ?Array = null,
+
+    pub fn deinit(self: *Glm53MlaCache) void {
+        self.latent.deinit();
+        if (self.k_hist) |a| a.deinit();
+        if (self.gate_hist) |a| a.deinit();
+        self.* = .{};
+    }
+
+    /// Borrowed k/gate are concatenated onto the owned history.
+    pub fn appendKeys(self: *Glm53MlaCache, ctx: EagerContext, k: Array, gate: Array) !void {
+        if (self.k_hist) |old_k| {
+            const old_g = self.gate_hist.?;
+            const new_k = try shape_mod.concatenateAxis(ctx, &[_]Array{ old_k, k }, 1);
+            const new_g = shape_mod.concatenateAxis(ctx, &[_]Array{ old_g, gate }, 1) catch |err| {
+                new_k.deinit();
+                return err;
+            };
+            old_k.deinit();
+            old_g.deinit();
+            self.k_hist = new_k;
+            self.gate_hist = new_g;
+        } else {
+            self.k_hist = try ops.copy(ctx, k);
+            self.gate_hist = try ops.copy(ctx, gate);
+        }
     }
 };
 
@@ -597,7 +697,11 @@ pub const Glm53Mla = struct {
     /// No-cache forward (oracle cache=None path).
     /// x: [B, L, hidden] (post input_layernorm). Returns branch output and
     /// the indexer topk indices.
-    pub fn forward(self: *const Glm53Mla, allocator: std.mem.Allocator, x: Array) !MlaResult {
+    /// Shared q/latent projections for forward and forwardStep.
+    /// x: [B,L,hidden] → q [B,H,L,256], q_resid [B,L,q_lora], latent_new [B,1,L,512].
+    const Projections = struct { q: Array, q_resid: Array, latent_new: Array };
+
+    fn project(self: *const Glm53Mla, x: Array) !Projections {
         const ctx = self.ctx;
         const xsh = x.shape();
         const b = xsh[0];
@@ -611,28 +715,77 @@ pub const Glm53Mla = struct {
         defer kv_a.deinit();
 
         const q_resid = try fast_mod.rmsNorm(ctx, q_a, self.q_a_layernorm_w, self.rms_norm_eps);
-        defer q_resid.deinit();
+        errdefer q_resid.deinit();
         const q_flat = try self.q_b_proj.apply(ctx, q_resid);
         defer q_flat.deinit();
         const q4 = try ops.reshape(ctx, q_flat, &[_]i32{ b, l, self.num_heads, self.qk_nope_head_dim });
         defer q4.deinit();
         const q = try ops.transposeAxes(ctx, q4, &[_]i32{ 0, 2, 1, 3 });
-        defer q.deinit(); // [B,H,L,D]
+        errdefer q.deinit(); // [B,H,L,D]
 
         const latent3 = try fast_mod.rmsNorm(ctx, kv_a, self.kv_a_layernorm_w, self.rms_norm_eps);
         defer latent3.deinit();
         const latent = try ops.expandDims(ctx, latent3, 1);
-        defer latent.deinit(); // [B,1,L,512]
+        errdefer latent.deinit(); // [B,1,L,512]
 
-        const topk = try self.indexer.forward(allocator, x, q_resid);
+        return .{ .q = q, .q_resid = q_resid, .latent_new = latent };
+    }
+
+    /// No-cache prefill (oracle cache=None path). When `cache` is set, the
+    /// latent and indexer k/gate history are appended so decode steps can
+    /// continue from this prompt.
+    pub fn forward(self: *const Glm53Mla, allocator: std.mem.Allocator, x: Array, cache: ?*Glm53MlaCache) !MlaResult {
+        const ctx = self.ctx;
+        const b = x.shape()[0];
+        const l = x.shape()[1];
+
+        var proj = try self.project(x);
+        defer proj.q.deinit();
+        defer proj.q_resid.deinit();
+        defer proj.latent_new.deinit();
+
+        var latent = proj.latent_new;
+        if (cache) |cc| {
+            latent = try cc.latent.updateAndFetch(ctx, proj.latent_new);
+            // borrowed from cache — no deinit
+        }
+
+        const topk = try self.indexer.forward(allocator, x, proj.q_resid, cache);
         errdefer topk.deinit();
 
-        const attended = try self.attend(allocator, q, latent, topk);
+        const attended = try self.attend(allocator, proj.q, latent, topk);
         defer attended.deinit(); // [B,H,L,V]
 
         const out_t = try ops.transposeAxes(ctx, attended, &[_]i32{ 0, 2, 1, 3 });
         defer out_t.deinit();
         const out_flat = try ops.reshape(ctx, out_t, &[_]i32{ b, l, self.num_heads * self.v_head_dim });
+        defer out_flat.deinit();
+        const out = try self.o_proj.apply(ctx, out_flat);
+        return .{ .out = out, .topk = topk };
+    }
+
+    /// Cached decode step (oracle cache!=None, length<=DECODE_BLOCK_SIZE
+    /// branch). x: [B,1,hidden]. Appends the new latent and indexer keys to
+    /// the cache, selects top-k over the full history, gathers and attends.
+    pub fn forwardStep(self: *const Glm53Mla, allocator: std.mem.Allocator, x: Array, cache: *Glm53MlaCache) !MlaResult {
+        const ctx = self.ctx;
+        const b = x.shape()[0];
+
+        var proj = try self.project(x);
+        defer proj.q.deinit();
+        defer proj.q_resid.deinit();
+        defer proj.latent_new.deinit();
+
+        const latent = try cache.latent.updateAndFetch(ctx, proj.latent_new);
+        const topk = try self.indexer.forwardStep(allocator, x, proj.q_resid, cache);
+        errdefer topk.deinit();
+
+        const attended = try self.attend(allocator, proj.q, latent, topk);
+        defer attended.deinit(); // [B,H,1,V]
+
+        const out_t = try ops.transposeAxes(ctx, attended, &[_]i32{ 0, 2, 1, 3 });
+        defer out_t.deinit();
+        const out_flat = try ops.reshape(ctx, out_t, &[_]i32{ b, 1, self.num_heads * self.v_head_dim });
         defer out_flat.deinit();
         const out = try self.o_proj.apply(ctx, out_flat);
         return .{ .out = out, .topk = topk };
@@ -893,7 +1046,7 @@ test "Glm53Indexer.forward: 打分支 (select_k < pc) 形状与因果不变量" 
     const q_resid = try makeTestArray(allocator, &[_]i32{ 1, l, hidden }, 6);
     defer q_resid.deinit();
 
-    const topk = try indexer.forward(allocator, x, q_resid);
+    const topk = try indexer.forward(allocator, x, q_resid, null);
     defer topk.deinit();
 
     // Shape [1, L, index_topk + kpool - 1], dtype int32.
@@ -1071,3 +1224,85 @@ pub const Glm53PoolCache = struct {
         return self.pooled.?;
     }
 };
+
+test "Glm53Indexer: prefill 与 prefill+forwardStep 的末位 topk 一致" {
+    test_c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const hidden: i32 = 64;
+    const head_dim: i32 = 32;
+    const n_heads: i32 = 4;
+    const l: i32 = 6;
+    const kpool: i32 = 2;
+    const index_topk: i32 = 8;
+
+    var indexer = Glm53Indexer{
+        .ctx = ctx,
+        .n_heads = n_heads,
+        .head_dim = head_dim,
+        .index_topk = index_topk,
+        .kpool = kpool,
+        .always_select_tail = true,
+        .wq_b = try makeTestQuantLinear(ctx, allocator, n_heads * head_dim, hidden, 1),
+        .wk = try makeTestQuantLinear(ctx, allocator, head_dim, hidden, 2),
+        .weights_proj = try makeTestQuantLinear(ctx, allocator, n_heads, hidden, 3),
+        .k_norm_w = blk: {
+            const ones_buf = try allocator.alloc(f32, @intCast(head_dim));
+            defer allocator.free(ones_buf);
+            @memset(ones_buf, 1.0);
+            break :blk try Array.fromData(allocator, f32, ones_buf, &[_]i32{head_dim});
+        },
+        .k_norm_b = try creation_mod.zeros(ctx, &[_]i32{head_dim}, .float32),
+        .ape = try creation_mod.zeros(ctx, &[_]i32{ kpool, head_dim }, .float32),
+        .compress_gate_t = try makeTestArray(allocator, &[_]i32{ hidden, head_dim }, 4),
+    };
+    defer {
+        indexer.wq_b.w.deinit();
+        indexer.wq_b.scales.deinit();
+        indexer.wq_b.biases.deinit();
+        indexer.wk.w.deinit();
+        indexer.wk.scales.deinit();
+        indexer.wk.biases.deinit();
+        indexer.weights_proj.w.deinit();
+        indexer.weights_proj.scales.deinit();
+        indexer.weights_proj.biases.deinit();
+        indexer.k_norm_w.deinit();
+        indexer.k_norm_b.deinit();
+        indexer.ape.deinit();
+        indexer.compress_gate_t.deinit();
+    }
+
+    const x = try makeTestArray(allocator, &[_]i32{ 1, l, hidden }, 5);
+    defer x.deinit();
+    const q_resid = try makeTestArray(allocator, &[_]i32{ 1, l, hidden }, 6);
+    defer q_resid.deinit();
+
+    // Full prefill.
+    const topk_full = try indexer.forward(allocator, x, q_resid, null);
+    defer topk_full.deinit();
+
+    // Prefill L-1 (history cached) + one decode step.
+    var cache = Glm53MlaCache{};
+    defer cache.deinit();
+    const x_pre = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, l - 1, hidden }, &[_]i32{ 1, 1, 1 });
+    defer x_pre.deinit();
+    const q_pre = try ops.slice(ctx, q_resid, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, l - 1, hidden }, &[_]i32{ 1, 1, 1 });
+    defer q_pre.deinit();
+    const topk_pre = try indexer.forward(allocator, x_pre, q_pre, &cache);
+    defer topk_pre.deinit();
+    const x_step = try ops.slice(ctx, x, &[_]i32{ 0, l - 1, 0 }, &[_]i32{ 1, l, hidden }, &[_]i32{ 1, 1, 1 });
+    defer x_step.deinit();
+    const q_step = try ops.slice(ctx, q_resid, &[_]i32{ 0, l - 1, 0 }, &[_]i32{ 1, l, hidden }, &[_]i32{ 1, 1, 1 });
+    defer q_step.deinit();
+    const topk_step = try indexer.forwardStep(allocator, x_step, q_step, &cache);
+    defer topk_step.deinit();
+
+    // Last query row must match bit-exact.
+    const w: usize = @intCast(index_topk + kpool - 1);
+    try topk_full.eval();
+    try topk_step.eval();
+    const full_row = (try topk_full.dataSlice(i32))[(@as(usize, @intCast(l)) - 1) * w ..][0..w];
+    const step_row = try topk_step.dataSlice(i32);
+    try std.testing.expectEqualSlices(i32, full_row, step_row);
+}

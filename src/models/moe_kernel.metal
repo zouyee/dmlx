@@ -4762,3 +4762,103 @@ kernel void gather6_down_2b(
     float g6d_sum = simd_sum(acc);  // collective: must be executed by ALL lanes
     if (simd_lane == 0) out[k_idx * DIM + row] = (bfloat)g6d_sum;
 }
+
+// ============================================================================
+// Two-stage greedy argmax over the logits vector.
+// Tie-breaking matches the CPU linear scan in sampleFromLogits: a candidate
+// only replaces the current best on a strict `>` comparison, and when values
+// are bit-equal the smaller index wins. Because each thread visits indices in
+// increasing order and every combine step prefers the smaller index on ties,
+// the result is exactly the first occurrence of the maximum value.
+// ============================================================================
+
+struct ArgmaxCandidate {
+    uint  idx;
+    float val;
+};
+
+// Stage 1: each threadgroup reduces its grid-stride slice to one candidate.
+kernel void argmax_partials(
+    device const float*     x           [[buffer(0)]],  // [n] logits
+    device ArgmaxCandidate* partials    [[buffer(1)]],  // [num_groups]
+    constant uint&          n           [[buffer(2)]],
+    constant uint&          total_threads [[buffer(3)]],
+    uint gid    [[thread_position_in_grid]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint group  [[threadgroup_position_in_grid]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    float best = -INFINITY;
+    uint  best_idx = 0xFFFFFFFFu;
+    for (uint i = gid; i < n; i += total_threads) {
+        float v = x[i];
+        if (v > best) { best = v; best_idx = i; }
+    }
+
+    threadgroup float tg_val[256];
+    threadgroup uint  tg_idx[256];
+    tg_val[tid] = best;
+    tg_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = tgsize >> 1u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) {
+            float bv = tg_val[tid + offset];
+            uint  bi = tg_idx[tid + offset];
+            float av = tg_val[tid];
+            uint  ai = tg_idx[tid];
+            if (bv > av || (bv == av && bi < ai)) {
+                tg_val[tid] = bv;
+                tg_idx[tid] = bi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        partials[group].idx = tg_idx[0];
+        partials[group].val = tg_val[0];
+    }
+}
+
+// Stage 2: a single threadgroup reduces num_groups partials to one result.
+kernel void argmax_final(
+    device const ArgmaxCandidate* partials [[buffer(0)]],  // [n]
+    device ArgmaxCandidate*       result   [[buffer(1)]],  // [1]
+    constant uint&                n        [[buffer(2)]],
+    uint tid    [[thread_index_in_threadgroup]],
+    uint tgsize [[threads_per_threadgroup]]
+) {
+    float best = -INFINITY;
+    uint  best_idx = 0xFFFFFFFFu;
+    for (uint i = tid; i < n; i += tgsize) {
+        float v = partials[i].val;
+        uint  k = partials[i].idx;
+        if (v > best || (v == best && k < best_idx)) { best = v; best_idx = k; }
+    }
+
+    threadgroup float tg_val[256];
+    threadgroup uint  tg_idx[256];
+    tg_val[tid] = best;
+    tg_idx[tid] = best_idx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint offset = tgsize >> 1u; offset > 0u; offset >>= 1u) {
+        if (tid < offset) {
+            float bv = tg_val[tid + offset];
+            uint  bi = tg_idx[tid + offset];
+            float av = tg_val[tid];
+            uint  ai = tg_idx[tid];
+            if (bv > av || (bv == av && bi < ai)) {
+                tg_val[tid] = bv;
+                tg_idx[tid] = bi;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        result[0].idx = tg_idx[0];
+        result[0].val = tg_val[0];
+    }
+}

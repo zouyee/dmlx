@@ -267,6 +267,82 @@ pub fn parseGlm53Config(allocator: std.mem.Allocator, json_text: []const u8) !Gl
     return cfg;
 }
 
+const expert_stream = @import("expert_stream.zig");
+const safetensors_reader = @import("mlx").safetensors_reader;
+
+/// Build per-layer expert metadata for ExpertStreamProvider (Task 10).
+/// GLM layout: language_model.model.layers.{i}.mlp.switch_mlp.{gate,up,down}_proj.{weight,scales,biases},
+/// all experts 4-bit affine gs=64 (verified across all MoE layers of the
+/// prep checkpoint — no 8-bit expert tensors, so the stream path needs no
+/// per-tensor bits). Dense layers get placeholder entries (never queried:
+/// the model only streams on MoE layers).
+pub fn buildLayerExpertMeta(
+    allocator: std.mem.Allocator,
+    cfg: *const Glm53Config,
+    index: *safetensors_reader.TensorIndex,
+) ![]expert_stream.LayerExpertMeta {
+    const meta = try allocator.alloc(expert_stream.LayerExpertMeta, cfg.num_hidden_layers);
+    errdefer allocator.free(meta);
+
+    for (0..cfg.num_hidden_layers) |i| {
+        if (!cfg.isMoE(@intCast(i))) {
+            meta[i] = .{
+                .gate_proj_name = "",
+                .up_proj_name = "",
+                .down_proj_name = "",
+                .gate_scales_name = null,
+                .up_scales_name = null,
+                .down_scales_name = null,
+                .expert_row_bytes = 0,
+                .expert_scale_row_bytes = 0,
+                .n_experts = 0,
+            };
+            continue;
+        }
+        const prefix = try std.fmt.allocPrint(allocator, "language_model.model.layers.{d}.mlp.switch_mlp", .{i});
+
+        const gate_w = try std.fmt.allocPrint(allocator, "{s}.gate_proj.weight", .{prefix});
+        const up_w = try std.fmt.allocPrint(allocator, "{s}.up_proj.weight", .{prefix});
+        const down_w = try std.fmt.allocPrint(allocator, "{s}.down_proj.weight", .{prefix});
+        const gate_s = try std.fmt.allocPrint(allocator, "{s}.gate_proj.scales", .{prefix});
+        const up_s = try std.fmt.allocPrint(allocator, "{s}.up_proj.scales", .{prefix});
+        const down_s = try std.fmt.allocPrint(allocator, "{s}.down_proj.scales", .{prefix});
+        const gate_b = try std.fmt.allocPrint(allocator, "{s}.gate_proj.biases", .{prefix});
+        const up_b = try std.fmt.allocPrint(allocator, "{s}.up_proj.biases", .{prefix});
+        const down_b = try std.fmt.allocPrint(allocator, "{s}.down_proj.biases", .{prefix});
+
+        var row_bytes: usize = 0;
+        var scale_row_bytes: usize = 0;
+        var bias_row_bytes: usize = 0;
+        if (index.entries.get(gate_w)) |info| {
+            row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+        }
+        if (index.entries.get(gate_s)) |info| {
+            scale_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+        }
+        if (index.entries.get(gate_b)) |info| {
+            bias_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+        }
+
+        meta[i] = .{
+            .gate_proj_name = gate_w,
+            .up_proj_name = up_w,
+            .down_proj_name = down_w,
+            .gate_scales_name = gate_s,
+            .up_scales_name = up_s,
+            .down_scales_name = down_s,
+            .gate_biases_name = gate_b,
+            .up_biases_name = up_b,
+            .down_biases_name = down_b,
+            .expert_row_bytes = row_bytes,
+            .expert_scale_row_bytes = scale_row_bytes,
+            .expert_bias_row_bytes = bias_row_bytes,
+            .n_experts = cfg.n_routed_experts,
+        };
+    }
+    return meta;
+}
+
 test "parseGlm53Config: text_config 嵌套 + linear_attn_config" {
     const allocator = std.testing.allocator;
     const json_text =
