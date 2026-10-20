@@ -9,25 +9,37 @@ const shape_mod = @import("mlx").shape;
 const reduce_mod = @import("mlx").reduce;
 const fast_mod = @import("mlx").fast;
 const quantize_mod = @import("mlx").quantize;
+const creation = @import("mlx").creation;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const QuantConfig = quantize_mod.QuantConfig;
 
+/// Slab-allocated KV cache: keys/values are [1, n_kv, capacity, head_dim]
+/// buffers grown in 256-token slabs (capacity doubles when a grow is needed,
+/// so appends are amortized O(1)); `len` tracks the number of valid tokens.
 pub const Qwen38AttnCache = struct {
-    keys: ?Array = null, // [1, n_kv, L, head_dim]
-    values: ?Array = null, // [1, n_kv, L, head_dim]
+    pub const slab: i32 = 256;
+
+    keys: ?Array = null, // [1, n_kv, capacity, head_dim], len tokens valid
+    values: ?Array = null,
+    len_: i32 = 0,
 
     pub fn deinit(self: *Qwen38AttnCache) void {
         if (self.keys) |*k| k.deinit();
         if (self.values) |*v| v.deinit();
         self.keys = null;
         self.values = null;
+        self.len_ = 0;
     }
 
     pub fn len(self: *const Qwen38AttnCache) i32 {
+        return self.len_;
+    }
+
+    fn capacity(self: *const Qwen38AttnCache) i32 {
         const k = self.keys orelse return 0;
-        return k.shape()[2];
+        return @intCast(k.shape()[2]);
     }
 };
 
@@ -226,56 +238,66 @@ pub const Qwen38Attn = struct {
         const k_t = try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer k_t.deinit();
 
-        // Build new cache arrays first; only on full success swap them in, so
-        // any failure path leaves the old cache untouched (no leak, no
-        // dangling pointer, no double-free). The errdefers are scoped to this
-        // block: once the swap completes, later failures must not free the
-        // arrays now owned by the cache.
+        // Slab cache write: grow capacity (doubling, 256-token granularity) if
+        // needed, then one slice_update per tensor at [len, len+L). sliceUpdate
+        // returns a new array; swap it in and free the old buffer. On failure
+        // the cache stays consistent because `len` only advances at the end.
         {
-            const k_all = if (cache.keys) |ck|
-                try shape_mod.concatenateAxis(ctx, &[_]Array{ ck, k_t }, 2)
-            else
-                try ops.copy(ctx, k_t);
-            errdefer k_all.deinit();
-            const v_all = if (cache.values) |cv|
-                try shape_mod.concatenateAxis(ctx, &[_]Array{ cv, v_t }, 2)
-            else
-                try ops.copy(ctx, v_t);
-            errdefer v_all.deinit();
-            if (cache.keys) |*ck| ck.deinit();
-            if (cache.values) |*cv| cv.deinit();
-            cache.keys = k_all;
-            cache.values = v_all;
+            const needed: i32 = cache.len_ + L;
+            if (needed > cache.capacity()) {
+                var newcap: i32 = @max(cache.capacity() * 2, Qwen38AttnCache.slab);
+                while (newcap < needed) newcap += Qwen38AttnCache.slab;
+                const grow: i32 = newcap - cache.capacity();
+                if (cache.keys == null) {
+                    const zk = try creation.zeros(ctx, &[_]i32{ 1, HKV, newcap, D }, k_t.dtype());
+                    errdefer zk.deinit();
+                    const zv = try creation.zeros(ctx, &[_]i32{ 1, HKV, newcap, D }, v_t.dtype());
+                    errdefer zv.deinit();
+                    cache.keys = zk;
+                    cache.values = zv;
+                } else {
+                    const zk = try creation.zeros(ctx, &[_]i32{ 1, HKV, grow, D }, k_t.dtype());
+                    defer zk.deinit();
+                    const zv = try creation.zeros(ctx, &[_]i32{ 1, HKV, grow, D }, v_t.dtype());
+                    defer zv.deinit();
+                    const k_grown = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.keys.?, zk }, 2);
+                    errdefer k_grown.deinit();
+                    const v_grown = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.values.?, zv }, 2);
+                    errdefer v_grown.deinit();
+                    cache.keys.?.deinit();
+                    cache.values.?.deinit();
+                    cache.keys = k_grown;
+                    cache.values = v_grown;
+                }
+            }
+            const start = &[_]i32{ 0, 0, cache.len_, 0 };
+            const stop = &[_]i32{ 1, HKV, needed, D };
+            const ones = &[_]i32{ 1, 1, 1, 1 };
+            const k_new = try shape_mod.sliceUpdate(ctx, cache.keys.?, k_t, start, stop, ones);
+            cache.keys.?.deinit();
+            cache.keys = k_new;
+            const v_new = try shape_mod.sliceUpdate(ctx, cache.values.?, v_t, start, stop, ones);
+            cache.values.?.deinit();
+            cache.values = v_new;
+            cache.len_ = needed;
         }
         // No eval here: the caller (Qwen38ServingModel.forwardTokens) submits
         // the updated cache states via asyncEval once per token.
 
-        // GQA: repeat kv heads to q head count.
+        // SDPA reads a [1, HKV, len, D] view of the slab — no copy; MLX
+        // scaled_dot_product_attention handles GQA (H % HKV == 0) natively.
         const kv_len: i32 = cache.len();
-        const rep: i32 = @intCast(self.num_heads / self.num_kv_heads);
-        const k_rep = if (rep > 1) blk: {
-            const e = try ops.expandDims(ctx, cache.keys.?, 2); // [1, HKV, 1, L, D]
-            defer e.deinit();
-            const b = try shape_mod.broadcastTo(ctx, e, &[_]i32{ 1, HKV, rep, kv_len, D });
-            defer b.deinit();
-            break :blk try ops.reshape(ctx, b, &[_]i32{ 1, H, kv_len, D });
-        } else try ops.copy(ctx, cache.keys.?);
-        defer k_rep.deinit();
-        const v_rep = if (rep > 1) blk: {
-            const e = try ops.expandDims(ctx, cache.values.?, 2);
-            defer e.deinit();
-            const b = try shape_mod.broadcastTo(ctx, e, &[_]i32{ 1, HKV, rep, kv_len, D });
-            defer b.deinit();
-            break :blk try ops.reshape(ctx, b, &[_]i32{ 1, H, kv_len, D });
-        } else try ops.copy(ctx, cache.values.?);
-        defer v_rep.deinit();
+        const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer k_view.deinit();
+        const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer v_view.deinit();
 
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
         const attn = try fast_mod.scaledDotProductAttention(
             ctx,
             q_t,
-            k_rep,
-            v_rep,
+            k_view,
+            v_view,
             scale,
             if (prefill) "causal" else "",
             null,
@@ -392,4 +414,67 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     try std.testing.expectEqual(@as(i32, 1), tshape[0]);
     try std.testing.expectEqual(@as(i32, 16), tshape[1]);
     try std.testing.expectEqual(@as(i32, 4), cache.len());
+}
+
+test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const N = 260; // crosses the 256-token slab boundary
+    const HIDDEN = 16;
+
+    // Deterministic per-position inputs.
+    var buf: [N * HIDDEN]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+
+    // Decode path: one token at a time.
+    var attn_d = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_d.deinit();
+    var cache_d = Qwen38AttnCache{};
+    defer cache_d.deinit();
+    var dec_outs: [N]Array = undefined;
+    for (0..N) |i| {
+        const xt = try Array.fromData(allocator, f32, buf[i * HIDDEN ..][0..HIDDEN], &[_]i32{ 1, HIDDEN });
+        defer xt.deinit();
+        dec_outs[i] = try attn_d.forward(xt, &cache_d);
+        try dec_outs[i].eval();
+    }
+    defer for (&dec_outs) |*o| o.deinit();
+    try std.testing.expectEqual(@as(i32, N), cache_d.len());
+    // Slab growth: capacity must be >= N and a multiple of the slab size.
+    const cap = cache_d.keys.?.shape()[2];
+    try std.testing.expect(cap >= N);
+    try std.testing.expectEqual(@as(i32, 0), @mod(cap, Qwen38AttnCache.slab));
+
+    // Prefill path: all N tokens at once on a fresh module.
+    var attn_p = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_p.deinit();
+    var cache_p = Qwen38AttnCache{};
+    defer cache_p.deinit();
+    const xp = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, N, HIDDEN });
+    defer xp.deinit();
+    const out_p = try attn_p.forward(xp, &cache_p);
+    defer out_p.deinit();
+    try out_p.eval();
+    try std.testing.expectEqual(@as(i32, N), cache_p.len());
+
+    // Each decode step output must match the corresponding prefill row.
+    for (0..N) |i| {
+        const ii: i32 = @intCast(i);
+        const row = try ops.slice(ctx, out_p, &[_]i32{ 0, ii, 0 }, &[_]i32{ 1, ii + 1, HIDDEN }, &[_]i32{ 1, 1, 1 });
+        defer row.deinit();
+        const row_flat = try ops.reshape(ctx, row, &[_]i32{ 1, HIDDEN });
+        defer row_flat.deinit();
+        const diff = try ops.subtract(ctx, dec_outs[i], row_flat);
+        defer diff.deinit();
+        const abs_diff = try ops.abs(ctx, diff);
+        defer abs_diff.deinit();
+        const max_diff = try reduce_mod.max(ctx, abs_diff, false);
+        defer max_diff.deinit();
+        try max_diff.eval();
+        try std.testing.expect(try max_diff.item(f32) <= 1e-5);
+    }
 }
