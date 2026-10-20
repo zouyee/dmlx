@@ -337,6 +337,7 @@ pub const Qwen38Model = struct {
     /// into h in bf16. This keeps the 64-layer error compounding within the
     /// oracle's own rounding (f32 residuals drift past the 0.9999 gate by
     /// layer ~40).
+    /// Keep the dtype/op sequence in sync with `Qwen38ServingModel.forwardTokens`.
     pub fn forward(self: *const Qwen38Model, ids: []const i32, opts: ForwardOpts) !Array {
         const allocator = self.allocator;
         const cfg = self.cfg;
@@ -457,14 +458,13 @@ pub const Qwen38ServingModel = struct {
     weights: std.StringHashMap(Array), // resident weights, owned by caller
     caches: []Qwen38LayerCache,
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        ctx: EagerContext,
-        cfg: *const qwen38_loader.Qwen38Config,
-        weights: std.StringHashMap(Array),
-    ) !Qwen38ServingModel {
+    /// Allocate one fresh cache per layer. On failure every cache built so
+    /// far is deinited and the slice freed.
+    fn initCaches(allocator: std.mem.Allocator, cfg: *const qwen38_loader.Qwen38Config) ![]Qwen38LayerCache {
         const caches = try allocator.alloc(Qwen38LayerCache, cfg.num_hidden_layers);
         errdefer allocator.free(caches);
+        var made: usize = 0;
+        errdefer for (caches[0..made]) |*lc| lc.deinit();
         for (caches, 0..) |*lc, i| {
             if (cfg.isFullAttention(@intCast(i))) {
                 lc.* = .{ .attn = .{} };
@@ -477,7 +477,19 @@ pub const Qwen38ServingModel = struct {
                     cfg.linear_value_head_dim,
                 ) };
             }
+            made += 1;
         }
+        return caches;
+    }
+
+    pub fn init(
+        allocator: std.mem.Allocator,
+        ctx: EagerContext,
+        cfg: *const qwen38_loader.Qwen38Config,
+        weights: std.StringHashMap(Array),
+    ) !Qwen38ServingModel {
+        const caches = try initCaches(allocator, cfg);
+        errdefer allocator.free(caches);
         var self = Qwen38ServingModel{
             .allocator = allocator,
             .ctx = ctx,
@@ -487,6 +499,9 @@ pub const Qwen38ServingModel = struct {
             .weights = weights,
             .caches = caches,
         };
+        // NOTE: the WeightSource built here points at this local's fields;
+        // the caller MUST reseat after placement:
+        //   placed.ws = WeightSource.fromMap(&placed.weights, ctx, &placed.ws_backing);
         self.ws = WeightSource.fromMap(&self.weights, ctx, &self.ws_backing);
         return self;
     }
@@ -497,27 +512,20 @@ pub const Qwen38ServingModel = struct {
         // weights map entries are owned by the caller (registry adapter).
     }
 
-    /// Reset all per-layer decode state (fresh request).
+    /// Reset all per-layer decode state (fresh request). Builds the fresh
+    /// caches first and swaps only once every allocation succeeded, so a
+    /// failure leaves the old state intact.
     pub fn reset(self: *Qwen38ServingModel) !void {
-        const cfg = self.cfg;
+        const new_caches = try initCaches(self.allocator, self.cfg);
         for (self.caches) |*lc| lc.deinit();
-        for (self.caches, 0..) |*lc, i| {
-            if (cfg.isFullAttention(@intCast(i))) {
-                lc.* = .{ .attn = .{} };
-            } else {
-                lc.* = .{ .gdn = try qwen38_gdn.Qwen38GdnCache.init(
-                    self.allocator,
-                    cfg.linear_conv_kernel_dim,
-                    (2 * cfg.linear_num_key_heads + cfg.linear_num_value_heads) * cfg.linear_key_head_dim,
-                    cfg.linear_num_value_heads,
-                    cfg.linear_value_head_dim,
-                ) };
-            }
-        }
+        self.allocator.free(self.caches);
+        self.caches = new_caches;
     }
 
     /// ids: [L] u32 token ids → logits [1, L, vocab] f32. L>1 = prefill
     /// (resets state first); L=1 = cached decode step.
+    /// Keep the dtype/op sequence in sync with `Qwen38Model.forward` (the
+    /// oracle-aligned harness, cos >= 0.9999).
     pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
         const allocator = self.allocator;
         const cfg = self.cfg;

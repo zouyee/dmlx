@@ -72,6 +72,7 @@ pub fn handleStreamingCompletion(
         .top_p = server_config.top_p,
         .seed = seed,
         .stop_strings = req.stop,
+        .stop_tokens = state.stop_tokens,
         .streaming = true,
         .model_name = req.model,
     };

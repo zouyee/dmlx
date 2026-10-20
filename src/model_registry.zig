@@ -661,6 +661,9 @@ fn qwen38Loader(
     const model_ptr = try allocator.create(qwen38.Qwen38ServingModel);
     errdefer allocator.destroy(model_ptr);
     model_ptr.* = try qwen38.Qwen38ServingModel.init(allocator, ctx, cfg_ptr, weights);
+    // Reseat the WeightSource: init built it against its local `self`; the
+    // map/backing pointers must address the heap-placed struct.
+    model_ptr.ws = qwen38.WeightSource.fromMap(&model_ptr.weights, ctx, &model_ptr.ws_backing);
 
     const adapter = try allocator.create(Qwen38VTableAdapter);
     errdefer allocator.destroy(adapter);
