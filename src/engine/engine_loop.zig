@@ -77,18 +77,20 @@ const StreamCallbackCtx = struct {
     tokenizer: root.tokenizer.TokenizerStrategy,
     allocator: std.mem.Allocator,
     stop_strings: ?[]const []const u8,
+    stop_tokens: []const u32,
     text_buffer: std.ArrayList(u8),
     token_count: usize,
     max_tokens: usize,
     stopped: bool,
 
-    fn init(allocator: std.mem.Allocator, io: std.Io, signal: *CompletionSignal, tokenizer: root.tokenizer.TokenizerStrategy, stop_strings: ?[]const []const u8, max_tokens: usize) StreamCallbackCtx {
+    fn init(allocator: std.mem.Allocator, io: std.Io, signal: *CompletionSignal, tokenizer: root.tokenizer.TokenizerStrategy, stop_strings: ?[]const []const u8, stop_tokens: []const u32, max_tokens: usize) StreamCallbackCtx {
         return .{
             .signal = signal,
             .io = io,
             .tokenizer = tokenizer,
             .allocator = allocator,
             .stop_strings = stop_strings,
+            .stop_tokens = stop_tokens,
             .text_buffer = std.ArrayList(u8).empty,
             .token_count = 0,
             .max_tokens = max_tokens,
@@ -112,10 +114,11 @@ const StreamCallbackCtx = struct {
         self.text_buffer.appendSlice(self.allocator, token_text) catch return;
         self.token_count += 1;
 
-        // Check stop strings
+        // Resolve the real finish verdict: stop token → .stop, otherwise
+        // is_done means max_tokens truncation → .length.
         var finish_reason: ?TokenFinishReason = null;
         if (is_done) {
-            finish_reason = .length;
+            finish_reason = if (generation_mod.isStopToken(token, self.stop_tokens)) .stop else .length;
         }
         if (self.stop_strings) |stop_strings| {
             for (stop_strings) |stop_str| {
@@ -135,6 +138,14 @@ const StreamCallbackCtx = struct {
         self.signal.deliverToken(self.io, token, token_text, is_final, finish_reason);
     }
 };
+
+/// Derive the wire finish reason from a finished token sequence: a trailing
+/// stop token → .stop; hitting the max_tokens cap → .length.
+fn finishReasonForTokens(tokens: []const u32, gen_config: GenerateConfig) TokenFinishReason {
+    if (tokens.len > 0 and generation_mod.isStopToken(tokens[tokens.len - 1], gen_config.stop_tokens)) return .stop;
+    if (tokens.len >= gen_config.max_tokens) return .length;
+    return .stop;
+}
 
 /// EngineLoop configuration.
 pub const EngineConfig = struct {
@@ -820,6 +831,7 @@ pub const EngineLoop = struct {
             &req.completion,
             self.tokenizer,
             req.stop_strings,
+            req.stop_tokens,
             req.max_tokens,
         );
         defer stream_ctx.deinit();
@@ -892,7 +904,7 @@ pub const EngineLoop = struct {
 
         // Record token count and deliver the full text as a single token event.
         req.token_count = @intCast(tokens.len);
-        req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+        req.completion.deliverToken(self.io, 0, final_text, true, finishReasonForTokens(tokens, gen_config));
     }
 
     /// Speculative decoding path: uses n-gram draft proposal + target model verification.
@@ -1056,7 +1068,7 @@ pub const EngineLoop = struct {
         }
 
         req.token_count = total_generated;
-        req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+        req.completion.deliverToken(self.io, 0, final_text, true, finishReasonForTokens(generated_slice, gen_config));
     }
 
     /// Guided decoding path: uses FSM-based logit masking to constrain output.
@@ -1123,7 +1135,7 @@ pub const EngineLoop = struct {
         defer self.allocator.free(text);
 
         req.token_count = @intCast(tokens.len);
-        req.completion.deliverToken(self.io, 0, text, true, .stop);
+        req.completion.deliverToken(self.io, 0, text, true, finishReasonForTokens(tokens, gen_config));
     }
 
     fn processDSV4StreamingRequest(
@@ -1178,7 +1190,7 @@ pub const EngineLoop = struct {
                     token,
                     token_text,
                     is_final,
-                    if (is_final) .stop else null,
+                    if (is_final) (if (generation_mod.isStopToken(token, ctx.req.stop_tokens)) .stop else .length) else null,
                 );
             }
         }.callback;
@@ -1252,7 +1264,7 @@ pub const EngineLoop = struct {
         }
 
         req.token_count = @intCast(tokens.len);
-        req.completion.deliverToken(self.io, 0, final_text, true, .stop);
+        req.completion.deliverToken(self.io, 0, final_text, true, finishReasonForTokens(tokens, gen_config));
     }
 
     fn logRequestCompletion(io: std.Io, req: *RequestState) void {

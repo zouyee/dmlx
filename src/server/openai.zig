@@ -165,6 +165,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     var all_text = std.ArrayList(u8).empty;
     defer all_text.deinit(allocator);
 
+    var finish_reason: []const u8 = "stop";
     const t_wait_start = std.c.mach_absolute_time();
     var wait_call_count: usize = 0;
     while (true) {
@@ -178,7 +179,16 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
                 try all_text.appendSlice(allocator, e.token_text);
             }
             std.log.info("[OpenAI] Got token, is_final={}", .{e.is_final});
-            if (e.is_final) break;
+            if (e.is_final) {
+                if (e.finish_reason) |fr| {
+                    finish_reason = switch (fr) {
+                        .stop => "stop",
+                        .length => "length",
+                        .error_ => "stop", // error detail is surfaced via hasError below
+                    };
+                }
+                break;
+            }
         } else {
             std.log.info("[OpenAI] waitForToken returned null", .{});
             break;
@@ -267,12 +277,13 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     try jsonEscapeInto(&escaped, allocator, final_text);
 
     return try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         created,
         created,
         req.model,
         escaped.items,
+        finish_reason,
         prompt_tokens.len,
         new_tokens_len,
         prompt_tokens.len + new_tokens_len,

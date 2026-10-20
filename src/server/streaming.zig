@@ -97,7 +97,17 @@ pub fn handleStreamingCompletion(
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
             token_count += 1;
 
-            const finish: ?[]const u8 = if (e.is_final) "stop" else null;
+            const finish: ?[]const u8 = if (e.is_final)
+                if (e.finish_reason) |fr|
+                    switch (fr) {
+                        .stop => "stop",
+                        .length => "length",
+                        .error_ => "stop",
+                    }
+                else
+                    "stop"
+            else
+                null;
             const chunk = try formatSSEChunk(allocator, completion_id, created, req.model, e.token_text, finish);
             defer allocator.free(chunk);
             try sse.sendEvent(chunk);

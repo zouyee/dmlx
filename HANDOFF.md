@@ -34,6 +34,15 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
   32k vocab, ~minutes/token at Qwen3.8's 248,320 vocab. Now a stable O(n·k)
   top-k selection (`selectTopK`); `topPSampler` uses stable `std.sort.block`.
   Semantics preserved (stable ordering, ties keep lower token id).
+- **finish_reason threaded to the wire** (commit after acceptance): the engine
+  always computed the real verdict but `openai.zig` / `streaming.zig` /
+  `anthropic.zig` hardcoded `"stop"` / `"end_turn"`. Now threaded end-to-end:
+  `StreamCallbackCtx` got `stop_tokens` (EOS → `.stop`, cap → `.length`), and
+  the non-streaming/speculative/guided/DSV4 engine paths use
+  `finishReasonForTokens` in `engine_loop.zig`. Anthropic maps
+  `.stop`→`end_turn`, `.length`→`max_tokens`. Verified live on Qwen3.8:
+  EOS → `stop`, max_tokens=8 → `length` (streaming final chunk too),
+  Anthropic → `end_turn` / `max_tokens`.
 
 ## Known gaps / concerns
 

@@ -36,14 +36,15 @@ fn formatAnthropicResponse(
     text: []const u8,
     input_tokens: usize,
     output_tokens: usize,
+    stop_reason: []const u8,
 ) ![]u8 {
     var escaped = std.ArrayList(u8).empty;
     defer escaped.deinit(allocator);
     try jsonEscapeInto(&escaped, allocator, text);
 
     return try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"{s}"}}],"model":"{s}","stop_reason":"end_turn","usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
-    , .{ escaped.items, model, input_tokens, output_tokens });
+        \\{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"{s}"}}],"model":"{s}","stop_reason":"{s}","usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+    , .{ escaped.items, model, stop_reason, input_tokens, output_tokens });
 }
 
 // ------------------------------------------------------------------
@@ -119,6 +120,8 @@ pub fn handleAnthropicMessages(
     var all_text = std.ArrayList(u8).empty;
     defer all_text.deinit(allocator);
 
+    // Anthropic stop_reason mapping: engine .stop → "end_turn", .length → "max_tokens".
+    var stop_reason: []const u8 = "end_turn";
     while (true) {
         const event = req_state.completion.waitForToken(io) catch break;
         if (event) |e| {
@@ -126,7 +129,16 @@ pub fn handleAnthropicMessages(
             if (e.token_text.len > 0) {
                 try all_text.appendSlice(allocator, e.token_text);
             }
-            if (e.is_final) break;
+            if (e.is_final) {
+                if (e.finish_reason) |fr| {
+                    stop_reason = switch (fr) {
+                        .stop => "end_turn",
+                        .length => "max_tokens",
+                        .error_ => "end_turn",
+                    };
+                }
+                break;
+            }
         } else {
             break;
         }
@@ -139,6 +151,7 @@ pub fn handleAnthropicMessages(
         all_text.items,
         prompt_tokens.len,
         req_state.token_count,
+        stop_reason,
     );
     defer allocator.free(response);
 
