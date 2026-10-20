@@ -132,10 +132,13 @@ for i in 1 2 3 4 5; do
 done
 
 # ------------------------------------------------------------------
-# Correctness: Paris
+# Correctness: Paris. Generous max_tokens because Qwen3.8 thinks first
+# (<think> block); match on post-think text as well as raw.
 # ------------------------------------------------------------------
 echo "   Correctness check..."
-PARIS_TEXT=$(request '"The capital of France is"' 10 | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+PARIS_TEXT=$(request '"The capital of France is"' 64 | python3 -c "
+import re, sys, json
+print(re.sub(r'<think>.*?</think>', '', json.load(sys.stdin)['choices'][0]['message']['content'], flags=re.S))" 2>/dev/null || echo "")
 if echo "$PARIS_TEXT" | grep -qi "paris"; then
     echo "   ✓ Paris correct: \"${PARIS_TEXT}\""
     QWEN_CORRECT=1
@@ -204,7 +207,9 @@ E2E_PASS=0
 E2E_FAIL=0
 for idx in "${!PROMPTS[@]}"; do
     IFS='|' read -r prompt expected <<< "${PROMPTS[$idx]}"
-    content=$(request "\"${prompt}\"" 30 | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || echo "")
+    content=$(request "\"${prompt}\"" 64 | python3 -c "
+import re, sys, json
+print(re.sub(r'<think>.*?</think>', '', json.load(sys.stdin)['choices'][0]['message']['content'], flags=re.S))" 2>/dev/null || echo "")
     if echo "$content" | grep -qi "$expected"; then
         echo "   P$((idx+1)): ✅ PASSED"
         E2E_PASS=$((E2E_PASS + 1))
