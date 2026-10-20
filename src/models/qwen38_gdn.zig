@@ -16,6 +16,7 @@ const math_mod = @import("mlx").math;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
+const eval_mod = @import("mlx").eval;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -205,8 +206,10 @@ pub const Qwen38GDN = struct {
     }
 
     /// One decode token. x: [1, hidden]. Returns [1, hidden]. Advances cache.
-    /// Caller MUST eval the returned output each step (decode path does) so
-    /// lazy graphs do not accumulate across tokens.
+    /// No evals inside: the caller (Qwen38ServingModel.forwardTokens) submits
+    /// the updated cache states via asyncEval once per token and syncs on the
+    /// final logits, so lazy graphs stay O(1) deep across tokens. prefill
+    /// applies the same barrier per loop iteration.
     pub fn forward(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache) !Array {
         const ctx = self.ctx;
         const HK: i32 = @intCast(self.num_key_heads);
@@ -235,7 +238,6 @@ pub const Qwen38GDN = struct {
         const new_conv_state = try ops.copy(ctx, tail);
         cache.conv_state.deinit();
         cache.conv_state = new_conv_state;
-        try cache.conv_state.eval();
 
         const qkv = try activations.silu(ctx, conv_acc);
         defer qkv.deinit(); // [1, QKV]
@@ -348,8 +350,6 @@ pub const Qwen38GDN = struct {
         const s_new = try ops.add(ctx, s_decayed, k_delta);
         cache.ssm_state.deinit();
         cache.ssm_state = s_new;
-        // Force materialization each step (recurrent lazy graph stays O(1) deep).
-        try cache.ssm_state.eval();
 
         const q_b2 = try ops.reshape(ctx, q_full, &[_]i32{ HV, 1, D });
         defer q_b2.deinit();
@@ -385,6 +385,9 @@ pub const Qwen38GDN = struct {
     }
 
     /// Prefill: naive per-token loop over x [1, L, hidden]. Returns [1, L, hidden].
+    /// One eval barrier per token: submit the updated cache states via
+    /// asyncEval, then sync on the token output — the recurrent lazy graph
+    /// must not accumulate across prefill tokens.
     pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !Array {
         const xshape = x.shape();
         const L: i32 = @intCast(xshape[1]);
@@ -402,6 +405,8 @@ pub const Qwen38GDN = struct {
             defer x_flat.deinit();
             const out_t = try self.forward(x_flat, cache);
             errdefer out_t.deinit();
+            try eval_mod.asyncEval(allocator, &[_]Array{ cache.conv_state, cache.ssm_state });
+            try out_t.eval();
             const out_exp = try ops.expandDims(self.ctx, out_t, 1);
             outs.appendAssumeCapacity(out_exp);
             out_t.deinit();

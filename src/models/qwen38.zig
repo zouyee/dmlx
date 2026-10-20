@@ -15,6 +15,7 @@ const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
 const creation_mod = @import("mlx").creation;
+const eval_mod = @import("mlx").eval;
 const glm53 = @import("glm53.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
@@ -549,6 +550,28 @@ pub const Qwen38ServingModel = struct {
         self.caches = new_caches;
     }
 
+    /// Submit every live per-layer cache state array for async evaluation
+    /// (non-blocking). forwardTokens calls this once per token before the
+    /// single logits sync, so the next token's lazy graph references
+    /// materialized state arrays and graph depth stays O(1) across tokens.
+    fn asyncEvalCacheStates(self: *Qwen38ServingModel) !void {
+        var states = std.ArrayList(Array).empty;
+        defer states.deinit(self.allocator);
+        for (self.caches) |*lc| {
+            switch (lc.*) {
+                .gdn => |*gc| {
+                    try states.append(self.allocator, gc.conv_state);
+                    try states.append(self.allocator, gc.ssm_state);
+                },
+                .attn => |*ac| {
+                    if (ac.keys) |k| try states.append(self.allocator, k);
+                    if (ac.values) |v| try states.append(self.allocator, v);
+                },
+            }
+        }
+        try eval_mod.asyncEval(self.allocator, states.items);
+    }
+
     /// ids: [L] u32 token ids → logits [1, L, vocab] f32. L>1 = prefill
     /// (resets state first); L=1 = cached decode step.
     /// Keep the dtype/op sequence in sync with `Qwen38Model.forward` (the
@@ -596,7 +619,6 @@ pub const Qwen38ServingModel = struct {
                 const next = try ops.add(ctx, h, attn_out);
                 h.deinit();
                 h = next;
-                try h.eval();
             }
 
             // MLP sub-block.
@@ -616,7 +638,6 @@ pub const Qwen38ServingModel = struct {
                 const next = try ops.add(ctx, h, mlp_out);
                 h.deinit();
                 h = next;
-                try h.eval();
             }
         }
 
@@ -634,6 +655,10 @@ pub const Qwen38ServingModel = struct {
         var head_q = try self.ws.quantized("language_model.lm_head", hidden);
         defer head_q.deinit();
         const logits = try head_q.linear().apply(ctx, hidden_final);
+        // Single sync point per token: submit all live cache states for async
+        // evaluation (non-blocking), then block only on the logits needed by
+        // sampling. Step N+1's graph then references materialized states.
+        try self.asyncEvalCacheStates();
         try logits.eval();
         return logits;
     }

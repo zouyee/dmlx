@@ -247,8 +247,8 @@ pub const Qwen38Attn = struct {
             cache.keys = k_all;
             cache.values = v_all;
         }
-        try cache.keys.?.eval();
-        try cache.values.?.eval();
+        // No eval here: the caller (Qwen38ServingModel.forwardTokens) submits
+        // the updated cache states via asyncEval once per token.
 
         // GQA: repeat kv heads to q head count.
         const kv_len: i32 = cache.len();
