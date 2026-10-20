@@ -484,7 +484,28 @@ pub const Qwen38ServingModel = struct {
     ws: WeightSource,
     ws_backing: WeightSource.MapBacked,
     weights: std.StringHashMap(Array), // resident weights, owned by caller
+    /// embed_tokens dequantized once at init (bf16 [vocab, hidden], evaled);
+    /// null only when the resident map lacks the embed entries (tests).
+    embed_table_bf16: ?Array,
     caches: []Qwen38LayerCache,
+
+    /// Dequantize embed_tokens (packed U32 + scales + biases) to a resident
+    /// bf16 [vocab, hidden] table and eval it once, so decode gathers rows
+    /// from materialized memory instead of re-dequantizing per token.
+    fn buildResidentEmbedTable(ctx: EagerContext, ws: WeightSource, hidden: i32) !Array {
+        var embed_q = try ws.quantized("language_model.model.embed_tokens", hidden);
+        defer embed_q.deinit();
+        const embed_w = try quantize_mod.dequantizeAs(ctx, .{
+            .data = embed_q.data,
+            .scales = embed_q.scales,
+            .biases = embed_q.biases,
+            .config = embed_q.cfg,
+            .original_shape = &[_]i32{},
+        }, .bfloat16);
+        errdefer embed_w.deinit();
+        try embed_w.eval();
+        return embed_w;
+    }
 
     /// Allocate one fresh cache per layer. On failure every cache built so
     /// far is deinited and the slice freed.
@@ -525,19 +546,33 @@ pub const Qwen38ServingModel = struct {
             .ws = undefined,
             .ws_backing = undefined,
             .weights = weights,
+            .embed_table_bf16 = null,
             .caches = caches,
         };
         // NOTE: the WeightSource built here points at this local's fields;
         // the caller MUST reseat after placement:
         //   placed.ws = WeightSource.fromMap(&placed.weights, ctx, &placed.ws_backing);
         self.ws = WeightSource.fromMap(&self.weights, ctx, &self.ws_backing);
+        // Dequantize embed_tokens once (was ~3.1 GB dequant+eval per token),
+        // then drop the packed entries from the resident map (~0.8 GB).
+        if (self.weights.get("language_model.model.embed_tokens.weight") != null) {
+            errdefer if (self.embed_table_bf16) |*t| t.deinit();
+            self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+            inline for (.{ "weight", "scales", "biases" }) |suffix| {
+                if (self.weights.fetchRemove("language_model.model.embed_tokens." ++ suffix)) |kv| {
+                    self.allocator.free(kv.key);
+                    kv.value.deinit();
+                }
+            }
+        }
         return self;
     }
 
     pub fn deinit(self: *Qwen38ServingModel) void {
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
-        // weights map entries are owned by the caller (registry adapter).
+        if (self.embed_table_bf16) |*t| t.deinit();
+        // remaining weights map entries are owned by the caller (registry adapter).
     }
 
     /// Reset all per-layer decode state (fresh request). Builds the fresh
@@ -589,7 +624,16 @@ pub const Qwen38ServingModel = struct {
         defer allocator.free(ids_i32);
         for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
 
-        const emb = try embedTokensWs(ctx, self.ws, allocator, cfg, ids_i32);
+        // Gather rows from the resident bf16 table (dequantized once at
+        // init) — never re-dequantize the full vocab table per token.
+        if (self.embed_table_bf16 == null) {
+            self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+        }
+        const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
+        defer id_arr.deinit();
+        const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0);
+        defer rows.deinit();
+        const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) });
         defer emb.deinit();
         var h = try ops.copy(ctx, emb); // bf16
         defer h.deinit();
