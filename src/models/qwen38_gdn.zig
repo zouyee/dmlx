@@ -13,6 +13,8 @@ const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
 const reduce_mod = @import("mlx").reduce;
 const math_mod = @import("mlx").math;
+const comparison_mod = @import("mlx").comparison;
+const creation_mod = @import("mlx").creation;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
@@ -39,6 +41,51 @@ pub const Qwen38GdnCache = struct {
     }
 };
 
+/// Per-layer constants derived once from the loaded weights: the transposed
+/// conv kernel (turns the k=4 depthwise conv into one multiply + column sum),
+/// a ones vector so the weight-less q/k rms_norm can use the fused
+/// fast.rmsNorm, and kv-group gather indices that broadcast q/k to value
+/// heads in a single take.
+pub const Precomputed = struct {
+    conv1d_t: Array, // [conv_kernel, QKV]
+    ones_d: Array, // [head_dim] f32
+    qk_idx: Array, // [num_value_heads] i32
+
+    pub fn deinit(self: *Precomputed) void {
+        self.conv1d_t.deinit();
+        self.ones_d.deinit();
+        self.qk_idx.deinit();
+    }
+};
+
+pub fn precomputeDerived(
+    allocator: std.mem.Allocator,
+    ctx: EagerContext,
+    conv1d: Array, // [QKV, K, 1]
+    num_key_heads: usize,
+    num_value_heads: usize,
+    head_dim: usize,
+) !Precomputed {
+    const cshape = conv1d.shape();
+    const QKV: i32 = @intCast(cshape[0]);
+    const K: i32 = @intCast(cshape[1]);
+    const w2d = try ops.reshape(ctx, conv1d, &[_]i32{ QKV, K });
+    defer w2d.deinit();
+    var out: Precomputed = .{
+        .conv1d_t = try shape_mod.transpose(ctx, w2d),
+        .ones_d = try creation_mod.ones(ctx, &[_]i32{@intCast(head_dim)}, .float32),
+        .qk_idx = undefined,
+    };
+    errdefer out.conv1d_t.deinit();
+    errdefer out.ones_d.deinit();
+    const ratio = num_value_heads / num_key_heads;
+    const idx_buf = try allocator.alloc(i32, num_value_heads);
+    defer allocator.free(idx_buf);
+    for (idx_buf, 0..) |*v, h| v.* = @intCast(h / ratio);
+    out.qk_idx = try Array.fromData(allocator, i32, idx_buf, &[_]i32{@intCast(num_value_heads)});
+    return out;
+}
+
 pub const Qwen38GDN = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -58,6 +105,13 @@ pub const Qwen38GDN = struct {
     dt_bias: Array, // [Hv] f32
     norm_w: Array, // [D]
     out_proj: Array,
+
+    // Precomputed per-layer constants (see precomputeDerived). Ownership
+    // follows the struct: deinit frees them; construction sites that skip
+    // deinit (gdnBranch) must free the Precomputed themselves.
+    conv1d_t: Array, // [conv_kernel, QKV] = conv1d [QKV, K, 1] transposed
+    ones_d: Array, // [D] f32, ones weight for weight-less fast.rmsNorm
+    qk_idx: Array, // [Hv] i32, value head h -> key head h / (Hv/Hk)
 
     // Optional quantized forms (affine 4-bit gs=64 in the real checkpoint).
     qkv_scales: ?Array = null,
@@ -86,6 +140,9 @@ pub const Qwen38GDN = struct {
         self.dt_bias.deinit();
         self.norm_w.deinit();
         self.out_proj.deinit();
+        self.conv1d_t.deinit();
+        self.ones_d.deinit();
+        self.qk_idx.deinit();
         if (self.qkv_scales) |a| a.deinit();
         if (self.qkv_biases) |a| a.deinit();
         if (self.a_scales) |a| a.deinit();
@@ -123,86 +180,46 @@ pub const Qwen38GDN = struct {
         return ops.matmul(self.ctx, x, w_t);
     }
 
-    /// Weight-less rms_norm matching mx.fast.rms_norm(x, None, eps): f32
-    /// internally, output rounded back to the input dtype. The oracle uses
-    /// this for q/k normalization (q,k = rms_norm(x) * head_dim^-0.5 scale),
-    /// which equals l2norm up to rounding — but the rounding points matter
-    /// for oracle alignment, so replicate them exactly.
+    /// Weight-less rms_norm matching mx.fast.rms_norm(x, None, eps): fused
+    /// fast.rmsNorm with a precomputed ones vector (f32 internally, output
+    /// rounded back to the input dtype). The oracle uses this for q/k
+    /// normalization (q,k = rms_norm(x) * head_dim^-0.5 scale), which equals
+    /// l2norm up to rounding — but the rounding points matter for oracle
+    /// alignment, so the eps-inside-sqrt semantics must match exactly.
     fn rmsNormNoWeight(self: *const Qwen38GDN, x: Array) !Array {
-        const ctx = self.ctx;
-        const x_f32 = try ops.astype(ctx, x, .float32);
-        defer x_f32.deinit();
-        const sq = try math_mod.square(ctx, x_f32);
-        defer sq.deinit();
-        const ms = try reduce_mod.meanAxis(ctx, sq, -1, true);
-        defer ms.deinit();
-        const eps_arr = try ops.scalarF32(ctx, 1e-6);
-        defer eps_arr.deinit();
-        const ms_eps = try ops.add(ctx, ms, eps_arr);
-        defer ms_eps.deinit();
-        const rms = try ops.sqrt(ctx, ms_eps);
-        defer rms.deinit();
-        const y = try ops.divide(ctx, x_f32, rms);
-        defer y.deinit();
-        return ops.astype(ctx, y, x.dtype());
+        return fast_mod.rmsNorm(self.ctx, x, self.ones_d, 1e-6);
     }
 
-    /// f32-accumulated depthwise causal conv over [K, QKV] window, output
-    /// rounded to the input dtype (matches nn.Conv1d's fused kernel).
-    fn convAccum(self: *const Qwen38GDN, conv_input: Array, qkv_dim: i32, kernel: i32) !Array {
+    /// f32-accumulated depthwise causal conv over the [K, QKV] window, output
+    /// rounded to the input dtype (matches nn.Conv1d's fused kernel). The
+    /// transposed kernel conv1d_t [K, QKV] is precomputed once, so each step
+    /// is a single elementwise multiply + column sum.
+    fn convAccum(self: *const Qwen38GDN, conv_input: Array) !Array {
         const ctx = self.ctx;
-        const w_f32 = try ops.astype(ctx, self.conv1d, .float32);
+        const w_f32 = try ops.astype(ctx, self.conv1d_t, .float32);
         defer w_f32.deinit();
         const x_f32 = try ops.astype(ctx, conv_input, .float32);
         defer x_f32.deinit();
-
-        var acc = blk: {
-            const x_0 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0 }, &[_]i32{ 1, qkv_dim }, &[_]i32{ 1, 1 });
-            defer x_0.deinit();
-            const w_0_s = try ops.slice(ctx, w_f32, &[_]i32{ 0, 0, 0 }, &[_]i32{ qkv_dim, 1, 1 }, &[_]i32{ 1, 1, 1 });
-            defer w_0_s.deinit();
-            const w_0 = try ops.reshape(ctx, w_0_s, &[_]i32{qkv_dim});
-            defer w_0.deinit();
-            break :blk try ops.multiply(ctx, x_0, w_0);
-        };
-        var j: i32 = 1;
-        while (j < kernel) : (j += 1) {
-            const x_j = try ops.slice(ctx, x_f32, &[_]i32{ j, 0 }, &[_]i32{ j + 1, qkv_dim }, &[_]i32{ 1, 1 });
-            defer x_j.deinit();
-            const w_j_s = try ops.slice(ctx, w_f32, &[_]i32{ 0, j, 0 }, &[_]i32{ qkv_dim, j + 1, 1 }, &[_]i32{ 1, 1, 1 });
-            defer w_j_s.deinit();
-            const w_j = try ops.reshape(ctx, w_j_s, &[_]i32{qkv_dim});
-            defer w_j.deinit();
-            const term = try ops.multiply(ctx, x_j, w_j);
-            defer term.deinit();
-            const acc_new = try ops.add(ctx, acc, term);
-            acc.deinit();
-            acc = acc_new;
-        }
+        const prod = try ops.multiply(ctx, x_f32, w_f32); // [K, QKV]
+        defer prod.deinit();
+        const acc = try reduce_mod.sumAxis(ctx, prod, 0, true); // [1, QKV]
         defer acc.deinit();
         return ops.astype(ctx, acc, conv_input.dtype());
     }
 
-    /// softplus(x) = log1p(exp(-|x|)) + max(x, 0), numerically stable.
+    /// softplus(x) = log1p(exp(x)) for x <= 20, x above (exp saturates there
+    /// in f32 long before overflow, and softplus(x) - x < 1e-8).
     fn softplus(self: *const Qwen38GDN, x: Array) !Array {
         const ctx = self.ctx;
-        const abs_x = try ops.abs(ctx, x);
-        defer abs_x.deinit();
-        const neg_abs = try ops.negative(ctx, abs_x);
-        defer neg_abs.deinit();
-        const ex = try ops.exp(ctx, neg_abs);
+        const ex = try ops.exp(ctx, x);
         defer ex.deinit();
-        const one = try ops.scalarF32(ctx, 1.0);
-        defer one.deinit();
-        const p1 = try ops.add(ctx, ex, one);
-        defer p1.deinit();
-        const logp = try ops.log(ctx, p1);
-        defer logp.deinit();
-        const zero = try ops.scalarF32(ctx, 0.0);
-        defer zero.deinit();
-        const relu = try math_mod.maximum(ctx, x, zero);
-        defer relu.deinit();
-        return ops.add(ctx, logp, relu);
+        const lp = try math_mod.log1p(ctx, ex);
+        defer lp.deinit();
+        const twenty = try ops.scalarF32(ctx, 20.0);
+        defer twenty.deinit();
+        const big = try comparison_mod.greater(ctx, x, twenty);
+        defer big.deinit();
+        return ops.where(ctx, big, x, lp);
     }
 
     /// One decode token. x: [1, hidden]. Returns [1, hidden]. Advances cache.
@@ -229,7 +246,7 @@ pub const Qwen38GDN = struct {
         const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin }, 0);
         defer conv_input.deinit(); // [K, QKV]
 
-        const conv_acc = try self.convAccum(conv_input, QKV, K);
+        const conv_acc = try self.convAccum(conv_input);
         defer conv_acc.deinit();
 
         // Advance conv window: keep last K-1 rows.
@@ -308,19 +325,12 @@ pub const Qwen38GDN = struct {
         const beta = try ops.sigmoid(ctx, b_flat); // [HV]
         defer beta.deinit();
 
-        // 4. broadcast q/k to value heads (kv-group ratio = HV/HK).
-        const ratio: i32 = @intCast(self.num_value_heads / self.num_key_heads);
-        const q4 = try ops.reshape(ctx, q, &[_]i32{ HK, 1, D });
-        defer q4.deinit();
-        const q_b = try shape_mod.broadcastTo(ctx, q4, &[_]i32{ HK, ratio, D });
-        defer q_b.deinit();
-        const q_full = try ops.reshape(ctx, q_b, &[_]i32{ HV, D });
+        // 4. broadcast q/k to value heads (kv-group ratio = HV/HK) via a
+        // gather with precomputed indices — one materializing op each,
+        // instead of expandDims→broadcastTo→reshape.
+        const q_full = try shape_mod.takeAxis(ctx, q, self.qk_idx, 0); // [HV, D]
         defer q_full.deinit();
-        const k4 = try ops.reshape(ctx, k, &[_]i32{ HK, 1, D });
-        defer k4.deinit();
-        const k_b0 = try shape_mod.broadcastTo(ctx, k4, &[_]i32{ HK, ratio, D });
-        defer k_b0.deinit();
-        const k_full = try ops.reshape(ctx, k_b0, &[_]i32{ HV, D });
+        const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 0); // [HV, D]
         defer k_full.deinit();
 
         // 5. gated delta rule step. State S [Hv, Dv, Dk].
@@ -445,6 +455,10 @@ fn makeTestModule(allocator: std.mem.Allocator, ctx: EagerContext, dims: TestDim
     const D: i32 = @intCast(dims.head_dim);
     const K: i32 = @intCast(dims.conv_kernel);
     const qkv_dim: i32 = (2 * HK + HV) * D;
+    const conv1d = try makeTestWeight(allocator, &[_]i32{ qkv_dim, K, 1 });
+    errdefer conv1d.deinit();
+    var pre = try precomputeDerived(allocator, ctx, conv1d, dims.key_heads, dims.value_heads, dims.head_dim);
+    errdefer pre.deinit();
     return .{
         .ctx = ctx,
         .hidden_size = dims.hidden,
@@ -453,7 +467,10 @@ fn makeTestModule(allocator: std.mem.Allocator, ctx: EagerContext, dims: TestDim
         .head_dim = dims.head_dim,
         .conv_kernel = dims.conv_kernel,
         .in_proj_qkv = try makeTestWeight(allocator, &[_]i32{ qkv_dim, hidden }),
-        .conv1d = try makeTestWeight(allocator, &[_]i32{ qkv_dim, K, 1 }),
+        .conv1d = conv1d,
+        .conv1d_t = pre.conv1d_t,
+        .ones_d = pre.ones_d,
+        .qk_idx = pre.qk_idx,
         .in_proj_a = try makeTestWeight(allocator, &[_]i32{ HV, hidden }),
         .in_proj_b = try makeTestWeight(allocator, &[_]i32{ HV, hidden }),
         .in_proj_z = try makeTestWeight(allocator, &[_]i32{ HV * D, hidden }),

@@ -161,6 +161,15 @@ pub fn gdnBranch(
     // activation dtype and only casts A_log to f32 inside compute_g.
     const conv1d = try ws.tensor(fmtName(&nbuf, "{s}.conv1d.weight", .{la}));
     defer conv1d.deinit();
+    var pre = try qwen38_gdn.precomputeDerived(
+        allocator,
+        ctx,
+        conv1d,
+        cfg.linear_num_key_heads,
+        cfg.linear_num_value_heads,
+        cfg.linear_key_head_dim,
+    );
+    defer pre.deinit();
     const a_log = try ws.tensor(fmtName(&nbuf, "{s}.A_log", .{la}));
     defer a_log.deinit();
     const dt_bias = try ws.tensor(fmtName(&nbuf, "{s}.dt_bias", .{la}));
@@ -178,6 +187,9 @@ pub fn gdnBranch(
         .norm_eps = cfg.rms_norm_eps,
         .in_proj_qkv = qkv_q.data,
         .conv1d = conv1d,
+        .conv1d_t = pre.conv1d_t,
+        .ones_d = pre.ones_d,
+        .qk_idx = pre.qk_idx,
         .in_proj_a = a_q.data,
         .in_proj_b = b_q.data,
         .in_proj_z = z_q.data,
