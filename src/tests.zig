@@ -73,6 +73,7 @@ pub const qwen38_loader_tests = @import("models/qwen38_loader.zig");
 pub const qwen38_gdn_tests = @import("models/qwen38_gdn.zig");
 pub const qwen38_attn_tests = @import("models/qwen38_attn.zig");
 pub const qwen38_tests = @import("models/qwen38.zig");
+pub const engine_loop_tests = @import("engine/engine_loop.zig");
 
 test "init mlx error handler" {
     c.initErrorHandler();
@@ -150,4 +151,5 @@ test {
     _ = qwen38_gdn_tests;
     _ = qwen38_attn_tests;
     _ = qwen38_tests;
+    _ = engine_loop_tests;
 }

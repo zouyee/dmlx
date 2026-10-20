@@ -147,6 +147,16 @@ fn finishReasonForTokens(tokens: []const u32, gen_config: GenerateConfig) TokenF
     return .stop;
 }
 
+/// Three-way finish verdict for streaming callbacks that see only the final
+/// token: configured stop token → .stop; max_tokens cap reached → .length;
+/// otherwise the model's own internal EOS ended generation → .stop. (DSV4
+/// stops on its internal EOS token, which is not in `stop_tokens`.)
+fn streamFinalReason(token: u32, stop_tokens: []const u32, token_count: usize, max_tokens: usize) TokenFinishReason {
+    if (generation_mod.isStopToken(token, stop_tokens)) return .stop;
+    if (token_count >= max_tokens) return .length;
+    return .stop;
+}
+
 /// EngineLoop configuration.
 pub const EngineConfig = struct {
     allocator: std.mem.Allocator,
@@ -1190,7 +1200,7 @@ pub const EngineLoop = struct {
                     token,
                     token_text,
                     is_final,
-                    if (is_final) (if (generation_mod.isStopToken(token, ctx.req.stop_tokens)) .stop else .length) else null,
+                    if (is_final) streamFinalReason(token, ctx.req.stop_tokens, ctx.token_count, ctx.req.max_tokens) else null,
                 );
             }
         }.callback;
@@ -1527,4 +1537,19 @@ pub fn generateGuided(
     }
 
     return try result.toOwnedSlice(allocator);
+}
+
+test "streamFinalReason: stop token vs max_tokens vs internal EOS" {
+    const stop_tokens = [_]u32{ 100, 200 };
+    // Configured stop token → .stop regardless of count.
+    try std.testing.expectEqual(TokenFinishReason.stop, streamFinalReason(100, &stop_tokens, 3, 64));
+    try std.testing.expectEqual(TokenFinishReason.stop, streamFinalReason(200, &stop_tokens, 64, 64));
+    // Cap reached without a stop token → .length.
+    try std.testing.expectEqual(TokenFinishReason.length, streamFinalReason(42, &stop_tokens, 64, 64));
+    try std.testing.expectEqual(TokenFinishReason.length, streamFinalReason(42, &stop_tokens, 65, 64));
+    // Internal EOS (not in stop_tokens, cap not reached) → .stop.
+    try std.testing.expectEqual(TokenFinishReason.stop, streamFinalReason(1, &stop_tokens, 12, 64));
+    // Empty stop list: cap → .length, otherwise → .stop.
+    try std.testing.expectEqual(TokenFinishReason.length, streamFinalReason(1, &.{}, 8, 8));
+    try std.testing.expectEqual(TokenFinishReason.stop, streamFinalReason(1, &.{}, 7, 8));
 }

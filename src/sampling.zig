@@ -75,6 +75,7 @@ pub fn topKSampler(logits: Array, allocator: std.mem.Allocator, temperature: f32
     const data = try logits.dataPtr(f32);
     const vocab_size = logits.size();
     const k_actual = @min(k, vocab_size);
+    if (k_actual == 0) return greedy(logits, allocator, temperature);
 
     // Apply temperature
     var scored = try allocator.alloc(ScoredToken, vocab_size);
@@ -203,6 +204,7 @@ pub fn topKTopPSampler(
 
     // Apply top-k first (partial selection — see topKSampler).
     const k_actual = @min(k, vocab_size);
+    if (k_actual == 0) return greedy(logits, allocator, temperature);
     const top = try allocator.alloc(ScoredToken, k_actual);
     defer allocator.free(top);
     selectTopK(scored, top);
@@ -264,6 +266,9 @@ fn scoredGreater(_: void, a: ScoredToken, b: ScoredToken) bool {
 fn selectTopK(scored: []const ScoredToken, top: []ScoredToken) void {
     var top_len: usize = 0;
     for (scored) |s| {
+        // Skip NaN scores so NaN logits don't rank first (greedy's `>`
+        // comparisons never select a NaN either).
+        if (std.math.isNan(s.score)) continue;
         var pos: usize = 0;
         while (pos < top_len and top[pos].score >= s.score) : (pos += 1) {}
         if (pos >= top.len) continue;
@@ -434,4 +439,21 @@ pub fn extractTopLogprobs(logits: Array, k: usize, allocator: std.mem.Allocator)
         result[i] = scored[i];
     }
     return result;
+}
+
+test "selectTopK: top-k order, stability, NaN skip" {
+    const nan = std.math.nan(f32);
+    const scored = [_]ScoredToken{
+        .{ .token = 0, .score = 1.0 },
+        .{ .token = 1, .score = nan }, // must not rank first
+        .{ .token = 2, .score = 3.0 },
+        .{ .token = 3, .score = 3.0 }, // tie with 2: lower id first (stable)
+        .{ .token = 4, .score = 2.0 },
+        .{ .token = 5, .score = -5.0 },
+    };
+    var top: [3]ScoredToken = undefined;
+    selectTopK(&scored, &top);
+    try std.testing.expectEqual(@as(u32, 2), top[0].token); // 3.0
+    try std.testing.expectEqual(@as(u32, 3), top[1].token); // 3.0 tie → lower id first
+    try std.testing.expectEqual(@as(u32, 4), top[2].token); // 2.0
 }
