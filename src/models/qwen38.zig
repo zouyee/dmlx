@@ -17,6 +17,7 @@ const quantize_mod = @import("mlx").quantize;
 const creation_mod = @import("mlx").creation;
 const eval_mod = @import("mlx").eval;
 const glm53 = @import("glm53.zig");
+const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const qwen38_attn = @import("qwen38_attn.zig");
@@ -481,8 +482,241 @@ pub const Qwen38Model = struct {
 // Serving model: resident weights + per-layer decode caches
 // ============================================================
 
-/// Resident serving model: all weights live in a map (loaded once, borrowed
-/// via WeightSource.fromMap COW copies); dense model — no expert streaming.
+/// Borrow a resident-map Array handle WITHOUT a COW copy: the returned Array
+/// aliases the map entry (mlx arrays are reference-counted handles; sharing
+/// the handle is safe because the map outlives every borrower here). The
+/// caller must NOT deinit the returned Array — the map owns it.
+fn borrowTensor(map: *const std.StringHashMap(Array), name: []const u8) !Array {
+    return map.get(name) orelse {
+        std.log.err("resident weights: tensor missing: {s}", .{name});
+        return error.TensorNotFound;
+    };
+}
+
+/// Borrowed affine-quantized Linear triple (weight/scales/biases aliased from
+/// the resident map), with bits/group_size derived from the packed shapes —
+/// same derivation as WeightSource.quantized, but no COW copies and no
+/// ownership: do NOT deinit the returned Arrays.
+fn borrowQuantLinear(map: *const std.StringHashMap(Array), prefix: []const u8, in_features: i32) !glm53_attn.QuantLinear {
+    var nbuf: [256]u8 = undefined;
+    const data = try borrowTensor(map, fmtName(&nbuf, "{s}.weight", .{prefix}));
+    const scales = try borrowTensor(map, fmtName(&nbuf, "{s}.scales", .{prefix}));
+    const biases = try borrowTensor(map, fmtName(&nbuf, "{s}.biases", .{prefix}));
+    const wshape = data.shape();
+    const sshape = scales.shape();
+    const packed_cols: i64 = wshape[wshape.len - 1];
+    const scale_cols: i64 = sshape[sshape.len - 1];
+    return .{
+        .w = data,
+        .scales = scales,
+        .biases = biases,
+        .cfg = .{
+            .bits = @intCast(@divTrunc(packed_cols * 32, in_features)),
+            .group_size = @intCast(@divTrunc(in_features, scale_cols)),
+            .mode = .affine,
+        },
+    };
+}
+
+/// A ready-to-use per-layer attention module with weight Arrays borrowed
+/// from the resident map (built once at Qwen38ServingModel.init).
+///
+/// OWNERSHIP: modules do NOT own their weight Arrays — those alias resident
+/// map entries. Each module owns only its derived artifacts (GDN: conv1d_t /
+/// ones_d / qk_idx; attn: none). deinitShallow frees only the owned derived
+/// arrays; the map (freed by the registry adapter after model.deinit) owns
+/// the weights. Never call the module's own deinit() on these instances —
+/// it would free the shared map handles.
+pub const LayerModule = union(enum) {
+    gdn: qwen38_gdn.Qwen38GDN,
+    attn: qwen38_attn.Qwen38Attn,
+
+    pub fn deinitShallow(self: *LayerModule) void {
+        switch (self.*) {
+            .gdn => |*g| {
+                g.conv1d_t.deinit();
+                g.ones_d.deinit();
+                g.qk_idx.deinit();
+            },
+            .attn => {},
+        }
+    }
+};
+
+/// Per-layer persistent state: the attention module plus the two layernorm
+/// weights (cast to f32 and evaluated once) and the borrowed MLP projections.
+pub const LayerPersistent = struct {
+    ln1_f32: Array, // owned (f32 cast of input_layernorm.weight, evaled)
+    ln2_f32: Array, // owned (f32 cast of post_attention_layernorm.weight, evaled)
+    module: LayerModule,
+    mlp_gate: glm53_attn.QuantLinear, // borrowed
+    mlp_up: glm53_attn.QuantLinear, // borrowed
+    mlp_down: glm53_attn.QuantLinear, // borrowed
+
+    pub fn deinitShallow(self: *LayerPersistent) void {
+        self.ln1_f32.deinit();
+        self.ln2_f32.deinit();
+        self.module.deinitShallow();
+    }
+};
+
+/// Construct one layer's persistent module set from the resident map
+/// (mirrors gdnBranch/attnBranch/mlpBranch weight lookup exactly, minus the
+/// COW copies; GDN derived constants are precomputed and evaluated here).
+fn buildLayerPersistent(
+    allocator: std.mem.Allocator,
+    ctx: EagerContext,
+    cfg: *const qwen38_loader.Qwen38Config,
+    map: *const std.StringHashMap(Array),
+    layer_idx: u32,
+) !LayerPersistent {
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    var pbuf: [96]u8 = undefined;
+    const p = fmtName(&pbuf, "language_model.model.layers.{d}", .{layer_idx});
+    var nbuf: [256]u8 = undefined;
+
+    const ln1 = try borrowTensor(map, fmtName(&nbuf, "{s}.input_layernorm.weight", .{p}));
+    const ln1_f32 = try ops.astype(ctx, ln1, .float32);
+    try ln1_f32.eval();
+    const ln2 = try borrowTensor(map, fmtName(&nbuf, "{s}.post_attention_layernorm.weight", .{p}));
+    const ln2_f32 = try ops.astype(ctx, ln2, .float32);
+    try ln2_f32.eval();
+
+    var out: LayerPersistent = .{
+        .ln1_f32 = ln1_f32,
+        .ln2_f32 = ln2_f32,
+        .module = undefined,
+        .mlp_gate = undefined,
+        .mlp_up = undefined,
+        .mlp_down = undefined,
+    };
+    errdefer out.ln1_f32.deinit();
+    errdefer out.ln2_f32.deinit();
+
+    if (cfg.isFullAttention(layer_idx)) {
+        const sa = fmtName(&nbuf, "{s}.self_attn", .{p});
+        var qbuf: [256]u8 = undefined;
+        const q_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.q_proj", .{sa}), hidden);
+        const k_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.k_proj", .{sa}), hidden);
+        const v_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.v_proj", .{sa}), hidden);
+        const o_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.o_proj", .{sa}), @intCast(cfg.num_attention_heads * cfg.head_dim));
+        out.module = .{ .attn = .{
+            .ctx = ctx,
+            .hidden_size = cfg.hidden_size,
+            .num_heads = cfg.num_attention_heads,
+            .num_kv_heads = cfg.num_key_value_heads,
+            .head_dim = cfg.head_dim,
+            .rotary_dims = cfg.rotaryDims(),
+            .rope_theta = cfg.rope_theta,
+            .rms_norm_eps = cfg.rms_norm_eps,
+            .output_gate = cfg.attn_output_gate,
+            .q_proj = q_q.w,
+            .k_proj = k_q.w,
+            .v_proj = v_q.w,
+            .o_proj = o_q.w,
+            .q_norm = try borrowTensor(map, fmtName(&qbuf, "{s}.q_norm.weight", .{sa})),
+            .k_norm = try borrowTensor(map, fmtName(&qbuf, "{s}.k_norm.weight", .{sa})),
+            .q_scales = q_q.scales,
+            .q_biases = q_q.biases,
+            .q_quant = q_q.cfg,
+            .k_scales = k_q.scales,
+            .k_biases = k_q.biases,
+            .k_quant = k_q.cfg,
+            .v_scales = v_q.scales,
+            .v_biases = v_q.biases,
+            .v_quant = v_q.cfg,
+            .o_scales = o_q.scales,
+            .o_biases = o_q.biases,
+            .o_quant = o_q.cfg,
+        } };
+    } else {
+        const la = fmtName(&nbuf, "{s}.linear_attn", .{p});
+        var qbuf: [256]u8 = undefined;
+        const qkv_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.in_proj_qkv", .{la}), hidden);
+        const a_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.in_proj_a", .{la}), hidden);
+        const b_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.in_proj_b", .{la}), hidden);
+        const z_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.in_proj_z", .{la}), hidden);
+        const o_q = try borrowQuantLinear(map, fmtName(&qbuf, "{s}.out_proj", .{la}), @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim));
+
+        const conv1d = try borrowTensor(map, fmtName(&qbuf, "{s}.conv1d.weight", .{la}));
+        var pre = try qwen38_gdn.precomputeDerived(
+            allocator,
+            ctx,
+            conv1d,
+            cfg.linear_num_key_heads,
+            cfg.linear_num_value_heads,
+            cfg.linear_key_head_dim,
+        );
+        errdefer pre.deinit();
+        // Materialize the derived constants once so per-token graphs
+        // reference resident arrays instead of view/transpose chains.
+        try pre.conv1d_t.eval();
+        try pre.ones_d.eval();
+
+        out.module = .{ .gdn = .{
+            .ctx = ctx,
+            .hidden_size = cfg.hidden_size,
+            .num_key_heads = cfg.linear_num_key_heads,
+            .num_value_heads = cfg.linear_num_value_heads,
+            .head_dim = cfg.linear_key_head_dim,
+            .conv_kernel = cfg.linear_conv_kernel_dim,
+            .norm_eps = cfg.rms_norm_eps,
+            .in_proj_qkv = qkv_q.w,
+            .conv1d = conv1d,
+            .conv1d_t = pre.conv1d_t,
+            .ones_d = pre.ones_d,
+            .qk_idx = pre.qk_idx,
+            .in_proj_a = a_q.w,
+            .in_proj_b = b_q.w,
+            .in_proj_z = z_q.w,
+            .A_log = try borrowTensor(map, fmtName(&qbuf, "{s}.A_log", .{la})),
+            .dt_bias = try borrowTensor(map, fmtName(&qbuf, "{s}.dt_bias", .{la})),
+            .norm_w = try borrowTensor(map, fmtName(&qbuf, "{s}.norm.weight", .{la})),
+            .out_proj = o_q.w,
+            .qkv_scales = qkv_q.scales,
+            .qkv_biases = qkv_q.biases,
+            .qkv_quant = qkv_q.cfg,
+            .a_scales = a_q.scales,
+            .a_biases = a_q.biases,
+            .a_quant = a_q.cfg,
+            .b_scales = b_q.scales,
+            .b_biases = b_q.biases,
+            .b_quant = b_q.cfg,
+            .z_scales = z_q.scales,
+            .z_biases = z_q.biases,
+            .z_quant = z_q.cfg,
+            .o_scales = o_q.scales,
+            .o_biases = o_q.biases,
+            .o_quant = o_q.cfg,
+        } };
+    }
+    errdefer out.module.deinitShallow();
+
+    const mp = fmtName(&nbuf, "{s}.mlp", .{p});
+    var qbuf2: [256]u8 = undefined;
+    out.mlp_gate = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.gate_proj", .{mp}), hidden);
+    out.mlp_up = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.up_proj", .{mp}), hidden);
+    out.mlp_down = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.down_proj", .{mp}), @intCast(cfg.intermediate_size));
+    return out;
+}
+
+/// SwiGLU MLP on persistent borrowed projections: down(silu(gate(x)) * up(x)).
+fn mlpForwardPersistent(ctx: EagerContext, lp: *const LayerPersistent, x: Array) !Array {
+    const gate = try lp.mlp_gate.apply(ctx, x);
+    defer gate.deinit();
+    const up = try lp.mlp_up.apply(ctx, x);
+    defer up.deinit();
+    const act = try activations.silu(ctx, gate);
+    defer act.deinit();
+    const h = try ops.multiply(ctx, act, up);
+    defer h.deinit();
+    return lp.mlp_down.apply(ctx, h);
+}
+
+/// Resident serving model: all weights live in a map (loaded once); per-layer
+/// modules (GDN/attn), layernorms, MLP projections and lm_head are built ONCE
+/// at init with Arrays borrowed from the map — the token loop runs no
+/// WeightSource lookups, COW copies, or derived-constant precomputes.
 /// Per-layer caches (GDN conv+ssm state / attention KV) are internal — the
 /// engine's KVCacheStrategy array is unused.
 ///
@@ -500,6 +734,13 @@ pub const Qwen38ServingModel = struct {
     /// null only when the resident map lacks the embed entries (tests).
     embed_table_bf16: ?Array,
     caches: []Qwen38LayerCache,
+    /// Persistent per-layer modules + norm weights + borrowed MLP projections.
+    /// Empty when the resident map lacks layer weights (tests).
+    layers: []LayerPersistent,
+    /// Final norm weight (f32, evaled, owned); null when the map lacks it.
+    final_norm_f32: ?Array,
+    /// lm_head projection (Arrays borrowed from the map); null when absent.
+    lm_head: ?glm53_attn.QuantLinear,
 
     /// Dequantize embed_tokens (packed U32 + scales + biases) to a resident
     /// bf16 [vocab, hidden] table and eval it once, so decode gathers rows
@@ -560,6 +801,9 @@ pub const Qwen38ServingModel = struct {
             .weights = weights,
             .embed_table_bf16 = null,
             .caches = caches,
+            .layers = @constCast(&.{}),
+            .final_norm_f32 = null,
+            .lm_head = null,
         };
         // NOTE: the WeightSource built here points at this local's fields;
         // the caller MUST reseat after placement:
@@ -577,12 +821,47 @@ pub const Qwen38ServingModel = struct {
                 }
             }
         }
+        // Build the persistent per-layer modules once: weight Arrays are
+        // borrowed from the resident map (no COW copies), GDN derived
+        // constants precomputed, layernorms cast to f32 and evaluated. Tests
+        // with an empty map (zero layers) skip this — the vision-rejection
+        // path never touches weights.
+        if (cfg.num_hidden_layers > 0 and self.weights.get("language_model.model.layers.0.input_layernorm.weight") != null) {
+            const layers = try allocator.alloc(LayerPersistent, cfg.num_hidden_layers);
+            var built: usize = 0;
+            errdefer {
+                for (layers[0..built]) |*lp| lp.deinitShallow();
+                allocator.free(layers);
+            }
+            for (layers, 0..) |*lp, i| {
+                lp.* = try buildLayerPersistent(allocator, ctx, cfg, &self.weights, @intCast(i));
+                built += 1;
+            }
+            self.layers = layers;
+        }
+        // Final norm (f32, owned) + lm_head (borrowed) — hoisted out of the
+        // per-token finalLogits path.
+        if (self.weights.get("language_model.model.norm.weight")) |nw| {
+            const nf = try ops.astype(ctx, nw, .float32);
+            errdefer nf.deinit();
+            try nf.eval();
+            self.final_norm_f32 = nf;
+        }
+        if (self.weights.get("language_model.lm_head.weight") != null) {
+            self.lm_head = try borrowQuantLinear(&self.weights, "language_model.lm_head", @intCast(cfg.hidden_size));
+        }
         return self;
     }
 
     pub fn deinit(self: *Qwen38ServingModel) void {
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
+        // Shallow: frees only module-owned derived arrays (GDN conv1d_t /
+        // ones_d / qk_idx) and the f32 layernorms; borrowed weight Arrays
+        // stay with the resident map (freed by the caller after deinit).
+        for (self.layers) |*lp| lp.deinitShallow();
+        if (self.layers.len > 0) self.allocator.free(self.layers);
+        if (self.final_norm_f32) |*a| a.deinit();
         if (self.embed_table_bf16) |*t| t.deinit();
         // remaining weights map entries are owned by the caller (registry adapter).
     }
@@ -623,11 +902,14 @@ pub const Qwen38ServingModel = struct {
     /// (resets state first); L=1 = cached decode step.
     /// Keep the dtype/op sequence in sync with `Qwen38Model.forward` (the
     /// oracle-aligned harness, cos >= 0.9999).
+    ///
+    /// All weights come from the persistent per-layer modules built at init —
+    /// no WeightSource lookups, COW copies, or module construction per token.
     pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
-        var nbuf: [256]u8 = undefined;
+        const hidden: i32 = @intCast(cfg.hidden_size);
 
         try rejectVisionTokens(ids);
         if (ids.len > 1) try self.reset();
@@ -650,26 +932,29 @@ pub const Qwen38ServingModel = struct {
         var h = try ops.copy(ctx, emb); // bf16
         defer h.deinit();
 
-        var layer: u32 = 0;
-        while (layer < cfg.num_hidden_layers) : (layer += 1) {
-            var pbuf: [96]u8 = undefined;
-            const p = fmtName(&pbuf, "language_model.model.layers.{d}", .{layer});
-
+        for (self.layers, 0..) |*lp, layer| {
             // Attention sub-block (mirrors Qwen38Model.forward).
-            const ln1 = try loadNormWeight(ctx, self.ws, fmtName(&nbuf, "{s}.input_layernorm.weight", .{p}));
-            defer ln1.deinit();
             const normed1 = blk: {
                 const h_f32 = try ops.astype(ctx, h, .float32);
                 defer h_f32.deinit();
-                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, ln1, cfg.rms_norm_eps);
+                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln1_f32, cfg.rms_norm_eps);
                 defer n_f32.deinit();
                 break :blk try ops.astype(ctx, n_f32, .bfloat16);
             };
             defer normed1.deinit();
-            const attn_out = if (cfg.isFullAttention(layer))
-                try attnBranch(ctx, self.ws, allocator, cfg, layer, normed1, &self.caches[layer].attn)
-            else
-                try gdnBranch(ctx, self.ws, allocator, cfg, layer, normed1, &self.caches[layer].gdn);
+            const attn_out = switch (lp.module) {
+                .gdn => |*g| blk: {
+                    const cache = &self.caches[layer].gdn;
+                    const n = normed1.shape()[1];
+                    if (n > 1) break :blk try g.prefill(allocator, normed1, cache);
+                    const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
+                    defer step_in.deinit();
+                    const step_out = try g.forward(step_in, cache);
+                    defer step_out.deinit();
+                    break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
+                },
+                .attn => |*a| try a.forward(normed1, &self.caches[layer].attn),
+            };
             defer attn_out.deinit();
             {
                 const next = try ops.add(ctx, h, attn_out);
@@ -678,17 +963,15 @@ pub const Qwen38ServingModel = struct {
             }
 
             // MLP sub-block.
-            const ln2 = try loadNormWeight(ctx, self.ws, fmtName(&nbuf, "{s}.post_attention_layernorm.weight", .{p}));
-            defer ln2.deinit();
             const normed2 = blk: {
                 const h_f32 = try ops.astype(ctx, h, .float32);
                 defer h_f32.deinit();
-                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, ln2, cfg.rms_norm_eps);
+                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln2_f32, cfg.rms_norm_eps);
                 defer n_f32.deinit();
                 break :blk try ops.astype(ctx, n_f32, .bfloat16);
             };
             defer normed2.deinit();
-            const mlp_out = try mlpBranch(ctx, self.ws, cfg, layer, normed2);
+            const mlp_out = try mlpForwardPersistent(ctx, lp, normed2);
             defer mlp_out.deinit();
             {
                 const next = try ops.add(ctx, h, mlp_out);
@@ -700,17 +983,12 @@ pub const Qwen38ServingModel = struct {
         // Final norm → bf16 → lm_head (mirrors Qwen38Model.forward).
         const h_f32 = try ops.astype(ctx, h, .float32);
         defer h_f32.deinit();
-        const norm_w = try loadNormWeight(ctx, self.ws, "language_model.model.norm.weight");
-        defer norm_w.deinit();
-        const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, norm_w, cfg.rms_norm_eps);
+        const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, self.final_norm_f32.?, cfg.rms_norm_eps);
         defer hidden_final_f32.deinit();
         const hidden_final = try ops.astype(ctx, hidden_final_f32, .bfloat16);
         defer hidden_final.deinit();
 
-        const hidden: i32 = @intCast(cfg.hidden_size);
-        var head_q = try self.ws.quantized("language_model.lm_head", hidden);
-        defer head_q.deinit();
-        const logits = try head_q.linear().apply(ctx, hidden_final);
+        const logits = try self.lm_head.?.apply(ctx, hidden_final);
         // Single sync point per token: submit all live cache states for async
         // evaluation (non-blocking), then block only on the logits needed by
         // sampling. Step N+1's graph then references materialized states.
