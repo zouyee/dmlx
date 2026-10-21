@@ -58,11 +58,14 @@ Round-2 findings (measurement-driven):
   qmm GEMV kernel investigation.
 
 Environment notes:
-- mlx-c upgraded to 0.7.0 (mlx 0.32.4) via homebrew. mlx_z is now VENDORED
-  at `third_party/mlx_z` (build.zig.zon path dep) with 3 compat patches vs
-  upstream v0.0.2 (SDPA force_fused arg; cumsum/cumprod axis signatures;
-  upstream tarball hash changed after tag re-release — fresh checkouts must
-  use the vendored copy).
+- mlx-c 0.7.0 (mlx 0.32.4) via homebrew. mlx_z dependency is upstream
+  zouyee/mlx-zig **v0.0.3** (URL dep in build.zig.zon) — the 0.7.0 compat
+  patches (SDPA force_fused, cumsum/cumprod axis API, metal-kernel new
+  signature, vector add_value→append_value) and safetensors FP8 dtypes were
+  upstreamed and released there. Note: qwen38_gdn.zig's fused kernel calls
+  the mlx-c metal-kernel C API directly (written before the binding was
+  fixed); migrating it to the v0.0.3 `custom_kernel.CustomMetalKernel`
+  binding is a cleanup option.
 - `zig build test` silently used a stale binary for a while (2>/dev/null
   hid compile failures after the mlx-c upgrade); always verify by running
   the newest test binary directly and checking the count.
