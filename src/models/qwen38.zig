@@ -557,13 +557,50 @@ pub const LayerPersistent = struct {
     mlp_gate: glm53_attn.QuantLinear, // borrowed
     mlp_up: glm53_attn.QuantLinear, // borrowed
     mlp_down: glm53_attn.QuantLinear, // borrowed
+    /// Fused gate|up projection (one qmm instead of two): row-concat of the
+    /// packed weights/scales/biases along dim 0 (gs-row packing makes this
+    /// exactly equivalent). Null when the gate/up shapes or quant configs
+    /// don't match — the unfused gate/up path is the fallback. Arrays are
+    /// OWNED via gate_up_bufs (the concat results, evaluated once at init).
+    mlp_gate_up: ?glm53_attn.QuantLinear = null,
+    gate_up_bufs: ?[3]Array = null, // owned: w, scales, biases
 
     pub fn deinitShallow(self: *LayerPersistent) void {
         self.ln1_f32.deinit();
         self.ln2_f32.deinit();
         self.module.deinitShallow();
+        if (self.gate_up_bufs) |*bufs| {
+            for (bufs) |*b| b.deinit();
+        }
     }
 };
+
+/// Concatenate gate and up packed quantized weights along the out dim into
+/// one fused projection. Packed layout is row-wise ([out, in*bits/32] U32,
+/// scales/biases [out, in/gs]), so row-concat is exactly equivalent to
+/// running both projections and concatenating the outputs. Returns null when
+/// the shapes/dtypes/quant configs don't match (caller keeps the unfused
+/// path). All three returned Arrays are owned by the caller.
+fn fuseGateUp(ctx: EagerContext, gate: glm53_attn.QuantLinear, up: glm53_attn.QuantLinear) !?glm53_attn.QuantLinear {
+    if (gate.w.dtype() != up.w.dtype()) return null;
+    if (gate.scales.dtype() != up.scales.dtype() or gate.biases.dtype() != up.biases.dtype()) return null;
+    if (!std.mem.eql(i32, gate.w.shape(), up.w.shape())) return null;
+    if (!std.mem.eql(i32, gate.scales.shape(), up.scales.shape())) return null;
+    if (!std.mem.eql(i32, gate.biases.shape(), up.biases.shape())) return null;
+    if (gate.cfg.bits != up.cfg.bits or gate.cfg.group_size != up.cfg.group_size or gate.cfg.mode != up.cfg.mode) return null;
+
+    const w = try shape_mod.concatenateAxis(ctx, &[_]Array{ gate.w, up.w }, 0);
+    errdefer w.deinit();
+    const s = try shape_mod.concatenateAxis(ctx, &[_]Array{ gate.scales, up.scales }, 0);
+    errdefer s.deinit();
+    const b = try shape_mod.concatenateAxis(ctx, &[_]Array{ gate.biases, up.biases }, 0);
+    errdefer b.deinit();
+    // Materialize once at init so per-token graphs reference resident arrays.
+    try w.eval();
+    try s.eval();
+    try b.eval();
+    return .{ .w = w, .scales = s, .biases = b, .cfg = gate.cfg };
+}
 
 /// Construct one layer's persistent module set from the resident map
 /// (mirrors gdnBranch/attnBranch/mlpBranch weight lookup exactly, minus the
@@ -704,6 +741,13 @@ fn buildLayerPersistent(
     out.mlp_gate = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.gate_proj", .{mp}), hidden);
     out.mlp_up = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.up_proj", .{mp}), hidden);
     out.mlp_down = try borrowQuantLinear(map, fmtName(&qbuf2, "{s}.down_proj", .{mp}), @intCast(cfg.intermediate_size));
+    // Fused gate|up: one wide qmm per token instead of two (halves the launch
+    // count of the biggest qmms and streams one contiguous 2× weight read).
+    // Best-effort — the unfused gate/up above stays as the fallback.
+    if (fuseGateUp(ctx, out.mlp_gate, out.mlp_up) catch null) |fused| {
+        out.gate_up_bufs = .{ fused.w, fused.scales, fused.biases };
+        out.mlp_gate_up = fused;
+    }
     return out;
 }
 
@@ -766,6 +810,224 @@ pub fn applyMlpSwiglu(allocator: std.mem.Allocator, mc: Closure, lp: *const Laye
         lp.mlp_up.w,        lp.mlp_up.scales,
         lp.mlp_up.biases,   lp.mlp_down.w,
         lp.mlp_down.scales, lp.mlp_down.biases,
+    };
+    const outs = try mc.apply(&inputs, allocator);
+    if (outs.len != 1) {
+        for (outs) |o| o.deinit();
+        allocator.free(outs);
+        return error.MlxError;
+    }
+    const out = outs[0];
+    allocator.free(outs);
+    return out;
+}
+
+// ============================================================
+// Fused Metal kernel: silu(gate) * up over one gate|up row
+// ============================================================
+//
+// The fused gate|up qmm produces [.., 2*inter]; the eager SwiGLU tail is
+// slice → silu → slice → multiply (4 kernels × 64 layers). This kernel reads
+// the gate half and the up half in one pass: out[i] = silu(gu[i]) * gu[i+n].
+// silu is computed in f32 and rounded to bf16 before the multiply, mirroring
+// the eager silu(bf16)→multiply(bf16) rounding chain (a bf16 product rounds
+// identically whether computed in bf16 or f32, since the f32 product is
+// exact). Falls back to the eager slice/silu/mul chain when unavailable.
+
+const silu_mul_kernel_body =
+    \\    const uint t = thread_position_in_grid.x;
+    \\    if (t < {[n]}) {{
+    \\        const float g = float(gu[t]);
+    \\        const float a = g / (1.0f + metal::exp(-g));
+    \\        sm_out[t] = bfloat16_t(float(bfloat16_t(a)) * float(gu[t + {[n]}]));
+    \\    }}
+    \\
+;
+
+const SiluMulEntry = struct {
+    n: i32,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var silu_mul_entries: [4]?SiluMulEntry = .{ null, null, null, null };
+var silu_mul_stream: ?c.c.mlx_stream = null;
+var silu_mul_warned = false;
+
+fn siluMulStream() c.c.mlx_stream {
+    if (silu_mul_stream == null) {
+        silu_mul_stream = c.c.mlx_default_gpu_stream_new();
+    }
+    return silu_mul_stream.?;
+}
+
+fn siluMulWarn(err: anyerror) void {
+    if (!silu_mul_warned) {
+        silu_mul_warned = true;
+        std.log.warn("fused silu_mul kernel unavailable ({s}); using eager slice/silu/mul", .{@errorName(err)});
+    }
+}
+
+fn createSiluMulKernel(allocator: std.mem.Allocator, n: i32) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "silu_mul_n{d}", .{n}, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, silu_mul_kernel_body, .{ .n = n }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try addRmsStringVec(allocator, &.{"gu"});
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try addRmsStringVec(allocator, &.{"sm_out"});
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+fn getSiluMulKernel(allocator: std.mem.Allocator, n: i32) ?c.c.mlx_fast_metal_kernel {
+    for (&silu_mul_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (e.n == n) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createSiluMulKernel(allocator, n) catch |err| {
+        siluMulWarn(err);
+        return null;
+    };
+    for (&silu_mul_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .n = n, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markSiluMulBroken(n: i32) void {
+    for (&silu_mul_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (e.n == n) e.broken = true;
+        }
+    }
+}
+
+/// Eager SwiGLU tail on a fused gate|up row [.., 2*inter]: slice the two
+/// halves, silu(gate) * up. Matches mlpBranch/mlpForwardPersistent exactly.
+pub fn siluMulEager(ctx: EagerContext, gu: Array) !Array {
+    const gs = gu.shape();
+    const nd = gs.len;
+    if (nd == 0 or nd > 4 or @mod(gs[nd - 1], 2) != 0) return error.MlxError;
+    const inter: i32 = @intCast(@divTrunc(gs[nd - 1], 2));
+    var start: [4]i32 = [_]i32{0} ** 4;
+    var stop: [4]i32 = undefined;
+    var strides: [4]i32 = [_]i32{1} ** 4;
+    for (gs, 0..) |s, i| stop[i] = @intCast(s);
+    stop[nd - 1] = inter;
+    const gate = try ops.slice(ctx, gu, start[0..nd], stop[0..nd], strides[0..nd]);
+    defer gate.deinit();
+    start[nd - 1] = inter;
+    stop[nd - 1] = @intCast(gs[nd - 1]);
+    const up = try ops.slice(ctx, gu, start[0..nd], stop[0..nd], strides[0..nd]);
+    defer up.deinit();
+    const act = try activations.silu(ctx, gate);
+    defer act.deinit();
+    return ops.multiply(ctx, act, up);
+}
+
+/// Fused silu(gate)*up on a gate|up row [.., 2*inter]. Returns null for
+/// non-bf16 inputs, multi-row (prefill) shapes, or when the kernel is
+/// unavailable.
+pub fn siluMulFused(ctx: EagerContext, gu: Array) !?Array {
+    if (gu.dtype() != .bfloat16) return null;
+    const gs = gu.shape();
+    const nd = gs.len;
+    if (nd == 0 or nd > 4 or @mod(gs[nd - 1], 2) != 0) return null;
+    const n: i64 = @divTrunc(gs[nd - 1], 2);
+    // Decode only: exactly one gate|up row. Multi-row (prefill) inputs fall
+    // back to the eager slice/silu/mul chain — the flat gate/up offset
+    // arithmetic in the kernel assumes a single row.
+    var rows: i64 = 1;
+    for (gs[0 .. nd - 1]) |s| rows *= s;
+    if (rows != 1) return null;
+
+    const kernel = getSiluMulKernel(ctx.allocator, @intCast(n)) orelse return null;
+    const nt: i32 = @intCast(@min(@as(i64, 1024), std.mem.alignForward(i64, n, 32)));
+    const groups = @divTrunc(n + nt - 1, nt);
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(groups * nt), 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, nt, 1, 1));
+    // Output shape mirrors gu with the last dim halved.
+    var dims_buf: [4]i32 = undefined;
+    for (gs, 0..) |s, i| dims_buf[i] = @intCast(s);
+    dims_buf[nd - 1] = @intCast(n);
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &dims_buf, @intCast(nd), c.c.MLX_BFLOAT16));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    try c.check(c.c.mlx_vector_array_append_value(input_vec, gu.inner));
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, siluMulStream())) catch |err| {
+        markSiluMulBroken(@intCast(n));
+        siluMulWarn(err);
+        return null;
+    };
+
+    var out_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&out_handle, output_vec, 0));
+    return Array.fromHandle(out_handle);
+}
+
+/// silu(gate) * up from a fused gate|up row: fused kernel when eligible,
+/// eager slice/silu/mul otherwise.
+fn siluMul(ctx: EagerContext, gu: Array) !Array {
+    return (try siluMulFused(ctx, gu)) orelse siluMulEager(ctx, gu);
+}
+
+/// Compiled fused SwiGLU core: down(silu_mul(gate_up(x))) on an already-normed
+/// bf16 x. Input order (7): x, gate_up_w, gate_up_s, gate_up_b, down_w,
+/// down_s, down_b. gate_up_w is the row-concatenated packed [gate; up]
+/// projection (see fuseGateUp).
+fn mlpSwigluFusedClosure(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 7) return error.MlxError;
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = c.c.mlx_default_gpu_stream_new() });
+    defer ctx.deinit();
+    const x = inputs[0];
+    const gu = qwen38_gdn.linearQuantParts(ctx, x, inputs[1], inputs[2], inputs[3]) catch return error.MlxError;
+    defer gu.deinit();
+    const gated = siluMul(ctx, gu) catch return error.MlxError;
+    defer gated.deinit();
+    const mlp_out = qwen38_gdn.linearQuantParts(ctx, gated, inputs[4], inputs[5], inputs[6]) catch return error.MlxError;
+    const out = allocator.alloc(Array, 1) catch return error.MlxError;
+    out[0] = mlp_out;
+    return out;
+}
+
+/// Build the mx.compile'd fused SwiGLU core (see mlpSwigluFusedClosure).
+pub fn compiledMlpSwigluFused(allocator: std.mem.Allocator) !Closure {
+    const base = try Closure.init(&mlpSwigluFusedClosure, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
+}
+
+/// One compiled fused SwiGLU apply on normed x (owned by the caller; x is NOT
+/// consumed). Requires lp.mlp_gate_up.
+pub fn applyMlpSwigluFused(allocator: std.mem.Allocator, mc: Closure, lp: *const LayerPersistent, x: Array) !Array {
+    const gu = lp.mlp_gate_up orelse return error.MlxError;
+    const inputs = [_]Array{
+        x,                  gu.w,          gu.scales,
+        gu.biases,          lp.mlp_down.w, lp.mlp_down.scales,
+        lp.mlp_down.biases,
     };
     const outs = try mc.apply(&inputs, allocator);
     if (outs.len != 1) {
@@ -1052,6 +1314,11 @@ pub const Qwen38ServingModel = struct {
     /// (A/B on the profile harness), so only the qmm/silu/mul core is
     /// compiled.
     mlp_swiglu_compiled: ?Closure,
+    /// mx.compile'd fused SwiGLU core over the row-concatenated gate|up
+    /// projection (one wide qmm + one silu_mul kernel instead of two qmms +
+    /// slice/silu/mul). Preferred over mlp_swiglu_compiled when the layer has
+    /// fused gate_up weights.
+    mlp_swiglu_fused_compiled: ?Closure,
     /// mx.compile'd attention pre-cache segment (projections → q/k norm →
     /// ropeDynamic → gate sigmoid), one graph shared by all full-attention
     /// layers; KV append + SDPA + o_proj stay eager. Null when unavailable.
@@ -1121,6 +1388,7 @@ pub const Qwen38ServingModel = struct {
             .lm_head = null,
             .gdn_step_compiled = null,
             .mlp_swiglu_compiled = null,
+            .mlp_swiglu_fused_compiled = null,
             .attn_precache_compiled = null,
         };
         // NOTE: the WeightSource built here points at this local's fields;
@@ -1203,6 +1471,20 @@ pub const Qwen38ServingModel = struct {
             }
         } else |_| {
             std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
+        }
+        // Fused gate|up variant: only when the layer weights fused at init.
+        if (self.layers[0].mlp_gate_up != null) {
+            if (compiledMlpSwigluFused(self.allocator)) |mc| {
+                if (self.warmMlpSwigluFused(mc)) {
+                    self.mlp_swiglu_fused_compiled = mc;
+                    std.debug.print("info: compiled fused MLP gate_up+swiglu core active\n", .{});
+                } else {
+                    std.debug.print("warn: compiled fused MLP swiglu warm failed — unfused fallback\n", .{});
+                    mc.deinit();
+                }
+            } else |_| {
+                std.debug.print("warn: compiled fused MLP swiglu build failed — unfused fallback\n", .{});
+            }
         }
         // Attention pre-cache segment: only for the exact config the closure
         // bakes (quantized, rotary_dims=64, theta=1e7, output gate).
@@ -1302,6 +1584,23 @@ pub const Qwen38ServingModel = struct {
         return true;
     }
 
+    /// Trace + warm the compiled fused SwiGLU core on the first layer's fused
+    /// gate|up weights.
+    fn warmMlpSwigluFused(self: *Qwen38ServingModel, mc: Closure) bool {
+        const hidden: i32 = @intCast(self.cfg.hidden_size);
+        const lp = &self.layers[0];
+        if (lp.mlp_gate_up == null) return false;
+        const x_f32 = creation_mod.zeros(self.ctx, &[_]i32{ 1, 1, hidden }, .float32) catch return false;
+        defer x_f32.deinit();
+        const x = ops.astype(self.ctx, x_f32, .bfloat16) catch return false;
+        defer x.deinit();
+        x.eval() catch return false;
+        const out = applyMlpSwigluFused(self.allocator, mc, lp, x) catch return false;
+        defer out.deinit();
+        out.eval() catch return false;
+        return true;
+    }
+
     /// One compiled GDN decode step against `cache`: applies the closure and
     /// swaps the new states in. Returns the [1, hidden] output (owned by the
     /// caller). On apply failure the cache is untouched and the error
@@ -1384,6 +1683,7 @@ pub const Qwen38ServingModel = struct {
         if (self.embed_table_bf16) |*t| t.deinit();
         if (self.gdn_step_compiled) |cc| cc.deinit();
         if (self.mlp_swiglu_compiled) |mc| mc.deinit();
+        if (self.mlp_swiglu_fused_compiled) |mc| mc.deinit();
         if (self.attn_precache_compiled) |ac| ac.deinit();
         // remaining weights map entries are owned by the caller (registry adapter).
     }
@@ -1511,6 +1811,13 @@ pub const Qwen38ServingModel = struct {
             const normed2 = r1.normed;
             defer normed2.deinit();
             const mlp_out = blk: {
+                if (self.mlp_swiglu_fused_compiled) |mc| {
+                    if (lp.mlp_gate_up != null) {
+                        if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+                            break :blk mo;
+                        } else |_| {} // fall through to the unfused path
+                    }
+                }
                 if (self.mlp_swiglu_compiled) |mc| {
                     if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
                         break :blk mo;
@@ -1622,6 +1929,228 @@ test "fused add+rmsNorm matches eager chain (decode shapes)" {
         const exp_n = try eno.dataSlice(f32);
         try std.testing.expectEqual(exp_n.len, got_n.len);
         for (exp_n, got_n) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2); // ≤1 bf16 ulp
+    }
+}
+
+test "fuseGateUp: dequantized fused weight == row-concat of dequantized parts, fused qmm matches" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    const in_dim: i32 = 128;
+    const inter: i32 = 16;
+    const qcfg = quantize_mod.QuantConfig{ .bits = 4, .group_size = 64, .mode = .affine };
+
+    const gw_buf = try allocator.alloc(f32, @intCast(in_dim * inter));
+    defer allocator.free(gw_buf);
+    const uw_buf = try allocator.alloc(f32, @intCast(in_dim * inter));
+    defer allocator.free(uw_buf);
+    for (gw_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 37 + 11, 23) - 11)) * 0.05;
+    for (uw_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 19 + 7, 17) - 8)) * 0.04;
+
+    const gate_f32 = try Array.fromData(allocator, f32, gw_buf, &[_]i32{ inter, in_dim });
+    defer gate_f32.deinit();
+    const up_f32 = try Array.fromData(allocator, f32, uw_buf, &[_]i32{ inter, in_dim });
+    defer up_f32.deinit();
+    var gate_q = try quantize_mod.quantize(ctx, gate_f32, qcfg);
+    defer gate_q.deinit(allocator);
+    var up_q = try quantize_mod.quantize(ctx, up_f32, qcfg);
+    defer up_q.deinit(allocator);
+
+    const gate_ql = glm53_attn.QuantLinear{ .w = gate_q.data, .scales = gate_q.scales, .biases = gate_q.biases, .cfg = qcfg };
+    const up_ql = glm53_attn.QuantLinear{ .w = up_q.data, .scales = up_q.scales, .biases = up_q.biases, .cfg = qcfg };
+    var fused = (try fuseGateUp(ctx, gate_ql, up_ql)) orelse return error.FusionRejected;
+    defer fused.w.deinit();
+    defer fused.scales.deinit();
+    defer fused.biases.deinit();
+    try std.testing.expectEqual(@as(i64, 2 * inter), fused.w.shape()[0]);
+    try std.testing.expectEqual(@as(i64, 2 * inter), fused.scales.shape()[0]);
+    try std.testing.expectEqual(@as(i64, 2 * inter), fused.biases.shape()[0]);
+
+    // Packed row-concat must dequantize to exactly the row-concat of the
+    // separate dequantized weights (bit-identical, per-row affine dequant).
+    const fused_deq = try quantize_mod.dequantizeAs(ctx, .{
+        .data = fused.w,
+        .scales = fused.scales,
+        .biases = fused.biases,
+        .config = fused.cfg,
+        .original_shape = &[_]i32{},
+    }, .float32);
+    defer fused_deq.deinit();
+    const gate_deq = try quantize_mod.dequantizeAs(ctx, .{
+        .data = gate_q.data,
+        .scales = gate_q.scales,
+        .biases = gate_q.biases,
+        .config = qcfg,
+        .original_shape = &[_]i32{},
+    }, .float32);
+    defer gate_deq.deinit();
+    const up_deq = try quantize_mod.dequantizeAs(ctx, .{
+        .data = up_q.data,
+        .scales = up_q.scales,
+        .biases = up_q.biases,
+        .config = qcfg,
+        .original_shape = &[_]i32{},
+    }, .float32);
+    defer up_deq.deinit();
+    const sep_deq = try shape_mod.concatenateAxis(ctx, &[_]Array{ gate_deq, up_deq }, 0);
+    defer sep_deq.deinit();
+    try fused_deq.eval();
+    try sep_deq.eval();
+    const fd = try fused_deq.dataSlice(f32);
+    const sd = try sep_deq.dataSlice(f32);
+    try std.testing.expectEqual(sd.len, fd.len);
+    for (sd, fd) |e, o| try std.testing.expectEqual(e, o); // bit-identical
+
+    // One fused qmm == the two separate qmms concatenated (decode shape).
+    const x_buf = try allocator.alloc(f32, @intCast(in_dim));
+    defer allocator.free(x_buf);
+    for (x_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 3, 11) - 5)) * 0.1;
+    const x_f32 = try Array.fromData(allocator, f32, x_buf, &[_]i32{ 1, 1, in_dim });
+    defer x_f32.deinit();
+    const x = try ops.astype(ctx, x_f32, .bfloat16);
+    defer x.deinit();
+
+    const fused_out = try fused.apply(ctx, x);
+    defer fused_out.deinit();
+    const g_out = try gate_ql.apply(ctx, x);
+    defer g_out.deinit();
+    const u_out = try up_ql.apply(ctx, x);
+    defer u_out.deinit();
+    const sep_out = try shape_mod.concatenateAxis(ctx, &[_]Array{ g_out, u_out }, 2);
+    defer sep_out.deinit();
+    const fo = try ops.astype(ctx, fused_out, .float32);
+    defer fo.deinit();
+    const so = try ops.astype(ctx, sep_out, .float32);
+    defer so.deinit();
+    try fo.eval();
+    try so.eval();
+    const fos = try fo.dataSlice(f32);
+    const sos = try so.dataSlice(f32);
+    try std.testing.expectEqual(sos.len, fos.len);
+    for (sos, fos) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-2);
+}
+
+test "siluMulFused matches eager slice+silu+mul (decode shapes)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    for ([_]i32{ 17408, 64 }) |n| {
+        const buf = try allocator.alloc(f32, @intCast(2 * n));
+        defer allocator.free(buf);
+        for (buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 37 + 11, 23) - 11)) * 0.3;
+
+        const gu_f32 = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, 1, 2 * n });
+        defer gu_f32.deinit();
+        const gu = try ops.astype(ctx, gu_f32, .bfloat16);
+        defer gu.deinit();
+
+        const fused = (try siluMulFused(ctx, gu)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.deinit();
+        try std.testing.expectEqual(@as(i64, n), fused.shape()[2]);
+        const eager = try siluMulEager(ctx, gu);
+        defer eager.deinit();
+
+        const fo = try ops.astype(ctx, fused, .float32);
+        defer fo.deinit();
+        const eo = try ops.astype(ctx, eager, .float32);
+        defer eo.deinit();
+        try fo.eval();
+        try eo.eval();
+        const fos = try fo.dataSlice(f32);
+        const eos = try eo.dataSlice(f32);
+        try std.testing.expectEqual(eos.len, fos.len);
+        for (eos, fos) |e, o| {
+            // ≤1 bf16 ulp (ulp grows with magnitude; 0.03125 at |x|≈8).
+            const tol = 0.0625 * @max(@abs(e), 1.0);
+            try std.testing.expectApproxEqAbs(e, o, tol);
+        }
+    }
+}
+
+test "compiled fused SwiGLU matches eager unfused MLP" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    defer ctx.deinit();
+
+    const in_dim: i32 = 128;
+    const inter: i32 = 64;
+    const hidden_down: i32 = 128;
+    const qcfg = quantize_mod.QuantConfig{ .bits = 4, .group_size = 64, .mode = .affine };
+
+    const gw_buf = try allocator.alloc(f32, @intCast(in_dim * inter));
+    defer allocator.free(gw_buf);
+    const uw_buf = try allocator.alloc(f32, @intCast(in_dim * inter));
+    defer allocator.free(uw_buf);
+    const dw_buf = try allocator.alloc(f32, @intCast(hidden_down * inter));
+    defer allocator.free(dw_buf);
+    for (gw_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 37 + 11, 23) - 11)) * 0.05;
+    for (uw_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 19 + 7, 17) - 8)) * 0.04;
+    for (dw_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 23 + 5, 19) - 9)) * 0.03;
+
+    const gate_f32 = try Array.fromData(allocator, f32, gw_buf, &[_]i32{ inter, in_dim });
+    defer gate_f32.deinit();
+    const up_f32 = try Array.fromData(allocator, f32, uw_buf, &[_]i32{ inter, in_dim });
+    defer up_f32.deinit();
+    const down_f32 = try Array.fromData(allocator, f32, dw_buf, &[_]i32{ hidden_down, inter });
+    defer down_f32.deinit();
+    var gate_q = try quantize_mod.quantize(ctx, gate_f32, qcfg);
+    defer gate_q.deinit(allocator);
+    var up_q = try quantize_mod.quantize(ctx, up_f32, qcfg);
+    defer up_q.deinit(allocator);
+    var down_q = try quantize_mod.quantize(ctx, down_f32, qcfg);
+    defer down_q.deinit(allocator);
+
+    var lp: LayerPersistent = .{
+        .ln1_f32 = undefined,
+        .ln2_f32 = undefined,
+        .module = undefined,
+        .mlp_gate = .{ .w = gate_q.data, .scales = gate_q.scales, .biases = gate_q.biases, .cfg = qcfg },
+        .mlp_up = .{ .w = up_q.data, .scales = up_q.scales, .biases = up_q.biases, .cfg = qcfg },
+        .mlp_down = .{ .w = down_q.data, .scales = down_q.scales, .biases = down_q.biases, .cfg = qcfg },
+    };
+    if (try fuseGateUp(ctx, lp.mlp_gate, lp.mlp_up)) |fused| {
+        lp.gate_up_bufs = .{ fused.w, fused.scales, fused.biases };
+        lp.mlp_gate_up = fused;
+    } else return error.FusionRejected;
+    defer for (&lp.gate_up_bufs.?) |*b| b.deinit();
+
+    const x_buf = try allocator.alloc(f32, @intCast(in_dim));
+    defer allocator.free(x_buf);
+    for (x_buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 3, 11) - 5)) * 0.1;
+    const x_f32 = try Array.fromData(allocator, f32, x_buf, &[_]i32{ 1, 1, in_dim });
+    defer x_f32.deinit();
+    const x = try ops.astype(ctx, x_f32, .bfloat16);
+    defer x.deinit();
+    try x.eval();
+
+    const ref = try mlpForwardPersistent(ctx, &lp, x);
+    defer ref.deinit();
+
+    const mc = try compiledMlpSwigluFused(allocator);
+    defer mc.deinit();
+    const got = try applyMlpSwigluFused(allocator, mc, &lp, x);
+    defer got.deinit();
+
+    const ro = try ops.astype(ctx, ref, .float32);
+    defer ro.deinit();
+    const go = try ops.astype(ctx, got, .float32);
+    defer go.deinit();
+    try ro.eval();
+    try go.eval();
+    const ros = try ro.dataSlice(f32);
+    const gos = try go.dataSlice(f32);
+    try std.testing.expectEqual(ros.len, gos.len);
+    var max_diff: f32 = 0;
+    for (ros, gos) |e, o| max_diff = @max(max_diff, @abs(e - o));
+    for (ros, gos) |e, o| {
+        const tol = 0.0625 * @max(@abs(e), 1.0);
+        try std.testing.expectApproxEqAbs(e, o, tol);
     }
 }
 
