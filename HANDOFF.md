@@ -1,6 +1,8 @@
 # Handoff — Qwen3.8-27B text-only support (2026-10-20)
 
-Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`..`ae35a88` + acceptance commit).
+Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
+`git log` (commits `fb826f1`..`ae35a88` + acceptance commit + `9a42856`,
+`26274ba`).
 
 ## What works
 
@@ -22,6 +24,32 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
   `Qwen38ServingModel.forwardTokens` (`qwen38.rejectVisionTokens`).
 
 ## Measured performance (M4 Pro, 48 GB)
+
+**Prefill, L=512 prompt (2026-10-21, `9a42856` + `26274ba`):**
+
+| Engine | tok/s |
+|---|---|
+| dmlx before (per-token GDN prefill loop) | 32.6 |
+| dmlx Task 1 (`9a42856`, vectorized projections/conv/gates/out) | ~92 |
+| **dmlx Task 2 (`26274ba`, single-kernel Metal recurrence)** | **~110–116** |
+| mlx-lm (warm, reference) | ~95 |
+
+- Task 1: one batched qmm per projection over `[1,L,*]`, whole-sequence
+  causal conv (`convAccumSeq`), vectorized gates/out-gate; recurrence stayed
+  a per-step eager loop (`deltaRulePrefillEager`, state synced every 16
+  steps — never eval the stacked per-step ys: live Metal shared events are
+  released only on array free and L×48 of them exhaust the pool).
+- Task 2: the recurrence is one Metal kernel per GDN layer
+  (`deltaRulePrefillFused`, port of mlx-lm `gated_delta.py`: grid
+  (32, Dv, Hv), threadgroup (32,4,1), state in registers, serial for-t loop,
+  `simd_sum` over Dk). Eligible when D%32==0 + f32; toy/small dims fall back
+  to the eager loop. `prefill` dispatches via `deltaRulePrefill`.
+- Numerics gates hold: prefill-vs-per-token unit test (L=3/64, 1e-5),
+  kernel-vs-eager recurrence test (HV=48/D=128, L=37/64/128, 1e-5), oracle
+  cos ≥ 0.9999 all segments, benchmark Paris + 7/7 E2E.
+- Gotcha fixed en route: inline `try ops.slice(...)` temporaries passed to
+  `ops.reshape` leak their handle; each leaked slice pinned its 12.6 MB
+  parent buffer (+2.2 GB per prefill iteration).
 
 **Decode, long-diagnostic (2026-10-21, after round 2):**
 
@@ -97,7 +125,8 @@ Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen3
 `DMLX_PROF_APPLY=1` adds apply/eval breakdown).
 
 - CLI: model load + 32 tokens in ~15 s total.
-- Prefill ~13 tokens in <1 s (GDN prefill loop is still per-token; not yet optimized).
+- Prefill is vectorized + single-kernel recurrence (see table above): L=512
+  prompt at ~110 tok/s warm.
 
 ## Fixes made during acceptance (Task 7)
 
@@ -129,12 +158,13 @@ Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen3
   so an explicit `--temperature 0.8` cannot be distinguished from the default.
 - `zig build test` reports a failed step due to the Zig 0.16 `--listen=-`
   runner quirk; real signal is the test binary tail line
-  (`440 passed; 1 skipped; 0 failed`).
+  (`454 passed; 1 skipped; 0 failed`).
 
 ## Regression status
 
-- Full unit suite: 440 passed, 1 skipped, 0 failed (baseline was 438; +2 new
-  vision-rejection tests).
+- Full unit suite: 454 passed, 1 skipped, 0 failed (440 at Task 7; +2
+  vision-rejection tests, +1 extended GDN prefill equivalence, +1 fused
+  prefill recurrence kernel test).
 - GLM-5.3 smoke (checkpoint present at
   `~/models/GLM-5.3-Flash-MLX-mixed-4_8bit-dmlx`): served on :8081, one
   non-streaming request → coherent text, `finish_reason: stop`, server alive.
