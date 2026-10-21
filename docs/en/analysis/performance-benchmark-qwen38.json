@@ -1,0 +1,25 @@
+{
+  "schema": "dmlx-qwen38-benchmark-v1",
+  "commit": "863dee6",
+  "branch": "glm53-mlx-support",
+  "date": "2026-10-21",
+  "hardware": "Apple M4 Pro",
+  "memory": "48GB",
+  "model_path": "/Users/zouyee/models/Qwen3.8-27B-4bit",
+  "startup_secs": 13,
+  "standard_median_tps": 5.674622,
+  "standard_tps_runs": [
+    5.640654,
+    5.7418,
+    5.674622
+  ],
+  "long_diagnostic_tps": 11.544016,
+  "long_diagnostic_elapsed_s": 8.662497,
+  "paris_correct": true,
+  "e2e_pass": 7,
+  "e2e_fail": 0,
+  "peak_rss_bytes": 16086646784,
+  "perf_secs": 67,
+  "total_secs": 69,
+  "command": "bash scripts/run_benchmark_qwen38.sh /Users/zouyee/models/Qwen3.8-27B-4bit"
+}

@@ -23,9 +23,34 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
 
 ## Measured performance (M4 Pro, 48 GB)
 
-- CLI: model load + 32 tokens in ~19 s total.
-- Server decode: ~4–5.5 tok/s (27 tokens/6.5 s, 128 tokens/23.8 s incl.
-  ~13–19 token prefill). Prefill ~13 tokens in <1 s.
+**Decode, long-diagnostic (2026-10-21, after perf phases 1–5b):**
+
+| Engine | tok/s |
+|---|---|
+| dmlx before optimization | 6.72 |
+| **dmlx now (profiler A/B mean)** | **12.8** |
+| mlx-lm 0.31.3 + mlx 0.32.3 (parity target) | 15.6 |
+| omlx (no custom kernels) | 13.4 |
+| flash-moe | n/a (MoE-only) |
+
+Phases: single eval barrier/token (5940174), embedding dequant-once (2f89b63),
+slab KV cache + native GQA SDPA (f748a02), GDN op-count cuts (88c6def),
+persistent layer modules (43abe0d, perf-neutral cleanup), mx.compile of the
+GDN step + SwiGLU core (863dee6) + attention pre-cache segment with
+ropeDynamic offset (fe04c3e). Root cause was CPU dispatch-bound:
+~3900 mlx-c calls/token at ~18 µs each; compiled closures cut the graph
+count but the remaining ~60 ms/token CPU sits in eager attention/norm
+remnants and closure-apply overhead. Next lever (not done): whole-step
+mega-closure (all layer weights as inputs, one apply per token) or a fused
+custom Metal GDN kernel via the existing custom_kernel.zig binding.
+
+Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen38.sh`
+(Paris + 7-prompt E2E + median/decode tok/s). Profiler harness:
+`zig build run-qwen38-profile -Doptimize=ReleaseFast -- --mode both --decode 50`
+(src/test_qwen38_profile.zig; buildsplit shows CPU-build vs GPU-wait).
+
+- CLI: model load + 32 tokens in ~15 s total.
+- Prefill ~13 tokens in <1 s (GDN prefill loop is still per-token; not yet optimized).
 
 ## Fixes made during acceptance (Task 7)
 

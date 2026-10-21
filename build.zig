@@ -474,6 +474,56 @@ pub fn build(b: *std.Build) void {
     );
     run_qwen38_oracle_dump_step.dependOn(&run_qwen38_oracle_dump.step);
 
+    // --- Qwen3.8 decode profiler (TEMPORARY, uncommitted) ---
+    // Section-level wall-clock breakdown of the serving decode path.
+    const qwen38_profile = b.addExecutable(.{
+        .name = "qwen38-profile",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_qwen38_profile.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qwen38_profile.root_module.addImport("mlx", mlx_z_module);
+    qwen38_profile.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    qwen38_profile.root_module.linkFramework("Metal", .{});
+    qwen38_profile.root_module.linkFramework("Foundation", .{});
+    const run_qwen38_profile = b.addRunArtifact(qwen38_profile);
+    if (b.args) |args| {
+        run_qwen38_profile.addArgs(args);
+    }
+    const run_qwen38_profile_step = b.step(
+        "run-qwen38-profile",
+        "Profile Qwen3.8 decode: baseline ms/token + per-section breakdown",
+    );
+    run_qwen38_profile_step.dependOn(&run_qwen38_profile.step);
+
+    // --- Scratch: compiled GDN apply micro-benchmark (uncommitted) ---
+    const bench_compiled_gdn = b.addExecutable(.{
+        .name = "bench-compiled-gdn",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_compiled_gdn.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_compiled_gdn.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_compiled_gdn = b.addRunArtifact(bench_compiled_gdn);
+    if (b.args) |args| {
+        run_bench_compiled_gdn.addArgs(args);
+    }
+    const run_bench_compiled_gdn_step = b.step(
+        "run-bench-compiled-gdn",
+        "Micro-benchmark compiled GDN step apply cost",
+    );
+    run_bench_compiled_gdn_step.dependOn(&run_bench_compiled_gdn.step);
+
     // --- Wave-5 bounded phase-aware chunk planner table tests (pure Zig) ---
     const native_chunk_planner_tests = b.addTest(.{
         .root_module = b.createModule(.{
