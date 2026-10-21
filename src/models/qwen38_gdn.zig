@@ -926,6 +926,91 @@ fn deltaRuleEager(
     return .{ .s_new = s_new, .y_f32 = y_f32 };
 }
 
+pub const PrefillRecurrenceOut = struct {
+    s_new: Array, // [HV, D, D] f32, final state (owned)
+    y: Array, // [L, HV, D] f32, per-step outputs stacked (owned)
+};
+
+/// Eager per-step delta-rule recurrence over a prefilled sequence. k_full /
+/// q_full / v: [L, HV, D] f32; beta / g: [L, HV] f32; ssm_state: [HV, D, D]
+/// f32 (borrowed). Per step this runs the exact decode recurrence
+/// (deltaRuleFused when eligible, deltaRuleEager otherwise) on [HV, D]
+/// slices, then asyncEvals the new state so the recurrent lazy graph and its
+/// intermediates stay O(1) per step instead of accumulating over L.
+///
+/// Task-2 seam: this function is the only per-step loop left in prefill;
+/// swapping it for a single Metal kernel must not touch anything else.
+fn deltaRulePrefillEager(
+    ctx: EagerContext,
+    allocator: std.mem.Allocator,
+    ssm_state: Array,
+    k_full: Array,
+    v: Array,
+    beta: Array,
+    g: Array,
+    q_full: Array,
+    hv: i32,
+    d: i32,
+) !PrefillRecurrenceOut {
+    const L: i32 = @intCast(k_full.shape()[0]);
+    if (L < 1) return .{ .s_new = try ops.copy(ctx, ssm_state), .y = try array_mod.zeros(allocator, &[_]i32{ 0, hv, d }, .float32) };
+
+    var state: ?Array = null; // owned state from the previous step (null = borrow ssm_state)
+    errdefer if (state) |s| s.deinit();
+    var ys = std.ArrayList(Array).empty;
+    defer ys.deinit(allocator);
+    errdefer for (ys.items) |yi| yi.deinit();
+    try ys.ensureTotalCapacity(allocator, @intCast(L));
+
+    var t: i32 = 0;
+    while (t < L) : (t += 1) {
+        const cur = state orelse ssm_state;
+        const k_sl = try ops.slice(ctx, k_full, &[_]i32{ t, 0, 0 }, &[_]i32{ t + 1, hv, d }, &[_]i32{ 1, 1, 1 });
+        defer k_sl.deinit();
+        const k_t = try ops.reshape(ctx, k_sl, &[_]i32{ hv, d });
+        defer k_t.deinit();
+        const q_sl = try ops.slice(ctx, q_full, &[_]i32{ t, 0, 0 }, &[_]i32{ t + 1, hv, d }, &[_]i32{ 1, 1, 1 });
+        defer q_sl.deinit();
+        const q_t = try ops.reshape(ctx, q_sl, &[_]i32{ hv, d });
+        defer q_t.deinit();
+        const v_sl = try ops.slice(ctx, v, &[_]i32{ t, 0, 0 }, &[_]i32{ t + 1, hv, d }, &[_]i32{ 1, 1, 1 });
+        defer v_sl.deinit();
+        const v_t = try ops.reshape(ctx, v_sl, &[_]i32{ hv, d });
+        defer v_t.deinit();
+        const beta_sl = try ops.slice(ctx, beta, &[_]i32{ t, 0 }, &[_]i32{ t + 1, hv }, &[_]i32{ 1, 1 });
+        defer beta_sl.deinit();
+        const beta_t = try ops.reshape(ctx, beta_sl, &[_]i32{hv});
+        defer beta_t.deinit();
+        const g_sl = try ops.slice(ctx, g, &[_]i32{ t, 0 }, &[_]i32{ t + 1, hv }, &[_]i32{ 1, 1 });
+        defer g_sl.deinit();
+        const g_t = try ops.reshape(ctx, g_sl, &[_]i32{hv});
+        defer g_t.deinit();
+
+        const dr = (try deltaRuleFused(ctx, cur, k_t, v_t, beta_t, g_t, q_t, hv, d)) orelse
+            (try deltaRuleEager(ctx, cur, k_t, v_t, beta_t, g_t, q_t, hv, d));
+        if (state) |s| s.deinit();
+        state = dr.s_new;
+
+        const y_t = try ops.expandDims(ctx, dr.y_f32, 0); // [1, HV, D]
+        dr.y_f32.deinit();
+        ys.appendAssumeCapacity(y_t);
+        // Periodic blocking sync on the state: bounds lazy-graph depth and
+        // intermediate memory. Never (async)eval the stacked ys here: a
+        // Metal shared event is released only when the evaled array is
+        // freed, the ys live until the end-of-prefill concat, and L x
+        // n_layer live events exhaust the pool ("Failed to create Metal
+        // shared event"). The state arrays are freed as the recurrence
+        // advances, so syncing only the state is safe.
+        if (@mod(t, 16) == 15 or t == L - 1) try dr.s_new.eval();
+    }
+
+    const y = try shape_mod.concatenateAxis(ctx, ys.items, 0); // [L, HV, D] f32
+    errdefer y.deinit();
+    for (ys.items) |yi| yi.deinit();
+    ys.clearRetainingCapacity();
+    return .{ .s_new = state.?, .y = y };
+}
+
 pub const Qwen38GdnCache = struct {
     conv_state: Array, // [conv_kernel-1, qkv_dim]
     ssm_state: Array, // [value_heads, head_dim, head_dim] f32, layout [Hv, Dv, Dk]
@@ -1091,6 +1176,37 @@ fn convAccumStep(ctx: EagerContext, conv1d_t: Array, conv_input: Array) !Array {
     const acc = try reduce_mod.sumAxis(ctx, prod, 0, true);
     defer acc.deinit();
     return ops.astype(ctx, acc, conv_input.dtype());
+}
+
+/// Whole-sequence causal depthwise conv for prefill: out[t] =
+/// sum_j window[t+j] * conv1d_t[j] for j in 0..K-1, ascending j (same order
+/// as the fused decode conv kernel), f32 throughout. window is the
+/// [L+K-1, QKV] concat of conv_state and the raw qkv projection (already
+/// promoted to f32); the final astype in convAccumStep is the identity here.
+fn convAccumSeq(ctx: EagerContext, conv1d_t: Array, window: Array, L: i32, qkv_dim: i32) !Array {
+    const k: i32 = @intCast(conv1d_t.shape()[0]);
+    const w_f32 = try ops.astype(ctx, conv1d_t, .float32);
+    defer w_f32.deinit();
+    const x_f32 = try ops.astype(ctx, window, .float32);
+    defer x_f32.deinit();
+    var acc: ?Array = null;
+    errdefer if (acc) |a| a.deinit();
+    var j: i32 = 0;
+    while (j < k) : (j += 1) {
+        const xj = try ops.slice(ctx, x_f32, &[_]i32{ j, 0 }, &[_]i32{ j + L, qkv_dim }, &[_]i32{ 1, 1 });
+        defer xj.deinit();
+        const wj = try ops.slice(ctx, w_f32, &[_]i32{ j, 0 }, &[_]i32{ j + 1, qkv_dim }, &[_]i32{ 1, 1 });
+        defer wj.deinit();
+        const prod = try ops.multiply(ctx, xj, wj); // [L, QKV] * [1, QKV]
+        if (acc) |a| {
+            acc = try ops.add(ctx, a, prod);
+            a.deinit();
+            prod.deinit();
+        } else {
+            acc = prod;
+        }
+    }
+    return acc.?;
 }
 
 /// softplus(x) = log1p(exp(x)) for x <= 20, x above.
@@ -1339,7 +1455,7 @@ pub const Qwen38GDN = struct {
     /// No evals inside: the caller (Qwen38ServingModel.forwardTokens) submits
     /// the updated cache states via asyncEval once per token and syncs on the
     /// final logits, so lazy graphs stay O(1) deep across tokens. prefill
-    /// applies the same barrier per loop iteration.
+    /// applies the same barrier per recurrence step (deltaRulePrefillEager).
     pub fn forward(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache) !Array {
         const res = try step(self.ctx, .{
             .x = x,
@@ -1376,34 +1492,150 @@ pub const Qwen38GDN = struct {
         return res.out;
     }
 
-    /// Prefill: naive per-token loop over x [1, L, hidden]. Returns [1, L, hidden].
-    /// One eval barrier per token: submit the updated cache states via
-    /// asyncEval, then sync on the token output — the recurrent lazy graph
-    /// must not accumulate across prefill tokens.
+    /// Prefill over x [1, L, hidden]. Returns [1, L, hidden]. Advances cache.
+    ///
+    /// Vectorized twin of the per-token decode path: one batched qmm per
+    /// projection over the whole sequence, a whole-sequence causal conv
+    /// (convAccumSeq), vectorized gates, and a vectorized out-gate + out_proj.
+    /// Only the delta-rule recurrence stays a per-step loop
+    /// (deltaRulePrefillEager — the Task-2 swap seam). Op-for-op math and
+    /// dtype round-trips match gdnTailEager; everything past the conv is f32
+    /// because the conv_state concat promotes, exactly as in decode.
     pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !Array {
-        const xshape = x.shape();
-        const L: i32 = @intCast(xshape[1]);
-        const hidden: i32 = @intCast(self.hidden_size);
+        const ctx = self.ctx;
+        const L: i32 = @intCast(x.shape()[1]);
+        const HV: i32 = @intCast(self.num_value_heads);
+        const HK: i32 = @intCast(self.num_key_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const K: i32 = @intCast(self.conv_kernel);
+        const QKV: i32 = (2 * HK + HV) * D;
+        const pk = HK * D;
 
-        var outs = try std.ArrayList(Array).initCapacity(allocator, @intCast(L));
-        defer outs.deinit(allocator);
-        defer for (outs.items) |o| o.deinit();
+        // 1. Batched projections: [1, L, hidden] -> [1, L, *].
+        const qkv_lin = try linearQuantParts(ctx, x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases);
+        defer qkv_lin.deinit(); // [1, L, QKV]
+        const a = try linearQuantParts(ctx, x, self.in_proj_a, self.a_scales, self.a_biases);
+        defer a.deinit(); // [1, L, HV]
+        const b = try linearQuantParts(ctx, x, self.in_proj_b, self.b_scales, self.b_biases);
+        defer b.deinit(); // [1, L, HV]
+        const z = try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
+        defer z.deinit(); // [1, L, HV*D]
 
-        var t: i32 = 0;
-        while (t < L) : (t += 1) {
-            const x_t = try ops.slice(self.ctx, x, &[_]i32{ 0, t, 0 }, &[_]i32{ 1, t + 1, hidden }, &[_]i32{ 1, 1, 1 });
-            defer x_t.deinit();
-            const x_flat = try ops.reshape(self.ctx, x_t, &[_]i32{ 1, hidden });
-            defer x_flat.deinit();
-            const out_t = try self.forward(x_flat, cache);
-            errdefer out_t.deinit();
-            try eval_mod.asyncEval(allocator, &[_]Array{ cache.conv_state, cache.ssm_state });
-            try out_t.eval();
-            const out_exp = try ops.expandDims(self.ctx, out_t, 1);
-            outs.appendAssumeCapacity(out_exp);
-            out_t.deinit();
-        }
-        return shape_mod.concatenateAxis(self.ctx, outs.items, 1);
+        // 2. Causal depthwise conv over the whole sequence (f32) + silu.
+        const qkv_lin2 = try ops.reshape(ctx, qkv_lin, &[_]i32{ L, QKV });
+        defer qkv_lin2.deinit();
+        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin2 }, 0); // [L+K-1, QKV] f32
+        defer window.deinit();
+        const conv_acc = try convAccumSeq(ctx, self.conv1d_t, window, L, QKV);
+        defer conv_acc.deinit(); // [L, QKV] f32
+
+        // New conv window: last K-1 rows of the (raw, pre-silu) window.
+        const tail = try ops.slice(ctx, window, &[_]i32{ L, 0 }, &[_]i32{ L + K - 1, QKV }, &[_]i32{ 1, 1 });
+        defer tail.deinit();
+        const new_conv_state = try ops.copy(ctx, tail);
+        errdefer new_conv_state.deinit();
+
+        const qkv = try activations.silu(ctx, conv_acc); // [L, QKV] f32
+        defer qkv.deinit();
+
+        // 3. Split q/k/v and apply the weight-less per-head rmsNorm (folded
+        // scales) — the norm runs along the last dim, so [L, H, D] works
+        // directly.
+        const q_parts = try ops.slice(ctx, qkv, &[_]i32{ 0, 0 }, &[_]i32{ L, pk }, &[_]i32{ 1, 1 });
+        defer q_parts.deinit();
+        const k_parts = try ops.slice(ctx, qkv, &[_]i32{ 0, pk }, &[_]i32{ L, 2 * pk }, &[_]i32{ 1, 1 });
+        defer k_parts.deinit();
+        const v_parts = try ops.slice(ctx, qkv, &[_]i32{ 0, 2 * pk }, &[_]i32{ L, QKV }, &[_]i32{ 1, 1 });
+        defer v_parts.deinit();
+
+        const q_resh = try ops.reshape(ctx, q_parts, &[_]i32{ L, HK, D });
+        defer q_resh.deinit();
+        const k_resh = try ops.reshape(ctx, k_parts, &[_]i32{ L, HK, D });
+        defer k_resh.deinit();
+        const v = try ops.reshape(ctx, v_parts, &[_]i32{ L, HV, D });
+        defer v.deinit();
+
+        const q = try fast_mod.rmsNorm(ctx, q_resh, self.q_norm_w, 1e-6); // [L, HK, D]
+        defer q.deinit();
+        const k = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm_w, 1e-6);
+        defer k.deinit();
+
+        // 4. Gates over [L, HV]: g = exp(-exp(A_log_f32) * softplus(a +
+        // dt_bias)), beta = sigmoid(b). beta is widened to f32 afterwards —
+        // an exact cast — so the per-step recurrence can use the fused
+        // kernel (decode rounds beta to b's dtype; widening back is lossless).
+        const a_flat = try ops.reshape(ctx, a, &[_]i32{ L, HV });
+        defer a_flat.deinit();
+        const a_dt = try ops.add(ctx, a_flat, self.dt_bias);
+        defer a_dt.deinit();
+        const sp = try softplusStep(ctx, a_dt);
+        defer sp.deinit();
+        const a_log_f32 = try ops.astype(ctx, self.A_log, .float32);
+        defer a_log_f32.deinit();
+        const e_a_log = try ops.exp(ctx, a_log_f32);
+        defer e_a_log.deinit();
+        const g_pre = try ops.multiply(ctx, e_a_log, sp);
+        defer g_pre.deinit();
+        const g_neg = try ops.negative(ctx, g_pre);
+        defer g_neg.deinit();
+        const g = try ops.exp(ctx, g_neg); // [L, HV] f32
+        defer g.deinit();
+
+        const b_flat = try ops.reshape(ctx, b, &[_]i32{ L, HV });
+        defer b_flat.deinit();
+        const beta_raw = try ops.sigmoid(ctx, b_flat); // [L, HV]
+        defer beta_raw.deinit();
+        const beta = try ops.astype(ctx, beta_raw, .float32);
+        defer beta.deinit();
+
+        // Broadcast q/k to value heads via the precomputed gather indices.
+        const q_full = try shape_mod.takeAxis(ctx, q, self.qk_idx, 1); // [L, HV, D]
+        defer q_full.deinit();
+        const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
+        defer k_full.deinit();
+
+        // 5. Delta-rule recurrence (per-step; Task 2 replaces this with a
+        // single Metal kernel over the sequence).
+        const rec = try deltaRulePrefillEager(ctx, allocator, cache.ssm_state, k_full, v, beta, g, q_full, HV, D);
+        errdefer rec.s_new.deinit();
+        defer rec.y.deinit(); // [L, HV, D] f32
+
+        // 6. Out gate + norm over [L, HV, D], then one out_proj qmm.
+        // gated_delta_update returns y.astype(qkv.dtype): round before norm.
+        const y = try ops.astype(ctx, rec.y, qkv.dtype());
+        defer y.deinit();
+        const y_normed = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
+        defer y_normed.deinit();
+        const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
+        defer y_normed_f32.deinit();
+        const z_resh = try ops.reshape(ctx, z, &[_]i32{ L, HV, D });
+        defer z_resh.deinit();
+        const z_f32 = try ops.astype(ctx, z_resh, .float32);
+        defer z_f32.deinit();
+        const z_act = try activations.silu(ctx, z_f32);
+        defer z_act.deinit();
+        const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
+        defer y_gated_f32.deinit();
+        const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
+        defer y_gated.deinit();
+        const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, L, HV * D });
+        defer y_flat.deinit();
+
+        const out = try linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
+        errdefer out.deinit();
+
+        // 7. Single cache swap at the end. Sync on the layer output so this
+        // layer's whole prefill graph (projections, conv, stacked ys) is
+        // flushed and freed before the next layer builds on top — the
+        // serving loop's only barrier is on the final logits, after ALL
+        // layers, which would otherwise pin every layer's intermediates.
+        try out.eval();
+        try eval_mod.asyncEval(allocator, &[_]Array{ new_conv_state, rec.s_new });
+        cache.conv_state.deinit();
+        cache.conv_state = new_conv_state;
+        cache.ssm_state.deinit();
+        cache.ssm_state = rec.s_new;
+        return out;
     }
 };
 
@@ -1800,47 +2032,67 @@ test "Qwen38GDN.prefill: per-token loop equivalence" {
     const ctx = EagerContext.init(allocator);
 
     const dims = TestDims{};
-    var g = try makeTestModule(allocator, ctx, dims);
-    defer g.deinit();
-    var cache = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
-    defer cache.deinit();
+    const hidden: i32 = @intCast(dims.hidden);
 
-    var buf: [24]f32 = undefined;
-    for (&buf, 0..) |*v, i| {
-        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
-    }
-    const x = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 8 });
-    defer x.deinit();
+    for ([_]i32{ 3, 64 }) |L| {
+        var g = try makeTestModule(allocator, ctx, dims);
+        defer g.deinit();
+        var cache = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+        defer cache.deinit();
 
-    const out = try g.prefill(allocator, x, &cache);
-    defer out.deinit();
-    const oshape = out.shape();
-    try std.testing.expectEqual(@as(i32, 1), oshape[0]);
-    try std.testing.expectEqual(@as(i32, 3), oshape[1]);
-    try std.testing.expectEqual(@as(i32, 8), oshape[2]);
-    try out.eval();
+        const n: usize = @intCast(L * hidden);
+        const buf = try allocator.alloc(f32, n);
+        defer allocator.free(buf);
+        for (buf, 0..) |*v, i| {
+            v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+        }
+        const x = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, L, hidden });
+        defer x.deinit();
 
-    var g_ref = try makeTestModule(allocator, ctx, dims);
-    defer g_ref.deinit();
-    var cache_ref = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
-    defer cache_ref.deinit();
+        const out = try g.prefill(allocator, x, &cache);
+        defer out.deinit();
+        const oshape = out.shape();
+        try std.testing.expectEqual(@as(i32, 1), oshape[0]);
+        try std.testing.expectEqual(L, oshape[1]);
+        try std.testing.expectEqual(hidden, oshape[2]);
+        try out.eval();
 
-    var ref_buf: [24]f32 = undefined;
-    var t: i32 = 0;
-    while (t < 3) : (t += 1) {
-        const x_t = try ops.slice(ctx, x, &[_]i32{ 0, t, 0 }, &[_]i32{ 1, t + 1, 8 }, &[_]i32{ 1, 1, 1 });
-        defer x_t.deinit();
-        const x_flat = try ops.reshape(ctx, x_t, &[_]i32{ 1, 8 });
-        defer x_flat.deinit();
-        const out_t = try g_ref.forward(x_flat, &cache_ref);
-        defer out_t.deinit();
-        try out_t.eval();
-        const row = try out_t.dataSlice(f32);
-        @memcpy(ref_buf[@intCast(t * 8)..@intCast((t + 1) * 8)], row);
-    }
-    const got = try out.dataSlice(f32);
-    for (ref_buf, got) |e, o| {
-        try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        var g_ref = try makeTestModule(allocator, ctx, dims);
+        defer g_ref.deinit();
+        var cache_ref = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+        defer cache_ref.deinit();
+
+        const ref_buf = try allocator.alloc(f32, n);
+        defer allocator.free(ref_buf);
+        var t: i32 = 0;
+        while (t < L) : (t += 1) {
+            const x_t = try ops.slice(ctx, x, &[_]i32{ 0, t, 0 }, &[_]i32{ 1, t + 1, hidden }, &[_]i32{ 1, 1, 1 });
+            defer x_t.deinit();
+            const x_flat = try ops.reshape(ctx, x_t, &[_]i32{ 1, hidden });
+            defer x_flat.deinit();
+            const out_t = try g_ref.forward(x_flat, &cache_ref);
+            defer out_t.deinit();
+            try out_t.eval();
+            const row = try out_t.dataSlice(f32);
+            @memcpy(ref_buf[@intCast(t * hidden)..@intCast((t + 1) * hidden)], row);
+        }
+        const got = try out.dataSlice(f32);
+        for (ref_buf, got) |e, o| {
+            try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        }
+        // Final states must match too (they seed the decode that follows).
+        try cache.conv_state.eval();
+        try cache_ref.conv_state.eval();
+        const got_conv = try cache.conv_state.dataSlice(f32);
+        const exp_conv = try cache_ref.conv_state.dataSlice(f32);
+        try std.testing.expectEqual(exp_conv.len, got_conv.len);
+        for (exp_conv, got_conv) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        try cache.ssm_state.eval();
+        try cache_ref.ssm_state.eval();
+        const got_ssm = try cache.ssm_state.dataSlice(f32);
+        const exp_ssm = try cache_ref.ssm_state.dataSlice(f32);
+        try std.testing.expectEqual(exp_ssm.len, got_ssm.len);
+        for (exp_ssm, got_ssm) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
 }
 
