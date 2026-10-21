@@ -21,9 +21,12 @@ const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const qwen38_attn = @import("qwen38_attn.zig");
+const closure_mod = @import("mlx").closure;
+const compile_mod = @import("mlx").compile;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
+const Closure = closure_mod.Closure;
 
 pub const WeightSource = glm53.WeightSource;
 pub const QuantParts = glm53.QuantParts;
@@ -713,6 +716,64 @@ fn mlpForwardPersistent(ctx: EagerContext, lp: *const LayerPersistent, x: Array)
     return lp.mlp_down.apply(ctx, h);
 }
 
+// ============================================================
+// Compiled decode steps (mx.compile) — dispatch-bound fix
+// ============================================================
+
+/// The compiled closures bake rms_norm eps as a trace-time constant; the
+/// serving model only builds them when the config matches.
+const COMPILED_RMS_EPS: f32 = 1e-6;
+
+/// Compiled SwiGLU core: down(silu(gate(x)) * up(x)) on an already-normed
+/// bf16 x (layernorm + residual stay eager). Input order (10): x, gate_w,
+/// gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b.
+fn mlpSwigluClosure(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 10) return error.MlxError;
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = c.c.mlx_default_gpu_stream_new() });
+    defer ctx.deinit();
+    const x = inputs[0];
+    const gate = qwen38_gdn.linearQuantParts(ctx, x, inputs[1], inputs[2], inputs[3]) catch return error.MlxError;
+    defer gate.deinit();
+    const act = activations.silu(ctx, gate) catch return error.MlxError;
+    defer act.deinit();
+    const up = qwen38_gdn.linearQuantParts(ctx, x, inputs[4], inputs[5], inputs[6]) catch return error.MlxError;
+    defer up.deinit();
+    const gated = ops.multiply(ctx, act, up) catch return error.MlxError;
+    defer gated.deinit();
+    const mlp_out = qwen38_gdn.linearQuantParts(ctx, gated, inputs[7], inputs[8], inputs[9]) catch return error.MlxError;
+    const out = allocator.alloc(Array, 1) catch return error.MlxError;
+    out[0] = mlp_out;
+    return out;
+}
+
+/// Build the mx.compile'd SwiGLU core (see mlpSwigluClosure).
+pub fn compiledMlpSwiglu(allocator: std.mem.Allocator) !Closure {
+    const base = try Closure.init(&mlpSwigluClosure, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
+}
+
+/// One compiled SwiGLU core on normed x: returns down(silu(gate(x))*up(x))
+/// (owned by the caller; x is NOT consumed).
+pub fn applyMlpSwiglu(allocator: std.mem.Allocator, mc: Closure, lp: *const LayerPersistent, x: Array) !Array {
+    const inputs = [_]Array{
+        x,                  lp.mlp_gate.w,
+        lp.mlp_gate.scales, lp.mlp_gate.biases,
+        lp.mlp_up.w,        lp.mlp_up.scales,
+        lp.mlp_up.biases,   lp.mlp_down.w,
+        lp.mlp_down.scales, lp.mlp_down.biases,
+    };
+    const outs = try mc.apply(&inputs, allocator);
+    if (outs.len != 1) {
+        for (outs) |o| o.deinit();
+        allocator.free(outs);
+        return error.MlxError;
+    }
+    const out = outs[0];
+    allocator.free(outs);
+    return out;
+}
+
 /// Resident serving model: all weights live in a map (loaded once); per-layer
 /// modules (GDN/attn), layernorms, MLP projections and lm_head are built ONCE
 /// at init with Arrays borrowed from the map — the token loop runs no
@@ -741,6 +802,15 @@ pub const Qwen38ServingModel = struct {
     final_norm_f32: ?Array,
     /// lm_head projection (Arrays borrowed from the map); null when absent.
     lm_head: ?glm53_attn.QuantLinear,
+    /// mx.compile'd GDN decode step (one graph shared by all GDN layers —
+    /// shapes/dtypes are layer-invariant). Null when unavailable (tests,
+    /// non-1e-6 eps, or compile/warm failure → eager fallback).
+    gdn_step_compiled: ?Closure,
+    /// mx.compile'd SwiGLU MLP core (ln + residual stay eager). The
+    /// ln+residual-inside-compile variant measured SLOWER than eager
+    /// (A/B on the profile harness), so only the qmm/silu/mul core is
+    /// compiled.
+    mlp_swiglu_compiled: ?Closure,
 
     /// Dequantize embed_tokens (packed U32 + scales + biases) to a resident
     /// bf16 [vocab, hidden] table and eval it once, so decode gathers rows
@@ -804,6 +874,8 @@ pub const Qwen38ServingModel = struct {
             .layers = @constCast(&.{}),
             .final_norm_f32 = null,
             .lm_head = null,
+            .gdn_step_compiled = null,
+            .mlp_swiglu_compiled = null,
         };
         // NOTE: the WeightSource built here points at this local's fields;
         // the caller MUST reseat after placement:
@@ -850,7 +922,126 @@ pub const Qwen38ServingModel = struct {
         if (self.weights.get("language_model.lm_head.weight") != null) {
             self.lm_head = try borrowQuantLinear(&self.weights, "language_model.lm_head", @intCast(cfg.hidden_size));
         }
+        // Compiled decode steps: one mx.compile graph per sub-block type,
+        // shared across layers (shapes/dtypes are layer-invariant). Trace +
+        // warm happens here, once; any failure leaves the eager fallback.
+        if (self.layers.len > 0 and @abs(cfg.rms_norm_eps - COMPILED_RMS_EPS) < 1e-12 and
+            std.c.getenv("DMLX_QWEN38_NO_COMPILE") == null)
+        {
+            self.initCompiledSteps();
+        }
         return self;
+    }
+
+    /// Build and warm the compiled GDN/MLP decode closures. Best-effort: a
+    /// compile or warm failure disables just that path (eager fallback).
+    fn initCompiledSteps(self: *Qwen38ServingModel) void {
+        if (qwen38_gdn.compiledStep(self.allocator, true)) |cc| {
+            if (self.warmGdnStep(cc)) {
+                self.gdn_step_compiled = cc;
+                std.debug.print("info: compiled GDN decode step active\n", .{});
+            } else {
+                std.debug.print("warn: compiled GDN step warm failed — eager fallback\n", .{});
+                cc.deinit();
+            }
+        } else |_| {
+            std.debug.print("warn: compiled GDN step build failed — eager fallback\n", .{});
+        }
+        if (compiledMlpSwiglu(self.allocator)) |mc| {
+            if (self.warmMlpSwiglu(mc)) {
+                self.mlp_swiglu_compiled = mc;
+                std.debug.print("info: compiled MLP swiglu core active\n", .{});
+            } else {
+                std.debug.print("warn: compiled MLP swiglu warm failed — eager fallback\n", .{});
+                mc.deinit();
+            }
+        } else |_| {
+            std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
+        }
+    }
+
+    /// Trace + warm the compiled SwiGLU core on the first layer's weights.
+    fn warmMlpSwiglu(self: *Qwen38ServingModel, mc: Closure) bool {
+        const hidden: i32 = @intCast(self.cfg.hidden_size);
+        const lp = &self.layers[0];
+        const x_f32 = creation_mod.zeros(self.ctx, &[_]i32{ 1, 1, hidden }, .float32) catch return false;
+        defer x_f32.deinit();
+        const x = ops.astype(self.ctx, x_f32, .bfloat16) catch return false;
+        defer x.deinit();
+        x.eval() catch return false;
+        const out = applyMlpSwiglu(self.allocator, mc, lp, x) catch return false;
+        defer out.deinit();
+        out.eval() catch return false;
+        return true;
+    }
+
+    /// One compiled GDN decode step against `cache`: applies the closure and
+    /// swaps the new states in. Returns the [1, hidden] output (owned by the
+    /// caller). On apply failure the cache is untouched and the error
+    /// propagates — callers fall back to the eager path.
+    pub fn applyGdnStep(self: *Qwen38ServingModel, cc: Closure, g: *qwen38_gdn.Qwen38GDN, cache: *qwen38_gdn.Qwen38GdnCache, x: Array) !Array {
+        const inputs = [_]Array{
+            x,             cache.conv_state, cache.ssm_state,
+            g.in_proj_qkv, g.qkv_scales.?,   g.qkv_biases.?,
+            g.conv1d_t,    g.in_proj_a,      g.a_scales.?,
+            g.a_biases.?,  g.in_proj_b,      g.b_scales.?,
+            g.b_biases.?,  g.in_proj_z,      g.z_scales.?,
+            g.z_biases.?,  g.A_log,          g.dt_bias,
+            g.norm_w,      g.out_proj,       g.o_scales.?,
+            g.o_biases.?,  g.ones_d,         g.qk_idx,
+        };
+        const outs = try cc.apply(&inputs, self.allocator);
+        if (outs.len != 3) {
+            for (outs) |o| o.deinit();
+            self.allocator.free(outs);
+            return error.MlxError;
+        }
+        cache.conv_state.deinit();
+        cache.conv_state = outs[1];
+        cache.ssm_state.deinit();
+        cache.ssm_state = outs[2];
+        const out = outs[0];
+        self.allocator.free(outs);
+        return out;
+    }
+
+    /// First apply of a compiled closure triggers the trace (seconds). Runs
+    /// the first GDN layer's weights against its zero init state with a zero
+    /// input; outputs are discarded (after a full eval, which is what forces
+    /// the compile) so the caches stay zeroed.
+    fn warmGdnStep(self: *Qwen38ServingModel, cc: Closure) bool {
+        const allocator = self.allocator;
+        const hidden: i32 = @intCast(self.cfg.hidden_size);
+        for (self.layers) |*lp| {
+            switch (lp.module) {
+                .gdn => |*g| {
+                    // Fresh zero cache: applyGdnStep swaps states into the
+                    // cache it is given, and the real per-layer caches must
+                    // keep their (zero) init state.
+                    var warm_cache = qwen38_gdn.Qwen38GdnCache.init(
+                        allocator,
+                        self.cfg.linear_conv_kernel_dim,
+                        (2 * self.cfg.linear_num_key_heads + self.cfg.linear_num_value_heads) * self.cfg.linear_key_head_dim,
+                        self.cfg.linear_num_value_heads,
+                        self.cfg.linear_value_head_dim,
+                    ) catch return false;
+                    defer warm_cache.deinit();
+                    const x_f32 = creation_mod.zeros(self.ctx, &[_]i32{ 1, hidden }, .float32) catch return false;
+                    defer x_f32.deinit();
+                    const x = ops.astype(self.ctx, x_f32, .bfloat16) catch return false;
+                    defer x.deinit();
+                    x.eval() catch return false;
+                    const out = self.applyGdnStep(cc, g, &warm_cache, x) catch return false;
+                    defer out.deinit();
+                    out.eval() catch return false;
+                    warm_cache.conv_state.eval() catch return false;
+                    warm_cache.ssm_state.eval() catch return false;
+                    return true;
+                },
+                .attn => {},
+            }
+        }
+        return false;
     }
 
     pub fn deinit(self: *Qwen38ServingModel) void {
@@ -863,6 +1054,8 @@ pub const Qwen38ServingModel = struct {
         if (self.layers.len > 0) self.allocator.free(self.layers);
         if (self.final_norm_f32) |*a| a.deinit();
         if (self.embed_table_bf16) |*t| t.deinit();
+        if (self.gdn_step_compiled) |cc| cc.deinit();
+        if (self.mlp_swiglu_compiled) |mc| mc.deinit();
         // remaining weights map entries are owned by the caller (registry adapter).
     }
 
@@ -949,6 +1142,12 @@ pub const Qwen38ServingModel = struct {
                     if (n > 1) break :blk try g.prefill(allocator, normed1, cache);
                     const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
                     defer step_in.deinit();
+                    if (self.gdn_step_compiled) |cc| {
+                        if (applyGdnStep(self, cc, g, cache, step_in)) |step_out| {
+                            defer step_out.deinit();
+                            break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
+                        } else |_| {} // fall through to the eager path
+                    }
                     const step_out = try g.forward(step_in, cache);
                     defer step_out.deinit();
                     break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
@@ -971,6 +1170,15 @@ pub const Qwen38ServingModel = struct {
                 break :blk try ops.astype(ctx, n_f32, .bfloat16);
             };
             defer normed2.deinit();
+            if (self.mlp_swiglu_compiled) |mc| {
+                if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mlp_out| {
+                    defer mlp_out.deinit();
+                    const next = try ops.add(ctx, h, mlp_out);
+                    h.deinit();
+                    h = next;
+                    continue;
+                } else |_| {} // fall through to the eager path
+            }
             const mlp_out = try mlpForwardPersistent(ctx, lp, normed2);
             defer mlp_out.deinit();
             {

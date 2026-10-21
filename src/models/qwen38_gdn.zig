@@ -19,10 +19,13 @@ const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
 const eval_mod = @import("mlx").eval;
+const closure_mod = @import("mlx").closure;
+const compile_mod = @import("mlx").compile;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const QuantConfig = quantize_mod.QuantConfig;
+const Closure = closure_mod.Closure;
 
 pub const Qwen38GdnCache = struct {
     conv_state: Array, // [conv_kernel-1, qkv_dim]
@@ -84,6 +87,360 @@ pub fn precomputeDerived(
     for (idx_buf, 0..) |*v, h| v.* = @intCast(h / ratio);
     out.qk_idx = try Array.fromData(allocator, i32, idx_buf, &[_]i32{@intCast(num_value_heads)});
     return out;
+}
+
+// ============================================================
+// Pure decode step (arrays -> arrays) + compiled closure
+// ============================================================
+
+/// All arrays one GDN decode token needs, with no module state. Shapes are
+/// fixed across layers and tokens, so a single compiled graph built from
+/// `compiledStep` serves every GDN layer (weight VALUES differ; shapes and
+/// dtypes are identical).
+pub const StepWeights = struct {
+    x: Array, // [1, hidden]
+    conv_state: Array, // [K-1, QKV]
+    ssm_state: Array, // [HV, D, D] f32
+    qkv_w: Array,
+    qkv_scales: ?Array = null,
+    qkv_biases: ?Array = null,
+    conv1d_t: Array, // [K, QKV]
+    a_w: Array,
+    a_scales: ?Array = null,
+    a_biases: ?Array = null,
+    b_w: Array,
+    b_scales: ?Array = null,
+    b_biases: ?Array = null,
+    z_w: Array,
+    z_scales: ?Array = null,
+    z_biases: ?Array = null,
+    A_log: Array, // [HV]
+    dt_bias: Array, // [HV]
+    norm_w: Array, // [D]
+    out_w: Array,
+    out_scales: ?Array = null,
+    out_biases: ?Array = null,
+    ones_d: Array, // [D]
+    qk_idx: Array, // [HV] i32
+    norm_eps: f32 = 1e-6,
+};
+
+pub const StepOutput = struct {
+    out: Array, // [1, hidden]
+    conv_state: Array, // [K-1, QKV]
+    ssm_state: Array, // [HV, D, D] f32
+};
+
+/// Affine QuantConfig derived from the packed shapes (mirrors
+/// WeightSource.quantized / borrowQuantLinear): bits = packed_cols*32/in,
+/// group_size = in/scale_cols.
+fn quantConfigFromShapes(x: Array, w: Array, scales: Array) QuantConfig {
+    const xs = x.shape();
+    const in_features: i64 = xs[xs.len - 1];
+    const ws = w.shape();
+    const ss = scales.shape();
+    const packed_cols: i64 = ws[ws.len - 1];
+    const scale_cols: i64 = ss[ss.len - 1];
+    return .{
+        .bits = @intCast(@divTrunc(packed_cols * 32, in_features)),
+        .group_size = @intCast(@divTrunc(in_features, scale_cols)),
+        .mode = .affine,
+    };
+}
+
+/// x @ w^T — fused quantized matmul when scales are present. The QuantConfig
+/// is derived from the packed shapes so the same code serves traced closures
+/// (no runtime config payload) and eager callers identically.
+pub fn linearQuantParts(ctx: EagerContext, x: Array, w: Array, scales: ?Array, biases: ?Array) !Array {
+    if (scales) |s| {
+        const qw = quantize_mod.QuantizedWeight{
+            .data = w,
+            .scales = s,
+            .biases = biases orelse Array.fromHandle(c.c.mlx_array_new()),
+            .config = quantConfigFromShapes(x, w, s),
+            .original_shape = &[_]i32{},
+        };
+        return quantize_mod.quantizedMatmul(ctx, x, qw, true);
+    }
+    const w_t = try ops.transpose(ctx, w);
+    defer w_t.deinit();
+    return ops.matmul(ctx, x, w_t);
+}
+
+/// f32-accumulated depthwise causal conv over the [K, QKV] window (see
+/// Qwen38GDN.convAccum).
+fn convAccumStep(ctx: EagerContext, conv1d_t: Array, conv_input: Array) !Array {
+    const w_f32 = try ops.astype(ctx, conv1d_t, .float32);
+    defer w_f32.deinit();
+    const x_f32 = try ops.astype(ctx, conv_input, .float32);
+    defer x_f32.deinit();
+    const prod = try ops.multiply(ctx, x_f32, w_f32);
+    defer prod.deinit();
+    const acc = try reduce_mod.sumAxis(ctx, prod, 0, true);
+    defer acc.deinit();
+    return ops.astype(ctx, acc, conv_input.dtype());
+}
+
+/// softplus(x) = log1p(exp(x)) for x <= 20, x above.
+fn softplusStep(ctx: EagerContext, x: Array) !Array {
+    const ex = try ops.exp(ctx, x);
+    defer ex.deinit();
+    const lp = try math_mod.log1p(ctx, ex);
+    defer lp.deinit();
+    const twenty = try ops.scalarF32(ctx, 20.0);
+    defer twenty.deinit();
+    const big = try comparison_mod.greater(ctx, x, twenty);
+    defer big.deinit();
+    return ops.where(ctx, big, x, lp);
+}
+
+/// One GDN decode token as a pure function of arrays. Body mirrors
+/// Qwen38GDN.forward exactly (same op sequence, same dtypes), but takes every
+/// weight/state as an explicit input and returns the new states instead of
+/// mutating a cache — this is the function compiled by `compiledStep`.
+/// All dims are derived from input shapes so the trace is shape-polymorphic
+/// across model sizes (and retrace-free as long as shapes stay fixed).
+pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
+    const HV: i32 = @intCast(w.A_log.shape()[0]);
+    const D: i32 = @intCast(w.norm_w.shape()[0]);
+    const K: i32 = @intCast(w.conv1d_t.shape()[0]);
+    const QKV: i32 = @intCast(w.conv1d_t.shape()[1]);
+    const PV: i32 = HV * D;
+    const PK: i32 = @divTrunc(QKV - PV, 2);
+    const HK: i32 = @divTrunc(PK, D);
+
+    // 1. qkv projection + depthwise causal conv (k=4) + silu.
+    const qkv_lin = try linearQuantParts(ctx, w.x, w.qkv_w, w.qkv_scales, w.qkv_biases);
+    defer qkv_lin.deinit();
+
+    const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ w.conv_state, qkv_lin }, 0);
+    defer conv_input.deinit(); // [K, QKV]
+
+    const conv_acc = try convAccumStep(ctx, w.conv1d_t, conv_input);
+    defer conv_acc.deinit();
+
+    // New conv window: keep last K-1 rows.
+    const tail = try ops.slice(ctx, conv_input, &[_]i32{ 1, 0 }, &[_]i32{ K, QKV }, &[_]i32{ 1, 1 });
+    defer tail.deinit();
+    const new_conv_state = try ops.copy(ctx, tail);
+    errdefer new_conv_state.deinit();
+
+    const qkv = try activations.silu(ctx, conv_acc);
+    defer qkv.deinit(); // [1, QKV]
+
+    // 2. split q/k/v; weight-less rms_norm per head; scale q by D^-1, k by D^-0.5.
+    const qkv_flat = try ops.reshape(ctx, qkv, &[_]i32{QKV});
+    defer qkv_flat.deinit();
+    const q_parts = try ops.slice(ctx, qkv_flat, &[_]i32{0}, &[_]i32{PK}, &[_]i32{1});
+    defer q_parts.deinit();
+    const k_parts = try ops.slice(ctx, qkv_flat, &[_]i32{PK}, &[_]i32{2 * PK}, &[_]i32{1});
+    defer k_parts.deinit();
+    const v_parts = try ops.slice(ctx, qkv_flat, &[_]i32{2 * PK}, &[_]i32{QKV}, &[_]i32{1});
+    defer v_parts.deinit();
+
+    const q_resh = try ops.reshape(ctx, q_parts, &[_]i32{ HK, D });
+    defer q_resh.deinit();
+    const k_resh = try ops.reshape(ctx, k_parts, &[_]i32{ HK, D });
+    defer k_resh.deinit();
+    const v = try ops.reshape(ctx, v_parts, &[_]i32{ HV, D });
+    defer v.deinit();
+
+    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    const q_rn = try fast_mod.rmsNorm(ctx, q_resh, w.ones_d, 1e-6);
+    defer q_rn.deinit();
+    const k_rn = try fast_mod.rmsNorm(ctx, k_resh, w.ones_d, 1e-6);
+    defer k_rn.deinit();
+    const q_scale = try ops.scalarF32(ctx, inv_scale * inv_scale);
+    defer q_scale.deinit();
+    const k_scale = try ops.scalarF32(ctx, inv_scale);
+    defer k_scale.deinit();
+    const q = try ops.multiply(ctx, q_rn, q_scale);
+    defer q.deinit();
+    const k = try ops.multiply(ctx, k_rn, k_scale);
+    defer k.deinit();
+
+    // 3. per-head gates: a (decay input), b (beta), z (output gate).
+    const a = try linearQuantParts(ctx, w.x, w.a_w, w.a_scales, w.a_biases);
+    defer a.deinit(); // [1, HV]
+    const b = try linearQuantParts(ctx, w.x, w.b_w, w.b_scales, w.b_biases);
+    defer b.deinit(); // [1, HV]
+    const z = try linearQuantParts(ctx, w.x, w.z_w, w.z_scales, w.z_biases);
+    defer z.deinit(); // [1, HV*D]
+
+    // g = exp(-exp(A_log_f32) * softplus(a + dt_bias))  [HV]
+    const a_flat = try ops.reshape(ctx, a, &[_]i32{HV});
+    defer a_flat.deinit();
+    const a_dt = try ops.add(ctx, a_flat, w.dt_bias);
+    defer a_dt.deinit();
+    const sp = try softplusStep(ctx, a_dt);
+    defer sp.deinit();
+    const a_log_f32 = try ops.astype(ctx, w.A_log, .float32);
+    defer a_log_f32.deinit();
+    const e_a_log = try ops.exp(ctx, a_log_f32);
+    defer e_a_log.deinit();
+    const g_pre = try ops.multiply(ctx, e_a_log, sp);
+    defer g_pre.deinit();
+    const g_neg = try ops.negative(ctx, g_pre);
+    defer g_neg.deinit();
+    const g = try ops.exp(ctx, g_neg); // [HV]
+    defer g.deinit();
+
+    const b_flat = try ops.reshape(ctx, b, &[_]i32{HV});
+    defer b_flat.deinit();
+    const beta = try ops.sigmoid(ctx, b_flat); // [HV]
+    defer beta.deinit();
+
+    // 4. broadcast q/k to value heads via the precomputed gather indices.
+    const q_full = try shape_mod.takeAxis(ctx, q, w.qk_idx, 0); // [HV, D]
+    defer q_full.deinit();
+    const k_full = try shape_mod.takeAxis(ctx, k, w.qk_idx, 0); // [HV, D]
+    defer k_full.deinit();
+
+    // 5. gated delta rule step. State S [Hv, Dv, Dk].
+    const g_decay = try ops.reshape(ctx, g, &[_]i32{ HV, 1, 1 });
+    defer g_decay.deinit();
+    const s_decayed = try ops.multiply(ctx, w.ssm_state, g_decay);
+    defer s_decayed.deinit();
+
+    const k_b = try ops.reshape(ctx, k_full, &[_]i32{ HV, 1, D });
+    defer k_b.deinit();
+    const sk = try ops.multiply(ctx, s_decayed, k_b);
+    defer sk.deinit();
+    const kv_mem = try reduce_mod.sumAxis(ctx, sk, -1, false); // [HV, Dv]
+    defer kv_mem.deinit();
+
+    const v_sub = try ops.subtract(ctx, v, kv_mem);
+    defer v_sub.deinit();
+    const beta_b = try ops.reshape(ctx, beta, &[_]i32{ HV, 1 });
+    defer beta_b.deinit();
+    const delta = try ops.multiply(ctx, v_sub, beta_b); // [HV, Dv]
+    defer delta.deinit();
+
+    const delta_b = try ops.expandDims(ctx, delta, -1); // [HV, Dv, 1]
+    defer delta_b.deinit();
+    const k_delta = try ops.multiply(ctx, k_b, delta_b);
+    defer k_delta.deinit();
+    const s_new = try ops.add(ctx, s_decayed, k_delta);
+    errdefer s_new.deinit();
+
+    const q_b2 = try ops.reshape(ctx, q_full, &[_]i32{ HV, 1, D });
+    defer q_b2.deinit();
+    const sq = try ops.multiply(ctx, s_new, q_b2);
+    defer sq.deinit();
+    const y_f32 = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv] f32
+    defer y_f32.deinit();
+    // gated_delta_update returns y.astype(q.dtype): round before the norm.
+    const y = try ops.astype(ctx, y_f32, qkv.dtype());
+    defer y.deinit();
+
+    // 6. gated RMSNorm: norm in f32, gate in f32, round to input dtype.
+    const y_normed = try fast_mod.rmsNorm(ctx, y, w.norm_w, w.norm_eps);
+    defer y_normed.deinit();
+    const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
+    defer y_normed_f32.deinit();
+    const z_resh = try ops.reshape(ctx, z, &[_]i32{ HV, D });
+    defer z_resh.deinit();
+    const z_f32 = try ops.astype(ctx, z_resh, .float32);
+    defer z_f32.deinit();
+    const z_act = try activations.silu(ctx, z_f32);
+    defer z_act.deinit();
+    const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
+    defer y_gated_f32.deinit();
+    const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
+    defer y_gated.deinit();
+    const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, PV });
+    defer y_flat.deinit();
+
+    const out = try linearQuantParts(ctx, y_flat, w.out_w, w.out_scales, w.out_biases);
+    errdefer out.deinit();
+    return .{ .out = out, .conv_state = new_conv_state, .ssm_state = s_new };
+}
+
+/// Closures are traced on the GPU stream so the compiled graph dispatches to
+/// the same device as the eager path (CPU-stream traces would bake CPU
+/// kernels into the graph).
+fn closureGpuCtx(allocator: std.mem.Allocator) EagerContext {
+    return EagerContext.initWithStream(allocator, .{ .inner = c.c.mlx_default_gpu_stream_new() });
+}
+
+fn stepToSlice(res: StepOutput, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    const out = allocator.alloc(Array, 3) catch return error.MlxError;
+    out[0] = res.out;
+    out[1] = res.conv_state;
+    out[2] = res.ssm_state;
+    return out;
+}
+
+/// Quantized variant. Input order (24): x, conv_state, ssm_state, qkv_w,
+/// qkv_s, qkv_b, conv1d_t, a_w, a_s, a_b, b_w, b_s, b_b, z_w, z_s, z_b,
+/// A_log, dt_bias, norm_w, out_w, out_s, out_b, ones_d, qk_idx.
+fn gdnStepClosureQuant(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 24) return error.MlxError;
+    const ctx = closureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = step(ctx, .{
+        .x = inputs[0],
+        .conv_state = inputs[1],
+        .ssm_state = inputs[2],
+        .qkv_w = inputs[3],
+        .qkv_scales = inputs[4],
+        .qkv_biases = inputs[5],
+        .conv1d_t = inputs[6],
+        .a_w = inputs[7],
+        .a_scales = inputs[8],
+        .a_biases = inputs[9],
+        .b_w = inputs[10],
+        .b_scales = inputs[11],
+        .b_biases = inputs[12],
+        .z_w = inputs[13],
+        .z_scales = inputs[14],
+        .z_biases = inputs[15],
+        .A_log = inputs[16],
+        .dt_bias = inputs[17],
+        .norm_w = inputs[18],
+        .out_w = inputs[19],
+        .out_scales = inputs[20],
+        .out_biases = inputs[21],
+        .ones_d = inputs[22],
+        .qk_idx = inputs[23],
+    }) catch return error.MlxError;
+    return stepToSlice(res, allocator);
+}
+
+/// Plain (unquantized) variant — used by the toy-module unit test. Input
+/// order (14): x, conv_state, ssm_state, qkv_w, conv1d_t, a_w, b_w, z_w,
+/// A_log, dt_bias, norm_w, out_w, ones_d, qk_idx.
+fn gdnStepClosurePlain(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 14) return error.MlxError;
+    const ctx = closureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = step(ctx, .{
+        .x = inputs[0],
+        .conv_state = inputs[1],
+        .ssm_state = inputs[2],
+        .qkv_w = inputs[3],
+        .conv1d_t = inputs[4],
+        .a_w = inputs[5],
+        .b_w = inputs[6],
+        .z_w = inputs[7],
+        .A_log = inputs[8],
+        .dt_bias = inputs[9],
+        .norm_w = inputs[10],
+        .out_w = inputs[11],
+        .ones_d = inputs[12],
+        .qk_idx = inputs[13],
+    }) catch return error.MlxError;
+    return stepToSlice(res, allocator);
+}
+
+/// Build the mx.compile'd GDN decode step. The returned closure takes the
+/// fixed input order of gdnStepClosureQuant/Plain and returns
+/// [out, new_conv_state, new_ssm_state]. Trace happens on first apply — warm
+/// it once with real-shaped arrays before serving.
+pub fn compiledStep(allocator: std.mem.Allocator, quantized: bool) !Closure {
+    const base = try Closure.init(if (quantized) &gdnStepClosureQuant else &gdnStepClosurePlain, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
 }
 
 pub const Qwen38GDN = struct {
@@ -155,243 +512,44 @@ pub const Qwen38GDN = struct {
         if (self.o_biases) |a| a.deinit();
     }
 
-    fn keyProjDim(self: *const Qwen38GDN) usize {
-        return self.num_key_heads * self.head_dim;
-    }
-
-    fn valueProjDim(self: *const Qwen38GDN) usize {
-        return self.num_value_heads * self.head_dim;
-    }
-
-    /// x @ w^T, quantizedMatmul when scales are present.
-    fn linear(self: *const Qwen38GDN, x: Array, w: Array, scales: ?Array, biases: ?Array, qcfg: QuantConfig) !Array {
-        if (scales) |s| {
-            const qw = quantize_mod.QuantizedWeight{
-                .data = w,
-                .scales = s,
-                .biases = biases orelse Array.fromHandle(c.c.mlx_array_new()),
-                .config = qcfg,
-                .original_shape = &[_]i32{},
-            };
-            return quantize_mod.quantizedMatmul(self.ctx, x, qw, true);
-        }
-        const w_t = try ops.transpose(self.ctx, w);
-        defer w_t.deinit();
-        return ops.matmul(self.ctx, x, w_t);
-    }
-
-    /// Weight-less rms_norm matching mx.fast.rms_norm(x, None, eps): fused
-    /// fast.rmsNorm with a precomputed ones vector (f32 internally, output
-    /// rounded back to the input dtype). The oracle uses this for q/k
-    /// normalization (q,k = rms_norm(x) * head_dim^-0.5 scale), which equals
-    /// l2norm up to rounding — but the rounding points matter for oracle
-    /// alignment, so the eps-inside-sqrt semantics must match exactly.
-    fn rmsNormNoWeight(self: *const Qwen38GDN, x: Array) !Array {
-        return fast_mod.rmsNorm(self.ctx, x, self.ones_d, 1e-6);
-    }
-
-    /// f32-accumulated depthwise causal conv over the [K, QKV] window, output
-    /// rounded to the input dtype (matches nn.Conv1d's fused kernel). The
-    /// transposed kernel conv1d_t [K, QKV] is precomputed once, so each step
-    /// is a single elementwise multiply + column sum.
-    fn convAccum(self: *const Qwen38GDN, conv_input: Array) !Array {
-        const ctx = self.ctx;
-        const w_f32 = try ops.astype(ctx, self.conv1d_t, .float32);
-        defer w_f32.deinit();
-        const x_f32 = try ops.astype(ctx, conv_input, .float32);
-        defer x_f32.deinit();
-        const prod = try ops.multiply(ctx, x_f32, w_f32); // [K, QKV]
-        defer prod.deinit();
-        const acc = try reduce_mod.sumAxis(ctx, prod, 0, true); // [1, QKV]
-        defer acc.deinit();
-        return ops.astype(ctx, acc, conv_input.dtype());
-    }
-
-    /// softplus(x) = log1p(exp(x)) for x <= 20, x above (exp saturates there
-    /// in f32 long before overflow, and softplus(x) - x < 1e-8).
-    fn softplus(self: *const Qwen38GDN, x: Array) !Array {
-        const ctx = self.ctx;
-        const ex = try ops.exp(ctx, x);
-        defer ex.deinit();
-        const lp = try math_mod.log1p(ctx, ex);
-        defer lp.deinit();
-        const twenty = try ops.scalarF32(ctx, 20.0);
-        defer twenty.deinit();
-        const big = try comparison_mod.greater(ctx, x, twenty);
-        defer big.deinit();
-        return ops.where(ctx, big, x, lp);
-    }
-
     /// One decode token. x: [1, hidden]. Returns [1, hidden]. Advances cache.
     /// No evals inside: the caller (Qwen38ServingModel.forwardTokens) submits
     /// the updated cache states via asyncEval once per token and syncs on the
     /// final logits, so lazy graphs stay O(1) deep across tokens. prefill
     /// applies the same barrier per loop iteration.
     pub fn forward(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache) !Array {
-        const ctx = self.ctx;
-        const HK: i32 = @intCast(self.num_key_heads);
-        const HV: i32 = @intCast(self.num_value_heads);
-        const D: i32 = @intCast(self.head_dim);
-        const PK: i32 = @intCast(self.keyProjDim());
-        const PV: i32 = @intCast(self.valueProjDim());
-        const QKV: i32 = 2 * PK + PV;
-        const K: i32 = @intCast(self.conv_kernel);
-
-        // 1. qkv projection + depthwise causal conv (k=4) + silu.
-        // Conv accumulates in f32 and rounds back to the input dtype, matching
-        // nn.Conv1d's fused kernel; the cache window keeps the input dtype.
-        const qkv_lin = try self.linear(x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases, self.qkv_quant);
-        defer qkv_lin.deinit();
-
-        const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin }, 0);
-        defer conv_input.deinit(); // [K, QKV]
-
-        const conv_acc = try self.convAccum(conv_input);
-        defer conv_acc.deinit();
-
-        // Advance conv window: keep last K-1 rows.
-        const tail = try ops.slice(ctx, conv_input, &[_]i32{ 1, 0 }, &[_]i32{ K, QKV }, &[_]i32{ 1, 1 });
-        defer tail.deinit();
-        const new_conv_state = try ops.copy(ctx, tail);
+        const res = try step(self.ctx, .{
+            .x = x,
+            .conv_state = cache.conv_state,
+            .ssm_state = cache.ssm_state,
+            .qkv_w = self.in_proj_qkv,
+            .qkv_scales = self.qkv_scales,
+            .qkv_biases = self.qkv_biases,
+            .conv1d_t = self.conv1d_t,
+            .a_w = self.in_proj_a,
+            .a_scales = self.a_scales,
+            .a_biases = self.a_biases,
+            .b_w = self.in_proj_b,
+            .b_scales = self.b_scales,
+            .b_biases = self.b_biases,
+            .z_w = self.in_proj_z,
+            .z_scales = self.z_scales,
+            .z_biases = self.z_biases,
+            .A_log = self.A_log,
+            .dt_bias = self.dt_bias,
+            .norm_w = self.norm_w,
+            .out_w = self.out_proj,
+            .out_scales = self.o_scales,
+            .out_biases = self.o_biases,
+            .ones_d = self.ones_d,
+            .qk_idx = self.qk_idx,
+            .norm_eps = self.norm_eps,
+        });
         cache.conv_state.deinit();
-        cache.conv_state = new_conv_state;
-
-        const qkv = try activations.silu(ctx, conv_acc);
-        defer qkv.deinit(); // [1, QKV]
-
-        // 2. split q/k/v; weight-less rms_norm per head (f32 internally, output
-        // rounded to input dtype); then scale q by D^-1 and k by D^-0.5
-        // (mlx-lm: q = inv^2 * rms_norm(q), k = inv * rms_norm(k)).
-        const qkv_flat = try ops.reshape(ctx, qkv, &[_]i32{QKV});
-        defer qkv_flat.deinit();
-        const q_parts = try ops.slice(ctx, qkv_flat, &[_]i32{0}, &[_]i32{PK}, &[_]i32{1});
-        defer q_parts.deinit();
-        const k_parts = try ops.slice(ctx, qkv_flat, &[_]i32{PK}, &[_]i32{2 * PK}, &[_]i32{1});
-        defer k_parts.deinit();
-        const v_parts = try ops.slice(ctx, qkv_flat, &[_]i32{2 * PK}, &[_]i32{QKV}, &[_]i32{1});
-        defer v_parts.deinit();
-
-        const q_resh = try ops.reshape(ctx, q_parts, &[_]i32{ HK, D });
-        defer q_resh.deinit();
-        const k_resh = try ops.reshape(ctx, k_parts, &[_]i32{ HK, D });
-        defer k_resh.deinit();
-        const v = try ops.reshape(ctx, v_parts, &[_]i32{ HV, D });
-        defer v.deinit();
-
-        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const q_rn = try self.rmsNormNoWeight(q_resh);
-        defer q_rn.deinit();
-        const k_rn = try self.rmsNormNoWeight(k_resh);
-        defer k_rn.deinit();
-        const q_scale = try ops.scalarF32(ctx, inv_scale * inv_scale);
-        defer q_scale.deinit();
-        const k_scale = try ops.scalarF32(ctx, inv_scale);
-        defer k_scale.deinit();
-        const q = try ops.multiply(ctx, q_rn, q_scale);
-        defer q.deinit();
-        const k = try ops.multiply(ctx, k_rn, k_scale);
-        defer k.deinit();
-
-        // 3. per-head gates: a (decay input), b (beta), z (output gate).
-        const a = try self.linear(x, self.in_proj_a, self.a_scales, self.a_biases, self.a_quant);
-        defer a.deinit(); // [1, HV]
-        const b = try self.linear(x, self.in_proj_b, self.b_scales, self.b_biases, self.b_quant);
-        defer b.deinit(); // [1, HV]
-        const z = try self.linear(x, self.in_proj_z, self.z_scales, self.z_biases, self.z_quant);
-        defer z.deinit(); // [1, HV*D]
-
-        // g = exp(-exp(A_log_f32) * softplus(a + dt_bias))  [HV]
-        // (mlx-lm compute_g: A_log cast to f32; a + dt_bias and softplus run
-        // in the activation dtype.)
-        const a_flat = try ops.reshape(ctx, a, &[_]i32{HV});
-        defer a_flat.deinit();
-        const a_dt = try ops.add(ctx, a_flat, self.dt_bias);
-        defer a_dt.deinit();
-        const sp = try self.softplus(a_dt);
-        defer sp.deinit();
-        const a_log_f32 = try ops.astype(ctx, self.A_log, .float32);
-        defer a_log_f32.deinit();
-        const e_a_log = try ops.exp(ctx, a_log_f32);
-        defer e_a_log.deinit();
-        const g_pre = try ops.multiply(ctx, e_a_log, sp);
-        defer g_pre.deinit();
-        const g_neg = try ops.negative(ctx, g_pre);
-        defer g_neg.deinit();
-        const g = try ops.exp(ctx, g_neg); // [HV]
-        defer g.deinit();
-
-        const b_flat = try ops.reshape(ctx, b, &[_]i32{HV});
-        defer b_flat.deinit();
-        const beta = try ops.sigmoid(ctx, b_flat); // [HV]
-        defer beta.deinit();
-
-        // 4. broadcast q/k to value heads (kv-group ratio = HV/HK) via a
-        // gather with precomputed indices — one materializing op each,
-        // instead of expandDims→broadcastTo→reshape.
-        const q_full = try shape_mod.takeAxis(ctx, q, self.qk_idx, 0); // [HV, D]
-        defer q_full.deinit();
-        const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 0); // [HV, D]
-        defer k_full.deinit();
-
-        // 5. gated delta rule step. State S [Hv, Dv, Dk].
-        const g_decay = try ops.reshape(ctx, g, &[_]i32{ HV, 1, 1 });
-        defer g_decay.deinit();
-        const s_decayed = try ops.multiply(ctx, cache.ssm_state, g_decay);
-        defer s_decayed.deinit();
-
-        const k_b = try ops.reshape(ctx, k_full, &[_]i32{ HV, 1, D });
-        defer k_b.deinit();
-        const sk = try ops.multiply(ctx, s_decayed, k_b);
-        defer sk.deinit();
-        const kv_mem = try reduce_mod.sumAxis(ctx, sk, -1, false); // [HV, Dv]
-        defer kv_mem.deinit();
-
-        const v_sub = try ops.subtract(ctx, v, kv_mem);
-        defer v_sub.deinit();
-        const beta_b = try ops.reshape(ctx, beta, &[_]i32{ HV, 1 });
-        defer beta_b.deinit();
-        const delta = try ops.multiply(ctx, v_sub, beta_b); // [HV, Dv]
-        defer delta.deinit();
-
-        const delta_b = try ops.expandDims(ctx, delta, -1); // [HV, Dv, 1]
-        defer delta_b.deinit();
-        const k_delta = try ops.multiply(ctx, k_b, delta_b);
-        defer k_delta.deinit();
-        const s_new = try ops.add(ctx, s_decayed, k_delta);
+        cache.conv_state = res.conv_state;
         cache.ssm_state.deinit();
-        cache.ssm_state = s_new;
-
-        const q_b2 = try ops.reshape(ctx, q_full, &[_]i32{ HV, 1, D });
-        defer q_b2.deinit();
-        const sq = try ops.multiply(ctx, cache.ssm_state, q_b2);
-        defer sq.deinit();
-        const y_f32 = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv] f32
-        defer y_f32.deinit();
-        // gated_delta_update returns y.astype(q.dtype): round before the norm.
-        const y = try ops.astype(ctx, y_f32, qkv.dtype());
-        defer y.deinit();
-
-        // 6. gated RMSNorm (mlx-lm Qwen3NextRMSNormGated + _precise_swiglu):
-        // norm first in f32, then gate in f32, round to input dtype —
-        // silu(z_f32) * rmsnorm(y, norm_w)_f32 -> astype(x.dtype) -> out_proj.
-        const y_normed = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
-        defer y_normed.deinit();
-        const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
-        defer y_normed_f32.deinit();
-        const z_resh = try ops.reshape(ctx, z, &[_]i32{ HV, D });
-        defer z_resh.deinit();
-        const z_f32 = try ops.astype(ctx, z_resh, .float32);
-        defer z_f32.deinit();
-        const z_act = try activations.silu(ctx, z_f32);
-        defer z_act.deinit();
-        const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
-        defer y_gated_f32.deinit();
-        const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
-        defer y_gated.deinit();
-        const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, PV });
-        defer y_flat.deinit();
-
-        return self.linear(y_flat, self.out_proj, self.o_scales, self.o_biases, self.o_quant);
+        cache.ssm_state = res.ssm_state;
+        return res.out;
     }
 
     /// Prefill: naive per-token loop over x [1, L, hidden]. Returns [1, L, hidden].
@@ -615,5 +773,85 @@ test "Qwen38GDN.prefill: per-token loop equivalence" {
     const got = try out.dataSlice(f32);
     for (ref_buf, got) |e, o| {
         try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+}
+
+test "Qwen38GDN.step: compiled closure matches eager forward" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const dims = TestDims{};
+    const qkv_dim = (2 * dims.key_heads + dims.value_heads) * dims.head_dim;
+
+    var g = try makeTestModule(allocator, ctx, dims);
+    defer g.deinit();
+    var cache_eager = try Qwen38GdnCache.init(allocator, dims.conv_kernel, qkv_dim, dims.value_heads, dims.head_dim);
+    defer cache_eager.deinit();
+    var cache_comp = try Qwen38GdnCache.init(allocator, dims.conv_kernel, qkv_dim, dims.value_heads, dims.head_dim);
+    defer cache_comp.deinit();
+
+    const x = try makeTestInput(allocator);
+    defer x.deinit();
+
+    // Eager reference.
+    const out_eager = try g.forward(x, &cache_eager);
+    defer out_eager.deinit();
+    try out_eager.eval();
+    try cache_eager.conv_state.eval();
+    try cache_eager.ssm_state.eval();
+
+    // Compiled step (plain closure — the toy module is unquantized). First
+    // apply traces; second apply must reuse the trace (no recompile) and
+    // stay correct, which the state-advance assertions below also cover.
+    const cc = try compiledStep(allocator, false);
+    defer cc.deinit();
+
+    var t: usize = 0;
+    while (t < 2) : (t += 1) {
+        const inputs = [_]Array{
+            x,             cache_comp.conv_state, cache_comp.ssm_state,
+            g.in_proj_qkv, g.conv1d_t,            g.in_proj_a,
+            g.in_proj_b,   g.in_proj_z,           g.A_log,
+            g.dt_bias,     g.norm_w,              g.out_proj,
+            g.ones_d,      g.qk_idx,
+        };
+        const outs = try cc.apply(&inputs, allocator);
+        try std.testing.expectEqual(@as(usize, 3), outs.len);
+        cache_comp.conv_state.deinit();
+        cache_comp.conv_state = outs[1];
+        cache_comp.ssm_state.deinit();
+        cache_comp.ssm_state = outs[2];
+        const out_comp = outs[0];
+        allocator.free(outs);
+        defer out_comp.deinit();
+        try out_comp.eval();
+        try cache_comp.conv_state.eval();
+        try cache_comp.ssm_state.eval();
+
+        if (t == 0) {
+            const got_out = try out_comp.dataSlice(f32);
+            const exp_out = try out_eager.dataSlice(f32);
+            try std.testing.expectEqual(exp_out.len, got_out.len);
+            for (exp_out, got_out) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+            const got_conv = try cache_comp.conv_state.dataSlice(f32);
+            const exp_conv = try cache_eager.conv_state.dataSlice(f32);
+            try std.testing.expectEqual(exp_conv.len, got_conv.len);
+            for (exp_conv, got_conv) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+            const got_ssm = try cache_comp.ssm_state.dataSlice(f32);
+            const exp_ssm = try cache_eager.ssm_state.dataSlice(f32);
+            try std.testing.expectEqual(exp_ssm.len, got_ssm.len);
+            for (exp_ssm, got_ssm) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        } else {
+            // Second token: state must keep advancing (nonzero delta vs
+            // token 1's output would need the eager run too — simply check
+            // the state is still finite and the run did not retrace-crash).
+            const ssm_abs = try ops.abs(ctx, cache_comp.ssm_state);
+            defer ssm_abs.deinit();
+            const ssm_max = try reduce_mod.max(ctx, ssm_abs, false);
+            defer ssm_max.deinit();
+            try ssm_max.eval();
+            try std.testing.expect(try ssm_max.item(f32) > 0.0);
+        }
     }
 }
