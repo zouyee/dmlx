@@ -29,7 +29,7 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
 |---|---|---|
 | dmlx before optimization | 157 | 6.72 |
 | dmlx after round 1 (phases 1–5b) | 78 | 12.8 |
-| **dmlx now (fused GDN kernel, 9892ce7)** | **~72** | **~13.9** |
+| **dmlx now (fully fused GDN tail, 9025567)** | **~71** | **~14.1** |
 | mlx-lm 0.31.3 + mlx 0.32.3 (parity target) | 64 | 15.6 |
 | omlx (no custom kernels) | — | 13.4 |
 | flash-moe | n/a (MoE-only) | |
@@ -47,15 +47,18 @@ Round-2 findings (measurement-driven):
   mlx 0.31→0.32.4 upgrade: no effect.
 - DeepInfer (../DeepInfer) investigated: CUDA SM100/Ascend-only, no GDN, no
   int4 GEMV — nothing borrowable.
-- **Fused custom Metal kernel for the GDN delta-rule step** (9892ce7):
-  state [48,128,128] read+written once per layer instead of ~8 passes
-  (~2.4 GB → ~0.3 GB/token), one threadgroup per head, row-per-thread in
-  registers; lives inside the compiled GDN closure, eager fallback kept.
-- Remaining ~8 ms gap to mlx-lm: likely their fused `gated_delta_update`
-  covers more of the GDN tail (gates/norms) and qmm kernel tuning; the
-  profiler's `buildsplit` mode can quantify. Next levers if pursued:
-  extend the fused kernel to the whole GDN tail (gates + out-gate-norm),
-  qmm GEMV kernel investigation.
+- **Fully fused GDN tail Metal kernel** (9025567): post-conv qkv + raw gate
+  projections + f32 state → out_proj input + new state, ONE kernel per GDN
+  layer (rmsNorm q/k with pre-folded scales, softplus/exp/sigmoid gates,
+  delta rule, out-gate silu + gated rmsNorm, exact dtype round-trips).
+  Interleaved A/B: 83.4 → 70.8 ms/token (Δ12.6 ms). NOTE: round-2's v1
+  delta-rule kernel (9892ce7) was dtype-gated OFF in the real path (beta is
+  bf16 there) — v2 is the first fusion that actually runs; v1 remains as the
+  fallback inside the eager tail.
+- Remaining ~7 ms gap to mlx-lm: diminishing returns. Next levers if
+  pursued: fold the conv chain into the tail kernel (~5 small
+  kernels/layer), qmm GEMV kernel efficiency at [1,5120] skinny shapes
+  (~176 vs ~225 GB/s effective), GDN prefill batching (separate project).
 
 Environment notes:
 - mlx-c 0.7.0 (mlx 0.32.4) via homebrew. mlx_z dependency is upstream
