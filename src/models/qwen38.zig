@@ -778,6 +778,243 @@ pub fn applyMlpSwiglu(allocator: std.mem.Allocator, mc: Closure, lp: *const Laye
     return out;
 }
 
+// ============================================================
+// Fused Metal kernel: residual add + rmsNorm (bf16 h/branch, f32 weight)
+// ============================================================
+//
+// The decode layer loop runs `h = h + branch_out; normed = rmsNorm(h, w)` as
+// an astype→add→astype→rmsNorm→astype chain (4+ kernels × 128/token). This
+// kernel does both in one pass over the flat hidden vector: the add is
+// computed in f32 and rounded to bf16 (bit-identical to a bf16 add), the
+// bf16-rounded value feeds the f32 norm (matching the eager astype), and the
+// normed result rounds to bf16. One threadgroup, nt threads, each owning
+// npt = ceil(n/nt) elements; block reduction via simd_sum + a 32-slot shared
+// buffer. Decode only (total elements == one hidden row); prefill and
+// non-bf16 inputs fall back to the eager chain.
+
+const add_rms_kernel_body =
+    \\    const uint t = thread_position_in_grid.x;
+    \\    float vals[{[npt]}];
+    \\    float local = 0.0f;
+    \\    for (int i = 0; i < {[npt]}; ++i) {{
+    \\        const uint idx = t + i * {[nt]};
+    \\        if (idx < {[n]}) {{
+    \\            const float s = float(h[idx]) + float(branch[idx]);
+    \\            const bfloat16_t r = bfloat16_t(s);
+    \\            h_out[idx] = r;
+    \\            const float v = float(r);
+    \\            vals[i] = v;
+    \\            local += v * v;
+    \\        }}
+    \\    }}
+    \\    local = metal::simd_sum(local);
+    \\    threadgroup float red[32];
+    \\    const uint lane = t % 32;
+    \\    const uint wid = t / 32;
+    \\    if (lane == 0) red[wid] = local;
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    if (wid == 0) {{
+    \\        const uint nwid = {[nt]} / 32;
+    \\        float s2 = (lane < nwid) ? red[lane] : 0.0f;
+    \\        s2 = metal::simd_sum(s2);
+    \\        if (lane == 0) red[0] = s2;
+    \\    }}
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    const float inv = metal::rsqrt(red[0] / {[n]}.0f + {[eps]s});
+    \\    for (int i = 0; i < {[npt]}; ++i) {{
+    \\        const uint idx = t + i * {[nt]};
+    \\        if (idx < {[n]}) {{
+    \\            normed[idx] = bfloat16_t((vals[i] * inv) * float(w[idx]));
+    \\        }}
+    \\    }}
+    \\
+;
+
+const AddRmsKey = struct {
+    n: i32,
+    eps_bits: u32,
+};
+
+const AddRmsEntry = struct {
+    key: AddRmsKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var add_rms_entries: [4]?AddRmsEntry = .{ null, null, null, null };
+var add_rms_stream: ?c.c.mlx_stream = null;
+var add_rms_warned = false;
+
+fn addRmsStream() c.c.mlx_stream {
+    if (add_rms_stream == null) {
+        add_rms_stream = c.c.mlx_default_gpu_stream_new();
+    }
+    return add_rms_stream.?;
+}
+
+fn addRmsWarn(err: anyerror) void {
+    if (!add_rms_warned) {
+        add_rms_warned = true;
+        std.log.warn("fused add+rmsNorm kernel unavailable ({s}); using eager op chain", .{@errorName(err)});
+    }
+}
+
+fn addRmsStringVec(allocator: std.mem.Allocator, names: []const []const u8) !c.c.mlx_vector_string {
+    const vec = c.c.mlx_vector_string_new();
+    errdefer _ = c.c.mlx_vector_string_free(vec);
+    for (names) |n| {
+        const n_z = try allocator.dupeZ(u8, n);
+        defer allocator.free(n_z);
+        try c.check(c.c.mlx_vector_string_append_value(vec, n_z.ptr));
+    }
+    return vec;
+}
+
+fn createAddRmsKernel(allocator: std.mem.Allocator, key: AddRmsKey) !c.c.mlx_fast_metal_kernel {
+    const n: usize = @intCast(key.n);
+    const nt: usize = if (n >= 1024) 1024 else std.mem.alignForward(usize, n, 32);
+    const npt = (n + nt - 1) / nt;
+    const eps: f32 = @bitCast(key.eps_bits);
+    const eps_z = try std.fmt.allocPrintSentinel(allocator, "{d}f", .{eps}, 0);
+    defer allocator.free(eps_z);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "add_rmsnorm_n{d}_{x}", .{ key.n, key.eps_bits }, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, add_rms_kernel_body, .{
+        .n = key.n,
+        .nt = nt,
+        .npt = npt,
+        .eps = eps_z,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try addRmsStringVec(allocator, &.{ "h", "branch", "w" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try addRmsStringVec(allocator, &.{ "h_out", "normed" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+fn getAddRmsKernel(allocator: std.mem.Allocator, key: AddRmsKey) ?c.c.mlx_fast_metal_kernel {
+    for (&add_rms_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createAddRmsKernel(allocator, key) catch |err| {
+        addRmsWarn(err);
+        return null;
+    };
+    for (&add_rms_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markAddRmsBroken(key: AddRmsKey) void {
+    for (&add_rms_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+const AddRmsOut = struct {
+    h: Array, // bf16, same shape as input h: h + branch
+    normed: Array, // bf16, same shape: rmsNorm(h + branch, w)
+};
+
+/// Eager reference: bf16 add → astype f32 → rmsNorm → astype bf16 (the exact
+/// op sequence this replaces).
+pub fn addRmsNormEager(ctx: EagerContext, h: Array, branch: Array, w_f32: Array, eps: f32) !AddRmsOut {
+    const next = try ops.add(ctx, h, branch);
+    errdefer next.deinit();
+    const h_f32 = try ops.astype(ctx, next, .float32);
+    defer h_f32.deinit();
+    const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, w_f32, eps);
+    defer n_f32.deinit();
+    const normed = try ops.astype(ctx, n_f32, .bfloat16);
+    return .{ .h = next, .normed = normed };
+}
+
+/// Fused add+rmsNorm. Returns null for prefill shapes (more than one hidden
+/// row), non-bf16 inputs, or when the kernel is unavailable.
+pub fn addRmsNormFused(ctx: EagerContext, h: Array, branch: Array, w_f32: Array, eps: f32) !?AddRmsOut {
+    if (h.dtype() != .bfloat16 or branch.dtype() != .bfloat16 or w_f32.dtype() != .float32) return null;
+    const hs = h.shape();
+    const ws = w_f32.shape();
+    if (ws.len != 1) return null;
+    var n: i64 = 1;
+    for (hs) |s| n *= s;
+    if (n != ws[0]) return null; // decode only: exactly one hidden row
+
+    const key = AddRmsKey{ .n = @intCast(n), .eps_bits = @bitCast(eps) };
+    const kernel = getAddRmsKernel(ctx.allocator, key) orelse return null;
+    const n_usize: usize = @intCast(n);
+    const nt: i32 = @intCast(if (n_usize >= 1024) @as(usize, 1024) else std.mem.alignForward(usize, n_usize, 32));
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, nt, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, nt, 1, 1));
+    // Output shape mirrors h (row dims preserved).
+    var dims_buf: [4]i32 = undefined;
+    const nd: usize = hs.len;
+    for (hs, 0..) |s, i| dims_buf[i] = @intCast(s);
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &dims_buf, @intCast(nd), c.c.MLX_BFLOAT16));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &dims_buf, @intCast(nd), c.c.MLX_BFLOAT16));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ h, branch, w_f32 }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, addRmsStream())) catch |err| {
+        markAddRmsBroken(key);
+        addRmsWarn(err);
+        return null;
+    };
+
+    var h_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&h_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(h_handle);
+    var n_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&n_handle, output_vec, 1));
+    return .{ .h = Array.fromHandle(h_handle), .normed = Array.fromHandle(n_handle) };
+}
+
+/// h + branch → rmsNorm(h + branch, w_f32): fused kernel when eligible,
+/// eager chain otherwise.
+fn addRmsNorm(ctx: EagerContext, h: Array, branch: Array, w_f32: Array, eps: f32) !AddRmsOut {
+    return (try addRmsNormFused(ctx, h, branch, w_f32, eps)) orelse
+        addRmsNormEager(ctx, h, branch, w_f32, eps);
+}
+
+/// Standalone bf16→f32→rmsNorm→bf16 (no residual add), used for the first
+/// layer's input layernorm where there is no preceding branch output.
+fn rmsNormOnly(ctx: EagerContext, h: Array, w_f32: Array, eps: f32) !Array {
+    const h_f32 = try ops.astype(ctx, h, .float32);
+    defer h_f32.deinit();
+    const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, w_f32, eps);
+    defer n_f32.deinit();
+    return ops.astype(ctx, n_f32, .bfloat16);
+}
+
 /// Resident serving model: all weights live in a map (loaded once); per-layer
 /// modules (GDN/attn), layernorms, MLP projections and lm_head are built ONCE
 /// at init with Arrays borrowed from the map — the token loop runs no
@@ -1217,15 +1454,19 @@ pub const Qwen38ServingModel = struct {
         var h = try ops.copy(ctx, emb); // bf16
         defer h.deinit();
 
+        // Fused add+rmsNorm restructure: the norm feeding layer i+1's input
+        // layernorm is computed together with layer i's post-MLP residual
+        // add (identical dataflow — the eager fallback produces the same
+        // values), so `normed1` for the next iteration is carried across.
+        var normed1_carry: ?Array = null;
+        defer if (normed1_carry) |*nc| nc.deinit();
+
         for (self.layers, 0..) |*lp, layer| {
             // Attention sub-block (mirrors Qwen38Model.forward).
-            const normed1 = blk: {
-                const h_f32 = try ops.astype(ctx, h, .float32);
-                defer h_f32.deinit();
-                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln1_f32, cfg.rms_norm_eps);
-                defer n_f32.deinit();
-                break :blk try ops.astype(ctx, n_f32, .bfloat16);
-            };
+            const normed1 = if (normed1_carry) |nc| blk: {
+                normed1_carry = null;
+                break :blk nc;
+            } else try rmsNormOnly(ctx, h, lp.ln1_f32, cfg.rms_norm_eps);
             defer normed1.deinit();
             const attn_out = switch (lp.module) {
                 .gdn => |*g| blk: {
@@ -1263,33 +1504,29 @@ pub const Qwen38ServingModel = struct {
                 },
             };
             defer attn_out.deinit();
-            {
-                const next = try ops.add(ctx, h, attn_out);
-                h.deinit();
-                h = next;
-            }
-
-            // MLP sub-block.
-            const normed2 = blk: {
-                const h_f32 = try ops.astype(ctx, h, .float32);
-                defer h_f32.deinit();
-                const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln2_f32, cfg.rms_norm_eps);
-                defer n_f32.deinit();
-                break :blk try ops.astype(ctx, n_f32, .bfloat16);
-            };
+            // h += attn_out, then rmsNorm(h, ln2) for the MLP branch.
+            const r1 = try addRmsNorm(ctx, h, attn_out, lp.ln2_f32, cfg.rms_norm_eps);
+            h.deinit();
+            h = r1.h;
+            const normed2 = r1.normed;
             defer normed2.deinit();
-            if (self.mlp_swiglu_compiled) |mc| {
-                if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mlp_out| {
-                    defer mlp_out.deinit();
-                    const next = try ops.add(ctx, h, mlp_out);
-                    h.deinit();
-                    h = next;
-                    continue;
-                } else |_| {} // fall through to the eager path
-            }
-            const mlp_out = try mlpForwardPersistent(ctx, lp, normed2);
+            const mlp_out = blk: {
+                if (self.mlp_swiglu_compiled) |mc| {
+                    if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
+                        break :blk mo;
+                    } else |_| {} // fall through to the eager path
+                }
+                break :blk try mlpForwardPersistent(ctx, lp, normed2);
+            };
             defer mlp_out.deinit();
-            {
+            // h += mlp_out, then rmsNorm(h, next layer's ln1) — fused into the
+            // residual add. The final layer has no following ln1: plain add.
+            if (layer + 1 < self.layers.len) {
+                const r2 = try addRmsNorm(ctx, h, mlp_out, self.layers[layer + 1].ln1_f32, cfg.rms_norm_eps);
+                h.deinit();
+                h = r2.h;
+                normed1_carry = r2.normed;
+            } else {
                 const next = try ops.add(ctx, h, mlp_out);
                 h.deinit();
                 h = next;
@@ -1326,6 +1563,66 @@ test "Qwen38Model: module surface compiles" {
     _ = WeightSource.fromIndex;
     _ = Qwen38ServingModel.init;
     _ = Qwen38ServingModel.forwardTokens;
+}
+
+test "fused add+rmsNorm matches eager chain (decode shapes)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    for ([_]i32{ 5120, 64 }) |n| {
+        const hbuf = try allocator.alloc(f32, @intCast(n));
+        defer allocator.free(hbuf);
+        const bbuf = try allocator.alloc(f32, @intCast(n));
+        defer allocator.free(bbuf);
+        const wbuf = try allocator.alloc(f32, @intCast(n));
+        defer allocator.free(wbuf);
+        for (hbuf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 37 + 11, 23) - 11)) * 0.05;
+        for (bbuf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 19 + 7, 17) - 8)) * 0.03;
+        for (wbuf, 0..) |*v, i| v.* = 0.5 + @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 3, 11))) * 0.1;
+
+        const h_f32 = try Array.fromData(allocator, f32, hbuf, &[_]i32{ 1, 1, n });
+        defer h_f32.deinit();
+        const b_f32 = try Array.fromData(allocator, f32, bbuf, &[_]i32{ 1, 1, n });
+        defer b_f32.deinit();
+        const h = try ops.astype(ctx, h_f32, .bfloat16);
+        defer h.deinit();
+        const branch = try ops.astype(ctx, b_f32, .bfloat16);
+        defer branch.deinit();
+        const w = try Array.fromData(allocator, f32, wbuf, &[_]i32{n});
+        defer w.deinit();
+
+        const fused = (try addRmsNormFused(ctx, h, branch, w, 1e-6)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.h.deinit();
+        defer fused.normed.deinit();
+        const eager = try addRmsNormEager(ctx, h, branch, w, 1e-6);
+        defer eager.h.deinit();
+        defer eager.normed.deinit();
+
+        // dataSlice(f32) does not convert dtypes — astype to f32 first.
+        const fh = try ops.astype(ctx, fused.h, .float32);
+        defer fh.deinit();
+        const fno = try ops.astype(ctx, fused.normed, .float32);
+        defer fno.deinit();
+        const eh = try ops.astype(ctx, eager.h, .float32);
+        defer eh.deinit();
+        const eno = try ops.astype(ctx, eager.normed, .float32);
+        defer eno.deinit();
+        try fh.eval();
+        try fno.eval();
+        try eh.eval();
+        try eno.eval();
+
+        const got_h = try fh.dataSlice(f32);
+        const exp_h = try eh.dataSlice(f32);
+        try std.testing.expectEqual(exp_h.len, got_h.len);
+        for (exp_h, got_h) |e, o| try std.testing.expectEqual(e, o); // bf16 add: bit-identical
+        const got_n = try fno.dataSlice(f32);
+        const exp_n = try eno.dataSlice(f32);
+        try std.testing.expectEqual(exp_n.len, got_n.len);
+        for (exp_n, got_n) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2); // ≤1 bf16 ulp
+    }
 }
 
 test "rejectVisionTokens: vision range rejected, text ids pass" {

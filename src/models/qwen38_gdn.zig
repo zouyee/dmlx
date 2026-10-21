@@ -403,6 +403,304 @@ fn markTailBroken(key: TailKernelKey) void {
     }
 }
 
+// ============================================================
+// Fused Metal kernel v3: the depthwise causal conv chain + the whole
+// post-conv GDN tail in ONE kernel
+// ============================================================
+//
+// v2's post-conv tail plus the conv front-end that used to run as
+// concatenate(conv_state, qkv_lin) → multiply → column-sum → silu →
+// slice/copy new conv state. Per value-head threadgroup, thread dv owns the
+// three channels it needs: q channel hk*D+dv, k channel PK+hk*D+dv (both
+// shared into threadgroup memory for the norm/delta-rule passes), and v
+// channel 2*PK+h*D+dv (register-local). The conv sum runs j=0..K-1 ascending
+// per channel, matching convAccumStep semantics; silu is f32.
+//
+// The new conv window (window rows 1..K-1 = conv_state rows 1..K-2 plus the
+// raw qkv_lin row) is written by the same groups: v channels by the owning
+// group, q/k channels only by the first group of each ratio-sharing set
+// (h % ratio == 0) so shared channels are written exactly once.
+//
+// The post-conv tensors are always f32 in the fused path (the conv promotes
+// to f32), so the v2 template's qkv-dtype round-trips become identities and
+// are dropped; the b-dtype round on beta is kept. Everything downstream of
+// the conv (norms, gates, delta rule, out gate) is numerically identical to
+// v2 with T=float.
+
+const conv_tail_kernel_body =
+    \\    const uint dv = thread_position_in_grid.x;
+    \\    const uint h = thread_position_in_grid.y;
+    \\    const uint hk = h / {[ratio]};
+    \\    const uint qbase = hk * {[d]} + dv;
+    \\    const uint kbase = {[pk]} + hk * {[d]} + dv;
+    \\    const uint vbase = 2 * {[pk]} + h * {[d]} + dv;
+    \\
+    \\    // Depthwise causal conv (K taps) + silu, f32. Window rows 0..K-2 come
+    \\    // from conv_state, row K-1 is the fresh qkv_lin token.
+    \\    threadgroup float qsh[{[d]}];
+    \\    threadgroup float ksh[{[d]}];
+    \\    float qa = 0.0f;
+    \\    float ka = 0.0f;
+    \\    float va = 0.0f;
+    \\    for (int j = 0; j < {[km1]}; ++j) {{
+    \\        const uint off = j * {[qkv]};
+    \\        qa += conv_state[off + qbase] * conv1d_t[off + qbase];
+    \\        ka += conv_state[off + kbase] * conv1d_t[off + kbase];
+    \\        va += conv_state[off + vbase] * conv1d_t[off + vbase];
+    \\    }}
+    \\    const uint loff = {[km1]} * {[qkv]};
+    \\    qa += float(qkv_lin[qbase]) * conv1d_t[loff + qbase];
+    \\    ka += float(qkv_lin[kbase]) * conv1d_t[loff + kbase];
+    \\    va += float(qkv_lin[vbase]) * conv1d_t[loff + vbase];
+    \\    qsh[dv] = qa / (1.0f + metal::exp(-qa));
+    \\    ksh[dv] = ka / (1.0f + metal::exp(-ka));
+    \\    const float vown = va / (1.0f + metal::exp(-va));
+    \\
+    \\    // New conv window = window rows 1..K-1 (raw pre-conv values).
+    \\    if (h % {[ratio]} == 0) {{
+    \\        for (int r = 0; r < {[km2]}; ++r) {{
+    \\            conv_out[r * {[qkv]} + qbase] = conv_state[(r + 1) * {[qkv]} + qbase];
+    \\            conv_out[r * {[qkv]} + kbase] = conv_state[(r + 1) * {[qkv]} + kbase];
+    \\        }}
+    \\        conv_out[{[km2]} * {[qkv]} + qbase] = float(qkv_lin[qbase]);
+    \\        conv_out[{[km2]} * {[qkv]} + kbase] = float(qkv_lin[kbase]);
+    \\    }}
+    \\    for (int r = 0; r < {[km2]}; ++r) {{
+    \\        conv_out[r * {[qkv]} + vbase] = conv_state[(r + 1) * {[qkv]} + vbase];
+    \\    }}
+    \\    conv_out[{[km2]} * {[qkv]} + vbase] = float(qkv_lin[vbase]);
+    \\
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\    // Per-head weight-less rmsNorm factors for q/k (folded scales):
+    \\    // redundant serial reduction per thread — no cross-thread sync.
+    \\    float ssq = 0.0f;
+    \\    float ssk = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) {{
+    \\        ssq += qsh[i] * qsh[i];
+    \\        ssk += ksh[i] * ksh[i];
+    \\    }}
+    \\    const float qfac = {[qscale]s} * metal::rsqrt(ssq / {[d]}.0f + 1e-6f);
+    \\    const float kfac = {[kscale]s} * metal::rsqrt(ssk / {[d]}.0f + 1e-6f);
+    \\
+    \\    // Per-head gates (f32): g = exp(-exp(A_log) * softplus(a + dt_bias)),
+    \\    // beta = sigmoid(b) rounded to b's dtype.
+    \\    const float ax = float(a[h]) + float(dt_bias[h]);
+    \\    const float sp = ax > 20.0f ? ax : metal::log(1.0f + metal::exp(ax));
+    \\    const float gh = metal::exp(-metal::exp(float(A_log[h])) * sp);
+    \\    const float bh = float({[bt]s}(1.0f / (1.0f + metal::exp(-float(b[h])))));
+    \\
+    \\    // Delta rule: thread owns state row dv.
+    \\    const device metal::float4* srow_in = (const device metal::float4*)(s_in + (h * {[d]} + dv) * {[d]});
+    \\    device metal::float4* srow_out = (device metal::float4*)(s_out + (h * {[d]} + dv) * {[d]});
+    \\    metal::float4 row[{[df4]}];
+    \\    float kv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        const metal::float4 s = srow_in[i] * gh;
+    \\        row[i] = s;
+    \\        const metal::float4 k4 = kfac * metal::float4(ksh[4 * i], ksh[4 * i + 1], ksh[4 * i + 2], ksh[4 * i + 3]);
+    \\        kv += metal::dot(s, k4);
+    \\    }}
+    \\    const float dl = (vown - kv) * bh;
+    \\    float yv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        const metal::float4 s = row[i] + (kfac * dl) * metal::float4(ksh[4 * i], ksh[4 * i + 1], ksh[4 * i + 2], ksh[4 * i + 3]);
+    \\        srow_out[i] = s;
+    \\        yv += metal::dot(s, qfac * metal::float4(qsh[4 * i], qsh[4 * i + 1], qsh[4 * i + 2], qsh[4 * i + 3]));
+    \\    }}
+    \\
+    \\    // Out gate (all f32 here — the conv promotes the tail input to f32, so
+    \\    // the eager chain's T round-trips are identities): norm the head's y
+    \\    // row, weight multiply, silu(z) gate.
+    \\    threadgroup float y_shared[{[d]}];
+    \\    y_shared[dv] = yv;
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    float ssy = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) ssy += y_shared[i] * y_shared[i];
+    \\    const float yn = y_shared[dv] * metal::rsqrt(ssy / {[d]}.0f + 1e-6f);
+    \\    const float yw = yn * float(norm_w[dv]);
+    \\    const float zz = float(z[h * {[d]} + dv]);
+    \\    const float zact = zz / (1.0f + metal::exp(-zz));
+    \\    out[h * {[d]} + dv] = zact * yw;
+    \\
+;
+
+const ConvTailKernelKey = struct {
+    d: i32,
+    ratio: i32,
+    pk: i32,
+    k: i32,
+    b_bf16: bool,
+};
+
+const ConvTailKernelEntry = struct {
+    key: ConvTailKernelKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var conv_tail_entries: [8]?ConvTailKernelEntry = .{ null, null, null, null, null, null, null, null };
+var conv_tail_warned = false;
+
+fn convTailWarn(err: anyerror) void {
+    if (!conv_tail_warned) {
+        conv_tail_warned = true;
+        std.log.warn("fused GDN conv+tail kernel unavailable ({s}); using eager op chain", .{@errorName(err)});
+    }
+}
+
+fn createConvTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) !c.c.mlx_fast_metal_kernel {
+    const d = key.d;
+    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+    const qscale_z = try f32MetalLit(allocator, inv_scale * inv_scale);
+    defer allocator.free(qscale_z);
+    const kscale_z = try f32MetalLit(allocator, inv_scale);
+    defer allocator.free(kscale_z);
+    const bt: []const u8 = if (key.b_bf16) "bfloat16_t" else "float";
+    const qkv = key.pk * (2 + key.ratio);
+
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_conv_tail_d{d}_r{d}_p{d}_k{d}_{c}", .{ d, key.ratio, key.pk, key.k, if (key.b_bf16) @as(u8, 'b') else 'f' }, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, conv_tail_kernel_body, .{
+        .d = d,
+        .df4 = @divExact(d, 4),
+        .ratio = key.ratio,
+        .pk = key.pk,
+        .qkv = qkv,
+        .km1 = key.k - 1,
+        .km2 = key.k - 2,
+        .qscale = qscale_z,
+        .kscale = kscale_z,
+        .bt = bt,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "qkv_lin", "conv_state", "conv1d_t", "a", "b", "z", "A_log", "dt_bias", "norm_w", "s_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "out", "s_out", "conv_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+fn getConvTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) ?c.c.mlx_fast_metal_kernel {
+    for (&conv_tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createConvTailKernel(allocator, key) catch |err| {
+        convTailWarn(err);
+        return null;
+    };
+    for (&conv_tail_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markConvTailBroken(key: ConvTailKernelKey) void {
+    for (&conv_tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+pub const ConvTailOut = struct {
+    y: Array, // [1, HV*D] f32, ready for out_proj
+    s_new: Array, // [HV, D, D] f32
+    conv_state: Array, // [K-1, QKV] f32
+};
+
+/// Fused single-kernel conv chain + post-conv tail (conv+silu+new conv state,
+/// then norms + gates + delta rule + out gate). Returns null when
+/// shapes/dtypes are unsupported or the kernel is unavailable (caller falls
+/// back to the eager conv chain + v2/eager tail).
+fn gdnConvTailFused(
+    ctx: EagerContext,
+    qkv_lin: Array, // [1, QKV] raw in_proj_qkv output (f32 or bf16)
+    conv_state: Array, // [K-1, QKV] f32
+    conv1d_t: Array, // [K, QKV] f32
+    a: Array, // [1, HV]
+    b: Array, // [1, HV]
+    z: Array, // [1, HV*D]
+    tw: TailWeights,
+    hv: i32,
+    hk: i32,
+    d: i32,
+    k: i32,
+) !?ConvTailOut {
+    if (@mod(d, 4) != 0 or d < 4 or d > 128) return null;
+    if (hk < 1 or @mod(hv, hk) != 0) return null;
+    if (k < 2) return null;
+    if (@abs(tw.norm_eps - 1e-6) > 1e-12) return null;
+    if (!isFloatDtype(qkv_lin.dtype())) return null;
+    if (conv_state.dtype() != .float32) return null;
+    if (!isFloatDtype(conv1d_t.dtype())) return null; // read as f32 (eager casts too)
+    if (tw.ssm_state.dtype() != .float32) return null;
+    if (!isFloatDtype(a.dtype()) or !isFloatDtype(b.dtype()) or !isFloatDtype(z.dtype()) or
+        !isFloatDtype(tw.A_log.dtype()) or !isFloatDtype(tw.dt_bias.dtype()) or !isFloatDtype(tw.norm_w.dtype())) return null;
+
+    const key = ConvTailKernelKey{
+        .d = d,
+        .ratio = @divExact(hv, hk),
+        .pk = hk * d,
+        .k = k,
+        .b_bf16 = b.dtype() == .bfloat16,
+    };
+    const kernel = getConvTailKernel(ctx.allocator, key) orelse return null;
+    const qkv_dim: i32 = key.pk * (2 + key.ratio);
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, hv, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, hv * d }, 2, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d, d }, 3, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ k - 1, qkv_dim }, 2, c.c.MLX_FLOAT32));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ qkv_lin, conv_state, conv1d_t, a, b, z, tw.A_log, tw.dt_bias, tw.norm_w, tw.ssm_state }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markConvTailBroken(key);
+        convTailWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
+    errdefer _ = c.c.mlx_array_free(s_handle);
+    var cs_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&cs_handle, output_vec, 2));
+    return .{
+        .y = Array.fromHandle(y_handle),
+        .s_new = Array.fromHandle(s_handle),
+        .conv_state = Array.fromHandle(cs_handle),
+    };
+}
+
 pub const TailOut = struct {
     y: Array, // [1, HV*D] qkv dtype, ready for out_proj
     s_new: Array, // [HV, D, D] f32
@@ -821,26 +1119,11 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const QKV: i32 = @intCast(w.conv1d_t.shape()[1]);
     const HK: i32 = @divTrunc(@divTrunc(QKV - HV * D, 2), D);
 
-    // 1. qkv projection + depthwise causal conv (k=4) + silu.
+    // 1. qkv projection (raw) + gate projections; the conv chain lives in the
+    // fused conv+tail kernel below when eligible.
     const qkv_lin = try linearQuantParts(ctx, w.x, w.qkv_w, w.qkv_scales, w.qkv_biases);
     defer qkv_lin.deinit();
 
-    const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ w.conv_state, qkv_lin }, 0);
-    defer conv_input.deinit(); // [K, QKV]
-
-    const conv_acc = try convAccumStep(ctx, w.conv1d_t, conv_input);
-    defer conv_acc.deinit();
-
-    // New conv window: keep last K-1 rows.
-    const tail = try ops.slice(ctx, conv_input, &[_]i32{ 1, 0 }, &[_]i32{ K, QKV }, &[_]i32{ 1, 1 });
-    defer tail.deinit();
-    const new_conv_state = try ops.copy(ctx, tail);
-    errdefer new_conv_state.deinit();
-
-    const qkv = try activations.silu(ctx, conv_acc);
-    defer qkv.deinit(); // [1, QKV]
-
-    // 2. gate projections (raw; gates themselves live in the tail).
     const a = try linearQuantParts(ctx, w.x, w.a_w, w.a_scales, w.a_biases);
     defer a.deinit(); // [1, HV]
     const b = try linearQuantParts(ctx, w.x, w.b_w, w.b_scales, w.b_biases);
@@ -848,9 +1131,9 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const z = try linearQuantParts(ctx, w.x, w.z_w, w.z_scales, w.z_biases);
     defer z.deinit(); // [1, HV*D]
 
-    // 3. post-conv tail: q/k rmsNorm (folded scales) + gates + delta rule +
-    // silu out-gate. Fused Metal kernel when supported, eager op chain
-    // otherwise.
+    // 2. conv chain + post-conv tail: q/k rmsNorm (folded scales) + gates +
+    // delta rule + silu out-gate. Single fused Metal kernel when supported;
+    // otherwise the eager conv chain feeds the v2 fused tail / eager tail.
     const tw = TailWeights{
         .q_norm_w = w.q_norm_w,
         .k_norm_w = w.k_norm_w,
@@ -861,15 +1144,35 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
         .qk_idx = w.qk_idx,
         .norm_eps = w.norm_eps,
     };
-    const tail_res = (try gdnTailFused(ctx, qkv, a, b, z, tw, HV, HK, D)) orelse
-        (try gdnTailEager(ctx, qkv, a, b, z, tw, HV, HK, D, QKV));
+    const tail_res: ConvTailOut = (try gdnConvTailFused(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)) orelse blk: {
+        // Eager depthwise causal conv (k=4) + silu.
+        const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ w.conv_state, qkv_lin }, 0);
+        defer conv_input.deinit(); // [K, QKV]
+
+        const conv_acc = try convAccumStep(ctx, w.conv1d_t, conv_input);
+        defer conv_acc.deinit();
+
+        // New conv window: keep last K-1 rows.
+        const tail = try ops.slice(ctx, conv_input, &[_]i32{ 1, 0 }, &[_]i32{ K, QKV }, &[_]i32{ 1, 1 });
+        defer tail.deinit();
+        const new_conv_state = try ops.copy(ctx, tail);
+        errdefer new_conv_state.deinit();
+
+        const qkv = try activations.silu(ctx, conv_acc);
+        defer qkv.deinit(); // [1, QKV]
+
+        const t2 = (try gdnTailFused(ctx, qkv, a, b, z, tw, HV, HK, D)) orelse
+            (try gdnTailEager(ctx, qkv, a, b, z, tw, HV, HK, D, QKV));
+        break :blk ConvTailOut{ .y = t2.y, .s_new = t2.s_new, .conv_state = new_conv_state };
+    };
     errdefer tail_res.s_new.deinit();
+    errdefer tail_res.conv_state.deinit();
     defer tail_res.y.deinit();
     const s_new = tail_res.s_new;
 
     const out = try linearQuantParts(ctx, tail_res.y, w.out_w, w.out_scales, w.out_biases);
     errdefer out.deinit();
-    return .{ .out = out, .conv_state = new_conv_state, .ssm_state = s_new };
+    return .{ .out = out, .conv_state = tail_res.conv_state, .ssm_state = s_new };
 }
 
 /// Closures are traced on the GPU stream so the compiled graph dispatches to
@@ -1377,6 +1680,117 @@ test "Qwen38GDN fused tail kernel matches eager tail" {
         const exp_s = try eager.s_new.dataSlice(f32);
         try std.testing.expectEqual(exp_s.len, got_s.len);
         for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+}
+
+test "Qwen38GDN fused conv+tail kernel matches eager conv chain + eager tail" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const Case = struct { hv: i32, hk: i32, d: i32, k: i32, qkv_bf16: bool = false, conv_bf16: bool = false };
+    for ([_]Case{
+        .{ .hv = 6, .hk = 2, .d = 4, .k = 4 },
+        .{ .hv = 6, .hk = 2, .d = 4, .k = 4, .qkv_bf16 = true, .conv_bf16 = true }, // real decode dtypes
+        .{ .hv = 48, .hk = 16, .d = 128, .k = 4 },
+    }) |cs| {
+        const hv = cs.hv;
+        const d = cs.d;
+        const k = cs.k;
+        const qkv_dim: i32 = (2 * cs.hk + hv) * d;
+
+        const qkv_lin_f32 = try makeTestWeight(allocator, &[_]i32{ 1, qkv_dim });
+        defer qkv_lin_f32.deinit();
+        const qkv_lin = if (cs.qkv_bf16) try ops.astype(ctx, qkv_lin_f32, .bfloat16) else qkv_lin_f32;
+        defer if (cs.qkv_bf16) qkv_lin.deinit();
+        const conv_state = try makeTestWeight(allocator, &[_]i32{ k - 1, qkv_dim });
+        defer conv_state.deinit();
+        const conv1d_t_f32 = try makeTestWeight(allocator, &[_]i32{ k, qkv_dim });
+        defer conv1d_t_f32.deinit();
+        const conv1d_t = if (cs.conv_bf16) try ops.astype(ctx, conv1d_t_f32, .bfloat16) else conv1d_t_f32;
+        defer if (cs.conv_bf16) conv1d_t.deinit();
+        const a = try makeTestWeight(allocator, &[_]i32{ 1, hv });
+        defer a.deinit();
+        const b = try makeTestWeight(allocator, &[_]i32{ 1, hv });
+        defer b.deinit();
+        const z = try makeTestWeight(allocator, &[_]i32{ 1, hv * d });
+        defer z.deinit();
+        const ssm_state = try makeTestWeight(allocator, &[_]i32{ hv, d, d });
+        defer ssm_state.deinit();
+        const a_log = try makeTestWeight(allocator, &[_]i32{hv});
+        defer a_log.deinit();
+        const dt_bias = try makeTestWeight(allocator, &[_]i32{hv});
+        defer dt_bias.deinit();
+        const norm_w = try makeTestWeight(allocator, &[_]i32{d});
+        defer norm_w.deinit();
+
+        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        const nw_buf = try allocator.alloc(f32, @intCast(d));
+        defer allocator.free(nw_buf);
+        @memset(nw_buf, inv_scale * inv_scale);
+        const q_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{d});
+        defer q_norm_w.deinit();
+        @memset(nw_buf, inv_scale);
+        const k_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{d});
+        defer k_norm_w.deinit();
+
+        const ratio: usize = @intCast(@divExact(hv, cs.hk));
+        const idx_buf = try allocator.alloc(i32, @intCast(hv));
+        defer allocator.free(idx_buf);
+        for (idx_buf, 0..) |*vv, h| vv.* = @intCast(h / ratio);
+        const qk_idx = try Array.fromData(allocator, i32, idx_buf, &[_]i32{hv});
+        defer qk_idx.deinit();
+
+        const tw = TailWeights{
+            .q_norm_w = q_norm_w,
+            .k_norm_w = k_norm_w,
+            .A_log = a_log,
+            .dt_bias = dt_bias,
+            .norm_w = norm_w,
+            .ssm_state = ssm_state,
+            .qk_idx = qk_idx,
+        };
+
+        const fused = (try gdnConvTailFused(ctx, qkv_lin, conv_state, conv1d_t, a, b, z, tw, hv, cs.hk, d, k)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.y.deinit();
+        defer fused.s_new.deinit();
+        defer fused.conv_state.deinit();
+        try fused.y.eval();
+        try fused.s_new.eval();
+        try fused.conv_state.eval();
+
+        // Eager reference: concatenate → convAccum → slice/copy window → silu
+        // → eager tail (the exact fallback path in step()).
+        const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ conv_state, qkv_lin }, 0);
+        defer conv_input.deinit();
+        const conv_acc = try convAccumStep(ctx, conv1d_t, conv_input);
+        defer conv_acc.deinit();
+        const tail = try ops.slice(ctx, conv_input, &[_]i32{ 1, 0 }, &[_]i32{ k, qkv_dim }, &[_]i32{ 1, 1 });
+        defer tail.deinit();
+        const exp_conv = try ops.copy(ctx, tail);
+        defer exp_conv.deinit();
+        const qkv_e = try activations.silu(ctx, conv_acc);
+        defer qkv_e.deinit();
+        const eager = try gdnTailEager(ctx, qkv_e, a, b, z, tw, hv, cs.hk, d, qkv_dim);
+        defer eager.y.deinit();
+        defer eager.s_new.deinit();
+        try eager.y.eval();
+        try eager.s_new.eval();
+        try exp_conv.eval();
+
+        const got_y = try fused.y.dataSlice(f32);
+        const exp_y = try eager.y.dataSlice(f32);
+        try std.testing.expectEqual(exp_y.len, got_y.len);
+        for (exp_y, got_y) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        const got_s = try fused.s_new.dataSlice(f32);
+        const exp_s = try eager.s_new.dataSlice(f32);
+        try std.testing.expectEqual(exp_s.len, got_s.len);
+        for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        const got_cs = try fused.conv_state.dataSlice(f32);
+        const exp_cs = try exp_conv.dataSlice(f32);
+        try std.testing.expectEqual(exp_cs.len, got_cs.len);
+        for (exp_cs, got_cs) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
 }
 
