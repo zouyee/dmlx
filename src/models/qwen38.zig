@@ -192,7 +192,8 @@ pub fn gdnBranch(
         .in_proj_qkv = qkv_q.data,
         .conv1d = conv1d,
         .conv1d_t = pre.conv1d_t,
-        .ones_d = pre.ones_d,
+        .q_norm_w = pre.q_norm_w,
+        .k_norm_w = pre.k_norm_w,
         .qk_idx = pre.qk_idx,
         .in_proj_a = a_q.data,
         .in_proj_b = b_q.data,
@@ -526,7 +527,7 @@ fn borrowQuantLinear(map: *const std.StringHashMap(Array), prefix: []const u8, i
 ///
 /// OWNERSHIP: modules do NOT own their weight Arrays — those alias resident
 /// map entries. Each module owns only its derived artifacts (GDN: conv1d_t /
-/// ones_d / qk_idx; attn: none). deinitShallow frees only the owned derived
+/// q_norm_w / k_norm_w / qk_idx; attn: none). deinitShallow frees only the owned derived
 /// arrays; the map (freed by the registry adapter after model.deinit) owns
 /// the weights. Never call the module's own deinit() on these instances —
 /// it would free the shared map handles.
@@ -538,7 +539,8 @@ pub const LayerModule = union(enum) {
         switch (self.*) {
             .gdn => |*g| {
                 g.conv1d_t.deinit();
-                g.ones_d.deinit();
+                g.q_norm_w.deinit();
+                g.k_norm_w.deinit();
                 g.qk_idx.deinit();
             },
             .attn => {},
@@ -654,7 +656,8 @@ fn buildLayerPersistent(
         // Materialize the derived constants once so per-token graphs
         // reference resident arrays instead of view/transpose chains.
         try pre.conv1d_t.eval();
-        try pre.ones_d.eval();
+        try pre.q_norm_w.eval();
+        try pre.k_norm_w.eval();
 
         out.module = .{ .gdn = .{
             .ctx = ctx,
@@ -667,7 +670,8 @@ fn buildLayerPersistent(
             .in_proj_qkv = qkv_q.w,
             .conv1d = conv1d,
             .conv1d_t = pre.conv1d_t,
-            .ones_d = pre.ones_d,
+            .q_norm_w = pre.q_norm_w,
+            .k_norm_w = pre.k_norm_w,
             .qk_idx = pre.qk_idx,
             .in_proj_a = a_q.w,
             .in_proj_b = b_q.w,
@@ -1074,7 +1078,8 @@ pub const Qwen38ServingModel = struct {
             g.b_biases.?,  g.in_proj_z,      g.z_scales.?,
             g.z_biases.?,  g.A_log,          g.dt_bias,
             g.norm_w,      g.out_proj,       g.o_scales.?,
-            g.o_biases.?,  g.ones_d,         g.qk_idx,
+            g.o_biases.?,  g.q_norm_w,       g.k_norm_w,
+            g.qk_idx,
         };
         const outs = try cc.apply(&inputs, self.allocator);
         if (outs.len != 3) {
@@ -1134,7 +1139,7 @@ pub const Qwen38ServingModel = struct {
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
         // Shallow: frees only module-owned derived arrays (GDN conv1d_t /
-        // ones_d / qk_idx) and the f32 layernorms; borrowed weight Arrays
+        // q_norm_w / k_norm_w / qk_idx) and the f32 layernorms; borrowed weight Arrays
         // stay with the resident map (freed by the caller after deinit).
         for (self.layers) |*lp| lp.deinitShallow();
         if (self.layers.len > 0) self.allocator.free(self.layers);

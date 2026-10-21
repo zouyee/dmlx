@@ -14,7 +14,6 @@ const shape_mod = @import("mlx").shape;
 const reduce_mod = @import("mlx").reduce;
 const math_mod = @import("mlx").math;
 const comparison_mod = @import("mlx").comparison;
-const creation_mod = @import("mlx").creation;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
@@ -218,6 +217,371 @@ fn deltaRuleFused(
     return .{ .s_new = Array.fromHandle(s_handle), .y_f32 = Array.fromHandle(y_handle) };
 }
 
+// ============================================================
+// Fused Metal kernel v2: the whole post-conv GDN tail
+// ============================================================
+//
+// One threadgroup per value head, D threads per group; thread t owns state
+// row dv=t (float4 register chunks) as in the v1 delta-rule kernel. On top of
+// the delta rule this kernel folds in: the q/k per-head weight-less rmsNorm
+// (scales pre-folded into the per-head factors — item A), the per-head gates
+// (softplus decay g, sigmoid beta), and the silu out-gate (bf16 round-trips
+// included), producing the out_proj input directly. The q/k norms are
+// redundant per-thread serial reductions over D elements (no cross-thread
+// sync); the out-gate norm needs the head's full y row, exchanged via one
+// threadgroup buffer + barrier.
+//
+// Dtype round-trips replicate the eager chain exactly: y is rounded to the
+// qkv dtype T before the out-gate norm (gated_delta_update returns
+// y.astype(q.dtype)), the normed value is rounded to T before AND after the
+// norm_w multiply (mlx fast.rms_norm: astype to out_type, then a multiply in
+// out_type), beta is rounded to b's dtype, and the final gated value is
+// rounded to T. With T=float every rounding is an identity — the real decode
+// path is f32 here because the conv state promotes the concat.
+//
+// Source is text-generated per (D, ratio, PK, qkv dtype, b dtype); registry
+// and fallback mirror the v1 kernel.
+
+const tail_kernel_body =
+    \\    const uint dv = thread_position_in_grid.x;
+    \\    const uint h = thread_position_in_grid.y;
+    \\    const uint hk = h / {[ratio]};
+    \\    const device {[t]s}* qp = qkv + hk * {[d]};
+    \\    const device {[t]s}* kp = qkv + {[pk]} + hk * {[d]};
+    \\    const device {[t]s}* vp = qkv + 2 * {[pk]} + h * {[d]};
+    \\
+    \\    // Per-head weight-less rmsNorm factors for q/k (folded scales):
+    \\    // redundant serial reduction per thread — no cross-thread sync.
+    \\    float ssq = 0.0f;
+    \\    float ssk = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) {{
+    \\        const float qi = float(qp[i]);
+    \\        const float ki = float(kp[i]);
+    \\        ssq += qi * qi;
+    \\        ssk += ki * ki;
+    \\    }}
+    \\    const float qfac = {[qscale]s} * metal::rsqrt(ssq / {[d]}.0f + 1e-6f);
+    \\    const float kfac = {[kscale]s} * metal::rsqrt(ssk / {[d]}.0f + 1e-6f);
+    \\
+    \\    // Per-head gates (f32): g = exp(-exp(A_log) * softplus(a + dt_bias)),
+    \\    // beta = sigmoid(b) rounded to b's dtype.
+    \\    const float ax = float(a[h]) + float(dt_bias[h]);
+    \\    const float sp = ax > 20.0f ? ax : metal::log(1.0f + metal::exp(ax));
+    \\    const float gh = metal::exp(-metal::exp(float(A_log[h])) * sp);
+    \\    const float bh = float({[bt]s}(1.0f / (1.0f + metal::exp(-float(b[h])))));
+    \\
+    \\    // Delta rule: thread owns state row dv.
+    \\    const device metal::float4* srow_in = (const device metal::float4*)(s_in + (h * {[d]} + dv) * {[d]});
+    \\    device metal::float4* srow_out = (device metal::float4*)(s_out + (h * {[d]} + dv) * {[d]});
+    \\    metal::float4 row[{[df4]}];
+    \\    float kv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        const metal::float4 s = srow_in[i] * gh;
+    \\        row[i] = s;
+    \\        const metal::float4 k4 = kfac * metal::float4(float(kp[4 * i]), float(kp[4 * i + 1]), float(kp[4 * i + 2]), float(kp[4 * i + 3]));
+    \\        kv += metal::dot(s, k4);
+    \\    }}
+    \\    const float dl = (float(vp[dv]) - kv) * bh;
+    \\    float yv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        const metal::float4 s = row[i] + (kfac * dl) * metal::float4(float(kp[4 * i]), float(kp[4 * i + 1]), float(kp[4 * i + 2]), float(kp[4 * i + 3]));
+    \\        srow_out[i] = s;
+    \\        yv += metal::dot(s, qfac * metal::float4(float(qp[4 * i]), float(qp[4 * i + 1]), float(qp[4 * i + 2]), float(qp[4 * i + 3])));
+    \\    }}
+    \\
+    \\    // Out gate: y rounds to T before the norm; norm in f32; norm_w
+    \\    // multiply rounds to T; silu(z) gate in f32; output rounds to T.
+    \\    const {[t]s} y_t = {[t]s}(yv);
+    \\    threadgroup float y_shared[{[d]}];
+    \\    y_shared[dv] = float(y_t);
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    float ssy = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) ssy += y_shared[i] * y_shared[i];
+    \\    const float yn = float({[t]s}(y_shared[dv] * metal::rsqrt(ssy / {[d]}.0f + 1e-6f)));
+    \\    const float yw = float({[t]s}(yn * float(norm_w[dv])));
+    \\    const float zz = float(z[h * {[d]} + dv]);
+    \\    const float zact = zz / (1.0f + metal::exp(-zz));
+    \\    out[h * {[d]} + dv] = {[t]s}(zact * yw);
+    \\
+;
+
+const TailKernelKey = struct {
+    d: i32,
+    ratio: i32,
+    pk: i32,
+    qkv_bf16: bool,
+    b_bf16: bool,
+};
+
+const TailKernelEntry = struct {
+    key: TailKernelKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var tail_entries: [8]?TailKernelEntry = .{ null, null, null, null, null, null, null, null };
+var tail_warned = false;
+
+fn tailWarn(err: anyerror) void {
+    if (!tail_warned) {
+        tail_warned = true;
+        std.log.warn("fused GDN tail kernel unavailable ({s}); using eager op chain", .{@errorName(err)});
+    }
+}
+
+fn f32MetalLit(allocator: std.mem.Allocator, v: f32) ![:0]u8 {
+    // Shortest round-trip decimal + f suffix parses back to the exact f32.
+    return std.fmt.allocPrintSentinel(allocator, "{d}f", .{v}, 0);
+}
+
+fn createTailKernel(allocator: std.mem.Allocator, key: TailKernelKey) !c.c.mlx_fast_metal_kernel {
+    const d = key.d;
+    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+    const qscale_z = try f32MetalLit(allocator, inv_scale * inv_scale);
+    defer allocator.free(qscale_z);
+    const kscale_z = try f32MetalLit(allocator, inv_scale);
+    defer allocator.free(kscale_z);
+    const t: []const u8 = if (key.qkv_bf16) "bfloat16_t" else "float";
+    const bt: []const u8 = if (key.b_bf16) "bfloat16_t" else "float";
+
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_tail_d{d}_r{d}_p{d}_{c}{c}", .{ d, key.ratio, key.pk, if (key.qkv_bf16) @as(u8, 'b') else 'f', if (key.b_bf16) @as(u8, 'b') else 'f' }, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, tail_kernel_body, .{
+        .d = d,
+        .df4 = @divExact(d, 4),
+        .ratio = key.ratio,
+        .pk = key.pk,
+        .qscale = qscale_z,
+        .kscale = kscale_z,
+        .t = t,
+        .bt = bt,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "qkv", "a", "b", "z", "A_log", "dt_bias", "norm_w", "s_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "out", "s_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+fn getTailKernel(allocator: std.mem.Allocator, key: TailKernelKey) ?c.c.mlx_fast_metal_kernel {
+    for (&tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createTailKernel(allocator, key) catch |err| {
+        tailWarn(err);
+        return null;
+    };
+    for (&tail_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markTailBroken(key: TailKernelKey) void {
+    for (&tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+pub const TailOut = struct {
+    y: Array, // [1, HV*D] qkv dtype, ready for out_proj
+    s_new: Array, // [HV, D, D] f32
+};
+
+/// Everything the post-conv tail needs from StepWeights.
+const TailWeights = struct {
+    q_norm_w: Array, // [D] f32 (folded q scale)
+    k_norm_w: Array, // [D] f32 (folded k scale)
+    A_log: Array, // [HV]
+    dt_bias: Array, // [HV]
+    norm_w: Array, // [D]
+    ssm_state: Array, // [HV, D, D] f32
+    qk_idx: Array, // [HV] i32
+    norm_eps: f32 = 1e-6,
+};
+
+fn isFloatDtype(dt: dtype_mod.Dtype) bool {
+    return dt == .float32 or dt == .bfloat16;
+}
+
+/// Fused single-kernel post-conv tail (norms + gates + delta rule + out
+/// gate). Returns null when shapes/dtypes are unsupported or the kernel is
+/// unavailable (caller falls back to the eager tail).
+fn gdnTailFused(
+    ctx: EagerContext,
+    qkv: Array, // [1, QKV]
+    a: Array, // [1, HV]
+    b: Array, // [1, HV]
+    z: Array, // [1, HV*D]
+    tw: TailWeights,
+    hv: i32,
+    hk: i32,
+    d: i32,
+) !?TailOut {
+    if (@mod(d, 4) != 0 or d < 4 or d > 128) return null;
+    if (hk < 1 or @mod(hv, hk) != 0) return null;
+    if (@abs(tw.norm_eps - 1e-6) > 1e-12) return null;
+    const qdt = qkv.dtype();
+    if (!isFloatDtype(qdt)) return null;
+    if (tw.ssm_state.dtype() != .float32) return null;
+    if (!isFloatDtype(a.dtype()) or !isFloatDtype(b.dtype()) or !isFloatDtype(z.dtype()) or
+        !isFloatDtype(tw.A_log.dtype()) or !isFloatDtype(tw.dt_bias.dtype()) or !isFloatDtype(tw.norm_w.dtype())) return null;
+
+    const key = TailKernelKey{
+        .d = d,
+        .ratio = @divExact(hv, hk),
+        .pk = hk * d,
+        .qkv_bf16 = qdt == .bfloat16,
+        .b_bf16 = b.dtype() == .bfloat16,
+    };
+    const kernel = getTailKernel(ctx.allocator, key) orelse return null;
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, hv, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, hv * d }, 2, if (key.qkv_bf16) c.c.MLX_BFLOAT16 else c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d, d }, 3, c.c.MLX_FLOAT32));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ qkv, a, b, z, tw.A_log, tw.dt_bias, tw.norm_w, tw.ssm_state }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markTailBroken(key);
+        tailWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
+    return .{ .y = Array.fromHandle(y_handle), .s_new = Array.fromHandle(s_handle) };
+}
+
+/// Eager op-chain post-conv tail (reference implementation and fallback):
+/// split q/k/v, per-head weight-less rmsNorm (folded scales), gates, kv-group
+/// broadcast, delta rule (v1 fused kernel when eligible), silu out-gate.
+fn gdnTailEager(
+    ctx: EagerContext,
+    qkv: Array, // [1, QKV]
+    a: Array, // [1, HV]
+    b: Array, // [1, HV]
+    z: Array, // [1, HV*D]
+    tw: TailWeights,
+    hv: i32,
+    hk: i32,
+    d: i32,
+    qkv_dim: i32,
+) !TailOut {
+    const qkv_flat = try ops.reshape(ctx, qkv, &[_]i32{qkv_dim});
+    defer qkv_flat.deinit();
+    const pk = hk * d;
+    const q_parts = try ops.slice(ctx, qkv_flat, &[_]i32{0}, &[_]i32{pk}, &[_]i32{1});
+    defer q_parts.deinit();
+    const k_parts = try ops.slice(ctx, qkv_flat, &[_]i32{pk}, &[_]i32{2 * pk}, &[_]i32{1});
+    defer k_parts.deinit();
+    const v_parts = try ops.slice(ctx, qkv_flat, &[_]i32{2 * pk}, &[_]i32{qkv_dim}, &[_]i32{1});
+    defer v_parts.deinit();
+
+    const q_resh = try ops.reshape(ctx, q_parts, &[_]i32{ hk, d });
+    defer q_resh.deinit();
+    const k_resh = try ops.reshape(ctx, k_parts, &[_]i32{ hk, d });
+    defer k_resh.deinit();
+    const v = try ops.reshape(ctx, v_parts, &[_]i32{ hv, d });
+    defer v.deinit();
+
+    // Weight-less per-head rmsNorm with the q/k scales folded into the weight.
+    const q = try fast_mod.rmsNorm(ctx, q_resh, tw.q_norm_w, 1e-6);
+    defer q.deinit();
+    const k = try fast_mod.rmsNorm(ctx, k_resh, tw.k_norm_w, 1e-6);
+    defer k.deinit();
+
+    // g = exp(-exp(A_log_f32) * softplus(a + dt_bias))  [HV]
+    const a_flat = try ops.reshape(ctx, a, &[_]i32{hv});
+    defer a_flat.deinit();
+    const a_dt = try ops.add(ctx, a_flat, tw.dt_bias);
+    defer a_dt.deinit();
+    const sp = try softplusStep(ctx, a_dt);
+    defer sp.deinit();
+    const a_log_f32 = try ops.astype(ctx, tw.A_log, .float32);
+    defer a_log_f32.deinit();
+    const e_a_log = try ops.exp(ctx, a_log_f32);
+    defer e_a_log.deinit();
+    const g_pre = try ops.multiply(ctx, e_a_log, sp);
+    defer g_pre.deinit();
+    const g_neg = try ops.negative(ctx, g_pre);
+    defer g_neg.deinit();
+    const g = try ops.exp(ctx, g_neg); // [HV]
+    defer g.deinit();
+
+    const b_flat = try ops.reshape(ctx, b, &[_]i32{hv});
+    defer b_flat.deinit();
+    const beta = try ops.sigmoid(ctx, b_flat); // [HV]
+    defer beta.deinit();
+
+    // Broadcast q/k to value heads via the precomputed gather indices.
+    const q_full = try shape_mod.takeAxis(ctx, q, tw.qk_idx, 0); // [HV, D]
+    defer q_full.deinit();
+    const k_full = try shape_mod.takeAxis(ctx, k, tw.qk_idx, 0); // [HV, D]
+    defer k_full.deinit();
+
+    // Gated delta rule step. State S [Hv, Dv, Dk]. Fused v1 kernel when
+    // supported (one state read + one write), eager op chain otherwise.
+    const dr = (try deltaRuleFused(ctx, tw.ssm_state, k_full, v, beta, g, q_full, hv, d)) orelse
+        (try deltaRuleEager(ctx, tw.ssm_state, k_full, v, beta, g, q_full, hv, d));
+    errdefer dr.s_new.deinit();
+    defer dr.y_f32.deinit();
+
+    // gated_delta_update returns y.astype(q.dtype): round before the norm.
+    const y = try ops.astype(ctx, dr.y_f32, qkv.dtype());
+    defer y.deinit();
+
+    // Gated RMSNorm: norm in f32, gate in f32, round to input dtype.
+    const y_normed = try fast_mod.rmsNorm(ctx, y, tw.norm_w, tw.norm_eps);
+    defer y_normed.deinit();
+    const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
+    defer y_normed_f32.deinit();
+    const z_resh = try ops.reshape(ctx, z, &[_]i32{ hv, d });
+    defer z_resh.deinit();
+    const z_f32 = try ops.astype(ctx, z_resh, .float32);
+    defer z_f32.deinit();
+    const z_act = try activations.silu(ctx, z_f32);
+    defer z_act.deinit();
+    const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
+    defer y_gated_f32.deinit();
+    const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
+    defer y_gated.deinit();
+    const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, hv * d });
+    errdefer y_flat.deinit();
+    return .{ .y = y_flat, .s_new = dr.s_new };
+}
+
 /// Eager op-chain delta rule (reference implementation and fallback).
 fn deltaRuleEager(
     ctx: EagerContext,
@@ -283,17 +647,20 @@ pub const Qwen38GdnCache = struct {
 
 /// Per-layer constants derived once from the loaded weights: the transposed
 /// conv kernel (turns the k=4 depthwise conv into one multiply + column sum),
-/// a ones vector so the weight-less q/k rms_norm can use the fused
-/// fast.rmsNorm, and kv-group gather indices that broadcast q/k to value
-/// heads in a single take.
+/// the weight-less q/k rms_norm "weights" (ones with the q/k scalar scales
+/// folded in — rmsNorm computes x*rsqrt(mean(x²)+eps)*w, so scaling w is
+/// exactly the post-norm scalar multiply), and kv-group gather indices that
+/// broadcast q/k to value heads in a single take.
 pub const Precomputed = struct {
     conv1d_t: Array, // [conv_kernel, QKV]
-    ones_d: Array, // [head_dim] f32
+    q_norm_w: Array, // [head_dim] f32, ones * D^-1 (folded q scale)
+    k_norm_w: Array, // [head_dim] f32, ones * D^-0.5 (folded k scale)
     qk_idx: Array, // [num_value_heads] i32
 
     pub fn deinit(self: *Precomputed) void {
         self.conv1d_t.deinit();
-        self.ones_d.deinit();
+        self.q_norm_w.deinit();
+        self.k_norm_w.deinit();
         self.qk_idx.deinit();
     }
 };
@@ -311,13 +678,22 @@ pub fn precomputeDerived(
     const K: i32 = @intCast(cshape[1]);
     const w2d = try ops.reshape(ctx, conv1d, &[_]i32{ QKV, K });
     defer w2d.deinit();
+    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const nw_buf = try allocator.alloc(f32, head_dim);
+    defer allocator.free(nw_buf);
+    @memset(nw_buf, inv_scale * inv_scale);
+    const q_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{@intCast(head_dim)});
+    errdefer q_norm_w.deinit();
+    @memset(nw_buf, inv_scale);
+    const k_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{@intCast(head_dim)});
+    errdefer k_norm_w.deinit();
     var out: Precomputed = .{
         .conv1d_t = try shape_mod.transpose(ctx, w2d),
-        .ones_d = try creation_mod.ones(ctx, &[_]i32{@intCast(head_dim)}, .float32),
+        .q_norm_w = q_norm_w,
+        .k_norm_w = k_norm_w,
         .qk_idx = undefined,
     };
     errdefer out.conv1d_t.deinit();
-    errdefer out.ones_d.deinit();
     const ratio = num_value_heads / num_key_heads;
     const idx_buf = try allocator.alloc(i32, num_value_heads);
     defer allocator.free(idx_buf);
@@ -357,7 +733,8 @@ pub const StepWeights = struct {
     out_w: Array,
     out_scales: ?Array = null,
     out_biases: ?Array = null,
-    ones_d: Array, // [D]
+    q_norm_w: Array, // [D] f32 (folded q scale)
+    k_norm_w: Array, // [D] f32 (folded k scale)
     qk_idx: Array, // [HV] i32
     norm_eps: f32 = 1e-6,
 };
@@ -442,9 +819,7 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const D: i32 = @intCast(w.norm_w.shape()[0]);
     const K: i32 = @intCast(w.conv1d_t.shape()[0]);
     const QKV: i32 = @intCast(w.conv1d_t.shape()[1]);
-    const PV: i32 = HV * D;
-    const PK: i32 = @divTrunc(QKV - PV, 2);
-    const HK: i32 = @divTrunc(PK, D);
+    const HK: i32 = @divTrunc(@divTrunc(QKV - HV * D, 2), D);
 
     // 1. qkv projection + depthwise causal conv (k=4) + silu.
     const qkv_lin = try linearQuantParts(ctx, w.x, w.qkv_w, w.qkv_scales, w.qkv_biases);
@@ -465,38 +840,7 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const qkv = try activations.silu(ctx, conv_acc);
     defer qkv.deinit(); // [1, QKV]
 
-    // 2. split q/k/v; weight-less rms_norm per head; scale q by D^-1, k by D^-0.5.
-    const qkv_flat = try ops.reshape(ctx, qkv, &[_]i32{QKV});
-    defer qkv_flat.deinit();
-    const q_parts = try ops.slice(ctx, qkv_flat, &[_]i32{0}, &[_]i32{PK}, &[_]i32{1});
-    defer q_parts.deinit();
-    const k_parts = try ops.slice(ctx, qkv_flat, &[_]i32{PK}, &[_]i32{2 * PK}, &[_]i32{1});
-    defer k_parts.deinit();
-    const v_parts = try ops.slice(ctx, qkv_flat, &[_]i32{2 * PK}, &[_]i32{QKV}, &[_]i32{1});
-    defer v_parts.deinit();
-
-    const q_resh = try ops.reshape(ctx, q_parts, &[_]i32{ HK, D });
-    defer q_resh.deinit();
-    const k_resh = try ops.reshape(ctx, k_parts, &[_]i32{ HK, D });
-    defer k_resh.deinit();
-    const v = try ops.reshape(ctx, v_parts, &[_]i32{ HV, D });
-    defer v.deinit();
-
-    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
-    const q_rn = try fast_mod.rmsNorm(ctx, q_resh, w.ones_d, 1e-6);
-    defer q_rn.deinit();
-    const k_rn = try fast_mod.rmsNorm(ctx, k_resh, w.ones_d, 1e-6);
-    defer k_rn.deinit();
-    const q_scale = try ops.scalarF32(ctx, inv_scale * inv_scale);
-    defer q_scale.deinit();
-    const k_scale = try ops.scalarF32(ctx, inv_scale);
-    defer k_scale.deinit();
-    const q = try ops.multiply(ctx, q_rn, q_scale);
-    defer q.deinit();
-    const k = try ops.multiply(ctx, k_rn, k_scale);
-    defer k.deinit();
-
-    // 3. per-head gates: a (decay input), b (beta), z (output gate).
+    // 2. gate projections (raw; gates themselves live in the tail).
     const a = try linearQuantParts(ctx, w.x, w.a_w, w.a_scales, w.a_biases);
     defer a.deinit(); // [1, HV]
     const b = try linearQuantParts(ctx, w.x, w.b_w, w.b_scales, w.b_biases);
@@ -504,65 +848,26 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const z = try linearQuantParts(ctx, w.x, w.z_w, w.z_scales, w.z_biases);
     defer z.deinit(); // [1, HV*D]
 
-    // g = exp(-exp(A_log_f32) * softplus(a + dt_bias))  [HV]
-    const a_flat = try ops.reshape(ctx, a, &[_]i32{HV});
-    defer a_flat.deinit();
-    const a_dt = try ops.add(ctx, a_flat, w.dt_bias);
-    defer a_dt.deinit();
-    const sp = try softplusStep(ctx, a_dt);
-    defer sp.deinit();
-    const a_log_f32 = try ops.astype(ctx, w.A_log, .float32);
-    defer a_log_f32.deinit();
-    const e_a_log = try ops.exp(ctx, a_log_f32);
-    defer e_a_log.deinit();
-    const g_pre = try ops.multiply(ctx, e_a_log, sp);
-    defer g_pre.deinit();
-    const g_neg = try ops.negative(ctx, g_pre);
-    defer g_neg.deinit();
-    const g = try ops.exp(ctx, g_neg); // [HV]
-    defer g.deinit();
+    // 3. post-conv tail: q/k rmsNorm (folded scales) + gates + delta rule +
+    // silu out-gate. Fused Metal kernel when supported, eager op chain
+    // otherwise.
+    const tw = TailWeights{
+        .q_norm_w = w.q_norm_w,
+        .k_norm_w = w.k_norm_w,
+        .A_log = w.A_log,
+        .dt_bias = w.dt_bias,
+        .norm_w = w.norm_w,
+        .ssm_state = w.ssm_state,
+        .qk_idx = w.qk_idx,
+        .norm_eps = w.norm_eps,
+    };
+    const tail_res = (try gdnTailFused(ctx, qkv, a, b, z, tw, HV, HK, D)) orelse
+        (try gdnTailEager(ctx, qkv, a, b, z, tw, HV, HK, D, QKV));
+    errdefer tail_res.s_new.deinit();
+    defer tail_res.y.deinit();
+    const s_new = tail_res.s_new;
 
-    const b_flat = try ops.reshape(ctx, b, &[_]i32{HV});
-    defer b_flat.deinit();
-    const beta = try ops.sigmoid(ctx, b_flat); // [HV]
-    defer beta.deinit();
-
-    // 4. broadcast q/k to value heads via the precomputed gather indices.
-    const q_full = try shape_mod.takeAxis(ctx, q, w.qk_idx, 0); // [HV, D]
-    defer q_full.deinit();
-    const k_full = try shape_mod.takeAxis(ctx, k, w.qk_idx, 0); // [HV, D]
-    defer k_full.deinit();
-
-    // 5. gated delta rule step. State S [Hv, Dv, Dk]. Fused Metal kernel when
-    // supported (one state read + one write), eager op chain otherwise.
-    const dr = (try deltaRuleFused(ctx, w.ssm_state, k_full, v, beta, g, q_full, HV, D)) orelse
-        (try deltaRuleEager(ctx, w.ssm_state, k_full, v, beta, g, q_full, HV, D));
-    errdefer dr.s_new.deinit();
-    defer dr.y_f32.deinit();
-    const s_new = dr.s_new;
-    // gated_delta_update returns y.astype(q.dtype): round before the norm.
-    const y = try ops.astype(ctx, dr.y_f32, qkv.dtype());
-    defer y.deinit();
-
-    // 6. gated RMSNorm: norm in f32, gate in f32, round to input dtype.
-    const y_normed = try fast_mod.rmsNorm(ctx, y, w.norm_w, w.norm_eps);
-    defer y_normed.deinit();
-    const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
-    defer y_normed_f32.deinit();
-    const z_resh = try ops.reshape(ctx, z, &[_]i32{ HV, D });
-    defer z_resh.deinit();
-    const z_f32 = try ops.astype(ctx, z_resh, .float32);
-    defer z_f32.deinit();
-    const z_act = try activations.silu(ctx, z_f32);
-    defer z_act.deinit();
-    const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
-    defer y_gated_f32.deinit();
-    const y_gated = try ops.astype(ctx, y_gated_f32, qkv.dtype());
-    defer y_gated.deinit();
-    const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, PV });
-    defer y_flat.deinit();
-
-    const out = try linearQuantParts(ctx, y_flat, w.out_w, w.out_scales, w.out_biases);
+    const out = try linearQuantParts(ctx, tail_res.y, w.out_w, w.out_scales, w.out_biases);
     errdefer out.deinit();
     return .{ .out = out, .conv_state = new_conv_state, .ssm_state = s_new };
 }
@@ -582,11 +887,11 @@ fn stepToSlice(res: StepOutput, allocator: std.mem.Allocator) error{MlxError}![]
     return out;
 }
 
-/// Quantized variant. Input order (24): x, conv_state, ssm_state, qkv_w,
+/// Quantized variant. Input order (25): x, conv_state, ssm_state, qkv_w,
 /// qkv_s, qkv_b, conv1d_t, a_w, a_s, a_b, b_w, b_s, b_b, z_w, z_s, z_b,
-/// A_log, dt_bias, norm_w, out_w, out_s, out_b, ones_d, qk_idx.
+/// A_log, dt_bias, norm_w, out_w, out_s, out_b, q_norm_w, k_norm_w, qk_idx.
 fn gdnStepClosureQuant(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
-    if (inputs.len != 24) return error.MlxError;
+    if (inputs.len != 25) return error.MlxError;
     const ctx = closureGpuCtx(allocator);
     defer ctx.deinit();
     const res = step(ctx, .{
@@ -612,17 +917,18 @@ fn gdnStepClosureQuant(inputs: []const Array, allocator: std.mem.Allocator) erro
         .out_w = inputs[19],
         .out_scales = inputs[20],
         .out_biases = inputs[21],
-        .ones_d = inputs[22],
-        .qk_idx = inputs[23],
+        .q_norm_w = inputs[22],
+        .k_norm_w = inputs[23],
+        .qk_idx = inputs[24],
     }) catch return error.MlxError;
     return stepToSlice(res, allocator);
 }
 
 /// Plain (unquantized) variant — used by the toy-module unit test. Input
-/// order (14): x, conv_state, ssm_state, qkv_w, conv1d_t, a_w, b_w, z_w,
-/// A_log, dt_bias, norm_w, out_w, ones_d, qk_idx.
+/// order (15): x, conv_state, ssm_state, qkv_w, conv1d_t, a_w, b_w, z_w,
+/// A_log, dt_bias, norm_w, out_w, q_norm_w, k_norm_w, qk_idx.
 fn gdnStepClosurePlain(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
-    if (inputs.len != 14) return error.MlxError;
+    if (inputs.len != 15) return error.MlxError;
     const ctx = closureGpuCtx(allocator);
     defer ctx.deinit();
     const res = step(ctx, .{
@@ -638,8 +944,9 @@ fn gdnStepClosurePlain(inputs: []const Array, allocator: std.mem.Allocator) erro
         .dt_bias = inputs[9],
         .norm_w = inputs[10],
         .out_w = inputs[11],
-        .ones_d = inputs[12],
-        .qk_idx = inputs[13],
+        .q_norm_w = inputs[12],
+        .k_norm_w = inputs[13],
+        .qk_idx = inputs[14],
     }) catch return error.MlxError;
     return stepToSlice(res, allocator);
 }
@@ -678,7 +985,8 @@ pub const Qwen38GDN = struct {
     // follows the struct: deinit frees them; construction sites that skip
     // deinit (gdnBranch) must free the Precomputed themselves.
     conv1d_t: Array, // [conv_kernel, QKV] = conv1d [QKV, K, 1] transposed
-    ones_d: Array, // [D] f32, ones weight for weight-less fast.rmsNorm
+    q_norm_w: Array, // [D] f32, ones * D^-1 (folded q scale) for fast.rmsNorm
+    k_norm_w: Array, // [D] f32, ones * D^-0.5 (folded k scale) for fast.rmsNorm
     qk_idx: Array, // [Hv] i32, value head h -> key head h / (Hv/Hk)
 
     // Optional quantized forms (affine 4-bit gs=64 in the real checkpoint).
@@ -709,7 +1017,8 @@ pub const Qwen38GDN = struct {
         self.norm_w.deinit();
         self.out_proj.deinit();
         self.conv1d_t.deinit();
-        self.ones_d.deinit();
+        self.q_norm_w.deinit();
+        self.k_norm_w.deinit();
         self.qk_idx.deinit();
         if (self.qkv_scales) |a| a.deinit();
         if (self.qkv_biases) |a| a.deinit();
@@ -752,7 +1061,8 @@ pub const Qwen38GDN = struct {
             .out_w = self.out_proj,
             .out_scales = self.o_scales,
             .out_biases = self.o_biases,
-            .ones_d = self.ones_d,
+            .q_norm_w = self.q_norm_w,
+            .k_norm_w = self.k_norm_w,
             .qk_idx = self.qk_idx,
             .norm_eps = self.norm_eps,
         });
@@ -838,7 +1148,8 @@ fn makeTestModule(allocator: std.mem.Allocator, ctx: EagerContext, dims: TestDim
         .in_proj_qkv = try makeTestWeight(allocator, &[_]i32{ qkv_dim, hidden }),
         .conv1d = conv1d,
         .conv1d_t = pre.conv1d_t,
-        .ones_d = pre.ones_d,
+        .q_norm_w = pre.q_norm_w,
+        .k_norm_w = pre.k_norm_w,
         .qk_idx = pre.qk_idx,
         .in_proj_a = try makeTestWeight(allocator, &[_]i32{ HV, hidden }),
         .in_proj_b = try makeTestWeight(allocator, &[_]i32{ HV, hidden }),
@@ -990,6 +1301,85 @@ test "Qwen38GDN fused delta-rule kernel matches eager chain" {
     }
 }
 
+test "Qwen38GDN fused tail kernel matches eager tail" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const Case = struct { hv: i32, hk: i32, d: i32 };
+    for ([_]Case{ .{ .hv = 6, .hk = 2, .d = 4 }, .{ .hv = 48, .hk = 16, .d = 128 } }) |cs| {
+        const hv = cs.hv;
+        const d = cs.d;
+        const qkv_dim: i32 = (2 * cs.hk + hv) * d;
+
+        const qkv = try makeTestWeight(allocator, &[_]i32{ 1, qkv_dim });
+        defer qkv.deinit();
+        const a = try makeTestWeight(allocator, &[_]i32{ 1, hv });
+        defer a.deinit();
+        const b = try makeTestWeight(allocator, &[_]i32{ 1, hv });
+        defer b.deinit();
+        const z = try makeTestWeight(allocator, &[_]i32{ 1, hv * d });
+        defer z.deinit();
+        const ssm_state = try makeTestWeight(allocator, &[_]i32{ hv, d, d });
+        defer ssm_state.deinit();
+        const a_log = try makeTestWeight(allocator, &[_]i32{hv});
+        defer a_log.deinit();
+        const dt_bias = try makeTestWeight(allocator, &[_]i32{hv});
+        defer dt_bias.deinit();
+        const norm_w = try makeTestWeight(allocator, &[_]i32{d});
+        defer norm_w.deinit();
+
+        const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        const nw_buf = try allocator.alloc(f32, @intCast(d));
+        defer allocator.free(nw_buf);
+        @memset(nw_buf, inv_scale * inv_scale);
+        const q_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{d});
+        defer q_norm_w.deinit();
+        @memset(nw_buf, inv_scale);
+        const k_norm_w = try Array.fromData(allocator, f32, nw_buf, &[_]i32{d});
+        defer k_norm_w.deinit();
+
+        const ratio: usize = @intCast(@divExact(hv, cs.hk));
+        const idx_buf = try allocator.alloc(i32, @intCast(hv));
+        defer allocator.free(idx_buf);
+        for (idx_buf, 0..) |*vv, h| vv.* = @intCast(h / ratio);
+        const qk_idx = try Array.fromData(allocator, i32, idx_buf, &[_]i32{hv});
+        defer qk_idx.deinit();
+
+        const tw = TailWeights{
+            .q_norm_w = q_norm_w,
+            .k_norm_w = k_norm_w,
+            .A_log = a_log,
+            .dt_bias = dt_bias,
+            .norm_w = norm_w,
+            .ssm_state = ssm_state,
+            .qk_idx = qk_idx,
+        };
+
+        const fused = (try gdnTailFused(ctx, qkv, a, b, z, tw, hv, cs.hk, d)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.y.deinit();
+        defer fused.s_new.deinit();
+        try fused.y.eval();
+        try fused.s_new.eval();
+
+        const eager = try gdnTailEager(ctx, qkv, a, b, z, tw, hv, cs.hk, d, qkv_dim);
+        defer eager.y.deinit();
+        defer eager.s_new.deinit();
+        try eager.y.eval();
+        try eager.s_new.eval();
+
+        const got_y = try fused.y.dataSlice(f32);
+        const exp_y = try eager.y.dataSlice(f32);
+        try std.testing.expectEqual(exp_y.len, got_y.len);
+        for (exp_y, got_y) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        const got_s = try fused.s_new.dataSlice(f32);
+        const exp_s = try eager.s_new.dataSlice(f32);
+        try std.testing.expectEqual(exp_s.len, got_s.len);
+        for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+}
+
 test "Qwen38GDN.prefill: per-token loop equivalence" {
     c.initErrorHandler();
     const allocator = std.testing.allocator;
@@ -1078,7 +1468,7 @@ test "Qwen38GDN.step: compiled closure matches eager forward" {
             g.in_proj_qkv, g.conv1d_t,            g.in_proj_a,
             g.in_proj_b,   g.in_proj_z,           g.A_log,
             g.dt_bias,     g.norm_w,              g.out_proj,
-            g.ones_d,      g.qk_idx,
+            g.q_norm_w,    g.k_norm_w,            g.qk_idx,
         };
         const outs = try cc.apply(&inputs, allocator);
         try std.testing.expectEqual(@as(usize, 3), outs.len);
