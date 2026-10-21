@@ -811,6 +811,10 @@ pub const Qwen38ServingModel = struct {
     /// (A/B on the profile harness), so only the qmm/silu/mul core is
     /// compiled.
     mlp_swiglu_compiled: ?Closure,
+    /// mx.compile'd attention pre-cache segment (projections → q/k norm →
+    /// ropeDynamic → gate sigmoid), one graph shared by all full-attention
+    /// layers; KV append + SDPA + o_proj stay eager. Null when unavailable.
+    attn_precache_compiled: ?Closure,
 
     /// Dequantize embed_tokens (packed U32 + scales + biases) to a resident
     /// bf16 [vocab, hidden] table and eval it once, so decode gathers rows
@@ -876,6 +880,7 @@ pub const Qwen38ServingModel = struct {
             .lm_head = null,
             .gdn_step_compiled = null,
             .mlp_swiglu_compiled = null,
+            .attn_precache_compiled = null,
         };
         // NOTE: the WeightSource built here points at this local's fields;
         // the caller MUST reseat after placement:
@@ -958,6 +963,87 @@ pub const Qwen38ServingModel = struct {
         } else |_| {
             std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
         }
+        // Attention pre-cache segment: only for the exact config the closure
+        // bakes (quantized, rotary_dims=64, theta=1e7, output gate).
+        const cfg = self.cfg;
+        if (cfg.attn_output_gate and cfg.rotaryDims() == qwen38_attn.COMPILED_ROTARY_DIMS and
+            @abs(cfg.rope_theta - qwen38_attn.COMPILED_ROPE_THETA) < 1.0)
+        {
+            if (qwen38_attn.compiledPreCache(self.allocator)) |ac| {
+                if (self.warmAttnPreCache(ac)) {
+                    self.attn_precache_compiled = ac;
+                    std.debug.print("info: compiled attention pre-cache segment active\n", .{});
+                } else {
+                    std.debug.print("warn: compiled attn pre-cache warm failed — eager fallback\n", .{});
+                    ac.deinit();
+                }
+            } else |_| {
+                std.debug.print("warn: compiled attn pre-cache build failed — eager fallback\n", .{});
+            }
+        }
+    }
+
+    /// One compiled pre-cache apply: builds the scalar rope offset from the
+    /// cache length and returns the segment outputs (owned by the caller).
+    /// On failure nothing is consumed — callers fall back to the eager path.
+    pub fn applyAttnPreCache(self: *Qwen38ServingModel, ac: Closure, a: *qwen38_attn.Qwen38Attn, cache: *qwen38_attn.Qwen38AttnCache, x: Array) !qwen38_attn.PreCacheOut {
+        const offset_arr = try ops.scalarI32(self.ctx, cache.len());
+        defer offset_arr.deinit();
+        const inputs = [_]Array{
+            x,            a.q_proj,     a.q_scales.?, a.q_biases.?,
+            a.k_proj,     a.k_scales.?, a.k_biases.?, a.v_proj,
+            a.v_scales.?, a.v_biases.?, a.q_norm,     a.k_norm,
+            offset_arr,
+        };
+        const outs = try ac.apply(&inputs, self.allocator);
+        if (outs.len != 4) {
+            for (outs) |o| o.deinit();
+            self.allocator.free(outs);
+            return error.MlxError;
+        }
+        const pre = qwen38_attn.PreCacheOut{
+            .q_t = outs[0],
+            .k_t = outs[1],
+            .v_t = outs[2],
+            .gate_sig = outs[3],
+        };
+        self.allocator.free(outs);
+        return pre;
+    }
+
+    /// Trace + warm the compiled pre-cache segment on the first full-attention
+    /// layer's weights with a zero input; outputs are discarded after eval.
+    fn warmAttnPreCache(self: *Qwen38ServingModel, ac: Closure) bool {
+        const hidden: i32 = @intCast(self.cfg.hidden_size);
+        for (self.layers) |*lp| {
+            switch (lp.module) {
+                .attn => |*a| {
+                    if (a.q_scales == null) return false;
+                    var warm_cache: qwen38_attn.Qwen38AttnCache = .{};
+                    defer warm_cache.deinit();
+                    const x_f32 = creation_mod.zeros(self.ctx, &[_]i32{ 1, hidden }, .float32) catch return false;
+                    defer x_f32.deinit();
+                    const x = ops.astype(self.ctx, x_f32, .bfloat16) catch return false;
+                    defer x.deinit();
+                    x.eval() catch return false;
+                    var pre = self.applyAttnPreCache(ac, a, &warm_cache, x) catch return false;
+                    defer pre.deinit();
+                    pre.q_t.eval() catch return false;
+                    pre.k_t.eval() catch return false;
+                    pre.v_t.eval() catch return false;
+                    pre.gate_sig.?.eval() catch return false;
+                    // A second apply at a non-zero offset proves the traced
+                    // graph is offset-invariant (no per-token retrace).
+                    warm_cache.len_ = 17;
+                    var pre2 = self.applyAttnPreCache(ac, a, &warm_cache, x) catch return false;
+                    defer pre2.deinit();
+                    pre2.q_t.eval() catch return false;
+                    return true;
+                },
+                .gdn => {},
+            }
+        }
+        return false;
     }
 
     /// Trace + warm the compiled SwiGLU core on the first layer's weights.
@@ -1056,6 +1142,7 @@ pub const Qwen38ServingModel = struct {
         if (self.embed_table_bf16) |*t| t.deinit();
         if (self.gdn_step_compiled) |cc| cc.deinit();
         if (self.mlp_swiglu_compiled) |mc| mc.deinit();
+        if (self.attn_precache_compiled) |ac| ac.deinit();
         // remaining weights map entries are owned by the caller (registry adapter).
     }
 
@@ -1152,7 +1239,23 @@ pub const Qwen38ServingModel = struct {
                     defer step_out.deinit();
                     break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
                 },
-                .attn => |*a| try a.forward(normed1, &self.caches[layer].attn),
+                .attn => |*a| blk: {
+                    const cache = &self.caches[layer].attn;
+                    const n = normed1.shape()[1];
+                    if (n > 1) break :blk try a.forward(normed1, cache);
+                    if (self.attn_precache_compiled) |ac| {
+                        const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
+                        defer step_in.deinit();
+                        if (self.applyAttnPreCache(ac, a, cache, step_in)) |pre| {
+                            var pre_v = pre;
+                            defer pre_v.deinit();
+                            const out2d = try a.postCache(pre_v, cache);
+                            defer out2d.deinit();
+                            break :blk try ops.reshape(ctx, out2d, &[_]i32{ 1, 1, hidden });
+                        } else |_| {} // fall through to the eager path
+                    }
+                    break :blk try a.forward(normed1, cache);
+                },
             };
             defer attn_out.deinit();
             {
