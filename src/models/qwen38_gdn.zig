@@ -931,15 +931,232 @@ pub const PrefillRecurrenceOut = struct {
     y: Array, // [L, HV, D] f32, per-step outputs stacked (owned)
 };
 
-/// Eager per-step delta-rule recurrence over a prefilled sequence. k_full /
-/// q_full / v: [L, HV, D] f32; beta / g: [L, HV] f32; ssm_state: [HV, D, D]
-/// f32 (borrowed). Per step this runs the exact decode recurrence
+// ============================================================
+// Single-kernel sequential delta-rule recurrence for prefill
+// ============================================================
+//
+// Port of mlx-lm gated_delta.py `_make_gated_delta_kernel`: one Metal kernel
+// runs the whole L-step recurrence with the state held in registers.
+// Layout: grid (32, Dv, Hv) threads, threadgroup (32, 4, 1) — the 32 lanes of
+// a simdgroup split Dk (n_per_t = Dk/32 floats per thread), thread dv owns
+// state row dv, and a serial for-t loop does decay → kv_mem (simd_sum over
+// Dk) → delta → rank-1 update → readout (simd_sum) → y[t]. Our q/k are
+// already broadcast to value heads ([L, HV, D]), so the hk mapping in the
+// reference drops out. Everything is f32 (prefill's post-conv tail is f32),
+// so the reference's InT/StT casts are identities. Eligibility: D % 32 == 0
+// (simd split); smaller/odd head dims fall back to the eager per-step loop.
+
+const prefill_rec_kernel_body =
+    \\    const uint hv = thread_position_in_grid.z;
+    \\    const uint dv = thread_position_in_grid.y;
+    \\    const uint dk = thread_position_in_threadgroup.x;
+    \\    const int T = T_in[0];
+    \\
+    \\    // state: [HV, Dv, Dk]; this thread owns row dv, Dk slice dk.
+    \\    const device float* i_state = s_in + (hv * {[d]} + dv) * {[d]};
+    \\    device float* o_state = s_out + (hv * {[d]} + dv) * {[d]};
+    \\    float state[{[npt]}];
+    \\    for (int i = 0; i < {[npt]}; ++i) {{
+    \\        state[i] = i_state[{[npt]} * dk + i];
+    \\    }}
+    \\
+    \\    // q, k, v, y: [L, HV, D]; g, beta: [L, HV].
+    \\    const device float* q_ = q + hv * {[d]};
+    \\    const device float* k_ = k + hv * {[d]};
+    \\    const device float* v_ = v + hv * {[d]};
+    \\    device float* y_ = y + hv * {[d]};
+    \\    const device float* g_ = g + hv;
+    \\    const device float* beta_ = beta + hv;
+    \\
+    \\    for (int t = 0; t < T; ++t) {{
+    \\        const float gh = g_[0];
+    \\        float kv = 0.0f;
+    \\        for (int i = 0; i < {[npt]}; ++i) {{
+    \\            const uint s_idx = {[npt]} * dk + i;
+    \\            state[i] = state[i] * gh;
+    \\            kv += state[i] * k_[s_idx];
+    \\        }}
+    \\        kv = metal::simd_sum(kv);
+    \\        const float delta = (v_[dv] - kv) * beta_[0];
+    \\        float out = 0.0f;
+    \\        for (int i = 0; i < {[npt]}; ++i) {{
+    \\            const uint s_idx = {[npt]} * dk + i;
+    \\            state[i] = state[i] + k_[s_idx] * delta;
+    \\            out += state[i] * q_[s_idx];
+    \\        }}
+    \\        out = metal::simd_sum(out);
+    \\        if (dk == 0) y_[dv] = out; // lane 0 of the simdgroup owns the write
+    \\        q_ += {[hvd]};
+    \\        k_ += {[hvd]};
+    \\        v_ += {[hvd]};
+    \\        y_ += {[hvd]};
+    \\        g_ += {[hv]};
+    \\        beta_ += {[hv]};
+    \\    }}
+    \\    for (int i = 0; i < {[npt]}; ++i) {{
+    \\        o_state[{[npt]} * dk + i] = state[i];
+    \\    }}
+    \\
+;
+
+const PrefillRecKernelKey = struct {
+    d: i32,
+    hv: i32,
+};
+
+const PrefillRecKernelEntry = struct {
+    key: PrefillRecKernelKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var prefill_rec_entries: [4]?PrefillRecKernelEntry = .{ null, null, null, null };
+var prefill_rec_warned = false;
+
+fn prefillRecWarn(err: anyerror) void {
+    if (!prefill_rec_warned) {
+        prefill_rec_warned = true;
+        std.log.warn("fused GDN prefill recurrence kernel unavailable ({s}); using eager per-step loop", .{@errorName(err)});
+    }
+}
+
+fn createPrefillRecKernel(allocator: std.mem.Allocator, key: PrefillRecKernelKey) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_rec_d{d}_h{d}", .{ key.d, key.hv }, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, prefill_rec_kernel_body, .{
+        .d = key.d,
+        .npt = @divExact(key.d, 32),
+        .hv = key.hv,
+        .hvd = key.hv * key.d,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "q", "k", "v", "g", "beta", "s_in", "T_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "y", "s_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+fn getPrefillRecKernel(allocator: std.mem.Allocator, key: PrefillRecKernelKey) ?c.c.mlx_fast_metal_kernel {
+    for (&prefill_rec_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createPrefillRecKernel(allocator, key) catch |err| {
+        prefillRecWarn(err);
+        return null;
+    };
+    for (&prefill_rec_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markPrefillRecBroken(key: PrefillRecKernelKey) void {
+    for (&prefill_rec_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+/// Single-kernel whole-sequence delta-rule recurrence. Returns null when the
+/// shape/dtype is unsupported or the kernel is unavailable (caller falls back
+/// to the eager per-step loop).
+fn deltaRulePrefillFused(
+    ctx: EagerContext,
+    ssm_state: Array, // [HV, D, D] f32
+    k_full: Array, // [L, HV, D] f32
+    v: Array, // [L, HV, D] f32
+    beta: Array, // [L, HV] f32
+    g: Array, // [L, HV] f32
+    q_full: Array, // [L, HV, D] f32
+    hv: i32,
+    d: i32,
+) !?PrefillRecurrenceOut {
+    if (@mod(d, 32) != 0 or d < 32) return null;
+    const L: i32 = @intCast(k_full.shape()[0]);
+    if (L < 1) return null;
+    const dt_f32 = dtype_mod.Dtype.float32;
+    if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
+        v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+
+    const key = PrefillRecKernelKey{ .d = d, .hv = hv };
+    const kernel = getPrefillRecKernel(ctx.allocator, key) orelse return null;
+
+    const t_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{L}, &[_]i32{1});
+    defer t_arr.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // mlx-lm layout: grid (32, Dv, Hv) threads, threadgroup (32, 4, 1).
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32, d, hv));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, hv, d }, 3, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d, d }, 3, c.c.MLX_FLOAT32));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ q_full, k_full, v, g, beta, ssm_state, t_arr }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markPrefillRecBroken(key);
+        prefillRecWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
+    return .{ .s_new = Array.fromHandle(s_handle), .y = Array.fromHandle(y_handle) };
+}
+
+/// Prefill recurrence dispatch: single Metal kernel over the whole sequence
+/// when eligible (D % 32 == 0, f32), otherwise the eager per-step loop.
+fn deltaRulePrefill(
+    ctx: EagerContext,
+    allocator: std.mem.Allocator,
+    ssm_state: Array,
+    k_full: Array,
+    v: Array,
+    beta: Array,
+    g: Array,
+    q_full: Array,
+    hv: i32,
+    d: i32,
+) !PrefillRecurrenceOut {
+    return (try deltaRulePrefillFused(ctx, ssm_state, k_full, v, beta, g, q_full, hv, d)) orelse
+        deltaRulePrefillEager(ctx, allocator, ssm_state, k_full, v, beta, g, q_full, hv, d);
+}
+
+/// Eager per-step delta-rule recurrence over a prefilled sequence (fallback
+/// for head dims the single kernel does not support, e.g. toy D < 32).
+/// k_full / q_full / v: [L, HV, D] f32; beta / g: [L, HV] f32; ssm_state:
+/// [HV, D, D] f32 (borrowed). Per step this runs the exact decode recurrence
 /// (deltaRuleFused when eligible, deltaRuleEager otherwise) on [HV, D]
 /// slices, then asyncEvals the new state so the recurrent lazy graph and its
 /// intermediates stay O(1) per step instead of accumulating over L.
-///
-/// Task-2 seam: this function is the only per-step loop left in prefill;
-/// swapping it for a single Metal kernel must not touch anything else.
 fn deltaRulePrefillEager(
     ctx: EagerContext,
     allocator: std.mem.Allocator,
@@ -1455,7 +1672,8 @@ pub const Qwen38GDN = struct {
     /// No evals inside: the caller (Qwen38ServingModel.forwardTokens) submits
     /// the updated cache states via asyncEval once per token and syncs on the
     /// final logits, so lazy graphs stay O(1) deep across tokens. prefill
-    /// applies the same barrier per recurrence step (deltaRulePrefillEager).
+    /// applies the same barrier per recurrence step in the eager fallback
+    /// (deltaRulePrefillEager); the fused recurrence kernel needs none.
     pub fn forward(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache) !Array {
         const res = try step(self.ctx, .{
             .x = x,
@@ -1497,9 +1715,11 @@ pub const Qwen38GDN = struct {
     /// Vectorized twin of the per-token decode path: one batched qmm per
     /// projection over the whole sequence, a whole-sequence causal conv
     /// (convAccumSeq), vectorized gates, and a vectorized out-gate + out_proj.
-    /// Only the delta-rule recurrence stays a per-step loop
-    /// (deltaRulePrefillEager — the Task-2 swap seam). Op-for-op math and
-    /// dtype round-trips match gdnTailEager; everything past the conv is f32
+    /// The delta-rule recurrence runs as one Metal kernel over the whole
+    /// sequence when the head dim allows (deltaRulePrefill →
+    /// deltaRulePrefillFused), falling back to a per-step eager loop
+    /// (deltaRulePrefillEager) otherwise. Op-for-op math and dtype
+    /// round-trips match gdnTailEager; everything past the conv is f32
     /// because the conv_state concat promotes, exactly as in decode.
     pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !Array {
         const ctx = self.ctx;
@@ -1594,9 +1814,9 @@ pub const Qwen38GDN = struct {
         const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
         defer k_full.deinit();
 
-        // 5. Delta-rule recurrence (per-step; Task 2 replaces this with a
-        // single Metal kernel over the sequence).
-        const rec = try deltaRulePrefillEager(ctx, allocator, cache.ssm_state, k_full, v, beta, g, q_full, HV, D);
+        // 5. Delta-rule recurrence over the whole sequence (single Metal
+        // kernel when eligible; per-step eager loop otherwise).
+        const rec = try deltaRulePrefill(ctx, allocator, cache.ssm_state, k_full, v, beta, g, q_full, HV, D);
         errdefer rec.s_new.deinit();
         defer rec.y.deinit(); // [L, HV, D] f32
 
@@ -2023,6 +2243,70 @@ test "Qwen38GDN fused conv+tail kernel matches eager conv chain + eager tail" {
         const exp_cs = try exp_conv.dataSlice(f32);
         try std.testing.expectEqual(exp_cs.len, got_cs.len);
         for (exp_cs, got_cs) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+}
+
+test "Qwen38GDN fused prefill recurrence kernel matches eager per-step loop" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Real model head dims; L values cross the eager loop's sync cadence (16).
+    const hv: i32 = 48;
+    const d: i32 = 128;
+    for ([_]i32{ 37, 64, 128 }) |L| {
+        const n_lhvd: usize = @intCast(L * hv * d);
+        const n_lhv: usize = @intCast(L * hv);
+        const n_state: usize = @intCast(hv * d * d);
+
+        const qkv_buf = try allocator.alloc(f32, 3 * n_lhvd);
+        defer allocator.free(qkv_buf);
+        testFill(qkv_buf);
+        const gb_buf = try allocator.alloc(f32, 2 * n_lhv);
+        defer allocator.free(gb_buf);
+        // Gates in (0, 1) like the real softplus-decay / sigmoid-beta path.
+        for (0..n_lhv) |i| {
+            gb_buf[i] = 0.5 + 0.04 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11)));
+            gb_buf[n_lhv + i] = 0.3 + 0.05 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 5 + 1, 9)));
+        }
+        const state_buf = try allocator.alloc(f32, n_state);
+        defer allocator.free(state_buf);
+        testFill(state_buf);
+
+        const q = try Array.fromData(allocator, f32, qkv_buf[0..n_lhvd], &[_]i32{ L, hv, d });
+        defer q.deinit();
+        const k = try Array.fromData(allocator, f32, qkv_buf[n_lhvd .. 2 * n_lhvd], &[_]i32{ L, hv, d });
+        defer k.deinit();
+        const v = try Array.fromData(allocator, f32, qkv_buf[2 * n_lhvd ..], &[_]i32{ L, hv, d });
+        defer v.deinit();
+        const g = try Array.fromData(allocator, f32, gb_buf[0..n_lhv], &[_]i32{ L, hv });
+        defer g.deinit();
+        const beta = try Array.fromData(allocator, f32, gb_buf[n_lhv..], &[_]i32{ L, hv });
+        defer beta.deinit();
+        const state = try Array.fromData(allocator, f32, state_buf, &[_]i32{ hv, d, d });
+        defer state.deinit();
+
+        const fused = (try deltaRulePrefillFused(ctx, state, k, v, beta, g, q, hv, d)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.s_new.deinit();
+        defer fused.y.deinit();
+        try fused.s_new.eval();
+        try fused.y.eval();
+
+        const eager = try deltaRulePrefillEager(ctx, allocator, state, k, v, beta, g, q, hv, d);
+        defer eager.s_new.deinit();
+        defer eager.y.deinit();
+        try eager.s_new.eval();
+        try eager.y.eval();
+
+        const got_y = try fused.y.dataSlice(f32);
+        const exp_y = try eager.y.dataSlice(f32);
+        try std.testing.expectEqual(exp_y.len, got_y.len);
+        for (exp_y, got_y) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        const got_s = try fused.s_new.dataSlice(f32);
+        const exp_s = try eager.s_new.dataSlice(f32);
+        try std.testing.expectEqual(exp_s.len, got_s.len);
+        for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
 }
 
