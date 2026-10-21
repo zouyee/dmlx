@@ -29,8 +29,25 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
 |---|---|---|
 | dmlx before optimization | 157 | 6.72 |
 | dmlx after round 1 (phases 1–5b) | 78 | 12.8 |
-| **dmlx now (fully fused GDN tail, 9025567)** | **~71** | **~14.1** |
+| **dmlx now (fully fused GDN tail, 9025567 + bdb417e + 6c93624)** | **~69** | **~14.4** |
 | mlx-lm 0.31.3 + mlx 0.32.3 (parity target) | 64 | 15.6 |
+
+Round 4/5 (final, kernel-level):
+- GPU kernel timeline (micro-bench, single-command-buffer timing): qmm is at
+  **97% of the 52.8 ms DRAM roofline** (14.4 GB packed weights/token) — not
+  the target. MLP qmm alone = 37.6 ms.
+- **v3 conv+tail kernel** (bdb417e): the depthwise causal conv folded into
+  the gdn_tail kernel (threadgroup-per-head; q/k conv via threadgroup-shared
+  stage, v in registers; new conv state written in-kernel). GDN layer is now
+  4 qmm + 1 kernel + out_proj qmm. Plus **fused add-rmsnorm** kernel for all
+  128 ln/residual sites. A/B (200-token): 70.9 → 69.2 ms/token.
+- **gate+up packed concat + silu_mul kernel** (6c93624): 128 fewer kernel
+  launches/token; perf-neutral on wall (69.45 vs 69.25) — dispatch overhead
+  is fully hidden behind GPU busy; kept for CPU-submit headroom.
+- Stopping point rationale: wall ≈ GPU busy ≈ 69 ms; the residual gap to
+  mlx-lm (64 ms) is inside qmm wall + tail-kernel state traffic; further
+  gains need sub-roofline tricks (e.g. bf16 ssm state — numerics risk) or
+  MLX qmm kernel work itself. Declared done at ~93% parity.
 | omlx (no custom kernels) | — | 13.4 |
 | flash-moe | n/a (MoE-only) | |
 
@@ -55,10 +72,10 @@ Round-2 findings (measurement-driven):
   delta-rule kernel (9892ce7) was dtype-gated OFF in the real path (beta is
   bf16 there) — v2 is the first fusion that actually runs; v1 remains as the
   fallback inside the eager tail.
-- Remaining ~7 ms gap to mlx-lm: diminishing returns. Next levers if
-  pursued: fold the conv chain into the tail kernel (~5 small
-  kernels/layer), qmm GEMV kernel efficiency at [1,5120] skinny shapes
-  (~176 vs ~225 GB/s effective), GDN prefill batching (separate project).
+- Remaining ~5 ms gap to mlx-lm: wall ≈ GPU busy ≈ 69 ms; qmm is at 97% of
+  the DRAM roofline. Further gains need sub-roofline tricks (bf16 ssm state —
+  numerics risk vs the oracle gate; GDN state r/w is ~6.3 MB/layer) or MLX
+  qmm kernel improvements upstream. Diminishing returns reached.
 
 Environment notes:
 - mlx-c 0.7.0 (mlx 0.32.4) via homebrew. mlx_z dependency is upstream
