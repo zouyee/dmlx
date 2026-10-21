@@ -23,31 +23,55 @@ Branch `glm53-mlx-support`, HEAD after Task 7: see `git log` (commits `fb826f1`.
 
 ## Measured performance (M4 Pro, 48 GB)
 
-**Decode, long-diagnostic (2026-10-21, after perf phases 1–5b):**
+**Decode, long-diagnostic (2026-10-21, after round 2):**
 
-| Engine | tok/s |
-|---|---|
-| dmlx before optimization | 6.72 |
-| **dmlx now (profiler A/B mean)** | **12.8** |
-| mlx-lm 0.31.3 + mlx 0.32.3 (parity target) | 15.6 |
-| omlx (no custom kernels) | 13.4 |
-| flash-moe | n/a (MoE-only) |
+| Engine | ms/token | tok/s |
+|---|---|---|
+| dmlx before optimization | 157 | 6.72 |
+| dmlx after round 1 (phases 1–5b) | 78 | 12.8 |
+| **dmlx now (fused GDN kernel, 9892ce7)** | **~72** | **~13.9** |
+| mlx-lm 0.31.3 + mlx 0.32.3 (parity target) | 64 | 15.6 |
+| omlx (no custom kernels) | — | 13.4 |
+| flash-moe | n/a (MoE-only) | |
 
-Phases: single eval barrier/token (5940174), embedding dequant-once (2f89b63),
-slab KV cache + native GQA SDPA (f748a02), GDN op-count cuts (88c6def),
-persistent layer modules (43abe0d, perf-neutral cleanup), mx.compile of the
-GDN step + SwiGLU core (863dee6) + attention pre-cache segment with
-ropeDynamic offset (fe04c3e). Root cause was CPU dispatch-bound:
-~3900 mlx-c calls/token at ~18 µs each; compiled closures cut the graph
-count but the remaining ~60 ms/token CPU sits in eager attention/norm
-remnants and closure-apply overhead. Next lever (not done): whole-step
-mega-closure (all layer weights as inputs, one apply per token) or a fused
-custom Metal GDN kernel via the existing custom_kernel.zig binding.
+Round-1 phases: single eval barrier/token (5940174), embedding dequant-once
+(2f89b63), slab KV cache + native GQA SDPA (f748a02), GDN op-count cuts
+(88c6def), persistent layer modules (43abe0d, perf-neutral), mx.compile of
+GDN step + SwiGLU core (863dee6) + attention pre-cache segment (fe04c3e).
+
+Round-2 findings (measurement-driven):
+- Stage 0 attribution: closure applies are only ~2.4 ms/token; the 63 ms
+  "CPU" inside asyncEval is **GPU back-pressure** — MLX's scheduler blocks
+  after 10 in-flight command buffers (`wait_for_one`), so wall ≈ GPU-bound
+  at ~176 GB/s effective (roofline 273 GB/s). Eval-structure A/Bs and
+  mlx 0.31→0.32.4 upgrade: no effect.
+- DeepInfer (../DeepInfer) investigated: CUDA SM100/Ascend-only, no GDN, no
+  int4 GEMV — nothing borrowable.
+- **Fused custom Metal kernel for the GDN delta-rule step** (9892ce7):
+  state [48,128,128] read+written once per layer instead of ~8 passes
+  (~2.4 GB → ~0.3 GB/token), one threadgroup per head, row-per-thread in
+  registers; lives inside the compiled GDN closure, eager fallback kept.
+- Remaining ~8 ms gap to mlx-lm: likely their fused `gated_delta_update`
+  covers more of the GDN tail (gates/norms) and qmm kernel tuning; the
+  profiler's `buildsplit` mode can quantify. Next levers if pursued:
+  extend the fused kernel to the whole GDN tail (gates + out-gate-norm),
+  qmm GEMV kernel investigation.
+
+Environment notes:
+- mlx-c upgraded to 0.7.0 (mlx 0.32.4) via homebrew. mlx_z is now VENDORED
+  at `third_party/mlx_z` (build.zig.zon path dep) with 3 compat patches vs
+  upstream v0.0.2 (SDPA force_fused arg; cumsum/cumprod axis signatures;
+  upstream tarball hash changed after tag re-release — fresh checkouts must
+  use the vendored copy).
+- `zig build test` silently used a stale binary for a while (2>/dev/null
+  hid compile failures after the mlx-c upgrade); always verify by running
+  the newest test binary directly and checking the count.
 
 Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen38.sh`
 (Paris + 7-prompt E2E + median/decode tok/s). Profiler harness:
 `zig build run-qwen38-profile -Doptimize=ReleaseFast -- --mode both --decode 50`
-(src/test_qwen38_profile.zig; buildsplit shows CPU-build vs GPU-wait).
+(src/test_qwen38_profile.zig; buildsplit shows CPU-build vs GPU-wait;
+`DMLX_PROF_APPLY=1` adds apply/eval breakdown).
 
 - CLI: model load + 32 tokens in ~15 s total.
 - Prefill ~13 tokens in <1 s (GDN prefill loop is still per-token; not yet optimized).
