@@ -26,6 +26,243 @@ const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const QuantConfig = quantize_mod.QuantConfig;
 const Closure = closure_mod.Closure;
+const dtype_mod = @import("mlx").dtype;
+
+// ============================================================
+// Fused Metal kernel for the gated delta-rule state update
+// ============================================================
+//
+// One threadgroup per value head, D threads per group; thread t owns state
+// row dv=t in registers (float4 chunks). Reads the [HV, D, D] f32 state once
+// and writes it once, replacing ~8 elementwise/reduction passes. The kernel
+// source body is generated per head-dim D (register array must be a Metal
+// compile-time size); mlx auto-generates the function signature from the
+// input/output names, so `source` is the body only. Enabled for f32 tensors
+// with D % 4 == 0 and D <= 128; anything else falls back to the eager chain.
+
+const fused_kernel_body =
+    \\    const uint dv = thread_position_in_grid.x;
+    \\    const uint h = thread_position_in_grid.y;
+    \\    const device metal::float4* srow_in = (const device metal::float4*)(s_in + (h * {[d]} + dv) * {[d]});
+    \\    device metal::float4* srow_out = (device metal::float4*)(s_out + (h * {[d]} + dv) * {[d]});
+    \\    const device metal::float4* k4 = (const device metal::float4*)(k + h * {[d]});
+    \\    const device metal::float4* q4 = (const device metal::float4*)(q + h * {[d]});
+    \\    const float gh = g[h];
+    \\    metal::float4 row[{[df4]}];
+    \\    float kv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        metal::float4 s = srow_in[i] * gh;
+    \\        row[i] = s;
+    \\        kv += metal::dot(s, k4[i]);
+    \\    }}
+    \\    const float d = (v[h * {[d]} + dv] - kv) * beta[h];
+    \\    float yv = 0.0f;
+    \\    for (int i = 0; i < {[df4]}; ++i) {{
+    \\        metal::float4 s = row[i] + k4[i] * d;
+    \\        srow_out[i] = s;
+    \\        yv += metal::dot(s, q4[i]);
+    \\    }}
+    \\    y[h * {[d]} + dv] = yv;
+    \\
+;
+
+const FusedKernelEntry = struct {
+    d: i32,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+// Lazy-init registry. Not synchronized: decode serving is serial
+// (vtable_serial) and the test runner is single-threaded.
+var fused_entries: [4]?FusedKernelEntry = .{ null, null, null, null };
+var fused_gpu_stream: ?c.c.mlx_stream = null;
+var fused_warned = false;
+
+/// Default GPU stream, shared by every fused apply. Kernel work must land on
+/// a GPU stream even when the caller's EagerContext targets the CPU (unit
+/// tests); the default stream handle is process-lifetime and never freed.
+fn fusedStream() c.c.mlx_stream {
+    if (fused_gpu_stream == null) {
+        fused_gpu_stream = c.c.mlx_default_gpu_stream_new();
+    }
+    return fused_gpu_stream.?;
+}
+
+fn fusedWarn(err: anyerror) void {
+    if (!fused_warned) {
+        fused_warned = true;
+        std.log.warn("fused GDN delta-rule kernel unavailable ({s}); using eager op chain", .{@errorName(err)});
+    }
+}
+
+fn makeStringVec(allocator: std.mem.Allocator, names: []const []const u8) !c.c.mlx_vector_string {
+    const vec = c.c.mlx_vector_string_new();
+    errdefer _ = c.c.mlx_vector_string_free(vec);
+    for (names) |n| {
+        const n_z = try allocator.dupeZ(u8, n);
+        defer allocator.free(n_z);
+        try c.check(c.c.mlx_vector_string_append_value(vec, n_z.ptr));
+    }
+    return vec;
+}
+
+fn createFusedKernel(allocator: std.mem.Allocator, d: i32) !c.c.mlx_fast_metal_kernel {
+    const df4 = @divExact(d, 4);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_delta_d{d}", .{d}, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, fused_kernel_body, .{ .d = d, .df4 = df4 }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "q", "k", "v", "g", "beta", "s_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "y", "s_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    // The Zig binding in mlx-zig predates the mlx-c 0.7.0 signature (it lacks
+    // output_names / ensure_row_contiguous), so call the C API directly.
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false, // atomic_outputs
+    );
+}
+
+/// Fetch (or lazily build) the fused kernel for head-dim d. Returns null when
+/// the kernel is known-broken so callers fall back to the eager chain.
+fn getFusedKernel(allocator: std.mem.Allocator, d: i32) ?c.c.mlx_fast_metal_kernel {
+    for (&fused_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (e.d == d) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createFusedKernel(allocator, d) catch |err| {
+        fusedWarn(err);
+        return null;
+    };
+    for (&fused_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .d = d, .kernel = kernel };
+            return kernel;
+        }
+    }
+    // Registry full (more than 4 distinct head dims in one process): leak the
+    // handle rather than evict a live kernel; the eager chain stays correct.
+    return null;
+}
+
+fn markFusedBroken(d: i32) void {
+    for (&fused_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (e.d == d) e.broken = true;
+        }
+    }
+}
+
+const DeltaRuleOut = struct {
+    s_new: Array, // [HV, D, D] f32
+    y_f32: Array, // [HV, D] f32
+};
+
+/// Fused single-kernel delta rule. Returns null when the shape/dtype is
+/// unsupported or the kernel is unavailable (caller falls back to eager).
+fn deltaRuleFused(
+    ctx: EagerContext,
+    ssm_state: Array,
+    k_full: Array,
+    v: Array,
+    beta: Array,
+    g: Array,
+    q_full: Array,
+    hv: i32,
+    d: i32,
+) !?DeltaRuleOut {
+    if (@mod(d, 4) != 0 or d < 4 or d > 128) return null;
+    const dt_f32 = dtype_mod.Dtype.float32;
+    if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
+        v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+
+    const kernel = getFusedKernel(ctx.allocator, d) orelse return null;
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // Grid is in threads: D threads per head-row owner, HV groups on y.
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, hv, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d }, 2, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d, d }, 3, c.c.MLX_FLOAT32));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ q_full, k_full, v, g, beta, ssm_state }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markFusedBroken(d);
+        fusedWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
+    return .{ .s_new = Array.fromHandle(s_handle), .y_f32 = Array.fromHandle(y_handle) };
+}
+
+/// Eager op-chain delta rule (reference implementation and fallback).
+fn deltaRuleEager(
+    ctx: EagerContext,
+    ssm_state: Array,
+    k_full: Array,
+    v: Array,
+    beta: Array,
+    g: Array,
+    q_full: Array,
+    hv: i32,
+    d: i32,
+) !DeltaRuleOut {
+    const g_decay = try ops.reshape(ctx, g, &[_]i32{ hv, 1, 1 });
+    defer g_decay.deinit();
+    const s_decayed = try ops.multiply(ctx, ssm_state, g_decay);
+    defer s_decayed.deinit();
+
+    const k_b = try ops.reshape(ctx, k_full, &[_]i32{ hv, 1, d });
+    defer k_b.deinit();
+    const sk = try ops.multiply(ctx, s_decayed, k_b);
+    defer sk.deinit();
+    const kv_mem = try reduce_mod.sumAxis(ctx, sk, -1, false); // [HV, Dv]
+    defer kv_mem.deinit();
+
+    const v_sub = try ops.subtract(ctx, v, kv_mem);
+    defer v_sub.deinit();
+    const beta_b = try ops.reshape(ctx, beta, &[_]i32{ hv, 1 });
+    defer beta_b.deinit();
+    const delta = try ops.multiply(ctx, v_sub, beta_b); // [HV, Dv]
+    defer delta.deinit();
+
+    const delta_b = try ops.expandDims(ctx, delta, -1); // [HV, Dv, 1]
+    defer delta_b.deinit();
+    const k_delta = try ops.multiply(ctx, k_b, delta_b);
+    defer k_delta.deinit();
+    const s_new = try ops.add(ctx, s_decayed, k_delta);
+    errdefer s_new.deinit();
+
+    const q_b2 = try ops.reshape(ctx, q_full, &[_]i32{ hv, 1, d });
+    defer q_b2.deinit();
+    const sq = try ops.multiply(ctx, s_new, q_b2);
+    defer sq.deinit();
+    const y_f32 = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv] f32
+    return .{ .s_new = s_new, .y_f32 = y_f32 };
+}
 
 pub const Qwen38GdnCache = struct {
     conv_state: Array, // [conv_kernel-1, qkv_dim]
@@ -296,41 +533,15 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     const k_full = try shape_mod.takeAxis(ctx, k, w.qk_idx, 0); // [HV, D]
     defer k_full.deinit();
 
-    // 5. gated delta rule step. State S [Hv, Dv, Dk].
-    const g_decay = try ops.reshape(ctx, g, &[_]i32{ HV, 1, 1 });
-    defer g_decay.deinit();
-    const s_decayed = try ops.multiply(ctx, w.ssm_state, g_decay);
-    defer s_decayed.deinit();
-
-    const k_b = try ops.reshape(ctx, k_full, &[_]i32{ HV, 1, D });
-    defer k_b.deinit();
-    const sk = try ops.multiply(ctx, s_decayed, k_b);
-    defer sk.deinit();
-    const kv_mem = try reduce_mod.sumAxis(ctx, sk, -1, false); // [HV, Dv]
-    defer kv_mem.deinit();
-
-    const v_sub = try ops.subtract(ctx, v, kv_mem);
-    defer v_sub.deinit();
-    const beta_b = try ops.reshape(ctx, beta, &[_]i32{ HV, 1 });
-    defer beta_b.deinit();
-    const delta = try ops.multiply(ctx, v_sub, beta_b); // [HV, Dv]
-    defer delta.deinit();
-
-    const delta_b = try ops.expandDims(ctx, delta, -1); // [HV, Dv, 1]
-    defer delta_b.deinit();
-    const k_delta = try ops.multiply(ctx, k_b, delta_b);
-    defer k_delta.deinit();
-    const s_new = try ops.add(ctx, s_decayed, k_delta);
-    errdefer s_new.deinit();
-
-    const q_b2 = try ops.reshape(ctx, q_full, &[_]i32{ HV, 1, D });
-    defer q_b2.deinit();
-    const sq = try ops.multiply(ctx, s_new, q_b2);
-    defer sq.deinit();
-    const y_f32 = try reduce_mod.sumAxis(ctx, sq, -1, false); // [HV, Dv] f32
-    defer y_f32.deinit();
+    // 5. gated delta rule step. State S [Hv, Dv, Dk]. Fused Metal kernel when
+    // supported (one state read + one write), eager op chain otherwise.
+    const dr = (try deltaRuleFused(ctx, w.ssm_state, k_full, v, beta, g, q_full, HV, D)) orelse
+        (try deltaRuleEager(ctx, w.ssm_state, k_full, v, beta, g, q_full, HV, D));
+    errdefer dr.s_new.deinit();
+    defer dr.y_f32.deinit();
+    const s_new = dr.s_new;
     // gated_delta_update returns y.astype(q.dtype): round before the norm.
-    const y = try ops.astype(ctx, y_f32, qkv.dtype());
+    const y = try ops.astype(ctx, dr.y_f32, qkv.dtype());
     defer y.deinit();
 
     // 6. gated RMSNorm: norm in f32, gate in f32, round to input dtype.
@@ -723,6 +934,59 @@ test "Qwen38GDN.step: numpy reference cross-check" {
     try std.testing.expectEqual(@as(usize, 96), got_state.len);
     for (expected_state, got_state) |e, o| {
         try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+}
+
+test "Qwen38GDN fused delta-rule kernel matches eager chain" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const Case = struct { hv: i32, d: i32 };
+    for ([_]Case{ .{ .hv = 6, .d = 4 }, .{ .hv = 48, .d = 128 } }) |cs| {
+        const state = try makeTestWeight(allocator, &[_]i32{ cs.hv, cs.d, cs.d });
+        defer state.deinit();
+        const q = try makeTestWeight(allocator, &[_]i32{ cs.hv, cs.d });
+        defer q.deinit();
+        const k = try makeTestWeight(allocator, &[_]i32{ cs.hv, cs.d });
+        defer k.deinit();
+        const v = try makeTestWeight(allocator, &[_]i32{ cs.hv, cs.d });
+        defer v.deinit();
+
+        // Gates in (0, 1) like the real softplus-decay / sigmoid-beta path.
+        const n_hv: usize = @intCast(cs.hv);
+        var gbuf: [48]f32 = undefined;
+        var bbuf: [48]f32 = undefined;
+        for (0..n_hv) |i| {
+            gbuf[i] = 0.5 + 0.04 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11)));
+            bbuf[i] = 0.3 + 0.05 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 5 + 1, 9)));
+        }
+        const g = try Array.fromData(allocator, f32, gbuf[0..n_hv], &[_]i32{cs.hv});
+        defer g.deinit();
+        const beta = try Array.fromData(allocator, f32, bbuf[0..n_hv], &[_]i32{cs.hv});
+        defer beta.deinit();
+
+        const fused = (try deltaRuleFused(ctx, state, k, v, beta, g, q, cs.hv, cs.d)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.s_new.deinit();
+        defer fused.y_f32.deinit();
+        try fused.s_new.eval();
+        try fused.y_f32.eval();
+
+        const eager = try deltaRuleEager(ctx, state, k, v, beta, g, q, cs.hv, cs.d);
+        defer eager.s_new.deinit();
+        defer eager.y_f32.deinit();
+        try eager.s_new.eval();
+        try eager.y_f32.eval();
+
+        const got_s = try fused.s_new.dataSlice(f32);
+        const exp_s = try eager.s_new.dataSlice(f32);
+        try std.testing.expectEqual(exp_s.len, got_s.len);
+        for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        const got_y = try fused.y_f32.dataSlice(f32);
+        const exp_y = try eager.y_f32.dataSlice(f32);
+        try std.testing.expectEqual(exp_y.len, got_y.len);
+        for (exp_y, got_y) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
 }
 
