@@ -18,6 +18,18 @@
 /// Sub-breakdown of GDN/attn internals requires the temporary
 /// instrumentation in qwen38_gdn.zig / qwen38_attn.zig (DMLX_PROF_SUB=1).
 ///
+/// Env-gated apply-level timing: with DMLX_PROF_APPLY=1 the baseline mode
+/// additionally runs an instrumented replica of the forwardTokens decode
+/// step (same op sequence, compiled closures active, no intermediate
+/// barriers) that accumulates per token:
+///   - GDN closure apply x48 (input vector build + mlx_closure_apply + state swap)
+///   - MLP swiglu closure apply x64
+///   - attn pre-cache closure apply x16
+///   - attn post-cache eager ops (KV append + SDPA + o_proj) x16
+///   - other eager ops (embed, ln/residual clusters, final norm + lm_head)
+///   - barrier split: asyncEval cache-state submit (CPU dispatch) vs
+///     logits.eval (GPU wait)
+///
 /// Usage:
 ///   zig build run-qwen38-profile -Doptimize=ReleaseFast -- \
 ///       [--model-dir DIR] [--prefill N] [--decode N] [--mode baseline|breakdown|both]
@@ -334,6 +346,211 @@ fn forwardStepBuildSplit(model: *qwen38.Qwen38ServingModel, id: u32, build_ns: *
     return logits;
 }
 
+/// Per-token apply-level accumulators for the DMLX_PROF_APPLY=1 mode.
+const ApplyAccum = struct {
+    gdn_ns: u64 = 0, // 48 compiled GDN step applies (vector build + apply + swap)
+    gdn_n: u64 = 0,
+    mlp_ns: u64 = 0, // 64 compiled SwiGLU applies
+    mlp_n: u64 = 0,
+    attn_pre_ns: u64 = 0, // 16 compiled attn pre-cache applies
+    attn_pre_n: u64 = 0,
+    attn_post_ns: u64 = 0, // 16 eager attn post-cache segments (KV append + SDPA + o_proj)
+    eager_ns: u64 = 0, // embed + ln/residual clusters + final norm + lm_head
+    barrier_ns: u64 = 0, // asyncEval(cache states) submit (CPU dispatch)
+    eval_ns: u64 = 0, // logits.eval (GPU wait after submit)
+    tokens: u64 = 0,
+
+    fn ms(ns: u64) f64 {
+        return @as(f64, @floatFromInt(ns)) / 1e6;
+    }
+
+    fn report(self: *const ApplyAccum, wall_ns: u64) void {
+        const per = @as(f64, @floatFromInt(@max(self.tokens, 1)));
+        const wall = ms(wall_ns) / per;
+        const applies = ms(self.gdn_ns + self.mlp_ns + self.attn_pre_ns) / per;
+        const eager = ms(self.attn_post_ns + self.eager_ns) / per;
+        std.debug.print("\n=== apply-level (DMLX_PROF_APPLY): {d} decode tokens, wall {d:.2} ms/token ===\n", .{ self.tokens, wall });
+        const rows = .{
+            .{ "GDN closure apply x48", self.gdn_ns, self.gdn_n },
+            .{ "MLP closure apply x64", self.mlp_ns, self.mlp_n },
+            .{ "attn pre-cache apply x16", self.attn_pre_ns, self.attn_pre_n },
+            .{ "attn post-cache eager x16", self.attn_post_ns, @as(u64, 0) },
+            .{ "eager (embed/ln/residual/head)", self.eager_ns, @as(u64, 0) },
+            .{ "barrier submit (asyncEval states)", self.barrier_ns, @as(u64, 0) },
+            .{ "logits.eval (GPU wait)", self.eval_ns, @as(u64, 0) },
+        };
+        inline for (rows) |r| {
+            const ns = r[1];
+            std.debug.print("  {s: <38} {d: >7.3} ms/tok  {d: >5.1}% of wall\n", .{ r[0], ms(ns) / per, 100.0 * @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(@max(wall_ns, 1))) });
+            if (r[2] > 0) {
+                const n = r[2];
+                std.debug.print("     -> {d:.4} ms/apply ({d} applies/token)\n", .{ ms(ns) / per / @as(f64, @floatFromInt(@max(n / @max(self.tokens, 1), 1))), n / @max(self.tokens, 1) });
+            }
+        }
+        std.debug.print("  applies total (GDN+MLP+attn-pre):   {d:.3} ms/tok ({d:.1}% of wall)\n", .{ applies, 100.0 * applies / wall });
+        std.debug.print("  eager remnants total:               {d:.3} ms/tok ({d:.1}% of wall)\n", .{ eager, 100.0 * eager / wall });
+    }
+};
+
+/// Instrumented replica of the forwardTokens L=1 decode step (compiled
+/// closures active, no intermediate barriers) that times each compiled
+/// closure apply against the surrounding eager dispatch. Wall-identical op
+/// sequence to forwardStepBuildSplit plus the attn pre-cache segment.
+fn forwardStepApplyProf(model: *qwen38.Qwen38ServingModel, id: u32, acc: *ApplyAccum) !Array {
+    const allocator = model.allocator;
+    const cfg = model.cfg;
+    const ctx = model.ctx;
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    var t = Lap.start();
+
+    const id_arr = try Array.fromData(allocator, i32, &[_]i32{@intCast(id)}, &[_]i32{1});
+    defer id_arr.deinit();
+    const rows = try shape_mod.takeAxis(ctx, model.embed_table_bf16.?, id_arr, 0);
+    defer rows.deinit();
+    const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, 1, hidden });
+    defer emb.deinit();
+    var h = try ops.copy(ctx, emb);
+    defer h.deinit();
+    acc.eager_ns += t.lap();
+
+    for (model.layers, 0..) |*lp, layer| {
+        // --- ln1 (eager) ---
+        t.reset();
+        const normed1 = blk: {
+            const h_f32 = try ops.astype(ctx, h, .float32);
+            defer h_f32.deinit();
+            const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln1_f32, cfg.rms_norm_eps);
+            defer n_f32.deinit();
+            break :blk try ops.astype(ctx, n_f32, .bfloat16);
+        };
+        defer normed1.deinit();
+        acc.eager_ns += t.lap();
+
+        // --- attention sub-block branch ---
+        const attn_out = switch (lp.module) {
+            .gdn => |*g| blk: {
+                const cache = &model.caches[layer].gdn;
+                t.reset();
+                const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
+                defer step_in.deinit();
+                acc.eager_ns += t.lap();
+                if (model.gdn_step_compiled) |cc| {
+                    t.reset();
+                    const step_out = try model.applyGdnStep(cc, g, cache, step_in);
+                    acc.gdn_ns += t.lap();
+                    acc.gdn_n += 1;
+                    defer step_out.deinit();
+                    t.reset();
+                    const r = try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
+                    acc.eager_ns += t.lap();
+                    break :blk r;
+                }
+                t.reset();
+                const step_out = try g.forward(step_in, cache);
+                acc.eager_ns += t.lap();
+                defer step_out.deinit();
+                break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
+            },
+            .attn => |*a| blk: {
+                const cache = &model.caches[layer].attn;
+                if (model.attn_precache_compiled) |ac| {
+                    t.reset();
+                    const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
+                    defer step_in.deinit();
+                    acc.eager_ns += t.lap();
+                    t.reset();
+                    var pre = try model.applyAttnPreCache(ac, a, cache, step_in);
+                    acc.attn_pre_ns += t.lap();
+                    acc.attn_pre_n += 1;
+                    defer pre.deinit();
+                    t.reset();
+                    const out2d = try a.postCache(pre, cache);
+                    defer out2d.deinit();
+                    const r = try ops.reshape(ctx, out2d, &[_]i32{ 1, 1, hidden });
+                    acc.attn_post_ns += t.lap();
+                    break :blk r;
+                }
+                t.reset();
+                const r = try a.forward(normed1, cache);
+                acc.eager_ns += t.lap();
+                break :blk r;
+            },
+        };
+        defer attn_out.deinit();
+
+        // --- residual + ln2 (eager) ---
+        t.reset();
+        {
+            const next = try ops.add(ctx, h, attn_out);
+            h.deinit();
+            h = next;
+        }
+        const normed2 = blk: {
+            const h_f32 = try ops.astype(ctx, h, .float32);
+            defer h_f32.deinit();
+            const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln2_f32, cfg.rms_norm_eps);
+            defer n_f32.deinit();
+            break :blk try ops.astype(ctx, n_f32, .bfloat16);
+        };
+        defer normed2.deinit();
+        acc.eager_ns += t.lap();
+
+        // --- MLP ---
+        if (model.mlp_swiglu_compiled) |mc| {
+            t.reset();
+            const mlp_out = try qwen38.applyMlpSwiglu(allocator, mc, lp, normed2);
+            acc.mlp_ns += t.lap();
+            acc.mlp_n += 1;
+            defer mlp_out.deinit();
+            t.reset();
+            const next = try ops.add(ctx, h, mlp_out);
+            h.deinit();
+            h = next;
+            acc.eager_ns += t.lap();
+            continue;
+        }
+        t.reset();
+        const mlp_out = blk: {
+            const gate = try lp.mlp_gate.apply(ctx, normed2);
+            defer gate.deinit();
+            const up = try lp.mlp_up.apply(ctx, normed2);
+            defer up.deinit();
+            const act = try activations.silu(ctx, gate);
+            defer act.deinit();
+            const hh = try ops.multiply(ctx, act, up);
+            defer hh.deinit();
+            break :blk try lp.mlp_down.apply(ctx, hh);
+        };
+        defer mlp_out.deinit();
+        {
+            const next = try ops.add(ctx, h, mlp_out);
+            h.deinit();
+            h = next;
+        }
+        acc.eager_ns += t.lap();
+    }
+
+    // --- final norm + lm_head (eager) ---
+    t.reset();
+    const h_f32 = try ops.astype(ctx, h, .float32);
+    defer h_f32.deinit();
+    const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, model.final_norm_f32.?, cfg.rms_norm_eps);
+    defer hidden_final_f32.deinit();
+    const hidden_final = try ops.astype(ctx, hidden_final_f32, .bfloat16);
+    defer hidden_final.deinit();
+    const logits = try model.lm_head.?.apply(ctx, hidden_final);
+    acc.eager_ns += t.lap();
+
+    // --- barrier ---
+    t.reset();
+    try asyncEvalCacheStates(model);
+    acc.barrier_ns += t.lap();
+    t.reset();
+    try logits.eval();
+    acc.eval_ns += t.lap();
+    return logits;
+}
+
 fn sampleGreedy(ctx: EagerContext, logits: Array) !u32 {
     const sh = logits.shape();
     const vocab: usize = @intCast(sh[sh.len - 1]);
@@ -495,6 +712,31 @@ pub fn main(init: std.process.Init) !void {
             @as(f64, @floatFromInt(total_ns)) / 1e6 / @as(f64, @floatFromInt(n_decode)),
             1e9 * @as(f64, @floatFromInt(n_decode)) / @as(f64, @floatFromInt(total_ns)),
         });
+    }
+
+    // ================= apply-level timing (DMLX_PROF_APPLY=1) =================
+    if (std.c.getenv("DMLX_PROF_APPLY")) |v| {
+        if (v[0] != 0 and v[0] != '0') {
+            var logits = try model.forwardTokens(prompt.items); // prefill (resets state)
+            var next = try sampleGreedy(ctx, logits);
+            logits.deinit();
+            var acc = ApplyAccum{};
+            for (0..3) |_| { // warmup (also primes the compiled closures)
+                logits = try forwardStepApplyProf(&model, next, &acc);
+                next = try sampleGreedy(ctx, logits);
+                logits.deinit();
+            }
+            acc = .{};
+            var wall = Lap.start();
+            var i: usize = 0;
+            while (i < n_decode) : (i += 1) {
+                logits = try forwardStepApplyProf(&model, next, &acc);
+                acc.tokens += 1;
+                next = try sampleGreedy(ctx, logits);
+                logits.deinit();
+            }
+            acc.report(wall.read());
+        }
     }
 
     // ================= breakdown: instrumented step =================
