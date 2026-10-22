@@ -104,6 +104,22 @@ Round-2 findings (measurement-driven):
   the DRAM roofline. Further gains need sub-roofline tricks (bf16 ssm state —
   numerics risk vs the oracle gate; GDN state r/w is ~6.3 MB/layer) or MLX
   qmm kernel improvements upstream. Diminishing returns reached.
+- **Decode SDPA port (9c9c166 + follow-up commit)**: omlx's
+  `omlx_sdpa_decode` (mlx PR #4294) ported as the decode-path SDPA in
+  `qwen38_attn.postCache`: 1-pass kernel (one 1024-thread group per q-head,
+  KV striped over 32 simdgroups in 4-key tiles, fp32 online softmax,
+  vectorized bf16 loads) plus the 2-pass split-KV variant for kv_len ≥ 1024
+  (pass 1: grid (HKV,1,blocks) × (32,gqa,1) threads, ~256-key chunks, fp32
+  partials + per-block max/sum; pass 2: LSE merge per q-head; block count is
+  a runtime scalar so no per-length recompile). Gated to qL=1/bf16/D%32==0/
+  contiguous slabs, stock SDPA fallback otherwise; `DMLX_NO_SDPA_DECODE=1`
+  disables. Measured: barrier-isolated stock SDPA ≈ 2.7 ms/token at kv~300,
+  but interleaved A/B shows **no wall gain** — ~71.4 vs ~71.3 ms/token at
+  kv~300 and ~69.2 vs ~68.9 at kv~4100 (±4 ms run variance). The decode step
+  is bound by the 14 GB weight read; SDPA traffic (≤25 MB/token even at 4k
+  context) is irrelevant. Kept for correctness-validated parity with omlx
+  and as the vehicle for any future long-context work, but it does NOT move
+  decode. (Two-pass verified vs stock SDPA at kv_len 1025/2048/4097, 5e-3.)
 
 Environment notes:
 - mlx-c 0.7.0 (mlx 0.32.4) via homebrew. mlx_z dependency is upstream
