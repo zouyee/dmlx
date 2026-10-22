@@ -235,7 +235,7 @@ pub fn gdnBranch(
 
     const n = x.shape()[1];
     if (n > 1) {
-        return gdn.prefill(allocator, x, cache);
+        return gdn.prefill(allocator, x, cache, true);
     }
     const step_in = try ops.reshape(ctx, x, &[_]i32{ 1, hidden });
     defer step_in.deinit();
@@ -1760,9 +1760,14 @@ pub const Qwen38ServingModel = struct {
         // values), so `normed1` for the next iteration is carried across.
         var normed1_carry: ?Array = null;
         defer if (normed1_carry) |*nc| nc.deinit();
+        var gdn_seen: usize = 0;
 
         for (self.layers, 0..) |*lp, layer| {
             // Attention sub-block (mirrors Qwen38Model.forward).
+            // Prefill sync cadence: sync every 8th GDN layer (and on the
+            // final layer) to bound peak memory without paying a pipeline
+            // drain per layer.
+            gdn_seen += if (lp.module == .gdn) 1 else 0;
             const normed1 = if (normed1_carry) |nc| blk: {
                 normed1_carry = null;
                 break :blk nc;
@@ -1772,7 +1777,7 @@ pub const Qwen38ServingModel = struct {
                 .gdn => |*g| blk: {
                     const cache = &self.caches[layer].gdn;
                     const n = normed1.shape()[1];
-                    if (n > 1) break :blk try g.prefill(allocator, normed1, cache);
+                    if (n > 1) break :blk try g.prefill(allocator, normed1, cache, gdn_seen % 8 == 0 or layer + 1 == self.layers.len);
                     const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
                     defer step_in.deinit();
                     if (self.gdn_step_compiled) |cc| {

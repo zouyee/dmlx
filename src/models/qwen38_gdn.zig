@@ -1721,7 +1721,7 @@ pub const Qwen38GDN = struct {
     /// (deltaRulePrefillEager) otherwise. Op-for-op math and dtype
     /// round-trips match gdnTailEager; everything past the conv is f32
     /// because the conv_state concat promotes, exactly as in decode.
-    pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !Array {
+    pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache, sync: bool) !Array {
         const ctx = self.ctx;
         const L: i32 = @intCast(x.shape()[1]);
         const HV: i32 = @intCast(self.num_value_heads);
@@ -1844,12 +1844,12 @@ pub const Qwen38GDN = struct {
         const out = try linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
         errdefer out.deinit();
 
-        // 7. Single cache swap at the end. Sync on the layer output so this
-        // layer's whole prefill graph (projections, conv, stacked ys) is
-        // flushed and freed before the next layer builds on top — the
-        // serving loop's only barrier is on the final logits, after ALL
-        // layers, which would otherwise pin every layer's intermediates.
-        try out.eval();
+        // 7. Single cache swap at the end. `sync` (serving loop: every few
+        // layers) bounds peak memory: without any barrier the whole
+        // forward's prefill graphs stay live until the final logits sync
+        // (~+12 GB at L=4096); syncing every layer costs ~5% wall in lost
+        // CPU/GPU overlap.
+        if (sync) try out.eval();
         try eval_mod.asyncEval(allocator, &[_]Array{ new_conv_state, rec.s_new });
         cache.conv_state.deinit();
         cache.conv_state = new_conv_state;
@@ -2333,7 +2333,7 @@ test "Qwen38GDN.prefill: per-token loop equivalence" {
         const x = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, L, hidden });
         defer x.deinit();
 
-        const out = try g.prefill(allocator, x, &cache);
+        const out = try g.prefill(allocator, x, &cache, true);
         defer out.deinit();
         const oshape = out.shape();
         try std.testing.expectEqual(@as(i32, 1), oshape[0]);
