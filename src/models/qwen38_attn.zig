@@ -19,6 +19,7 @@ const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 const Closure = closure_mod.Closure;
 const QuantConfig = quantize_mod.QuantConfig;
+const dtype_mod = @import("mlx").dtype;
 
 // ============================================================
 // Decode pre-cache segment (projections → q/k norm → rope → gate sigmoid)
@@ -295,6 +296,297 @@ fn cacheAppend(ctx: EagerContext, cache: *Qwen38AttnCache, k_t: Array, v_t: Arra
     cache.len_ = needed;
 }
 
+// ============================================================
+// Fused decode SDPA (qL=1) — port of omlx sdpa_decode_kernels.h
+// `omlx_sdpa_decode` (itself a port of ml-explore/mlx PR #4294)
+// ============================================================
+//
+// One threadgroup per query head (1024 threads = 32 simdgroups); the KV
+// sequence is striped across simdgroups in TK=4-key tiles; per thread
+// qk_per_thread = D/32 elements; Q·K scores are scalar FMA + simd_sum; tiled
+// online softmax rescales the accumulator only when the running max
+// increases; fp32 accumulation throughout; widest aligned vectorized loads
+// (bf16 → metal::vec<bfloat16_t, 8>). KV must be last-dim-contiguous with
+// 16B-aligned rows (checked by the gate). Decode attends to all cached KV,
+// so no causal/mask path. B=1 and qL=1 only.
+//
+// Follow-up (not done): omlx's 2-pass split-KV variant
+// (omlx_sdpa_decode_2pass_1/2) for long contexts (>=1k-4k tokens).
+
+const sdpa_decode_body =
+    \\    const uint q_head = threadgroup_position_in_grid.x;
+    \\    const uint sg = simdgroup_index_in_threadgroup; // 0..31
+    \\    const uint lane = thread_index_in_simdgroup; // 0..31
+    \\    const int N = n_in[0];
+    \\    const int khs = k_head_stride_in[0];
+    \\    const int kss = k_seq_stride_in[0];
+    \\    const int vhs = v_head_stride_in[0];
+    \\    const int vss = v_seq_stride_in[0];
+    \\
+    \\    const int kv_head = q_head / {[gqa]}; // GQA: kv head = q head / factor
+    \\    const device bfloat16_t* qp = q + q_head * {[d]} + lane * {[qpt]};
+    \\    const device bfloat16_t* kp = keys + kv_head * khs + sg * 4 * kss + lane * {[qpt]};
+    \\    const device bfloat16_t* vp = values + kv_head * vhs + sg * 4 * vss + lane * {[qpt]};
+    \\
+    \\    // Read the query (scaled) and zero the output accumulator.
+    \\    float qq[{[qpt]}];
+    \\    {{
+    \\        const thread metal::vec<bfloat16_t, {[qpt]}> qt = *(const device metal::vec<bfloat16_t, {[qpt]}>*)qp;
+    \\        for (int j = 0; j < {[qpt]}; ++j) qq[j] = {[scale]s} * float(qt[j]);
+    \\    }}
+    \\    float o[{[qpt]}];
+    \\    for (int j = 0; j < {[qpt]}; ++j) o[j] = 0.0f;
+    \\    float max_score = -3.402823466e+38f;
+    \\    float sum_exp = 0.0f;
+    \\
+    \\    // Main loop: this simdgroup's stripe of keys, 4-key tiles.
+    \\    int i = sg * 4;
+    \\    for (; i + 4 <= N; i += 128) {{
+    \\        bfloat16_t ks[4][{[qpt]}];
+    \\        for (int t = 0; t < 4; ++t) {{
+    \\            const thread metal::vec<bfloat16_t, {[qpt]}> kv = *(const device metal::vec<bfloat16_t, {[qpt]}>*)(kp + t * kss);
+    \\            for (int j = 0; j < {[qpt]}; ++j) ks[t][j] = kv[j];
+    \\        }}
+    \\        float scores[4];
+    \\        for (int t = 0; t < 4; ++t) {{
+    \\            float s = 0.0f;
+    \\            for (int j = 0; j < {[qpt]}; ++j) s += qq[j] * float(ks[t][j]);
+    \\            scores[t] = metal::simd_sum(s);
+    \\        }}
+    \\        const float tile_max = metal::max(metal::max(scores[0], scores[1]), metal::max(scores[2], scores[3]));
+    \\        const float new_max = metal::max(max_score, tile_max);
+    \\
+    \\        bfloat16_t vs[4][{[qpt]}];
+    \\        for (int t = 0; t < 4; ++t) {{
+    \\            const thread metal::vec<bfloat16_t, {[qpt]}> vv = *(const device metal::vec<bfloat16_t, {[qpt]}>*)(vp + t * vss);
+    \\            for (int j = 0; j < {[qpt]}; ++j) vs[t][j] = vv[j];
+    \\        }}
+    \\
+    \\        // Rescale only when the running max actually increased.
+    \\        if (new_max > max_score) {{
+    \\            const float factor = metal::exp(max_score - new_max);
+    \\            sum_exp *= factor;
+    \\            for (int j = 0; j < {[qpt]}; ++j) o[j] *= factor;
+    \\            max_score = new_max;
+    \\        }}
+    \\        for (int t = 0; t < 4; ++t) {{
+    \\            const float p = metal::exp(scores[t] - max_score);
+    \\            sum_exp += p;
+    \\            for (int j = 0; j < {[qpt]}; ++j) o[j] += p * float(vs[t][j]);
+    \\        }}
+    \\        kp += 128 * kss;
+    \\        vp += 128 * vss;
+    \\    }}
+    \\
+    \\    // Remaining keys of the last partial tile (< 4 for this simdgroup).
+    \\    for (; i < N; ++i) {{
+    \\        const thread metal::vec<bfloat16_t, {[qpt]}> kv = *(const device metal::vec<bfloat16_t, {[qpt]}>*)kp;
+    \\        float s = 0.0f;
+    \\        for (int j = 0; j < {[qpt]}; ++j) s += qq[j] * float(kv[j]);
+    \\        s = metal::simd_sum(s);
+    \\        const float new_max = metal::max(max_score, s);
+    \\        const float factor = metal::exp(max_score - new_max);
+    \\        const float exp_score = metal::exp(s - new_max);
+    \\        max_score = new_max;
+    \\        sum_exp = sum_exp * factor + exp_score;
+    \\        const thread metal::vec<bfloat16_t, {[qpt]}> vv = *(const device metal::vec<bfloat16_t, {[qpt]}>*)vp;
+    \\        for (int j = 0; j < {[qpt]}; ++j) o[j] = o[j] * factor + exp_score * float(vv[j]);
+    \\        kp += kss;
+    \\        vp += vss;
+    \\    }}
+    \\
+    \\    // Combine the 32 simdgroup partials: max/sum_exp first, then the
+    \\    // output accumulator via a shared-memory transpose.
+    \\    threadgroup float outputs[1024];
+    \\    threadgroup float max_scores[32];
+    \\    threadgroup float sum_exp_scores[32];
+    \\    if (lane == 0) {{
+    \\        max_scores[sg] = max_score;
+    \\        sum_exp_scores[sg] = sum_exp;
+    \\    }}
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    max_score = max_scores[lane];
+    \\    const float total_max = metal::simd_max(max_score);
+    \\    const float factor = metal::exp(max_score - total_max);
+    \\    sum_exp = metal::simd_sum(sum_exp_scores[lane] * factor);
+    \\    for (int j = 0; j < {[qpt]}; ++j) {{
+    \\        outputs[lane * 32 + sg] = o[j];
+    \\        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\        o[j] = metal::simd_sum(outputs[sg * 32 + lane] * factor);
+    \\        o[j] = sum_exp == 0.0f ? o[j] : o[j] / sum_exp;
+    \\        metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    }}
+    \\    if (lane == 0) {{
+    \\        device bfloat16_t* op = out + q_head * {[d]} + sg * {[qpt]};
+    \\        for (int j = 0; j < {[qpt]}; ++j) op[j] = bfloat16_t(o[j]);
+    \\    }}
+    \\
+;
+
+const SdpaDecodeKey = struct {
+    d: i32,
+    gqa: i32,
+    scale_bits: u32,
+};
+
+const SdpaDecodeEntry = struct {
+    key: SdpaDecodeKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var sdpa_decode_entries: [4]?SdpaDecodeEntry = .{ null, null, null, null };
+var sdpa_decode_warned = false;
+var sdpa_decode_off: ?bool = null;
+
+/// Debug escape hatch / A/B toggle: DMLX_NO_SDPA_DECODE=1 forces the stock
+/// fused SDPA path.
+fn sdpaDecodeDisabled() bool {
+    if (sdpa_decode_off == null) {
+        sdpa_decode_off = if (std.c.getenv("DMLX_NO_SDPA_DECODE")) |v| v[0] != 0 and v[0] != '0' else false;
+    }
+    return sdpa_decode_off.?;
+}
+
+fn sdpaDecodeWarn(err: anyerror) void {
+    if (!sdpa_decode_warned) {
+        sdpa_decode_warned = true;
+        std.log.warn("fused decode SDPA kernel unavailable ({s}); using stock scaled_dot_product_attention", .{@errorName(err)});
+    }
+}
+
+fn createSdpaDecodeKernel(allocator: std.mem.Allocator, key: SdpaDecodeKey) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "sdpa_decode_d{d}_g{d}_s{x}", .{ key.d, key.gqa, key.scale_bits }, 0);
+    defer allocator.free(name_z);
+    const scale_z = try qwen38_gdn.f32MetalLit(allocator, @bitCast(key.scale_bits));
+    defer allocator.free(scale_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, sdpa_decode_body, .{
+        .d = key.d,
+        .qpt = @divExact(key.d, 32),
+        .gqa = key.gqa,
+        .scale = scale_z,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try qwen38_gdn.makeStringVec(allocator, &.{ "q", "keys", "values", "n_in", "k_head_stride_in", "k_seq_stride_in", "v_head_stride_in", "v_seq_stride_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try qwen38_gdn.makeStringVec(allocator, &.{"out"});
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        source_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous (all inputs are contiguous by the gate)
+        false, // atomic_outputs
+    );
+}
+
+fn getSdpaDecodeKernel(allocator: std.mem.Allocator, key: SdpaDecodeKey) ?c.c.mlx_fast_metal_kernel {
+    for (&sdpa_decode_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createSdpaDecodeKernel(allocator, key) catch |err| {
+        sdpaDecodeWarn(err);
+        return null;
+    };
+    for (&sdpa_decode_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markSdpaDecodeBroken(key: SdpaDecodeKey) void {
+    for (&sdpa_decode_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+fn isContiguous4D(a: Array, d0: i32, d1: i32, d2: i32, d3: i32) bool {
+    const sh = a.shape();
+    if (sh.len != 4) return false;
+    if (sh[0] != d0 or sh[1] != d1 or sh[2] != d2 or sh[3] != d3) return false;
+    const st = a.strides();
+    return st[0] == d1 * d2 * d3 and st[1] == d2 * d3 and st[2] == d3 and st[3] == 1;
+}
+
+/// Fused decode SDPA over the KV slab. q: [1, H, 1, D] bf16; k/v: the full
+/// contiguous slabs [1, HKV, cap, D] bf16 with kv_len valid rows. Returns
+/// [1, H, 1, D] bf16, or null when unsupported (caller falls back to stock
+/// SDPA). The kernel indexes strides directly, so slab capacity is fine.
+fn sdpaDecodeFused(
+    ctx: EagerContext,
+    q: Array,
+    k: Array,
+    v: Array,
+    scale: f32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    kv_len: i32,
+) !?Array {
+    if (sdpaDecodeDisabled()) return null;
+    if (kv_len < 1 or @mod(d, 32) != 0 or d < 32 or @mod(h, hkv) != 0) return null;
+    const dt = dtype_mod.Dtype.bfloat16;
+    if (q.dtype() != dt or k.dtype() != dt or v.dtype() != dt) return null;
+    const cap: i32 = @intCast(k.shape()[2]);
+    if (!isContiguous4D(q, 1, h, 1, d)) return null;
+    if (!isContiguous4D(k, 1, hkv, cap, d)) return null;
+    if (!isContiguous4D(v, 1, hkv, cap, d)) return null;
+    // Vectorized bf16 loads need 16B-aligned rows: strides divisible by 8.
+    const khs: i32 = cap * d;
+    if (@mod(khs, 8) != 0 or @mod(d, 8) != 0) return null;
+
+    const key = SdpaDecodeKey{ .d = d, .gqa = @divExact(h, hkv), .scale_bits = @bitCast(scale) };
+    const kernel = getSdpaDecodeKernel(ctx.allocator, key) orelse return null;
+
+    const n_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{kv_len}, &[_]i32{1});
+    defer n_arr.deinit();
+    const khs_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{khs}, &[_]i32{1});
+    defer khs_arr.deinit();
+    const kss_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{d}, &[_]i32{1});
+    defer kss_arr.deinit();
+    const vhs_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{cap * d}, &[_]i32{1});
+    defer vhs_arr.deinit();
+    const vss_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{d}, &[_]i32{1});
+    defer vss_arr.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // One threadgroup per q head; 1024 threads = 32 simdgroups.
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, h * 1024, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, h, 1, d }, 4, c.c.MLX_BFLOAT16));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ q, k, v, n_arr, khs_arr, kss_arr, vhs_arr, vss_arr }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, qwen38_gdn.fusedStream())) catch |err| {
+        markSdpaDecodeBroken(key);
+        sdpaDecodeWarn(err);
+        return null;
+    };
+
+    var out_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&out_handle, output_vec, 0));
+    return Array.fromHandle(out_handle);
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -499,13 +791,15 @@ pub const Qwen38Attn = struct {
         // the updated cache states via asyncEval once per token.
 
         const kv_len: i32 = cache.len();
-        const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
-        defer k_view.deinit();
-        const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
-        defer v_view.deinit();
-
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn = try fast_mod.scaledDotProductAttention(ctx, pre.q_t, k_view, v_view, scale, "", null, null);
+        const attn = (try sdpaDecodeFused(ctx, pre.q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, kv_len)) orelse blk: {
+            // Fallback: stock fused SDPA on [1, HKV, len, D] slab views.
+            const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer k_view.deinit();
+            const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer v_view.deinit();
+            break :blk try fast_mod.scaledDotProductAttention(ctx, pre.q_t, k_view, v_view, scale, "", null, null);
+        };
         defer attn.deinit(); // [1, H, 1, D]
 
         const attn_t = try ops.squeeze(ctx, attn);
@@ -604,6 +898,73 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     try std.testing.expectEqual(@as(i32, 1), tshape[0]);
     try std.testing.expectEqual(@as(i32, 16), tshape[1]);
     try std.testing.expectEqual(@as(i32, 4), cache.len());
+}
+
+test "Qwen38Attn fused decode SDPA matches stock SDPA" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const H: i32 = 24;
+    const HKV: i32 = 4;
+    const D: i32 = 256;
+    const cap: i32 = 768; // 3 slabs — exercises non-trivial head strides
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    for ([_]i32{ 37, 257, 513 }) |kv_len| {
+        const n_q: usize = @intCast(H * D);
+        const n_kv: usize = @intCast(HKV * cap * D);
+        const qbuf = try allocator.alloc(f32, n_q);
+        defer allocator.free(qbuf);
+        const kvbuf = try allocator.alloc(f32, 2 * n_kv);
+        defer allocator.free(kvbuf);
+        // Wider dynamic range than testFill so softmax weighting matters.
+        for (qbuf, 0..) |*x, i| {
+            x.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 29 + 7, 23) - 11)) * 0.1;
+        }
+        for (kvbuf, 0..) |*x, i| {
+            x.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 17 + 3, 19) - 9)) * 0.1;
+        }
+        const q_f32 = try Array.fromData(allocator, f32, qbuf, &[_]i32{ 1, H, 1, D });
+        defer q_f32.deinit();
+        const q = try ops.astype(ctx, q_f32, .bfloat16);
+        defer q.deinit();
+        const k_f32 = try Array.fromData(allocator, f32, kvbuf[0..n_kv], &[_]i32{ 1, HKV, cap, D });
+        defer k_f32.deinit();
+        const k = try ops.astype(ctx, k_f32, .bfloat16);
+        defer k.deinit();
+        const v_f32 = try Array.fromData(allocator, f32, kvbuf[n_kv..], &[_]i32{ 1, HKV, cap, D });
+        defer v_f32.deinit();
+        const v = try ops.astype(ctx, v_f32, .bfloat16);
+        defer v.deinit();
+
+        const fused = (try sdpaDecodeFused(ctx, q, k, v, scale, H, HKV, D, kv_len)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.deinit();
+        try fused.eval();
+        const fshape = fused.shape();
+        try std.testing.expectEqual(@as(i32, 1), fshape[0]);
+        try std.testing.expectEqual(H, fshape[1]);
+        try std.testing.expectEqual(@as(i32, 1), fshape[2]);
+        try std.testing.expectEqual(D, fshape[3]);
+
+        const k_view = try ops.slice(ctx, k, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer k_view.deinit();
+        const v_view = try ops.slice(ctx, v, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer v_view.deinit();
+        const stock = try fast_mod.scaledDotProductAttention(ctx, q, k_view, v_view, scale, "", null, null);
+        defer stock.deinit();
+        try stock.eval();
+
+        const fused_f32 = try ops.astype(ctx, fused, .float32);
+        defer fused_f32.deinit();
+        const stock_f32 = try ops.astype(ctx, stock, .float32);
+        defer stock_f32.deinit();
+        const got = try fused_f32.dataSlice(f32);
+        const exp = try stock_f32.dataSlice(f32);
+        try std.testing.expectEqual(exp.len, got.len);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 5e-3);
+    }
 }
 
 test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" {

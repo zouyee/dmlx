@@ -80,7 +80,7 @@ var fused_warned = false;
 /// Default GPU stream, shared by every fused apply. Kernel work must land on
 /// a GPU stream even when the caller's EagerContext targets the CPU (unit
 /// tests); the default stream handle is process-lifetime and never freed.
-fn fusedStream() c.c.mlx_stream {
+pub fn fusedStream() c.c.mlx_stream {
     if (fused_gpu_stream == null) {
         fused_gpu_stream = c.c.mlx_default_gpu_stream_new();
     }
@@ -94,7 +94,7 @@ fn fusedWarn(err: anyerror) void {
     }
 }
 
-fn makeStringVec(allocator: std.mem.Allocator, names: []const []const u8) !c.c.mlx_vector_string {
+pub fn makeStringVec(allocator: std.mem.Allocator, names: []const []const u8) !c.c.mlx_vector_string {
     const vec = c.c.mlx_vector_string_new();
     errdefer _ = c.c.mlx_vector_string_free(vec);
     for (names) |n| {
@@ -329,7 +329,7 @@ fn tailWarn(err: anyerror) void {
     }
 }
 
-fn f32MetalLit(allocator: std.mem.Allocator, v: f32) ![:0]u8 {
+pub fn f32MetalLit(allocator: std.mem.Allocator, v: f32) ![:0]u8 {
     // Shortest round-trip decimal + f suffix parses back to the exact f32.
     return std.fmt.allocPrintSentinel(allocator, "{d}f", .{v}, 0);
 }
