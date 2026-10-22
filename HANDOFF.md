@@ -25,14 +25,24 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
 
 ## Measured performance (M4 Pro, 48 GB)
 
-**Prefill, L=512 prompt (2026-10-21, `9a42856` + `26274ba`):**
+**Prefill scaling (2026-10-22, warm best-of-3, interleaved same-session;
+dmlx = Task 1 + Task 2 + sync-cadence fix):**
 
-| Engine | tok/s |
-|---|---|
-| dmlx before (per-token GDN prefill loop) | 32.6 |
-| dmlx Task 1 (`9a42856`, vectorized projections/conv/gates/out) | ~92 |
-| **dmlx Task 2 (`26274ba`, single-kernel Metal recurrence)** | **~110–116** |
-| mlx-lm (warm, reference) | ~95 |
+| L | dmlx tok/s | mlx-lm tok/s | gap |
+|---|---|---|---|
+| 512 | 112.6 | 117.5 | 4% |
+| 1024 | 117.5 | 124.6 | 6% |
+| 2048 | 117.2 | 124.8 | 6% |
+| 4096 | 114.8 | 124.1 | 7% |
+
+Baseline before this work was 32.6 tok/s at L=512 (per-token GDN loop) and
+flat ~32 at any L, so the improvement is ~3.5× across the range. NOTE: the
+earlier "mlx-lm warm ~95" reference was measured at L=61 where fixed
+overheads dominate; at matched lengths mlx-lm is ~123-124 tok/s, so dmlx is
+within 4-7% (not ahead). The residual gap is 4-bit qmm compute throughput at
+long-L shapes — prefill at long L is compute-bound (MLP ≈ 55% of barrier-
+inflated section time at L=4096; SDPA measured in isolation: 40 ms/call at
+L=4096 = <2% of wall, so the omlx fa256 port is NOT warranted).
 
 - Task 1: one batched qmm per projection over `[1,L,*]`, whole-sequence
   causal conv (`convAccumSeq`), vectorized gates/out-gate; recurrence stayed
@@ -44,6 +54,13 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
   (32, Dv, Hv), threadgroup (32,4,1), state in registers, serial for-t loop,
   `simd_sum` over Dk). Eligible when D%32==0 + f32; toy/small dims fall back
   to the eager loop. `prefill` dispatches via `deltaRulePrefill`.
+- Sync cadence (2026-10-22): `prefill(..., sync)` — the serving loop syncs
+  every 8th GDN layer + the last layer instead of every layer. Per-layer
+  `out.eval()` was added for a memory blow-up that actually came from a
+  slice-handle leak (fixed separately); removing the 48 per-prefill drains
+  bought ~4-8% (L=4096: 107 → 115 tok/s). Peak MLX memory at L=4096 ≈ 35 GB
+  regardless of cadence (dominated by the [1,L,248320] logits + qmm
+  transients, not layer intermediates).
 - Numerics gates hold: prefill-vs-per-token unit test (L=3/64, 1e-5),
   kernel-vs-eager recurrence test (HV=48/D=128, L=37/64/128, 1e-5), oracle
   cos ≥ 0.9999 all segments, benchmark Paris + 7/7 E2E.
@@ -141,8 +158,8 @@ Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen3
 `DMLX_PROF_APPLY=1` adds apply/eval breakdown).
 
 - CLI: model load + 32 tokens in ~15 s total.
-- Prefill is vectorized + single-kernel recurrence (see table above): L=512
-  prompt at ~110 tok/s warm.
+- Prefill is vectorized + single-kernel recurrence + 8-layer sync cadence
+  (see table above): ~113-117 tok/s warm from L=512 to 4096.
 
 ## Fixes made during acceptance (Task 7)
 
