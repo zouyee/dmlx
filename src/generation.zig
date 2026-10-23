@@ -59,9 +59,53 @@ pub const ModelVTable = struct {
         mask: ?Array,
         caches: ?[]KVCacheStrategy,
     ) anyerror!ForwardWithHiddenResult = null,
+    /// Optional MTP (multi-token prediction) speculative-decoding capability.
+    /// Null for models without a drafter head. See MtpOps.
+    mtp: ?*const MtpOps = null,
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     config: ModelConfig,
     ptr: *anyopaque,
+};
+
+// ============================================================
+// MTP speculative decoding vtable (Qwen3.8; see qwen38_mtp.zig)
+// ============================================================
+
+/// One drafter/prefill step output: token logits [vocab] f32 (owned) +
+/// pre-final-norm hidden [1, hidden] bf16 (owned) for chaining.
+pub const MtpStepOut = struct {
+    logits: Array,
+    hidden: Array,
+};
+
+/// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).
+pub const MtpVerifyHandle = *anyopaque;
+
+/// MTP capability: all model state (backbone caches, drafter module + its KV
+/// cache) lives behind `ctx` (the adapter). The engine drives the rounds and
+/// does all sampling/acceptance.
+pub const MtpOps = struct {
+    /// Lazily load the drafter and set the round size. Idempotent; returns
+    /// false (with a log) when no drafter checkpoint is available.
+    enable: *const fn (ctx: *anyopaque, num_drafts: usize) anyerror!bool,
+    /// Prefill the prompt (resets backbone + drafter state) → last-position
+    /// logits + hidden.
+    prefill: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpStepOut,
+    /// One drafter step: (hidden, token) → draft logits + chained hidden.
+    draft: *const fn (ctx: *anyopaque, hidden: Array, token: u32) anyerror!MtpStepOut,
+    /// Backbone verify over ids (continuation, no reset) → opaque handle.
+    verify: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpVerifyHandle,
+    /// Logits column i of the verify handle → [vocab] f32 (owned).
+    verifyLogits: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
+    /// Pre-final-norm hidden row i of the verify handle → [1, hidden] (owned).
+    verifyHidden: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
+    /// Commit `accepted` ∈ 1..L verify positions (backbone + drafter caches).
+    commit: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted: usize) void,
+    /// Discard the whole verify pass (backbone + drafter caches restored).
+    rollback: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void,
+    /// Free the verify handle (call after commit/rollback).
+    freeVerify: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void,
+    num_drafts: usize,
 };
 
 // ============================================================

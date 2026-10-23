@@ -30,6 +30,7 @@ const glm53_loader = @import("models/glm53_loader.zig");
 const glm53 = @import("models/glm53.zig");
 const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
+const qwen38_mtp = @import("models/qwen38_mtp.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -584,6 +585,23 @@ pub const Qwen38VTableAdapter = struct {
     /// Resident weights — kept alive for the model's lifetime.
     weights: std.StringHashMap(Array),
     allocator: std.mem.Allocator,
+    /// MTP drafter state (lazily loaded on first enable()).
+    mtp: ?*qwen38_mtp.Qwen38Mtp = null,
+    /// Drafter KV length before the current round's draft chain; null when
+    /// no round is active (set on the round's first draft call).
+    mtp_round_old_len: ?i32 = null,
+    mtp_ops: generation.MtpOps = .{
+        .enable = &mtpEnable,
+        .prefill = &mtpPrefill,
+        .draft = &mtpDraft,
+        .verify = &mtpVerify,
+        .verifyLogits = &mtpVerifyLogits,
+        .verifyHidden = &mtpVerifyHidden,
+        .commit = &mtpCommit,
+        .rollback = &mtpRollback,
+        .freeVerify = &mtpFreeVerify,
+        .num_drafts = 0,
+    },
 
     fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
@@ -600,8 +618,157 @@ pub const Qwen38VTableAdapter = struct {
         return logits;
     }
 
+    fn mtpDims(self: *Qwen38VTableAdapter) qwen38_mtp.Qwen38MtpDims {
+        const cfg = self.cfg;
+        return .{
+            .hidden_size = cfg.hidden_size,
+            .num_heads = cfg.num_attention_heads,
+            .num_kv_heads = cfg.num_key_value_heads,
+            .head_dim = cfg.head_dim,
+            .rotary_dims = cfg.rotaryDims(),
+            .intermediate_size = cfg.intermediate_size,
+            .rope_theta = cfg.rope_theta,
+            .rms_norm_eps = cfg.rms_norm_eps,
+            .output_gate = cfg.attn_output_gate,
+        };
+    }
+
+    fn mtpEnable(ctx_ptr: *anyopaque, num_drafts: usize) anyerror!bool {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        self.mtp_ops.num_drafts = num_drafts;
+        if (self.mtp != null) return true;
+        const dir = blk: {
+            if (std.c.getenv("DMLX_QWEN38_MTP_DIR")) |d| break :blk std.mem.span(d);
+            break :blk default_mtp_drafter_dir;
+        };
+        std.log.info("Qwen3.8 MTP: loading drafter from {s} ({d} drafts/round)", .{ dir, num_drafts });
+        const m = try self.allocator.create(qwen38_mtp.Qwen38Mtp);
+        errdefer self.allocator.destroy(m);
+        m.* = qwen38_mtp.Qwen38Mtp.load(self.allocator, self.model.ctx, dir, self.mtpDims()) catch |err| {
+            std.log.warn("Qwen3.8 MTP drafter load failed at {s} ({}; set DMLX_QWEN38_MTP_DIR)", .{ dir, err });
+            self.allocator.destroy(m);
+            return false;
+        };
+        self.mtp = m;
+        return true;
+    }
+
+    fn mtpLmHead(self: *Qwen38VTableAdapter) qwen38_mtp.MtpLinear {
+        const lm = self.model.lm_head.?;
+        return .{ .w = lm.w, .scales = lm.scales, .biases = lm.biases };
+    }
+
+    fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const m = self.mtp.?;
+        // Reset the drafter state alongside the backbone (forwardTokensHidden
+        // resets the backbone on L>1).
+        m.cache.deinit();
+        m.cache = .{};
+        self.mtp_round_old_len = null;
+        const out = try self.model.forwardTokensHidden(ids);
+        errdefer out.logits.deinit();
+        errdefer out.hidden.deinit();
+        // Last-position logits → [vocab] f32.
+        const lshape = out.logits.shape();
+        const vocab: i32 = lshape[2];
+        const L: i32 = lshape[1];
+        const last = try ops.slice(self.model.ctx, out.logits, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, vocab }, &[_]i32{ 1, 1, 1 });
+        defer last.deinit();
+        const flat = try ops.reshape(self.model.ctx, last, &[_]i32{vocab});
+        defer flat.deinit();
+        const logits = try ops.astype(self.model.ctx, flat, .float32);
+        out.logits.deinit();
+        return .{ .logits = logits, .hidden = out.hidden };
+    }
+
+    fn mtpDraft(ctx_ptr: *anyopaque, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const m = self.mtp.?;
+        if (self.mtp_round_old_len == null) {
+            self.mtp_round_old_len = m.cache.len();
+        }
+        const out = try m.forward(self.allocator, hidden, token, self.model.embed_table_bf16.?, self.mtpLmHead());
+        errdefer out.logits.deinit();
+        errdefer out.hidden_out.deinit();
+        // [1, 1, vocab] f32 → [vocab]
+        const lshape = out.logits.shape();
+        const vocab: i32 = lshape[2];
+        const logits = try ops.reshape(self.model.ctx, out.logits, &[_]i32{vocab});
+        out.logits.deinit();
+        return .{ .logits = logits, .hidden = out.hidden_out };
+    }
+
+    fn mtpVerify(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpVerifyHandle {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
+        errdefer self.allocator.destroy(box);
+        box.* = try qwen38.forwardVerifyImpl(self.model, ids);
+        return box;
+    }
+
+    fn mtpVerifyLogits(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        const ctx = self.model.ctx;
+        const vocab: i32 = v.logits.shape()[2];
+        const col = try ops.slice(ctx, v.logits, &[_]i32{ 0, @intCast(i), 0 }, &[_]i32{ 1, @as(i32, @intCast(i)) + 1, vocab }, &[_]i32{ 1, 1, 1 });
+        defer col.deinit();
+        const flat = try ops.reshape(ctx, col, &[_]i32{vocab});
+        defer flat.deinit();
+        return ops.astype(ctx, flat, .float32);
+    }
+
+    fn mtpVerifyHidden(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        const ctx = self.model.ctx;
+        const hidden: i32 = v.hidden_pre_norm_all.shape()[2];
+        const row = try ops.slice(ctx, v.hidden_pre_norm_all, &[_]i32{ 0, @intCast(i), 0 }, &[_]i32{ 1, @as(i32, @intCast(i)) + 1, hidden }, &[_]i32{ 1, 1, 1 });
+        defer row.deinit();
+        const flat = try ops.reshape(ctx, row, &[_]i32{ 1, hidden });
+        defer flat.deinit();
+        return ops.copy(ctx, flat);
+    }
+
+    fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        qwen38.commitVerify(self.model, v, accepted);
+        // Drafter cache: the draft chain processed N tokens (t, d1..d_{N-1}).
+        // `accepted` backbone positions means the drafter keeps `accepted`
+        // tokens past the round start; on full acceptance (accepted == N+1)
+        // the engine already appended d_N via a tail draft, so only partial
+        // acceptance needs truncation.
+        const m = self.mtp.?;
+        if (accepted <= self.mtp_ops.num_drafts) {
+            m.cache.len_ = self.mtp_round_old_len.? + @as(i32, @intCast(accepted));
+        }
+        self.mtp_round_old_len = null;
+    }
+
+    fn mtpRollback(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        qwen38.rollbackVerify(self.model, v);
+        const m = self.mtp.?;
+        m.cache.len_ = self.mtp_round_old_len.?;
+        self.mtp_round_old_len = null;
+    }
+
+    fn mtpFreeVerify(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        v.deinit(self.allocator);
+        self.allocator.destroy(v);
+    }
+
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        if (self.mtp) |m| {
+            m.deinit();
+            allocator.destroy(m);
+        }
         self.model.deinit();
         allocator.destroy(self.model);
         var it = self.weights.iterator();
@@ -615,6 +782,8 @@ pub const Qwen38VTableAdapter = struct {
         allocator.destroy(self);
     }
 };
+
+const default_mtp_drafter_dir = "/Users/zouyee/models/Qwen3.8-27B-MTP-4bit";
 
 fn qwen38Loader(
     allocator: std.mem.Allocator,
@@ -678,6 +847,7 @@ fn qwen38Loader(
 
     return ModelVTable{
         .forward = &Qwen38VTableAdapter.forward,
+        .mtp = &adapter.mtp_ops,
         .deinit = &Qwen38VTableAdapter.deinitFn,
         .config = ModelConfig{
             .num_layers = cfg_ptr.num_hidden_layers,

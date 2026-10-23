@@ -157,6 +157,71 @@ fn streamFinalReason(token: u32, stop_tokens: []const u32, token_count: usize, m
     return .stop;
 }
 
+/// softmax(logits / temperature) over the full vocab, on CPU.
+fn softmaxProbs(logits: []const f32, temperature: f32, allocator: std.mem.Allocator) ![]f32 {
+    const probs = try allocator.alloc(f32, logits.len);
+    errdefer allocator.free(probs);
+    const t = if (temperature > 1e-6) temperature else 1e-6;
+    var max_l: f32 = -std.math.inf(f32);
+    for (logits) |l| max_l = @max(max_l, l / t);
+    var sum: f64 = 0;
+    for (logits, 0..) |l, i| {
+        const e = @exp((l / t) - max_l);
+        probs[i] = e;
+        sum += e;
+    }
+    const inv: f32 = @floatCast(1.0 / sum);
+    for (probs) |*p| p.* *= inv;
+    return probs;
+}
+
+/// Speculative-sampling acceptance probability for a draft token:
+/// min(1, p_target / q_draft) with both distributions temperature-shaped.
+fn mtpAcceptProb(target_logits: Array, draft_logits: Array, token: u32, temperature: f32, allocator: std.mem.Allocator) !f32 {
+    const p_data = try target_logits.dataSlice(f32);
+    const q_data = try draft_logits.dataSlice(f32);
+    const p = try softmaxProbs(p_data, temperature, allocator);
+    defer allocator.free(p);
+    const q = try softmaxProbs(q_data, temperature, allocator);
+    defer allocator.free(q);
+    const qd = q[token];
+    if (qd <= 0) return 1.0;
+    return @min(1.0, p[token] / qd);
+}
+
+/// Rejection resample from the adjusted distribution (p_target - q_draft)+,
+/// normalized — the standard speculative-sampling correction step.
+fn mtpResampleAdjusted(target_logits: Array, draft_logits: Array, temperature: f32, prng: *std.Random.DefaultPrng, allocator: std.mem.Allocator) !sampling_mod.SampleResult {
+    const p_data = try target_logits.dataSlice(f32);
+    const q_data = try draft_logits.dataSlice(f32);
+    const p = try softmaxProbs(p_data, temperature, allocator);
+    defer allocator.free(p);
+    const q = try softmaxProbs(q_data, temperature, allocator);
+    defer allocator.free(q);
+    const adj = try allocator.alloc(f32, p.len);
+    defer allocator.free(adj);
+    var sum: f64 = 0;
+    for (p, q, 0..) |pp, qq, i| {
+        adj[i] = @max(0, pp - qq);
+        sum += adj[i];
+    }
+    if (sum <= 0) {
+        // Degenerate: fall back to the plain target distribution argmax.
+        var best: usize = 0;
+        for (p[1..], 1..) |v, i| {
+            if (v > p[best]) best = i;
+        }
+        return .{ .token = @intCast(best), .logprob = 0 };
+    }
+    const r = prng.random().float(f32) * @as(f32, @floatCast(sum));
+    var acc: f32 = 0;
+    for (adj, 0..) |a, i| {
+        acc += a;
+        if (r < acc) return .{ .token = @intCast(i), .logprob = 0 };
+    }
+    return .{ .token = @intCast(adj.len - 1), .logprob = 0 };
+}
+
 /// EngineLoop configuration.
 pub const EngineConfig = struct {
     allocator: std.mem.Allocator,
@@ -183,6 +248,9 @@ pub const EngineConfig = struct {
     max_batch_size: usize = 8,
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
     speculative_ngram: ?usize = null,
+    /// MTP speculative decoding: number of draft tokens per round (null =
+    /// disabled). Requires a model with `ModelVTable.mtp` (Qwen3.8).
+    speculative_mtp: ?usize = null,
     /// Prefix cache: max number of prompts to cache KV state for (0 = disabled).
     prefix_cache_max_entries: usize = 16,
 };
@@ -212,6 +280,8 @@ pub const EngineLoop = struct {
     active_requests: std.ArrayList(*RequestState),
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
     speculative_ngram: ?usize,
+    /// MTP speculative decoding: draft tokens per round (null = disabled).
+    speculative_mtp: ?usize,
     /// Prefix cache for skipping prefill on repeated prompts.
     prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
 
@@ -239,6 +309,7 @@ pub const EngineLoop = struct {
             .seq_index_counter = 0,
             .active_requests = std.ArrayList(*RequestState).empty,
             .speculative_ngram = config.speculative_ngram,
+            .speculative_mtp = config.speculative_mtp,
             .prefix_cache = if (config.prefix_cache_max_entries > 0)
                 prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
             else
@@ -875,6 +946,12 @@ pub const EngineLoop = struct {
         caches: []KVCacheStrategy,
         gen_config: GenerateConfig,
     ) void {
+        // MTP speculative decoding takes precedence when enabled and the
+        // model supports it (Qwen3.8 drafter); n-gram is the fallback when
+        // --speculative-mtp was requested but no drafter is available.
+        if (self.speculative_mtp) |n_drafts| {
+            if (self.tryMtpRequest(req, caches, gen_config, n_drafts)) return;
+        }
         // If speculative decoding is enabled, use the speculative path.
         if (self.speculative_ngram) |ngram_n| {
             self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
@@ -1079,6 +1156,300 @@ pub const EngineLoop = struct {
 
         req.token_count = total_generated;
         req.completion.deliverToken(self.io, 0, final_text, true, finishReasonForTokens(generated_slice, gen_config));
+    }
+
+    /// Try the MTP path; returns false (after one warning) when the model has
+    /// no MTP capability or the drafter fails to load — caller falls back.
+    fn tryMtpRequest(
+        self: *EngineLoop,
+        req: *RequestState,
+        caches: []KVCacheStrategy,
+        gen_config: GenerateConfig,
+        n_drafts: usize,
+    ) bool {
+        const ops_mtp = self.model.mtp orelse {
+            std.log.warn("EngineLoop: --speculative-mtp set but model has no MTP capability; using normal decoding", .{});
+            return false;
+        };
+        const ok = ops_mtp.enable(self.model.ptr, n_drafts) catch |err| {
+            std.log.warn("EngineLoop: MTP drafter load failed ({}); using normal decoding", .{err});
+            return false;
+        };
+        if (!ok) return false;
+        self.processMtpRequest(req, caches, gen_config, ops_mtp, n_drafts);
+        return true;
+    }
+
+    /// MTP speculative decoding (Qwen3.8 drafter head). Per round:
+    ///   1. Draft chain: N drafter steps from (hidden, t_next).
+    ///   2. One backbone verify over [t_next, d1..dN] (continuation).
+    ///   3. Acceptance: greedy longest-prefix at temperature==0, speculative
+    ///      sampling (p_target/q_draft with resample from (p-q)+) otherwise.
+    ///   4. Commit accepted positions / roll back the rest; emit.
+    /// Bitwise-lossless at temperature 0: emitted == plain greedy sequence.
+    fn processMtpRequest(
+        self: *EngineLoop,
+        req: *RequestState,
+        caches: []KVCacheStrategy,
+        gen_config: GenerateConfig,
+        mtp: *const generation_mod.MtpOps,
+        n_drafts: usize,
+    ) void {
+        const allocator = self.allocator;
+        // The serial path never initializes req.sampler from the request
+        // (only prefillBatch does); SamplerConfig defaults to temperature 1.0.
+        // Initialize from gen_config so temperature=0 actually means greedy.
+        req.sampler = SamplerConfig.init(gen_config.seed);
+        req.sampler.temperature = gen_config.temperature;
+        req.sampler.top_k = gen_config.top_k;
+        req.sampler.top_p = gen_config.top_p;
+        const greedy = req.sampler.temperature <= 0.0;
+
+        var context = std.ArrayList(u32).empty;
+        defer context.deinit(allocator);
+        context.appendSlice(allocator, req.prompt_tokens) catch {
+            req.completion.deliverError(self.io, "MTP: context allocation failed");
+            return;
+        };
+
+        // Prefill (resets backbone + drafter) → first token.
+        const pf = mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
+            std.log.err("EngineLoop: MTP prefill failed: {}", .{err});
+            req.completion.deliverError(self.io, "MTP: prefill failed");
+            return;
+        };
+        defer pf.logits.deinit();
+        var hidden = pf.hidden; // owned; reassigned per round
+
+        var t_next = req.sampler.sample(pf.logits, allocator) catch {
+            pf.hidden.deinit();
+            req.completion.deliverError(self.io, "MTP: sampling failed");
+            return;
+        };
+        context.append(allocator, t_next.token) catch return;
+        var total_generated: usize = 1;
+        var drafts_proposed: usize = 0;
+        var drafts_accepted: usize = 0;
+
+        var finish: TokenFinishReason = .length;
+        var stopped = generation_mod.isStopToken(t_next.token, gen_config.stop_tokens);
+        if (stopped) finish = .stop;
+
+        // Drafter samples with the same shaping config but an independent prng.
+        var draft_sampler = req.sampler;
+        draft_sampler.prng = std.Random.DefaultPrng.init(gen_config.seed +% 0x5d1f);
+
+        while (!stopped and total_generated < gen_config.max_tokens) {
+            // 1. Draft chain.
+            var drafts = std.ArrayList(u32).empty;
+            defer drafts.deinit(allocator);
+            var draft_logits = std.ArrayList(Array).empty;
+            defer {
+                for (draft_logits.items) |l| l.deinit();
+                draft_logits.deinit(allocator);
+            }
+            var h_cur = hidden;
+            var tok = t_next.token;
+            var draft_failed = false;
+            for (0..n_drafts) |_| {
+                const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
+                    draft_failed = true;
+                    break;
+                };
+                if (drafts.items.len > 0) h_cur.deinit(); // previous chained hidden
+                h_cur = d_out.hidden;
+                const d = draft_sampler.sample(d_out.logits, allocator) catch {
+                    d_out.logits.deinit();
+                    draft_failed = true;
+                    break;
+                };
+                draft_logits.append(allocator, d_out.logits) catch {
+                    d_out.logits.deinit();
+                    draft_failed = true;
+                    break;
+                };
+                drafts.append(allocator, d.token) catch {
+                    draft_failed = true;
+                    break;
+                };
+                tok = d.token;
+            }
+            // Keep h_cur (the last chained drafter hidden) until after
+            // acceptance — a full-acceptance round needs it for the tail
+            // draft that appends d_N to the drafter cache.
+            if (draft_failed or drafts.items.len == 0) {
+                h_cur.deinit();
+                // Draft path failed (OOM-class): finish the request with plain
+                // decode steps. Backbone state was untouched by the aborted
+                // round (drafts only touch the drafter cache, which the next
+                // prefill resets), so plain continuation is exact.
+                std.log.warn("EngineLoop: MTP draft failed; finishing with plain decode", .{});
+                hidden.deinit();
+                while (total_generated < gen_config.max_tokens and !stopped) {
+                    const arr = array_mod.Array.fromData(allocator, u32, &[_]u32{t_next.token}, &[_]i32{ 1, 1 }) catch break;
+                    const st = generation_mod.generateStep(self.model, arr, caches, &req.sampler, self.ctx) catch break;
+                    t_next = st;
+                    context.append(allocator, t_next.token) catch break;
+                    total_generated += 1;
+                    if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
+                        stopped = true;
+                        finish = .stop;
+                    }
+                }
+                break;
+            }
+            drafts_proposed += drafts.items.len;
+
+            // 2. Verify [t_next, d1..dN] on the backbone (continuation).
+            var vids = std.ArrayList(u32).empty;
+            defer vids.deinit(allocator);
+            vids.append(allocator, t_next.token) catch break;
+            vids.appendSlice(allocator, drafts.items) catch break;
+            const vh = mtp.verify(self.model.ptr, vids.items) catch |err| {
+                std.log.err("EngineLoop: MTP verify failed: {}", .{err});
+                break;
+            };
+
+            // 3. Acceptance.
+            var k: usize = 0; // accepted drafts
+            var rejected = false;
+            var stop_in_drafts = false;
+            for (0..drafts.items.len) |i| {
+                const v_i = mtp.verifyLogits(self.model.ptr, vh, i) catch {
+                    rejected = true;
+                    break;
+                };
+                defer v_i.deinit();
+                if (greedy) {
+                    const target = req.sampler.sample(v_i, allocator) catch {
+                        rejected = true;
+                        break;
+                    };
+                    if (target.token != drafts.items[i]) {
+                        rejected = true;
+                        break;
+                    }
+                    k += 1;
+                    if (generation_mod.isStopToken(drafts.items[i], gen_config.stop_tokens)) {
+                        stop_in_drafts = true;
+                        break;
+                    }
+                } else {
+                    // Speculative sampling: accept w.p. min(1, p/q); the
+                    // rejection resample happens after the loop.
+                    const accept = mtpAcceptProb(v_i, draft_logits.items[i], drafts.items[i], req.sampler.temperature, allocator) catch {
+                        rejected = true;
+                        break;
+                    };
+                    const r = req.sampler.prng.random().float(f32);
+                    if (r >= accept) {
+                        rejected = true;
+                        break;
+                    }
+                    k += 1;
+                    if (generation_mod.isStopToken(drafts.items[i], gen_config.stop_tokens)) {
+                        stop_in_drafts = true;
+                        break;
+                    }
+                }
+            }
+            if (stop_in_drafts) {
+                // An accepted draft is a stop token: emit through it and end.
+                h_cur.deinit();
+                mtp.commit(self.model.ptr, vh, k + 1);
+                mtp.freeVerify(self.model.ptr, vh);
+                for (drafts.items[0..k]) |d| {
+                    if (total_generated >= gen_config.max_tokens) break;
+                    context.append(allocator, d) catch break;
+                    total_generated += 1;
+                    drafts_accepted += 1;
+                }
+                stopped = true;
+                finish = .stop;
+                break;
+            }
+
+            // 4. Next token: from V_k (rejection point) or bonus V_N.
+            const next_pos = k; // logits position predicting the next token
+            const v_next = mtp.verifyLogits(self.model.ptr, vh, next_pos) catch break;
+            defer v_next.deinit();
+            const next_sample = if (greedy or !rejected)
+                // Greedy: exact target argmax (rejection) / sampler (bonus).
+                // temp>0 with all drafts accepted: plain bonus sample.
+                req.sampler.sample(v_next, allocator) catch break
+            else
+                // temp>0 rejection: resample from the adjusted distribution
+                // (p_target - q_draft)+, preserving the target distribution.
+                mtpResampleAdjusted(v_next, draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
+
+            const hidden_next = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
+
+            // Full acceptance: d_N was never drafted — append it through the
+            // head (tail draft) so the drafter cache covers every confirmed
+            // token. Discard its outputs.
+            if (k == drafts.items.len) {
+                const tail = mtp.draft(self.model.ptr, h_cur, drafts.items[drafts.items.len - 1]) catch null;
+                if (tail) |t2| {
+                    t2.logits.deinit();
+                    t2.hidden.deinit();
+                }
+            }
+            h_cur.deinit();
+
+            // Commit k+1 backbone positions (t_next + accepted drafts).
+            mtp.commit(self.model.ptr, vh, k + 1);
+            mtp.freeVerify(self.model.ptr, vh);
+
+            // Emit accepted drafts + the next sampled token, capped at
+            // max_tokens (plain decode emits exactly max_tokens).
+            for (drafts.items[0..k]) |d| {
+                if (total_generated >= gen_config.max_tokens) break;
+                context.append(allocator, d) catch break;
+                total_generated += 1;
+                drafts_accepted += 1;
+            }
+            if (total_generated >= gen_config.max_tokens) {
+                hidden_next.deinit();
+                break;
+            }
+            t_next = next_sample;
+            context.append(allocator, t_next.token) catch break;
+            total_generated += 1;
+            hidden.deinit();
+            hidden = hidden_next;
+            if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
+                stopped = true;
+                finish = .stop;
+            }
+        }
+        hidden.deinit();
+
+        if (drafts_proposed > 0) {
+            std.log.info("[Engine] MTP request {d}: acceptance {d:.1}% ({d}/{d} drafts)", .{
+                req.id,
+                100.0 * @as(f64, @floatFromInt(drafts_accepted)) / @as(f64, @floatFromInt(drafts_proposed)),
+                drafts_accepted,
+                drafts_proposed,
+            });
+        }
+
+        const generated_slice = context.items[req.prompt_tokens.len..];
+        const text = self.tokenizer.decode(generated_slice, allocator) catch {
+            req.completion.deliverError(self.io, "Failed to decode tokens");
+            return;
+        };
+        defer allocator.free(text);
+        var final_text = text;
+        if (req.stop_strings) |stop_strings| {
+            for (stop_strings) |stop_str| {
+                if (std.mem.indexOf(u8, text, stop_str)) |idx| {
+                    final_text = text[0..idx];
+                    break;
+                }
+            }
+        }
+        req.token_count = total_generated;
+        req.completion.deliverToken(self.io, 0, final_text, true, if (finish == .stop) .stop else finishReasonForTokens(generated_slice, gen_config));
     }
 
     /// Guided decoding path: uses FSM-based logit masking to constrain output.

@@ -44,6 +44,7 @@ pub const ServerState = struct {
     block_manager: ?scheduler_mod.BlockManager,
     scheduler: ?scheduler_mod.Scheduler,
     speculative_ngram: ?usize,
+    speculative_mtp: ?usize,
     prompt_cache_file: ?[]const u8,
     prefix_disk_cache: ?prefix_disk_mod.PrefixDiskCache,
     running: bool,
@@ -215,6 +216,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .block_manager = scheduler_mod.BlockManager.init(0),
             .scheduler = null,
             .speculative_ngram = config.speculative_ngram,
+            .speculative_mtp = config.speculative_mtp,
             .prompt_cache_file = null,
             .prefix_disk_cache = null,
             .native_engine = ne,
@@ -436,6 +438,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .block_manager = block_manager,
         .scheduler = null,
         .speculative_ngram = config.speculative_ngram,
+        .speculative_mtp = config.speculative_mtp,
         .prompt_cache_file = config.prompt_cache_file,
         .prefix_disk_cache = if (config.kv_cold_dir) |cold_dir|
             prefix_disk_mod.PrefixDiskCache.init(allocator, cold_dir, kvcache.default_page_size) catch null

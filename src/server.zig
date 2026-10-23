@@ -98,6 +98,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
             .dsv4_model = server_state.dsv4_model,
             .vtable_serial = server_state.vtable_serial,
             .speculative_ngram = server_state.speculative_ngram,
+            .speculative_mtp = server_state.speculative_mtp,
             .prefix_cache_max_entries = server_config.prefix_cache_entries,
         };
 

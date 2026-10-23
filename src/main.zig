@@ -64,6 +64,7 @@ const ServerCommand = struct {
     kv_cold_dir: ?[]const u8 = null,
     prompt_cache_file: ?[]const u8 = null,
     speculative_ngram: ?usize = null,
+    speculative_mtp: ?usize = null, // MTP speculative decoding (Qwen3.8 drafter): draft tokens/round
     smelt: bool = false,
     smelt_experts: f32 = 1.0,
     smelt_strategy: []const u8 = "preload", // "preload" or "stream"
@@ -206,6 +207,7 @@ pub fn main(init: std.process.Init) !void {
             .kv_cold_dir = cmd.kv_cold_dir,
             .prompt_cache_file = cmd.prompt_cache_file,
             .speculative_ngram = cmd.speculative_ngram,
+            .speculative_mtp = cmd.speculative_mtp,
             .smelt = cmd.smelt,
             .smelt_experts = cmd.smelt_experts,
             .smelt_strategy = cmd.smelt_strategy,
@@ -423,6 +425,8 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.prompt_cache_file = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--speculative-ngram")) {
             cmd.speculative_ngram = try std.fmt.parseInt(usize, value, 10);
+        } else if (std.mem.eql(u8, flag, "--speculative-mtp")) {
+            cmd.speculative_mtp = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--smelt")) {
             cmd.smelt = true;
         } else if (std.mem.eql(u8, flag, "--smelt-experts")) {

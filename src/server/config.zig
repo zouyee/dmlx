@@ -37,6 +37,8 @@ pub const ServerConfig = struct {
     kv_quant: KvQuant = .simple,
     prompt_cache_file: ?[]const u8 = null,
     speculative_ngram: ?usize = null,
+    speculative_mtp: ?usize = null, // MTP speculative decoding (Qwen3.8 drafter)
+
     kv_tier: KvTier = .ram,
     kv_cold_dir: ?[]const u8 = null,
     allow_unsafe_tools: bool = false,

@@ -1728,6 +1728,25 @@ pub const Qwen38ServingModel = struct {
     /// All weights come from the persistent per-layer modules built at init —
     /// no WeightSource lookups, COW copies, or module construction per token.
     pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
+        const res = try self.forwardTokensCore(ids, false);
+        return res.logits;
+    }
+
+    pub const ForwardHiddenOut = struct {
+        logits: Array, // [1, L, vocab]
+        hidden: Array, // [1, hidden] bf16, pre-final-norm, LAST position
+    };
+
+    /// forwardTokens + the pre-final-norm hidden at the last position (the
+    /// MTP head's chaining input after a prefill or plain decode step).
+    pub fn forwardTokensHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardHiddenOut {
+        const res = try self.forwardTokensCore(ids, true);
+        return .{ .logits = res.logits, .hidden = res.hidden.? };
+    }
+
+    const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
+
+    fn forwardTokensCore(self: *Qwen38ServingModel, ids: []const u32, capture_hidden: bool) !ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
@@ -1846,6 +1865,14 @@ pub const Qwen38ServingModel = struct {
         }
 
         // Final norm → bf16 → lm_head (mirrors Qwen38Model.forward).
+        const hidden_cap: ?Array = if (capture_hidden) blk: {
+            const last = try ops.slice(ctx, h, &[_]i32{ 0, @as(i32, @intCast(ids.len)) - 1, 0 }, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+            defer last.deinit();
+            const flat = try ops.reshape(ctx, last, &[_]i32{ 1, @intCast(cfg.hidden_size) });
+            defer flat.deinit();
+            break :blk try ops.copy(ctx, flat); // [1, hidden] bf16, pre-norm
+        } else null;
+        errdefer if (hidden_cap) |hc| hc.deinit();
         const h_f32 = try ops.astype(ctx, h, .float32);
         defer h_f32.deinit();
         const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, self.final_norm_f32.?, cfg.rms_norm_eps);
@@ -1859,7 +1886,7 @@ pub const Qwen38ServingModel = struct {
         // sampling. Step N+1's graph then references materialized states.
         try self.asyncEvalCacheStates();
         try logits.eval();
-        return logits;
+        return .{ .logits = logits, .hidden = hidden_cap };
     }
 };
 
