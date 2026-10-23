@@ -120,6 +120,26 @@ declining series; dmlx was stable at 113-117 there. Interleaving note: dmlx
 numbers above are from a solo run; when measured with the omlx server
 co-resident (15 GB), dmlx lost ~10% at L=1024 to memory pressure.
 
+**Speculative decode comparison (2026-10-23, temp 0, N=2 drafts both sides):**
+
+| Engine | code tok/s | prose tok/s | math tok/s | acceptance |
+|---|---|---|---|---|
+| dmlx `--speculative-mtp 2` | 22.6 | 20.9 | 21.9 | 83–85% |
+| mlx-vlm 0.7.8 `--draft-kind mtp` | 31.1 | 26.1 | 31.0 | 61–98% (avg draft 2) |
+
+(mlx-vlm numbers are its own generation tok/s; dmlx numbers are effective
+tok/s over 128-token requests incl. prefill + thinking — dmlx decode-only
+diagnostic is 24.05. omlx's native `mtp_enabled` does NOT work with the
+local 4-bit checkpoint: it was stripped of `mtp.*` weights, and omlx's
+native MTP needs them in the main checkpoint ("Lightning MTP is inactive …
+checkpoint has no MTP weights"); the mlx-vlm row uses the same community
+drafter we use. Notable: acceptance varies by content on both sides
+(mlx-vlm: 98% code / 61% prose / 88% math; dmlx: flat ~85% everywhere) —
+yet mlx-vlm is faster even where OUR acceptance is higher (prose), so its
+edge is pipeline efficiency (BatchGenerator verify loop, faster decode
+baseline) more than acceptance. Verdict: dmlx is BELOW mlx-vlm speculative
+today (~1.3–1.4× gap), roughly at parity nowhere but within ~20% on math.)
+
 **Decode, same session (2026-10-22):**
 
 | Engine | tok/s |
