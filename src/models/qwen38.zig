@@ -1863,6 +1863,180 @@ pub const Qwen38ServingModel = struct {
     }
 };
 
+/// Verify-pass output (MTP speculative decoding). `gdn[i]` holds the
+/// per-position states for GDN layer `gdn_layers[i]`; `attn_old_lens[i]` is
+/// the pre-verify `len_` of attention layer `attn_layers[i]` (its slab
+/// already contains the L appended rows; rollback truncates `len_`).
+pub const Qwen38VerifyOut = struct {
+    logits: Array, // [1, L, vocab], lm_head dtype (bf16) — same as forwardTokens
+    /// Pre-final-norm hidden states for all L positions [1, L, hidden] bf16.
+    /// The MTP head consumes row `accepted-1` (post-norm chaining convention
+    /// from Task 1: the head re-norms via pre_fc_norm_hidden).
+    hidden_pre_norm_all: Array,
+    gdn: []qwen38_gdn.Qwen38GDN.PrefillVerifyResult,
+    gdn_layers: []usize,
+    attn_old_lens: []i32,
+    attn_layers: []usize,
+
+    pub fn deinit(self: *Qwen38VerifyOut, allocator: std.mem.Allocator) void {
+        self.logits.deinit();
+        self.hidden_pre_norm_all.deinit();
+        for (self.gdn) |*r| r.deinit(allocator);
+        allocator.free(self.gdn);
+        allocator.free(self.gdn_layers);
+        allocator.free(self.attn_old_lens);
+        allocator.free(self.attn_layers);
+    }
+};
+
+/// Verify-continuation pass for MTP speculative decoding: identical dataflow
+/// to forwardTokens at L>1 but WITHOUT the cache reset — the ids continue
+/// the sequence already in the caches. GDN layers run prefillVerify
+/// (per-position states retained, caches untouched); attention layers append
+/// normally (rollback truncates len_). Returns per-position logits and the
+/// pre-final-norm hidden states needed by the MTP head.
+pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38VerifyOut {
+    const allocator = self.allocator;
+    const cfg = self.cfg;
+    const ctx = self.ctx;
+
+    try rejectVisionTokens(ids);
+    if (ids.len <= 1) return error.VerifyNeedsSequence;
+
+    const ids_i32 = try allocator.alloc(i32, ids.len);
+    defer allocator.free(ids_i32);
+    for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+
+    if (self.embed_table_bf16 == null) {
+        self.embed_table_bf16 = try Qwen38ServingModel.buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+    }
+    const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
+    defer id_arr.deinit();
+    const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0);
+    defer rows.deinit();
+    const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) });
+    defer emb.deinit();
+    var h = try ops.copy(ctx, emb); // bf16
+    errdefer h.deinit();
+
+    var gdn_results = std.ArrayList(qwen38_gdn.Qwen38GDN.PrefillVerifyResult).empty;
+    errdefer {
+        for (gdn_results.items) |*r| r.deinit(allocator);
+        gdn_results.deinit(allocator);
+    }
+    var gdn_layers = std.ArrayList(usize).empty;
+    errdefer gdn_layers.deinit(allocator);
+    var attn_old_lens = std.ArrayList(i32).empty;
+    errdefer attn_old_lens.deinit(allocator);
+    var attn_layers = std.ArrayList(usize).empty;
+    errdefer attn_layers.deinit(allocator);
+
+    var normed1_carry: ?Array = null;
+    defer if (normed1_carry) |*nc| nc.deinit();
+
+    for (self.layers, 0..) |*lp, layer| {
+        const normed1 = if (normed1_carry) |nc| blk: {
+            normed1_carry = null;
+            break :blk nc;
+        } else try rmsNormOnly(ctx, h, lp.ln1_f32, cfg.rms_norm_eps);
+        defer normed1.deinit();
+        const attn_out = switch (lp.module) {
+            .gdn => |*g| blk: {
+                const cache = &self.caches[layer].gdn;
+                var res = try g.prefillVerify(allocator, normed1, cache);
+                errdefer res.deinit(allocator);
+                try gdn_results.append(allocator, res);
+                try gdn_layers.append(allocator, layer);
+                break :blk res.out; // owned by gdn_results now — no defer
+            },
+            .attn => |*a| blk: {
+                const cache = &self.caches[layer].attn;
+                try attn_old_lens.append(allocator, cache.len());
+                try attn_layers.append(allocator, layer);
+                break :blk try a.forward(normed1, cache);
+            },
+        };
+        defer if (lp.module != .gdn) attn_out.deinit();
+        // h += attn_out, then rmsNorm(h, ln2) for the MLP branch.
+        const r1 = try addRmsNorm(ctx, h, attn_out, lp.ln2_f32, cfg.rms_norm_eps);
+        h.deinit();
+        h = r1.h;
+        const normed2 = r1.normed;
+        defer normed2.deinit();
+        const mlp_out = blk: {
+            if (self.mlp_swiglu_fused_compiled) |mc| {
+                if (lp.mlp_gate_up != null) {
+                    if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+                        break :blk mo;
+                    } else |_| {}
+                }
+            }
+            if (self.mlp_swiglu_compiled) |mc| {
+                if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
+                    break :blk mo;
+                } else |_| {}
+            }
+            break :blk try mlpForwardPersistent(ctx, lp, normed2);
+        };
+        defer mlp_out.deinit();
+        if (layer + 1 < self.layers.len) {
+            const r2 = try addRmsNorm(ctx, h, mlp_out, self.layers[layer + 1].ln1_f32, cfg.rms_norm_eps);
+            h.deinit();
+            h = r2.h;
+            normed1_carry = r2.normed;
+        } else {
+            const next = try ops.add(ctx, h, mlp_out);
+            h.deinit();
+            h = next;
+        }
+    }
+
+    // Capture pre-final-norm hidden for all positions (MTP chaining input).
+    const hidden_pre_norm_all = h; // [1, L, hidden] bf16 — ownership moves out
+    errdefer hidden_pre_norm_all.deinit();
+
+    const h_f32 = try ops.astype(ctx, h, .float32);
+    defer h_f32.deinit();
+    const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, self.final_norm_f32.?, cfg.rms_norm_eps);
+    defer hidden_final_f32.deinit();
+    const hidden_final = try ops.astype(ctx, hidden_final_f32, .bfloat16);
+    defer hidden_final.deinit();
+    const logits = try self.lm_head.?.apply(ctx, hidden_final);
+    errdefer logits.deinit();
+    try logits.eval();
+
+    return .{
+        .logits = logits,
+        .hidden_pre_norm_all = hidden_pre_norm_all,
+        .gdn = try gdn_results.toOwnedSlice(allocator),
+        .gdn_layers = try gdn_layers.toOwnedSlice(allocator),
+        .attn_old_lens = try attn_old_lens.toOwnedSlice(allocator),
+        .attn_layers = try attn_layers.toOwnedSlice(allocator),
+    };
+}
+
+/// Commit `accepted` ∈ 1..L verify positions: GDN caches take the retained
+/// post-step-(accepted-1) states; attention caches keep old+accepted rows.
+/// Frees the GDN per-position lists inside `v` (v.deinit still required for
+/// logits/hidden/lists-of-results).
+pub fn commitVerify(self: *Qwen38ServingModel, v: *Qwen38VerifyOut, accepted: usize) void {
+    const a_idx = accepted - 1;
+    for (v.gdn, v.gdn_layers) |*r, layer| {
+        qwen38_gdn.Qwen38GDN.commitVerifyStates(&self.caches[layer].gdn, r, self.allocator, a_idx);
+    }
+    for (v.attn_layers, v.attn_old_lens) |layer, old| {
+        self.caches[layer].attn.len_ = old + @as(i32, @intCast(accepted));
+    }
+}
+
+/// Discard the whole verify pass: attention lengths truncated back, GDN
+/// caches untouched (their retained states die with v.deinit).
+pub fn rollbackVerify(self: *Qwen38ServingModel, v: *Qwen38VerifyOut) void {
+    for (v.attn_layers, v.attn_old_lens) |layer, old| {
+        self.caches[layer].attn.len_ = old;
+    }
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -2195,4 +2369,248 @@ test "Qwen38ServingModel.forwardTokens: vision token rejected before any weight 
         VisionError.VisionInputNotSupported,
         model.forwardTokens(&[_]u32{ 100, 248053, 200 }), // <|vision_start|>, prefill path
     );
+}
+
+// ============================================================
+// MTP forwardVerify toy-model tests
+// ============================================================
+
+fn testFillToy(buf: []f32) void {
+    for (buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 37 + 11, 13) - 6)) * 0.02;
+    }
+}
+
+fn putToyTensor(allocator: std.mem.Allocator, map: *std.StringHashMap(Array), name: []const u8, shape_: []const i32) !void {
+    var n: usize = 1;
+    for (shape_) |s| n *= @intCast(s);
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    testFillToy(buf);
+    const arr = try Array.fromData(allocator, f32, buf, shape_);
+    errdefer arr.deinit();
+    try map.put(try allocator.dupe(u8, name), arr);
+}
+
+fn putToyQuant(allocator: std.mem.Allocator, ctx: EagerContext, map: *std.StringHashMap(Array), prefix: []const u8, out_f: i32, in_f: i32) !void {
+    var nbuf: [256]u8 = undefined;
+    const n: usize = @intCast(out_f * in_f);
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    testFillToy(buf);
+    const w = try Array.fromData(allocator, f32, buf, &[_]i32{ out_f, in_f });
+    defer w.deinit();
+    const qw = try quantize_mod.quantize(ctx, w, .{ .group_size = 64, .bits = 4, .mode = .affine });
+    defer allocator.free(qw.original_shape);
+    try map.put(try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "{s}.weight", .{prefix})), qw.data);
+    try map.put(try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "{s}.scales", .{prefix})), qw.scales);
+    try map.put(try allocator.dupe(u8, try std.fmt.bufPrint(&nbuf, "{s}.biases", .{prefix})), qw.biases);
+}
+
+test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const fa = try allocator.dupe(u32, &[_]u32{1});
+    var cfg = qwen38_loader.Qwen38Config{
+        .allocator = allocator,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .vocab_size = 64,
+        .intermediate_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 32,
+        .partial_rotary_factor = 0.25,
+        .linear_num_key_heads = 2,
+        .linear_num_value_heads = 8,
+        .linear_key_head_dim = 8,
+        .linear_value_head_dim = 8,
+        .full_attn_layers = fa,
+    };
+    defer cfg.deinit();
+
+    const mkModel = struct {
+        fn call(alloc: std.mem.Allocator, c2: EagerContext, c3: *qwen38_loader.Qwen38Config) !Qwen38ServingModel {
+            const hidden: i32 = 64;
+            const vocab: i32 = 64;
+            const inter: i32 = 128;
+            const gdn_qkv: i32 = 96;
+            const gdn_z: i32 = 64;
+            var map = std.StringHashMap(Array).init(alloc);
+            errdefer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    alloc.free(e.key_ptr.*);
+                    e.value_ptr.deinit();
+                }
+                map.deinit();
+            }
+            try putToyQuant(alloc, c2, &map, "language_model.model.embed_tokens", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.norm.weight", &[_]i32{hidden});
+            try putToyQuant(alloc, c2, &map, "language_model.lm_head", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.post_attention_layernorm.weight", &[_]i32{hidden});
+            const la = "language_model.model.layers.0.linear_attn";
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_qkv", gdn_qkv, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_a", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_b", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_z", gdn_z, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".out_proj", hidden, gdn_z);
+            try putToyTensor(alloc, &map, la ++ ".conv1d.weight", &[_]i32{ gdn_qkv, 4, 1 });
+            try putToyTensor(alloc, &map, la ++ ".A_log", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".dt_bias", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".norm.weight", &[_]i32{8});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.down_proj", hidden, inter);
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.post_attention_layernorm.weight", &[_]i32{hidden});
+            const sa = "language_model.model.layers.1.self_attn";
+            try putToyQuant(alloc, c2, &map, sa ++ ".q_proj", 128, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".k_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".v_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".o_proj", hidden, 64);
+            try putToyTensor(alloc, &map, sa ++ ".q_norm.weight", &[_]i32{32});
+            try putToyTensor(alloc, &map, sa ++ ".k_norm.weight", &[_]i32{32});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.down_proj", hidden, inter);
+            var m = try Qwen38ServingModel.init(alloc, c2, c3, map);
+            m.ws = WeightSource.fromMap(&m.weights, c2, &m.ws_backing);
+            return m;
+        }
+    }.call;
+
+    // model: prefill 3, then verify [4,5] as continuation.
+    var model = try mkModel(allocator, ctx, &cfg);
+    defer {
+        model.deinit();
+        var it = model.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        model.weights.deinit();
+    }
+    // reference: fresh model, one-shot prefill of all 5.
+    var ref = try mkModel(allocator, ctx, &cfg);
+    defer {
+        ref.deinit();
+        var it = ref.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        ref.weights.deinit();
+    }
+
+    const l0 = try model.forwardTokens(&[_]u32{ 1, 2, 3 });
+    l0.deinit();
+    const l_ref = try ref.forwardTokens(&[_]u32{ 1, 2, 3, 4, 5 });
+    defer l_ref.deinit();
+
+    var v = try forwardVerifyImpl(&model, &[_]u32{ 4, 5 });
+    defer v.deinit(allocator);
+    const vshape = v.logits.shape();
+    try std.testing.expectEqual(@as(i32, 2), vshape[1]);
+    try std.testing.expectEqual(@as(i32, 64), vshape[2]);
+    try std.testing.expectEqual(@as(i32, 2), v.hidden_pre_norm_all.shape()[1]);
+
+    // Logits of the verify positions match the fresh full prefill.
+    {
+        const ref_tail = try ops.slice(ctx, l_ref, &[_]i32{ 0, 3, 0 }, &[_]i32{ 1, 5, 64 }, &[_]i32{ 1, 1, 1 });
+        defer ref_tail.deinit();
+        const got_f32 = try ops.astype(ctx, v.logits, .float32);
+        defer got_f32.deinit();
+        const exp_f32 = try ops.astype(ctx, ref_tail, .float32);
+        defer exp_f32.deinit();
+        const got = try got_f32.dataSlice(f32);
+        const exp = try exp_f32.dataSlice(f32);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+
+    // hidden_pre_norm row i must produce logits row i via final norm + lm_head.
+    {
+        const row0 = try ops.slice(ctx, v.hidden_pre_norm_all, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, 64 }, &[_]i32{ 1, 1, 1 });
+        defer row0.deinit();
+        const r0f = try ops.astype(ctx, row0, .float32);
+        defer r0f.deinit();
+        const n0 = try fast_mod.rmsNorm(ctx, r0f, model.final_norm_f32.?, cfg.rms_norm_eps);
+        defer n0.deinit();
+        const n0b = try ops.astype(ctx, n0, .bfloat16);
+        defer n0b.deinit();
+        const lg0 = try model.lm_head.?.apply(ctx, n0b);
+        defer lg0.deinit();
+        const lg0f = try ops.astype(ctx, lg0, .float32);
+        defer lg0f.deinit();
+        const v_col0 = try ops.slice(ctx, v.logits, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, 64 }, &[_]i32{ 1, 1, 1 });
+        defer v_col0.deinit();
+        const v0f = try ops.astype(ctx, v_col0, .float32);
+        defer v0f.deinit();
+        const got = try lg0f.dataSlice(f32);
+        const exp = try v0f.dataSlice(f32);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+
+    // Commit both verify positions, then decode token 6 — must match the
+    // reference model (which prefilled all 5) decoding token 6.
+    commitVerify(&model, &v, 2);
+    const l_a = try model.forwardTokens(&[_]u32{6});
+    defer l_a.deinit();
+    const l_b = try ref.forwardTokens(&[_]u32{6});
+    defer l_b.deinit();
+    {
+        const a32 = try ops.astype(ctx, l_a, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_b, .float32);
+        defer b32.deinit();
+        const got = try a32.dataSlice(f32);
+        const exp = try b32.dataSlice(f32);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+
+    // Rollback: a second model prefills 3, verifies [4,5], rolls back, then
+    // decodes token 4 — must match a fresh 3-prefill model decoding 4.
+    var model_r = try mkModel(allocator, ctx, &cfg);
+    defer {
+        model_r.deinit();
+        var it = model_r.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        model_r.weights.deinit();
+    }
+    var ref_r = try mkModel(allocator, ctx, &cfg);
+    defer {
+        ref_r.deinit();
+        var it = ref_r.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        ref_r.weights.deinit();
+    }
+    const lr0 = try model_r.forwardTokens(&[_]u32{ 1, 2, 3 });
+    lr0.deinit();
+    const lr_ref0 = try ref_r.forwardTokens(&[_]u32{ 1, 2, 3 });
+    lr_ref0.deinit();
+    var v2 = try forwardVerifyImpl(&model_r, &[_]u32{ 4, 5 });
+    defer v2.deinit(allocator);
+    rollbackVerify(&model_r, &v2);
+    const l_r = try model_r.forwardTokens(&[_]u32{4});
+    defer l_r.deinit();
+    const l_rr = try ref_r.forwardTokens(&[_]u32{4});
+    defer l_rr.deinit();
+    {
+        const a32 = try ops.astype(ctx, l_r, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_rr, .float32);
+        defer b32.deinit();
+        const got = try a32.dataSlice(f32);
+        const exp = try b32.dataSlice(f32);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
 }
