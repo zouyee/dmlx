@@ -1299,6 +1299,7 @@ pub const EngineLoop = struct {
                 break;
             }
             drafts_proposed += drafts.items.len;
+            defer h_cur.deinit(); // all exits below (incl. error breaks)
 
             // 2. Verify [t_next, d1..dN] on the backbone (continuation).
             var vids = std.ArrayList(u32).empty;
@@ -1309,6 +1310,10 @@ pub const EngineLoop = struct {
                 std.log.err("EngineLoop: MTP verify failed: {}", .{err});
                 break;
             };
+            // The verify box pins (N+1) x ~150 MB x 48 GDN layers of retained
+            // per-step states — it must be freed on EVERY exit from this
+            // round (normal, stop, max_tokens, and all error paths).
+            defer mtp.freeVerify(self.model.ptr, vh);
 
             // 3. Acceptance.
             var k: usize = 0; // accepted drafts
@@ -1355,9 +1360,7 @@ pub const EngineLoop = struct {
             }
             if (stop_in_drafts) {
                 // An accepted draft is a stop token: emit through it and end.
-                h_cur.deinit();
                 mtp.commit(self.model.ptr, vh, k + 1);
-                mtp.freeVerify(self.model.ptr, vh);
                 for (drafts.items[0..k]) |d| {
                     if (total_generated >= gen_config.max_tokens) break;
                     context.append(allocator, d) catch break;
@@ -1382,7 +1385,8 @@ pub const EngineLoop = struct {
                 // (p_target - q_draft)+, preserving the target distribution.
                 mtpResampleAdjusted(v_next, draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
 
-            const hidden_next = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
+            var hidden_next_opt: ?Array = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
+            defer if (hidden_next_opt) |hn| hn.deinit();
 
             // Full acceptance: d_N was never drafted — append it through the
             // head (tail draft) so the drafter cache covers every confirmed
@@ -1394,11 +1398,9 @@ pub const EngineLoop = struct {
                     t2.hidden.deinit();
                 }
             }
-            h_cur.deinit();
 
             // Commit k+1 backbone positions (t_next + accepted drafts).
             mtp.commit(self.model.ptr, vh, k + 1);
-            mtp.freeVerify(self.model.ptr, vh);
 
             // Emit accepted drafts + the next sampled token, capped at
             // max_tokens (plain decode emits exactly max_tokens).
@@ -1408,15 +1410,13 @@ pub const EngineLoop = struct {
                 total_generated += 1;
                 drafts_accepted += 1;
             }
-            if (total_generated >= gen_config.max_tokens) {
-                hidden_next.deinit();
-                break;
-            }
+            if (total_generated >= gen_config.max_tokens) break;
             t_next = next_sample;
             context.append(allocator, t_next.token) catch break;
             total_generated += 1;
             hidden.deinit();
-            hidden = hidden_next;
+            hidden = hidden_next_opt.?;
+            hidden_next_opt = null;
             if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
                 stopped = true;
                 finish = .stop;
