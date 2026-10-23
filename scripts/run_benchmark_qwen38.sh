@@ -14,6 +14,7 @@
 #   SKIP_BENCHMARK_BUILD=1   reuse zig-out/bin/dmlx as-is
 #   SKIP_PURGE=1             skip sudo purge
 #   BENCHMARK_JSON=<path>    override JSON output path
+#   EXTRA_SERVE_FLAGS="..."  extra flags for `dmlx serve` (e.g. --speculative-mtp 2)
 # ============================================================
 
 set -uo pipefail
@@ -85,7 +86,7 @@ cleanup
 # Serve
 # ------------------------------------------------------------------
 T_PERF=$(date +%s)
-"$CLI" serve --model "$MODEL_PATH" --port "$PORT" > "$SERVE_LOG" 2>&1 &
+"$CLI" serve --model "$MODEL_PATH" --port "$PORT" ${EXTRA_SERVE_FLAGS:-} > "$SERVE_LOG" 2>&1 &
 SERVER_PID=$!
 
 RSS_SAMPLE_FILE=$(mktemp)

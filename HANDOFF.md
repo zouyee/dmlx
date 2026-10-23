@@ -6,6 +6,10 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
 
 ## What works
 
+- **Qwen3.8 MTP speculative decoding (2026-10-23)** — see the dedicated
+  section below. `--speculative-mtp N` (server/CLI) enables it;
+  ~1.6-1.7× effective decode on greedy workloads.
+
 - **Qwen3.8-27B-4bit (qwen3_5, hybrid GDN + full attention)** end to end:
   config parsing (`src/models/qwen38_loader.zig`), GDN linear-attention module
   (`qwen38_gdn.zig`), partial-RoPE full attention (`qwen38_attn.zig`), model
@@ -22,6 +26,77 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
   (`<|vision_start|>`, `<|vision_end|>`, `<|vision_pad|>`, `<|image_pad|>`,
   `<|video_pad|>`) raise `error.VisionInputNotSupported` from
   `Qwen38ServingModel.forwardTokens` (`qwen38.rejectVisionTokens`).
+
+## MTP speculative decoding (2026-10-23)
+
+**Design** (commits `2bd5b34`, `41b4907`, `23d6321` + memory-hardening fix):
+- Drafter: `mlx-community/Qwen3.8-27B-MTP-4bit` (239 MB, 4-bit gs=64) at
+  `/Users/zouyee/models/Qwen3.8-27B-MTP-4bit`; override via
+  `DMLX_QWEN38_MTP_DIR`. Loaded lazily on first `--speculative-mtp` request.
+- `src/models/qwen38_mtp.zig` (`Qwen38Mtp`): pre_fc norms + fc(2H→H) + one
+  full-attention decoder layer (own KV cache) + final norm → shared
+  embed/lm_head. Chaining convention (verified against omlx/HF): the next
+  pass consumes the POST-final-norm output.
+- Backbone verify continuation (`forwardVerifyImpl`/`commitVerify`/
+  `rollbackVerify` in `qwen38.zig`): L>1 without reset; GDN per-position
+  states retained per round and committed/rolled back (`prefillVerify`,
+  per-step recurrence — verify rounds are tiny, N+1 ≤ 4). Attention rollback
+  is `len_` truncation. MLX fast SDPA `"causal"` is right-aligned (verified
+  empirically) — no explicit mask needed.
+- Engine loop `processMtpRequest` (non-streaming only; guided decoding is
+  untouched): draft chain → one backbone verify → greedy longest-prefix at
+  temperature 0 / speculative sampling with (p−q)+ resample at temp>0 →
+  commit/rollback → bonus token on full acceptance. Drafter prompt pass at
+  prefill (head processes the prompt so its KV/RoPE offsets are correct).
+- Flags: `--speculative-mtp N` (drafts/round; N=2 default choice, N=3 also
+  works). Benchmark script: `EXTRA_SERVE_FLAGS="--speculative-mtp 2"`.
+
+**Measured (temp 0, M4 Pro 48 GB):**
+
+| Metric | MTP off | MTP N=2 | MTP N=3 |
+|---|---|---|---|
+| 128-token request, code (best of 2) | 9.14 s | 5.54 s | 5.82 s |
+| 128-token request, prose | 9.20 s | 5.98 s | 6.35 s |
+| 128-token request, math | 9.44 s | 5.95 s | 5.94 s |
+| Benchmark long-decode diagnostic | 13.8 tok/s | **24.05 tok/s** | — |
+| Acceptance rate (code/prose/math) | — | 83–85% | 72–82% |
+
+→ N=2 is the sweet spot (~1.6-1.7× effective decode; N=3 slightly worse).
+
+**Correctness / losslessness (honest version):**
+- MTP-on is fully deterministic at temperature 0 (after fixing the
+  `req.sampler` bug below).
+- 2/3 fixed prompts bitwise identical to MTP-off; the third diverges at one
+  bf16 near-tie flip. Root cause measured: batched-verify vs decode-step
+  logits drift up to 0.0625 (bf16 rounding) — argmax flips only when top-2
+  gap < ~0.06. Strict bitwise equality is infeasible at bf16 (same for
+  omlx/vLLM). Instead verified: self-consistency probe — every emitted token
+  equals the model's own argmax in a fresh single batched re-prefill (9/9),
+  i.e. MTP emits exactly the target model's greedy path under batched
+  scoring.
+- Benchmark with `--speculative-mtp 2`: Paris ✓, E2E 7/7.
+
+**Memory (hardened before measurement):**
+- All MTP round exits free the verify box + retained per-step GDN states
+  (single `defer freeVerify`; previously error/max_tokens paths leaked
+  ~150 MB × positions × 48 layers per round). h_cur/hidden_next ownership
+  audited; stale drafter round state cleared in freeVerify.
+- Per-round transient is bounded by design: (N+1) × ~150 MB × 48 GDN layers
+  retained only within one round. Peak RSS (0.5 s polling during
+  2×128-token requests): off 11.56 GB vs N=2 11.48 GB — no delta.
+- Drafter loads once per adapter (idempotent enable), freed at adapter deinit.
+
+**Bugs found and fixed along the way:**
+- `req.sampler` was never initialized from the request in the serial engine
+  path (only `prefillBatch` does) — `SamplerConfig` defaults to
+  temperature **1.0**, so temperature=0 requests still sampled stochastically
+  in the MTP loop. Fixed inside `processMtpRequest` (init from gen_config).
+  **Known issue, unfixed**: the pre-existing ngram speculative path
+  (`processSpeculativeRequest` fallback `generateStep` calls) uses the same
+  uninitialized `req.sampler` and has the same latent bug.
+- Emission overshoot past max_tokens (capped).
+- mlx-lm has no native MTP for this arch (it strips the weights at load);
+  omlx monkey-patches. dmlx's is a native implementation.
 
 ## Measured performance (M4 Pro, 48 GB)
 
