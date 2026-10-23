@@ -100,6 +100,83 @@ pub const Qwen38Mtp = struct {
     /// accepted token; rollback is a length truncation (Task 3).
     cache: qwen38_attn.Qwen38AttnCache = .{},
 
+    /// Prompt pass: run the head over the prompt so the drafter's KV cache
+    /// covers the confirmed sequence with correct RoPE offsets. Inputs follow
+    /// the head's shifted convention (omlx/HF): head position j fuses
+    /// backbone hidden row j with embed(token_ids[j]); pass
+    /// `hidden_rows = hidden_pre_norm_all[0 .. L-2]` and
+    /// `token_ids = prompt[1..]`. Attention runs prefill-mode causal over the
+    /// head's own cache (offset = current cache len). Returns the last
+    /// position's post-norm hidden [1, hidden] bf16 (chaining input for the
+    /// first draft) — the caller's first draft still uses the BACKBONE
+    /// last-position hidden per the omlx convention.
+    pub fn prefill(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_rows: Array, // [L-1, hidden] bf16
+        token_ids: []const u32, // [L-1]
+        embed_table_bf16: Array, // shared backbone embed table
+    ) !Array {
+        const ctx = self.ctx;
+        const hidden: i32 = @intCast(self.dims.hidden_size);
+        const L: i32 = @intCast(token_ids.len);
+        const eps = self.dims.rms_norm_eps;
+        if (L < 1) return error.MtpPrefillEmpty;
+
+        const ids_i32 = try allocator.alloc(i32, token_ids.len);
+        defer allocator.free(ids_i32);
+        for (token_ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+        const ids_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{L});
+        defer ids_arr.deinit();
+
+        // e = normE(embed(tokens)); h = normH(hidden rows) — positionwise.
+        const rows = try shape_mod.takeAxis(ctx, embed_table_bf16, ids_arr, 0); // [L-1, hidden] bf16
+        defer rows.deinit();
+        const e = try rmsNormBf16(ctx, rows, self.pre_fc_norm_embedding_f32, eps);
+        defer e.deinit();
+        const h = try rmsNormBf16(ctx, hidden_rows, self.pre_fc_norm_hidden_f32, eps);
+        defer h.deinit();
+
+        // fused = fc(concat([e, h], -1))  [L-1, hidden]
+        const cat = try shape_mod.concatenateAxis(ctx, &[_]Array{ e, h }, 1);
+        defer cat.deinit();
+        const fused = try self.fc.apply(ctx, cat);
+        defer fused.deinit();
+
+        // Decoder layer over the sequence (prefill-mode causal attention).
+        const fused3 = try ops.reshape(ctx, fused, &[_]i32{ 1, L, hidden });
+        defer fused3.deinit();
+        const n1 = try rmsNormBf16(ctx, fused3, self.ln1_f32, eps);
+        defer n1.deinit();
+        const attn_out = try self.attn.forward(n1, &self.cache); // [1, L-1, hidden]
+        defer attn_out.deinit();
+        const h2 = try ops.add(ctx, fused3, attn_out);
+        defer h2.deinit();
+
+        const n2 = try rmsNormBf16(ctx, h2, self.ln2_f32, eps);
+        defer n2.deinit();
+        const gate = try self.mlp_gate.apply(ctx, n2);
+        defer gate.deinit();
+        const up = try self.mlp_up.apply(ctx, n2);
+        defer up.deinit();
+        const act = try activations.silu(ctx, gate);
+        defer act.deinit();
+        const hh = try ops.multiply(ctx, act, up);
+        defer hh.deinit();
+        const mlp_out = try self.mlp_down.apply(ctx, hh);
+        defer mlp_out.deinit();
+        const dec_out = try ops.add(ctx, h2, mlp_out);
+        defer dec_out.deinit();
+
+        const normed = try rmsNormBf16(ctx, dec_out, self.norm_f32, eps);
+        defer normed.deinit();
+        const last = try ops.slice(ctx, normed, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden }, &[_]i32{ 1, 1, 1 });
+        defer last.deinit();
+        const flat = try ops.reshape(ctx, last, &[_]i32{ 1, hidden });
+        defer flat.deinit();
+        return ops.copy(ctx, flat);
+    }
+
     pub fn deinit(self: *Qwen38Mtp) void {
         self.pre_fc_norm_hidden_f32.deinit();
         self.pre_fc_norm_embedding_f32.deinit();

@@ -661,25 +661,48 @@ pub const Qwen38VTableAdapter = struct {
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         const m = self.mtp.?;
-        // Reset the drafter state alongside the backbone (forwardTokensHidden
-        // resets the backbone on L>1).
+        const ctx = self.model.ctx;
+        // Backbone: normal prefill path (reset + fused recurrence — NO
+        // per-position state retention; verify-mode would pin L x 3.1 MB x 48
+        // layers and OOM at long prompts).
         m.cache.deinit();
         m.cache = .{};
         self.mtp_round_old_len = null;
-        const out = try self.model.forwardTokensHidden(ids);
-        errdefer out.logits.deinit();
-        errdefer out.hidden.deinit();
-        // Last-position logits → [vocab] f32.
+        const out = try self.model.forwardTokensAllHidden(ids);
+        defer out.logits.deinit();
+        defer out.hidden_all.deinit();
+
+        // Drafter prompt pass: populate the head's KV cache over the prompt
+        // (head position j ← (backbone hidden row j, embed ids[j+1])).
+        if (ids.len > 1) {
+            const hidden: i32 = out.hidden_all.shape()[2];
+            const rows = try ops.slice(ctx, out.hidden_all, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @as(i32, @intCast(ids.len)) - 1, hidden }, &[_]i32{ 1, 1, 1 });
+            defer rows.deinit();
+            const rows2 = try ops.reshape(ctx, rows, &[_]i32{ @as(i32, @intCast(ids.len)) - 1, hidden });
+            defer rows2.deinit();
+            const tail_hidden = try m.prefill(self.allocator, rows2, ids[1..], self.model.embed_table_bf16.?);
+            tail_hidden.deinit(); // last-row output unused — the first draft
+            // takes the BACKBONE last-position hidden (omlx convention).
+        }
+
+        // Last-position logits → [vocab] f32; last hidden row → [1, hidden].
         const lshape = out.logits.shape();
         const vocab: i32 = lshape[2];
         const L: i32 = lshape[1];
-        const last = try ops.slice(self.model.ctx, out.logits, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, vocab }, &[_]i32{ 1, 1, 1 });
+        const last = try ops.slice(ctx, out.logits, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, vocab }, &[_]i32{ 1, 1, 1 });
         defer last.deinit();
-        const flat = try ops.reshape(self.model.ctx, last, &[_]i32{vocab});
+        const flat = try ops.reshape(ctx, last, &[_]i32{vocab});
         defer flat.deinit();
-        const logits = try ops.astype(self.model.ctx, flat, .float32);
-        out.logits.deinit();
-        return .{ .logits = logits, .hidden = out.hidden };
+        const logits = try ops.astype(ctx, flat, .float32);
+        errdefer logits.deinit();
+
+        const hidden_dim: i32 = out.hidden_all.shape()[2];
+        const hrow = try ops.slice(ctx, out.hidden_all, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden_dim }, &[_]i32{ 1, 1, 1 });
+        defer hrow.deinit();
+        const hflat = try ops.reshape(ctx, hrow, &[_]i32{ 1, hidden_dim });
+        defer hflat.deinit();
+        const hidden = try ops.copy(ctx, hflat);
+        return .{ .logits = logits, .hidden = hidden };
     }
 
     fn mtpDraft(ctx_ptr: *anyopaque, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
@@ -761,6 +784,7 @@ pub const Qwen38VTableAdapter = struct {
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         v.deinit(self.allocator);
         self.allocator.destroy(v);
+        self.mtp_round_old_len = null; // never leave stale round state
     }
 
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {

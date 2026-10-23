@@ -1728,7 +1728,7 @@ pub const Qwen38ServingModel = struct {
     /// All weights come from the persistent per-layer modules built at init —
     /// no WeightSource lookups, COW copies, or module construction per token.
     pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
-        const res = try self.forwardTokensCore(ids, false);
+        const res = try self.forwardTokensCore(ids, .none);
         return res.logits;
     }
 
@@ -1737,16 +1737,29 @@ pub const Qwen38ServingModel = struct {
         hidden: Array, // [1, hidden] bf16, pre-final-norm, LAST position
     };
 
+    pub const ForwardAllHiddenOut = struct {
+        logits: Array, // [1, L, vocab]
+        hidden_all: Array, // [1, L, hidden] bf16, pre-final-norm, ALL positions
+    };
+
     /// forwardTokens + the pre-final-norm hidden at the last position (the
     /// MTP head's chaining input after a prefill or plain decode step).
     pub fn forwardTokensHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardHiddenOut {
-        const res = try self.forwardTokensCore(ids, true);
+        const res = try self.forwardTokensCore(ids, .last);
         return .{ .logits = res.logits, .hidden = res.hidden.? };
     }
 
+    /// forwardTokens + pre-final-norm hidden for ALL positions (MTP drafter
+    /// prompt pass input; one array, no per-step state retention).
+    pub fn forwardTokensAllHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardAllHiddenOut {
+        const res = try self.forwardTokensCore(ids, .all);
+        return .{ .logits = res.logits, .hidden_all = res.hidden.? };
+    }
+
+    const HiddenCapture = enum { none, last, all };
     const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
-    fn forwardTokensCore(self: *Qwen38ServingModel, ids: []const u32, capture_hidden: bool) !ForwardCoreOut {
+    fn forwardTokensCore(self: *Qwen38ServingModel, ids: []const u32, capture: HiddenCapture) !ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
@@ -1865,13 +1878,17 @@ pub const Qwen38ServingModel = struct {
         }
 
         // Final norm → bf16 → lm_head (mirrors Qwen38Model.forward).
-        const hidden_cap: ?Array = if (capture_hidden) blk: {
-            const last = try ops.slice(ctx, h, &[_]i32{ 0, @as(i32, @intCast(ids.len)) - 1, 0 }, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-            defer last.deinit();
-            const flat = try ops.reshape(ctx, last, &[_]i32{ 1, @intCast(cfg.hidden_size) });
-            defer flat.deinit();
-            break :blk try ops.copy(ctx, flat); // [1, hidden] bf16, pre-norm
-        } else null;
+        const hidden_cap: ?Array = switch (capture) {
+            .none => null,
+            .last => blk: {
+                const last = try ops.slice(ctx, h, &[_]i32{ 0, @as(i32, @intCast(ids.len)) - 1, 0 }, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+                defer last.deinit();
+                const flat = try ops.reshape(ctx, last, &[_]i32{ 1, @intCast(cfg.hidden_size) });
+                defer flat.deinit();
+                break :blk try ops.copy(ctx, flat); // [1, hidden] bf16, pre-norm
+            },
+            .all => try ops.copy(ctx, h), // [1, L, hidden] bf16, pre-norm
+        };
         errdefer if (hidden_cap) |hc| hc.deinit();
         const h_f32 = try ops.astype(ctx, h, .float32);
         defer h_f32.deinit();
