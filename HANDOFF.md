@@ -28,21 +28,42 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
 **Prefill scaling (2026-10-22, warm best-of-3, interleaved same-session;
 dmlx = Task 1 + Task 2 + sync-cadence fix):**
 
-| L | dmlx tok/s | mlx-lm tok/s | gap |
+| L | dmlx tok/s | mlx-lm tok/s | omlx (custom kernels) tok/s |
 |---|---|---|---|
-| 512 | 112.6 | 117.5 | 4% |
-| 1024 | 117.5 | 124.6 | 6% |
-| 2048 | 117.2 | 124.8 | 6% |
-| 4096 | 114.8 | 124.1 | 7% |
+| 512 | 112.6 | 117.5 | 123.7 |
+| 1024 | 117.5 | 124.6 | 127.2 |
+| 2048 | 117.2 | 124.8 | 128.2 |
+| 4096 | 114.8 | 124.1 | 116.8 |
+
+omlx measured 2026-10-22 via `omlx serve` + /v1/chat/completions
+(prompt_tokens / prompt_eval_duration, fresh random-word prompts each
+attempt — prefix cache confirmed defeated via cached_tokens=0; actual prompt
+sizes undershot the target by up to ~8% at 2k/4k, harmless given flat
+scaling). omlx's L=4096 attempts degraded across reps (116.8 → 93 → 73,
+thermal/memory pressure), so its 4k number is a best-case outlier of a
+declining series; dmlx was stable at 113-117 there. Interleaving note: dmlx
+numbers above are from a solo run; when measured with the omlx server
+co-resident (15 GB), dmlx lost ~10% at L=1024 to memory pressure.
+
+**Decode, same session (2026-10-22):**
+
+| Engine | tok/s |
+|---|---|
+| dmlx | 14.0 |
+| mlx-lm | 15.41 |
+| omlx (custom kernels) | 15.42 |
 
 Baseline before this work was 32.6 tok/s at L=512 (per-token GDN loop) and
 flat ~32 at any L, so the improvement is ~3.5× across the range. NOTE: the
 earlier "mlx-lm warm ~95" reference was measured at L=61 where fixed
 overheads dominate; at matched lengths mlx-lm is ~123-124 tok/s, so dmlx is
-within 4-7% (not ahead). The residual gap is 4-bit qmm compute throughput at
-long-L shapes — prefill at long L is compute-bound (MLP ≈ 55% of barrier-
-inflated section time at L=4096; SDPA measured in isolation: 40 ms/call at
-L=4096 = <2% of wall, so the omlx fa256 port is NOT warranted).
+within 4-7% at prefill (not ahead). The residual gap is 4-bit qmm compute
+throughput at long-L shapes — prefill at long L is compute-bound (MLP ≈ 55%
+of barrier-inflated section time at L=4096; SDPA measured in isolation:
+40 ms/call at L=4096 = <2% of wall, so the omlx fa256 port is NOT
+warranted). Decode: omlx ≈ mlx-lm ≈ 15.4 vs dmlx 14.0 — the ~9% delta is
+the known residual qmm-wall/dispatch gap (decode SDPA kernels measured
+wall-neutral at every context length), not attention.
 
 - Task 1: one batched qmm per projection over `[1,L,*]`, whole-sequence
   causal conv (`convAccumSeq`), vectorized gates/out-gate; recurrence stayed
