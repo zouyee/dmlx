@@ -74,7 +74,9 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
 | Benchmark long-decode diagnostic | 13.8 tok/s | **24.05 tok/s** | — |
 | Acceptance rate (code/prose/math) | — | 83–85% | 72–82% |
 
-→ N=2 is the sweet spot (~1.6-1.7× effective decode; N=3 slightly worse).
+→ N=2 was the sweet spot at the time (~1.6-1.7× effective decode); after the
+2026-10-24 replay-semantics + round-overhead fixes, **N=3 is the sweet spot**
+(see the update sections below).
 
 **2026-10-24 update (fused GDN verify, `ab078d5`):** the verify recurrence
 runs as ONE Metal kernel per GDN layer with per-position states in `s_all`
@@ -82,19 +84,27 @@ runs as ONE Metal kernel per GDN layer with per-position states in `s_all`
 Per-round profile (ms, N=2, code prompt): draft 11.0 / verify 82.4 /
 accept 3.4 / commit 0.1 (verify was 94.2). Request wall 5.39 → **4.84 s**;
 long-decode diagnostic 24.05 → **26.83 tok/s**; acceptance 86.2% (fused vs
-eager numeric path flips near-ties). N=3 with replay semantics: acceptance
-no longer degrades (85.2% flat — the pre-replay 72–82% drop was stale
-drafter-cache entries), wall parity with N=2 (4.84 s), N=2 stays default.
-**Next bottleneck identified: the verify phase is CPU graph-BUILD bound** —
-`mtp.verify()` is lazy, so its ~82 ms lap is graph construction (GPU forward
-overlaps it; the acceptance sampling tail is only ~3 ms). The decode path
-killed the same cost with mx.compile closures ("compiled GDN decode step");
-verify (M = N+1) still builds the full prefill-style graph per round.
-Candidate: compiled verify closures specialized at enable time for the fixed
-L = n_drafts+1. Kernel-side gotcha fixed en route: MLX passes inputs smaller
-than its constant-space cutoff as `constant` — both prefill recurrence
-kernel bodies now declare small-input pointers (`g`/`beta`, [L, HV]) as
-`auto` instead of `const device float*`.
+eager numeric path flips near-ties). Kernel-side gotcha fixed en route: MLX
+passes inputs smaller than its constant-space cutoff as `constant` — both
+prefill recurrence kernel bodies now declare small-input pointers
+(`g`/`beta`, [L, HV]) as `auto` instead of `const device float*`.
+
+**2026-10-24 update 2 (batched argmax + GPU draft chain, `34ffb13`):**
+accept-phase per-row sampling (L × full-vocab CPU pull+scan) replaced by one
+batched GPU argmax (`MtpOps.verifyArgmax`): accept 3.4 → 0.2 ms/round.
+Greedy draft chain now keeps token ids on GPU (`MtpOps.draftGreedy`,
+`Qwen38Mtp.forwardGreedyGpu`), one sync per chain: draft 11.2 → 9.0
+ms/round. With per-round overheads down, **N=3 is the new sweet spot**:
+replay semantics keep acceptance flat at 85.2% through depth 3, while N=4
+degrades (72% code / 51% prose — chained drafts past depth 3 are weak) and
+loses. Results (temp 0, M4 Pro): 128-token code request 5.39 → 4.84 →
+**4.45 s (N=3)**; long-decode diagnostic 24.05 → 26.83 → **29.37 tok/s
+(N=3)** — within ~6% of mlx-vlm's 31.1 (was a 1.3-1.4× gap). Verify-cost
+split (DMLX_MTP_DEBUG): N=2 verify 82.4 ms = 64.7 ms graph build (GPU mostly
+overlaps it) + 17.8 ms eval drain; +1 verify position costs ~19 ms, mostly
+build. Remaining levers, in order: compiled verify closures (build is the
+exposed cost), drafter-step compile (~4 ms/round), s_all write elision
+(~2.6 ms GPU/round, needs failable commit).
 
 **Correctness / losslessness (honest version):**
 - MTP-on is fully deterministic at temperature 0 (after fixing the
