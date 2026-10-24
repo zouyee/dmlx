@@ -2066,7 +2066,7 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
 pub fn commitVerify(self: *Qwen38ServingModel, v: *Qwen38VerifyOut, accepted: usize) void {
     const a_idx = accepted - 1;
     for (v.gdn, v.gdn_layers) |*r, layer| {
-        qwen38_gdn.Qwen38GDN.commitVerifyStates(&self.caches[layer].gdn, r, self.allocator, a_idx);
+        qwen38_gdn.Qwen38GDN.commitVerifyStates(self.ctx, &self.caches[layer].gdn, r, self.allocator, a_idx);
     }
     for (v.attn_layers, v.attn_old_lens) |layer, old| {
         self.caches[layer].attn.len_ = old + @as(i32, @intCast(accepted));

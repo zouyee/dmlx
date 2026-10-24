@@ -1231,6 +1231,29 @@ pub const EngineLoop = struct {
         var drafts_proposed: usize = 0;
         var drafts_accepted: usize = 0;
 
+        // Phase profiling (printed in the final log line).
+        const prof_now = struct {
+            fn f() i128 {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+                return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+            }
+        }.f;
+        var prof_last: i128 = prof_now();
+        var prof_draft_ns: u64 = 0;
+        var prof_verify_ns: u64 = 0;
+        var prof_accept_ns: u64 = 0;
+        var prof_commit_ns: u64 = 0;
+        var prof_rounds: u64 = 0;
+        const prof_lap = struct {
+            fn f(now_fn: *const fn () i128, t: *i128, acc: *u64) void {
+                const now = now_fn();
+                const delta = now - t.*;
+                acc.* +|= if (delta > 0) @intCast(delta) else 0;
+                t.* = now;
+            }
+        }.f;
+
         var finish: TokenFinishReason = .length;
         var stopped = generation_mod.isStopToken(t_next.token, gen_config.stop_tokens);
         if (stopped) finish = .stop;
@@ -1300,6 +1323,8 @@ pub const EngineLoop = struct {
             }
             drafts_proposed += drafts.items.len;
             defer h_cur.deinit(); // all exits below (incl. error breaks)
+            prof_lap(prof_now, &prof_last, &prof_draft_ns);
+            prof_rounds +|= 1;
 
             // 2. Verify [t_next, d1..dN] on the backbone (continuation).
             var vids = std.ArrayList(u32).empty;
@@ -1314,6 +1339,7 @@ pub const EngineLoop = struct {
             // per-step states — it must be freed on EVERY exit from this
             // round (normal, stop, max_tokens, and all error paths).
             defer mtp.freeVerify(self.model.ptr, vh);
+            prof_lap(prof_now, &prof_last, &prof_verify_ns);
 
             // 3. Acceptance.
             var k: usize = 0; // accepted drafts
@@ -1387,6 +1413,7 @@ pub const EngineLoop = struct {
 
             var hidden_next_opt: ?Array = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
             defer if (hidden_next_opt) |hn| hn.deinit();
+            prof_lap(prof_now, &prof_last, &prof_accept_ns);
 
             // Commit k+1 backbone positions (t_next + accepted drafts); the
             // adapter replays the accepted drafts through the drafter with
@@ -1395,7 +1422,7 @@ pub const EngineLoop = struct {
                 std.debug.print("MTP round: t={d} drafts={any} k={d} t'={d}\n", .{ t_next.token, drafts.items, k, next_sample.token });
             }
             mtp.commit(self.model.ptr, vh, k + 1, vids.items);
-
+            prof_lap(prof_now, &prof_last, &prof_commit_ns);
             // Emit accepted drafts + the next sampled token, capped at
             // max_tokens (plain decode emits exactly max_tokens).
             for (drafts.items[0..k]) |d| {
@@ -1419,11 +1446,21 @@ pub const EngineLoop = struct {
         hidden.deinit();
 
         if (drafts_proposed > 0) {
-            std.log.info("[Engine] MTP request {d}: acceptance {d:.1}% ({d}/{d} drafts)", .{
+            const ms = struct {
+                fn f(ns: u64) f64 {
+                    return @as(f64, @floatFromInt(ns)) / 1e6;
+                }
+            }.f;
+            const rounds = if (prof_rounds > 0) prof_rounds else 1;
+            std.log.info("[Engine] MTP request {d}: acceptance {d:.1}% ({d}/{d} drafts); ms/round draft={d:.1} verify={d:.1} accept={d:.1} commit={d:.1}", .{
                 req.id,
                 100.0 * @as(f64, @floatFromInt(drafts_accepted)) / @as(f64, @floatFromInt(drafts_proposed)),
                 drafts_accepted,
                 drafts_proposed,
+                ms(prof_draft_ns / rounds),
+                ms(prof_verify_ns / rounds),
+                ms(prof_accept_ns / rounds),
+                ms(prof_commit_ns / rounds),
             });
         }
 

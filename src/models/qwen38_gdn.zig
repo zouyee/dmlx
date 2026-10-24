@@ -961,12 +961,15 @@ const prefill_rec_kernel_body =
     \\    }}
     \\
     \\    // q, k, v, y: [L, HV, D]; g, beta: [L, HV].
+    \\    // NB: inputs with fewer elements than MLX's constant-space cutoff are
+    \\    // passed in the constant address space, so small-input pointers use
+    \\    // auto (g/beta are [L, HV] — tiny for short prompts / small heads).
     \\    const device float* q_ = q + hv * {[d]};
     \\    const device float* k_ = k + hv * {[d]};
     \\    const device float* v_ = v + hv * {[d]};
     \\    device float* y_ = y + hv * {[d]};
-    \\    const device float* g_ = g + hv;
-    \\    const device float* beta_ = beta + hv;
+    \\    auto g_ = g + hv;
+    \\    auto beta_ = beta + hv;
     \\
     \\    for (int t = 0; t < T; ++t) {{
     \\        const float gh = g_[0];
@@ -999,9 +1002,71 @@ const prefill_rec_kernel_body =
     \\
 ;
 
+// Verify variant: same recurrence, plus a per-position state output s_all
+// [L, HV, Dv, Dk] written inside the t-loop after each rank-1 update, so a
+// later commit can adopt any accepted position's state without re-running.
+// Replaces the per-step eager retain loop (one kernel launch per layer
+// instead of L × (12 view ops + 1 step kernel)).
+const prefill_rec_retain_kernel_body =
+    \\    const uint hv = thread_position_in_grid.z;
+    \\    const uint dv = thread_position_in_grid.y;
+    \\    const uint dk = thread_position_in_threadgroup.x;
+    \\    const int T = T_in[0];
+    \\
+    \\    // state: [HV, Dv, Dk]; this thread owns row dv, Dk slice dk.
+    \\    const device float* i_state = s_in + (hv * {[d]} + dv) * {[d]};
+    \\    float state[{[npt]}];
+    \\    for (int i = 0; i < {[npt]}; ++i) {{
+    \\        state[i] = i_state[{[npt]} * dk + i];
+    \\    }}
+    \\
+    \\    // q, k, v, y: [L, HV, D]; g, beta: [L, HV]; s_all: [L, HV, D, D].
+    \\    // NB: inputs with fewer elements than MLX's constant-space cutoff are
+    \\    // passed in the constant address space, so input pointers use auto.
+    \\    auto q_ = q + hv * {[d]};
+    \\    auto k_ = k + hv * {[d]};
+    \\    auto v_ = v + hv * {[d]};
+    \\    device float* y_ = y + hv * {[d]};
+    \\    auto g_ = g + hv;
+    \\    auto beta_ = beta + hv;
+    \\    device float* s_all_ = s_all + (hv * {[d]} + dv) * {[d]};
+    \\
+    \\    for (int t = 0; t < T; ++t) {{
+    \\        const float gh = g_[0];
+    \\        float kv = 0.0f;
+    \\        for (int i = 0; i < {[npt]}; ++i) {{
+    \\            const uint s_idx = {[npt]} * dk + i;
+    \\            state[i] = state[i] * gh;
+    \\            kv += state[i] * k_[s_idx];
+    \\        }}
+    \\        kv = metal::simd_sum(kv);
+    \\        const float delta = (v_[dv] - kv) * beta_[0];
+    \\        float out = 0.0f;
+    \\        for (int i = 0; i < {[npt]}; ++i) {{
+    \\            const uint s_idx = {[npt]} * dk + i;
+    \\            state[i] = state[i] + k_[s_idx] * delta;
+    \\            out += state[i] * q_[s_idx];
+    \\        }}
+    \\        out = metal::simd_sum(out);
+    \\        if (dk == 0) y_[dv] = out; // lane 0 of the simdgroup owns the write
+    \\        for (int i = 0; i < {[npt]}; ++i) {{
+    \\            s_all_[{[npt]} * dk + i] = state[i];
+    \\        }}
+    \\        q_ += {[hvd]};
+    \\        k_ += {[hvd]};
+    \\        v_ += {[hvd]};
+    \\        y_ += {[hvd]};
+    \\        g_ += {[hv]};
+    \\        beta_ += {[hv]};
+    \\        s_all_ += {[hvdd]};
+    \\    }}
+    \\
+;
+
 const PrefillRecKernelKey = struct {
     d: i32,
     hv: i32,
+    retain: bool = false,
 };
 
 const PrefillRecKernelEntry = struct {
@@ -1021,21 +1086,30 @@ fn prefillRecWarn(err: anyerror) void {
 }
 
 fn createPrefillRecKernel(allocator: std.mem.Allocator, key: PrefillRecKernelKey) !c.c.mlx_fast_metal_kernel {
-    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_rec_d{d}_h{d}", .{ key.d, key.hv }, 0);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_rec{s}_d{d}_h{d}", .{ if (key.retain) "_ret" else "", key.d, key.hv }, 0);
     defer allocator.free(name_z);
-    const source_z = try std.fmt.allocPrintSentinel(allocator, prefill_rec_kernel_body, .{
-        .d = key.d,
-        .npt = @divExact(key.d, 32),
-        .hv = key.hv,
-        .hvd = key.hv * key.d,
-    }, 0);
+    const source_z = if (key.retain)
+        try std.fmt.allocPrintSentinel(allocator, prefill_rec_retain_kernel_body, .{
+            .d = key.d,
+            .npt = @divExact(key.d, 32),
+            .hv = key.hv,
+            .hvd = key.hv * key.d,
+            .hvdd = key.hv * key.d * key.d,
+        }, 0)
+    else
+        try std.fmt.allocPrintSentinel(allocator, prefill_rec_kernel_body, .{
+            .d = key.d,
+            .npt = @divExact(key.d, 32),
+            .hv = key.hv,
+            .hvd = key.hv * key.d,
+        }, 0);
     defer allocator.free(source_z);
     const header_z = try allocator.dupeZ(u8, "");
     defer allocator.free(header_z);
 
     const in_vec = try makeStringVec(allocator, &.{ "q", "k", "v", "g", "beta", "s_in", "T_in" });
     defer _ = c.c.mlx_vector_string_free(in_vec);
-    const out_vec = try makeStringVec(allocator, &.{ "y", "s_out" });
+    const out_vec = try makeStringVec(allocator, if (key.retain) &.{ "y", "s_all" } else &.{ "y", "s_out" });
     defer _ = c.c.mlx_vector_string_free(out_vec);
 
     return c.c.mlx_fast_metal_kernel_new(
@@ -1130,6 +1204,67 @@ fn deltaRulePrefillFused(
     var s_handle = c.c.mlx_array_new();
     try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
     return .{ .s_new = Array.fromHandle(s_handle), .y = Array.fromHandle(y_handle) };
+}
+
+pub const PrefillRetainFusedOut = struct {
+    y: Array, // [L, HV, D] f32
+    s_all: Array, // [L, HV, D, D] f32 — state after each step (one buffer)
+};
+
+/// Verify-mode fused recurrence: single Metal kernel over the whole (tiny)
+/// verify block, additionally writing the post-step state of EVERY position
+/// into s_all. Same eligibility rules as deltaRulePrefillFused; null → caller
+/// falls back to deltaRulePrefillEagerRetain.
+fn deltaRulePrefillFusedRetain(
+    ctx: EagerContext,
+    ssm_state: Array, // [HV, D, D] f32
+    k_full: Array, // [L, HV, D] f32
+    v: Array, // [L, HV, D] f32
+    beta: Array, // [L, HV] f32
+    g: Array, // [L, HV] f32
+    q_full: Array, // [L, HV, D] f32
+    hv: i32,
+    d: i32,
+) !?PrefillRetainFusedOut {
+    if (@mod(d, 32) != 0 or d < 32) return null;
+    const L: i32 = @intCast(k_full.shape()[0]);
+    if (L < 1) return null;
+    const dt_f32 = dtype_mod.Dtype.float32;
+    if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
+        v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+
+    const key = PrefillRecKernelKey{ .d = d, .hv = hv, .retain = true };
+    const kernel = getPrefillRecKernel(ctx.allocator, key) orelse return null;
+
+    const t_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{L}, &[_]i32{1});
+    defer t_arr.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32, d, hv));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, hv, d }, 3, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, hv, d, d }, 4, c.c.MLX_FLOAT32));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ q_full, k_full, v, g, beta, ssm_state, t_arr }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec2 = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec2);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec2, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markPrefillRecBroken(key);
+        prefillRecWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec2, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec2, 1));
+    return .{ .y = Array.fromHandle(y_handle), .s_all = Array.fromHandle(s_handle) };
 }
 
 /// Prefill recurrence dispatch: single Metal kernel over the whole sequence
@@ -1993,12 +2128,15 @@ pub const Qwen38GDN = struct {
     }
 
     /// Per-position states from a verify pass (L ≤ ~5): the conv/ssm state
-    /// AFTER step t, for every t. Ownership: lists and arrays are owned by
-    /// the result; commitVerifyStates extracts one position.
+    /// AFTER step t, for every t. Fused path keeps them in one buffer
+    /// (`s_all` [L, HV, D, D]); the eager fallback keeps per-step arrays
+    /// (`ssm_states` [L]). Ownership: lists and arrays are owned by the
+    /// result; commitVerifyStates extracts one position.
     pub const PrefillVerifyResult = struct {
         out: Array, // [1, L, hidden]
         conv_states: []Array, // [L] of [K-1, QKV]
-        ssm_states: []Array, // [L] of [HV, D, D] f32
+        ssm_states: []Array, // [L] of [HV, D, D] f32 (eager path; empty when fused)
+        s_all: ?Array = null, // [L, HV, D, D] f32 (fused path)
 
         pub fn deinit(self: *PrefillVerifyResult, allocator: std.mem.Allocator) void {
             self.out.deinit();
@@ -2006,16 +2144,19 @@ pub const Qwen38GDN = struct {
             for (self.ssm_states) |s| s.deinit();
             if (self.conv_states.len > 0) allocator.free(self.conv_states);
             if (self.ssm_states.len > 0) allocator.free(self.ssm_states);
+            if (self.s_all) |s| s.deinit();
             self.conv_states = &.{};
             self.ssm_states = &.{};
+            self.s_all = null;
         }
     };
 
-    /// Verify pass: identical math to prefill but does NOT touch the cache —
-    /// the recurrence runs per-step (deltaRuleFused/eager per step, same as
-    /// the eager fallback path) and every step's conv/ssm state is retained
-    /// for later commit/rollback. The conv state after step t is window rows
-    /// [t+1, t+K) of the precomputed whole-sequence window.
+    /// Verify pass: identical math to prefill but does NOT touch the cache.
+    /// The recurrence runs as ONE Metal kernel when eligible
+    /// (deltaRulePrefillFusedRetain, per-position states in s_all), falling
+    /// back to the per-step eager loop with per-step retained arrays
+    /// otherwise. The conv state after step t is window rows [t+1, t+K) of
+    /// the precomputed whole-sequence window.
     pub fn prefillVerify(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !PrefillVerifyResult {
         const ctx = self.ctx;
         var front = try self.prefillFront(x, cache);
@@ -2027,14 +2168,26 @@ pub const Qwen38GDN = struct {
         const K: i32 = @intCast(self.conv_kernel);
         const QKV: i32 = @intCast(front.qkv.shape()[1]);
 
-        // Per-step recurrence with retained states.
-        const rec = try deltaRulePrefillEagerRetain(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D);
-        errdefer {
-            rec.y.deinit();
-            for (rec.ssm_states) |s| s.deinit();
-            allocator.free(rec.ssm_states);
+        // Recurrence: fused single-kernel with per-position states, else the
+        // eager per-step retain loop (toy/odd head dims).
+        var y: Array = undefined;
+        var s_all: ?Array = null;
+        var ssm_states: []Array = &.{};
+        errdefer if (s_all) |s| s.deinit();
+        if (try deltaRulePrefillFusedRetain(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr| {
+            y = fr.y;
+            s_all = fr.s_all;
+        } else {
+            const rec = try deltaRulePrefillEagerRetain(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D);
+            y = rec.y;
+            ssm_states = rec.ssm_states;
         }
-        defer rec.y.deinit();
+        errdefer y.deinit();
+        errdefer {
+            for (ssm_states) |s| s.deinit();
+            if (ssm_states.len > 0) allocator.free(ssm_states);
+        }
+        defer y.deinit();
 
         // Per-step conv states: rows [t+1, t+K) of the window.
         const conv_states = try allocator.alloc(Array, @intCast(L));
@@ -2049,31 +2202,62 @@ pub const Qwen38GDN = struct {
             made += 1;
         }
 
-        const out = try self.prefillTail(rec.y, front.z, front.qkv.dtype());
+        const out = try self.prefillTail(y, front.z, front.qkv.dtype());
         errdefer out.deinit();
         // Materialize everything the caller may commit: all retained states.
         try eval_mod.asyncEval(allocator, conv_states);
-        try eval_mod.asyncEval(allocator, rec.ssm_states);
-        return .{ .out = out, .conv_states = conv_states, .ssm_states = rec.ssm_states };
+        if (s_all) |s| {
+            try eval_mod.asyncEval(allocator, &[_]Array{s});
+        } else {
+            try eval_mod.asyncEval(allocator, ssm_states);
+        }
+        return .{ .out = out, .conv_states = conv_states, .ssm_states = ssm_states, .s_all = s_all };
     }
 
     /// Commit the post-step-`accepted` states (accepted ∈ 0..L-1) into the
     /// cache, freeing every other retained state. Afterwards `res` holds
     /// only `out` (its lists are emptied).
-    pub fn commitVerifyStates(cache: *Qwen38GdnCache, res: *PrefillVerifyResult, allocator: std.mem.Allocator, accepted: usize) void {
+    pub fn commitVerifyStates(ctx: EagerContext, cache: *Qwen38GdnCache, res: *PrefillVerifyResult, allocator: std.mem.Allocator, accepted: usize) void {
         cache.conv_state.deinit();
         cache.conv_state = res.conv_states[accepted];
-        cache.ssm_state.deinit();
-        cache.ssm_state = res.ssm_states[accepted];
         for (res.conv_states, 0..) |s, i| {
             if (i != accepted) s.deinit();
         }
+        allocator.free(res.conv_states);
+        res.conv_states = &.{};
+
+        if (res.s_all) |sa| {
+            // Fused path: copy row `accepted` of [L, HV, D, D] into the cache.
+            const hv: i32 = sa.shape()[1];
+            const d: i32 = sa.shape()[2];
+            const a: i32 = @intCast(accepted);
+            const row = ops.slice(ctx, sa, &[_]i32{ a, 0, 0, 0 }, &[_]i32{ a + 1, hv, d, d }, &[_]i32{ 1, 1, 1, 1 }) catch {
+                std.log.err("GDN commitVerifyStates: s_all slice failed; cache state unchanged", .{});
+                return;
+            };
+            defer row.deinit();
+            const flat = ops.reshape(ctx, row, &[_]i32{ hv, d, d }) catch {
+                std.log.err("GDN commitVerifyStates: s_all reshape failed; cache state unchanged", .{});
+                return;
+            };
+            defer flat.deinit();
+            const copied = ops.copy(ctx, flat) catch {
+                std.log.err("GDN commitVerifyStates: s_all copy failed; cache state unchanged", .{});
+                return;
+            };
+            cache.ssm_state.deinit();
+            cache.ssm_state = copied;
+            sa.deinit();
+            res.s_all = null;
+            return;
+        }
+
+        cache.ssm_state.deinit();
+        cache.ssm_state = res.ssm_states[accepted];
         for (res.ssm_states, 0..) |s, i| {
             if (i != accepted) s.deinit();
         }
-        allocator.free(res.conv_states);
         allocator.free(res.ssm_states);
-        res.conv_states = &.{};
         res.ssm_states = &.{};
     }
 };
@@ -2465,6 +2649,79 @@ test "Qwen38GDN fused conv+tail kernel matches eager conv chain + eager tail" {
     }
 }
 
+test "Qwen38GDN fused verify recurrence kernel matches eager per-step retain" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Real model head dims; verify blocks are tiny (N+1 ≤ 4), plus one
+    // larger L to cross the fused kernel's loop.
+    const hv: i32 = 48;
+    const d: i32 = 128;
+    for ([_]i32{ 1, 3, 4, 17 }) |L| {
+        const n_lhvd: usize = @intCast(L * hv * d);
+        const n_lhv: usize = @intCast(L * hv);
+        const n_state: usize = @intCast(hv * d * d);
+
+        const qkv_buf = try allocator.alloc(f32, 3 * n_lhvd);
+        defer allocator.free(qkv_buf);
+        testFill(qkv_buf);
+        const gb_buf = try allocator.alloc(f32, 2 * n_lhv);
+        defer allocator.free(gb_buf);
+        for (0..n_lhv) |i| {
+            gb_buf[i] = 0.5 + 0.04 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11)));
+            gb_buf[n_lhv + i] = 0.3 + 0.05 * @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 5 + 1, 9)));
+        }
+        const state_buf = try allocator.alloc(f32, n_state);
+        defer allocator.free(state_buf);
+        testFill(state_buf);
+
+        const q = try Array.fromData(allocator, f32, qkv_buf[0..n_lhvd], &[_]i32{ L, hv, d });
+        defer q.deinit();
+        const k = try Array.fromData(allocator, f32, qkv_buf[n_lhvd .. 2 * n_lhvd], &[_]i32{ L, hv, d });
+        defer k.deinit();
+        const v = try Array.fromData(allocator, f32, qkv_buf[2 * n_lhvd ..], &[_]i32{ L, hv, d });
+        defer v.deinit();
+        const g = try Array.fromData(allocator, f32, gb_buf[0..n_lhv], &[_]i32{ L, hv });
+        defer g.deinit();
+        const beta = try Array.fromData(allocator, f32, gb_buf[n_lhv..], &[_]i32{ L, hv });
+        defer beta.deinit();
+        const state = try Array.fromData(allocator, f32, state_buf, &[_]i32{ hv, d, d });
+        defer state.deinit();
+
+        const fused = (try deltaRulePrefillFusedRetain(ctx, state, k, v, beta, g, q, hv, d)) orelse
+            return error.FusedKernelUnavailable;
+        defer fused.y.deinit();
+        defer fused.s_all.deinit();
+        try fused.y.eval();
+        try fused.s_all.eval();
+
+        const eager = try deltaRulePrefillEagerRetain(ctx, allocator, state, k, v, beta, g, q, hv, d);
+        defer {
+            eager.y.deinit();
+            for (eager.ssm_states) |s| s.deinit();
+            allocator.free(eager.ssm_states);
+        }
+        try eager.y.eval();
+
+        const got_y = try fused.y.dataSlice(f32);
+        const exp_y = try eager.y.dataSlice(f32);
+        try std.testing.expectEqual(exp_y.len, got_y.len);
+        for (exp_y, got_y) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+
+        // Row t of s_all equals the eager retained state after step t.
+        const got_all = try fused.s_all.dataSlice(f32);
+        var t: usize = 0;
+        while (t < @as(usize, @intCast(L))) : (t += 1) {
+            try eager.ssm_states[t].eval();
+            const exp_s = try eager.ssm_states[t].dataSlice(f32);
+            const got_s = got_all[t * n_state .. (t + 1) * n_state];
+            try std.testing.expectEqual(exp_s.len, got_s.len);
+            for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+        }
+    }
+}
+
 test "Qwen38GDN fused prefill recurrence kernel matches eager per-step loop" {
     c.initErrorHandler();
     const allocator = std.testing.allocator;
@@ -2608,7 +2865,7 @@ test "Qwen38GDN.prefillVerify: matches prefill + per-position states + commit" {
     defer cache2.deinit();
     var res2 = try g2.prefillVerify(allocator, x, &cache2);
     defer res2.deinit(allocator);
-    Qwen38GDN.commitVerifyStates(&cache2, &res2, allocator, 2);
+    Qwen38GDN.commitVerifyStates(ctx, &cache2, &res2, allocator, 2);
 
     const x_next = try ops.slice(ctx, x, &[_]i32{ 0, 3, 0 }, &[_]i32{ 1, 4, hidden }, &[_]i32{ 1, 1, 1 });
     defer x_next.deinit();
@@ -2637,6 +2894,82 @@ test "Qwen38GDN.prefillVerify: matches prefill + per-position states + commit" {
     // Commit emptied the lists; res2.deinit (defer) frees only `out`.
     try std.testing.expectEqual(@as(usize, 0), res2.conv_states.len);
     try std.testing.expectEqual(@as(usize, 0), res2.ssm_states.len);
+}
+
+test "Qwen38GDN.prefillVerify fused: s_all commit matches prefix prefill" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // head_dim 32 → the fused retain kernel is eligible (D % 32 == 0).
+    const dims = TestDims{ .hidden = 8, .key_heads = 1, .value_heads = 2, .head_dim = 32, .conv_kernel = 4 };
+    const hidden: i32 = @intCast(dims.hidden);
+    const L: i32 = 5;
+
+    const buf = try allocator.alloc(f32, @intCast(L * hidden));
+    defer allocator.free(buf);
+    for (buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+    const x = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, L, hidden });
+    defer x.deinit();
+
+    var g = try makeTestModule(allocator, ctx, dims);
+    defer g.deinit();
+    var cache = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+    defer cache.deinit();
+
+    var res = try g.prefillVerify(allocator, x, &cache);
+    defer res.deinit(allocator);
+    // Fused path taken: per-position states live in one [L, HV, D, D] buffer.
+    try std.testing.expect(res.s_all != null);
+    try std.testing.expectEqual(@as(usize, 0), res.ssm_states.len);
+    try res.out.eval();
+
+    // Output matches the plain prefill path.
+    var g_ref = try makeTestModule(allocator, ctx, dims);
+    defer g_ref.deinit();
+    var cache_ref = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+    defer cache_ref.deinit();
+    const out_ref = try g_ref.prefill(allocator, x, &cache_ref, true);
+    defer out_ref.deinit();
+    try out_ref.eval();
+    {
+        const got = try res.out.dataSlice(f32);
+        const exp = try out_ref.dataSlice(f32);
+        try std.testing.expectEqual(exp.len, got.len);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
+    }
+
+    // Commit position 2 (accept 3 tokens) then decode token 4 — must match a
+    // fresh prefix-prefill(3) + forward.
+    Qwen38GDN.commitVerifyStates(ctx, &cache, &res, allocator, 2);
+    try std.testing.expect(res.s_all == null);
+
+    const x_next = try ops.slice(ctx, x, &[_]i32{ 0, 3, 0 }, &[_]i32{ 1, 4, hidden }, &[_]i32{ 1, 1, 1 });
+    defer x_next.deinit();
+    const x_flat = try ops.reshape(ctx, x_next, &[_]i32{ 1, hidden });
+    defer x_flat.deinit();
+
+    var g3 = try makeTestModule(allocator, ctx, dims);
+    defer g3.deinit();
+    var cache3 = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+    defer cache3.deinit();
+    const x_pre3 = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 3, hidden }, &[_]i32{ 1, 1, 1 });
+    defer x_pre3.deinit();
+    const out_pre3 = try g3.prefill(allocator, x_pre3, &cache3, true);
+    defer out_pre3.deinit();
+    try out_pre3.eval();
+
+    const out_commit = try g.forward(x_flat, &cache);
+    defer out_commit.deinit();
+    const out_ref3 = try g3.forward(x_flat, &cache3);
+    defer out_ref3.deinit();
+    try out_commit.eval();
+    try out_ref3.eval();
+    const got2 = try out_commit.dataSlice(f32);
+    const exp2 = try out_ref3.dataSlice(f32);
+    for (exp2, got2) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
 }
 
 test "Qwen38GDN.prefill: per-token loop equivalence" {
