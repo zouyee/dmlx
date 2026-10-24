@@ -48,6 +48,19 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
   temperature 0 / speculative sampling with (p−q)+ resample at temp>0 →
   commit/rollback → bonus token on full acceptance. Drafter prompt pass at
   prefill (head processes the prompt so its KV/RoPE offsets are correct).
+- Commit semantics (2026-10-24, `afe2886`): on commit the drafter cache is
+  truncated to round start + t_next, then each accepted draft is REPLAYED
+  through the head with the TARGET's pre-final-norm verify hidden rows
+  (mlx-vlm `accept_verified_tokens` semantics; `MtpOps.commit` now takes the
+  verify token ids). Replaces the full-acceptance tail-draft hack. A/B on
+  fixed temp-0 prompts: acceptance 85.1/65.5/88.0% vs 85.1/63.4/88.0%
+  (code/prose/math) — neutral-to-slightly-better; 128-token request wall
+  5.39 s warm both sides. Acceptance is content-bound (mirrors mlx-vlm's
+  98/61/88 spread), not cache-semantics-bound. Gotcha documented in
+  `qwen38_mtp.loadNormF32`: the community drafter checkpoint is flat-layout
+  (norms scale-encoded, NO +1 shift — adding it drops acceptance ~85→63%).
+  Env-gated debug: `DMLX_MTP_STAGE` (per-stage checksums in the head),
+  `DMLX_MTP_DEBUG` (per-round engine trace).
 - Flags: `--speculative-mtp N` (drafts/round; N=2 default choice, N=3 also
   works). Benchmark script: `EXTRA_SERVE_FLAGS="--speculative-mtp 2"`.
 
