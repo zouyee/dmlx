@@ -140,8 +140,10 @@ pub const Qwen38Mtp = struct {
         // fused = fc(concat([e, h], -1))  [L-1, hidden]
         const cat = try shape_mod.concatenateAxis(ctx, &[_]Array{ e, h }, 1);
         defer cat.deinit();
+        stageChk("cat", ctx, cat);
         const fused = try self.fc.apply(ctx, cat);
         defer fused.deinit();
+        stageChk("fused", ctx, fused);
 
         // Decoder layer over the sequence (prefill-mode causal attention).
         const fused3 = try ops.reshape(ctx, fused, &[_]i32{ 1, L, hidden });
@@ -165,6 +167,7 @@ pub const Qwen38Mtp = struct {
         defer hh.deinit();
         const mlp_out = try self.mlp_down.apply(ctx, hh);
         defer mlp_out.deinit();
+        stageChk("mlp", ctx, mlp_out);
         const dec_out = try ops.add(ctx, h2, mlp_out);
         defer dec_out.deinit();
 
@@ -191,6 +194,12 @@ pub const Qwen38Mtp = struct {
         self.cache.deinit();
     }
 
+    /// NOTE (verified against mlx-vlm's qwen3_5_mtp drafter sanitize): HF
+    /// `mtp.*`-prefixed layouts store RMSNorm weights as (scale − 1) deltas
+    /// and consumers add 1.0 — but the community drafter checkpoint uses the
+    /// FLAT mlx layout, where norms are already scale-encoded and NO shift
+    /// applies. Do not "fix" this by adding 1.0 (measured: it drops
+    /// acceptance from ~85% to ~63%).
     fn loadNormF32(ctx: EagerContext, ws: WeightSource, name: []const u8) !Array {
         const w = try ws.tensor(name);
         defer w.deinit();
@@ -348,20 +357,26 @@ pub const Qwen38Mtp = struct {
         defer row.deinit();
         const e = try rmsNormBf16(ctx, row, self.pre_fc_norm_embedding_f32, eps);
         defer e.deinit();
+        stageChk("e", ctx, e);
         const h = try rmsNormBf16(ctx, hidden_pre_norm, self.pre_fc_norm_hidden_f32, eps);
         defer h.deinit();
+        stageChk("hn", ctx, h);
 
         // fused = fc(concat([e, h], -1))  [1, hidden]
         const cat = try shape_mod.concatenateAxis(ctx, &[_]Array{ e, h }, 1);
         defer cat.deinit();
+        stageChk("cat", ctx, cat);
         const fused = try self.fc.apply(ctx, cat);
         defer fused.deinit();
+        stageChk("fused", ctx, fused);
 
         // Decoder layer: attn block + MLP block, both residual.
         const n1 = try rmsNormBf16(ctx, fused, self.ln1_f32, eps);
         defer n1.deinit();
+        stageChk("n1", ctx, n1);
         const attn_out = try self.attn.forward(n1, &self.cache); // [1, hidden]
         defer attn_out.deinit();
+        stageChk("attn", ctx, attn_out);
         const h2 = try ops.add(ctx, fused, attn_out);
         defer h2.deinit();
 
@@ -377,13 +392,16 @@ pub const Qwen38Mtp = struct {
         defer hh.deinit();
         const mlp_out = try self.mlp_down.apply(ctx, hh);
         defer mlp_out.deinit();
+        stageChk("mlp", ctx, mlp_out);
         const dec_out = try ops.add(ctx, h2, mlp_out);
         defer dec_out.deinit();
 
         // Final norm → hidden_out (this tensor feeds both lm_head and, in
         // chained drafting, the next pass's pre_fc_norm_hidden).
+        stageChk("dec", ctx, dec_out);
         const hidden_out = try rmsNormBf16(ctx, dec_out, self.norm_f32, eps);
         errdefer hidden_out.deinit();
+        stageChk("normed", ctx, hidden_out);
         const h3 = try ops.reshape(ctx, hidden_out, &[_]i32{ 1, 1, hidden });
         defer h3.deinit();
         const logits_bf16 = try lm_head.apply(ctx, h3);
@@ -400,6 +418,21 @@ fn rmsNormBf16(ctx: EagerContext, x: Array, w_f32: Array, eps: f32) !Array {
     const n_f32 = try fast_mod.rmsNorm(ctx, x_f32, w_f32, eps);
     defer n_f32.deinit();
     return ops.astype(ctx, n_f32, .bfloat16);
+}
+
+fn stageChk(name: []const u8, ctx: EagerContext, t: Array) void {
+    if (std.c.getenv("DMLX_MTP_STAGE") == null) return;
+    const f = ops.astype(ctx, t, .float32) catch return;
+    defer f.deinit();
+    const s = reduce_mod.sum(ctx, f, false) catch return;
+    defer s.deinit();
+    const a = ops.abs(ctx, f) catch return;
+    defer a.deinit();
+    const m = reduce_mod.max(ctx, a, false) catch return;
+    defer m.deinit();
+    s.eval() catch return;
+    m.eval() catch return;
+    std.debug.print("DMLX {s}: chk={d:.4} absmax={d:.4}\n", .{ name, s.item(f32) catch 0, m.item(f32) catch 0 });
 }
 
 // ============================================================

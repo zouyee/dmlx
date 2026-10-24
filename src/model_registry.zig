@@ -754,18 +754,30 @@ pub const Qwen38VTableAdapter = struct {
         return ops.copy(ctx, flat);
     }
 
-    fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize) void {
+    fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize, tokens: []const u32) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         qwen38.commitVerify(self.model, v, accepted);
-        // Drafter cache: the draft chain processed N tokens (t, d1..d_{N-1}).
-        // `accepted` backbone positions means the drafter keeps `accepted`
-        // tokens past the round start; on full acceptance (accepted == N+1)
-        // the engine already appended d_N via a tail draft, so only partial
-        // acceptance needs truncation.
+        // Drafter cache, mlx-vlm accept_verified_tokens semantics: drop every
+        // drafted chain entry except t_next (whose input was already the
+        // TARGET hidden from the previous round/prefill), then replay the
+        // accepted drafts with the TARGET's verify hidden rows — the KV
+        // entries the drafter attends over must match confirmed processing,
+        // not the drafter's own chained recurrence.
         const m = self.mtp.?;
-        if (accepted <= self.mtp_ops.num_drafts) {
-            m.cache.len_ = self.mtp_round_old_len.? + @as(i32, @intCast(accepted));
+        const ctx = self.model.ctx;
+        const lm = self.mtpLmHead();
+        m.cache.len_ = self.mtp_round_old_len.? + 1;
+        var i: usize = 1;
+        while (i < accepted) : (i += 1) {
+            const hidden: i32 = v.hidden_pre_norm_all.shape()[2];
+            const row = ops.slice(ctx, v.hidden_pre_norm_all, &[_]i32{ 0, @as(i32, @intCast(i - 1)), 0 }, &[_]i32{ 1, @as(i32, @intCast(i)), hidden }, &[_]i32{ 1, 1, 1 }) catch return;
+            defer row.deinit();
+            const flat = ops.reshape(ctx, row, &[_]i32{ 1, hidden }) catch return;
+            defer flat.deinit();
+            var out = m.forward(self.allocator, flat, tokens[i], self.model.embed_table_bf16.?, lm) catch return;
+            out.logits.deinit();
+            out.hidden_out.deinit();
         }
         self.mtp_round_old_len = null;
     }

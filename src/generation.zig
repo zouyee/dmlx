@@ -100,7 +100,11 @@ pub const MtpOps = struct {
     /// Pre-final-norm hidden row i of the verify handle → [1, hidden] (owned).
     verifyHidden: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
     /// Commit `accepted` ∈ 1..L verify positions (backbone + drafter caches).
-    commit: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted: usize) void,
+    /// `tokens` is the full verify input [t_next, d1..dN] — the drafter cache
+    /// is truncated to the round start (+ t_next) and accepted drafts are
+    /// REPLAYED with the TARGET's verify hidden states (mlx-vlm
+    /// accept_verified_tokens semantics), not kept from the draft chain.
+    commit: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted: usize, tokens: []const u32) void,
     /// Discard the whole verify pass (backbone + drafter caches restored).
     rollback: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void,
     /// Free the verify handle (call after commit/rollback).

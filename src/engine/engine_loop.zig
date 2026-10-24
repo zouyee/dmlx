@@ -1360,7 +1360,7 @@ pub const EngineLoop = struct {
             }
             if (stop_in_drafts) {
                 // An accepted draft is a stop token: emit through it and end.
-                mtp.commit(self.model.ptr, vh, k + 1);
+                mtp.commit(self.model.ptr, vh, k + 1, vids.items);
                 for (drafts.items[0..k]) |d| {
                     if (total_generated >= gen_config.max_tokens) break;
                     context.append(allocator, d) catch break;
@@ -1388,19 +1388,13 @@ pub const EngineLoop = struct {
             var hidden_next_opt: ?Array = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
             defer if (hidden_next_opt) |hn| hn.deinit();
 
-            // Full acceptance: d_N was never drafted — append it through the
-            // head (tail draft) so the drafter cache covers every confirmed
-            // token. Discard its outputs.
-            if (k == drafts.items.len) {
-                const tail = mtp.draft(self.model.ptr, h_cur, drafts.items[drafts.items.len - 1]) catch null;
-                if (tail) |t2| {
-                    t2.logits.deinit();
-                    t2.hidden.deinit();
-                }
+            // Commit k+1 backbone positions (t_next + accepted drafts); the
+            // adapter replays the accepted drafts through the drafter with
+            // the target's verify hidden (see MtpOps.commit).
+            if (std.c.getenv("DMLX_MTP_DEBUG") != null) {
+                std.debug.print("MTP round: t={d} drafts={any} k={d} t'={d}\n", .{ t_next.token, drafts.items, k, next_sample.token });
             }
-
-            // Commit k+1 backbone positions (t_next + accepted drafts).
-            mtp.commit(self.model.ptr, vh, k + 1);
+            mtp.commit(self.model.ptr, vh, k + 1, vids.items);
 
             // Emit accepted drafts + the next sampled token, capped at
             // max_tokens (plain decode emits exactly max_tokens).
