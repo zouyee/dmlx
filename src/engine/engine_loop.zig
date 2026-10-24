@@ -1274,7 +1274,60 @@ pub const EngineLoop = struct {
             var h_cur = hidden;
             var tok = t_next.token;
             var draft_failed = false;
-            for (0..n_drafts) |_| {
+            const gpu_chain = greedy and mtp.draftGreedy != null;
+            if (gpu_chain) blk: {
+                // Greedy GPU-chained chain: token ids stay on GPU (argmax of
+                // each step's logits feeds the next step); ONE sync reads all
+                // N draft tokens at the end. Draft logits are dropped —
+                // greedy acceptance never needs them.
+                var gpu_toks = std.ArrayList(Array).empty;
+                defer {
+                    for (gpu_toks.items) |t2| t2.deinit();
+                    gpu_toks.deinit(allocator);
+                }
+                const tok0 = array_mod.Array.fromData(allocator, i32, &[_]i32{@intCast(tok)}, &[_]i32{1}) catch {
+                    draft_failed = true;
+                    break :blk;
+                };
+                defer tok0.deinit();
+                var cur = tok0; // borrowed (tok0, then the last gpu_toks item)
+                var steps: usize = 0;
+                for (0..n_drafts) |_| {
+                    const g = mtp.draftGreedy.?(self.model.ptr, h_cur, cur) catch {
+                        draft_failed = true;
+                        break :blk;
+                    };
+                    if (steps > 0) h_cur.deinit(); // previous chained hidden
+                    steps += 1;
+                    h_cur = g.hidden;
+                    gpu_toks.append(allocator, g.tok_gpu) catch {
+                        g.tok_gpu.deinit();
+                        draft_failed = true;
+                        break :blk;
+                    };
+                    cur = g.tok_gpu;
+                }
+                if (gpu_toks.items.len > 0) {
+                    // Single sync for the whole chain.
+                    const all = shape_mod.concatenateAxis(self.ctx, gpu_toks.items, 0) catch {
+                        draft_failed = true;
+                        break :blk;
+                    };
+                    defer all.deinit();
+                    all.eval() catch {
+                        draft_failed = true;
+                        break :blk;
+                    };
+                    const ids = all.dataSlice(i32) catch {
+                        draft_failed = true;
+                        break :blk;
+                    };
+                    for (ids) |id| drafts.append(allocator, @intCast(id)) catch {
+                        draft_failed = true;
+                        break :blk;
+                    };
+                }
+            } else for (0..n_drafts) |_| {
                 const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
                     draft_failed = true;
                     break;
@@ -1297,9 +1350,8 @@ pub const EngineLoop = struct {
                 };
                 tok = d.token;
             }
-            // Keep h_cur (the last chained drafter hidden) until after
-            // acceptance — a full-acceptance round needs it for the tail
-            // draft that appends d_N to the drafter cache.
+            // h_cur (the last chained drafter hidden) is kept until after the
+            // round so all exits can free it (see the defer below).
             if (draft_failed or drafts.items.len == 0) {
                 h_cur.deinit();
                 // Draft path failed (OOM-class): finish the request with plain
@@ -1342,10 +1394,44 @@ pub const EngineLoop = struct {
             prof_lap(prof_now, &prof_last, &prof_verify_ns);
 
             // 3. Acceptance.
+            // Greedy fast path: one batched argmax over all L verify rows
+            // (single GPU op + single sync) instead of L per-row sampler
+            // round-trips. NB: GPU argmax tie-breaks may differ from the CPU
+            // first-max scan on exact f32 ties (measure-zero); both are valid
+            // greedy tokens.
+            var greedy_tokens: []i32 = &.{}; // borrowed from greedy_am_data
+            var greedy_am: ?Array = null;
+            var greedy_am_data: []i32 = &.{};
+            defer if (greedy_am_data.len > 0) allocator.free(greedy_am_data);
+            defer if (greedy_am) |am| am.deinit();
+            if (greedy) {
+                if (mtp.verifyArgmax) |va| {
+                    if (va(self.model.ptr, vh)) |am| {
+                        greedy_am = am;
+                        if (am.dataSlice(i32)) |d| {
+                            greedy_am_data = allocator.dupe(i32, d) catch &.{};
+                            greedy_tokens = greedy_am_data;
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
             var k: usize = 0; // accepted drafts
             var rejected = false;
             var stop_in_drafts = false;
             for (0..drafts.items.len) |i| {
+                if (greedy and greedy_tokens.len > i) {
+                    // Batched-argmax path: no per-row logits pull.
+                    if (@as(u32, @intCast(greedy_tokens[i])) != drafts.items[i]) {
+                        rejected = true;
+                        break;
+                    }
+                    k += 1;
+                    if (generation_mod.isStopToken(drafts.items[i], gen_config.stop_tokens)) {
+                        stop_in_drafts = true;
+                        break;
+                    }
+                    continue;
+                }
                 const v_i = mtp.verifyLogits(self.model.ptr, vh, i) catch {
                     rejected = true;
                     break;
@@ -1400,16 +1486,21 @@ pub const EngineLoop = struct {
 
             // 4. Next token: from V_k (rejection point) or bonus V_N.
             const next_pos = k; // logits position predicting the next token
-            const v_next = mtp.verifyLogits(self.model.ptr, vh, next_pos) catch break;
-            defer v_next.deinit();
-            const next_sample = if (greedy or !rejected)
-                // Greedy: exact target argmax (rejection) / sampler (bonus).
-                // temp>0 with all drafts accepted: plain bonus sample.
-                req.sampler.sample(v_next, allocator) catch break
-            else
-                // temp>0 rejection: resample from the adjusted distribution
-                // (p_target - q_draft)+, preserving the target distribution.
-                mtpResampleAdjusted(v_next, draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
+            const next_sample = if (greedy and greedy_tokens.len > next_pos)
+                // Batched argmax already holds this row's greedy token.
+                sampling_mod.SampleResult{ .token = @intCast(greedy_tokens[next_pos]), .logprob = 0.0 }
+            else blk: {
+                const v_next = mtp.verifyLogits(self.model.ptr, vh, next_pos) catch break;
+                defer v_next.deinit();
+                break :blk if (greedy or !rejected)
+                    // Greedy: exact target argmax (rejection) / sampler (bonus).
+                    // temp>0 with all drafts accepted: plain bonus sample.
+                    req.sampler.sample(v_next, allocator) catch break
+                else
+                    // temp>0 rejection: resample from the adjusted distribution
+                    // (p_target - q_draft)+, preserving the target distribution.
+                    mtpResampleAdjusted(v_next, draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
+            };
 
             var hidden_next_opt: ?Array = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
             defer if (hidden_next_opt) |hn| hn.deinit();

@@ -346,13 +346,27 @@ pub const Qwen38Mtp = struct {
         embed_table_bf16: Array,
         lm_head: MtpLinear,
     ) !MtpForwardOut {
+        const id_arr = try Array.fromData(allocator, i32, &[_]i32{@intCast(token_id)}, &[_]i32{1});
+        defer id_arr.deinit();
+        return self.forwardIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16, lm_head);
+    }
+
+    /// As forward(), but the token id arrives as a GPU [1] i32 array — e.g.
+    /// the previous step's argmax, keeping a greedy draft chain fully on GPU.
+    pub fn forwardIds(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array, // [1] i32
+        embed_table_bf16: Array,
+        lm_head: MtpLinear,
+    ) !MtpForwardOut {
+        _ = allocator; // id array is supplied by the caller
         const ctx = self.ctx;
         const hidden: i32 = @intCast(self.dims.hidden_size);
         const eps = self.dims.rms_norm_eps;
 
         // e = normE(embed(token)); h = normH(hidden)
-        const id_arr = try Array.fromData(allocator, i32, &[_]i32{@intCast(token_id)}, &[_]i32{1});
-        defer id_arr.deinit();
         const row = try shape_mod.takeAxis(ctx, embed_table_bf16, id_arr, 0); // [1, hidden] bf16
         defer row.deinit();
         const e = try rmsNormBf16(ctx, row, self.pre_fc_norm_embedding_f32, eps);
@@ -410,6 +424,37 @@ pub const Qwen38Mtp = struct {
         errdefer logits.deinit();
         return .{ .logits = logits, .hidden_out = hidden_out };
     }
+
+    /// Greedy GPU-chained step: forwardIds + argmax, returning the token id
+    /// as an unevaled GPU [1] i32 array (chainable into the next step) and
+    /// the chained hidden. The logits are dropped — greedy drafting never
+    /// needs them on CPU. GPU argmax tie-breaks may differ from the CPU
+    /// first-max scan on exact f32 ties (measure-zero); either is a valid
+    /// greedy draft.
+    pub fn forwardGreedyGpu(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array, // [1] i32
+        embed_table_bf16: Array,
+        lm_head: MtpLinear,
+    ) !MtpGreedyStepOut {
+        const ctx = self.ctx;
+        var out = try self.forwardIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16, lm_head);
+        defer out.logits.deinit();
+        const am = try reduce_mod.argmax(ctx, out.logits, false); // scalar
+        defer am.deinit();
+        const am_i32 = try ops.astype(ctx, am, .int32);
+        defer am_i32.deinit();
+        const tok = try ops.reshape(ctx, am_i32, &[_]i32{1});
+        errdefer tok.deinit();
+        return .{ .tok_gpu = tok, .hidden_out = out.hidden_out };
+    }
+};
+
+pub const MtpGreedyStepOut = struct {
+    tok_gpu: Array, // [1] i32 (unevaled)
+    hidden_out: Array, // [1, hidden] bf16
 };
 
 fn rmsNormBf16(ctx: EagerContext, x: Array, w_f32: Array, eps: f32) !Array {

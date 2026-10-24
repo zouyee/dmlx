@@ -9,6 +9,7 @@
 const std = @import("std");
 const c = @import("mlx").c;
 const ops = @import("mlx").ops;
+const reduce_mod = @import("mlx").reduce;
 const kvcache = @import("kvcache.zig");
 const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
@@ -594,8 +595,10 @@ pub const Qwen38VTableAdapter = struct {
         .enable = &mtpEnable,
         .prefill = &mtpPrefill,
         .draft = &mtpDraft,
+        .draftGreedy = &mtpDraftGreedy,
         .verify = &mtpVerify,
         .verifyLogits = &mtpVerifyLogits,
+        .verifyArgmax = &mtpVerifyArgmax,
         .verifyHidden = &mtpVerifyHidden,
         .commit = &mtpCommit,
         .rollback = &mtpRollback,
@@ -722,6 +725,18 @@ pub const Qwen38VTableAdapter = struct {
         return .{ .logits = logits, .hidden = out.hidden_out };
     }
 
+    fn mtpDraftGreedy(ctx_ptr: *anyopaque, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const m = self.mtp.?;
+        if (self.mtp_round_old_len == null) {
+            self.mtp_round_old_len = m.cache.len();
+        }
+        const out = try m.forwardGreedyGpu(self.allocator, hidden, tok_gpu, self.model.embed_table_bf16.?, self.mtpLmHead());
+        errdefer out.tok_gpu.deinit();
+        errdefer out.hidden_out.deinit();
+        return .{ .tok_gpu = out.tok_gpu, .hidden = out.hidden_out };
+    }
+
     fn mtpVerify(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpVerifyHandle {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
@@ -752,6 +767,19 @@ pub const Qwen38VTableAdapter = struct {
         const flat = try ops.reshape(ctx, row, &[_]i32{ 1, hidden });
         defer flat.deinit();
         return ops.copy(ctx, flat);
+    }
+
+    fn mtpVerifyArgmax(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        const ctx = self.model.ctx;
+        const L: i32 = v.logits.shape()[1];
+        const vocab: i32 = v.logits.shape()[2];
+        const f32l = try ops.astype(ctx, v.logits, .float32);
+        defer f32l.deinit();
+        const flat = try ops.reshape(ctx, f32l, &[_]i32{ L, vocab });
+        defer flat.deinit();
+        return reduce_mod.argmaxAxis(ctx, flat, -1, false); // [L] i32
     }
 
     fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize, tokens: []const u32) void {

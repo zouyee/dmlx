@@ -1944,6 +1944,11 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
     const cfg = self.cfg;
     const ctx = self.ctx;
 
+    const prof = std.c.getenv("DMLX_MTP_DEBUG") != null;
+    var prof_t0: std.c.timespec = undefined;
+    var prof_t1: std.c.timespec = undefined;
+    if (prof) _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_t0);
+
     try rejectVisionTokens(ids);
     if (ids.len <= 1) return error.VerifyNeedsSequence;
 
@@ -2047,7 +2052,15 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
     defer hidden_final.deinit();
     const logits = try self.lm_head.?.apply(ctx, hidden_final);
     errdefer logits.deinit();
+    if (prof) _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_t1);
     try logits.eval();
+    if (prof) {
+        var t2: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t2);
+        const build_ms = @as(f64, @floatFromInt(@as(i128, prof_t1.sec - prof_t0.sec) * std.time.ns_per_s + (prof_t1.nsec - prof_t0.nsec))) / 1e6;
+        const eval_ms = @as(f64, @floatFromInt(@as(i128, t2.sec - prof_t1.sec) * std.time.ns_per_s + (t2.nsec - prof_t1.nsec))) / 1e6;
+        std.debug.print("verify split: build={d:.1}ms eval={d:.1}ms\n", .{ build_ms, eval_ms });
+    }
 
     return .{
         .logits = logits,

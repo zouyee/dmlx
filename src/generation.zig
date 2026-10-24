@@ -78,6 +78,14 @@ pub const MtpStepOut = struct {
     hidden: Array,
 };
 
+/// Greedy GPU-chained drafter step output: the argmax token id kept on GPU
+/// ([1] i32, unevaled) + chained hidden. Lets the engine run the whole draft
+/// chain without a CPU sync per step; one sync reads all N tokens at the end.
+pub const MtpGreedyDraftOut = struct {
+    tok_gpu: Array,
+    hidden: Array,
+};
+
 /// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).
 pub const MtpVerifyHandle = *anyopaque;
 
@@ -93,10 +101,19 @@ pub const MtpOps = struct {
     prefill: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpStepOut,
     /// One drafter step: (hidden, token) → draft logits + chained hidden.
     draft: *const fn (ctx: *anyopaque, hidden: Array, token: u32) anyerror!MtpStepOut,
+    /// Greedy-only GPU-chained drafter step: (hidden, tok_gpu [1] i32) →
+    /// argmax token kept on GPU + chained hidden. Null → per-step CPU
+    /// sampling fallback.
+    draftGreedy: ?*const fn (ctx: *anyopaque, hidden: Array, tok_gpu: Array) anyerror!MtpGreedyDraftOut = null,
     /// Backbone verify over ids (continuation, no reset) → opaque handle.
     verify: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpVerifyHandle,
     /// Logits column i of the verify handle → [vocab] f32 (owned).
     verifyLogits: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
+    /// Greedy-only fast path: argmax over ALL verify positions in one GPU op
+    /// → i32 [L] (owned, unevaled). One sync reads every row, replacing L
+    /// per-row sampler round-trips (each pulls the full vocab to CPU).
+    /// Null → the engine falls back to per-row sampling.
+    verifyArgmax: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) anyerror!Array = null,
     /// Pre-final-norm hidden row i of the verify handle → [1, hidden] (owned).
     verifyHidden: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
     /// Commit `accepted` ∈ 1..L verify positions (backbone + drafter caches).
