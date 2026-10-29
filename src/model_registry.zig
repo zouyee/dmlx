@@ -10,6 +10,7 @@ const std = @import("std");
 const c = @import("mlx").c;
 const ops = @import("mlx").ops;
 const reduce_mod = @import("mlx").reduce;
+const fast_mod = @import("mlx").fast;
 const kvcache = @import("kvcache.zig");
 const array_mod = @import("mlx").array;
 const generation = @import("generation.zig");
@@ -591,6 +592,13 @@ pub const Qwen38VTableAdapter = struct {
     /// Drafter KV length before the current round's draft chain; null when
     /// no round is active (set on the round's first draft call).
     mtp_round_old_len: ?i32 = null,
+    /// `DMLX_MTP_CHAIN_DUMP=1`: per-step drafter KV length trace (plan
+    /// 2026-10-29-catch-omlx-mtp Task 1). Read once per process; the RoPE
+    /// offset of every head forward equals cache.len() before its append,
+    /// so the lengths alone pin down the position accounting.
+    mtp_chain_dump: ?bool = null,
+    /// `DMLX_MTP_TRUNK_POSTNORM=1` cached lookup (see maybeTrunkNorm).
+    mtp_trunk_postnorm: ?bool = null,
     mtp_ops: generation.MtpOps = .{
         .enable = &mtpEnable,
         .prefill = &mtpPrefill,
@@ -616,7 +624,7 @@ pub const Qwen38VTableAdapter = struct {
         const ids_u32 = try input.dataSlice(u32);
         const ids = try self.allocator.dupe(u32, ids_u32);
         defer self.allocator.free(ids);
-        const logits = try self.model.forwardTokens(ids);
+        const logits = try self.model.forwardTokensLast(ids);
         self.start_pos += len;
         return logits;
     }
@@ -661,6 +669,32 @@ pub const Qwen38VTableAdapter = struct {
         return .{ .w = lm.w, .scales = lm.scales, .biases = lm.biases };
     }
 
+    /// `DMLX_MTP_TRUNK_POSTNORM=1`: feed the head trunk hidden AFTER the
+    /// backbone's final RMSNorm (omlx's convention: `_head_input` applies
+    /// `inner.model.norm` before the head's own `pre_fc_norm_hidden`;
+    /// `HEAD_HIDDEN_POST_NORM = True` in omlx's prompt_priming.py).
+    /// Plan 2026-10-29-catch-omlx-mtp Task 2: same drafter weights, but
+    /// omlx's conditional acceptance RISES with depth while ours decays —
+    /// this is the remaining input-convention difference. Applies to every
+    /// trunk-sourced hidden (prefill fold rows, draft-0 input, verify
+    /// chaining rows, commit replay rows); the head's OWN chained output
+    /// is never trunk-normed.
+    fn trunkPostnormEnabled(self: *Qwen38VTableAdapter) bool {
+        if (self.mtp_trunk_postnorm == null)
+            self.mtp_trunk_postnorm = std.c.getenv("DMLX_MTP_TRUNK_POSTNORM") != null;
+        return self.mtp_trunk_postnorm.?;
+    }
+
+    fn maybeTrunkNorm(self: *Qwen38VTableAdapter, x: Array) !Array {
+        if (!self.trunkPostnormEnabled()) return x;
+        const ctx = self.model.ctx;
+        const xf = try ops.astype(ctx, x, .float32);
+        defer xf.deinit();
+        const nf = try fast_mod.rmsNorm(ctx, xf, self.model.final_norm_f32.?, self.cfg.rms_norm_eps);
+        defer nf.deinit();
+        return ops.astype(ctx, nf, .bfloat16);
+    }
+
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         const m = self.mtp.?;
@@ -683,18 +717,23 @@ pub const Qwen38VTableAdapter = struct {
             defer rows.deinit();
             const rows2 = try ops.reshape(ctx, rows, &[_]i32{ @as(i32, @intCast(ids.len)) - 1, hidden });
             defer rows2.deinit();
-            const tail_hidden = try m.prefill(self.allocator, rows2, ids[1..], self.model.embed_table_bf16.?);
+            const rows2n = try self.maybeTrunkNorm(rows2);
+            defer if (self.trunkPostnormEnabled()) rows2n.deinit(); // disabled: same value as rows2 (borrowed)
+            const tail_hidden = try m.prefill(self.allocator, rows2n, ids[1..], self.model.embed_table_bf16.?);
             tail_hidden.deinit(); // last-row output unused — the first draft
             // takes the BACKBONE last-position hidden (omlx convention).
+            if (self.chainDumpEnabled())
+                std.debug.print("MTP-CHAIN prefill prompt_len={d} head_cache_len={d}\n", .{ ids.len, m.cache.len() });
         }
 
         // Last-position logits → [vocab] f32; last hidden row → [1, hidden].
         const lshape = out.logits.shape();
         const vocab: i32 = lshape[2];
-        const L: i32 = lshape[1];
-        const last = try ops.slice(ctx, out.logits, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, vocab }, &[_]i32{ 1, 1, 1 });
-        defer last.deinit();
-        const flat = try ops.reshape(ctx, last, &[_]i32{vocab});
+        // `out.logits` is ALREADY only the last position (see
+        // forwardTokensAllHidden), so its seq dim is 1 — the hidden row
+        // index MUST come from hidden_all, which still has all L rows.
+        const L: i32 = out.hidden_all.shape()[1];
+        const flat = try ops.reshape(ctx, out.logits, &[_]i32{vocab});
         defer flat.deinit();
         const logits = try ops.astype(ctx, flat, .float32);
         errdefer logits.deinit();
@@ -704,8 +743,16 @@ pub const Qwen38VTableAdapter = struct {
         defer hrow.deinit();
         const hflat = try ops.reshape(ctx, hrow, &[_]i32{ 1, hidden_dim });
         defer hflat.deinit();
-        const hidden = try ops.copy(ctx, hflat);
+        const hflatn = try self.maybeTrunkNorm(hflat);
+        defer if (self.trunkPostnormEnabled()) hflatn.deinit();
+        const hidden = try ops.copy(ctx, hflatn);
         return .{ .logits = logits, .hidden = hidden };
+    }
+
+    fn chainDumpEnabled(self: *Qwen38VTableAdapter) bool {
+        if (self.mtp_chain_dump == null)
+            self.mtp_chain_dump = std.c.getenv("DMLX_MTP_CHAIN_DUMP") != null;
+        return self.mtp_chain_dump.?;
     }
 
     fn mtpDraft(ctx_ptr: *anyopaque, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
@@ -714,6 +761,8 @@ pub const Qwen38VTableAdapter = struct {
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
         }
+        if (self.chainDumpEnabled())
+            std.debug.print("MTP-CHAIN draft step cache_len_before={d} tok={d}\n", .{ m.cache.len(), token });
         const out = try m.forward(self.allocator, hidden, token, self.model.embed_table_bf16.?, self.mtpLmHead());
         errdefer out.logits.deinit();
         errdefer out.hidden_out.deinit();
@@ -731,6 +780,8 @@ pub const Qwen38VTableAdapter = struct {
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
         }
+        if (self.chainDumpEnabled())
+            std.debug.print("MTP-CHAIN draftGreedy step cache_len_before={d}\n", .{m.cache.len()});
         const out = try m.forwardGreedyGpu(self.allocator, hidden, tok_gpu, self.model.embed_table_bf16.?, self.mtpLmHead());
         errdefer out.tok_gpu.deinit();
         errdefer out.hidden_out.deinit();
@@ -766,7 +817,9 @@ pub const Qwen38VTableAdapter = struct {
         defer row.deinit();
         const flat = try ops.reshape(ctx, row, &[_]i32{ 1, hidden });
         defer flat.deinit();
-        return ops.copy(ctx, flat);
+        const flatn = try self.maybeTrunkNorm(flat);
+        defer if (self.trunkPostnormEnabled()) flatn.deinit();
+        return ops.copy(ctx, flatn);
     }
 
     fn mtpVerifyArgmax(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) anyerror!Array {
@@ -796,6 +849,32 @@ pub const Qwen38VTableAdapter = struct {
         const ctx = self.model.ctx;
         const lm = self.mtpLmHead();
         m.cache.len_ = self.mtp_round_old_len.? + 1;
+        if (self.chainDumpEnabled())
+            std.debug.print("MTP-CHAIN commit accepted={d} truncate_to={d}\n", .{ accepted, m.cache.len_ });
+        // Batched fold (omlx `_chain_next_drafts` semantics): ONE head forward
+        // over the accepted drafts with the target's verify hidden rows,
+        // replacing k SEQUENTIAL replay forwards. The sequential loop's lazy
+        // work lands inside the NEXT round's verify sync as ~k x 1.6 ms of
+        // serialized drafter body time; the batched fold is a single ~2 ms
+        // prefill-mode pass. Visibility per folded entry is identical
+        // (causal over cache + earlier folded rows). Default on;
+        // `DMLX_MTP_NO_BATCH_FOLD=1` restores the sequential replay.
+        if (accepted > 1 and std.c.getenv("DMLX_MTP_NO_BATCH_FOLD") == null) {
+            const n: i32 = @intCast(accepted - 1);
+            const hdim: i32 = v.hidden_pre_norm_all.shape()[2];
+            const rows = ops.slice(ctx, v.hidden_pre_norm_all, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, n, hdim }, &[_]i32{ 1, 1, 1 }) catch return;
+            defer rows.deinit();
+            const rows2 = ops.reshape(ctx, rows, &[_]i32{ n, hdim }) catch return;
+            defer rows2.deinit();
+            const rows2n = self.maybeTrunkNorm(rows2) catch return;
+            defer if (self.trunkPostnormEnabled()) rows2n.deinit();
+            const tail = m.prefill(self.allocator, rows2n, tokens[1..accepted], self.model.embed_table_bf16.?) catch return;
+            tail.deinit();
+            if (self.chainDumpEnabled())
+                std.debug.print("MTP-CHAIN fold n={d} cache_len_after={d}\n", .{ n, m.cache.len() });
+            self.mtp_round_old_len = null;
+            return;
+        }
         var i: usize = 1;
         while (i < accepted) : (i += 1) {
             const hidden: i32 = v.hidden_pre_norm_all.shape()[2];
@@ -803,10 +882,25 @@ pub const Qwen38VTableAdapter = struct {
             defer row.deinit();
             const flat = ops.reshape(ctx, row, &[_]i32{ 1, hidden }) catch return;
             defer flat.deinit();
-            var out = m.forward(self.allocator, flat, tokens[i], self.model.embed_table_bf16.?, lm) catch return;
-            out.logits.deinit();
-            out.hidden_out.deinit();
+            const flatn = self.maybeTrunkNorm(flat) catch return;
+            defer if (self.trunkPostnormEnabled()) flatn.deinit();
+            // Body only: the replay exists for the KV-cache side effect, so
+            // building the full-vocab lm_head here (and discarding it) is
+            // pure waste. `DMLX_MTP_REPLAY_LM_HEAD=1` restores the old call
+            // for A/B.
+            if (std.c.getenv("DMLX_MTP_REPLAY_LM_HEAD") != null) {
+                var out = m.forward(self.allocator, flatn, tokens[i], self.model.embed_table_bf16.?, lm) catch return;
+                out.logits.deinit();
+                out.hidden_out.deinit();
+            } else {
+                const h = m.forwardBodyToken(self.allocator, flatn, tokens[i], self.model.embed_table_bf16.?) catch return;
+                h.deinit();
+            }
+            if (self.chainDumpEnabled())
+                std.debug.print("MTP-CHAIN replay i={d} tok={d} cache_len_after={d}\n", .{ i, tokens[i], m.cache.len() });
         }
+        if (self.chainDumpEnabled())
+            std.debug.print("MTP-CHAIN commit done cache_len={d}\n", .{m.cache.len()});
         self.mtp_round_old_len = null;
     }
 
