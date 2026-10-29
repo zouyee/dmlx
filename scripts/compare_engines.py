@@ -210,6 +210,18 @@ def engines() -> dict[str, Engine]:
             env={"DMLX_MTP_TRUNK_POSTNORM": "1"},
             note="adaptive MTP ceiling 7 + trunk post-norm head input",
         ),
+        # A/B arm: revert the batched commit fold to the sequential replay
+        # (ee8cee2). The fold measured perf-neutral at fixed depth on one
+        # prompt, but the first full-harness run after landing it read ~8%
+        # lower; isolate it before believing that.
+        "dmlx-nofold": Engine(
+            name="dmlx-nofold",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_NO_BATCH_FOLD": "1"},
+            note="adaptive MTP ceiling 7, sequential commit replay",
+        ),
         "dmlx-nospec": Engine(
             name="dmlx-nospec",
             cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
