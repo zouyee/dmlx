@@ -1918,6 +1918,7 @@ pub const EngineLoop = struct {
             }
             std.log.info("[Engine] MTP cond-acceptance{s}", .{p_buf[0..p_len]});
             qwen38_gdn_prof.gdnVerifyProfReport();
+            qwen38_gdn_prof.gdnPrefillProfReport(); // front sub-splits during verify (DMLX_GDN_PREFILL_PROF)
             verify_qmm_mod.tallyReport();
             if (topk_total[0] > 0) {
                 // Drafter top-k hit rate per depth: how often the target's

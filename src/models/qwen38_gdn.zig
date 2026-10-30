@@ -204,7 +204,7 @@ fn nowNs() i128 {
 
 /// Print and reset the accumulated GDN prefill section times.
 pub fn gdnPrefillProfReport() void {
-    if (gdn_prof.layers == 0) return;
+    if (gdn_prof.layers == 0 and gdn_prof.f_proj_ns == 0) return;
     const ms = struct {
         fn f(ns: u64) f64 {
             return @as(f64, @floatFromInt(ns)) / 1e6;
