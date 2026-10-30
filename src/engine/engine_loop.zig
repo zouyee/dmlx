@@ -43,6 +43,8 @@ const CompletionSignal = completion_signal.CompletionSignal;
 const TokenEvent = completion_signal.TokenEvent;
 const TokenFinishReason = completion_signal.TokenEvent.FinishReason;
 const sampling_mod = @import("../sampling.zig");
+const qwen38_gdn_prof = @import("../models/qwen38_gdn.zig");
+const verify_qmm_mod = @import("../models/verify_qmm.zig");
 const SamplerConfig = sampling_mod.SamplerConfig;
 
 /// Platform-native sleep that does NOT enter the std.Io event loop.
@@ -280,8 +282,13 @@ pub const EngineLoop = struct {
     active_requests: std.ArrayList(*RequestState),
     /// Speculative decoding: n-gram size for draft proposal (null = disabled).
     speculative_ngram: ?usize,
-    /// MTP speculative decoding: draft tokens per round (null = disabled).
+    /// MTP speculative decoding: UPPER BOUND on draft tokens per round
+    /// (null = disabled); the per-round depth is chosen by `mtp_depth`.
     speculative_mtp: ?usize,
+    /// Online MTP draft-depth controller. Lives on the engine rather than
+    /// per request so its (content-independent) cost estimates survive
+    /// across requests; see `MtpDepthController.resetForRequest`.
+    mtp_depth: ?MtpDepthController,
     /// Prefix cache for skipping prefill on repeated prompts.
     prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
 
@@ -310,6 +317,7 @@ pub const EngineLoop = struct {
             .active_requests = std.ArrayList(*RequestState).empty,
             .speculative_ngram = config.speculative_ngram,
             .speculative_mtp = config.speculative_mtp,
+            .mtp_depth = null,
             .prefix_cache = if (config.prefix_cache_max_entries > 0)
                 prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
             else
@@ -401,11 +409,27 @@ pub const EngineLoop = struct {
         var owns_caches = true;
         var prefix_hit = false;
 
+        // Engine-owned copy of the prompt for prefix-cache use. The HTTP
+        // handler frees req.prompt_tokens as soon as generation signals
+        // completion, which can precede the post-generation pc.store below
+        // (observed as "@memcpy arguments alias" in PrefixCacheManager.store
+        // when the allocator recycled the freed block into the dupe target).
+        var pc_prompt_owned = false;
+        const pc_prompt: []const u32 = if (self.prefix_cache != null and !self.vtable_serial)
+            self.allocator.dupe(u32, req.prompt_tokens) catch |err| blk: {
+                std.log.warn("[Engine] prompt dupe for prefix cache failed: {}", .{err});
+                break :blk req.prompt_tokens;
+            }
+        else
+            req.prompt_tokens;
+        pc_prompt_owned = pc_prompt.ptr != req.prompt_tokens.ptr;
+        defer if (pc_prompt_owned) self.allocator.free(pc_prompt);
+
         // Try prefix cache first (not for vtable_serial models — their state
         // is internal and cannot be restored from a KV snapshot).
         if (!self.vtable_serial) {
             if (self.prefix_cache) |*pc| {
-                if (pc.lookup(req.prompt_tokens)) |maybe_cloned| {
+                if (pc.lookup(pc_prompt)) |maybe_cloned| {
                     if (maybe_cloned) |cloned| {
                         caches = cloned;
                         prefix_hit = true;
@@ -457,8 +481,8 @@ pub const EngineLoop = struct {
         // After generation: store caches if this was a miss.
         if (!prefix_hit and self.prefix_cache != null) {
             const pc = &self.prefix_cache.?;
-            if (!pc.isCached(req.prompt_tokens)) {
-                if (pc.store(req.prompt_tokens, caches)) {
+            if (!pc.isCached(pc_prompt)) {
+                if (pc.store(pc_prompt, caches)) {
                     owns_caches = false; // Caches now owned by prefix cache.
                 } else |err| {
                     std.log.warn("[Engine] Failed to store caches in prefix cache: {}", .{err});
@@ -1180,8 +1204,230 @@ pub const EngineLoop = struct {
         return true;
     }
 
+    /// Online draft-depth controller for MTP speculative decoding.
+    ///
+    /// `--speculative-mtp N` is treated as the UPPER BOUND on draft depth,
+    /// not a fixed depth, because the optimal depth is content-dependent.
+    /// Per round the drafter cost is linear in depth (measured 4.5 ms per
+    /// draft position) but the verify cost is superlinear: MLX dispatches
+    /// `M < get_qmv_batch_limit` to the batched qmv kernel, whose cost climbs
+    /// sharply once M >= 3 (measured qmm per 64-layer forward at M=1..5:
+    /// 59.4 / 62.0 / 68.5 / 84.6 / 105.8 ms; the split-K GEMM path only
+    /// engages at M >= 14 and is far worse in absolute terms, so there is no
+    /// cheaper kernel to switch to). Acceptance meanwhile falls with depth,
+    /// and how fast it falls depends entirely on the content: on a code
+    /// prompt depth 2 wins, on a highly predictable prompt depth 3 wins.
+    ///
+    /// So instead of baking a constant, estimate ms-per-emitted-token for
+    /// every depth and run the best one. Set `DMLX_MTP_FIXED_N=1` to pin the
+    /// depth at the flag value (A/B).
+    ///
+    /// Estimator note: scoring each depth by an EMA of its own realized
+    /// ms/token does NOT work — it was tried and lost to a fixed depth.
+    /// Round cost is near-deterministic (measured 83/96/118/146 ms at depth
+    /// 1/2/3/4, +-1 ms, and a depth switch costs nothing measurable), but
+    /// tokens-per-round is a high-variance integer in 1..N+1. Estimating the
+    /// ratio per depth from the handful of rounds that depth gets means a
+    /// couple of unlucky zero-acceptance rounds poison a deep arm, greedy
+    /// exploitation then starves it of samples, and the controller collapses
+    /// onto depth 1.
+    ///
+    /// So estimate the two factors separately, which also lets every round
+    /// inform every depth:
+    ///   cost(n)   — running mean of round wall time at depth n (tiny variance)
+    ///   p_i       — conditional probability that draft i is accepted given
+    ///               the first i-1 were. A round at depth n observes p_1..p_j
+    ///               for every j it reached, so acceptance evidence is POOLED
+    ///               across depths instead of being per-arm.
+    /// Expected tokens at depth n is then analytic for every n, including
+    /// depths not run recently:
+    ///   tokens(n) = 1 + sum_{i=1..n} prod_{j<=i} p_j
+    /// and we run argmin_n cost(n)/tokens(n). A depth probe at max_n every
+    /// `deep_probe_period` rounds refreshes p_i for the deep tail (which the
+    /// chosen depth stops observing) at a cost of one round in 32.
+    const MtpDepthController = struct {
+        const max_depth = 16;
+        /// Rounds between forced probes. A probe both refreshes that depth's
+        /// cost estimate and (for deep probes) the pooled p_i tail.
+        const probe_period = 16;
+        /// Rounds spent at `max_n` at the start of every request before the
+        /// argmin is trusted. DEFAULT 0 — measured net-negative, see below.
+        ///
+        /// The hypothesis was that the controller was stuck shallow for lack
+        /// of deep evidence (on the code prompt it ran mean depth 2.02 with
+        /// p_3/p_4 at one sample each, while omlx ran depth 4 and measured
+        /// p_4 = 0.94 there). Forcing 3 deep rounds per request did raise
+        /// tokens/round 2.49 -> 2.93 and depth 2.02 -> 3.00, but ms/round
+        /// rose 85.8 -> 111.4 and the realized rate got WORSE: 41.3 ->
+        /// 43.5 ms/emitted-token.
+        ///
+        /// So the controller's shallow choice was CORRECT: our cost(n) curve
+        /// is steeper than omlx's, so our optimal depth genuinely is lower.
+        /// The gap is cost-per-round at depth, not the depth policy
+        /// (plan doc §27). Kept as a tunable because the right depth moves
+        /// as soon as cost(n) is flattened — which is exactly what the
+        /// coarse draft head in §27.3 would do.
+        /// DEFAULT 3 as of the §38 routing fixes. It was 0 because forcing
+        /// deep rounds measured net-negative under the OLD cost curve
+        /// (§27.3). Those fixes flattened cost(n) — 85.2 / 98.7 / 113.4 ms at
+        /// N=2/3/4, versus 88.2 / 108.8 / 120.3 before — and that exposed the
+        /// opposite failure: with no forced exploration the controller
+        /// COLLAPSED to mean depth 1.13 and 47.3 ms/token, because a
+        /// depth-1 round never increments `reached[1]`, so p_2 stays at its
+        /// Laplace prior, E[tokens(2)] stays pessimistic, and the argmin
+        /// keeps choosing depth 1 — self-reinforcing. Three forced deep
+        /// rounds per request break the loop: mean depth 2.93 and
+        /// 38.3 ms/token, a 19% improvement end to end.
+        const explore_rounds_default = 3;
+        fn exploreRounds() u32 {
+            const v = std.c.getenv("DMLX_MTP_EXPLORE_ROUNDS") orelse return explore_rounds_default;
+            return std.fmt.parseInt(u32, std.mem.span(v), 10) catch explore_rounds_default;
+        }
+        /// Cost is near-deterministic, so an EMA is safe and is preferable to
+        /// a running mean: verify cost grows with context length, and a plain
+        /// mean would leave unchosen depths frozen at their cheap, early
+        /// calibration value — biasing the controller toward whatever it is
+        /// NOT currently running.
+        const cost_alpha = 0.25;
+
+        max_n: usize,
+        fixed: bool,
+        /// Pooled conditional acceptance: `reached[i]` rounds got as far as
+        /// draft i+1, `accepted[i]` of them accepted it.
+        reached: [max_depth]u32 = @splat(0),
+        accepted: [max_depth]u32 = @splat(0),
+        cost_ms: [max_depth]f64 = @splat(0),
+        cost_n: [max_depth]u32 = @splat(0),
+        used: [max_depth]u32 = @splat(0),
+        rounds: u64 = 0,
+
+        fn init(max_n: usize) MtpDepthController {
+            return .{
+                .max_n = @max(1, @min(max_n, max_depth)),
+                .fixed = std.c.getenv("DMLX_MTP_FIXED_N") != null,
+            };
+        }
+
+        /// Laplace-smoothed conditional acceptance for draft `i` (1-based),
+        /// so an unobserved depth is optimistic-but-bounded rather than 0/0.
+        fn condAccept(self: *const MtpDepthController, i: usize) f64 {
+            const a: f64 = @floatFromInt(self.accepted[i - 1]);
+            const r: f64 = @floatFromInt(self.reached[i - 1]);
+            return (a + 1.0) / (r + 2.0);
+        }
+
+        /// Expected tokens emitted by a round at depth `n`: the first token
+        /// is always emitted, then each draft prefix survives with the
+        /// product of the conditional acceptances up to it.
+        fn expectedTokens(self: *const MtpDepthController, n: usize) f64 {
+            var total: f64 = 1.0;
+            var prefix: f64 = 1.0;
+            for (1..n + 1) |i| {
+                prefix *= self.condAccept(i);
+                total += prefix;
+            }
+            return total;
+        }
+
+        fn meanCostMs(self: *const MtpDepthController, n: usize) ?f64 {
+            if (self.cost_n[n - 1] == 0) return null;
+            return self.cost_ms[n - 1];
+        }
+
+        /// Estimated ms per emitted token at depth `n`, or null if we have
+        /// never timed a round at that depth.
+        fn score(self: *const MtpDepthController, n: usize) ?f64 {
+            const cost = self.meanCostMs(n) orelse return null;
+            return cost / self.expectedTokens(n);
+        }
+
+        /// Clear the per-request acceptance evidence but KEEP the cost
+        /// estimates: `cost(n)` is a property of the hardware and the model,
+        /// not of the content, so carrying it across requests skips
+        /// calibration entirely on every request after the first. That
+        /// matters because short requests only run ~12 rounds, and spending
+        /// 4 of them calibrating was eating a third of the request.
+        /// Acceptance IS content-dependent, so `p_i` starts fresh (it
+        /// re-converges within a few rounds — every round updates p_1..p_k+1).
+        fn resetForRequest(self: *MtpDepthController) void {
+            self.reached = @splat(0);
+            self.accepted = @splat(0);
+            self.used = @splat(0);
+            self.rounds = 0;
+        }
+
+        /// Depth for the next round, in 1..max_n.
+        fn pick(self: *const MtpDepthController) usize {
+            if (self.fixed or self.max_n == 1) return self.max_n;
+            // Acceptance exploration, BEFORE the cost calibration below.
+            //
+            // One round at depth n yields evidence for p_1..p_{k+1} in a
+            // single shot, while a shallow round says NOTHING about the deep
+            // tail. So the cheap way to learn the whole p_i curve is to run
+            // deep a few times; running shallow and waiting is not an option.
+            //
+            // Tying exploration to `cost_n == 0` (below) is not enough:
+            // `resetForRequest` deliberately keeps cost estimates but clears
+            // p_i, so from the second request onward the calibration loop
+            // never fires and the only deep evidence is the 1-in-32 probe —
+            // one sample, which Laplace smoothing keeps near the prior. The
+            // controller then locks shallow forever.
+            //
+            // Measured on the code prompt before this (plan doc §27): mean
+            // depth 2.02 with p_3 and p_4 at a single sample each, while
+            // omlx — which starts at max depth and sweeps down — ran depth 4
+            // and measured p_3 = 0.83, p_4 = 0.94 on the same prompt. Our
+            // ms/round was BETTER (85.8 vs 92.3); the entire gap was
+            // tokens/round (2.49 vs 3.20).
+            if (self.used[self.max_n - 1] < exploreRounds()) return self.max_n;
+            // Calibrate any depth never yet timed, deepest first so the
+            // pooled p_i table is populated from the very first round. Warm
+            // cost estimates (carried across requests) skip this entirely.
+            var uncal = self.max_n;
+            while (uncal >= 1) : (uncal -= 1) {
+                if (self.cost_n[uncal - 1] == 0) return uncal;
+            }
+            // Periodic probe, cycling from the deepest downward: the chosen
+            // depth stops generating evidence for p_i beyond it, and every
+            // unchosen depth's cost estimate would otherwise go stale.
+            if (self.rounds % probe_period == 0) {
+                const slot = (self.rounds / probe_period) % self.max_n;
+                return self.max_n - slot;
+            }
+            var best: usize = 1;
+            var best_score: f64 = std.math.floatMax(f64);
+            for (1..self.max_n + 1) |n| {
+                const s = self.score(n) orelse continue;
+                if (s < best_score) {
+                    best_score = s;
+                    best = n;
+                }
+            }
+            return best;
+        }
+
+        /// Fold one completed round into the estimator. `k` is the number of
+        /// accepted drafts, so drafts 1..k were accepted and (when k < n)
+        /// draft k+1 was reached and rejected.
+        fn record(self: *MtpDepthController, n: usize, round_ns: u64, k: usize) void {
+            self.rounds +|= 1;
+            if (n == 0 or n > max_depth) return;
+            self.used[n - 1] +|= 1;
+            const ms = @as(f64, @floatFromInt(round_ns)) / 1e6;
+            self.cost_ms[n - 1] = if (self.cost_n[n - 1] == 0)
+                ms
+            else
+                cost_alpha * ms + (1.0 - cost_alpha) * self.cost_ms[n - 1];
+            self.cost_n[n - 1] +|= 1;
+            const reached_upto = @min(k + 1, n);
+            for (1..reached_upto + 1) |i| self.reached[i - 1] +|= 1;
+            for (1..k + 1) |i| self.accepted[i - 1] +|= 1;
+        }
+    };
+
     /// MTP speculative decoding (Qwen3.8 drafter head). Per round:
-    ///   1. Draft chain: N drafter steps from (hidden, t_next).
+    ///   1. Draft chain: N drafter steps from (hidden, t_next), N chosen
+    ///      online by MtpDepthController (flag value = upper bound).
     ///   2. One backbone verify over [t_next, d1..dN] (continuation).
     ///   3. Acceptance: greedy longest-prefix at temperature==0, speculative
     ///      sampling (p_target/q_draft with resample from (p-q)+) otherwise.
@@ -1245,6 +1491,9 @@ pub const EngineLoop = struct {
         var prof_accept_ns: u64 = 0;
         var prof_commit_ns: u64 = 0;
         var prof_rounds: u64 = 0;
+        // DMLX_MEM_PROBE_ROUNDS=1: per-phase MLX active memory (leak hunt).
+        var phase_mem: [4]usize = .{ 0, 0, 0, 0 };
+        const mem_probe_on = std.c.getenv("DMLX_MEM_PROBE_ROUNDS") != null;
         const prof_lap = struct {
             fn f(now_fn: *const fn () i128, t: *i128, acc: *u64) void {
                 const now = now_fn();
@@ -1262,7 +1511,37 @@ pub const EngineLoop = struct {
         var draft_sampler = req.sampler;
         draft_sampler.prng = std.Random.DefaultPrng.init(gen_config.seed +% 0x5d1f);
 
+        // Depth controller persists across requests (cost estimates are
+        // hardware properties); only the acceptance evidence is per-request.
+        if (self.mtp_depth == null or self.mtp_depth.?.max_n != @min(n_drafts, MtpDepthController.max_depth)) {
+            self.mtp_depth = MtpDepthController.init(n_drafts);
+        } else {
+            self.mtp_depth.?.resetForRequest();
+        }
+        const depth_ctl = &self.mtp_depth.?;
+
+        // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
+        // the drafter's top-k at each depth. top1 reproduces p_i; the top1 ->
+        // top2/top4 gap is the headroom a multi-branch draft would capture.
+        // Needs the drafter's logits, which only the CPU draft path keeps, so
+        // it disables the GPU-chained path — this is a DIAGNOSTIC mode and
+        // costs throughput.
+        const topk_probe = std.c.getenv("DMLX_MTP_TOPK") != null;
+        const topk_depths: usize = 8;
+        var topk_total = [_]u32{0} ** topk_depths;
+        var topk_hit1 = [_]u32{0} ** topk_depths;
+        var topk_hit2 = [_]u32{0} ** topk_depths;
+        var topk_hit4 = [_]u32{0} ** topk_depths;
+        var topk_hit8 = [_]u32{0} ** topk_depths;
+
         while (!stopped and total_generated < gen_config.max_tokens) {
+            // Depth for this round (flag value is the upper bound). Never
+            // draft past max_tokens: a deeper chain than the remaining budget
+            // is pure waste, since emission is capped anyway.
+            const remaining = gen_config.max_tokens - total_generated;
+            const n_round = @max(1, @min(depth_ctl.pick(), remaining));
+            const round_t0 = prof_now();
+
             // 1. Draft chain.
             var drafts = std.ArrayList(u32).empty;
             defer drafts.deinit(allocator);
@@ -1274,7 +1553,7 @@ pub const EngineLoop = struct {
             var h_cur = hidden;
             var tok = t_next.token;
             var draft_failed = false;
-            const gpu_chain = greedy and mtp.draftGreedy != null;
+            const gpu_chain = greedy and mtp.draftGreedy != null and !topk_probe;
             if (gpu_chain) blk: {
                 // Greedy GPU-chained chain: token ids stay on GPU (argmax of
                 // each step's logits feeds the next step); ONE sync reads all
@@ -1292,7 +1571,7 @@ pub const EngineLoop = struct {
                 defer tok0.deinit();
                 var cur = tok0; // borrowed (tok0, then the last gpu_toks item)
                 var steps: usize = 0;
-                for (0..n_drafts) |_| {
+                for (0..n_round) |_| {
                     const g = mtp.draftGreedy.?(self.model.ptr, h_cur, cur) catch {
                         draft_failed = true;
                         break :blk;
@@ -1327,7 +1606,7 @@ pub const EngineLoop = struct {
                         break :blk;
                     };
                 }
-            } else for (0..n_drafts) |_| {
+            } else for (0..n_round) |_| {
                 const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
                     draft_failed = true;
                     break;
@@ -1377,6 +1656,7 @@ pub const EngineLoop = struct {
             defer h_cur.deinit(); // all exits below (incl. error breaks)
             prof_lap(prof_now, &prof_last, &prof_draft_ns);
             prof_rounds +|= 1;
+            if (mem_probe_on and prof_rounds <= 6) _ = c.c.mlx_get_active_memory(&phase_mem[0]);
 
             // 2. Verify [t_next, d1..dN] on the backbone (continuation).
             var vids = std.ArrayList(u32).empty;
@@ -1392,6 +1672,7 @@ pub const EngineLoop = struct {
             // round (normal, stop, max_tokens, and all error paths).
             defer mtp.freeVerify(self.model.ptr, vh);
             prof_lap(prof_now, &prof_last, &prof_verify_ns);
+            if (mem_probe_on and prof_rounds <= 6) _ = c.c.mlx_get_active_memory(&phase_mem[1]);
 
             // 3. Acceptance.
             // Greedy fast path: one batched argmax over all L verify rows
@@ -1415,6 +1696,34 @@ pub const EngineLoop = struct {
                     } else |_| {}
                 }
             }
+            // Top-k probe: for every drafted position, rank the target's own
+            // greedy token inside the drafter's logits. Rank is computed as
+            // "how many logits strictly exceed it", which needs no sort.
+            if (topk_probe and greedy and greedy_tokens.len > 0) {
+                for (draft_logits.items, 0..) |dl, i| {
+                    if (i >= topk_depths or i >= greedy_tokens.len) break;
+                    const target_tok: usize = @intCast(greedy_tokens[i]);
+                    const f32_logits = ops.astype(self.ctx, dl, .float32) catch continue;
+                    defer f32_logits.deinit();
+                    f32_logits.eval() catch continue;
+                    const vals = f32_logits.dataSlice(f32) catch continue;
+                    if (target_tok >= vals.len) continue;
+                    const tv = vals[target_tok];
+                    var rank: u32 = 0;
+                    for (vals) |v| {
+                        if (v > tv) {
+                            rank += 1;
+                            if (rank >= 8) break;
+                        }
+                    }
+                    topk_total[i] += 1;
+                    if (rank < 1) topk_hit1[i] += 1;
+                    if (rank < 2) topk_hit2[i] += 1;
+                    if (rank < 4) topk_hit4[i] += 1;
+                    if (rank < 8) topk_hit8[i] += 1;
+                }
+            }
+
             var k: usize = 0; // accepted drafts
             var rejected = false;
             var stop_in_drafts = false;
@@ -1505,15 +1814,37 @@ pub const EngineLoop = struct {
             var hidden_next_opt: ?Array = mtp.verifyHidden(self.model.ptr, vh, next_pos) catch break;
             defer if (hidden_next_opt) |hn| hn.deinit();
             prof_lap(prof_now, &prof_last, &prof_accept_ns);
+            if (mem_probe_on and prof_rounds <= 6) _ = c.c.mlx_get_active_memory(&phase_mem[2]);
 
             // Commit k+1 backbone positions (t_next + accepted drafts); the
             // adapter replays the accepted drafts through the drafter with
             // the target's verify hidden (see MtpOps.commit).
             if (std.c.getenv("DMLX_MTP_DEBUG") != null) {
-                std.debug.print("MTP round: t={d} drafts={any} k={d} t'={d}\n", .{ t_next.token, drafts.items, k, next_sample.token });
+                std.debug.print("MTP round: n={d} ms={d:.1} t={d} drafts={any} k={d} t'={d}\n", .{
+                    n_round,
+                    @as(f64, @floatFromInt(prof_now() - round_t0)) / 1e6,
+                    t_next.token,
+                    drafts.items,
+                    k,
+                    next_sample.token,
+                });
             }
             mtp.commit(self.model.ptr, vh, k + 1, vids.items);
             prof_lap(prof_now, &prof_last, &prof_commit_ns);
+            if (comptime true) {
+                // DMLX_MEM_PROBE_ROUNDS=1: per-phase MLX active memory for
+                // the first 6 rounds (leak hunt 2026-10-30).
+                if (mem_probe_on and prof_rounds <= 6) {
+                    _ = c.c.mlx_get_active_memory(&phase_mem[3]);
+                    std.debug.print("MEMROUND r={d} after-draft={d:.1} after-verify={d:.1} after-accept={d:.1} after-commit={d:.1} MB\n", .{
+                        prof_rounds,
+                        @as(f64, @floatFromInt(phase_mem[0])) / 1048576.0,
+                        @as(f64, @floatFromInt(phase_mem[1])) / 1048576.0,
+                        @as(f64, @floatFromInt(phase_mem[2])) / 1048576.0,
+                        @as(f64, @floatFromInt(phase_mem[3])) / 1048576.0,
+                    });
+                }
+            }
             // Emit accepted drafts + the next sampled token, capped at
             // max_tokens (plain decode emits exactly max_tokens).
             for (drafts.items[0..k]) |d| {
@@ -1533,6 +1864,14 @@ pub const EngineLoop = struct {
                 stopped = true;
                 finish = .stop;
             }
+            // Feed this round's realized cost-per-token back to the depth
+            // controller. Only full rounds are scored; the `break` paths
+            // above (draft failure, stop token, max_tokens) are not
+            // representative of steady-state cost.
+            {
+                const round_ns = prof_now() - round_t0;
+                depth_ctl.record(n_round, if (round_ns > 0) @intCast(round_ns) else 0, k);
+            }
         }
         hidden.deinit();
 
@@ -1543,6 +1882,66 @@ pub const EngineLoop = struct {
                 }
             }.f;
             const rounds = if (prof_rounds > 0) prof_rounds else 1;
+            // Depth controller trace: rounds spent at each depth and the
+            // converged ms/token estimate that drove the choice.
+            var depth_buf: [192]u8 = undefined;
+            var depth_len: usize = 0;
+            for (1..depth_ctl.max_n + 1) |n| {
+                if (depth_ctl.used[n - 1] == 0) continue;
+                const chunk = std.fmt.bufPrint(
+                    depth_buf[depth_len..],
+                    " N={d}:{d}r/{d:.1}ms/tok(E[t]={d:.2})",
+                    .{ n, depth_ctl.used[n - 1], depth_ctl.score(n) orelse 0.0, depth_ctl.expectedTokens(n) },
+                ) catch break;
+                depth_len += chunk.len;
+            }
+            std.log.info("[Engine] MTP depth{s}", .{depth_buf[0..depth_len]});
+            // Per-depth CONDITIONAL acceptance p_i = P(draft i accepted |
+            // drafts 1..i-1 accepted), with the raw counts behind it. This is
+            // the quantity that decides everything about depth: expected
+            // tokens is 1 + sum_i prod_{j<=i} p_j. The aggregate
+            // "acceptance %" below mixes depths and is NOT comparable across
+            // engines (it depends on how early-break rounds are counted).
+            var p_buf: [256]u8 = undefined;
+            var p_len: usize = 0;
+            for (1..depth_ctl.max_n + 1) |i| {
+                const reached = depth_ctl.reached[i - 1];
+                if (reached == 0) continue;
+                const acc = depth_ctl.accepted[i - 1];
+                const chunk = std.fmt.bufPrint(p_buf[p_len..], " p{d}={d:.3}({d}/{d})", .{
+                    i,
+                    @as(f64, @floatFromInt(acc)) / @as(f64, @floatFromInt(reached)),
+                    acc,
+                    reached,
+                }) catch break;
+                p_len += chunk.len;
+            }
+            std.log.info("[Engine] MTP cond-acceptance{s}", .{p_buf[0..p_len]});
+            qwen38_gdn_prof.gdnVerifyProfReport();
+            verify_qmm_mod.tallyReport();
+            if (topk_total[0] > 0) {
+                // Drafter top-k hit rate per depth: how often the target's
+                // own token was in the drafter's top-k. top1 == p_i; the
+                // gap between top1 and top2/top4 is exactly the payoff a
+                // multi-branch (tree) draft could capture, which is now
+                // affordable because sg8's cost is flat in row count.
+                var k_buf: [320]u8 = undefined;
+                var k_len: usize = 0;
+                for (0..topk_depths) |i| {
+                    if (topk_total[i] == 0) continue;
+                    const tot: f64 = @floatFromInt(topk_total[i]);
+                    const chunk = std.fmt.bufPrint(k_buf[k_len..], " d{d}:top1={d:.3} top2={d:.3} top4={d:.3} top8={d:.3} (n={d})", .{
+                        i + 1,
+                        @as(f64, @floatFromInt(topk_hit1[i])) / tot,
+                        @as(f64, @floatFromInt(topk_hit2[i])) / tot,
+                        @as(f64, @floatFromInt(topk_hit4[i])) / tot,
+                        @as(f64, @floatFromInt(topk_hit8[i])) / tot,
+                        topk_total[i],
+                    }) catch break;
+                    k_len += chunk.len;
+                }
+                std.log.info("[Engine] MTP drafter top-k{s}", .{k_buf[0..k_len]});
+            }
             std.log.info("[Engine] MTP request {d}: acceptance {d:.1}% ({d}/{d} drafts); ms/round draft={d:.1} verify={d:.1} accept={d:.1} commit={d:.1}", .{
                 req.id,
                 100.0 * @as(f64, @floatFromInt(drafts_accepted)) / @as(f64, @floatFromInt(drafts_proposed)),
@@ -1787,6 +2186,20 @@ pub const EngineLoop = struct {
             "[RequestLog] id={d} model={s} streaming={} prompt_tokens={d} generated_tokens={d} duration_ms={d:.2} tokens_per_sec={d:.2}",
             .{ req.id, req.model_name, req.streaming, prompt_len, gen_len, duration_ms, tokens_per_sec },
         );
+        // Leak probe: active MLX bytes should return to baseline after each
+        // request; monotonic growth == leaked arrays (see metal::malloc
+        // resource-limit crashes on long MTP sessions).
+        if (std.c.getenv("DMLX_MEM_PROBE") != null) {
+            var active: usize = 0;
+            var peak: usize = 0;
+            _ = c.c.mlx_get_active_memory(&active);
+            _ = c.c.mlx_get_peak_memory(&peak);
+            std.log.info("[MemProbe] id={d} active={d:.2} GB peak={d:.2} GB", .{
+                req.id,
+                @as(f64, @floatFromInt(active)) / 1073741824.0,
+                @as(f64, @floatFromInt(peak)) / 1073741824.0,
+            });
+        }
     }
 
     /// Warmup: generate a few tokens to force backbone page-in before real requests.

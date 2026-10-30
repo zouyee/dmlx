@@ -7,6 +7,7 @@
 //! silu output gate.
 //! f32 throughout; cross-checked against scripts/qwen38_gdn_ref.py.
 const std = @import("std");
+const verify_qmm = @import("verify_qmm.zig");
 const c = @import("mlx").c;
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
@@ -70,6 +71,158 @@ const FusedKernelEntry = struct {
     kernel: c.c.mlx_fast_metal_kernel,
     broken: bool = false,
 };
+
+// ============================================================
+// GDN prefill section profiling (DMLX_GDN_PREFILL_PROF=1)
+// ============================================================
+// The prefill breakdown (plan doc §17) put GDN's NON-qmm cost at 1448 ms of a
+// 17479 ms L=2048 prefill — the largest non-GEMM item and the only one worth
+// attacking, since 4-bit qmm already runs at 90% of a dense bf16 matmul (so
+// there is no GEMM headroom; see §18.0/A0). This splits GDN's prefill into
+// front (qkv qmm + causal conv + gates) / recurrence (delta rule) / tail
+// (out-gate norm + out_proj) to find which one holds that 1448 ms.
+var gdn_prof: struct {
+    // Verify-path counters (DMLX_VERIFY_PROF=1). The MTP round's non-qmm cost
+    // is the whole remaining gap to mlx-vlm at matched depth — 19.7 ms/round,
+    // of which ~17 ms is the verify forward's non-qmm part (plan doc §21.2).
+    // Splitting prefillVerify the same way §17 split prefill is what locates it.
+    v_front_ns: u64 = 0,
+    v_rec_ns: u64 = 0,
+    v_states_ns: u64 = 0,
+    v_tail_ns: u64 = 0,
+    v_layers: u64 = 0,
+    f_proj_ns: u64 = 0,
+    f_conv_ns: u64 = 0,
+    f_gate_ns: u64 = 0,
+    f_bcast_ns: u64 = 0,
+    front_ns: u64 = 0,
+    rec_ns: u64 = 0,
+    tail_ns: u64 = 0,
+    layers: u64 = 0,
+} = .{};
+
+var gdn_prof_enabled: ?bool = null;
+var verify_prof_enabled: ?bool = null;
+
+fn gdnVerifyProfEnabled() bool {
+    if (verify_prof_enabled) |v| return v;
+    const v = std.c.getenv("DMLX_VERIFY_PROF") != null;
+    verify_prof_enabled = v;
+    return v;
+}
+
+/// Print and reset the accumulated GDN VERIFY section times.
+pub fn gdnVerifyProfReport() void {
+    if (gdn_prof.v_layers == 0) return;
+    const ms = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    const total = gdn_prof.v_front_ns + gdn_prof.v_rec_ns + gdn_prof.v_states_ns + gdn_prof.v_tail_ns;
+    const pct = struct {
+        fn f(x: u64, t: u64) f64 {
+            return 100.0 * @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(@max(t, 1)));
+        }
+    }.f;
+    std.debug.print("\n=== GDN VERIFY sections over {d} layer-passes (total {d:.1} ms) ===\n", .{ gdn_prof.v_layers, ms(total) });
+    std.debug.print("  front  (4 proj qmm + conv + gates)     {d: >8.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.v_front_ns), pct(gdn_prof.v_front_ns, total) });
+    std.debug.print("  recur  (fused retain, writes s_all)    {d: >8.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.v_rec_ns), pct(gdn_prof.v_rec_ns, total) });
+    std.debug.print("  states (L conv-state slices + copies)  {d: >8.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.v_states_ns), pct(gdn_prof.v_states_ns, total) });
+    std.debug.print("  tail   (out-gate norm + out_proj qmm)  {d: >8.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.v_tail_ns), pct(gdn_prof.v_tail_ns, total) });
+    gdn_prof.v_front_ns = 0;
+    gdn_prof.v_rec_ns = 0;
+    gdn_prof.v_states_ns = 0;
+    gdn_prof.v_tail_ns = 0;
+    gdn_prof.v_layers = 0;
+}
+
+var verify_lazy_conv: ?bool = null;
+
+/// Verify path keeps the whole conv `window` and slices the committed
+/// position at commit time, instead of materializing L row copies per layer.
+/// `DMLX_NO_VERIFY_LAZY_CONV=1` restores the eager per-position copies.
+fn verifyLazyConv() bool {
+    if (verify_lazy_conv) |v| return v;
+    const v = std.c.getenv("DMLX_NO_VERIFY_LAZY_CONV") == null;
+    verify_lazy_conv = v;
+    return v;
+}
+
+var verify_no_sall: ?bool = null;
+
+/// DIAGNOSTIC ONLY (`DMLX_VERIFY_NO_SALL=1`): run the verify recurrence with
+/// the non-retain kernel, which writes just the final state instead of all L.
+/// This prices the s_all traffic (L x 3 MB per GDN layer = 432 MB/round at
+/// L=3). It commits the WRONG state whenever accepted < L-1, so output is
+/// garbage — use it to read ms/round, never for correctness.
+fn verifyNoSall() bool {
+    if (verify_no_sall) |v| return v;
+    const v = std.c.getenv("DMLX_VERIFY_NO_SALL") != null;
+    verify_no_sall = v;
+    return v;
+}
+
+var verify_no_recur: ?bool = null;
+
+/// DIAGNOSTIC ONLY (`DMLX_VERIFY_NO_RECUR=1`): replace the entire verify
+/// recurrence with a zero-cost stand-in. Prices the whole delta-rule step
+/// (launch + 600 MB of state traffic + ALU) in ONE reading, without the
+/// barrier distortion that makes the DMLX_VERIFY_PROF section shares
+/// unusable as absolute numbers. Output is garbage.
+fn verifyNoRecur() bool {
+    if (verify_no_recur) |v| return v;
+    const v = std.c.getenv("DMLX_VERIFY_NO_RECUR") != null;
+    verify_no_recur = v;
+    return v;
+}
+
+var verify_snapshot: ?bool = null;
+
+/// Snapshot + replay-on-rejection instead of writing every position's state
+/// (`DMLX_NO_VERIFY_SNAPSHOT=1` restores the s_all path). See
+/// PrefillVerifyResult.replay.
+fn verifySnapshot() bool {
+    if (verify_snapshot) |v| return v;
+    const v = std.c.getenv("DMLX_NO_VERIFY_SNAPSHOT") == null;
+    verify_snapshot = v;
+    return v;
+}
+
+fn gdnPrefillProfEnabled() bool {
+    if (gdn_prof_enabled) |v| return v;
+    const v = std.c.getenv("DMLX_GDN_PREFILL_PROF") != null;
+    gdn_prof_enabled = v;
+    return v;
+}
+
+fn nowNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
+/// Print and reset the accumulated GDN prefill section times.
+pub fn gdnPrefillProfReport() void {
+    if (gdn_prof.layers == 0) return;
+    const ms = struct {
+        fn f(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    const total = gdn_prof.front_ns + gdn_prof.rec_ns + gdn_prof.tail_ns;
+    std.debug.print("\n=== GDN prefill sections over {d} layer-passes (total {d:.0} ms) ===\n", .{ gdn_prof.layers, ms(total) });
+    std.debug.print("  front  (qkv qmm + causal conv + gates) {d: >9.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.front_ns), 100.0 * @as(f64, @floatFromInt(gdn_prof.front_ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    if (gdn_prof.f_proj_ns > 0) {
+        std.debug.print("    front/ 4 projections (qmm)           {d: >9.1} ms\n", .{ms(gdn_prof.f_proj_ns)});
+        std.debug.print("    front/ causal conv + window          {d: >9.1} ms\n", .{ms(gdn_prof.f_conv_ns)});
+        std.debug.print("    front/ gates (softplus/exp/sigmoid)  {d: >9.1} ms\n", .{ms(gdn_prof.f_gate_ns)});
+        std.debug.print("    front/ q,k head broadcast (gather)    {d: >9.1} ms\n", .{ms(gdn_prof.f_bcast_ns)});
+    }
+    std.debug.print("  recur  (delta rule, serial over L)     {d: >9.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.rec_ns), 100.0 * @as(f64, @floatFromInt(gdn_prof.rec_ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    std.debug.print("  tail   (out-gate norm + out_proj qmm)  {d: >9.1} ms  {d: >5.1}%\n", .{ ms(gdn_prof.tail_ns), 100.0 * @as(f64, @floatFromInt(gdn_prof.tail_ns)) / @as(f64, @floatFromInt(@max(total, 1))) });
+    gdn_prof = .{};
+}
 
 // Lazy-init registry. Not synchronized: decode serving is serial
 // (vtable_serial) and the test runner is single-threaded.
@@ -168,6 +321,74 @@ const DeltaRuleOut = struct {
     y_f32: Array, // [HV, D] f32
 };
 
+var decode_wide_rec: ?bool = null;
+
+/// `DMLX_DECODE_WIDE_REC=1`: run the DECODE delta rule on the prefill
+/// recurrence kernel's thread mapping (grid (32, D, HV) = 196608 threads,
+/// one simdgroup per state row) instead of the decode kernels' one-thread-
+/// per-row mapping (grid (D, HV) = 6144 threads).
+///
+/// Why (plan doc §25): the decode fused conv+tail kernel measured
+/// 0.254 ms/layer against a 23 us memory floor — 11x off, because 6144
+/// threads cannot cover memory latency on a part with 2560 ALU lanes. The
+/// same math with the 32x wider mapping measured FREE in the verify path
+/// (§23). Ablating the whole kernel is worth 12.2 ms/token (§25.1).
+///
+/// Cost: forces the eager conv + eager tail path, so the monolithic
+/// conv+tail and tail kernels are bypassed and their elementwise work goes
+/// back to separate ops. That trade is what this switch measures.
+fn decodeWideRec() bool {
+    if (decode_wide_rec) |v| return v;
+    const v = std.c.getenv("DMLX_DECODE_WIDE_REC") != null;
+    decode_wide_rec = v;
+    return v;
+}
+
+var decode_eager_tail: ?bool = null;
+
+/// Bypass BOTH monolithic decode kernels (`gdnConvTailFused`, `gdnTailFused`)
+/// so the tail runs as eager ops with `deltaRuleFused` as a separate kernel.
+/// `DMLX_DECODE_WIDE_REC` implies this (it has to, to reach the delta rule),
+/// which is why the two must be measured separately: this switch alone prices
+/// the eager penalty, so that `wide = eager+wide - eager` isolates the
+/// mapping's real gain (plan doc §25.5).
+fn decodeEagerTail() bool {
+    if (decode_eager_tail) |v| return v;
+    const v = std.c.getenv("DMLX_DECODE_EAGER_TAIL") != null or decodeWideRec();
+    decode_eager_tail = v;
+    return v;
+}
+
+/// Decode-shaped delta rule on the prefill kernel's wide mapping. Inputs are
+/// the decode shapes ([HV, D] / [HV]); the L=1 reshapes are free views.
+fn deltaRuleWide(
+    ctx: EagerContext,
+    ssm_state: Array,
+    k_full: Array, // [HV, D] f32
+    v: Array,
+    beta: Array, // [HV] f32
+    g: Array,
+    q_full: Array,
+    hv: i32,
+    d: i32,
+) !?DeltaRuleOut {
+    const k3 = try ops.reshape(ctx, k_full, &[_]i32{ 1, hv, d });
+    defer k3.deinit();
+    const v3 = try ops.reshape(ctx, v, &[_]i32{ 1, hv, d });
+    defer v3.deinit();
+    const q3 = try ops.reshape(ctx, q_full, &[_]i32{ 1, hv, d });
+    defer q3.deinit();
+    const b2 = try ops.reshape(ctx, beta, &[_]i32{ 1, hv });
+    defer b2.deinit();
+    const g2 = try ops.reshape(ctx, g, &[_]i32{ 1, hv });
+    defer g2.deinit();
+    const rec = (try deltaRulePrefillFused(ctx, ssm_state, k3, v3, b2, g2, q3, hv, d)) orelse return null;
+    errdefer rec.s_new.deinit();
+    defer rec.y.deinit();
+    const y2 = try ops.reshape(ctx, rec.y, &[_]i32{ hv, d });
+    return .{ .s_new = rec.s_new, .y_f32 = y2 };
+}
+
 /// Fused single-kernel delta rule. Returns null when the shape/dtype is
 /// unsupported or the kernel is unavailable (caller falls back to eager).
 fn deltaRuleFused(
@@ -185,6 +406,10 @@ fn deltaRuleFused(
     const dt_f32 = dtype_mod.Dtype.float32;
     if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
         v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+
+    if (decodeWideRec()) {
+        if (try deltaRuleWide(ctx, ssm_state, k_full, v, beta, g, q_full, hv, d)) |w| return w;
+    }
 
     const kernel = getFusedKernel(ctx.allocator, d) orelse return null;
 
@@ -525,6 +750,241 @@ const conv_tail_kernel_body =
     \\
 ;
 
+// ============================================================
+// Fused Metal kernel v4 ("wide"): same math as v3, re-mapped so the state
+// access coalesces — §25 option B
+// ============================================================
+//
+// v3 (`conv_tail_kernel_body`) launches grid (D, HV) = 6144 threads with one
+// thread per state ROW. Two things follow, both bad:
+//
+//  1. Only HV = 48 threadgroups exist, because the kernel needs the head's
+//     whole D-length q/k vector in threadgroup memory. 48 threadgroups is
+//     2.4 per core on this M4 Pro (20 cores) and leaves cores idle outright
+//     on any Mac with more than 48 (§25.7).
+//  2. Thread `dv` reads `s_in[(h*D + dv)*D + i]`, so neighbouring lanes are
+//     512 B apart: 32 lanes pull 32 separate 128 B cache lines for 512 B of
+//     useful data — an 8x read AND write amplification on the only sizable
+//     traffic in the kernel (6 MB/layer of state becomes ~48 MB/layer).
+//     That is the bulk of the 12.2 ms/token §25.1 measured by ablation.
+//
+// v4 keeps the fusion and flips the mapping: grid (32, D, HV) with
+// threadgroup (32, 4, 1) = 1536 threadgroups, and lane `dk` owns float4
+// index `dk` of the row, so consecutive lanes touch consecutive 16 B and a
+// simdgroup issues ONE coalesced 512 B transaction per row. The two
+// row-length dot products (kv, readout) become `simd_sum`.
+//
+// Two consequences handled below:
+//
+//  - A threadgroup now owns only 4 state rows but still needs the head's
+//    full q/k vectors, so phase 1 recomputes the whole head's conv with one
+//    channel per thread (threadgroup size is exactly D = 128). The 32x
+//    redundancy across a head's threadgroups is free in DRAM terms:
+//    `conv_state` and `conv1d_t` are ~123 KB each and stay L2-resident.
+//    `conv_out` writes are NOT free, so they are gated to the first
+//    row-block (`thread_position_in_grid.y < 4`) and happen exactly once.
+//  - The out-gate RMSNorm reduces over the head's whole y row, which no
+//    longer lives in one threadgroup. It moves to a second, cheap kernel
+//    (`out_gate_kernel_body`, grid (D, HV), reading a 24 KB y buffer).
+//
+// Requires D == 128 (threadgroup size must equal D so phase 1 covers every
+// channel exactly once, and D/4 must equal the 32 lanes). Anything else
+// falls back to v3.
+
+const wide_tail_kernel_body =
+    \\    const uint lane = thread_position_in_threadgroup.x;   // 0..31, owns float4 `lane`
+    \\    const uint dv = thread_position_in_grid.y;            // state row
+    \\    const uint h = thread_position_in_grid.z;
+    \\    const uint hk = h / {[ratio]};
+    \\    // Threadgroup is (32, 4, 1) = 128 threads == D, so this is the channel.
+    \\    const uint tid = thread_position_in_threadgroup.x + 32 * thread_position_in_threadgroup.y;
+    \\
+    \\    threadgroup float qsh[{[d]}];
+    \\    threadgroup float ksh[{[d]}];
+    \\    threadgroup float vsh[{[d]}];
+    \\
+    \\    // Phase 1: the whole head's depthwise causal conv + silu, one
+    \\    // channel per thread. Ascending j matches convAccumStep.
+    \\    {{
+    \\        const uint qbase = hk * {[d]} + tid;
+    \\        const uint kbase = {[pk]} + hk * {[d]} + tid;
+    \\        const uint vbase = 2 * {[pk]} + h * {[d]} + tid;
+    \\        float qa = 0.0f;
+    \\        float ka = 0.0f;
+    \\        float va = 0.0f;
+    \\        for (int j = 0; j < {[km1]}; ++j) {{
+    \\            const uint off = j * {[qkv]};
+    \\            qa += conv_state[off + qbase] * conv1d_t[off + qbase];
+    \\            ka += conv_state[off + kbase] * conv1d_t[off + kbase];
+    \\            va += conv_state[off + vbase] * conv1d_t[off + vbase];
+    \\        }}
+    \\        const uint loff = {[km1]} * {[qkv]};
+    \\        qa += float(qkv_lin[qbase]) * conv1d_t[loff + qbase];
+    \\        ka += float(qkv_lin[kbase]) * conv1d_t[loff + kbase];
+    \\        va += float(qkv_lin[vbase]) * conv1d_t[loff + vbase];
+    \\        qsh[tid] = qa / (1.0f + metal::exp(-qa));
+    \\        ksh[tid] = ka / (1.0f + metal::exp(-ka));
+    \\        vsh[tid] = va / (1.0f + metal::exp(-va));
+    \\
+    \\        // New conv window = window rows 1..K-1 (raw pre-conv values).
+    \\        // Written by the FIRST row-block only: every threadgroup of this
+    \\        // head computes the same values, and 32x redundant writes would
+    \\        // cost real bandwidth (unlike the L2-resident reads above).
+    \\        if (thread_position_in_grid.y < 4) {{
+    \\            if (h % {[ratio]} == 0) {{
+    \\                for (int r = 0; r < {[km2]}; ++r) {{
+    \\                    conv_out[r * {[qkv]} + qbase] = conv_state[(r + 1) * {[qkv]} + qbase];
+    \\                    conv_out[r * {[qkv]} + kbase] = conv_state[(r + 1) * {[qkv]} + kbase];
+    \\                }}
+    \\                conv_out[{[km2]} * {[qkv]} + qbase] = float(qkv_lin[qbase]);
+    \\                conv_out[{[km2]} * {[qkv]} + kbase] = float(qkv_lin[kbase]);
+    \\            }}
+    \\            for (int r = 0; r < {[km2]}; ++r) {{
+    \\                conv_out[r * {[qkv]} + vbase] = conv_state[(r + 1) * {[qkv]} + vbase];
+    \\            }}
+    \\            conv_out[{[km2]} * {[qkv]} + vbase] = float(qkv_lin[vbase]);
+    \\        }}
+    \\    }}
+    \\
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\    // This lane's slice of the head's q/k vectors (column dimension).
+    \\    const metal::float4 q4 = metal::float4(qsh[4 * lane], qsh[4 * lane + 1], qsh[4 * lane + 2], qsh[4 * lane + 3]);
+    \\    const metal::float4 k4 = metal::float4(ksh[4 * lane], ksh[4 * lane + 1], ksh[4 * lane + 2], ksh[4 * lane + 3]);
+    \\
+    \\    // Weight-less per-head rmsNorm factors (folded scales). v3 ran a
+    \\    // redundant D-iteration serial loop in every thread; here the 32
+    \\    // lanes split it and simd_sum combines.
+    \\    const float ssq = metal::simd_sum(metal::dot(q4, q4));
+    \\    const float ssk = metal::simd_sum(metal::dot(k4, k4));
+    \\    const float qfac = {[qscale]s} * metal::rsqrt(ssq / {[d]}.0f + 1e-6f);
+    \\    const float kfac = {[kscale]s} * metal::rsqrt(ssk / {[d]}.0f + 1e-6f);
+    \\
+    \\    // Per-head gates (f32), identical to v3.
+    \\    const float ax = float(a[h]) + float(dt_bias[h]);
+    \\    const float sp = ax > 20.0f ? ax : metal::log(1.0f + metal::exp(ax));
+    \\    const float gh = metal::exp(-metal::exp(float(A_log[h])) * sp);
+    \\    const float bh = float({[bt]s}(1.0f / (1.0f + metal::exp(-float(b[h])))));
+    \\
+    \\    // Delta rule. Lane `lane` owns float4 `lane` of state row dv, so the
+    \\    // simdgroup's 32 accesses are one contiguous 512 B span.
+    \\    const device metal::float4* srow_in = (const device metal::float4*)(s_in + (h * {[d]} + dv) * {[d]});
+    \\    device metal::float4* srow_out = (device metal::float4*)(s_out + (h * {[d]} + dv) * {[d]});
+    \\    const metal::float4 kk = kfac * k4;
+    \\    metal::float4 s = srow_in[lane] * gh;
+    \\    const float kv = metal::simd_sum(metal::dot(s, kk));
+    \\    const float dl = (vsh[dv] - kv) * bh;
+    \\    s = s + dl * kk;
+    \\    srow_out[lane] = s;
+    \\    const float yv = metal::simd_sum(metal::dot(s, qfac * q4));
+    \\    if (lane == 0) y_out[h * {[d]} + dv] = yv;
+    \\
+;
+
+// Out gate for the v4 split: norm the head's y row, weight multiply, silu(z)
+// gate. Separate kernel because the reduction spans the head's whole row,
+// which v4's narrow threadgroups no longer hold. Reads a 24 KB y buffer, so
+// the extra launch is the only real cost.
+const out_gate_kernel_body =
+    \\    const uint dv = thread_position_in_grid.x;
+    \\    const uint h = thread_position_in_grid.y;
+    \\    threadgroup float ysh[{[d]}];
+    \\    ysh[dv] = y_in[h * {[d]} + dv];
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    float ssy = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) ssy += ysh[i] * ysh[i];
+    \\    const float yn = ysh[dv] * metal::rsqrt(ssy / {[d]}.0f + 1e-6f);
+    \\    const float yw = yn * float(norm_w[dv]);
+    \\    const float zz = float(z[h * {[d]} + dv]);
+    \\    const float zact = zz / (1.0f + metal::exp(-zz));
+    \\    out[h * {[d]} + dv] = zact * yw;
+    \\
+;
+
+// Dependency-depth probe (DMLX_DECODE_EXTRA_LAUNCH=N).
+//
+// §29.3 attributed the ~7 ms that v4 did NOT recover to dependent
+// kernel-launch latency, on the arithmetic that 96 dependent launches per
+// token at ~70-100 us each lands in that range. That was an INFERENCE, and
+// the decision it feeds (transposing the SSM state layout so v3's
+// single-kernel shape coalesces, which has a large blast radius) is too
+// expensive to take on an unverified attribution.
+//
+// This prices dependency depth directly: insert N numerically-identity
+// pass-through kernels into each GDN layer's serial chain and read the slope
+// of ms/token against N. Each insertion adds exactly 48 dependent launches
+// per token and no meaningful work (one float copy per thread over a 24 KB
+// buffer), so slope / 48 is the per-dependent-launch cost.
+const passthru_kernel_body =
+    \\    const uint i = thread_position_in_grid.x + {[d]} * thread_position_in_grid.y;
+    \\    y_out[i] = y_in[i];
+    \\
+;
+
+var passthru_entries: [4]?struct { d: i32, kernel: c.c.mlx_fast_metal_kernel } = .{ null, null, null, null };
+var extra_launch: ?i32 = null;
+
+fn extraLaunchCount() i32 {
+    if (extra_launch) |v| return v;
+    const v = blk: {
+        const s = std.c.getenv("DMLX_DECODE_EXTRA_LAUNCH") orelse break :blk 0;
+        break :blk std.fmt.parseInt(i32, std.mem.span(s), 10) catch 0;
+    };
+    extra_launch = v;
+    return v;
+}
+
+fn getPassthruKernel(allocator: std.mem.Allocator, d: i32) ?c.c.mlx_fast_metal_kernel {
+    for (&passthru_entries) |*slot| {
+        if (slot.*) |e| {
+            if (e.d == d) return e.kernel;
+        }
+    }
+    const name_z = std.fmt.allocPrintSentinel(allocator, "gdn_passthru_d{d}", .{d}, 0) catch return null;
+    defer allocator.free(name_z);
+    const source_z = std.fmt.allocPrintSentinel(allocator, passthru_kernel_body, .{ .d = d }, 0) catch return null;
+    defer allocator.free(source_z);
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+    const in_vec = makeStringVec(allocator, &.{"y_in"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = makeStringVec(allocator, &.{"y_out"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+    const kernel = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, source_z.ptr, header_z.ptr, true, false);
+    for (&passthru_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .d = d, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return kernel;
+}
+
+/// Chain `n` identity kernels onto `y` ([HV, D] f32). Returns a new array.
+fn passthruChain(ctx: EagerContext, y: Array, hv: i32, d: i32, n: i32) !Array {
+    const kernel = getPassthruKernel(ctx.allocator, d) orelse return error.MlxError;
+    var cur = try ops.reshape(ctx, y, &[_]i32{ hv, d }); // owned view
+    var i: i32 = 0;
+    while (i < n) : (i += 1) {
+        const cfg = c.c.mlx_fast_metal_kernel_config_new();
+        defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+        try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, hv, 1));
+        try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
+        try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d }, 2, c.c.MLX_FLOAT32));
+        const in_v = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(in_v);
+        try c.check(c.c.mlx_vector_array_append_value(in_v, cur.inner));
+        var out_v = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(out_v);
+        try c.check(c.c.mlx_fast_metal_kernel_apply(&out_v, kernel, in_v, cfg, fusedStream()));
+        var h = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h, out_v, 0));
+        cur.deinit();
+        cur = Array.fromHandle(h);
+    }
+    return cur;
+}
+
 const ConvTailKernelKey = struct {
     d: i32,
     ratio: i32,
@@ -626,6 +1086,241 @@ pub const ConvTailOut = struct {
     conv_state: Array, // [K-1, QKV] f32
 };
 
+// --- v4 "wide" kernel cache (two kernels; see wide_tail_kernel_body) -------
+
+var wide_tail_entries: [8]?ConvTailKernelEntry = .{ null, null, null, null, null, null, null, null };
+var out_gate_entries: [4]?struct { d: i32, kernel: c.c.mlx_fast_metal_kernel, broken: bool = false } =
+    .{ null, null, null, null };
+
+fn createWideTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) !c.c.mlx_fast_metal_kernel {
+    const d = key.d;
+    const inv_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+    const qscale_z = try f32MetalLit(allocator, inv_scale * inv_scale);
+    defer allocator.free(qscale_z);
+    const kscale_z = try f32MetalLit(allocator, inv_scale);
+    defer allocator.free(kscale_z);
+    const bt: []const u8 = if (key.b_bf16) "bfloat16_t" else "float";
+    const qkv = key.pk * (2 + key.ratio);
+
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_wide_tail_d{d}_r{d}_p{d}_k{d}_{c}", .{ d, key.ratio, key.pk, key.k, if (key.b_bf16) @as(u8, 'b') else 'f' }, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, wide_tail_kernel_body, .{
+        .d = d,
+        .ratio = key.ratio,
+        .pk = key.pk,
+        .qkv = qkv,
+        .km1 = key.k - 1,
+        .km2 = key.k - 2,
+        .qscale = qscale_z,
+        .kscale = kscale_z,
+        .bt = bt,
+    }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "qkv_lin", "conv_state", "conv1d_t", "a", "b", "A_log", "dt_bias", "s_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "y_out", "s_out", "conv_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    return c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, source_z.ptr, header_z.ptr, true, false);
+}
+
+fn createOutGateKernel(allocator: std.mem.Allocator, d: i32) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_out_gate_d{d}", .{d}, 0);
+    defer allocator.free(name_z);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, out_gate_kernel_body, .{ .d = d }, 0);
+    defer allocator.free(source_z);
+    const header_z = try allocator.dupeZ(u8, "");
+    defer allocator.free(header_z);
+    const in_vec = try makeStringVec(allocator, &.{ "y_in", "z", "norm_w" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{"out"});
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+    return c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, source_z.ptr, header_z.ptr, true, false);
+}
+
+fn getWideTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) ?c.c.mlx_fast_metal_kernel {
+    for (&wide_tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createWideTailKernel(allocator, key) catch |err| {
+        convTailWarn(err);
+        return null;
+    };
+    for (&wide_tail_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn getOutGateKernel(allocator: std.mem.Allocator, d: i32) ?c.c.mlx_fast_metal_kernel {
+    for (&out_gate_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (e.d == d) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createOutGateKernel(allocator, d) catch |err| {
+        convTailWarn(err);
+        return null;
+    };
+    for (&out_gate_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .d = d, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markWideTailBroken(key: ConvTailKernelKey) void {
+    for (&wide_tail_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+var decode_wide_tail: ?bool = null;
+
+/// v4 coalesced mapping (§25 option B) is the DEFAULT; set
+/// `DMLX_DECODE_NO_WIDE_TAIL=1` to fall back to v3.
+///
+/// Gates it passed before becoming the default: ms/token 73.98 -> 70.73
+/// (median of 3 interleaved passes with cooldown, won all 3), and
+/// `scripts/decode_env_ab_text.py` 6/6 byte-identical greedy output. The
+/// text diff is the only gate that covers this kernel at all — unit tests
+/// run at D=4 where it is ineligible, and the mlx-lm oracle dump is a
+/// prefill pass.
+fn decodeWideTail() bool {
+    if (decode_wide_tail) |v| return v;
+    const v = std.c.getenv("DMLX_DECODE_NO_WIDE_TAIL") == null;
+    decode_wide_tail = v;
+    return v;
+}
+
+/// v4 conv+tail: grid (32, D, HV) / threadgroup (32, 4, 1) so the delta
+/// rule's state access coalesces, plus a small second kernel for the
+/// out gate. Same math as gdnConvTailFused; null when ineligible.
+fn gdnConvTailWide(
+    ctx: EagerContext,
+    qkv_lin: Array,
+    conv_state: Array,
+    conv1d_t: Array,
+    a: Array,
+    b: Array,
+    z: Array,
+    tw: TailWeights,
+    hv: i32,
+    hk: i32,
+    d: i32,
+    k: i32,
+) !?ConvTailOut {
+    // Threadgroup size must equal D (phase 1 is one channel per thread) and
+    // D/4 must equal the 32 lanes, so this kernel is D == 128 only.
+    if (d != 128) return null;
+    if (hk < 1 or @mod(hv, hk) != 0) return null;
+    if (k < 2) return null;
+    if (@abs(tw.norm_eps - 1e-6) > 1e-12) return null;
+    if (!isFloatDtype(qkv_lin.dtype())) return null;
+    if (conv_state.dtype() != .float32) return null;
+    if (!isFloatDtype(conv1d_t.dtype())) return null;
+    if (tw.ssm_state.dtype() != .float32) return null;
+    if (!isFloatDtype(a.dtype()) or !isFloatDtype(b.dtype()) or !isFloatDtype(z.dtype()) or
+        !isFloatDtype(tw.A_log.dtype()) or !isFloatDtype(tw.dt_bias.dtype()) or !isFloatDtype(tw.norm_w.dtype())) return null;
+
+    const key = ConvTailKernelKey{
+        .d = d,
+        .ratio = @divExact(hv, hk),
+        .pk = hk * d,
+        .k = k,
+        .b_bf16 = b.dtype() == .bfloat16,
+    };
+    const kernel = getWideTailKernel(ctx.allocator, key) orelse return null;
+    const gate_kernel = getOutGateKernel(ctx.allocator, d) orelse return null;
+    const qkv_dim: i32 = key.pk * (2 + key.ratio);
+
+    // --- kernel 1: conv + norms + gates + delta rule -> y, s_out, conv_out
+    var y_dev: Array = undefined;
+    var s_new: Array = undefined;
+    var conv_new: Array = undefined;
+    {
+        const cfg = c.c.mlx_fast_metal_kernel_config_new();
+        defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+        try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32, d, hv));
+        try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+        try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d }, 2, c.c.MLX_FLOAT32));
+        try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ hv, d, d }, 3, c.c.MLX_FLOAT32));
+        try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ k - 1, qkv_dim }, 2, c.c.MLX_FLOAT32));
+
+        const in1 = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(in1);
+        for ([_]Array{ qkv_lin, conv_state, conv1d_t, a, b, tw.A_log, tw.dt_bias, tw.ssm_state }) |inp| {
+            try c.check(c.c.mlx_vector_array_append_value(in1, inp.inner));
+        }
+        var out1 = c.c.mlx_vector_array_new();
+        defer _ = c.c.mlx_vector_array_free(out1);
+        c.check(c.c.mlx_fast_metal_kernel_apply(&out1, kernel, in1, cfg, fusedStream())) catch |err| {
+            markWideTailBroken(key);
+            convTailWarn(err);
+            return null;
+        };
+        var h0 = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h0, out1, 0));
+        y_dev = Array.fromHandle(h0);
+        errdefer y_dev.deinit();
+        var h1 = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h1, out1, 1));
+        s_new = Array.fromHandle(h1);
+        errdefer s_new.deinit();
+        var h2 = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h2, out1, 2));
+        conv_new = Array.fromHandle(h2);
+    }
+    defer y_dev.deinit();
+    errdefer s_new.deinit();
+    errdefer conv_new.deinit();
+
+    // Dependency-depth probe: identity kernels inserted into this layer's
+    // serial chain. Numerically a no-op; see passthru_kernel_body.
+    const n_extra = extraLaunchCount();
+    const y_chained: ?Array = if (n_extra > 0)
+        try passthruChain(ctx, y_dev, hv, d, n_extra)
+    else
+        null;
+    defer if (y_chained) |yc| yc.deinit();
+    const y_for_gate = y_chained orelse y_dev;
+
+    // --- kernel 2: out gate -> [1, HV*D]
+    const cfg2 = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg2);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg2, d, hv, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg2, d, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]i32{ 1, hv * d }, 2, c.c.MLX_FLOAT32));
+
+    const in2 = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in2);
+    for ([_]Array{ y_for_gate, z, tw.norm_w }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in2, inp.inner));
+    }
+    var out2 = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out2);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out2, gate_kernel, in2, cfg2, fusedStream())) catch |err| {
+        markWideTailBroken(key);
+        convTailWarn(err);
+        return null;
+    };
+    var hy = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&hy, out2, 0));
+    return .{ .y = Array.fromHandle(hy), .s_new = s_new, .conv_state = conv_new };
+}
+
 /// Fused single-kernel conv chain + post-conv tail (conv+silu+new conv state,
 /// then norms + gates + delta rule + out gate). Returns null when
 /// shapes/dtypes are unsupported or the kernel is unavailable (caller falls
@@ -644,6 +1339,10 @@ fn gdnConvTailFused(
     d: i32,
     k: i32,
 ) !?ConvTailOut {
+    // Wide-recurrence experiment (§25.3 option A) needs the eager conv +
+    // eager tail path, because the delta rule is buried inside this
+    // monolithic kernel and cannot be re-mapped from outside.
+    if (decodeEagerTail()) return null;
     if (@mod(d, 4) != 0 or d < 4 or d > 128) return null;
     if (hk < 1 or @mod(hv, hk) != 0) return null;
     if (k < 2) return null;
@@ -736,6 +1435,9 @@ fn gdnTailFused(
     hk: i32,
     d: i32,
 ) !?TailOut {
+    // See gdnConvTailFused: the wide-recurrence path needs gdnTailEager,
+    // which is the only tail that calls deltaRuleFused as a separate kernel.
+    if (decodeEagerTail()) return null;
     if (@mod(d, 4) != 0 or d < 4 or d > 128) return null;
     if (hk < 1 or @mod(hv, hk) != 0) return null;
     if (@abs(tw.norm_eps - 1e-6) > 1e-12) return null;
@@ -1227,6 +1929,10 @@ fn deltaRulePrefillFusedRetain(
     d: i32,
 ) !?PrefillRetainFusedOut {
     if (@mod(d, 32) != 0 or d < 32) return null;
+    // DIAGNOSTIC ONLY (`DMLX_VERIFY_EAGER_REC=1`): force the eager per-step
+    // loop. The fused kernel path leaks ~0.4 MB per layer per round of MLX
+    // active memory (MemProbe, 2026-10-30); this isolates kernel vs eager.
+    if (std.c.getenv("DMLX_VERIFY_EAGER_REC") != null) return null;
     const L: i32 = @intCast(k_full.shape()[0]);
     if (L < 1) return null;
     const dt_f32 = dtype_mod.Dtype.float32;
@@ -1586,6 +2292,8 @@ pub fn linearQuantParts(ctx: EagerContext, x: Array, w: Array, scales: ?Array, b
             .config = quantConfigFromShapes(x, w, s),
             .original_shape = &[_]i32{},
         };
+        // See verify_qmm.zig: armed only around the MTP verify forward.
+        if (try verify_qmm.maybeQmm(ctx, x, qw)) |y| return y;
         return quantize_mod.quantizedMatmul(ctx, x, qw, true);
     }
     const w_t = try ops.transpose(ctx, w);
@@ -1612,6 +2320,202 @@ fn convAccumStep(ctx: EagerContext, conv1d_t: Array, conv_input: Array) !Array {
 /// as the fused decode conv kernel), f32 throughout. window is the
 /// [L+K-1, QKV] concat of conv_state and the raw qkv projection (already
 /// promoted to f32); the final astype in convAccumStep is the identity here.
+// ============================================================
+// Fused whole-sequence causal conv (+ silu)
+// ============================================================
+//
+// `convAccumSeq` below is the eager form: for each of the K taps it slices the
+// window, multiplies by the tap's per-channel weight and adds into an
+// accumulator. At prefill shapes that is the largest NON-qmm cost in the whole
+// forward (plan doc §19.2): at L=2048, QKV=10240 each tap reads an 84 MB
+// strided slice and writes 84 MB, the adds read/write another 84 MB each, so
+// one layer moves ~1.43 GB and 48 layers move ~68 GB. The caller also builds
+// `window` with a `concatenateAxis`, another 84 MB copy per layer, and then
+// applies `silu` in a separate pass (another 168 MB).
+//
+// This kernel does the whole thing in one pass: it reads `conv_state` and the
+// projection output SEPARATELY (so no concatenated window is needed), applies
+// the K taps, folds in silu, and writes the result once — ~8 GB instead of
+// ~68 GB plus the concat and silu passes.
+//
+// The new conv state does not need the window either: window rows
+// [L, L+K-1) are, by construction, the last K-1 rows of the projection
+// output, so the caller slices those directly (valid while L >= K-1, which
+// prefill always satisfies; shorter inputs fall back to the eager path).
+//
+// Accumulation order matches the eager form exactly (tap 0 first, then += in
+// tap order) — the delta-rule recurrence downstream is sensitive to conv
+// rounding, and HANDOFF records an earlier FMA rewrite that passed smoke but
+// cost 10.6% and broke Paris, so the order is kept and gated by a unit test
+// against the eager path.
+/// Each thread produces TPT consecutive output rows for one channel.
+///
+/// The first version did one output per thread, which needs K strided global
+/// reads per output (stride QKV*4 = 40 KB at the real width). Interleaved A/B
+/// showed that lost ~2% of prefill slope at L=2048 even though it won 4% at
+/// L=512 — consecutive rows were re-read instead of reused. Producing TPT rows
+/// per thread loads TPT+K-1 rows once and reuses them from registers:
+/// 7 reads per 4 outputs instead of 16.
+///
+/// Generated fully unrolled with named registers, never thread-local arrays:
+/// the Metal compiler spills such arrays unless the trip count is a power of
+/// two, which cost 10x in the verify kernels (plan doc §9.5).
+fn buildConvSeqSource(allocator: std.mem.Allocator, k: i32, tpt: i32) ![]u8 {
+    var s = std.ArrayList(u8).empty;
+    errdefer s.deinit(allocator);
+    const Emit = struct {
+        a: std.mem.Allocator,
+        buf: *std.ArrayList(u8),
+        fn raw(self: @This(), text: []const u8) !void {
+            try self.buf.appendSlice(self.a, text);
+        }
+        fn fmt(self: @This(), comptime f: []const u8, args: anytype) !void {
+            var tmp: [512]u8 = undefined;
+            try self.buf.appendSlice(self.a, try std.fmt.bufPrint(&tmp, f, args));
+        }
+    };
+    const w = Emit{ .a = allocator, .buf = &s };
+
+    try w.raw(
+        \\    const uint c = thread_position_in_grid.x;
+        \\    const int t0 = int(thread_position_in_grid.y) * TPT;
+        \\    if (c >= QKV || t0 >= L) { return; }
+        \\
+    );
+    // Tap weights for this channel, reused by every row below.
+    var j: i32 = 0;
+    while (j < k) : (j += 1) {
+        try w.fmt("    const float wv{d} = w[{d} * QKV + c];\n", .{ j, j });
+    }
+    try w.raw(
+        \\
+        \\    // Logical window row r: the first KM1 rows come from the carried
+        \\    // conv state, the rest from this call's projection output. Rows
+        \\    // past the end are zero and their outputs are never stored.
+        \\
+    );
+    var i: i32 = 0;
+    while (i < k - 1 + tpt) : (i += 1) {
+        try w.fmt(
+            \\    const int r{d} = t0 + {d};
+            \\    const float xv{d} = (r{d} < KM1) ? cs[r{d} * QKV + c]
+            \\        : ((r{d} - KM1) < L ? x[(r{d} - KM1) * QKV + c] : 0.0f);
+            \\
+        , .{ i, i, i, i, i, i, i });
+    }
+    try w.raw("\n");
+    var row: i32 = 0;
+    while (row < tpt) : (row += 1) {
+        try w.fmt("    if (t0 + {d} < L) {{\n", .{row});
+        // Same accumulation order as the eager taps: tap 0 first, then +=.
+        try w.fmt("        float acc = xv{d} * wv0;\n", .{row});
+        j = 1;
+        while (j < k) : (j += 1) {
+            try w.fmt("        acc += xv{d} * wv{d};\n", .{ row + j, j });
+        }
+        // silu, folded in to avoid a separate full-tensor pass.
+        try w.fmt(
+            "        y[(t0 + {d}) * QKV + c] = acc / (1.0f + metal::exp(-acc));\n    }}\n",
+            .{row},
+        );
+    }
+    return s.toOwnedSlice(allocator);
+}
+
+/// Output rows per thread. 4 keeps the reused window rows (TPT+K-1 = 7
+/// floats) plus the K tap weights comfortably in registers.
+const conv_seq_tpt: i32 = 4;
+
+var conv_seq_kernel: ?c.c.mlx_fast_metal_kernel = null;
+var conv_seq_broken: bool = false;
+
+fn getConvSeqKernel(allocator: std.mem.Allocator) ?c.c.mlx_fast_metal_kernel {
+    if (conv_seq_broken) return null;
+    if (conv_seq_kernel) |k| return k;
+    const name_z = allocator.dupeZ(u8, "gdn_conv_seq_silu") catch return null;
+    defer allocator.free(name_z);
+    const body = buildConvSeqSource(allocator, 4, conv_seq_tpt) catch return null;
+    defer allocator.free(body);
+    const src_z = allocator.dupeZ(u8, body) catch return null;
+    defer allocator.free(src_z);
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+    const in_vec = makeStringVec(allocator, &.{ "x", "cs", "w" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = makeStringVec(allocator, &.{"y"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+    const k = c.c.mlx_fast_metal_kernel_new(
+        name_z.ptr,
+        in_vec,
+        out_vec,
+        src_z.ptr,
+        header_z.ptr,
+        true, // ensure_row_contiguous
+        false,
+    );
+    conv_seq_kernel = k;
+    return k;
+}
+
+/// silu(causal_conv(concat(conv_state, x))) in one kernel. Returns null when
+/// ineligible (caller falls back to `convAccumSeq` + separate silu).
+var conv_fusion_off: ?bool = null;
+
+fn convFusionDisabled() bool {
+    if (conv_fusion_off) |v| return v;
+    const v = std.c.getenv("DMLX_NO_CONV_FUSION") != null;
+    conv_fusion_off = v;
+    return v;
+}
+
+fn convAccumSeqFused(
+    ctx: EagerContext,
+    conv1d_t_f32: Array,
+    conv_state: Array,
+    x_f32: Array,
+    L: i32,
+    qkv_dim: i32,
+    K: i32,
+) !?Array {
+    if (convFusionDisabled()) return null;
+    if (L < K - 1) return null; // new-state slice below assumes L >= K-1
+    if (conv1d_t_f32.dtype() != .float32 or x_f32.dtype() != .float32 or
+        conv_state.dtype() != .float32) return null;
+    const allocator = ctx.allocator;
+    const kernel = getConvSeqKernel(allocator) orelse return null;
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // One thread per output element, channel-major so the K reads coalesce
+    // across the threadgroup.
+    const rows_per_thread = conv_seq_tpt;
+    const grid_y = @divFloor(L + rows_per_thread - 1, rows_per_thread);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, qkv_dim, grid_y, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, qkv_dim }, 2, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "L", L));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "QKV", qkv_dim));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", K));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KM1", K - 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TPT", rows_per_thread));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ x_f32, conv_state, conv1d_t_f32 }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, fusedStream())) catch |err| {
+        conv_seq_broken = true;
+        prefillRecWarn(err);
+        return null;
+    };
+    var h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+    return Array.fromHandle(h);
+}
+
 fn convAccumSeq(ctx: EagerContext, conv1d_t: Array, window: Array, L: i32, qkv_dim: i32) !Array {
     const k: i32 = @intCast(conv1d_t.shape()[0]);
     const w_f32 = try ops.astype(ctx, conv1d_t, .float32);
@@ -1689,7 +2593,41 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
         .qk_idx = w.qk_idx,
         .norm_eps = w.norm_eps,
     };
-    const tail_res: ConvTailOut = (try gdnConvTailFused(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)) orelse blk: {
+    // DIAGNOSTIC ONLY (`DMLX_DECODE_NO_GDN_TAIL=1`): zero-cost stand-in for
+    // the fused conv+tail kernel — the ONLY non-qmm GPU kernel in a GDN
+    // decode layer. All five qmm stay, so bytes/token is unchanged; what
+    // disappears is one kernel per layer plus the recurrence's state traffic.
+    // This is the §24.5 experiment: if the weight stream's efficiency jumps,
+    // the cost is the bubble these kernels punch in the stream, not their own
+    // duration. `reshape` to the identical shape is a free view, so the
+    // stand-in really costs nothing. Output is garbage.
+    if (std.c.getenv("DMLX_DECODE_NO_GDN_TAIL") != null) {
+        // The stand-in MUST keep every input projection alive. The first
+        // version used only `z`, which left `qkv_lin` unconsumed — and MLX is
+        // lazy, so the whole in_proj_qkv qmm ([10240, 5120] 4-bit = 29.5 MB
+        // per layer, 1.42 GB per token, ~6.1 ms) was silently pruned along
+        // with the tail. That inflated the measured "tail cost" by about 2x
+        // and is what §25.1's 12.2 ms actually contained (plan doc §30).
+        // Adding the two [1, 6144] rows costs ~24 KB and keeps both qmms.
+        const qkv_head = try ops.slice(ctx, qkv_lin, &[_]i32{ 0, 0 }, &[_]i32{ 1, HV * D }, &[_]i32{ 1, 1 });
+        defer qkv_head.deinit();
+        const z_row = try ops.reshape(ctx, z, &[_]i32{ 1, HV * D });
+        defer z_row.deinit();
+        const y_sub = try ops.add(ctx, qkv_head, z_row);
+        errdefer y_sub.deinit();
+        const cs_sub = try ops.reshape(ctx, w.conv_state, w.conv_state.shape());
+        errdefer cs_sub.deinit();
+        const ss_sub = try ops.reshape(ctx, w.ssm_state, w.ssm_state.shape());
+        errdefer ss_sub.deinit();
+        const out_sub = try linearQuantParts(ctx, y_sub, w.out_w, w.out_scales, w.out_biases);
+        y_sub.deinit();
+        return .{ .out = out_sub, .conv_state = cs_sub, .ssm_state = ss_sub };
+    }
+    const wide: ?ConvTailOut = if (decodeWideTail())
+        try gdnConvTailWide(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)
+    else
+        null;
+    const tail_res: ConvTailOut = wide orelse (try gdnConvTailFused(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)) orelse blk: {
         // Eager depthwise causal conv (k=4) + silu.
         const conv_input = try shape_mod.concatenateAxis(ctx, &[_]Array{ w.conv_state, qkv_lin }, 0);
         defer conv_input.deinit(); // [K, QKV]
@@ -1937,16 +2875,23 @@ pub const Qwen38GDN = struct {
         window: Array, // [L+K-1, QKV] f32 — per-step conv states are row slices
         new_conv_state: Array, // [K-1, QKV] f32 — state after the last step
         conv_moved: bool = false, // prefill moves new_conv_state into the cache
+        window_moved: bool = false, // verify moves `window` into its result
+        /// The snapshot+replay verify path moves the recurrence inputs
+        /// (q_full/k_full/v/beta/g) into its result so a rejection can replay
+        /// the accepted prefix. See PrefillVerifyResult.replay.
+        rec_moved: bool = false,
 
         fn deinit(self: *PrefillFront) void {
             self.qkv.deinit();
-            self.q_full.deinit();
-            self.k_full.deinit();
-            self.v.deinit();
-            self.beta.deinit();
-            self.g.deinit();
+            if (!self.rec_moved) {
+                self.q_full.deinit();
+                self.k_full.deinit();
+                self.v.deinit();
+                self.beta.deinit();
+                self.g.deinit();
+            }
             self.z.deinit();
-            self.window.deinit();
+            if (!self.window_moved) self.window.deinit();
             if (!self.conv_moved) self.new_conv_state.deinit();
         }
     };
@@ -1962,6 +2907,8 @@ pub const Qwen38GDN = struct {
         const pk = HK * D;
 
         // 1. Batched projections: [1, L, hidden] -> [1, L, *].
+        const fp = gdnPrefillProfEnabled();
+        var ft: i128 = if (fp) nowNs() else 0;
         const qkv_lin = try linearQuantParts(ctx, x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases);
         defer qkv_lin.deinit(); // [1, L, QKV]
         const a = try linearQuantParts(ctx, x, self.in_proj_a, self.a_scales, self.a_biases);
@@ -1971,22 +2918,60 @@ pub const Qwen38GDN = struct {
         const z = try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
         errdefer z.deinit(); // [1, L, HV*D]
 
+        if (fp) {
+            qkv_lin.eval() catch {};
+            a.eval() catch {};
+            b.eval() catch {};
+            z.eval() catch {};
+            gdn_prof.f_proj_ns += @intCast(nowNs() - ft);
+            ft = nowNs();
+        }
+
         // 2. Causal depthwise conv over the whole sequence (f32) + silu.
         const qkv_lin2 = try ops.reshape(ctx, qkv_lin, &[_]i32{ L, QKV });
         defer qkv_lin2.deinit();
+        // `window` stays for the VERIFY path, which slices per-position conv
+        // states out of it. In the prefill path nothing consumes it (the fused
+        // kernel reads conv_state and qkv_lin2 separately, and the new conv
+        // state is sliced from qkv_lin2), so MLX never materializes the
+        // concat — keeping it is free. Do NOT eval it in the profiler, or the
+        // dead 84 MB copy comes back.
         const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin2 }, 0); // [L+K-1, QKV] f32
         errdefer window.deinit();
-        const conv_acc = try convAccumSeq(ctx, self.conv1d_t, window, L, QKV);
-        defer conv_acc.deinit(); // [L, QKV] f32
 
-        // New conv window: last K-1 rows of the (raw, pre-silu) window.
-        const tail = try ops.slice(ctx, window, &[_]i32{ L, 0 }, &[_]i32{ L + K - 1, QKV }, &[_]i32{ 1, 1 });
-        defer tail.deinit();
-        const new_conv_state = try ops.copy(ctx, tail);
-        errdefer new_conv_state.deinit();
-
-        const qkv = try activations.silu(ctx, conv_acc); // [L, QKV] f32
+        // Fast path: one kernel for the K taps + silu, no concatenated
+        // window and no separate silu pass (see `convAccumSeqFused`).
+        var used_fused = true;
+        const w_f32 = try ops.astype(ctx, self.conv1d_t, .float32);
+        defer w_f32.deinit();
+        const qkv = blk: {
+            if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K)) |fused| {
+                break :blk fused;
+            }
+            used_fused = false;
+            const conv_acc = try convAccumSeq(ctx, self.conv1d_t, window, L, QKV);
+            defer conv_acc.deinit(); // [L, QKV] f32
+            break :blk try activations.silu(ctx, conv_acc);
+        };
         errdefer qkv.deinit();
+        if (fp) {
+            qkv.eval() catch {};
+            gdn_prof.f_conv_ns += @intCast(nowNs() - ft);
+            ft = nowNs();
+        }
+
+        // New conv state: the last K-1 rows of the RAW (pre-silu) window.
+        // With L >= K-1 those are exactly qkv_lin2's last K-1 rows, so the
+        // fused path never touches `window`.
+        const new_conv_state = blk: {
+            const src: Array = if (used_fused) qkv_lin2 else window;
+            const row0: i32 = if (used_fused) L - (K - 1) else L;
+            const row1: i32 = if (used_fused) L else L + K - 1;
+            const tail = try ops.slice(ctx, src, &[_]i32{ row0, 0 }, &[_]i32{ row1, QKV }, &[_]i32{ 1, 1 });
+            defer tail.deinit();
+            break :blk try ops.copy(ctx, tail);
+        };
+        errdefer new_conv_state.deinit();
 
         // 3. Split q/k/v and apply the weight-less per-head rmsNorm (folded
         // scales) — the norm runs along the last dim, so [L, H, D] works
@@ -2038,11 +3023,23 @@ pub const Qwen38GDN = struct {
         const beta = try ops.astype(ctx, beta_raw, .float32);
         errdefer beta.deinit();
 
+        if (fp) {
+            g.eval() catch {};
+            beta.eval() catch {};
+            gdn_prof.f_gate_ns += @intCast(nowNs() - ft);
+            ft = nowNs();
+        }
+
         // Broadcast q/k to value heads via the precomputed gather indices.
         const q_full = try shape_mod.takeAxis(ctx, q, self.qk_idx, 1); // [L, HV, D]
         errdefer q_full.deinit();
         const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
         errdefer k_full.deinit();
+        if (fp) {
+            q_full.eval() catch {};
+            k_full.eval() catch {};
+            gdn_prof.f_bcast_ns += @intCast(nowNs() - ft);
+        }
 
         return .{
             .qkv = qkv,
@@ -2100,17 +3097,51 @@ pub const Qwen38GDN = struct {
     /// because the conv_state concat promotes, exactly as in decode.
     pub fn prefill(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache, sync: bool) !Array {
         const ctx = self.ctx;
+        // `DMLX_GDN_PREFILL_PROF=1` splits this layer's prefill into its three
+        // sections with a barrier after each. Prefill has essentially no
+        // CPU/GPU overlap (the barriered whole-pass total measures within 2.5%
+        // of the real wall, see the plan doc §17.2), so these numbers add up
+        // and can be trusted — unlike the decode breakdown, which is heavily
+        // barrier-inflated. Accumulates across layers; dump with
+        // `gdnPrefillProfReport`.
+        const prof = gdnPrefillProfEnabled();
+        var t0: i128 = if (prof) nowNs() else 0;
+
         var front = try self.prefillFront(x, cache);
         defer front.deinit();
+        if (prof) {
+            // Force EVERY front output. Evaluating only some of them
+            // mis-attributes the rest: `z` is produced by its own qmm
+            // (gdn_z, ~937 ms over 48 layers at L=2048) and is consumed in
+            // the tail, so leaving it lazy charges that qmm to the tail and
+            // made the tail look ~2.5x more expensive than it is.
+            eval_mod.asyncEval(allocator, &[_]Array{
+                front.qkv,  front.q_full, front.k_full, front.v,
+                front.beta, front.g,      front.z,
+            }) catch {};
+            front.z.eval() catch {};
+            gdn_prof.front_ns += @intCast(nowNs() - t0);
+            t0 = nowNs();
+        }
 
         // Delta-rule recurrence over the whole sequence (single Metal kernel
         // when eligible; per-step eager loop otherwise).
         const rec = try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, @intCast(self.num_value_heads), @intCast(self.head_dim));
         errdefer rec.s_new.deinit();
         defer rec.y.deinit(); // [L, HV, D] f32
+        if (prof) {
+            rec.y.eval() catch {};
+            gdn_prof.rec_ns += @intCast(nowNs() - t0);
+            t0 = nowNs();
+        }
 
         const out = try self.prefillTail(rec.y, front.z, front.qkv.dtype());
         errdefer out.deinit();
+        if (prof) {
+            out.eval() catch {};
+            gdn_prof.tail_ns += @intCast(nowNs() - t0);
+            gdn_prof.layers += 1;
+        }
 
         // Single cache swap at the end. `sync` (serving loop: every few
         // layers) bounds peak memory: without any barrier the whole
@@ -2137,9 +3168,66 @@ pub const Qwen38GDN = struct {
         conv_states: []Array, // [L] of [K-1, QKV]
         ssm_states: []Array, // [L] of [HV, D, D] f32 (eager path; empty when fused)
         s_all: ?Array = null, // [L, HV, D, D] f32 (fused path)
+        // Lazy conv-state path (default): instead of materializing L row-slice
+        // copies per layer, keep the whole-sequence `window` and slice the ONE
+        // committed position out of it. The window is never evaluated on the
+        // fused conv path, so the concat that builds it is free too; what this
+        // removes is 2*(L-1) small dispatches per GDN layer per round (288 ops
+        // at L=3 over 48 layers) — the same "defer to commit" shape the s_all
+        // path already uses. Set DMLX_NO_VERIFY_LAZY_CONV=1 for the old path.
+        conv_window: ?Array = null, // [L+K-1, QKV] f32
+        conv_k: i32 = 0, // conv kernel width K
+
+        // --- snapshot + replay-on-rejection (plan doc §42) ----------------
+        // `s_all` holds the post-step state of EVERY position so commit can
+        // adopt any of them, which costs L x 3.1 MB x 48 layers of writes
+        // unconditionally — 1.19 GB per round at the depth-7 ceiling (~5 ms).
+        // omlx instead snapshots the pre-forward state and, only on a
+        // rejection, replays the accepted prefix
+        // (`qwen35_model.mtp_partial_rollback`: "One small gated-delta kernel
+        // per linear layer, paid only on rejections").
+        //
+        // `prefillVerify` never mutates `cache.ssm_state`, so the snapshot is
+        // free — we only need to retain the recurrence INPUTS to replay from
+        // it. Those are small: [L, HV, D] f32 x3 + [L, HV] f32 x2, about
+        // 590 KB per layer at L=8.
+        replay: ?struct {
+            s_in: Array, // [HV, D, D] f32 — pre-forward snapshot (borrowed)
+            k_full: Array, // [L, HV, D] f32
+            v: Array,
+            beta: Array, // [L, HV] f32
+            g: Array,
+            q_full: Array,
+            hv: i32,
+            d: i32,
+        } = null,
+
+        /// Conv state after step `t`, whichever retention path ran. Owned by
+        /// the caller.
+        pub fn convStateAt(self: *const PrefillVerifyResult, ctx: EagerContext, t: usize) !Array {
+            if (self.conv_window) |w| {
+                const a: i32 = @intCast(t);
+                const qkv: i32 = w.shape()[1];
+                const rows = try ops.slice(ctx, w, &[_]i32{ a + 1, 0 }, &[_]i32{ a + self.conv_k, qkv }, &[_]i32{ 1, 1 });
+                defer rows.deinit();
+                return ops.copy(ctx, rows);
+            }
+            return ops.copy(ctx, self.conv_states[t]);
+        }
 
         pub fn deinit(self: *PrefillVerifyResult, allocator: std.mem.Allocator) void {
             self.out.deinit();
+            if (self.replay) |r| {
+                // `s_in` is borrowed from the cache; the rest is owned here.
+                r.k_full.deinit();
+                r.v.deinit();
+                r.beta.deinit();
+                r.g.deinit();
+                r.q_full.deinit();
+                self.replay = null;
+            }
+            if (self.conv_window) |w| w.deinit();
+            self.conv_window = null;
             for (self.conv_states) |s| s.deinit();
             for (self.ssm_states) |s| s.deinit();
             if (self.conv_states.len > 0) allocator.free(self.conv_states);
@@ -2159,8 +3247,27 @@ pub const Qwen38GDN = struct {
     /// the precomputed whole-sequence window.
     pub fn prefillVerify(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !PrefillVerifyResult {
         const ctx = self.ctx;
+        // `DMLX_VERIFY_PROF=1` barriers each section. Unlike decode, the verify
+        // forward has little CPU/GPU overlap, so these add up (same reasoning
+        // as §17.2 for prefill). Dump with `gdnVerifyProfReport`.
+        const vp = gdnVerifyProfEnabled();
+        var vt: i128 = if (vp) nowNs() else 0;
+
         var front = try self.prefillFront(x, cache);
         defer front.deinit();
+        if (vp) {
+            // Force EVERY front output: `z` has its own qmm and is consumed in
+            // the tail, so leaving it lazy charges that qmm to the tail (the
+            // mis-attribution that made the prefill tail look 2.5x too
+            // expensive in §19.2).
+            eval_mod.asyncEval(allocator, &[_]Array{
+                front.qkv,  front.q_full, front.k_full, front.v,
+                front.beta, front.g,      front.z,
+            }) catch {};
+            front.z.eval() catch {};
+            gdn_prof.v_front_ns += @intCast(nowNs() - vt);
+            vt = nowNs();
+        }
 
         const L: i32 = @intCast(x.shape()[1]);
         const HV: i32 = @intCast(self.num_value_heads);
@@ -2174,7 +3281,49 @@ pub const Qwen38GDN = struct {
         var s_all: ?Array = null;
         var ssm_states: []Array = &.{};
         errdefer if (s_all) |s| s.deinit();
-        if (try deltaRulePrefillFusedRetain(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr| {
+        var replay_inputs: @FieldType(PrefillVerifyResult, "replay") = null;
+        if (verifySnapshot() and !verifyNoRecur()) {
+            // Snapshot path: write only the FINAL state and retain the
+            // recurrence inputs; commit replays the accepted prefix when a
+            // draft was rejected. Removes (L-1) x 3.1 MB x 48 layers of
+            // unconditional s_all writes — 1.04 GB per round at L=8.
+            if (try deltaRulePrefillFused(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr| {
+                y = fr.y;
+                defer fr.s_new.deinit();
+                s_all = try ops.reshape(ctx, fr.s_new, &[_]i32{ 1, HV, D, D });
+                replay_inputs = .{
+                    .s_in = cache.ssm_state, // borrowed: the cache still owns it
+                    .k_full = front.k_full,
+                    .v = front.v,
+                    .beta = front.beta,
+                    .g = front.g,
+                    .q_full = front.q_full,
+                    .hv = HV,
+                    .d = D,
+                };
+                front.rec_moved = true;
+            }
+        }
+        if (replay_inputs != null) {
+            // handled above
+        } else if (verifyNoRecur()) {
+            // Diagnostic: zero-cost stand-in for the WHOLE recurrence — no
+            // kernel launch, no state read, no s_all write, no ALU. `v` has
+            // the readout's exact shape/dtype ([L, HV, D] f32) and `s_in`
+            // reshaped to [1, HV, D, D] is a free view (commit clamps the
+            // row index). The round-cost delta is the recurrence's total
+            // price, with none of the barrier distortion of §21.3.
+            y = try ops.copy(ctx, front.v);
+            s_all = try ops.reshape(ctx, cache.ssm_state, &[_]i32{ 1, HV, D, D });
+        } else if (verifyNoSall()) {
+            // Diagnostic: final state only, shaped [1, HV, D, D] so commit's
+            // s_all path still works (it clamps the row index).
+            const fr = (try deltaRulePrefillFused(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) orelse
+                return error.VerifyNoSallUnavailable;
+            defer fr.s_new.deinit();
+            y = fr.y;
+            s_all = try ops.reshape(ctx, fr.s_new, &[_]i32{ 1, HV, D, D });
+        } else if (try deltaRulePrefillFusedRetain(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr| {
             y = fr.y;
             s_all = fr.s_all;
         } else {
@@ -2188,49 +3337,157 @@ pub const Qwen38GDN = struct {
             if (ssm_states.len > 0) allocator.free(ssm_states);
         }
         defer y.deinit();
+        if (vp) {
+            y.eval() catch {};
+            if (s_all) |sa| sa.eval() catch {};
+            gdn_prof.v_rec_ns += @intCast(nowNs() - vt);
+            vt = nowNs();
+        }
 
-        // Per-step conv states: rows [t+1, t+K) of the window.
-        const conv_states = try allocator.alloc(Array, @intCast(L));
-        errdefer allocator.free(conv_states);
+        // Per-step conv states: rows [t+1, t+K) of the window. By default we
+        // hand the window itself to the caller and let commitVerifyStates cut
+        // the single accepted position out of it.
+        var conv_window: ?Array = null;
+        var conv_states: []Array = &.{};
         var made: usize = 0;
-        errdefer for (conv_states[0..made]) |s| s.deinit();
-        var t: i32 = 0;
-        while (t < L) : (t += 1) {
-            const rows = try ops.slice(ctx, front.window, &[_]i32{ t + 1, 0 }, &[_]i32{ t + K, QKV }, &[_]i32{ 1, 1 });
-            defer rows.deinit();
-            conv_states[@intCast(t)] = try ops.copy(ctx, rows);
-            made += 1;
+        errdefer if (conv_window) |w| w.deinit();
+        errdefer if (conv_states.len > 0) {
+            for (conv_states[0..made]) |s| s.deinit();
+            allocator.free(conv_states);
+        };
+        if (verifyLazyConv()) {
+            conv_window = front.window;
+            front.window_moved = true;
+        } else {
+            conv_states = try allocator.alloc(Array, @intCast(L));
+            var t: i32 = 0;
+            while (t < L) : (t += 1) {
+                const rows = try ops.slice(ctx, front.window, &[_]i32{ t + 1, 0 }, &[_]i32{ t + K, QKV }, &[_]i32{ 1, 1 });
+                defer rows.deinit();
+                conv_states[@intCast(t)] = try ops.copy(ctx, rows);
+                made += 1;
+            }
+        }
+        if (vp and conv_states.len > 0) {
+            eval_mod.asyncEval(allocator, conv_states) catch {};
+            if (made > 0) conv_states[made - 1].eval() catch {};
+            gdn_prof.v_states_ns += @intCast(nowNs() - vt);
+            vt = nowNs();
         }
 
         const out = try self.prefillTail(y, front.z, front.qkv.dtype());
         errdefer out.deinit();
+        if (vp) {
+            out.eval() catch {};
+            gdn_prof.v_tail_ns += @intCast(nowNs() - vt);
+            gdn_prof.v_layers += 1;
+        }
         // Materialize everything the caller may commit: all retained states.
-        try eval_mod.asyncEval(allocator, conv_states);
+        // `conv_window` is deliberately NOT evaluated — commit slices it.
+        if (conv_states.len > 0) try eval_mod.asyncEval(allocator, conv_states);
         if (s_all) |s| {
             try eval_mod.asyncEval(allocator, &[_]Array{s});
-        } else {
+        } else if (ssm_states.len > 0) {
             try eval_mod.asyncEval(allocator, ssm_states);
         }
-        return .{ .out = out, .conv_states = conv_states, .ssm_states = ssm_states, .s_all = s_all };
+        return .{
+            .out = out,
+            .conv_states = conv_states,
+            .ssm_states = ssm_states,
+            .s_all = s_all,
+            .conv_window = conv_window,
+            .conv_k = K,
+            .replay = replay_inputs,
+        };
     }
 
     /// Commit the post-step-`accepted` states (accepted ∈ 0..L-1) into the
     /// cache, freeing every other retained state. Afterwards `res` holds
     /// only `out` (its lists are emptied).
     pub fn commitVerifyStates(ctx: EagerContext, cache: *Qwen38GdnCache, res: *PrefillVerifyResult, allocator: std.mem.Allocator, accepted: usize) void {
-        cache.conv_state.deinit();
-        cache.conv_state = res.conv_states[accepted];
-        for (res.conv_states, 0..) |s, i| {
-            if (i != accepted) s.deinit();
+        if (res.conv_window) |w| {
+            // Lazy path: cut rows [a+1, a+K) out of the retained window.
+            if (res.convStateAt(ctx, accepted)) |copied| {
+                cache.conv_state.deinit();
+                cache.conv_state = copied;
+            } else |_| {
+                std.log.err("GDN commitVerifyStates: conv window slice failed; cache state unchanged", .{});
+            }
+            w.deinit();
+            res.conv_window = null;
+        } else {
+            cache.conv_state.deinit();
+            cache.conv_state = res.conv_states[accepted];
+            for (res.conv_states, 0..) |s, i| {
+                if (i != accepted) s.deinit();
+            }
+            allocator.free(res.conv_states);
+            res.conv_states = &.{};
         }
-        allocator.free(res.conv_states);
-        res.conv_states = &.{};
+
+        if (res.replay) |r| {
+            // Snapshot path. `s_all` holds only the state after the LAST
+            // step, which is correct exactly when every draft was accepted.
+            // Otherwise replay steps 0..accepted from the pre-forward
+            // snapshot — one extra recurrence kernel per layer, paid only on
+            // a rejection (omlx's `mtp_partial_rollback` does the same).
+            const steps: i32 = @intCast(accepted + 1);
+            const total: i32 = r.k_full.shape()[0];
+            var adopted = false;
+            if (steps < total) {
+                const k3 = ops.slice(ctx, r.k_full, &[_]i32{ 0, 0, 0 }, &[_]i32{ steps, r.hv, r.d }, &[_]i32{ 1, 1, 1 }) catch null;
+                defer if (k3) |x| x.deinit();
+                const v3 = if (k3 != null) ops.slice(ctx, r.v, &[_]i32{ 0, 0, 0 }, &[_]i32{ steps, r.hv, r.d }, &[_]i32{ 1, 1, 1 }) catch null else null;
+                defer if (v3) |x| x.deinit();
+                const q3 = if (v3 != null) ops.slice(ctx, r.q_full, &[_]i32{ 0, 0, 0 }, &[_]i32{ steps, r.hv, r.d }, &[_]i32{ 1, 1, 1 }) catch null else null;
+                defer if (q3) |x| x.deinit();
+                const b2 = if (q3 != null) ops.slice(ctx, r.beta, &[_]i32{ 0, 0 }, &[_]i32{ steps, r.hv }, &[_]i32{ 1, 1 }) catch null else null;
+                defer if (b2) |x| x.deinit();
+                const g2 = if (b2 != null) ops.slice(ctx, r.g, &[_]i32{ 0, 0 }, &[_]i32{ steps, r.hv }, &[_]i32{ 1, 1 }) catch null else null;
+                defer if (g2) |x| x.deinit();
+                if (g2 != null) {
+                    if (deltaRulePrefillFused(ctx, r.s_in, k3.?, v3.?, b2.?, g2.?, q3.?, r.hv, r.d) catch null) |rep| {
+                        rep.y.deinit();
+                        cache.ssm_state.deinit();
+                        cache.ssm_state = rep.s_new;
+                        adopted = true;
+                    }
+                }
+            } else if (res.s_all) |sa| {
+                const flat = ops.reshape(ctx, sa, &[_]i32{ r.hv, r.d, r.d }) catch null;
+                if (flat) |f| {
+                    defer f.deinit();
+                    if (ops.copy(ctx, f)) |copied| {
+                        cache.ssm_state.deinit();
+                        cache.ssm_state = copied;
+                        adopted = true;
+                    } else |_| {}
+                }
+            }
+            if (!adopted) std.log.err("GDN commitVerifyStates: snapshot commit failed; cache state unchanged", .{});
+            // The replay inputs were MOVED out of `front` (rec_moved) and are
+            // owned by `res`; deinit frees them only while res.replay != null.
+            // Freeing here was missing -> ~0.4 MB per GDN layer per committed
+            // round leaked (MemProbe: +0.68 GB/request, metal::malloc limit
+            // crash after ~20 sustained MTP requests, 2026-10-30).
+            r.k_full.deinit();
+            r.v.deinit();
+            r.beta.deinit();
+            r.g.deinit();
+            r.q_full.deinit();
+            res.replay = null;
+            if (res.s_all) |sa| {
+                sa.deinit();
+                res.s_all = null;
+            }
+            return;
+        }
 
         if (res.s_all) |sa| {
             // Fused path: copy row `accepted` of [L, HV, D, D] into the cache.
             const hv: i32 = sa.shape()[1];
             const d: i32 = sa.shape()[2];
-            const a: i32 = @intCast(accepted);
+            const a: i32 = @min(@as(i32, @intCast(accepted)), sa.shape()[0] - 1);
             const row = ops.slice(ctx, sa, &[_]i32{ a, 0, 0, 0 }, &[_]i32{ a + 1, hv, d, d }, &[_]i32{ 1, 1, 1, 1 }) catch {
                 std.log.err("GDN commitVerifyStates: s_all slice failed; cache state unchanged", .{});
                 return;
@@ -2848,11 +4105,13 @@ test "Qwen38GDN.prefillVerify: matches prefill + per-position states + commit" {
         try cache_a.ssm_state.eval();
         try cache_a.conv_state.eval();
         try res.ssm_states[@intCast(a)].eval();
-        try res.conv_states[@intCast(a)].eval();
+        const conv_a = try res.convStateAt(ctx, @intCast(a));
+        defer conv_a.deinit();
+        try conv_a.eval();
         const got_s = try res.ssm_states[@intCast(a)].dataSlice(f32);
         const exp_s = try cache_a.ssm_state.dataSlice(f32);
         for (exp_s, got_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
-        const got_c = try res.conv_states[@intCast(a)].dataSlice(f32);
+        const got_c = try conv_a.dataSlice(f32);
         const exp_c = try cache_a.conv_state.dataSlice(f32);
         for (exp_c, got_c) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-5);
     }
@@ -3120,4 +4379,85 @@ test "Qwen38GDN.step: compiled closure matches eager forward" {
             try std.testing.expect(try ssm_max.item(f32) > 0.0);
         }
     }
+}
+
+test "convAccumSeqFused matches the eager taps + silu" {
+    // Gate for the fused conv: the delta-rule recurrence downstream is
+    // sensitive to conv rounding, and HANDOFF records an FMA rewrite that
+    // passed smoke yet cost 10.6% and broke Paris. So compare the fused
+    // kernel against the eager form it replaces, element by element.
+    const allocator = std.testing.allocator;
+    c.initErrorHandler();
+    const ctx = EagerContext.init(allocator);
+
+    const K: i32 = 4;
+    const QKV: i32 = 256;
+    for ([_]i32{ 3, 8, 37, 64 }) |L| {
+        const x = try makeTestWeight(allocator, &[_]i32{ L, QKV });
+        defer x.deinit();
+        const cs = try makeTestWeight(allocator, &[_]i32{ K - 1, QKV });
+        defer cs.deinit();
+        const w = try makeTestWeight(allocator, &[_]i32{ K, QKV });
+        defer w.deinit();
+
+        const fused = (try convAccumSeqFused(ctx, w, cs, x, L, QKV, K)) orelse {
+            // Kernel unavailable on this machine: nothing to compare.
+            return error.SkipZigTest;
+        };
+        defer fused.deinit();
+
+        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cs, x }, 0);
+        defer window.deinit();
+        const acc = try convAccumSeq(ctx, w, window, L, QKV);
+        defer acc.deinit();
+        const want = try activations.silu(ctx, acc);
+        defer want.deinit();
+
+        const d = try ops.subtract(ctx, fused, want);
+        defer d.deinit();
+        const ad = try ops.abs(ctx, d);
+        defer ad.deinit();
+        const mx = try ops.max(ctx, ad);
+        defer mx.deinit();
+        try mx.eval();
+        const worst = (try mx.dataSlice(f32))[0];
+        if (!(worst <= 1e-5)) {
+            std.debug.print("convAccumSeqFused mismatch at L={d}: max abs diff {e}\n", .{ L, worst });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "prefill fused conv path produces the same new conv state" {
+    // The fused path slices the new conv state from the projection output
+    // instead of the concatenated window. Those must be the same rows:
+    // window[L .. L+K-1) == qkv[L-(K-1) .. L) whenever L >= K-1. An off-by-one
+    // here would silently corrupt the next chunk's conv context.
+    const allocator = std.testing.allocator;
+    c.initErrorHandler();
+    const ctx = EagerContext.init(allocator);
+
+    const K: i32 = 4;
+    const QKV: i32 = 32;
+    const L: i32 = 16;
+    const x = try makeTestWeight(allocator, &[_]i32{ L, QKV });
+    defer x.deinit();
+    const cs = try makeTestWeight(allocator, &[_]i32{ K - 1, QKV });
+    defer cs.deinit();
+
+    const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cs, x }, 0);
+    defer window.deinit();
+    const from_window = try ops.slice(ctx, window, &[_]i32{ L, 0 }, &[_]i32{ L + K - 1, QKV }, &[_]i32{ 1, 1 });
+    defer from_window.deinit();
+    const from_x = try ops.slice(ctx, x, &[_]i32{ L - (K - 1), 0 }, &[_]i32{ L, QKV }, &[_]i32{ 1, 1 });
+    defer from_x.deinit();
+
+    const d = try ops.subtract(ctx, from_window, from_x);
+    defer d.deinit();
+    const ad = try ops.abs(ctx, d);
+    defer ad.deinit();
+    const mx = try ops.max(ctx, ad);
+    defer mx.deinit();
+    try mx.eval();
+    try std.testing.expectEqual(@as(f32, 0.0), (try mx.dataSlice(f32))[0]);
 }

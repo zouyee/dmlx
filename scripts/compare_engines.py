@@ -222,6 +222,30 @@ def engines() -> dict[str, Engine]:
             env={"DMLX_MTP_NO_BATCH_FOLD": "1"},
             note="adaptive MTP ceiling 7, sequential commit replay",
         ),
+        # A/B arm: MTP-D distilled drafter head (plan
+        # 2026-10-30-mtp-drafter-training). Same engine, same trunk; only the
+        # drafter checkpoint differs (DMLX_QWEN38_MTP_DIR).
+        "dmlx-distilled": Engine(
+            name="dmlx-distilled",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_QWEN38_MTP_DIR":
+                 os.path.expanduser("~/models/Qwen3.8-27B-MTP-4bit-distilled")},
+            note="adaptive MTP ceiling 7, self-distilled drafter",
+        ),
+        # A/B arm: empty-think generation prompt (HF enable_thinking=false,
+        # omlx's thinking_budget_enabled=false default). Parity of GENERATED
+        # CONTENT: without it dmlx free-thinks (longer outputs) while omlx
+        # answers directly, which confounds decode-rate comparisons.
+        "dmlx-nothink": Engine(
+            name="dmlx-nothink",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_CHAT_EMPTY_THINK": "1"},
+            note="adaptive MTP ceiling 7 + empty-think prompt (omlx parity)",
+        ),
         "dmlx-nospec": Engine(
             name="dmlx-nospec",
             cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",

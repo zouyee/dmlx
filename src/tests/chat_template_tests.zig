@@ -118,6 +118,22 @@ test "ChatML template still works correctly" {
     try std.testing.expectEqualStrings(expected, result);
 }
 
+test "ChatML empty_think appends empty think block (HF enable_thinking=false)" {
+    const allocator = std.testing.allocator;
+    var template = ChatTemplate.initChatML(allocator);
+    template.empty_think = true;
+
+    const messages = [_]ChatMessage{
+        .{ .role = "user", .content = "Hello" },
+    };
+
+    const result = try template.apply(&messages, true);
+    defer allocator.free(result);
+
+    const expected = "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
 test "Llama3 template still works correctly" {
     const allocator = std.testing.allocator;
     var template = ChatTemplate.initLlama3(allocator);

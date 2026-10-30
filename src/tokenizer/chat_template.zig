@@ -34,6 +34,14 @@ pub const ChatTemplate = struct {
     eos_token: []const u8,
     /// DeepSeek: 'chat' (non-thinking) or 'thinking' (model reasons before answering)
     thinking_mode: []const u8 = "chat",
+    /// Qwen ChatML: when true, the generation prompt appends an EMPTY think
+    /// block (`<think>\n\n</think>\n\n`), matching the HF chat template's
+    /// `enable_thinking=false` branch (chat_template.jinja:165) — omlx's
+    /// default (`thinking_budget_enabled: false`). Without it the bare
+    /// `<|im_start|>assistant\n` prompt lets the model free-think, which
+    /// generates different (longer) content than engines that honor
+    /// enable_thinking=false and confounds decode-rate comparisons.
+    empty_think: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, template_type: ChatTemplateType) ChatTemplate {
         return .{
@@ -149,6 +157,9 @@ pub const ChatTemplate = struct {
 
         if (add_generation_prompt) {
             try result.appendSlice(self.allocator, "<|im_start|>assistant\n");
+            if (self.empty_think) {
+                try result.appendSlice(self.allocator, "<think>\n\n</think>\n\n");
+            }
         }
     }
 

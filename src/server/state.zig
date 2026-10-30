@@ -156,7 +156,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     try tokenizer_backend.loadFromFile(io, tokenizer_path);
 
     // 4. Chat template
-    const chat_template = if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM"))
+    var chat_template = if (std.mem.eql(u8, arch_name, "DeepseekV4ForCausalLM"))
         root.tokenizer.ChatTemplate.initDeepSeek(allocator)
     else if (std.mem.indexOf(u8, config_content, "\"glm5_next\"") != null)
         root.tokenizer.ChatTemplate.initGlm(allocator)
@@ -164,6 +164,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         root.tokenizer.ChatTemplate.initChatML(allocator)
     else
         root.tokenizer.ChatTemplate.initDeepSeek(allocator);
+    // Opt-in empty-think generation prompt (HF enable_thinking=false parity).
+    if (std.c.getenv("DMLX_CHAT_EMPTY_THINK") != null) {
+        chat_template.empty_think = true;
+    }
 
     // ------------------------------------------------------------------
     // Native path (MLX-free) — default. Non-DSV4 architectures degrade to
