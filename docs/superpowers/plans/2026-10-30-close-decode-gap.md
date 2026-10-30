@@ -114,3 +114,7 @@ chunked GDN verify. Est. +10-15% decode at depth 3-4, and it flattens
 cost(n) enough that the controller's deeper depths (4-5) become profitable
 — the two effects multiply. Effort ~1 day, gated by self-consistency +
 fidelity + harness. Everything cheaper has been measured out.
+- [x] **Fused gate|up verify MLP: TRIED, NEUTRAL, REVERTED** (verify 98.6-101.7
+  vs 96.6-97.0 ms/round at fixed depth 4). Halving projection launches does
+  not touch the in-context marginal — confirming the marginal is per-kernel
+  in-context behavior, not launch count.
