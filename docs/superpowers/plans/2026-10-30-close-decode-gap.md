@@ -60,3 +60,22 @@ The honest residual is the ~7 ms/round gap at depth 3-4.
 - ANE prefill (their qwen35_ane_prefill path; we are at cold-prefill parity
   without it after the tokenizer fix).
 - mma kernel morphology for depth > 7 (vetoed by the acceptance cliff data).
+
+## Execution log (2026-10-30)
+
+- [x] **Final scorecard (post leak+tokenizer+parity fixes, 3 reps nonce)**:
+  dmlx-nothink 34.2 vs omlx-mtp 43.9 HEADLINE decode; effective tie
+  (35.0/22.2/33.2 vs 34.5/23.6/34.3); TTFT 0.283 vs 0.791 (we win 2.8x);
+  prefill 121.5 vs 137.5 tok/s (tokenizer fix; was 49.2); ttft@2048 17.9s
+  vs 16.0s (was 37.2s).
+- [x] **S2 evaluation — premise REFUTED**: verify-qmm routing tally at M=3-5
+  shows every projection shape routed (splitk/sg8), zero stock fallbacks;
+  qmm marginals are ~0.01 ms/row (weight-amortized). The verify marginal row
+  (8.2 ms vs omlx ~3.1) is NOT qmm. Differential DMLX_VERIFY_PROF (N=2 vs
+  N=5, same session): front +5.3 ms/row (conv+gates — the 4 qmms are
+  amortized), tail +2.9 ms/row (out-gate norm + out_proj), recur ~flat.
+  => the residual lives in the GDN conv/gates + tail ops at verify M,
+  inside the user's heavily-optimized in-flight verify path.
+- [ ] S1/S3 deferred: compile draft step ~+2.5%, GPU verify input ~+1% —
+  combined below the cross-session drift floor; revisit if the front/tail
+  marginal is fixed first.
