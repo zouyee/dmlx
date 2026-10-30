@@ -79,3 +79,38 @@ The honest residual is the ~7 ms/round gap at depth 3-4.
 - [ ] S1/S3 deferred: compile draft step ~+2.5%, GPU verify input ~+1% —
   combined below the cross-session drift floor; revisit if the front/tail
   marginal is fixed first.
+
+## Verify marginal deep-dive (2026-10-30, all same-session, fixed-depth A/B)
+
+Cycle/round totals at fixed depth 1/2/4 (same code prompt):
+- omlx: 70.6 / 75.9 / 89.3 ms per cycle -> marginal ~6.2-6.7 ms per
+  (verify row + draft step). With their draft step ~3.2 ms (same head, full
+  4-bit lm_head), their verify marginal row ~= 3.0-3.5 ms.
+- dmlx: 77.7 / — / 111.3 ms per round -> marginal 11.2 ms per (row+step) =
+  draft 3.1 + verify row 8.1.
+
+**The whole residual gap = verify marginal row: 8.1 vs ~3.2 ms.**
+
+Refinements:
+- verify_qmm routing tally at M=3-5: every projection routed (splitk/sg8),
+  zero stock fallbacks. sg8-everything (DMLX_VERIFY_QMM_SG8_MIN_M=4) measured
+  WORSE in context (+3 ms/round) — bench routing stands.
+- Front sub-splits (DMLX_GDN_PREFILL_PROF during verify, N=2 vs N=5): conv
+  FLAT (0.183->0.195 ms/layer-pass), gates FLAT, bcast FLAT; the growth is
+  entirely in the 4 projection qmms (2.09 -> 2.60 ms/layer-pass,
+  +0.17 ms/row/layer x48 = 8.2 ms/row) — even though the isolated bench shows
+  the same kernels nearly M-flat (0.015-0.056 ms/row). This is the §28
+  in-context penalty: 3-4x worse than isolated, growing with M.
+- omlx's split-K kernel source is near-identical to ours (same lane-strided
+  packs, 4-col tiles, threadgroup partials) — kernel morphology is NOT the
+  differentiator at M=3-5. What differs: their verify forward fuses far more
+  of the non-qmm work (custom_kernels/qwen35_prefill/, vk_swiglu_sg8 fused
+  gate_up+silu+mul, one-chunk GDN window processing), so the ~30+ small
+  per-layer ops that serialize with our qmms in context largely vanish.
+
+**Precise remaining lever**: consolidate the verify forward's per-layer
+non-qmm ops into fused kernels (omlx-style), or port their fused swiglu +
+chunked GDN verify. Est. +10-15% decode at depth 3-4, and it flattens
+cost(n) enough that the controller's deeper depths (4-5) become profitable
+— the two effects multiply. Effort ~1 day, gated by self-consistency +
+fidelity + harness. Everything cheaper has been measured out.
