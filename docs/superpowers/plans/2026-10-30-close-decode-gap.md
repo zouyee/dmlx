@@ -132,3 +132,9 @@ fidelity + harness. Everything cheaper has been measured out.
   evidence: omlx's per-layer mega-fusion (their custom_kernels/qwen35_prefill
   GDN chunk + vk_swiglu_sg8), which removes the small kernels BETWEEN the
   qmms. Est +10-15% decode at depth 3-4; ~1 day; all gates in place.
+- [x] **split-K BN=8 (x re-read halving): TRIED, REFUTED, REVERTED.** Theory:
+  each column tile re-reads the activation rows, traffic ~ N/BN x M. Correct
+  after a write-back fix (acceptance identical 56.1%/69.6%), but verify
+  SLOWED 96-125 -> 190-209 ms/round: halving the threadgroup count costs
+  more occupancy than the saved x traffic buys. The verify qmms are
+  occupancy-bound, not bandwidth-bound, at these shapes.
