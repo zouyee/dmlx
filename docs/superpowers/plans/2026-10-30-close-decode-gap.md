@@ -118,3 +118,17 @@ fidelity + harness. Everything cheaper has been measured out.
   vs 96.6-97.0 ms/round at fixed depth 4). Halving projection launches does
   not touch the in-context marginal — confirming the marginal is per-kernel
   in-context behavior, not launch count.
+- [x] **Prefill qmm port evaluated, REJECTED by data**: omlx's native
+  affine_q4_qmm_t (variant 8) vs stock MLX at M=2048 MLP shape = 1.05x, bit
+  exact. Their prefill edge is not the qmm kernel (ANE path is disabled in
+  their shipped settings too). Post-tokenizer-fix prefill is ~parity.
+- [x] **In-context vs isolated kernel divergence confirmed once more**: the
+  verify marginal (+0.17 ms/row/layer, = the entire 8.2 ms/row) appears only
+  in-context; the isolated bench shows the same kernels M-flat. Identical
+  split-K morphology on the omlx side rules out kernel source differences;
+  the cause is GPU scheduling/L2 interaction across the ~30 mixed kernels per
+  layer — i.e. kernel COUNT around the qmms, not the qmms (launch-count
+  fusion already tried and neutral). What remains untried and matched to the
+  evidence: omlx's per-layer mega-fusion (their custom_kernels/qwen35_prefill
+  GDN chunk + vk_swiglu_sg8), which removes the small kernels BETWEEN the
+  qmms. Est +10-15% decode at depth 3-4; ~1 day; all gates in place.
