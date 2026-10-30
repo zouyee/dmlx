@@ -257,6 +257,7 @@ pub const Pattern = enum {
     digits_1_3,
     cjk_kana,
     deepseek_word,
+    qwen_word,
 };
 
 const MatchResult = struct { start: usize, end: usize };
@@ -308,9 +309,133 @@ fn matchPattern(pat: Pattern, text: []const u8) MatchResult {
         .deepseek_word => {
             return matchDeepseekWord(text);
         },
+        .qwen_word => {
+            return matchQwenWord(text);
+        },
     }
 
     return .{ .start = 0, .end = 0 };
+}
+
+/// Qwen2/Qwen3 GPT-4-style Split pattern:
+///   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}|
+///    ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+/// Leftmost-first alternation (Rust regex / HF tokenizers semantics); each
+/// alternative is greedy. Without this matcher the Qwen tokenizer.json Split
+/// was skipped, leaving the WHOLE prompt as one BPE segment — O(n²) merges
+/// (measured 12 s for a 1618-token prompt, 2026-10-30).
+fn matchQwenWord(text: []const u8) MatchResult {
+    var pos: usize = 0;
+    while (pos < text.len) {
+        if (qwenMatchAt(text, pos)) |end| {
+            return .{ .start = pos, .end = end };
+        }
+        const res = decodeCp(text[pos..]) catch {
+            pos += 1;
+            continue;
+        };
+        pos += res.len;
+    }
+    return .{ .start = 0, .end = 0 };
+}
+
+/// Try the seven alternatives IN ORDER at byte offset `i`; return the end
+/// offset of the first that matches, or null.
+fn qwenMatchAt(text: []const u8, i: usize) ?usize {
+    // 1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
+    if (i < text.len and text[i] == '\'') {
+        inline for (.{ "'re", "'ve", "'ll", "'s", "'t", "'m", "'d" }) |tail| {
+            if (i + tail.len <= text.len and std.ascii.eqlIgnoreCase(text[i .. i + tail.len], tail)) {
+                return i + tail.len;
+            }
+        }
+    }
+
+    const cp0 = decodeCp(text[i..]) catch return null;
+    const is_l = isLetterCp(cp0.cp);
+    const is_n = isNumberCp(cp0.cp);
+    const is_ws = isWhitespaceCp(cp0.cp);
+    const is_nl = cp0.cp == '\r' or cp0.cp == '\n';
+
+    // 2. [^\r\n\p{L}\p{N}]?\p{L}+
+    if (is_l) {
+        var end = i;
+        while (end < text.len) {
+            const r = decodeCp(text[end..]) catch break;
+            if (!isLetterCp(r.cp)) break;
+            end += r.len;
+        }
+        return end;
+    }
+    if (!is_nl and !is_n and i + cp0.len < text.len) {
+        // optional prefix char, only when a letter immediately follows
+        if (decodeCp(text[i + cp0.len ..]) catch null) |nxt| {
+            if (isLetterCp(nxt.cp)) {
+                var end = i + cp0.len;
+                while (end < text.len) {
+                    const r = decodeCp(text[end..]) catch break;
+                    if (!isLetterCp(r.cp)) break;
+                    end += r.len;
+                }
+                return end;
+            }
+        }
+    }
+
+    // 3. \p{N} (single number char)
+    if (is_n) return i + cp0.len;
+
+    // 4. " "?[^\s\p{L}\p{N}]+[\r\n]*
+    {
+        var j = i;
+        if (text[i] == ' ') {
+            if (i + 1 < text.len) {
+                const nxt = decodeCp(text[i + 1 ..]) catch return null;
+                if (!isWhitespaceCp(nxt.cp) and !isLetterCp(nxt.cp) and !isNumberCp(nxt.cp)) j = i + 1;
+            }
+        }
+        var end = j;
+        var count: usize = 0;
+        while (end < text.len) {
+            const r = decodeCp(text[end..]) catch break;
+            if (isWhitespaceCp(r.cp) or isLetterCp(r.cp) or isNumberCp(r.cp)) break;
+            end += r.len;
+            count += 1;
+        }
+        if (count > 0) {
+            while (end < text.len and (text[end] == '\r' or text[end] == '\n')) end += 1;
+            return end;
+        }
+    }
+
+    // 5-7. whitespace alternatives
+    if (is_ws) {
+        var end = i;
+        var last_start = i;
+        var has_nl = false;
+        while (end < text.len) {
+            const r = decodeCp(text[end..]) catch break;
+            if (!isWhitespaceCp(r.cp)) break;
+            last_start = end;
+            if (r.cp == '\r' or r.cp == '\n') has_nl = true;
+            end += r.len;
+        }
+        // 5. \s*[\r\n]+ : run contains a newline; the match must END on a
+        //    newline (backtrack trailing non-newline whitespace).
+        if (has_nl) {
+            var e2 = end;
+            while (e2 > i and text[e2 - 1] != '\r' and text[e2 - 1] != '\n') e2 -= 1;
+            if (e2 > i) return e2;
+        }
+        // 6. \s+(?!\S): followed by end-of-text or whitespace; greedy \s+
+        //    backtracks one whitespace char when the lookahead fails.
+        if (end >= text.len) return end;
+        const nxt = decodeCp(text[end..]) catch return end;
+        if (isWhitespaceCp(nxt.cp)) return end;
+        if (last_start > i) return last_start;
+        return end; // alt 7: \s+ plain (single ws char, or lookahead ok path)
+    }
+    return null;
 }
 
 /// DeepSeek pattern 3 (adapted from cl100k_base style).

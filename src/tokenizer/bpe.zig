@@ -691,6 +691,12 @@ fn parseSplitPattern(val: std.json.Value) !pt.Pattern {
         } else if (std.mem.indexOf(u8, pattern_str, "[A-Za-z]+|") != null) {
             // DeepSeek / cl100k_base complex word pattern
             return .deepseek_word;
+        } else if (std.mem.indexOf(u8, pattern_str, "(?i:'s") != null and
+            std.mem.indexOf(u8, pattern_str, "\\p{L}") != null)
+        {
+            // Qwen2/Qwen3 GPT-4-style pattern (contractions + letter runs +
+            // single digits + punctuation + whitespace rules).
+            return .qwen_word;
         }
     }
     return error.UnsupportedPattern;

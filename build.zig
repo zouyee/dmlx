@@ -503,6 +503,27 @@ pub fn build(b: *std.Build) void {
     );
     run_qwen38_profile_step.dependOn(&run_qwen38_profile.step);
 
+    // --- Tokenizer parity harness (real tokenizer.json vs HF golden) ---
+    const tok_parity = b.addExecutable(.{
+        .name = "tokenizer-parity",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tokenizer_parity.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    tok_parity.root_module.addImport("mlx", mlx_z_module);
+    const run_tok_parity = b.addRunArtifact(tok_parity);
+    if (b.args) |args| {
+        run_tok_parity.addArgs(args);
+    }
+    const run_tok_parity_step = b.step(
+        "run-tokenizer-parity",
+        "Encode golden strings with the real tokenizer.json and diff against HF tokenizers ids",
+    );
+    run_tok_parity_step.dependOn(&run_tok_parity.step);
+
     // --- Scratch: compiled GDN apply micro-benchmark (uncommitted) ---
     const bench_compiled_gdn = b.addExecutable(.{
         .name = "bench-compiled-gdn",
@@ -523,6 +544,246 @@ pub fn build(b: *std.Build) void {
         "Micro-benchmark compiled GDN step apply cost",
     );
     run_bench_compiled_gdn_step.dependOn(&run_bench_compiled_gdn.step);
+
+    // --- Scratch: qmm shape micro-benchmark (uncommitted) ---
+    const bench_qmm_shapes = b.addExecutable(.{
+        .name = "bench-qmm-shapes",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_qmm_shapes.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_qmm_shapes.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_qmm_shapes = b.addRunArtifact(bench_qmm_shapes);
+    if (b.args) |args| {
+        run_bench_qmm_shapes.addArgs(args);
+    }
+    const run_bench_qmm_shapes_step = b.step(
+        "run-bench-qmm-shapes",
+        "Micro-benchmark quantized matmul at real Qwen3.8 decode shapes",
+    );
+    run_bench_qmm_shapes_step.dependOn(&run_bench_qmm_shapes.step);
+
+    // --- Scratch: qmm row-count (M) sweep for MTP verify (uncommitted) ---
+    const bench_verify_m = b.addExecutable(.{
+        .name = "bench-verify-m",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_verify_m.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_verify_m.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_verify_m = b.addRunArtifact(bench_verify_m);
+    if (b.args) |args| {
+        run_bench_verify_m.addArgs(args);
+    }
+    const run_bench_verify_m_step = b.step("run-bench-verify-m", "Sweep quantized matmul cost vs row count M (MTP verify)");
+    run_bench_verify_m_step.dependOn(&run_bench_verify_m.step);
+
+    // --- Scratch: q/k head broadcast cost (uncommitted) ---
+    const bench_qk_bc = b.addExecutable(.{
+        .name = "bench-qk-broadcast",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_qk_broadcast.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_qk_bc.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_qk_bc = b.addRunArtifact(bench_qk_bc);
+    const run_bench_qk_bc_step = b.step("run-bench-qk-broadcast", "Cost of materializing the q/k head broadcast");
+    run_bench_qk_bc_step.dependOn(&run_bench_qk_bc.step);
+
+    // --- Scratch: Phase 0/A0 hardware GEMM ceiling (uncommitted) ---
+    const bench_gemm_ceiling = b.addExecutable(.{
+        .name = "bench-gemm-ceiling",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_gemm_ceiling.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_gemm_ceiling.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_gemm_ceiling = b.addRunArtifact(bench_gemm_ceiling);
+    const run_bench_gemm_ceiling_step = b.step("run-bench-gemm-ceiling", "Dense bf16 vs 4-bit qmm ceiling at prefill shapes");
+    run_bench_gemm_ceiling_step.dependOn(&run_bench_gemm_ceiling.step);
+
+    // --- Scratch: split-K vs plain qmm at prefill shapes (uncommitted) ---
+    const bench_prefill_splitk = b.addExecutable(.{
+        .name = "bench-prefill-splitk",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_prefill_splitk.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_prefill_splitk.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_prefill_splitk = b.addRunArtifact(bench_prefill_splitk);
+    const run_bench_prefill_splitk_step = b.step("run-bench-prefill-splitk", "split-K vs plain qmm at prefill shapes");
+    run_bench_prefill_splitk_step.dependOn(&run_bench_prefill_splitk.step);
+
+    // --- Scratch: prefill qmm budget (uncommitted) ---
+    const bench_prefill_budget = b.addExecutable(.{
+        .name = "bench-prefill-budget",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_prefill_budget.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_prefill_budget.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_prefill_budget = b.addRunArtifact(bench_prefill_budget);
+    const run_bench_prefill_budget_step = b.step("run-bench-prefill-budget", "Where prefill time goes at L=512/2048");
+    run_bench_prefill_budget_step.dependOn(&run_bench_prefill_budget.step);
+
+    // --- Scratch: wasted lm_head rows during prefill (uncommitted) ---
+    const bench_prefill_head = b.addExecutable(.{
+        .name = "bench-prefill-head",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_prefill_head.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_prefill_head.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_prefill_head = b.addRunArtifact(bench_prefill_head);
+    const run_bench_prefill_head_step = b.step("run-bench-prefill-head", "lm_head cost vs prefill row count");
+    run_bench_prefill_head_step.dependOn(&run_bench_prefill_head.step);
+
+    // --- Scratch: verify-shape custom kernel feasibility (uncommitted) ---
+    const bench_verify_kernel = b.addExecutable(.{
+        .name = "bench-verify-kernel",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_verify_kernel.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_verify_kernel.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_verify_kernel = b.addRunArtifact(bench_verify_kernel);
+    if (b.args) |args| run_bench_verify_kernel.addArgs(args);
+    const run_bench_verify_kernel_step = b.step("run-bench-verify-kernel", "Split-K verify kernel vs stock qmm at M=2..6");
+    run_bench_verify_kernel_step.dependOn(&run_bench_verify_kernel.step);
+
+    // Does the number of distinct weight buffers change streaming bandwidth?
+    const bench_weight_layout = b.addExecutable(.{
+        .name = "bench-weight-layout",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_weight_layout.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_weight_layout.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_weight_layout = b.addRunArtifact(bench_weight_layout);
+    if (b.args) |args| run_bench_weight_layout.addArgs(args);
+    const run_bench_weight_layout_step = b.step("run-bench-weight-layout", "Weight buffer count vs achieved streaming bandwidth");
+    run_bench_weight_layout_step.dependOn(&run_bench_weight_layout.step);
+
+    // --- Scratch: weight bit-width sweep at decode shapes (uncommitted) ---
+    const bench_bits = b.addExecutable(.{
+        .name = "bench-bits",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_bits.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_bits.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_bits = b.addRunArtifact(bench_bits);
+    if (b.args) |args| run_bench_bits.addArgs(args);
+    const run_bench_bits_step = b.step("run-bench-bits", "Sweep weight bit width at decode shapes");
+    run_bench_bits_step.dependOn(&run_bench_bits.step);
+
+    // --- Scratch: quantized GDN step + misc kernel micro-benchmarks (uncommitted) ---
+    const bench_gdn_step_quant = b.addExecutable(.{
+        .name = "bench-gdn-step-quant",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_gdn_step_quant.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_gdn_step_quant.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_gdn_step_quant = b.addRunArtifact(bench_gdn_step_quant);
+    if (b.args) |args| {
+        run_bench_gdn_step_quant.addArgs(args);
+    }
+    const run_bench_gdn_step_quant_step = b.step("run-bench-gdn-step-quant", "Micro-benchmark quantized compiled GDN step");
+    run_bench_gdn_step_quant_step.dependOn(&run_bench_gdn_step_quant.step);
+
+    const bench_misc_kernels = b.addExecutable(.{
+        .name = "bench-misc-kernels",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_misc_kernels.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_misc_kernels.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_misc_kernels = b.addRunArtifact(bench_misc_kernels);
+    if (b.args) |args| {
+        run_bench_misc_kernels.addArgs(args);
+    }
+    const run_bench_misc_kernels_step = b.step("run-bench-misc-kernels", "Micro-benchmark SDPA/rmsNorm/embed/misc decode kernels");
+    run_bench_misc_kernels_step.dependOn(&run_bench_misc_kernels.step);
+
+    const dbg_addrms = b.addExecutable(.{
+        .name = "dbg-addrms",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbg_addrms.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    dbg_addrms.root_module.addImport("mlx", mlx_z_module);
+    const run_dbg_addrms = b.addRunArtifact(dbg_addrms);
+    const run_dbg_addrms_step = b.step("run-dbg-addrms", "debug scratch");
+    run_dbg_addrms_step.dependOn(&run_dbg_addrms.step);
+
+    // --- Scratch: MTP drafter checkpoint smoke load (uncommitted) ---
+    const dbg_mtp_drift = b.addExecutable(.{
+        .name = "dbg-mtp-drift",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbg_mtp_drift.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    dbg_mtp_drift.root_module.addImport("mlx", mlx_z_module);
+    const run_dbg_mtp_drift = b.addRunArtifact(dbg_mtp_drift);
+    const run_dbg_mtp_drift_step = b.step("run-dbg-mtp-drift", "decode vs verify logits drift probe");
+    run_dbg_mtp_drift_step.dependOn(&run_dbg_mtp_drift.step);
+
+    const dbg_mtp_load = b.addExecutable(.{
+        .name = "dbg-mtp-load",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbg_mtp_load.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    dbg_mtp_load.root_module.addImport("mlx", mlx_z_module);
+    const run_dbg_mtp_load = b.addRunArtifact(dbg_mtp_load);
+    const run_dbg_mtp_load_step = b.step("run-dbg-mtp-load", "smoke-load MTP drafter checkpoint");
+    run_dbg_mtp_load_step.dependOn(&run_dbg_mtp_load.step);
 
     // --- Wave-5 bounded phase-aware chunk planner table tests (pure Zig) ---
     const native_chunk_planner_tests = b.addTest(.{
