@@ -28,9 +28,18 @@ pub fn main() !void {
     const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
 
     for ([_]i32{ 1, 11, 12, 13, 24, 1901 }) |L| {
-        const q = try random.normal(ctx, &[_]i32{ L, HV, D }, .float32, 0.0, 0.09, null);
+        // unbroadcast [L,HK,D] masters; broadcast [L,HV,D] via qk_idx
+        const qh = try random.normal(ctx, &[_]i32{ L, HK, D }, .float32, 0.0, 0.09, null);
+        defer qh.deinit();
+        const kh = try random.normal(ctx, &[_]i32{ L, HK, D }, .float32, 0.0, 0.09, null);
+        defer kh.deinit();
+        var idx_buf: [HV]i32 = undefined;
+        for (&idx_buf, 0..) |*iv, h| iv.* = @intCast(h / 3);
+        const qk_idx = try Array.fromData(allocator, i32, &idx_buf, &[_]i32{HV});
+        defer qk_idx.deinit();
+        const q = try @import("mlx").shape.takeAxis(ctx, qh, qk_idx, 1);
         defer q.deinit();
-        const k = try random.normal(ctx, &[_]i32{ L, HV, D }, .float32, 0.0, 0.09, null);
+        const k = try @import("mlx").shape.takeAxis(ctx, kh, qk_idx, 1);
         defer k.deinit();
         const v = try random.normal(ctx, &[_]i32{ L, HV, D }, .float32, 0.0, 0.5, null);
         defer v.deinit();
@@ -47,7 +56,7 @@ pub fn main() !void {
         const serial = (try gdn.testDeltaRuleSerial(ctx, s0, k, v, beta, g, q, HV, D)).?;
         defer serial.s_new.deinit();
         defer serial.y.deinit();
-        const pipe = (try gdn.testDeltaRulePipelined(ctx, s0, k, v, beta, g, q, HV, HV, D)) orelse {
+        const pipe = (try gdn.testDeltaRulePipelined(ctx, s0, kh, v, beta, g, qh, HK, HV, D)) orelse {
             std.debug.print("L={d}: pipelined unavailable\n", .{L});
             continue;
         };

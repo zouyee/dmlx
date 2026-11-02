@@ -3032,6 +3032,8 @@ pub const Qwen38GDN = struct {
         qkv: Array, // [L, QKV] f32, post-conv+silu — dtype round-trip reference
         q_full: Array, // [L, HV, D] f32
         k_full: Array, // [L, HV, D] f32
+        q_heads: Array, // [L, HK, D] f32 — unbroadcast; the pipelined recurrence maps hv -> hv/(HV/HK) itself
+        k_heads: Array, // [L, HK, D] f32
         v: Array, // [L, HV, D] f32
         beta: Array, // [L, HV] f32
         g: Array, // [L, HV] f32
@@ -3047,6 +3049,8 @@ pub const Qwen38GDN = struct {
 
         fn deinit(self: *PrefillFront) void {
             self.qkv.deinit();
+            self.q_heads.deinit();
+            self.k_heads.deinit();
             if (!self.rec_moved) {
                 self.q_full.deinit();
                 self.k_full.deinit();
@@ -3187,9 +3191,9 @@ pub const Qwen38GDN = struct {
         errdefer v.deinit();
 
         const q = try fast_mod.rmsNorm(ctx, q_resh, self.q_norm_w, 1e-6); // [L, HK, D]
-        defer q.deinit();
+        errdefer q.deinit();
         const k = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm_w, 1e-6);
-        defer k.deinit();
+        errdefer k.deinit();
 
         // 4. Gates over [L, HV]: g = exp(-exp(A_log_f32) * softplus(a +
         // dt_bias)), beta = sigmoid(b). beta is widened to f32 afterwards —
@@ -3241,6 +3245,8 @@ pub const Qwen38GDN = struct {
             .qkv = qkv,
             .q_full = q_full,
             .k_full = k_full,
+            .q_heads = q,
+            .k_heads = k,
             .v = v,
             .beta = beta,
             .g = g,
@@ -3321,12 +3327,13 @@ pub const Qwen38GDN = struct {
         }
 
         // Delta-rule recurrence over the whole sequence: omlx's pipelined
-        // kernel first (~7x our serial fused kernel at T~1900; the broadcast
-        // q_full/k_full make every key head its own group, so Hk == Hv is the
-        // identity mapping), then the serial fused kernel, then eager.
+        // kernel first on the UNBROADCAST q/k (Hk=16: a third of the staging
+        // traffic of the Hv=48 broadcast form; the kernel maps hv -> hv/(Hv/Hk)
+        // itself, matching qk_idx), then the serial fused kernel, then eager.
+        const hk_i: i32 = @intCast(self.num_key_heads);
         const hv_i: i32 = @intCast(self.num_value_heads);
         const d_i: i32 = @intCast(self.head_dim);
-        const rec = (try deltaRulePrefillPipelined(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, hv_i, d_i)) orelse
+        const rec = (try deltaRulePrefillPipelined(ctx, cache.ssm_state, front.k_heads, front.v, front.beta, front.g, front.q_heads, hk_i, hv_i, d_i)) orelse
             try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, d_i);
         errdefer rec.s_new.deinit();
         defer rec.y.deinit(); // [L, HV, D] f32
