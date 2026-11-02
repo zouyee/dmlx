@@ -211,3 +211,38 @@ depth 4, stop and revert.
 - [ ] S5 final gates for the session's actual changes (test-gate fix,
   double-free fix): unit 465/466+1skip green; self-consistency 5/5 (run
   with the fusion kernels live, pre-opt-in-flip).
+
+## 2026-11-02 — prose-gap root cause: trunk-hidden norm convention (FIXED)
+
+The 6-rep interleaved harness with per-request raw samples showed the prose
+gap is REAL, not noise (effective 21.7 vs 30.7 tok/s, no overlap), and NOT
+the verify-marginal story: at the prose operating point per-round costs are
+identical (83.6 vs 83.2 ms). The gap was tok/round: 2.02 vs 2.25.
+
+Decomposition by conditional acceptance (empty-think prose, matched
+semantics to omlx's depth[d=a/b] log):
+  p1..p4: dmlx 0.64/0.34/0.11/0.11   omlx 0.74/0.68/0.33/0.50
+
+Eliminated by A/B (each bit-identical or unchanged): CHAIN_PRENORM
+(chain on pre-norm head output), NO_COARSE_HEAD (2-bit proposal head),
+REPLAY_FREE (keep drafter's own chain states instead of replaying with
+target hiddens — new toggle, kept for future A/B).
+
+Cause: **omlx feeds the head the trunk's POST-final-norm hidden and folds
+committed history with post-norm rows** (`HEAD_HIDDEN_POST_NORM = True`,
+prompt_priming.py: "accepts a few points higher than PR 990's pre-norm at
+every depth"); we fed PRE-norm everywhere. The `DMLX_MTP_TRUNK_POSTNORM`
+toggle (built 10-30, never flipped) covers priming rows, draft-0 input,
+verify chaining rows and commit replay rows. Measured with it ON:
+- prose: p1 0.643 -> 0.776 (omlx: 0.736), tok/round 2.02 -> 2.17, ms/tok
+  41.6 -> 37.6 (-10%);
+- code:  p1 0.960 -> 0.977, p4 0.267 -> 0.677, tok/round 3.74 -> 4.18 (+12%).
+
+Flipped to DEFAULT ON (`DMLX_MTP_NO_TRUNK_POSTNORM=1` reverts). Gates:
+unit 465/466+1skip, self-consistency 5/5, fidelity neutral (median
+first-divergence 591 both sides).
+
+Residual p2 gap on prose (0.36 vs 0.68) is suspected SELECTION, not defect:
+omlx's controller only runs d2 in 38/57 cycles (high-confidence content),
+so their p2 is conditioned on favourable rounds; our parked-2 measures all
+rounds uniformly. p1 — the only selection-free statistic — now favours us.
