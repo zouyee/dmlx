@@ -476,7 +476,7 @@ def measure(engine: Engine, reps_prompt: int, max_tokens: int,
     log = open(f"/tmp/cmp_{engine.name}.log", "w")
     proc = subprocess.Popen(engine.cmd, stdout=log, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
-    out: dict = {"ok": False, "per_prompt": {}}
+    out: dict = {"ok": False, "per_prompt": {}, "per_prompt_raw": {}}
     try:
         if not wait_health():
             out["error"] = "server did not become healthy"
@@ -493,6 +493,14 @@ def measure(engine: Engine, reps_prompt: int, max_tokens: int,
                 continue
             best = max(runs, key=lambda r: r["decode_tok_s"])  # warm best-of
             out["per_prompt"][key] = best
+            # Raw per-request samples for noise analysis: the best-of above
+            # compresses variance by construction, so a spread computed from
+            # `per_prompt` would understate run-to-run noise.
+            out["per_prompt_raw"][key] = [
+                {"decode_tok_s": r["decode_tok_s"],
+                 "effective_tok_s": r["effective_tok_s"],
+                 "ttft_s": r["ttft_s"]} for r in runs
+            ]
         # Directly measured TTFT at a short prompt, plus the prefill-throughput
         # sweep. Seeded per engine-visit so every engine sees different random
         # text (defeating prefix caches) but the same length targets.
@@ -627,6 +635,9 @@ def main() -> int:
                 "samples": len(vals),
             }
             m = ev["per_prompt"][key]
+            raw = [s for p in acc[n] for s in p.get("per_prompt_raw", {}).get(key, [])]
+            if raw:
+                ev.setdefault("per_request_raw", {})[key] = raw
             tag = key + ("*" if key not in HEADLINE else "")
             print(f"{n:<12}{ev['version']:<10}{tag:<8}{m['decode_tok_s']:>12.1f}"
                   f"{m['effective_tok_s']:>11.1f}{m['ttft_s']:>9.2f}")
