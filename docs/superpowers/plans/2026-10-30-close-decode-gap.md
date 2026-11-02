@@ -382,3 +382,18 @@ ms/pass in-context win (9.3 vs 27.3 ms/layer). Pipelined stays ON by default
 front projections at 6.4-7.2 s vs 2.5 s isolated — either barrier
 misattribution or a genuine cold-weight/L2 effect; the isolated benches reuse
 one weight copy per shape (warm), in-context each layer's weight is cold.
+
+Follow-ups after the first harness read (ttft@2048 16.50 -> 16.21 vs omlx
+15.68):
+- Unbroadcast q/k into the pipelined recurrence (Hk=16; kernel's hv->hv/3
+  mapping == qk_idx): recur 699 ms vs 918-1088 broadcast.
+- bf16 recurrence inputs (DMLX_GDN_PIPE_BF16=0 kills): recur 543 ms vs 877
+  f32. Numerics: max|dy| ~2-3e-3 on O(1) values — the input rounding
+  mlx_vlm/omlx themselves apply (their kernels take bf16 q/k/v); state and
+  accumulation stay f32. Fidelity gate re-run for this.
+- False leads closed by measurement: section-profiler inflation (conv
+  "1.7 s in-context" is 61 ms isolated; tail "3.4 s" is 164 ms isolated;
+  cold-vs-warm weight probe: 1.00x — the "in-context qmm penalty" at prefill
+  shapes was barrier misattribution, unlike the verify case where it was
+  real). The prefill section barriers misattribute; only recur (a serializing
+  kernel) and whole-pass walls are trustworthy.

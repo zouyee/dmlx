@@ -1781,7 +1781,7 @@ const PrefillRecKernelKey = struct {
 // order of the two 128-wide dots differs (documented in the source header).
 const pipe_kernel_body = @embedFile("qwen38_gdn_pipe.metal");
 
-const PipeKernelKey = struct { hk: i32, hv: i32 };
+const PipeKernelKey = struct { hk: i32, hv: i32, bf16: bool = false };
 const PipeKernelEntry = struct {
     key: PipeKernelKey,
     kernel: c.c.mlx_fast_metal_kernel,
@@ -1807,8 +1807,19 @@ fn pipeEnabled() bool {
     return pipe_enabled.?;
 }
 
+var pipe_bf16: ?bool = null;
+
+fn pipeBf16Enabled() bool {
+    if (pipe_bf16 == null) {
+        if (std.c.getenv("DMLX_GDN_PIPE_BF16")) |v| {
+            pipe_bf16 = !(v[0] == '0' and v[1] == 0);
+        } else pipe_bf16 = true;
+    }
+    return pipe_bf16.?;
+}
+
 fn createPipeKernel(allocator: std.mem.Allocator, key: PipeKernelKey) !c.c.mlx_fast_metal_kernel {
-    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_pipe_h{d}_v{d}", .{ key.hk, key.hv }, 0);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_pipe_h{d}_v{d}{s}", .{ key.hk, key.hv, if (key.bf16) "_bf" else "" }, 0);
     defer allocator.free(name_z);
     const header_z = try allocator.dupeZ(u8, "#include <metal_stdlib>\nusing namespace metal;\n");
     defer allocator.free(header_z);
@@ -1858,11 +1869,11 @@ fn markPipeBroken(key: PipeKernelKey) void {
 fn deltaRulePrefillPipelined(
     ctx: EagerContext,
     ssm_state: Array, // [HV, D, D] f32
-    k_full: Array, // [L, HV, D] f32
-    v: Array, // [L, HV, D] f32
+    k_full: Array, // [L, HK, D] f32/bf16
+    v: Array, // [L, HV, D] f32/bf16
     beta: Array, // [L, HV] f32
     g: Array, // [L, HV] f32
-    q_full: Array, // [L, HV, D] f32
+    q_full: Array, // [L, HK, D] f32/bf16
     hk: i32,
     hv: i32,
     d: i32,
@@ -1872,10 +1883,13 @@ fn deltaRulePrefillPipelined(
     const L: i32 = @intCast(k_full.shape()[0]);
     if (L < 1) return null;
     const dt_f32 = dtype_mod.Dtype.float32;
-    if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
-        v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+    const in_dt = q_full.dtype();
+    if (in_dt != dt_f32 and in_dt != .bfloat16) return null;
+    if (k_full.dtype() != in_dt or v.dtype() != in_dt) return null;
+    if (ssm_state.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+    const in_bf16 = in_dt == .bfloat16;
 
-    const key = PipeKernelKey{ .hk = hk, .hv = hv };
+    const key = PipeKernelKey{ .hk = hk, .hv = hv, .bf16 = in_bf16 };
     const kernel = getPipeKernel(ctx.allocator, key) orelse return null;
 
     const t_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{L}, &[_]i32{1});
@@ -1886,9 +1900,9 @@ fn deltaRulePrefillPipelined(
     // grid (128 * (Dv/16), Hv, 1) threads, threadgroup (128, 1, 1).
     try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * @divTrunc(d, 16), hv, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
-    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, L, hv, d }, 4, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, L, hv, d }, 4, if (in_bf16) c.c.MLX_BFLOAT16 else c.c.MLX_FLOAT32));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, hv, d, d }, 4, c.c.MLX_FLOAT32));
-    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", if (in_bf16) c.c.MLX_BFLOAT16 else c.c.MLX_FLOAT32));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dk", d));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dv", d));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hk", hk));
@@ -2680,6 +2694,11 @@ fn convAccumSeqFused(
     return Array.fromHandle(h);
 }
 
+/// Bench hook for the fused whole-sequence causal conv (+silu inside).
+pub fn testConvAccumSeqFused(ctx: EagerContext, conv1d_t_f32: Array, conv_state: Array, x_f32: Array, L: i32, qkv_dim: i32, K: i32) !?Array {
+    return convAccumSeqFused(ctx, conv1d_t_f32, conv_state, x_f32, L, qkv_dim, K);
+}
+
 fn convAccumSeq(ctx: EagerContext, conv1d_t: Array, window: Array, L: i32, qkv_dim: i32) !Array {
     const k: i32 = @intCast(conv1d_t.shape()[0]);
     const w_f32 = try ops.astype(ctx, conv1d_t, .float32);
@@ -3330,11 +3349,26 @@ pub const Qwen38GDN = struct {
         // kernel first on the UNBROADCAST q/k (Hk=16: a third of the staging
         // traffic of the Hv=48 broadcast form; the kernel maps hv -> hv/(Hv/Hk)
         // itself, matching qk_idx), then the serial fused kernel, then eager.
+        // Inputs are rounded to bf16 first (mlx_vlm/omlx feed their recurrence
+        // bf16 too; the kernel accumulates in f32, state stays f32): halves
+        // the q/k/v staging + y writeback traffic. DMLX_GDN_PIPE_BF16=0 keeps
+        // the f32 inputs.
         const hk_i: i32 = @intCast(self.num_key_heads);
         const hv_i: i32 = @intCast(self.num_value_heads);
         const d_i: i32 = @intCast(self.head_dim);
-        const rec = (try deltaRulePrefillPipelined(ctx, cache.ssm_state, front.k_heads, front.v, front.beta, front.g, front.q_heads, hk_i, hv_i, d_i)) orelse
-            try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, d_i);
+        const rec = blk: {
+            if (pipeBf16Enabled()) {
+                const qb = try ops.astype(ctx, front.q_heads, .bfloat16);
+                defer qb.deinit();
+                const kb = try ops.astype(ctx, front.k_heads, .bfloat16);
+                defer kb.deinit();
+                const vb = try ops.astype(ctx, front.v, .bfloat16);
+                defer vb.deinit();
+                if (try deltaRulePrefillPipelined(ctx, cache.ssm_state, kb, vb, front.beta, front.g, qb, hk_i, hv_i, d_i)) |r| break :blk r;
+            }
+            if (try deltaRulePrefillPipelined(ctx, cache.ssm_state, front.k_heads, front.v, front.beta, front.g, front.q_heads, hk_i, hv_i, d_i)) |r| break :blk r;
+            break :blk try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, d_i);
+        };
         errdefer rec.s_new.deinit();
         defer rec.y.deinit(); // [L, HV, D] f32
         if (prof) {

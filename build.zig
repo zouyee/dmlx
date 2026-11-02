@@ -659,6 +659,21 @@ pub fn build(b: *std.Build) void {
     const run_bench_gdn_pipe_step = b.step("run-bench-gdn-pipe", "pipelined GDN recurrence vs serial");
     run_bench_gdn_pipe_step.dependOn(&run_bench_gdn_pipe.step);
 
+    // --- Scratch: GDN tail/conv chain isolated cost ---
+    const bench_gdn_chains = b.addExecutable(.{
+        .name = "bench-gdn-chains",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_gdn_chains.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_gdn_chains.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_gdn_chains = b.addRunArtifact(bench_gdn_chains);
+    const run_bench_gdn_chains_step = b.step("run-bench-gdn-chains", "GDN tail/conv chain isolated cost");
+    run_bench_gdn_chains_step.dependOn(&run_bench_gdn_chains.step);
+
     // --- Scratch: embed gather cost ---
     const bench_embed = b.addExecutable(.{
         .name = "bench-embed",

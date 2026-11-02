@@ -56,6 +56,23 @@ pub fn main() !void {
         const serial = (try gdn.testDeltaRuleSerial(ctx, s0, k, v, beta, g, q, HV, D)).?;
         defer serial.s_new.deinit();
         defer serial.y.deinit();
+        const qb = try ops.astype(ctx, qh, .bfloat16);
+        defer qb.deinit();
+        const kb = try ops.astype(ctx, kh, .bfloat16);
+        defer kb.deinit();
+        const vb = try ops.astype(ctx, v, .bfloat16);
+        defer vb.deinit();
+        const pipe_bf = (try gdn.testDeltaRulePipelined(ctx, s0, kb, vb, beta, g, qb, HK, HV, D)).?;
+        defer pipe_bf.s_new.deinit();
+        defer pipe_bf.y.deinit();
+        const dyb = try ops.subtract(ctx, serial.y, try ops.astype(ctx, pipe_bf.y, .float32));
+        defer dyb.deinit();
+        const ayb = try ops.abs(ctx, dyb);
+        defer ayb.deinit();
+        const myb = try ops.max(ctx, ayb);
+        defer myb.deinit();
+        try myb.eval();
+        std.debug.print("L={d:5} bf16-in max|dy|={e:.3}\n", .{ L, try myb.item(f32) });
         const pipe = (try gdn.testDeltaRulePipelined(ctx, s0, kh, v, beta, g, qh, HK, HV, D)) orelse {
             std.debug.print("L={d}: pipelined unavailable\n", .{L});
             continue;
