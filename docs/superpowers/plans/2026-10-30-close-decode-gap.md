@@ -397,3 +397,21 @@ Follow-ups after the first harness read (ttft@2048 16.50 -> 16.21 vs omlx
   shapes was barrier misattribution, unlike the verify case where it was
   real). The prefill section barriers misattribute; only recur (a serializing
   kernel) and whole-pass walls are trustworthy.
+
+## Final state (2026-11-02, 6-rep interleaved, both engines empty-think)
+
+ttft@2048: 17.2-17.5 (start) -> 16.50 (v8) -> 16.21 (+unbroadcast pipe) ->
+16.14 (+bf16 inputs) vs omlx 15.68-15.76 (stable across r1-r3). Residual
+-2.4% / 0.38 s. Killed en route: packed linear (1.017x), fused gate_up at
+prefill (1.008-1.012x), omlx's whole prefill patch stack (0 at T=1901),
+embed gather (JIT artifact), conv/tail "in-context inflation" (prof barrier
+misattribution; isolated conv 61 ms, tail 164 ms per pass), cold weights
+(1.00x). The residual is diffuse per-layer dispatch/scheduler overhead, not a
+kernel gap: every kernel we run is now >= their equivalent (v8 > their stock
+below 2048 where their tile doesn't even engage; pipelined recurrence 543 ms
+vs their chunked ~200 ms is the last kernel-level delta, at fp32-exact-vs-
+chunked numerics tradeoff).
+
+Full scorecard r3 (artifacts/prefill_close_20261102_r3.json): code +13.5%,
+count +27%, math/prose inside their decode sigma, TTFT short 0.28 vs 0.78 s,
+ttft@512 4.32 vs 4.64 s, ttft@2048 16.14 vs 15.76 s.
