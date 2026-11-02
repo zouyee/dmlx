@@ -644,6 +644,51 @@ pub fn build(b: *std.Build) void {
     const run_bench_prefill_budget_step = b.step("run-bench-prefill-budget", "Where prefill time goes at L=512/2048");
     run_bench_prefill_budget_step.dependOn(&run_bench_prefill_budget.step);
 
+    // --- Scratch: pipelined GDN prefill recurrence vs serial ---
+    const bench_gdn_pipe = b.addExecutable(.{
+        .name = "bench-gdn-pipe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_gdn_pipe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_gdn_pipe.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_gdn_pipe = b.addRunArtifact(bench_gdn_pipe);
+    const run_bench_gdn_pipe_step = b.step("run-bench-gdn-pipe", "pipelined GDN recurrence vs serial");
+    run_bench_gdn_pipe_step.dependOn(&run_bench_gdn_pipe.step);
+
+    // --- Scratch: embed gather cost ---
+    const bench_embed = b.addExecutable(.{
+        .name = "bench-embed",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_embed.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_embed.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_embed = b.addRunArtifact(bench_embed);
+    const run_bench_embed_step = b.step("run-bench-embed", "embed gather cost");
+    run_bench_embed_step.dependOn(&run_bench_embed.step);
+
+    // --- Scratch: v8-tile prefill qmm correctness/speed ---
+    const bench_prefill_v8 = b.addExecutable(.{
+        .name = "bench-prefill-v8",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_prefill_v8.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_prefill_v8.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_prefill_v8 = b.addRunArtifact(bench_prefill_v8);
+    const run_bench_prefill_v8_step = b.step("run-bench-prefill-v8", "v8-tile prefill qmm vs stock");
+    run_bench_prefill_v8_step.dependOn(&run_bench_prefill_v8.step);
+
     // --- Scratch: wasted lm_head rows during prefill (uncommitted) ---
     const bench_prefill_head = b.addExecutable(.{
         .name = "bench-prefill-head",

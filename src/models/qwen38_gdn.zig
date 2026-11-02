@@ -8,6 +8,7 @@
 //! f32 throughout; cross-checked against scripts/qwen38_gdn_ref.py.
 const std = @import("std");
 const verify_qmm = @import("verify_qmm.zig");
+const qmm_v8 = @import("qwen38_qmm_v8.zig");
 const c = @import("mlx").c;
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
@@ -1771,6 +1772,157 @@ const PrefillRecKernelKey = struct {
     retain: bool = false,
 };
 
+// omlx's software-pipelined blocked-sequential GDN prefill recurrence
+// (omlx/custom_kernels/attention/gated_delta.py `_pipelined_source(12)`,
+// verbatim). At T=1901 on M4 Pro this runs 3.96 ms/layer where our
+// per-lane-serial kernel above measures ~27 ms (DMLX_GDN_PREFILL_PROF): the
+// exact recurrence is issue/latency-bound and this layout hides the
+// cross-lane reduction latency. Same per-step math; only the fp32 summation
+// order of the two 128-wide dots differs (documented in the source header).
+const pipe_kernel_body = @embedFile("qwen38_gdn_pipe.metal");
+
+const PipeKernelKey = struct { hk: i32, hv: i32 };
+const PipeKernelEntry = struct {
+    key: PipeKernelKey,
+    kernel: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+var pipe_entries: [4]?PipeKernelEntry = .{ null, null, null, null };
+var pipe_warned = false;
+var pipe_enabled: ?bool = null;
+
+fn pipeWarn(err: anyerror) void {
+    if (!pipe_warned) {
+        pipe_warned = true;
+        std.log.warn("pipelined GDN prefill kernel unavailable ({s}); using the serial fused kernel", .{@errorName(err)});
+    }
+}
+
+fn pipeEnabled() bool {
+    if (pipe_enabled == null) {
+        if (std.c.getenv("DMLX_GDN_PIPE_PREFILL")) |v| {
+            pipe_enabled = !(v[0] == '0' and v[1] == 0);
+        } else pipe_enabled = true;
+    }
+    return pipe_enabled.?;
+}
+
+fn createPipeKernel(allocator: std.mem.Allocator, key: PipeKernelKey) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_prefill_pipe_h{d}_v{d}", .{ key.hk, key.hv }, 0);
+    defer allocator.free(name_z);
+    const header_z = try allocator.dupeZ(u8, "#include <metal_stdlib>\nusing namespace metal;\n");
+    defer allocator.free(header_z);
+    const source_z = try allocator.dupeZ(u8, pipe_kernel_body);
+    defer allocator.free(source_z);
+
+    const in_vec = try makeStringVec(allocator, &.{ "q", "k", "v", "g", "beta", "state_in", "T_in" });
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = try makeStringVec(allocator, &.{ "y", "state_out" });
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+
+    const kernel = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, source_z.ptr, header_z.ptr, true, false);
+    return kernel;
+}
+
+fn getPipeKernel(allocator: std.mem.Allocator, key: PipeKernelKey) ?c.c.mlx_fast_metal_kernel {
+    for (&pipe_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) return if (e.broken) null else e.kernel;
+        }
+    }
+    const kernel = createPipeKernel(allocator, key) catch |err| {
+        pipeWarn(err);
+        return null;
+    };
+    for (&pipe_entries) |*slot| {
+        if (slot.* == null) {
+            slot.* = .{ .key = key, .kernel = kernel };
+            return kernel;
+        }
+    }
+    return null;
+}
+
+fn markPipeBroken(key: PipeKernelKey) void {
+    for (&pipe_entries) |*slot| {
+        if (slot.*) |*e| {
+            if (std.meta.eql(e.key, key)) e.broken = true;
+        }
+    }
+}
+
+/// Pipelined whole-sequence delta-rule recurrence (omlx Kernel P). Same
+/// in/out contract as deltaRulePrefillFused. Eligible when the head dims fit
+/// the kernel's fixed layout: Dk == Dv == 128, Dv % 16 == 0, Hv % Hk == 0,
+/// all inputs f32. Null → caller falls back.
+fn deltaRulePrefillPipelined(
+    ctx: EagerContext,
+    ssm_state: Array, // [HV, D, D] f32
+    k_full: Array, // [L, HV, D] f32
+    v: Array, // [L, HV, D] f32
+    beta: Array, // [L, HV] f32
+    g: Array, // [L, HV] f32
+    q_full: Array, // [L, HV, D] f32
+    hk: i32,
+    hv: i32,
+    d: i32,
+) !?PrefillRecurrenceOut {
+    if (!pipeEnabled()) return null;
+    if (d != 128 or @mod(hv, 16) != 0 or hk < 1 or @mod(hv, hk) != 0) return null;
+    const L: i32 = @intCast(k_full.shape()[0]);
+    if (L < 1) return null;
+    const dt_f32 = dtype_mod.Dtype.float32;
+    if (ssm_state.dtype() != dt_f32 or q_full.dtype() != dt_f32 or k_full.dtype() != dt_f32 or
+        v.dtype() != dt_f32 or g.dtype() != dt_f32 or beta.dtype() != dt_f32) return null;
+
+    const key = PipeKernelKey{ .hk = hk, .hv = hv };
+    const kernel = getPipeKernel(ctx.allocator, key) orelse return null;
+
+    const t_arr = try Array.fromData(ctx.allocator, i32, &[_]i32{L}, &[_]i32{1});
+    defer t_arr.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // grid (128 * (Dv/16), Hv, 1) threads, threadgroup (128, 1, 1).
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * @divTrunc(d, 16), hv, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, L, hv, d }, 4, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ 1, hv, d, d }, 4, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "InT", c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dk", d));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Dv", d));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hk", hk));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "Hv", hv));
+
+    const input_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(input_vec);
+    for ([_]Array{ q_full, k_full, v, g, beta, ssm_state, t_arr }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(input_vec, inp.inner));
+    }
+    var output_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(output_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&output_vec, kernel, input_vec, cfg, fusedStream())) catch |err| {
+        markPipeBroken(key);
+        pipeWarn(err);
+        return null;
+    };
+
+    var y_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&y_handle, output_vec, 0));
+    errdefer _ = c.c.mlx_array_free(y_handle);
+    var s_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&s_handle, output_vec, 1));
+    // y comes out [1, L, HV, D]; state [1, HV, D, D] — drop the unit axis.
+    const y4 = Array.fromHandle(y_handle);
+    defer y4.deinit();
+    const y = try ops.reshape(ctx, y4, &[_]i32{ L, hv, d });
+    errdefer y.deinit();
+    const s4 = Array.fromHandle(s_handle);
+    defer s4.deinit();
+    const s_new = try ops.reshape(ctx, s4, &[_]i32{ hv, d, d });
+    return .{ .s_new = s_new, .y = y };
+}
+
 const PrefillRecKernelEntry = struct {
     key: PrefillRecKernelKey,
     kernel: c.c.mlx_fast_metal_kernel,
@@ -1989,6 +2141,15 @@ fn deltaRulePrefill(
 ) !PrefillRecurrenceOut {
     return (try deltaRulePrefillFused(ctx, ssm_state, k_full, v, beta, g, q_full, hv, d)) orelse
         deltaRulePrefillEager(ctx, allocator, ssm_state, k_full, v, beta, g, q_full, hv, d);
+}
+
+/// Test/bench hooks for the two whole-sequence recurrence kernels.
+pub fn testDeltaRuleSerial(ctx: EagerContext, ssm_state: Array, k_full: Array, v: Array, beta: Array, g: Array, q_full: Array, hv: i32, d: i32) !?PrefillRecurrenceOut {
+    return deltaRulePrefillFused(ctx, ssm_state, k_full, v, beta, g, q_full, hv, d);
+}
+
+pub fn testDeltaRulePipelined(ctx: EagerContext, ssm_state: Array, k_full: Array, v: Array, beta: Array, g: Array, q_full: Array, hk: i32, hv: i32, d: i32) !?PrefillRecurrenceOut {
+    return deltaRulePrefillPipelined(ctx, ssm_state, k_full, v, beta, g, q_full, hk, hv, d);
 }
 
 /// Eager per-step delta-rule recurrence over a prefilled sequence (fallback
@@ -2294,6 +2455,9 @@ pub fn linearQuantParts(ctx: EagerContext, x: Array, w: Array, scales: ?Array, b
         };
         // See verify_qmm.zig: armed only around the MTP verify forward.
         if (try verify_qmm.maybeQmm(ctx, x, qw)) |y| return y;
+        // Long-prefill rows: omlx's affine_q4_qmm_t variant-8 tile (~1.05x at
+        // every projection shape, bit-exact; bench_prefill_v8).
+        if (try qmm_v8.maybeApply(ctx, x, w, s, biases)) |y| return y;
         return quantize_mod.quantizedMatmul(ctx, x, qw, true);
     }
     const w_t = try ops.transpose(ctx, w);
@@ -3156,9 +3320,14 @@ pub const Qwen38GDN = struct {
             t0 = nowNs();
         }
 
-        // Delta-rule recurrence over the whole sequence (single Metal kernel
-        // when eligible; per-step eager loop otherwise).
-        const rec = try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, @intCast(self.num_value_heads), @intCast(self.head_dim));
+        // Delta-rule recurrence over the whole sequence: omlx's pipelined
+        // kernel first (~7x our serial fused kernel at T~1900; the broadcast
+        // q_full/k_full make every key head its own group, so Hk == Hv is the
+        // identity mapping), then the serial fused kernel, then eager.
+        const hv_i: i32 = @intCast(self.num_value_heads);
+        const d_i: i32 = @intCast(self.head_dim);
+        const rec = (try deltaRulePrefillPipelined(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, hv_i, d_i)) orelse
+            try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, hv_i, d_i);
         errdefer rec.s_new.deinit();
         defer rec.y.deinit(); // [L, HV, D] f32
         if (prof) {

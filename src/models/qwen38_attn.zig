@@ -15,6 +15,7 @@ const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const verify_qmm = @import("verify_qmm.zig");
+const qmm_v8 = @import("qwen38_qmm_v8.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -991,6 +992,8 @@ pub const Qwen38Attn = struct {
             // MTP verify rows (M = 1 + draft depth) are a shape stock qmm
             // handles badly; routed only while armed (see verify_qmm.zig).
             if (try verify_qmm.maybeQmm(self.ctx, x, qw)) |y| return y;
+            // Long-prefill rows: variant-8 tile (see qwen38_qmm_v8.zig).
+            if (try qmm_v8.maybeApply(self.ctx, x, w, s, biases)) |y| return y;
             return quantize_mod.quantizedMatmul(self.ctx, x, qw, true);
         }
         const w_t = try ops.transpose(self.ctx, w);

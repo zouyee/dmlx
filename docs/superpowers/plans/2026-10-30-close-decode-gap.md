@@ -340,3 +340,45 @@ early-exit @3 samples/1.15 margin stands):
 - cold shallow-first sweep + exit@3/1.20: code 43.2 / prose 22.4 /
   math 37.1 / count 50.7 vs committed 42.6 / 23.3 / 38.5 / 48.6 —
   within noise on all four; not adopted (keeps history simple).
+
+## Long-prefill closure (2026-11-02) — ttft@~1900: 17.2-17.5 -> ~16.6, more coming
+
+Attribution (all measured, M4 Pro, T=1901 prompt):
+- omlx's entire prefill patch stack (sdpa256 + fa256 + GDN pipelined + q4 v8
+  tile) is WORTHLESS at 1901 tokens: stock mlx_vlm prefill measures 14.6-14.9 s
+  with or without every default patch arm (ladder probe). omlx server 15.7-15.9 s
+  is plain MLX eager plus server overhead. Their ANE hybrid prefill is opt-in
+  and OFF; the v8 qmm tile only engages at >= 2048 tokens.
+- The real dmlx-vs-stock gap was ours: (a) stock qmm tile ~4-5% slower than
+  omlx's v8 tile at every projection shape from M>=256; (b) our exact-serial
+  GDN prefill recurrence = 27 ms/layer in-context (1.3 s/pass) where omlx's
+  pipelined layout runs 4 ms — the serial chain is issue/latency-bound.
+- Killed by measurement: packed-linear 4->1 (1.017x, 40 ms), pipelined vs
+  blocked_seq ON THE OMlx SIDE (190 vs 223 ms — the right baseline is OUR
+  serial kernel, 1.3 s), GDN prework fusion (not used in prefill by omlx).
+
+Ports:
+1. affine_q4_qmm_t variant-8 tile (bm=64,bk=32,bn=64) as an mlx-c fast metal
+   kernel — scripts/flatten_qmm_v8.py flattens the MLX steel GEMM header
+   closure + omlx's vendored affine_quantized.h into
+   src/models/qwen38_qmm_v8_steel.metal (the mlx-c JIT has no steel include
+   path). src/models/qwen38_qmm_v8.zig routes M>=256 q4/gs64 affine prefill
+   projections. BIT-EXACT vs stock at all seven shapes (bench_prefill_v8).
+   ttft@1901 A/B (5 reps, interleaved arms): v8 on 17.43/16.37/16.64/16.24/
+   17.18 vs off 17.49/17.03/17.24/16.78/17.27 — ~0.45 s saved.
+   Kill: DMLX_PREFILL_QMM_V8=0; floor: DMLX_PREFILL_QMM_V8_MIN_M.
+2. GDN pipelined recurrence (omlx Kernel P, verbatim generated source
+   src/models/qwen38_gdn_pipe.metal + deltaRulePrefillPipelined). Numerics vs
+   our serial kernel: max|dy| ~1e-7 at L=1..1901 incl tail blocks (fp32
+   noise; the 128-wide dots use a different pairwise tree). Isolated 6.4 vs
+   10.8 ms/layer at L=1901. Kill: DMLX_GDN_PIPE_PREFILL=0.
+
+Correction to the pipelined-recurrence kill above: the ttft A/B (5 reps,
+server restarts) was too noisy to see it (cross-run thermal drift ±0.5 s), but
+the GDN section profiler (front outputs forced, recur timed to rec.y.eval)
+shows recur = 897 ms pipelined vs 1312 ms serial at L=1901 — a real ~415
+ms/pass in-context win (9.3 vs 27.3 ms/layer). Pipelined stays ON by default
+(DMLX_GDN_PIPE_PREFILL=0 kills). Open: the same profiler shows the four GDN
+front projections at 6.4-7.2 s vs 2.5 s isolated — either barrier
+misattribution or a genuine cold-weight/L2 effect; the isolated benches reuse
+one weight copy per shape (warm), in-context each layer's weight is cold.
