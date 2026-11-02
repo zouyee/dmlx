@@ -126,6 +126,9 @@ class Engine:
     model_id: str = MODEL
     env: dict = field(default_factory=dict)
     note: str = ""
+    # Merged verbatim into every request body (e.g. omlx's
+    # chat_template_kwargs={"enable_thinking": false} for think-mode parity).
+    extra_body: dict = field(default_factory=dict)
 
     def available(self) -> tuple[bool, str]:
         exe = self.cmd[0]
@@ -303,6 +306,23 @@ def engines() -> dict[str, Engine]:
             model_id=os.path.basename(OMLX_MTP_MODEL),
             note="native Lightning MTP, adaptive depth",
         ),
+        # Parity arm: omlx's DEFAULT on this model is thinking-ON with the
+        # reasoning-effort system prompt (reasoning_tokens ~86% of the
+        # completion — its decode rate is measured on highly predictable
+        # think boilerplate, NOT on answer prose). dmlx-nothink runs
+        # empty-think. Comparing the two arms directly measured different
+        # CONTENT, which read as an acceptance/throughput gap. This arm
+        # pins omlx to enable_thinking=false so both engines decode the
+        # same kind of text.
+        "omlx-mtp-nothink": Engine(
+            name="omlx-mtp-nothink",
+            cmd=[OMLX_PY, "-m", "omlx.cli", "serve",
+                 "--model-dir", os.path.dirname(OMLX_MTP_MODEL),
+                 "--port", str(PORT)],
+            model_id=os.path.basename(OMLX_MTP_MODEL),
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            note="omlx-mtp with enable_thinking=false (parity with dmlx-nothink)",
+        ),
     }
 
 
@@ -318,7 +338,8 @@ def wait_health(timeout: int = 240) -> bool:
     return False
 
 
-def one_request(prompt: str, max_tokens: int, model_id: str = MODEL) -> dict | None:
+def one_request(prompt: str, max_tokens: int, model_id: str = MODEL,
+                extra_body: dict | None = None) -> dict | None:
     """One NON-streaming completion; returns wall time and usage counts.
 
     Non-streaming is mandatory, not a convenience: dmlx's MTP speculative
@@ -330,12 +351,15 @@ def one_request(prompt: str, max_tokens: int, model_id: str = MODEL) -> dict | N
     # The model id must be the real path: mlx-lm's server resolves the
     # request's `model` field against HuggingFace, so a placeholder like "d"
     # makes it 404 on every request. dmlx ignores the field.
-    body = json.dumps({
+    payload = {
         "model": model_id,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,
-    }).encode()
+    }
+    if extra_body:
+        payload.update(extra_body)
+    body = json.dumps(payload).encode()
     last_err = None
     for path in ("/v1/chat/completions", "/chat/completions"):
         req = urllib.request.Request(
@@ -428,7 +452,8 @@ def prefill_sweep(model_id: str, lengths: list[int], reps: int,
     return out
 
 
-def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL) -> dict | None:
+def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL,
+              extra_body: dict | None = None) -> dict | None:
     """Prefill-free decode rate from two non-streaming requests.
 
     wall(n) = prefill + (n - 1) * step + fixed, so
@@ -439,10 +464,10 @@ def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL) -> dic
     streaming timestamps or any engine-reported timing field. The same
     formula is applied to every engine, which is the point.
     """
-    a = one_request(prompt, short, model_id)
+    a = one_request(prompt, short, model_id, extra_body)
     if a is None:
         return None
-    b = one_request(prompt, long_, model_id)
+    b = one_request(prompt, long_, model_id, extra_body)
     if b is None:
         return None
     dc = b["completion_tokens"] - a["completion_tokens"]
@@ -486,7 +511,8 @@ def measure(engine: Engine, reps_prompt: int, max_tokens: int,
         for key in PROMPTS:
             runs = []
             for _ in range(reps_prompt):
-                r = two_point(prompt_text(key), 8, max_tokens, engine.model_id)
+                r = two_point(prompt_text(key), 8, max_tokens, engine.model_id,
+                              engine.extra_body)
                 if r:
                     runs.append(r)
             if not runs:

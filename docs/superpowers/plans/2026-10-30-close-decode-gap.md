@@ -281,3 +281,23 @@ acceptance convention fixed, the remaining deltas are within the omlx-side
 run-to-run variance on prose/math and decisively in our favour on code.
 This plan's remaining levers (F3 group-sums, partial flush) are closed as
 unnecessary for parity.
+
+## 2026-11-02 (later) — the prose/math "gap" was a CONTENT mismatch, not speed
+
+omlx's default on this model is THINKING-ON with the reasoning-effort
+system prompt (prompt 66-70 tokens; reasoning_tokens = 110/128 on prose).
+Its "prose decode" was measured on highly predictable think boilerplate,
+while dmlx-nothink decoded pure answer prose. Same for acceptance stats:
+their p1..p4 = 0.74/0.68/... was measured on think text. The 10-30 note
+"omlx sends enable_thinking=false" was wrong (or regressed upstream) —
+their server only sets enable_thinking when a thinking budget is active.
+
+Harness fix: `omlx-mtp-nothink` arm sends chat_template_kwargs
+enable_thinking=false per request (verified: prompt 30 tokens, reasoning 0,
+identical to dmlx-nothink's prompt). compare_engines.py now supports
+per-engine extra_body for this.
+
+Side finding (production, not bench): dmlx's ChatML path never emits the
+model's DEFAULT system prompt / think block that the official jinja
+produces with no kwargs — a template-fidelity gap vs HF/omlx defaults,
+filed for a separate fix.

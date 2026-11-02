@@ -2162,6 +2162,14 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
             h.deinit();
             h = next;
         }
+        // Partial-graph flush every 8 layers (omlx `_FLUSH_LAYERS`): submits
+        // the prefix so the GPU starts while the host builds the rest.
+        // MEASURED NEUTRAL here (2026-11-02, opt-in via DMLX_VERIFY_FLUSH=1):
+        // code +2%, prose -3%, math -1% — inside run noise; our host build
+        // is already cheap enough that overlap buys nothing at these sizes.
+        if (layer % 8 == 7 and std.c.getenv("DMLX_VERIFY_FLUSH") != null) {
+            try eval_mod.asyncEval(allocator, &[_]Array{h});
+        }
     }
 
     // Capture pre-final-norm hidden for all positions (MTP chaining input).
