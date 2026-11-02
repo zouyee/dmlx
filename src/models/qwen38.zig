@@ -759,6 +759,25 @@ fn buildLayerPersistent(
 
 /// SwiGLU MLP on persistent borrowed projections: down(silu(gate(x)) * up(x)).
 fn mlpForwardPersistent(ctx: EagerContext, lp: *const LayerPersistent, x: Array) !Array {
+    // While verify-qmm routing is armed, gate/up + silu + mul go out in ONE
+    // sg8 swiglu launch (close-decode-gap fusion program F2); falls back to
+    // the separate ops when ineligible.
+    if (try verify_qmm.maybeSwiglu(ctx, x, .{
+        .data = lp.mlp_gate.w,
+        .scales = lp.mlp_gate.scales,
+        .biases = lp.mlp_gate.biases,
+        .config = lp.mlp_gate.cfg,
+        .original_shape = &[_]i32{},
+    }, .{
+        .data = lp.mlp_up.w,
+        .scales = lp.mlp_up.scales,
+        .biases = lp.mlp_up.biases,
+        .config = lp.mlp_up.cfg,
+        .original_shape = &[_]i32{},
+    })) |h| {
+        defer h.deinit();
+        return lp.mlp_down.apply(ctx, h);
+    }
     const gate = try lp.mlp_gate.apply(ctx, x);
     defer gate.deinit();
     const up = try lp.mlp_up.apply(ctx, x);

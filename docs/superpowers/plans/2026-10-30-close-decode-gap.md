@@ -138,3 +138,76 @@ fidelity + harness. Everything cheaper has been measured out.
   SLOWED 96-125 -> 190-209 ms/round: halving the threadgroup count costs
   more occupancy than the saved x traffic buys. The verify qmms are
   occupancy-bound, not bandwidth-bound, at these shapes.
+
+## Fusion program design (2026-11-02) — omlx verify mega-fusion port
+
+Inventory (both sides, same weights, M = 1 + depth rows):
+
+- omlx verify layer: `vk_group_sg8` (every same-input projection tuple in
+  ONE sg8 launch; grid y = sum(N)/8, per-threadgroup tile picks its matrix
+  via an if-chain), `vk_swiglu_sg8` (gate/up + silu + mul in one launch,
+  epilogue rounds both to T first), fused add+rmsnorm that also emits
+  per-64 group sums consumed by the sg8 kernels, partial-graph flush every
+  8 layers, chunked-GDN Metal kernels.
+- dmlx verify layer: conv and the delta-rule recurrence are already single
+  fused kernels; add+rmsNorm is already fused. What is NOT fused: the 4 GDN
+  in-projections (qkv/a/b/z, shared input), the 3 attention projections
+  (q/k/v, shared input), and the MLP gate/up + silu + mul chain. Those are
+  the ~30 mixed kernels per layer that the in-context penalty lives in.
+
+Scope for this port (phased, each phase A/B gated at fixed depth):
+
+- **F1. sg8 group kernel** (`maybeGroupQmm`): GDN front (qkv 10240 + a 48 +
+  b 48 + z 6144 = 16480 cols, 2060 tiles, one launch) and attention
+  (q/k/v) at 4 <= M <= 8, 4-bit gs in {32,64,128}. K=5120 % (64*8) = 0 OK.
+  M < 4 stays on the existing per-projection split-K routing.
+- **F2. sg8 swiglu kernel** (`maybeSwiglu`): gate/up (N=17408) + silu + mul
+  in one launch, epilogue rounds gate/up to bf16 first (bit-parity with the
+  separate ops), then down_proj as today.
+- **F3 (only if F1/F2 pay)**: group-sums producer in the fused add+rmsnorm
+  (gs=64 == omlx's _SUM_GROUP, so the sums variant applies) and the
+  every-8-layers partial-graph flush in forwardVerifyImpl.
+
+Kill switches: both are OPT-IN (DMLX_VERIFY_GROUP_SG8=1 / DMLX_VERIFY_SWIGLU_SG8=1) after the 2026-11-02 A/B refuted them at the parking depth.
+Kill criterion (same as S2): if the combined delta is <1 ms/round at fixed
+depth 4, stop and revert.
+
+## Execution log (2026-11-02)
+
+- [x] **F1+F2 implemented**: sg8 group kernel (one launch per same-input
+  projection tuple: GDN qkv/a/b/z, attention q/k/v) and sg8 swiglu kernel
+  (gate/up + silu + mul, epilogue rounds to bf16 first for bit-parity),
+  ported from omlx `vk_group_sg8`/`vk_swiglu_sg8` into
+  `src/models/verify_qmm.zig` (`maybeGroupQmm`/`maybeSwiglu`), wired into
+  `qwen38_gdn.prefillFront`, `qwen38_attn.forward` (L>1) and
+  `qwen38.mlpForwardPersistent`. Armed-only, 4 <= M <= 8, 4-bit affine,
+  kill switches DMLX_VERIFY_NO_GROUP_SG8 / DMLX_VERIFY_NO_SWIGLU_SG8.
+  Self-consistency 5/5 with both live.
+- [x] **Latent double-free fixed en route**: `prefillVerify` registered both
+  `errdefer y.deinit()` and `defer y.deinit()` — any error after `y` was
+  assigned segfaulted the server in unwinding (first seen when a Metal
+  source typo failed the swiglu compile mid-request).
+- [x] **F1+F2 A/B at fixed depth 3 (M=4), median ms/round, same session**:
+  both off 94.1 / group only 95.4 / swiglu only 96.2 / both on 99.7.
+  WORSE monotonically. Consistent with the bench table: split-K beats sg8
+  per-kernel at M=4-5 on every narrow shape, so replacing 4 split-K launches
+  with 1 sg8 launch trades a winning morphology for launch-count savings —
+  and launch count was already measured neutral (fused gate|up). omlx wins
+  with this because THEIR alternative is stock qmv (much worse at M=4), not
+  split-K. Depth-5 (M=6, where sg8 wins per-kernel) checked before revert.
+- [x] **Depth-5 check (M=6) + final verdict — fusion program REFUTED at the
+  operating point**: N=5 median 114.0 on vs 117.6 off (fusion wins at M=6,
+  as the per-kernel bench predicts). But ms/token (same session, code
+  prompt): depth 3 off 94.1/2.98 = 31.6; depth 5 on 114.0/3.47 = 32.8;
+  depth 5 off 33.9. The deeper chain's acceptance (3.47 tok/round, not the
+  pooled-p_i 3.86) does not repay its rows even fused. Both kernels flipped
+  to OPT-IN (DMLX_VERIFY_GROUP_SG8 / DMLX_VERIFY_SWIGLU_SG8), code kept for
+  an M >= 6 operating point. Combined with fused-gate|up-neutral and
+  split-K-BN8-refuted, the "kernel count between qmms" hypothesis is now
+  measured out three ways. The residual ~7% ms/round gap vs omlx stays
+  unexplained by any single lever tried; remaining untried: their
+  add_rms+group-sums (F3) and 8-layer partial-graph flush — deprioritized,
+  since F1/F2 were the load-bearing half and went backwards.
+- [ ] S5 final gates for the session's actual changes (test-gate fix,
+  double-free fix): unit 465/466+1skip green; self-consistency 5/5 (run
+  with the fusion kernels live, pre-opt-in-flip).

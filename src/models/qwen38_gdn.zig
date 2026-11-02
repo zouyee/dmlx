@@ -2909,13 +2909,45 @@ pub const Qwen38GDN = struct {
         // 1. Batched projections: [1, L, hidden] -> [1, L, *].
         const fp = gdnPrefillProfEnabled();
         var ft: i128 = if (fp) nowNs() else 0;
-        const qkv_lin = try linearQuantParts(ctx, x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases);
+        // While the verify-qmm routing is armed, the four in-projections
+        // share this input and go out in ONE sg8 group launch (plan doc:
+        // close-decode-gap fusion program F1). Falls back to the four
+        // separate calls when anything is ineligible.
+        var qkv_lin: Array = undefined;
+        var a: Array = undefined;
+        var b: Array = undefined;
+        var z: Array = undefined;
+        var grouped = false;
+        if (self.qkv_scales != null and self.a_scales != null and
+            self.b_scales != null and self.z_scales != null and
+            self.qkv_biases != null and self.a_biases != null and
+            self.b_biases != null and self.z_biases != null)
+        {
+            const group_qws = [_]quantize_mod.QuantizedWeight{
+                .{ .data = self.in_proj_qkv, .scales = self.qkv_scales.?, .biases = self.qkv_biases.?, .config = quantConfigFromShapes(x, self.in_proj_qkv, self.qkv_scales.?), .original_shape = &[_]i32{} },
+                .{ .data = self.in_proj_a, .scales = self.a_scales.?, .biases = self.a_biases.?, .config = quantConfigFromShapes(x, self.in_proj_a, self.a_scales.?), .original_shape = &[_]i32{} },
+                .{ .data = self.in_proj_b, .scales = self.b_scales.?, .biases = self.b_biases.?, .config = quantConfigFromShapes(x, self.in_proj_b, self.b_scales.?), .original_shape = &[_]i32{} },
+                .{ .data = self.in_proj_z, .scales = self.z_scales.?, .biases = self.z_biases.?, .config = quantConfigFromShapes(x, self.in_proj_z, self.z_scales.?), .original_shape = &[_]i32{} },
+            };
+            if (try verify_qmm.maybeGroupQmm(ctx, x, &group_qws)) |*gout| {
+                var go = gout.*;
+                qkv_lin = go.outs[0];
+                a = go.outs[1];
+                b = go.outs[2];
+                z = go.outs[3];
+                go.count = 0; // ownership moved to the four locals
+                grouped = true;
+            }
+        }
+        if (!grouped) {
+            qkv_lin = try linearQuantParts(ctx, x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases);
+            a = try linearQuantParts(ctx, x, self.in_proj_a, self.a_scales, self.a_biases);
+            b = try linearQuantParts(ctx, x, self.in_proj_b, self.b_scales, self.b_biases);
+            z = try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
+        }
         defer qkv_lin.deinit(); // [1, L, QKV]
-        const a = try linearQuantParts(ctx, x, self.in_proj_a, self.a_scales, self.a_biases);
         defer a.deinit(); // [1, L, HV]
-        const b = try linearQuantParts(ctx, x, self.in_proj_b, self.b_scales, self.b_biases);
         defer b.deinit(); // [1, L, HV]
-        const z = try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
         errdefer z.deinit(); // [1, L, HV*D]
 
         if (fp) {
@@ -3331,7 +3363,10 @@ pub const Qwen38GDN = struct {
             y = rec.y;
             ssm_states = rec.ssm_states;
         }
-        errdefer y.deinit();
+        // NOTE: no errdefer for y — the plain defer below already covers the
+        // error path; registering both double-freed y (segfault in error
+        // unwinding, first seen when a verify-kernel compile failure
+        // propagated through here).
         errdefer {
             for (ssm_states) |s| s.deinit();
             if (ssm_states.len > 0) allocator.free(ssm_states);

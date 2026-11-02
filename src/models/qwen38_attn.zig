@@ -1035,8 +1035,39 @@ pub const Qwen38Attn = struct {
         }
 
         // q path: [1, L, H*2*D] -> [1, L, H, 2*D] -> chunk into q / gate.
-        const q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+        // While verify-qmm routing is armed, q/k/v share this input and go
+        // out in ONE sg8 group launch (close-decode-gap fusion program F1);
+        // falls back to three separate calls when ineligible.
+        var q_lin: Array = undefined;
+        var k_lin: Array = undefined;
+        var v_lin: Array = undefined;
+        if (self.q_scales != null and self.k_scales != null and self.v_scales != null and
+            self.q_biases != null and self.k_biases != null and self.v_biases != null)
+        {
+            const group_qws = [_]quantize_mod.QuantizedWeight{
+                .{ .data = self.q_proj, .scales = self.q_scales.?, .biases = self.q_biases.?, .config = self.q_quant, .original_shape = &[_]i32{} },
+                .{ .data = self.k_proj, .scales = self.k_scales.?, .biases = self.k_biases.?, .config = self.k_quant, .original_shape = &[_]i32{} },
+                .{ .data = self.v_proj, .scales = self.v_scales.?, .biases = self.v_biases.?, .config = self.v_quant, .original_shape = &[_]i32{} },
+            };
+            if (try verify_qmm.maybeGroupQmm(ctx, x, &group_qws)) |*gout| {
+                var go = gout.*;
+                q_lin = go.outs[0];
+                k_lin = go.outs[1];
+                v_lin = go.outs[2];
+                go.count = 0; // ownership moved to the three locals
+            } else {
+                q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+                k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
+                v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
+            }
+        } else {
+            q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+            k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
+            v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
+        }
         defer q_lin.deinit();
+        defer k_lin.deinit();
+        defer v_lin.deinit();
         const q_resh = try ops.reshape(ctx, q_lin, &[_]i32{ 1, L, H, 2 * D });
         defer q_resh.deinit();
         const q_raw = try ops.slice(ctx, q_resh, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, L, H, D }, &[_]i32{ 1, 1, 1, 1 });
@@ -1047,10 +1078,6 @@ pub const Qwen38Attn = struct {
         } else null;
         defer if (gate) |g| g.deinit();
 
-        const k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
-        defer k_lin.deinit();
-        const v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
-        defer v_lin.deinit();
         const k_resh = try ops.reshape(ctx, k_lin, &[_]i32{ 1, L, HKV, D });
         defer k_resh.deinit();
         const v_resh = try ops.reshape(ctx, v_lin, &[_]i32{ 1, L, HKV, D });

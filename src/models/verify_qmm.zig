@@ -201,15 +201,25 @@ fn newKernel(
     name: []const u8,
     body: []const u8,
 ) !c.c.mlx_fast_metal_kernel {
+    return newKernelEx(allocator, name, body, &.{ "x", "w_q", "scales", "biases" }, &.{"y"});
+}
+
+fn newKernelEx(
+    allocator: std.mem.Allocator,
+    name: []const u8,
+    body: []const u8,
+    inputs: []const []const u8,
+    outputs: []const []const u8,
+) !c.c.mlx_fast_metal_kernel {
     const name_z = try allocator.dupeZ(u8, name);
     defer allocator.free(name_z);
     const source_z = try allocator.dupeZ(u8, body);
     defer allocator.free(source_z);
     const header_z = try allocator.dupeZ(u8, "");
     defer allocator.free(header_z);
-    const in_vec = try makeStringVec(allocator, &.{ "x", "w_q", "scales", "biases" });
+    const in_vec = try makeStringVec(allocator, inputs);
     defer _ = c.c.mlx_vector_string_free(in_vec);
-    const out_vec = try makeStringVec(allocator, &.{"y"});
+    const out_vec = try makeStringVec(allocator, outputs);
     defer _ = c.c.mlx_vector_string_free(out_vec);
     return c.c.mlx_fast_metal_kernel_new(
         name_z.ptr,
@@ -489,6 +499,567 @@ fn getSg8(allocator: std.mem.Allocator, ct: i32) !c.c.mlx_fast_metal_kernel {
     const k = try newKernel(allocator, name, body);
     sg8_kernels[@intCast(ct)] = k;
     return k;
+}
+
+// ---------------------------------------------------------------------------
+// sg8 group (one launch for every same-input projection tuple) + swiglu
+// ---------------------------------------------------------------------------
+//
+// Ported from oMLX (`vk_group_sg8` / `vk_swiglu_sg8` in
+// omlx/patches/qwen35_verify_qmm.py, Apache-2.0; sg8 morphology from Splash,
+// group/swiglu integration original to oMLX).
+//
+// The verify marginal row is not qmm-kernel-bound — identical kernels are
+// M-flat in isolation and +0.17 ms/row/layer in context (plan doc §39) — it
+// is bound by the ~30 mixed small kernels BETWEEN the qmms. These two
+// kernels remove most of them:
+//
+// - group: the GDN front's four in-projections (qkv/a/b/z) and the
+//   attention q/k/v triple all share one input row block, so one launch
+//   covers them: grid y = sum(N)/8 and each threadgroup's tile picks its
+//   matrix through a uniform if-chain.
+// - swiglu: gate and up are one two-matrix pass whose epilogue rounds both
+//   to T (bit-parity with the separate projections) and applies
+//   silu(g) * u, folding two more elementwise launches into the qmm.
+//
+// Both keep the single-matrix kernel's discipline: no thread-local arrays
+// indexed by loop variables (the 10x spill regression), fp32 accumulation,
+// bf16 128+q operand trick with the per-group xsum fold.
+
+/// Max projections in one group launch (GDN qkv/a/b/z).
+pub const group_max_mats = 4;
+
+const group_nsg: i32 = 8;
+
+/// 4-bit only: the model's weights are all 4-bit affine, and the 5-bit word
+/// path exists in oMLX for other families. Adding it here is one branch in
+/// the hot loop; leave it out until a 5-bit verify model shows up.
+fn buildSg8GroupSource(allocator: std.mem.Allocator, ns: []const i32) ![]u8 {
+    var s = std.ArrayList(u8).empty;
+    errdefer s.deinit(allocator);
+    const w = Emit{ .a = allocator, .buf = &s };
+
+    try w.raw(
+        \\    const uint tid = thread_position_in_threadgroup.x;
+        \\    const uint sg = tid / 32;
+        \\    const uint lane = tid % 32;
+        \\    const uint qid = lane >> 2;
+        \\    const uint fm = (qid & 4) | ((lane >> 1) & 3);
+        \\    const uint fn_ = ((qid & 2) << 1) | ((lane & 1) << 1);
+        \\    constexpr int GROUPS = K / GS;
+        \\    constexpr int PER = GROUPS / NSG;
+        \\    constexpr int WB = GS * 4 / 8;
+        \\    constexpr long ROW_BYTES = long(K) * 4 / 8;
+        \\    const int tile = int(threadgroup_position_in_grid.y);
+        \\    const device uchar* wbase;
+        \\    const device T* sp;
+        \\    const device T* bp;
+        \\    device T* yp;
+        \\    int n_out = 0;
+        \\    int n = 0;
+        \\
+    );
+    var start: i32 = 0;
+    for (ns, 0..) |n_i, i| {
+        const end = start + @divExact(n_i, 8);
+        const head: []const u8 = if (i == 0) "if" else "} else if";
+        try w.fmt(
+            \\    {s} (tile < {d}) {{
+            \\        wbase = (const device uchar*)w{d};
+            \\        sp = s{d};
+            \\        bp = b{d};
+            \\        yp = y{d};
+            \\        n_out = {d};
+            \\        n = (tile - {d}) * 8 + int(fm);
+            \\
+        , .{ head, end, i, i, i, i, n_i, start });
+        start = end;
+    }
+    try w.raw(
+        \\    }
+        \\    const int g_begin = int(sg) * PER;
+        \\    const bool r0 = int(fn_) < M;
+        \\    const bool r1 = int(fn_) + 1 < M;
+        \\    // Same operand order as the single-matrix kernel.
+        \\    const uint kx = (fm >> 1) * 8 + (fm & 1u) * 4;
+        \\    // Lanes past the last row read row M-1 and never store, so the hot
+        \\    // loop carries no row branches.
+        \\    const device T* x0 = x + min(int(fn_), M - 1) * K + kx;
+        \\    const device T* x1 = x + min(int(fn_) + 1, M - 1) * K + kx;
+        \\    float2 out = float2(0.0f);
+        \\    for (int g = g_begin; g < g_begin + PER; ++g) {
+        \\        simdgroup_matrix<float, 8, 8> acc = simdgroup_matrix<float, 8, 8>(0.0f);
+        \\        float2 xsum = float2(0.0f);
+        \\        const device uchar* wg = wbase + long(n) * ROW_BYTES + long(g) * WB;
+        \\        for (int qd = 0; qd < GS / 32; ++qd) {
+        \\            const int kq = g * GS + qd * 32;
+        \\            const uint w0 = ((const device uint*)(wg + qd * 16))[fn_ >> 1];
+        \\            const vec<T, 4> va = *((const device vec<T, 4>*)(x0 + kq));
+        \\            const vec<T, 4> vb = *((const device vec<T, 4>*)(x1 + kq));
+        \\            for (int j = 0; j < 4; ++j) {
+        \\                const T xa = va[j];
+        \\                const T xb = vb[j];
+        \\                xsum += float2(float(xa), float(xb));
+        \\                const uint pr = ((w0 >> (4 * j)) & 0x000F000Fu) | 0x43004300u;
+        \\                simdgroup_matrix<T, 8, 8> ma, mb;
+        \\                ma.thread_elements()[0] = as_type<T>(ushort(pr));
+        \\                ma.thread_elements()[1] = as_type<T>(ushort(pr >> 16));
+        \\                mb.thread_elements()[0] = xa;
+        \\                mb.thread_elements()[1] = xb;
+        \\                simdgroup_multiply_accumulate(acc, ma, mb, acc);
+        \\            }
+        \\        }
+        \\        // Lanes sharing fn_ differ only in the fm bits of the lane id.
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 2), simd_shuffle_xor(xsum.y, 2));
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 4), simd_shuffle_xor(xsum.y, 4));
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 16), simd_shuffle_xor(xsum.y, 16));
+        \\        const float sc = float(sp[long(n) * GROUPS + g]);
+        \\        const float bi = float(bp[long(n) * GROUPS + g]);
+        \\        const float2 a2 = float2(acc.thread_elements()[0], acc.thread_elements()[1]);
+        \\        out += sc * a2 + (bi - 128.0f * sc) * xsum;
+        \\    }
+        \\    threadgroup float2 part[NSG * 32];
+        \\    part[sg * 32 + lane] = out;
+        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (sg == 0) {
+        \\        float2 t = float2(0.0f);
+        \\        for (int i = 0; i < NSG; ++i) { t += part[i * 32 + lane]; }
+        \\        if (r0) { yp[int(fn_) * n_out + n] = T(t.x); }
+        \\        if (r1) { yp[(int(fn_) + 1) * n_out + n] = T(t.y); }
+        \\    }
+        \\
+    );
+    return s.toOwnedSlice(allocator);
+}
+
+/// Two-matrix sg8 (gate|up) whose epilogue rounds both to T — bit-parity
+/// with the separate projections — and applies silu(gate) * up.
+fn buildSg8SwigluSource(allocator: std.mem.Allocator, ct: i32) ![]u8 {
+    var s = std.ArrayList(u8).empty;
+    errdefer s.deinit(allocator);
+    const w = Emit{ .a = allocator, .buf = &s };
+
+    try w.raw(
+        \\    const uint tid = thread_position_in_threadgroup.x;
+        \\    const uint sg = tid / 32;
+        \\    const uint lane = tid % 32;
+        \\    const uint qid = lane >> 2;
+        \\    const uint fm = (qid & 4) | ((lane >> 1) & 3);
+        \\    const uint fn_ = ((qid & 2) << 1) | ((lane & 1) << 1);
+        \\    constexpr int GROUPS = K / GS;
+        \\    constexpr int PER = GROUPS / NSG;
+        \\    constexpr int WB = GS * 4 / 8;
+        \\    constexpr long ROW_BYTES = long(K) * 4 / 8;
+        \\    const int g_begin = int(sg) * PER;
+        \\    const int nbase = int(threadgroup_position_in_grid.y) * 8 * CT;
+        \\    const bool r0 = int(fn_) < M;
+        \\    const bool r1 = int(fn_) + 1 < M;
+        \\    const uint kx = (fm >> 1) * 8 + (fm & 1u) * 4;
+        \\    const device T* x0 = x + min(int(fn_), M - 1) * K + kx;
+        \\    const device T* x1 = x + min(int(fn_) + 1, M - 1) * K + kx;
+        \\
+    );
+    var ci: i32 = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt("    float2 outg{d} = float2(0.0f);\n", .{ci});
+        try w.fmt("    float2 outu{d} = float2(0.0f);\n", .{ci});
+    }
+    try w.raw("    for (int g = g_begin; g < g_begin + PER; ++g) {\n");
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt("        simdgroup_matrix<float, 8, 8> accg{d} = simdgroup_matrix<float, 8, 8>(0.0f);\n", .{ci});
+        try w.fmt("        simdgroup_matrix<float, 8, 8> accu{d} = simdgroup_matrix<float, 8, 8>(0.0f);\n", .{ci});
+    }
+    try w.raw(
+        \\        float2 xsum = float2(0.0f);
+        \\        for (int qd = 0; qd < GS / 32; ++qd) {
+        \\            const int kq = g * GS + qd * 32;
+        \\            const vec<T, 4> va = *((const device vec<T, 4>*)(x0 + kq));
+        \\            const vec<T, 4> vb = *((const device vec<T, 4>*)(x1 + kq));
+        \\            xsum += float2(float(va[0]) + float(va[1]) + float(va[2]) + float(va[3]),
+        \\                           float(vb[0]) + float(vb[1]) + float(vb[2]) + float(vb[3]));
+        \\
+    );
+    // Gate matrix pass.
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt(
+            \\            {{
+            \\                const long n = long(nbase) + {d} * 8 + long(fm);
+            \\                const device uchar* wg = (const device uchar*)w_q
+            \\                    + n * ROW_BYTES + long(g) * WB;
+            \\                const uint wd = ((const device uint*)(wg + qd * 16))[fn_ >> 1];
+            \\
+        , .{ci});
+        var j: i32 = 0;
+        while (j < 4) : (j += 1) {
+            try w.fmt(
+                \\                {{
+                \\                    const uint pr = ((wd >> {d}) & 0x000F000Fu) | 0x43004300u;
+                \\                    simdgroup_matrix<T, 8, 8> ma, mb;
+                \\                    ma.thread_elements()[0] = as_type<T>(ushort(pr));
+                \\                    ma.thread_elements()[1] = as_type<T>(ushort(pr >> 16));
+                \\                    mb.thread_elements()[0] = va[{d}];
+                \\                    mb.thread_elements()[1] = vb[{d}];
+                \\                    simdgroup_multiply_accumulate(accg{d}, ma, mb, accg{d});
+                \\                }}
+                \\
+            , .{ j * 4, j, j, ci, ci });
+        }
+        try w.raw("            }\n");
+    }
+    // Up matrix pass (second weight tensor).
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt(
+            \\            {{
+            \\                const long n = long(nbase) + {d} * 8 + long(fm);
+            \\                const device uchar* wu = (const device uchar*)w_q2
+            \\                    + n * ROW_BYTES + long(g) * WB;
+            \\                const uint wd2 = ((const device uint*)(wu + qd * 16))[fn_ >> 1];
+            \\
+        , .{ci});
+        var j: i32 = 0;
+        while (j < 4) : (j += 1) {
+            try w.fmt(
+                \\                {{
+                \\                    const uint pr2 = ((wd2 >> {d}) & 0x000F000Fu) | 0x43004300u;
+                \\                    simdgroup_matrix<T, 8, 8> ma2, mb2;
+                \\                    ma2.thread_elements()[0] = as_type<T>(ushort(pr2));
+                \\                    ma2.thread_elements()[1] = as_type<T>(ushort(pr2 >> 16));
+                \\                    mb2.thread_elements()[0] = va[{d}];
+                \\                    mb2.thread_elements()[1] = vb[{d}];
+                \\                    simdgroup_multiply_accumulate(accu{d}, ma2, mb2, accu{d});
+                \\                }}
+                \\
+            , .{ j * 4, j, j, ci, ci });
+        }
+        try w.raw("            }\n");
+    }
+    try w.raw(
+        \\        }
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 2), simd_shuffle_xor(xsum.y, 2));
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 4), simd_shuffle_xor(xsum.y, 4));
+        \\        xsum += float2(simd_shuffle_xor(xsum.x, 16), simd_shuffle_xor(xsum.y, 16));
+        \\
+    );
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt(
+            \\        {{
+            \\            const long n = long(nbase) + {d} * 8 + long(fm);
+            \\            const float scg = float(scales[n * GROUPS + g]);
+            \\            const float bg = float(biases[n * GROUPS + g]);
+            \\            const float2 ag2 = float2(accg{d}.thread_elements()[0],
+            \\                                      accg{d}.thread_elements()[1]);
+            \\            outg{d} += scg * ag2 + (bg - 128.0f * scg) * xsum;
+            \\            const float scu = float(scales2[n * GROUPS + g]);
+            \\            const float bu = float(biases2[n * GROUPS + g]);
+            \\            const float2 au2 = float2(accu{d}.thread_elements()[0],
+            \\                                      accu{d}.thread_elements()[1]);
+            \\            outu{d} += scu * au2 + (bu - 128.0f * scu) * xsum;
+            \\        }}
+            \\
+        , .{ ci, ci, ci, ci, ci, ci, ci });
+    }
+    try w.fmt(
+        \\    }}
+        \\    threadgroup float2 part[2 * NSG * {d} * 32];
+        \\
+    , .{ct});
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt("    part[(({d} * NSG) + sg) * 32 + lane] = outg{d};\n", .{ ci, ci });
+        try w.fmt("    part[((({d} + CT) * NSG) + sg) * 32 + lane] = outu{d};\n", .{ ci, ci });
+    }
+    try w.raw(
+        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (sg == 0) {
+        \\
+    );
+    ci = 0;
+    while (ci < ct) : (ci += 1) {
+        try w.fmt(
+            \\        {{
+            \\            const long n = long(nbase) + {d} * 8 + long(fm);
+            \\            float2 tg2 = float2(0.0f);
+            \\            float2 tu2 = float2(0.0f);
+            \\            for (int i = 0; i < NSG; ++i) {{
+            \\                tg2 += part[(({d} * NSG) + i) * 32 + lane];
+            \\                tu2 += part[((({d} + CT) * NSG) + i) * 32 + lane];
+            \\            }}
+            \\            // Round gate/up to T like the separate projections,
+            \\            // then silu(gate) * up (omlx vk_swiglu_sg8 epilogue).
+            \\            const float2 g2 = float2(T(tg2.x), T(tg2.y));
+            \\            const float2 u2 = float2(T(tu2.x), T(tu2.y));
+            \\            const float2 v = g2 / (1.0f + exp(-g2)) * u2;
+            \\            if (r0) {{ y[long(fn_) * N + n] = T(v.x); }}
+            \\            if (r1) {{ y[(long(fn_) + 1) * N + n] = T(v.y); }}
+            \\        }}
+            \\
+        , .{ ci, ci, ci });
+    }
+    try w.raw("    }\n");
+    return s.toOwnedSlice(allocator);
+}
+
+var sg8_swiglu_kernels = [_]?c.c.mlx_fast_metal_kernel{null} ** 5;
+var swiglu_broken: bool = false;
+var swiglu_disabled: ?bool = null;
+
+fn getSg8Swiglu(allocator: std.mem.Allocator, ct: i32) !c.c.mlx_fast_metal_kernel {
+    if (sg8_swiglu_kernels[@intCast(ct)]) |k| return k;
+    const body = try buildSg8SwigluSource(allocator, ct);
+    defer allocator.free(body);
+    var nbuf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nbuf, "dmlx_vk_sg8_swiglu_q4_ct{d}", .{ct});
+    const inputs: []const []const u8 = &.{ "x", "w_q", "scales", "biases", "w_q2", "scales2", "biases2" };
+    const k = try newKernelEx(allocator, name, body, inputs, &.{"y"});
+    sg8_swiglu_kernels[@intCast(ct)] = k;
+    return k;
+}
+
+/// Cache of compiled group kernels, keyed by the N tuple (fixed per model).
+const GroupCacheEntry = struct {
+    ns: [group_max_mats]i32,
+    count: usize,
+    kernel: c.c.mlx_fast_metal_kernel,
+};
+var group_kernels: [8]?GroupCacheEntry = [_]?GroupCacheEntry{null} ** 8;
+var group_broken: bool = false;
+var group_disabled: ?bool = null;
+
+fn getSg8Group(allocator: std.mem.Allocator, ns: []const i32) !c.c.mlx_fast_metal_kernel {
+    for (&group_kernels) |*e| {
+        if (e.*) |ent| {
+            if (ent.count == ns.len and std.mem.eql(i32, ent.ns[0..ent.count], ns)) return ent.kernel;
+        }
+    }
+    const body = try buildSg8GroupSource(allocator, ns);
+    defer allocator.free(body);
+    var nbuf: [96]u8 = undefined;
+    var name_list = std.ArrayList(u8).empty;
+    defer name_list.deinit(allocator);
+    try name_list.appendSlice(allocator, "dmlx_vk_sg8_group_q4");
+    for (ns) |n_i| try name_list.appendSlice(allocator, try std.fmt.bufPrint(&nbuf, "_{d}", .{n_i}));
+    var in_names = std.ArrayList([]const u8).empty;
+    defer in_names.deinit(allocator);
+    var out_names = std.ArrayList([]const u8).empty;
+    defer out_names.deinit(allocator);
+    try in_names.append(allocator, "x");
+    // Names must interleave w{i}/s{i}/b{i} exactly like the value order at
+    // apply time (x, then per matrix: w, s, b).
+    var name_bufs: [group_max_mats][3][16]u8 = undefined;
+    var name_bufs4: [group_max_mats][16]u8 = undefined;
+    for (ns, 0..) |_, i| {
+        try in_names.append(allocator, try std.fmt.bufPrint(&name_bufs[i][0], "w{d}", .{i}));
+        try in_names.append(allocator, try std.fmt.bufPrint(&name_bufs[i][1], "s{d}", .{i}));
+        try in_names.append(allocator, try std.fmt.bufPrint(&name_bufs[i][2], "b{d}", .{i}));
+        try out_names.append(allocator, try std.fmt.bufPrint(&name_bufs4[i], "y{d}", .{i}));
+    }
+    const k = try newKernelEx(allocator, name_list.items, body, in_names.items, out_names.items);
+    for (&group_kernels) |*e| {
+        if (e.* == null) {
+            var ent: GroupCacheEntry = .{ .ns = @splat(0), .count = ns.len, .kernel = k };
+            @memcpy(ent.ns[0..ns.len], ns);
+            e.* = ent;
+            break;
+        }
+    }
+    return k;
+}
+
+/// Shared eligibility for the group/swiglu launches: armed, on GPU, bf16
+/// [M, K] or [1, M, K] with 4 <= M <= 8 (M < 4 stays on per-projection
+/// split-K; M > 8 is prefill territory).
+fn groupEligibleX(ctx: EagerContext, x: Array) ?struct { m: i32, k: i32, three_d: bool } {
+    if (!armed) return null;
+    if (c.c.mlx_stream_equal(ctx.stream.inner, defaultCpuStream())) return null;
+    if (x.dtype() != .bfloat16) return null;
+    const xs = x.shape();
+    var m: i32 = undefined;
+    var k: i32 = undefined;
+    var three_d = false;
+    if (xs.len == 2) {
+        m = @intCast(xs[0]);
+        k = @intCast(xs[1]);
+    } else if (xs.len == 3 and xs[0] == 1) {
+        m = @intCast(xs[1]);
+        k = @intCast(xs[2]);
+        three_d = true;
+    } else return null;
+    if (m < 4 or m > 8) return null;
+    return .{ .m = m, .k = k, .three_d = three_d };
+}
+
+/// Every weight of a group must be 4-bit affine with the same group size,
+/// bf16 scales/biases (the kernel binds one pointer type), N % 8 == 0, and
+/// K % (GS * NSG) == 0 so each simdgroup's K-share is whole groups.
+fn groupEligibleWs(qws: []const quantize_mod.QuantizedWeight, k: i32) ?i32 {
+    if (qws.len < 2 or qws.len > group_max_mats) return null;
+    const gs = qws[0].config.group_size;
+    if (qws[0].config.bits != 4 or qws[0].config.mode != .affine) return null;
+    if (gs != 32 and gs != 64 and gs != 128) return null;
+    if (@mod(k, gs * group_nsg) != 0) return null;
+    for (qws) |qw| {
+        if (qw.config.bits != 4 or qw.config.mode != .affine) return null;
+        if (qw.config.group_size != gs) return null;
+        if (qw.scales.dtype() != .bfloat16 or qw.biases.dtype() != .bfloat16) return null;
+        const ws = qw.data.shape();
+        if (ws.len != 2) return null;
+        if (@mod(ws[0], 8) != 0) return null;
+    }
+    return gs;
+}
+
+pub const GroupOut = struct {
+    outs: [group_max_mats]Array = undefined,
+    count: usize = 0,
+
+    pub fn deinitAll(self: *GroupOut) void {
+        for (self.outs[0..self.count]) |*o| o.deinit();
+        self.count = 0;
+    }
+};
+
+/// One launch for every projection of `x` (GDN qkv/a/b/z, attention q/k/v).
+/// Returns null when anything is ineligible — the caller falls back to the
+/// per-projection path. Kill switch: DMLX_VERIFY_NO_GROUP_SG8=1.
+pub fn maybeGroupQmm(ctx: EagerContext, x: Array, qws: []const quantize_mod.QuantizedWeight) !?GroupOut {
+    // OPT-IN (DMLX_VERIFY_GROUP_SG8=1). Measured 2026-11-02 (plan doc,
+    // close-decode-gap fusion program): WORSE at the controller's parking
+    // depth (M=4: 95.4 vs 94.1 ms/round median) because sg8 loses to our
+    // split-K per-kernel at M=4-5; better at M=6 (114.0 vs 117.6) but the
+    // deeper chain still loses on ms/token (32.8 vs 31.6 at depth 3). Kept
+    // for a future operating point at M >= 6.
+    if (group_disabled == null) group_disabled = !envTrue("DMLX_VERIFY_GROUP_SG8");
+    if (group_disabled.?) return null;
+    const xe = groupEligibleX(ctx, x) orelse return null;
+    if (group_broken) return null;
+    const gs = groupEligibleWs(qws, xe.k) orelse return null;
+
+    const allocator = ctx.allocator;
+    const x2 = if (xe.three_d)
+        try ops.reshape(ctx, x, &[_]i32{ xe.m, xe.k })
+    else
+        x;
+    defer if (xe.three_d) x2.deinit();
+
+    var ns: [group_max_mats]i32 = undefined;
+    for (qws, 0..) |qw, i| ns[i] = @intCast(qw.data.shape()[0]);
+    const kernel = getSg8Group(allocator, ns[0..qws.len]) catch {
+        group_broken = true;
+        return null;
+    };
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", c.c.MLX_BFLOAT16));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", xe.k));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", xe.m));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", gs));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", group_nsg));
+    var total: i32 = 0;
+    for (qws, 0..) |_, i| {
+        const n_i = ns[i];
+        try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ xe.m, n_i }, 2, c.c.MLX_BFLOAT16));
+        total += @divExact(n_i, 8);
+    }
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * @as(c_int, @intCast(group_nsg)), total, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32 * @as(c_int, @intCast(group_nsg)), 1, 1));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    try c.check(c.c.mlx_vector_array_append_value(in_vec, x2.inner));
+    for (qws) |qw| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, qw.data.inner));
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, qw.scales.inner));
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, qw.biases.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, ctx.stream.inner)) catch {
+        group_broken = true;
+        std.log.warn("verify_qmm: group kernel apply failed; group routing off", .{});
+        return null;
+    };
+    var res: GroupOut = .{ .count = qws.len };
+    errdefer res.deinitAll();
+    for (0..qws.len) |i| {
+        var h = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h, out_vec, i));
+        const y2 = Array.fromHandle(h);
+        if (xe.three_d) {
+            defer y2.deinit();
+            res.outs[i] = try ops.reshape(ctx, y2, &[_]i32{ 1, xe.m, ns[i] });
+        } else {
+            res.outs[i] = y2;
+        }
+    }
+    return res;
+}
+
+/// silu(x @ gate^T) * (x @ up^T) in one launch. Returns null when
+/// ineligible; the caller runs the separate projections + elementwise ops.
+/// Kill switch: DMLX_VERIFY_NO_SWIGLU_SG8=1.
+pub fn maybeSwiglu(ctx: EagerContext, x: Array, gate: quantize_mod.QuantizedWeight, up: quantize_mod.QuantizedWeight) !?Array {
+    // OPT-IN (DMLX_VERIFY_SWIGLU_SG8=1) — same measurement as the group
+    // kernel above: worse at M=4 (96.2 vs 94.1 ms/round), kept for M >= 6
+    // operating points.
+    if (swiglu_disabled == null) swiglu_disabled = !envTrue("DMLX_VERIFY_SWIGLU_SG8");
+    if (swiglu_disabled.?) return null;
+    const xe = groupEligibleX(ctx, x) orelse return null;
+    if (swiglu_broken) return null;
+    const pair = [_]quantize_mod.QuantizedWeight{ gate, up };
+    const gs = groupEligibleWs(&pair, xe.k) orelse return null;
+    // Gate and up must share geometry.
+    if (!std.mem.eql(i32, gate.data.shape(), up.data.shape())) return null;
+    const n: i32 = @intCast(gate.data.shape()[0]);
+    const geo = sg8Geometry(xe.k, n);
+    if (@mod(n, 8 * geo.ct) != 0) return null;
+
+    const allocator = ctx.allocator;
+    const x2 = if (xe.three_d)
+        try ops.reshape(ctx, x, &[_]i32{ xe.m, xe.k })
+    else
+        x;
+    defer if (xe.three_d) x2.deinit();
+
+    const kernel = getSg8Swiglu(allocator, geo.ct) catch {
+        swiglu_broken = true;
+        return null;
+    };
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", c.c.MLX_BFLOAT16));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", xe.k));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", n));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "M", xe.m));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", gs));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", geo.nsg));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "CT", geo.ct));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ xe.m, n }, 2, c.c.MLX_BFLOAT16));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * @as(c_int, @intCast(geo.nsg)), @divExact(n, 8 * geo.ct), 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32 * @as(c_int, @intCast(geo.nsg)), 1, 1));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ x2, gate.data, gate.scales, gate.biases, up.data, up.scales, up.biases }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, ctx.stream.inner)) catch {
+        swiglu_broken = true;
+        std.log.warn("verify_qmm: swiglu kernel apply failed; swiglu routing off", .{});
+        return null;
+    };
+    var h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+    const y2 = Array.fromHandle(h);
+    if (!xe.three_d) return y2;
+    defer y2.deinit();
+    return try ops.reshape(ctx, y2, &[_]i32{ 1, xe.m, n });
 }
 
 // ---------------------------------------------------------------------------
@@ -779,6 +1350,42 @@ test "verify_qmm: source generation is unrolled and array-free" {
         try std.testing.expect(std.mem.indexOf(u8, src, "acc[") == null);
         try std.testing.expect(std.mem.indexOf(u8, src, "out[") == null);
         try std.testing.expect(std.mem.indexOf(u8, src, "0x43004300u") != null);
+    }
+}
+
+test "verify_qmm: group and swiglu source generation" {
+    const allocator = std.testing.allocator;
+    // Group: one if-chain branch per matrix; scalar locals only in the hot
+    // loop (thread-local arrays indexed by loop variables spill — see the
+    // M1 regression guarded above).
+    {
+        const src = try buildSg8GroupSource(allocator, &[_]i32{ 10240, 48, 48, 6144 });
+        defer allocator.free(src);
+        try std.testing.expect(std.mem.indexOf(u8, src, "if (tile < 1280)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "else if (tile < 1286)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "else if (tile < 1292)") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "n_out = 10240") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "n_out = 6144") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "wds[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "acc[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "0x43004300u") != null);
+    }
+    // Swiglu: gate and up rounded to T before silu(g)*u (bit-parity with the
+    // separate projections + elementwise ops).
+    for ([_]i32{ 1, 2 }) |ct| {
+        const src = try buildSg8SwigluSource(allocator, ct);
+        defer allocator.free(src);
+        try std.testing.expect(std.mem.indexOf(u8, src, "accg[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "accu[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "float2(T(tg2.x), T(tg2.y))") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "g2 / (1.0f + exp(-g2)) * u2") != null);
+        // One named accumulator pair per column tile.
+        var count: usize = 0;
+        var it = std.mem.splitScalar(u8, src, '\n');
+        while (it.next()) |line| {
+            if (std.mem.indexOf(u8, line, "simdgroup_matrix<float, 8, 8> accg") != null) count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, @intCast(ct)), count);
     }
 }
 
