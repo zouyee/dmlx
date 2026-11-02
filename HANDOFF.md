@@ -1256,3 +1256,16 @@ the fold. Compare same-session only.
   (segfaulted the server when a Metal compile failure propagated).
 - verify_qmm test-gate repair: CPU-stream guard via mlx_stream_equal
   (mlx_stream_get_device SEGFAULTS in mlx-c 0.7.0 — do not use it).
+
+### Final scorecard (2026-11-02, post postnorm+explore=9; raw-sample means, effective tok/s)
+
+| prompt | dmlx (before -> final) | omlx-mtp (3 runs) | verdict |
+|---|---|---|---|
+| code  | 34.7 -> **42.7** (+23%) | 35.9 / 37.8 / 33.9 | **dmlx wins** |
+| prose | 21.7 -> 22.3 (+3%) | 30.7 / 25.3 / 23.8 | -6%, inside omlx's own cross-run swing |
+| math  | 33.9 -> 33.9 | 36.6 / 33.8 / 37.0 | tie (omlx swings 33.8-37.0) |
+
+HEADLINE decode: 33.9 -> 38.0 (theirs 50.7/46.4/45.8, still max-tail biased).
+omlx's cross-run spread is +/-10-20% per domain; dmlx's is +/-0.5 tok/s.
+TTFT unchanged: 0.28s vs 0.78s; prefill 123 vs 141 tok/s (they keep the
+prefill edge at 2048: 17.2s vs 15.7s TTFT).

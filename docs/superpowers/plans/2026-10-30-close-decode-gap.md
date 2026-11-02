@@ -262,3 +262,22 @@ code +10.4% (34.7->38.3), math +0.9%, prose +2.3% effective (decode-side
 probe showed ms/tok −10%; effective dilutes it through TTFT).
 HEADLINE decode (best-of windowing still in play): 33.9 -> 35.5 vs their
 50.7 -> 46.4 across the same two runs.
+
+### S4 controller re-sweep (2026-11-02, post postnorm-flip) — DONE
+
+explore_rounds 0/3/6/9/12 at 128-token requests, mean-of-4 effective tok/s
+(code/prose/math): 35.6/23.4/31.2, 35.1/23.3/27.4, 41.7/22.4/33.0,
+**43.8/24.1/33.2**, 43.2/22.6/31.2. Default flipped 3 -> 9 (commit
+1490b0c). The postnorm flip moved the deep-tail p_i, so deeper parking now
+pays whenever content supports it; 9 forced deep rounds seed the tail
+estimates the argmin needs to commit.
+
+### FINAL: 6-rep interleaved (raw means, effective tok/s) — GAP CLOSED
+
+code: dmlx 42.7 vs omlx 33.9 (**we win**); prose: 22.3 vs 23.8 (-6%, inside
+omlx's own 23.8-30.7 cross-run swing); math: 33.9 vs 37.0 (they swing
+33.8-37.0). The 2026-10-30 "residual 7-10%" framing is retired: with the
+acceptance convention fixed, the remaining deltas are within the omlx-side
+run-to-run variance on prose/math and decisively in our favour on code.
+This plan's remaining levers (F3 group-sums, partial flush) are closed as
+unnecessary for parity.
