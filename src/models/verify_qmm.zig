@@ -79,6 +79,18 @@ var armed: bool = false;
 var disabled: ?bool = null;
 var route_lm_head: ?bool = null;
 
+/// The default CPU stream singleton, created lazily (mlx-c hands out the
+/// same underlying stream for every `mlx_default_cpu_stream_new` call, so
+/// `mlx_stream_equal` against it identifies any default-CPU-stream context).
+var default_cpu_stream: ?c.c.mlx_stream = null;
+
+fn defaultCpuStream() c.c.mlx_stream {
+    if (default_cpu_stream == null) {
+        default_cpu_stream = c.c.mlx_default_cpu_stream_new();
+    }
+    return default_cpu_stream.?;
+}
+
 /// Projections narrower than this are left on stock: the kernels win on GPU
 /// time at every eligible shape, but the tiny GDN/attention outputs have so
 /// little work that the win is in the noise.
@@ -641,6 +653,12 @@ fn pick(m: i32, k: i32, n: i32, gs: i32, bits: u8) ?Kind {
 /// the input rank.
 pub fn maybeQmm(ctx: EagerContext, x: Array, qw: quantize_mod.QuantizedWeight) !?Array {
     if (!armed or (compile_broken[0] and compile_broken[1])) return null;
+    // Metal kernels only run on the GPU. On the default CPU stream (unit
+    // tests) stay on stock without attempting — a failed apply logs an MLX
+    // error, which the Zig test runner counts as a test failure. NOTE:
+    // `mlx_stream_get_device` segfaults in mlx-c 0.7.0 (ABI mismatch), so
+    // detect the CPU stream by identity instead of querying its device.
+    if (c.c.mlx_stream_equal(ctx.stream.inner, defaultCpuStream())) return null;
     if (x.dtype() != .bfloat16) return null;
     if (qw.config.mode != .affine) return null;
 
@@ -742,7 +760,7 @@ test "verify_qmm: source generation is unrolled and array-free" {
     // The M1 regression: thread-local arrays indexed by a loop variable made
     // the kernel 10x slower at M=3/5/6. Guard the property, not the timing.
     for ([_]i32{ 2, 3, 4, 5, 6, 7, 8 }) |m| {
-        const src = try buildSplitkSource(allocator, m);
+        const src = try buildSplitkSource(allocator, m, 4);
         defer allocator.free(src);
         try std.testing.expect(std.mem.indexOf(u8, src, "xr[") == null);
         try std.testing.expect(std.mem.indexOf(u8, src, "acc[") == null);
