@@ -45,6 +45,7 @@ const memory_mod = @import("mlx").memory;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
+const qwen38_gdn = @import("models/qwen38_gdn.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -136,6 +137,134 @@ fn asyncEvalCacheStates(model: *qwen38.Qwen38ServingModel) !void {
 
 /// Instrumented re-implementation of Qwen38ServingModel.forwardTokens for the
 /// L=1 decode path. Uses only pub fields of the serving model.
+/// Prefill (L > 1) counterpart of `forwardStepProfiled`.
+///
+/// Added because the prefill gap to omlx/mlx-vlm (117.4 vs 134.5 / 133.1
+/// tok/s) could not be attributed from isolated qmm micro-benchmarks:
+/// summing those gave "qmm is 85.6% of the prefill wall", but the same kind
+/// of isolated-vs-in-context mismatch already bit the verify work twice, so
+/// the non-qmm 14.4% had to be measured in place rather than inferred. This
+/// mirrors `Qwen38ServingModel.forwardTokensCore` at L > 1, including the
+/// GDN prefill path (`g.prefill`, not `g.forward`) and the last-row-only
+/// head, with a barrier after each section.
+///
+/// As with the decode breakdown, barriers serialize work that overlaps in the
+/// real forward, so the total OVERSTATES the wall; the shares are what matter.
+fn forwardPrefillProfiled(
+    model: *qwen38.Qwen38ServingModel,
+    ids: []const u32,
+    acc: *Accum,
+) !Array {
+    const allocator = model.allocator;
+    const cfg = model.cfg;
+    const ctx = model.ctx;
+    const hidden: i32 = @intCast(cfg.hidden_size);
+    const L: i32 = @intCast(ids.len);
+    var t = Lap.start();
+
+    const ids_i32 = try allocator.alloc(i32, ids.len);
+    defer allocator.free(ids_i32);
+    for (ids, 0..) |v, i| ids_i32[i] = @intCast(v);
+    const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{L});
+    defer id_arr.deinit();
+    const rows = try shape_mod.takeAxis(ctx, model.embed_table_bf16.?, id_arr, 0);
+    defer rows.deinit();
+    const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, L, hidden });
+    defer emb.deinit();
+    var h = try ops.copy(ctx, emb);
+    defer h.deinit();
+    try h.eval();
+    acc.embed_ns += t.lap();
+
+    var gdn_seen: usize = 0;
+    for (model.layers, 0..) |*lp, layer| {
+        t.reset();
+        const normed1 = blk: {
+            const h_f32 = try ops.astype(ctx, h, .float32);
+            defer h_f32.deinit();
+            const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln1_f32, cfg.rms_norm_eps);
+            defer n_f32.deinit();
+            break :blk try ops.astype(ctx, n_f32, .bfloat16);
+        };
+        defer normed1.deinit();
+        try normed1.eval();
+        acc.ln_ns += t.lap();
+
+        t.reset();
+        const attn_out = switch (lp.module) {
+            .gdn => |*g| blk: {
+                gdn_seen += 1;
+                const cache = &model.caches[layer].gdn;
+                break :blk try g.prefill(allocator, normed1, cache, gdn_seen % 8 == 0 or layer + 1 == model.layers.len);
+            },
+            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn),
+        };
+        defer attn_out.deinit();
+        try attn_out.eval();
+        switch (lp.module) {
+            .gdn => acc.gdn_ns += t.lap(),
+            .attn => acc.attn_ns += t.lap(),
+        }
+
+        t.reset();
+        {
+            const next = try ops.add(ctx, h, attn_out);
+            h.deinit();
+            h = next;
+        }
+        const normed2 = blk: {
+            const h_f32 = try ops.astype(ctx, h, .float32);
+            defer h_f32.deinit();
+            const n_f32 = try fast_mod.rmsNorm(ctx, h_f32, lp.ln2_f32, cfg.rms_norm_eps);
+            defer n_f32.deinit();
+            break :blk try ops.astype(ctx, n_f32, .bfloat16);
+        };
+        defer normed2.deinit();
+        try normed2.eval();
+        acc.ln_ns += t.lap();
+
+        t.reset();
+        const mlp_out = blk: {
+            const gate = try lp.mlp_gate.apply(ctx, normed2);
+            defer gate.deinit();
+            const up = try lp.mlp_up.apply(ctx, normed2);
+            defer up.deinit();
+            const act = try activations.silu(ctx, gate);
+            defer act.deinit();
+            const prod = try ops.multiply(ctx, act, up);
+            defer prod.deinit();
+            break :blk try lp.mlp_down.apply(ctx, prod);
+        };
+        defer mlp_out.deinit();
+        try mlp_out.eval();
+        acc.mlp_ns += t.lap();
+
+        t.reset();
+        {
+            const next = try ops.add(ctx, h, mlp_out);
+            h.deinit();
+            h = next;
+        }
+        try h.eval();
+        acc.ln_ns += t.lap();
+    }
+
+    // Head on the LAST row only, matching production (`last_logits_only`).
+    t.reset();
+    const last = try ops.slice(ctx, h, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden }, &[_]i32{ 1, 1, 1 });
+    defer last.deinit();
+    const h_f32 = try ops.astype(ctx, last, .float32);
+    defer h_f32.deinit();
+    const hf = try fast_mod.rmsNorm(ctx, h_f32, model.final_norm_f32.?, cfg.rms_norm_eps);
+    defer hf.deinit();
+    const hb = try ops.astype(ctx, hf, .bfloat16);
+    defer hb.deinit();
+    const logits = try model.lm_head.?.apply(ctx, hb);
+    try logits.eval();
+    acc.head_ns += t.lap();
+    return logits;
+}
+
 fn forwardStepProfiled(model: *qwen38.Qwen38ServingModel, id: u32, acc: *Accum) !Array {
     const allocator = model.allocator;
     const cfg = model.cfg;
@@ -687,6 +816,7 @@ pub fn main(init: std.process.Init) !void {
     const run_baseline = std.mem.eql(u8, mode, "baseline") or std.mem.eql(u8, mode, "both");
     const run_breakdown = std.mem.eql(u8, mode, "breakdown") or std.mem.eql(u8, mode, "both");
     const run_buildsplit = std.mem.eql(u8, mode, "buildsplit") or std.mem.eql(u8, mode, "both");
+    const run_prefill_bd = std.mem.eql(u8, mode, "prefill") or std.mem.eql(u8, mode, "both");
 
     // ================= baseline: uninstrumented forwardTokens =================
     if (run_baseline) {
@@ -765,6 +895,27 @@ pub fn main(init: std.process.Init) !void {
         acc.report("breakdown (barrier per section — overstates wall)");
     }
 
+    // ============ prefill breakdown: where the L>1 pass goes ============
+    if (run_prefill_bd) {
+        // One cold pass to warm kernels/PSOs, then the measured pass. State
+        // is reset by each full prefill, so successive passes are equivalent.
+        {
+            var warm_acc = Accum{};
+            const warm = try forwardPrefillProfiled(&model, prompt.items, &warm_acc);
+            warm.deinit();
+        }
+        var acc = Accum{};
+        var wall = Lap.start();
+        var logits = try forwardPrefillProfiled(&model, prompt.items, &acc);
+        const wall_ns = wall.read();
+        logits.deinit();
+        acc.tokens = 1;
+        acc.report("prefill breakdown (barrier per section — overstates wall)");
+        qwen38_gdn.gdnPrefillProfReport();
+        std.debug.print("  prompt tokens: {d} | barriered pass {d:.0} ms | unbarriered wall for reference: run compare_engines.py\n", .{
+            prompt.items.len, @as(f64, @floatFromInt(wall_ns)) / 1e6,
+        });
+    }
     // ================= buildsplit: CPU build vs GPU eval =================
     if (run_buildsplit) {
         var logits = try model.forwardTokens(prompt.items); // prefill (resets state)

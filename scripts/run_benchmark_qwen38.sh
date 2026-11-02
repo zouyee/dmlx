@@ -257,7 +257,8 @@ doc = {
     "peak_rss_bytes": ${PEAK_RSS_BYTES},
     "perf_secs": ${BM_PERF_SECS},
     "total_secs": ${BM_TOTAL_SECS},
-    "command": "bash scripts/run_benchmark_qwen38.sh ${MODEL_PATH}",
+    "serve_flags": "${EXTRA_SERVE_FLAGS:-}",
+    "command": "EXTRA_SERVE_FLAGS=\"${EXTRA_SERVE_FLAGS:-}\" bash scripts/run_benchmark_qwen38.sh ${MODEL_PATH}",
 }
 Path("$RESULT_JSON").parent.mkdir(parents=True, exist_ok=True)
 Path("$RESULT_JSON").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
