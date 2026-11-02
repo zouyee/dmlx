@@ -168,6 +168,13 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
     if (std.c.getenv("DMLX_CHAT_EMPTY_THINK") != null) {
         chat_template.empty_think = true;
     }
+    // Qwen ChatML reasoning effort override (xhigh default / medium / low).
+    if (std.c.getenv("DMLX_CHAT_REASONING_EFFORT")) |s| {
+        const v = std.mem.span(s);
+        if (std.mem.eql(u8, v, "xhigh") or std.mem.eql(u8, v, "medium") or std.mem.eql(u8, v, "low")) {
+            chat_template.reasoning_effort = v;
+        }
+    }
 
     // ------------------------------------------------------------------
     // Native path (MLX-free) — default. Non-DSV4 architectures degrade to

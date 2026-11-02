@@ -114,7 +114,73 @@ test "ChatML template still works correctly" {
     const result = try template.apply(&messages, true);
     defer allocator.free(result);
 
-    const expected = "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n";
+    // HF default (thinking on, reasoning effort xhigh): the reasoning
+    // instructions system block + an open <think> in the generation prompt.
+    const expected = "<|im_start|>system\n" ++ ChatTemplate.chatml_reasoning_xhigh ++ "<|im_end|>\n" ++
+        "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "ChatML merges a leading system message with the reasoning instructions" {
+    const allocator = std.testing.allocator;
+    var template = ChatTemplate.initChatML(allocator);
+
+    const messages = [_]ChatMessage{
+        .{ .role = "system", .content = "Be terse." },
+        .{ .role = "user", .content = "Hello" },
+    };
+
+    const result = try template.apply(&messages, true);
+    defer allocator.free(result);
+
+    const expected = "<|im_start|>system\n" ++ ChatTemplate.chatml_reasoning_xhigh ++ "\n\nBe terse.<|im_end|>\n" ++
+        "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n<think>\n";
+    try std.testing.expectEqualStrings(expected, result);
+}
+
+test "ChatML reasoning effort: medium emits no system block, low its own text" {
+    const allocator = std.testing.allocator;
+    const messages = [_]ChatMessage{
+        .{ .role = "user", .content = "Hello" },
+    };
+
+    var medium = ChatTemplate.initChatML(allocator);
+    medium.reasoning_effort = "medium";
+    const r_medium = try medium.apply(&messages, true);
+    defer allocator.free(r_medium);
+    try std.testing.expectEqualStrings(
+        "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        r_medium,
+    );
+
+    var low = ChatTemplate.initChatML(allocator);
+    low.reasoning_effort = "low";
+    const r_low = try low.apply(&messages, true);
+    defer allocator.free(r_low);
+    try std.testing.expectEqualStrings(
+        "<|im_start|>system\n" ++ ChatTemplate.chatml_reasoning_low ++ "<|im_end|>\n" ++
+            "<|im_start|>user\nHello\n<|im_end|>\n<|im_start|>assistant\n<think>\n",
+        r_low,
+    );
+}
+
+test "ChatML multi-turn history carries empty think blocks (HF parity)" {
+    const allocator = std.testing.allocator;
+    var template = ChatTemplate.initChatML(allocator);
+
+    const messages = [_]ChatMessage{
+        .{ .role = "user", .content = "Hi" },
+        .{ .role = "assistant", .content = "Hey" },
+        .{ .role = "user", .content = "Bye" },
+    };
+
+    const result = try template.apply(&messages, true);
+    defer allocator.free(result);
+
+    const expected = "<|im_start|>system\n" ++ ChatTemplate.chatml_reasoning_xhigh ++ "<|im_end|>\n" ++
+        "<|im_start|>user\nHi<|im_end|>\n" ++
+        "<|im_start|>assistant\n<think>\n\n</think>\n\nHey<|im_end|>\n" ++
+        "<|im_start|>user\nBye<|im_end|>\n<|im_start|>assistant\n<think>\n";
     try std.testing.expectEqualStrings(expected, result);
 }
 

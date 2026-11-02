@@ -42,6 +42,12 @@ pub const ChatTemplate = struct {
     /// generates different (longer) content than engines that honor
     /// enable_thinking=false and confounds decode-rate comparisons.
     empty_think: bool = false,
+    /// Qwen ChatML reasoning effort: "xhigh" (default), "medium", or "low",
+    /// mirroring chat_template.jinja:47-56. Only xhigh and low emit the
+    /// system-block instructions; medium emits none. Ignored when
+    /// `empty_think` is set (the jinja's enable_thinking=false branch drops
+    /// the reasoning system block entirely).
+    reasoning_effort: []const u8 = "xhigh",
 
     pub fn init(allocator: std.mem.Allocator, template_type: ChatTemplateType) ChatTemplate {
         return .{
@@ -146,11 +152,60 @@ pub const ChatTemplate = struct {
         }
     }
 
+    pub const chatml_reasoning_xhigh = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+    pub const chatml_reasoning_low = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+
     fn applyChatML(self: *ChatTemplate, messages: []const ChatMessage, add_generation_prompt: bool, result: *std.ArrayList(u8)) !void {
-        for (messages) |msg| {
+        // Qwen3.5 chat_template.jinja parity (no-tools, text-only path).
+        //
+        // Thinking ON (the HF default, enable_thinking undefined/true): a
+        // system block carries the reasoning-effort instructions — merged
+        // with the caller's leading system message when one is present —
+        // and the generation prompt opens "<think>\n". empty_think maps to
+        // the jinja's enable_thinking=false branch: no reasoning system
+        // block and an empty think block in the generation prompt.
+        //
+        // Before 2026-11-02 this produced NEITHER the default system prompt
+        // NOR the think block, diverging from what HF/omlx send by default
+        // (and silently benching different content — see the close-decode-gap
+        // plan's 2026-11-02 content-mismatch entry).
+        var start: usize = 0;
+        if (!self.empty_think) {
+            const instructions: ?[]const u8 = if (std.mem.eql(u8, self.reasoning_effort, "xhigh"))
+                chatml_reasoning_xhigh
+            else if (std.mem.eql(u8, self.reasoning_effort, "low"))
+                chatml_reasoning_low
+            else
+                null; // "medium" (and anything else) emits no instructions
+            const sys_content: ?[]const u8 = blk: {
+                if (messages.len == 0 or !std.mem.eql(u8, messages[0].role, "system")) break :blk null;
+                const trimmed = std.mem.trim(u8, messages[0].content, " \t\n\r");
+                break :blk if (trimmed.len > 0) trimmed else null;
+            };
+            if (sys_content != null or instructions != null) {
+                try result.appendSlice(self.allocator, "<|im_start|>system\n");
+                if (instructions) |ins| {
+                    try result.appendSlice(self.allocator, ins);
+                    if (sys_content != null) try result.appendSlice(self.allocator, "\n\n");
+                }
+                if (sys_content) |sc| try result.appendSlice(self.allocator, sc);
+                try result.appendSlice(self.allocator, "<|im_end|>\n");
+            }
+            // The leading system message is consumed by the merge above even
+            // when its content is empty (the jinja emits nothing for it).
+            if (messages.len > 0 and std.mem.eql(u8, messages[0].role, "system")) start = 1;
+        }
+        for (messages[start..]) |msg| {
             try result.appendSlice(self.allocator, "<|im_start|>");
             try result.appendSlice(self.allocator, msg.role);
             try result.appendSlice(self.allocator, "\n");
+            // Historical assistant turns carry an (empty, since our message
+            // type has no reasoning_content field) think block before the
+            // content — jinja lines 116-117, preserve_thinking default true,
+            // independent of enable_thinking.
+            if (std.mem.eql(u8, msg.role, "assistant")) {
+                try result.appendSlice(self.allocator, "<think>\n\n</think>\n\n");
+            }
             try result.appendSlice(self.allocator, msg.content);
             try result.appendSlice(self.allocator, "<|im_end|>\n");
         }
@@ -159,6 +214,8 @@ pub const ChatTemplate = struct {
             try result.appendSlice(self.allocator, "<|im_start|>assistant\n");
             if (self.empty_think) {
                 try result.appendSlice(self.allocator, "<think>\n\n</think>\n\n");
+            } else {
+                try result.appendSlice(self.allocator, "<think>\n");
             }
         }
     }
