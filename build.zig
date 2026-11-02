@@ -785,6 +785,20 @@ pub fn build(b: *std.Build) void {
     const run_dbg_mtp_load_step = b.step("run-dbg-mtp-load", "smoke-load MTP drafter checkpoint");
     run_dbg_mtp_load_step.dependOn(&run_dbg_mtp_load.step);
 
+    const dbg_mtp_chain = b.addExecutable(.{
+        .name = "dbg-mtp-chain",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dbg_mtp_chain.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    dbg_mtp_chain.root_module.addImport("mlx", mlx_z_module);
+    const run_dbg_mtp_chain = b.addRunArtifact(dbg_mtp_chain);
+    const run_dbg_mtp_chain_step = b.step("run-dbg-mtp-chain", "chained-draft probe vs mlx_vlm reference");
+    run_dbg_mtp_chain_step.dependOn(&run_dbg_mtp_chain.step);
+
     // --- Wave-5 bounded phase-aware chunk planner table tests (pure Zig) ---
     const native_chunk_planner_tests = b.addTest(.{
         .root_module = b.createModule(.{

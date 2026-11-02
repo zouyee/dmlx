@@ -1386,7 +1386,34 @@ pub const EngineLoop = struct {
             // and measured p_3 = 0.83, p_4 = 0.94 on the same prompt. Our
             // ms/round was BETTER (85.8 vs 92.3); the entire gap was
             // tokens/round (2.49 vs 3.20).
-            if (self.used[self.max_n - 1] < exploreRounds()) return self.max_n;
+            // Explore at max_n, but with an EARLY EXIT: once the deep arm
+            // has >= 3 samples, its score is real (pooled p_i populated by
+            // the first deep rounds), and if it is clearly losing to the
+            // best calibrated alternative the remaining explore rounds are
+            // pure cost. Measured 2026-11-02: exploring all 9 rounds at
+            // depth 7 taxed math ~8% (p4 collapse there) vs ceiling 4,
+            // while exploring shallow (min(max_n,4)) cost code -18%
+            // (deep-tail p_i stayed at the Laplace prior, so the argmin
+            // never committed to depth 7 where code wins). Adaptive:
+            // deep content keeps exploring, math-class content exits early.
+            if (self.used[self.max_n - 1] < exploreRounds()) {
+                const deep_used = self.used[self.max_n - 1];
+                var keep_exploring = true;
+                if (deep_used >= 3) {
+                    if (self.score(self.max_n)) |deep_score| {
+                        var alt: f64 = std.math.floatMax(f64);
+                        var found = false;
+                        for (1..self.max_n) |n| {
+                            if (self.score(n)) |s| {
+                                found = true;
+                                if (s < alt) alt = s;
+                            }
+                        }
+                        if (found and deep_score > alt * 1.15) keep_exploring = false;
+                    }
+                }
+                if (keep_exploring) return self.max_n;
+            }
             // Calibrate any depth never yet timed, deepest first so the
             // pooled p_i table is populated from the very first round. Warm
             // cost estimates (carried across requests) skip this entirely.

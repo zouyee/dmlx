@@ -301,3 +301,29 @@ Side finding (production, not bench): dmlx's ChatML path never emits the
 model's DEFAULT system prompt / think block that the official jinja
 produces with no kwargs — a template-fidelity gap vs HF/omlx defaults,
 filed for a separate fix.
+
+## 2026-11-02 (final) — adaptive exploration; head cleared by fp32 reference
+
+- **Head math CLEARED as the p4-gap suspect**: paired chain probe
+  (src/dbg_mtp_chain.zig vs /tmp/mtp_chain_ref.py, mlx_vlm MTPModule = the
+  exact head omlx serves) on a forced input: same argmax order at step 0,
+  and deviation from an fp32 head reference is the SAME CLASS on both sides
+  (mean |Δ| ~0.03 logits, symmetric sign patterns). Our chain flips ties no
+  more often than theirs; the residual deep-tail acceptance differences are
+  content/stream luck (cross-engine greedy streams diverge at char ~36 on
+  math, so per-position acceptance stats are not alignable there).
+- **Ceiling sweep** (mean-of-4 effective tok/s, code/prose/math):
+  cap4 35.9/23.4/34.7, cap5 39.2/23.4/33.5, cap7 43.5/22.7/31.9 — the
+  content-dependent optimum differs per prompt, and no fixed ceiling wins.
+- **Adaptive exploration** (engine_loop.zig pick()): explore rounds still
+  run at max_n, but exit early once the deep arm has >= 3 samples AND scores
+  >15% worse than the best calibrated alternative. Code keeps unlocking
+  depth 7; math stops paying the depth-7 tax. Measured:
+  code 41.7 / prose 23.2 / math 39.5 / count 51.0 — math +24% vs the
+  fixed-9 deep explore, count +21%. (Exploring shallow instead — min(max_n,4)
+  — cost code -18% by leaving the deep tail at the Laplace prior; rejected.)
+- Gates: unit 465/466+1skip; fidelity neutral (median first-divergence 209
+  both arms); self-consistency on thinking-on content is the documented
+  near-tie fidelity class (3/5 byte-diverge with coherent alternates);
+  empty-think arm 4/5, divergence on the math prompt at a coherent branch
+  point.
