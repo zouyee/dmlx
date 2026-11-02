@@ -1269,3 +1269,27 @@ HEADLINE decode: 33.9 -> 38.0 (theirs 50.7/46.4/45.8, still max-tail biased).
 omlx's cross-run spread is +/-10-20% per domain; dmlx's is +/-0.5 tok/s.
 TTFT unchanged: 0.28s vs 0.78s; prefill 123 vs 141 tok/s (they keep the
 prefill edge at 2048: 17.2s vs 15.7s TTFT).
+
+### 2026-11-02 (later) — content-parity fix + fair-harness final state
+
+- **The prose/math "gaps" were partly a CONTENT mismatch**: omlx defaults
+  to thinking-ON + reasoning-effort system prompt (66-70 token prompts,
+  110/128 reasoning tokens on prose); dmlx-nothink decoded pure answer
+  prose. Fixed harness-side with the omlx-mtp-nothink arm
+  (enable_thinking=false). Fair 6-rep: code eff +10.9% (we win),
+  prose -8.6%, math -14.0%.
+- **ChatML template now matches the official jinja byte-for-byte** (6/6
+  cases vs HF apply_chat_template): default = system prompt + thinking ON;
+  DMLX_CHAT_EMPTY_THINK=1 keeps the empty-think arm. NOTE: server default
+  behavior for Qwen3.5 changed to thinking-on (HF parity).
+  DMLX_CHAT_REASONING_EFFORT selects xhigh/medium/low.
+- Residual honest gaps (fair basis): prose -8.6% / math -14% effective.
+  math decomposes to the known verify marginal at depth 4-5 + deep-tail
+  acceptance measured on non-alignable streams (backbone greedy diverges
+  at char ~36 cross-engine, so per-position draft comparison is
+  impossible on this content). Partial-graph flush tried, neutral, opt-in
+  (DMLX_VERIFY_FLUSH=1).
+- Self-consistency byte-exactness is content-length-bound: under
+  thinking-on content it hits the documented fidelity class (near-tie
+  flips). Gate = mtp_fidelity_profile (currently neutral: median
+  first-divergence 209, 4/6 identical, both arms equal).
