@@ -246,3 +246,19 @@ Residual p2 gap on prose (0.36 vs 0.68) is suspected SELECTION, not defect:
 omlx's controller only runs d2 in 38/57 cycles (high-confidence content),
 so their p2 is conditioned on favourable rounds; our parked-2 measures all
 rounds uniformly. p1 — the only selection-free statistic — now favours us.
+
+### 6-rep interleaved harness, post-flip (raw per-request samples, effective tok/s)
+
+| prompt | before (dmlx vs omlx) | after | delta move |
+|---|---|---|---|
+| code  | 34.7 vs 35.9 (−3.3%) | 38.3 vs 37.8 | **+1.1% — WIN** |
+| prose | 21.7 vs 30.7 (−29.2%) | 22.2 vs 25.3 | −12.4%, gap halved |
+| math  | 33.9 vs 36.6 (−7.3%) | 34.2 vs 33.8 | **+1.3% — WIN** |
+
+Caveat: omlx's prose is cross-run unstable on THEIR side (30.7 -> 25.3
+between the two 6-rep runs, ~17% swing; ours is ±0.1), so part of the
+"before" prose gap was their lucky run. dmlx-side gains are solid:
+code +10.4% (34.7->38.3), math +0.9%, prose +2.3% effective (decode-side
+probe showed ms/tok −10%; effective dilutes it through TTFT).
+HEADLINE decode (best-of windowing still in play): 33.9 -> 35.5 vs their
+50.7 -> 46.4 across the same two runs.

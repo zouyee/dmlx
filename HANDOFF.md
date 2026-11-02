@@ -1230,3 +1230,29 @@ the fold. Compare same-session only.
 - MTP-D self-distillation pipeline built but ON HOLD per user decision
   (scripts/mtpd_*.py, plan docs/superpowers/plans/2026-10-30-mtp-drafter-training.md).
   Corpus: artifacts/mtpd/corpus.jsonl (183 sequences).
+
+## 2026-11-02 — fusion program refuted; trunk-postnorm flip (prose gap root cause)
+
+- Session state: branch glm53-mlx-support, commits 490ef5f..de0ac2c. The
+  whole close-decode-gap ledger is in
+  docs/superpowers/plans/2026-10-30-close-decode-gap.md (2026-11-02 entries).
+- **Fusion program (F1 sg8 group / F2 sg8 swiglu) ported from omlx and
+  REFUTED by A/B at the parking depth** (worse at M=4, better at M=6 but
+  deep chains still lose ms/token). Both kernels kept, OPT-IN via
+  DMLX_VERIFY_GROUP_SG8=1 / DMLX_VERIFY_SWIGLU_SG8=1.
+- **prose-gap root cause = trunk-hidden norm convention.** omlx feeds the
+  MTP head the POST-final-norm trunk hidden (HEAD_HIDDEN_POST_NORM=True);
+  we fed pre-norm. Flipped to default on (DMLX_MTP_NO_TRUNK_POSTNORM=1
+  reverts): prose p1 0.64->0.78 (omlx 0.74), code p4 0.27->0.68,
+  tok/round +7-12% at equal round cost. Harness effective: code and math
+  flipped to WINS (+1.1% / +1.3%), prose gap halved (-29% -> -12%).
+- New toggles for future A/B: DMLX_MTP_REPLAY_FREE=1 (omlx replay-free
+  commit; measured NOT the acceptance difference).
+- Harness methodology: compare_engines.py now records per-request raw
+  samples (per_request_raw) — the best-of-N per-prompt pick compresses
+  variance and hid the prose gap's true size. omlx decode numbers have
+  stdev 5-10 tok/s vs our ~1; their headline is max-tail biased.
+- Latent bug fixed: prefillVerify errdefer+defer double-free of y
+  (segfaulted the server when a Metal compile failure propagated).
+- verify_qmm test-gate repair: CPU-stream guard via mlx_stream_equal
+  (mlx_stream_get_device SEGFAULTS in mlx-c 0.7.0 — do not use it).
