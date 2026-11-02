@@ -1278,7 +1278,14 @@ pub const EngineLoop = struct {
         /// keeps choosing depth 1 — self-reinforcing. Three forced deep
         /// rounds per request break the loop: mean depth 2.93 and
         /// 38.3 ms/token, a 19% improvement end to end.
-        const explore_rounds_default = 3;
+        /// DEFAULT 9 as of 2026-11-02 (was 3). The trunk-postnorm flip raised
+        /// deep-tail acceptance (code p4 0.267 -> 0.677), so deep parking
+        /// pays whenever the content supports it — but only once the tail
+        /// p_i estimates are sampled enough for the argmin to commit.
+        /// Sweep at 128-token requests, mean-of-4 tok/s (code/prose/math):
+        ///   0: 35.6/23.4/31.2   3: 35.1/23.3/27.4   6: 41.7/22.4/33.0
+        ///   9: 43.8/24.1/33.2   12: 43.2/22.6/31.2
+        const explore_rounds_default = 9;
         fn exploreRounds() u32 {
             const v = std.c.getenv("DMLX_MTP_EXPLORE_ROUNDS") orelse return explore_rounds_default;
             return std.fmt.parseInt(u32, std.mem.span(v), 10) catch explore_rounds_default;
