@@ -1,25 +1,26 @@
 {
   "schema": "dmlx-qwen38-benchmark-v1",
-  "commit": "41b4907",
+  "commit": "8b8922b",
   "branch": "glm53-mlx-support",
-  "date": "2026-10-23",
+  "date": "2026-10-29",
   "hardware": "Apple M4 Pro",
   "memory": "48GB",
   "model_path": "/Users/zouyee/models/Qwen3.8-27B-4bit",
-  "startup_secs": 4,
-  "standard_median_tps": 9.364453,
+  "startup_secs": 5,
+  "standard_median_tps": 11.281028,
   "standard_tps_runs": [
-    9.364453,
-    9.37898,
-    9.155598
+    11.139083,
+    11.281028,
+    11.283702
   ],
-  "long_diagnostic_tps": 13.83251,
-  "long_diagnostic_elapsed_s": 7.229346,
+  "long_diagnostic_tps": 45.678912,
+  "long_diagnostic_elapsed_s": 2.189194,
   "paris_correct": true,
   "e2e_pass": 7,
   "e2e_fail": 0,
-  "peak_rss_bytes": 16077012992,
-  "perf_secs": 47,
-  "total_secs": 48,
-  "command": "bash scripts/run_benchmark_qwen38.sh /Users/zouyee/models/Qwen3.8-27B-4bit"
+  "peak_rss_bytes": 16079798272,
+  "perf_secs": 30,
+  "total_secs": 31,
+  "serve_flags": "--speculative-mtp 7",
+  "command": "EXTRA_SERVE_FLAGS=\"--speculative-mtp 7\" bash scripts/run_benchmark_qwen38.sh /Users/zouyee/models/Qwen3.8-27B-4bit"
 }

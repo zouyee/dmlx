@@ -10,48 +10,48 @@
   },
   "engines": {
     "dmlx": {
-      "version": "git:8b8922b",
+      "version": "git:ee8cee2",
       "note": "adaptive MTP depth (ceiling 7), verify-shape kernels armed",
       "per_prompt": {
         "code": {
-          "decode_tok_s": 36.577777080090364,
-          "effective_tok_s": 34.49643785228057,
-          "ttft_s": 0.22670698260177838,
+          "decode_tok_s": 33.770303861252096,
+          "effective_tok_s": 31.94299672411278,
+          "ttft_s": 0.2445427090163018,
           "chunks": 128,
           "samples": 3
         },
         "prose": {
-          "decode_tok_s": 29.0261719316888,
-          "effective_tok_s": 27.520295592868013,
-          "ttft_s": 0.2757511663350063,
+          "decode_tok_s": 26.775106096237362,
+          "effective_tok_s": 25.444117459107954,
+          "ttft_s": 0.28767662744727807,
           "chunks": 128,
           "samples": 3
         },
         "math": {
-          "decode_tok_s": 36.256911036641,
-          "effective_tok_s": 33.46673874358542,
-          "ttft_s": 0.32172227328289105,
+          "decode_tok_s": 33.45452350628958,
+          "effective_tok_s": 30.937599918376044,
+          "ttft_s": 0.34116223228823706,
           "chunks": 128,
           "samples": 3
         },
         "count": {
-          "decode_tok_s": 48.270503072250264,
-          "effective_tok_s": 44.12303950870511,
-          "ttft_s": 0.2699724020842041,
+          "decode_tok_s": 43.02260575528508,
+          "effective_tok_s": 39.635974023963556,
+          "ttft_s": 0.27839477919957667,
           "chunks": 128,
           "samples": 3
         }
       },
-      "headline_decode_tok_s": 33.95362001614006,
-      "ttft_short_s": 0.2784002919943305,
-      "prefill_tok_s": 119.97959526703622,
+      "headline_decode_tok_s": 31.333311154593012,
+      "ttft_short_s": 0.2961295830027666,
+      "prefill_tok_s": 47.74523602054897,
       "prefill_span": [
         520,
         2056
       ],
       "prefill_points": {
-        "512": 4.7283194579940755,
-        "2048": 17.530496332998155
+        "512": 5.886724750002031,
+        "2048": 38.44981495799584
       }
     },
     "omlx-mtp": {
@@ -59,44 +59,44 @@
       "note": "native Lightning MTP, adaptive depth",
       "per_prompt": {
         "code": {
-          "decode_tok_s": 41.29071328855041,
-          "effective_tok_s": 31.193786519585398,
-          "ttft_s": 1.0279129107973253,
+          "decode_tok_s": 48.59315723313455,
+          "effective_tok_s": 34.10347233300654,
+          "ttft_s": 1.1397467958309182,
           "chunks": 128,
           "samples": 3
         },
         "prose": {
-          "decode_tok_s": 26.23189248365178,
-          "effective_tok_s": 25.471360079844384,
-          "ttft_s": 0.20700825833264386,
+          "decode_tok_s": 31.80087634499338,
+          "effective_tok_s": 25.27601249646281,
+          "ttft_s": 1.0704892798958705,
           "chunks": 128,
           "samples": 3
         },
         "math": {
-          "decode_tok_s": 56.37060722107799,
-          "effective_tok_s": 35.5087928020534,
-          "ttft_s": 1.073810484401928,
-          "chunks": 101,
+          "decode_tok_s": 58.44800744822021,
+          "effective_tok_s": 32.95270226253053,
+          "ttft_s": 1.1687544792036038,
+          "chunks": 87,
           "samples": 3
         },
         "count": {
-          "decode_tok_s": 49.43326732241365,
-          "effective_tok_s": 37.70347819743348,
-          "ttft_s": 0.8273534573290211,
+          "decode_tok_s": 35.00111626153674,
+          "effective_tok_s": 28.666002114681078,
+          "ttft_s": 0.8409292895597901,
           "chunks": 128,
           "samples": 3
         }
       },
-      "headline_decode_tok_s": 41.29773766442673,
-      "ttft_short_s": 0.7816834169934737,
-      "prefill_tok_s": 138.8384595270097,
+      "headline_decode_tok_s": 46.28068034211604,
+      "ttft_short_s": 0.8323819170036586,
+      "prefill_tok_s": 130.90501825679914,
       "prefill_span": [
         564,
         2100
       ],
       "prefill_points": {
-        "512": 4.661633582996728,
-        "2048": 15.888320207996003
+        "512": 4.946549207998032,
+        "2048": 16.68024758300453
       }
     },
     "mlx-vlm": {
@@ -104,44 +104,134 @@
       "note": "MTP via --draft-kind mtp, same drafter as dmlx",
       "per_prompt": {
         "code": {
-          "decode_tok_s": 33.18383554534127,
-          "effective_tok_s": 30.0513155536634,
-          "ttft_s": 0.4309307708062988,
+          "decode_tok_s": 30.21912231608354,
+          "effective_tok_s": 27.508427901614,
+          "ttft_s": 0.45064242676295785,
           "chunks": 128,
           "samples": 3
         },
         "prose": {
-          "decode_tok_s": 25.20092862620867,
-          "effective_tok_s": 23.00889749410039,
-          "ttft_s": 0.5128233965371691,
+          "decode_tok_s": 22.444691892624622,
+          "effective_tok_s": 20.659969963580156,
+          "ttft_s": 0.5395661773920437,
           "chunks": 128,
           "samples": 3
         },
         "math": {
-          "decode_tok_s": 33.85439557985513,
-          "effective_tok_s": 28.52065824740128,
-          "ttft_s": 0.7366157083436216,
+          "decode_tok_s": 30.89782480657158,
+          "effective_tok_s": 26.13540823243274,
+          "ttft_s": 0.786029335049534,
           "chunks": 128,
           "samples": 3
         },
         "count": {
-          "decode_tok_s": 35.625097508692114,
-          "effective_tok_s": 32.04807478017228,
-          "ttft_s": 0.43036480034673635,
+          "decode_tok_s": 32.399737524509895,
+          "effective_tok_s": 29.288575356201036,
+          "ttft_s": 0.452580647939673,
           "chunks": 128,
           "samples": 3
         }
       },
-      "headline_decode_tok_s": 30.746386583801687,
-      "ttft_short_s": 0.3730636249965755,
-      "prefill_tok_s": 134.09569559031897,
+      "headline_decode_tok_s": 27.853879671759913,
+      "ttft_short_s": 0.3948917919988162,
+      "prefill_tok_s": 126.55837182521458,
       "prefill_span": [
         524,
         2060
       ],
       "prefill_points": {
-        "512": 4.180094333001762,
-        "2048": 15.728585707998718
+        "512": 4.3922279170001275,
+        "2048": 16.567396375001408
+      }
+    },
+    "omlx": {
+      "version": "0.7.1",
+      "note": "no speculation (no embedded mtp.* in this checkpoint)",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 15.596740554170992,
+          "effective_tok_s": 13.874535421549107,
+          "ttft_s": 1.0828071520837208,
+          "chunks": 128,
+          "samples": 3
+        },
+        "prose": {
+          "decode_tok_s": 15.637896512157358,
+          "effective_tok_s": 13.884969866686752,
+          "ttft_s": 1.0931920530937835,
+          "chunks": 128,
+          "samples": 3
+        },
+        "math": {
+          "decode_tok_s": 16.291829414589667,
+          "effective_tok_s": 13.584294040034898,
+          "ttft_s": 1.1061295859721074,
+          "chunks": 86,
+          "samples": 3
+        },
+        "count": {
+          "decode_tok_s": 15.122573736014962,
+          "effective_tok_s": 13.876113846788432,
+          "ttft_s": 0.8264433294700211,
+          "chunks": 128,
+          "samples": 3
+        }
+      },
+      "headline_decode_tok_s": 15.84215549363934,
+      "ttft_short_s": 0.8015247500006808,
+      "prefill_tok_s": 135.04739582910648,
+      "prefill_span": [
+        564,
+        2100
+      ],
+      "prefill_points": {
+        "512": 4.974577957997099,
+        "2048": 16.348362625001755
+      }
+    },
+    "mlx-lm": {
+      "version": "0.31.3",
+      "note": "no speculation (mlx-lm has no MTP for this arch)",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 15.447576722774242,
+          "effective_tok_s": 13.654746995086501,
+          "ttft_s": 1.1526752010867616,
+          "chunks": 128,
+          "samples": 3
+        },
+        "prose": {
+          "decode_tok_s": 15.483098478990199,
+          "effective_tok_s": 13.616322656397928,
+          "ttft_s": 1.1655578611454378,
+          "chunks": 128,
+          "samples": 3
+        },
+        "math": {
+          "decode_tok_s": 16.411805294323702,
+          "effective_tok_s": 13.525723096364056,
+          "ttft_s": 1.1826379653520454,
+          "chunks": 87,
+          "samples": 3
+        },
+        "count": {
+          "decode_tok_s": 15.408189667891698,
+          "effective_tok_s": 13.637212693295055,
+          "ttft_s": 1.1453479628158676,
+          "chunks": 128,
+          "samples": 3
+        }
+      },
+      "headline_decode_tok_s": 15.780826832029382,
+      "ttft_short_s": 1.0860904590008431,
+      "prefill_tok_s": 124.04289010719633,
+      "prefill_span": [
+        564,
+        2100
+      ],
+      "prefill_points": {
+        "512": 4.867955458001234,
+        "2048": 17.275037833998795
       }
     }
   }

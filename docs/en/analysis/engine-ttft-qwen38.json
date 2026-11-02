@@ -1,0 +1,148 @@
+{
+  "schema": "dmlx-engine-comparison-v1",
+  "model": "/Users/zouyee/models/Qwen3.8-27B-4bit",
+  "max_tokens": 128,
+  "metric_defs": {
+    "prefill_tok_s": "prompt_tokens / ttft (not reported per-prompt: prompt_tokens is engine-reported and not uniformly available over SSE)",
+    "decode_tok_s": "(streamed_chunks - 1) / (t_last_chunk - t_first_chunk) \u2014 excludes prefill",
+    "effective_tok_s": "streamed_chunks / (t_last_chunk - t_request_start) \u2014 includes prefill and thinking",
+    "caveat": "chunks are SSE content deltas, which equal tokens for all engines here but are not guaranteed to; verify per engine before citing"
+  },
+  "engines": {
+    "dmlx": {
+      "version": "git:8b8922b",
+      "note": "adaptive MTP depth, verify-shape kernels armed",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 27.320087419169006,
+          "effective_tok_s": 26.185020896902927,
+          "ttft_s": 0.23994496438832963,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "prose": {
+          "decode_tok_s": 25.969331559745473,
+          "effective_tok_s": 24.959044347743355,
+          "ttft_s": 0.23790082378759508,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "math": {
+          "decode_tok_s": 32.30114824509372,
+          "effective_tok_s": 29.72000674186794,
+          "ttft_s": 0.37502421424058713,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "count": {
+          "decode_tok_s": 33.830715256783705,
+          "effective_tok_s": 31.596871318083807,
+          "ttft_s": 0.29704744061953836,
+          "chunks": 128.0,
+          "samples": 2
+        }
+      },
+      "headline_decode_tok_s": 28.5301890746694,
+      "ttft_short_s": 0.27708000000347965,
+      "prefill_tok_s": 117.38759523078625,
+      "prefill_span": [
+        520,
+        2056
+      ],
+      "prefill_points": {
+        "512": 4.3939545410030405,
+        "2048": 17.47881241700088
+      }
+    },
+    "mlx-vlm": {
+      "version": "0.7.8",
+      "note": "MTP via --draft-kind mtp, same drafter as dmlx",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 32.37626000085859,
+          "effective_tok_s": 29.382600227988622,
+          "ttft_s": 0.43374644287854003,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "prose": {
+          "decode_tok_s": 21.770529397894077,
+          "effective_tok_s": 20.07629922401988,
+          "ttft_s": 0.5435033645794344,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "math": {
+          "decode_tok_s": 32.479096195146084,
+          "effective_tok_s": 28.844677811133643,
+          "ttft_s": 0.527334820663206,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "count": {
+          "decode_tok_s": 34.562309342667724,
+          "effective_tok_s": 31.204473679376804,
+          "ttft_s": 0.4274268727212681,
+          "chunks": 128.0,
+          "samples": 2
+        }
+      },
+      "headline_decode_tok_s": 28.875295197966253,
+      "ttft_short_s": 0.3756136250012787,
+      "prefill_tok_s": 135.1949459220747,
+      "prefill_span": [
+        524,
+        2060
+      ],
+      "prefill_points": {
+        "512": 4.1604315830009,
+        "2048": 15.696868833001645
+      }
+    },
+    "omlx": {
+      "version": "0.7.1",
+      "note": "no speculation (native MTP inactive on this stripped ckpt)",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 16.315664814985773,
+          "effective_tok_s": 14.916939179544599,
+          "ttft_s": 0.7967611397430421,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "prose": {
+          "decode_tok_s": 15.38198477154598,
+          "effective_tok_s": 15.005983771095469,
+          "ttft_s": 0.2734904944732989,
+          "chunks": 128.0,
+          "samples": 2
+        },
+        "math": {
+          "decode_tok_s": 16.627014528208534,
+          "effective_tok_s": 14.804054994839404,
+          "ttft_s": 0.8081157548408311,
+          "chunks": 101.0,
+          "samples": 2
+        },
+        "count": {
+          "decode_tok_s": 16.396226971955002,
+          "effective_tok_s": 14.986835241779024,
+          "ttft_s": 0.7950742578128028,
+          "chunks": 128.0,
+          "samples": 2
+        }
+      },
+      "headline_decode_tok_s": 16.108221371580097,
+      "ttft_short_s": 0.7619171250007639,
+      "prefill_tok_s": 140.52128203850015,
+      "prefill_span": [
+        565,
+        2100
+      ],
+      "prefill_points": {
+        "512": 4.554844124999363,
+        "2048": 15.96809787500024
+      }
+    }
+  }
+}

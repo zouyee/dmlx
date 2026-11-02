@@ -245,3 +245,39 @@ Residual honest gap: ~7-10% steady-state decode on long generations
 Not chased further: within cross-session drift and shrinking; the remaining
 big structural lever (deeper chains at p4+) stays blocked on acceptance,
 not on any identified defect.
+
+## PREFILL FIX (2026-10-30): Qwen2 pre-tokenizer — 891x tokenize speedup
+
+The "prefill gap" (ttft@2048-words 37.2s vs omlx 15.9s) decomposed as:
+**12.0 s of pure TOKENIZATION** per 1618-token prompt (`prepare=` log).
+Cause: `tokenizer.json`'s pre_tokenizer is `Sequence[Split(qwen2-regex),
+ByteLevel]`; `parseSplitPattern` only knew 3 hardcoded patterns, so the Split
+was skipped ("Skipping unsupported pre_tokenizer in Sequence"), ByteLevel ran
+on the WHOLE prompt as one segment, and the O(n^2) BPE merge loop
+(full-scan-per-merge) exploded.
+
+Fix: `qwen_word` pattern matcher in pre_tokenizer.zig implementing the exact
+7-alternative Qwen2 regex (contractions / letter runs / single digits /
+punct runs / newline-aware whitespace) with leftmost-first, greedy,
+lookahead-backtrack semantics; registered in parseSplitPattern.
+
+Also a CORRECTNESS fix: without the Split, BPE merges crossed word
+boundaries the reference tokenizer forbids -> different token ids on
+complex text (short simple prompts coincidentally matched, which is why
+the raw-prompt chain probes were byte-identical anyway).
+
+Validation: golden parity harness `zig build run-tokenizer-parity`
+(tests/golden/qwen38_tokenizer_parity.json, HF `tokenizers` reference)
+20/20 incl. contractions/CJK/whitespace edges; prepare 12033ms -> 13.5ms;
+fair cold-prefill (nonce, same 1618-token prompt): dmlx 14.2s vs omlx
+13.6s — PARITY (was 26s vs 14s, an ~85% penalty).
+
+## Controller note (2026-10-30): shallow parking is CORRECT under our cost(n)
+
+Re-examined whether the depth controller under-drafts (omlx hits d4 in ~60%
+of math rounds; we park at 3). With our cost curve (N=3 ~94 ms, N=4 ~105 ms)
+and pooled p_i (0.87/0.78/0.80/0.78), argmin cost/E[tok] sits at 3-4 within
+noise of each other; forcing deep rounds measured net-negative twice before
+(§27.3, and the explore_rounds comment). Deep drafting pays only once the
+marginal row gets cheaper — i.e. it is a cost(n) problem, not a policy
+problem. No controller change made.
