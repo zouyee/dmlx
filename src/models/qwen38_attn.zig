@@ -14,6 +14,7 @@ const creation = @import("mlx").creation;
 const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
 const qwen38_gdn = @import("qwen38_gdn.zig");
+const verify_qmm = @import("verify_qmm.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -987,6 +988,9 @@ pub const Qwen38Attn = struct {
                 .config = qcfg,
                 .original_shape = &[_]i32{},
             };
+            // MTP verify rows (M = 1 + draft depth) are a shape stock qmm
+            // handles badly; routed only while armed (see verify_qmm.zig).
+            if (try verify_qmm.maybeQmm(self.ctx, x, qw)) |y| return y;
             return quantize_mod.quantizedMatmul(self.ctx, x, qw, true);
         }
         const w_t = try ops.transpose(self.ctx, w);
@@ -1075,6 +1079,45 @@ pub const Qwen38Attn = struct {
         const k_t = try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer k_t.deinit();
 
+        // DIAGNOSTIC ONLY (`DMLX_VERIFY_NO_ATTN_CORE=1`): price the
+        // multi-row (verify / prefill) attention core — slab append, the
+        // causal SDPA over L query rows, the transposes and the output gate
+        // — across the 16 full-attention layers.
+        //
+        // Worth pricing because omlx wrote dedicated kernels for exactly this
+        // shape (`patches/qwen35_verify_sdpa_split.py`: blocks of up to 8
+        // rows through `_gqa_causal_sdpa` / `_wide_causal_sdpa`), and its
+        // docstring states the per-row fallback "is the reason deeper MTP
+        // chains stop paying on this family". Their verify forward's non-qmm
+        // is ~5 ms against our ~16 ms (plan doc §41).
+        //
+        // Per §30.6 the stand-in consumes q_t, k_t AND v_t so none of the
+        // three projection qmms is pruned, and per §31.2 it keeps values
+        // bounded (q_t is already rope'd and norm'd, so the residual stream
+        // stays in range). Output is garbage.
+        if (std.c.getenv("DMLX_VERIFY_NO_ATTN_CORE") != null and L > 1) {
+            const qf = try ops.transposeAxes(ctx, q_t, &[_]i32{ 0, 2, 1, 3 });
+            defer qf.deinit();
+            const qflat = try ops.reshape(ctx, qf, &[_]i32{ 1, L, H * D });
+            defer qflat.deinit();
+            const kf = try ops.transposeAxes(ctx, k_t, &[_]i32{ 0, 2, 1, 3 });
+            defer kf.deinit();
+            const vf = try ops.transposeAxes(ctx, v_t, &[_]i32{ 0, 2, 1, 3 });
+            defer vf.deinit();
+            const kvsum = try ops.add(ctx, kf, vf);
+            defer kvsum.deinit();
+            const kvflat = try ops.reshape(ctx, kvsum, &[_]i32{ 1, L, HKV * D });
+            defer kvflat.deinit();
+            const reps: usize = @intCast(@divExact(H, HKV));
+            var parts: [64]Array = undefined;
+            for (0..reps) |i| parts[i] = kvflat;
+            const wide = try shape_mod.concatenateAxis(ctx, parts[0..reps], 2);
+            defer wide.deinit();
+            const sub = try ops.add(ctx, qflat, wide);
+            defer sub.deinit();
+            return self.linear(sub, self.o_proj, self.o_scales, self.o_biases, self.o_quant);
+        }
+
         // Slab cache write (see postCache).
         try cacheAppend(ctx, cache, k_t, v_t, L, HKV, D);
 
@@ -1126,6 +1169,37 @@ pub const Qwen38Attn = struct {
         const H: i32 = @intCast(self.num_heads);
         const HKV: i32 = @intCast(self.num_kv_heads);
         const D: i32 = @intCast(self.head_dim);
+
+        // DIAGNOSTIC ONLY (`DMLX_DECODE_NO_ATTN_CORE=1`): price the
+        // attention block's non-qmm work (KV slab append + SDPA + output
+        // gate) across the 16 full-attention layers, as part of decomposing
+        // the ~7.7 ms of per-forward non-qmm left after plan doc §30.
+        //
+        // Per the §30.6 rule, the stand-in CONSUMES q_t, k_t AND v_t so that
+        // none of the three projection qmms becomes dead code in MLX's lazy
+        // graph — that pruning is exactly what inflated §25.1 by 9x. Bytes
+        // read per token are therefore unchanged; only the append and the
+        // SDPA disappear. Output is garbage.
+        if (std.c.getenv("DMLX_DECODE_NO_ATTN_CORE") != null) {
+            const qf = try ops.reshape(ctx, pre.q_t, &[_]i32{ 1, H * D });
+            defer qf.deinit();
+            const kf = try ops.reshape(ctx, pre.k_t, &[_]i32{ 1, HKV * D });
+            defer kf.deinit();
+            const vf = try ops.reshape(ctx, pre.v_t, &[_]i32{ 1, HKV * D });
+            defer vf.deinit();
+            const kv = try ops.add(ctx, kf, vf);
+            defer kv.deinit();
+            // Widen [1, HKV*D] to [1, H*D] by repetition (H*D is an exact
+            // multiple of HKV*D for grouped-query attention).
+            const reps: usize = @intCast(@divExact(H, HKV));
+            var parts: [64]Array = undefined;
+            for (0..reps) |i| parts[i] = kv;
+            const wide = try shape_mod.concatenateAxis(ctx, parts[0..reps], 1);
+            defer wide.deinit();
+            const sub = try ops.add(ctx, qf, wide);
+            defer sub.deinit();
+            return self.linear(sub, self.o_proj, self.o_scales, self.o_biases, self.o_quant);
+        }
 
         try cacheAppend(ctx, cache, pre.k_t, pre.v_t, 1, HKV, D);
         // No eval here: the caller (Qwen38ServingModel.forwardTokens) submits

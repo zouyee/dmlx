@@ -27,6 +27,7 @@
 /// compress → pool selection against the growing pool cache), mirroring the
 /// oracle's cache!=None branch.
 const std = @import("std");
+const verify_qmm = @import("verify_qmm.zig");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
@@ -77,6 +78,9 @@ pub const QuantLinear = struct {
             .config = self.cfg,
             .original_shape = &[_]i32{},
         };
+        // MLP gate/up/down and lm_head come through here. Routed to the
+        // verify-shape kernels only while armed (see verify_qmm.zig).
+        if (try verify_qmm.maybeQmm(ctx, x, qw)) |y| return y;
         return quantize_mod.quantizedMatmul(ctx, x, qw, true);
     }
 };

@@ -21,6 +21,7 @@ const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const qwen38_attn = @import("qwen38_attn.zig");
+const verify_qmm = @import("verify_qmm.zig");
 const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
 
@@ -582,6 +583,11 @@ pub const LayerPersistent = struct {
 /// the shapes/dtypes/quant configs don't match (caller keeps the unfused
 /// path). All three returned Arrays are owned by the caller.
 fn fuseGateUp(ctx: EagerContext, gate: glm53_attn.QuantLinear, up: glm53_attn.QuantLinear) !?glm53_attn.QuantLinear {
+    // `DMLX_QWEN38_NO_FUSE_GATEUP=1` keeps gate/up as two separate qmm calls.
+    // Used to price per-qmm-call overhead: it adds exactly 64 calls per token
+    // with identical bytes, which calibrates whether fusing the GDN input
+    // projections (which would remove 144 calls) is worth doing.
+    if (std.c.getenv("DMLX_QWEN38_NO_FUSE_GATEUP") != null) return null;
     if (gate.w.dtype() != up.w.dtype()) return null;
     if (gate.scales.dtype() != up.scales.dtype() or gate.biases.dtype() != up.biases.dtype()) return null;
     if (!std.mem.eql(i32, gate.w.shape(), up.w.shape())) return null;
@@ -763,6 +769,9 @@ fn mlpForwardPersistent(ctx: EagerContext, lp: *const LayerPersistent, x: Array)
     defer h.deinit();
     return lp.mlp_down.apply(ctx, h);
 }
+
+// (A fused gate|up verify-path variant was tried and measured neutral —
+// 2026-10-30 — and removed.)
 
 // ============================================================
 // Compiled decode steps (mx.compile) — dispatch-bound fix
@@ -1263,6 +1272,15 @@ pub fn addRmsNormFused(ctx: EagerContext, h: Array, branch: Array, w_f32: Array,
 /// h + branch → rmsNorm(h + branch, w_f32): fused kernel when eligible,
 /// eager chain otherwise.
 fn addRmsNorm(ctx: EagerContext, h: Array, branch: Array, w_f32: Array, eps: f32) !AddRmsOut {
+    // DIAGNOSTIC ONLY (`DMLX_DECODE_NO_NORMS=1`): keep the residual add (the
+    // dependency chain and every downstream qmm need it) but drop the norm,
+    // pricing all 128 decode-path add+rmsNorm fusions at once. Garbage output.
+    if (std.c.getenv("DMLX_DECODE_NO_NORMS") != null) {
+        const next = try ops.add(ctx, h, branch);
+        errdefer next.deinit();
+        const normed = try ops.copy(ctx, next);
+        return .{ .h = next, .normed = normed };
+    }
     return (try addRmsNormFused(ctx, h, branch, w_f32, eps)) orelse
         addRmsNormEager(ctx, h, branch, w_f32, eps);
 }
@@ -1698,6 +1716,27 @@ pub const Qwen38ServingModel = struct {
         self.caches = new_caches;
     }
 
+    var cached_sync_every: ?usize = null;
+
+    /// Prefill GDN sync cadence: drain the pipeline every Nth GDN layer to
+    /// bound peak memory. 8 is the shipped value; `DMLX_PREFILL_SYNC_EVERY=0`
+    /// disables all intermediate drains (the final layer always syncs).
+    ///
+    /// Worth re-testing rather than trusting: the per-layer `eval()` this
+    /// replaced was originally added for a memory blow-up that turned out to
+    /// come from a slice-handle leak, which was fixed separately — so the
+    /// remaining drains may be vestigial. Dropping 48 of them bought 4-8% at
+    /// L=4096 when the cadence was introduced (107 -> 115 tok/s).
+    fn prefillSyncEvery() usize {
+        if (cached_sync_every) |v| return v;
+        var v: usize = 8;
+        if (std.c.getenv("DMLX_PREFILL_SYNC_EVERY")) |s| {
+            v = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 8;
+        }
+        cached_sync_every = v;
+        return v;
+    }
+
     /// Submit every live per-layer cache state array for async evaluation
     /// (non-blocking). forwardTokens calls this once per token before the
     /// single logits sync, so the next token's lazy graph references
@@ -1728,7 +1767,7 @@ pub const Qwen38ServingModel = struct {
     /// All weights come from the persistent per-layer modules built at init —
     /// no WeightSource lookups, COW copies, or module construction per token.
     pub fn forwardTokens(self: *Qwen38ServingModel, ids: []const u32) !Array {
-        const res = try self.forwardTokensCore(ids, .none);
+        const res = try self.forwardTokensCore(ids, .none, false);
         return res.logits;
     }
 
@@ -1738,28 +1777,58 @@ pub const Qwen38ServingModel = struct {
     };
 
     pub const ForwardAllHiddenOut = struct {
-        logits: Array, // [1, L, vocab]
+        logits: Array, // [1, 1, vocab] — LAST position only (see below)
         hidden_all: Array, // [1, L, hidden] bf16, pre-final-norm, ALL positions
     };
+
+    /// Serving prefill/decode: logits for the LAST position only. The
+    /// sampler slices that row anyway, so the other rows are computed and
+    /// thrown away — 781 ms of lm_head at a 2048-token prompt (measured) and
+    /// ~1 GB of discarded logits. Use this everywhere the next token is all
+    /// that is wanted; use `forwardTokens` when the full [1, L, vocab] is
+    /// genuinely needed (oracle dumps, the MTP self-consistency test).
+    pub fn forwardTokensLast(self: *Qwen38ServingModel, ids: []const u32) !Array {
+        const res = try self.forwardTokensCore(ids, .none, true);
+        return res.logits;
+    }
 
     /// forwardTokens + the pre-final-norm hidden at the last position (the
     /// MTP head's chaining input after a prefill or plain decode step).
     pub fn forwardTokensHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardHiddenOut {
-        const res = try self.forwardTokensCore(ids, .last);
+        const res = try self.forwardTokensCore(ids, .last, false);
         return .{ .logits = res.logits, .hidden = res.hidden.? };
     }
 
     /// forwardTokens + pre-final-norm hidden for ALL positions (MTP drafter
     /// prompt pass input; one array, no per-step state retention).
+    /// NOTE: `logits` is [1, 1, vocab] — the LAST position only — while
+    /// `hidden_all` covers all L positions. The MTP prefill path needs every
+    /// hidden row (to prime the drafter's KV cache) but only the last row of
+    /// logits (to sample the first token), and the discarded rows cost 781 ms
+    /// of lm_head at a 2048-token prompt. Callers must therefore index
+    /// `hidden_all` by its OWN length, not by `logits.shape()[1]`.
     pub fn forwardTokensAllHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardAllHiddenOut {
-        const res = try self.forwardTokensCore(ids, .all);
+        const res = try self.forwardTokensCore(ids, .all, true);
         return .{ .logits = res.logits, .hidden_all = res.hidden.? };
     }
 
     const HiddenCapture = enum { none, last, all };
     const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
-    fn forwardTokensCore(self: *Qwen38ServingModel, ids: []const u32, capture: HiddenCapture) !ForwardCoreOut {
+    /// `last_logits_only` applies the final norm and lm_head to ONLY the last
+    /// position. Prefill never needs the other rows — the sampler slices the
+    /// last one (`generation.zig`) — but computing them is expensive and
+    /// scales with prompt length: lm_head at [248320, 5120] measured 781 ms at
+    /// M=2048 versus 3.1 ms for the single row that is actually read, and the
+    /// discarded [1, L, 248320] logits also dominate peak memory (~2 GB at
+    /// L=4096). It is NOT the default because the MTP self-consistency test
+    /// compares a verify pass against sliced rows of a full prefill's logits.
+    fn forwardTokensCore(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+    ) !ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
@@ -1809,7 +1878,11 @@ pub const Qwen38ServingModel = struct {
                 .gdn => |*g| blk: {
                     const cache = &self.caches[layer].gdn;
                     const n = normed1.shape()[1];
-                    if (n > 1) break :blk try g.prefill(allocator, normed1, cache, gdn_seen % 8 == 0 or layer + 1 == self.layers.len);
+                    if (n > 1) break :blk try g.prefill(allocator, normed1, cache, blk2: {
+                        if (layer + 1 == self.layers.len) break :blk2 true;
+                        const every = prefillSyncEvery();
+                        break :blk2 every != 0 and gdn_seen % every == 0;
+                    });
                     const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
                     defer step_in.deinit();
                     if (self.gdn_step_compiled) |cc| {
@@ -1890,7 +1963,22 @@ pub const Qwen38ServingModel = struct {
             .all => try ops.copy(ctx, h), // [1, L, hidden] bf16, pre-norm
         };
         errdefer if (hidden_cap) |hc| hc.deinit();
-        const h_f32 = try ops.astype(ctx, h, .float32);
+        // Narrow to the last position before the head when the caller only
+        // needs the next token. `hidden_cap` above is already materialized, so
+        // this cannot affect it.
+        const h_last: ?Array = if (last_logits_only and ids.len > 1)
+            try ops.slice(
+                ctx,
+                h,
+                &[_]i32{ 0, @as(i32, @intCast(ids.len)) - 1, 0 },
+                &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) },
+                &[_]i32{ 1, 1, 1 },
+            )
+        else
+            null;
+        defer if (h_last) |hl| hl.deinit();
+        const h_head = h_last orelse h;
+        const h_f32 = try ops.astype(ctx, h_head, .float32);
         defer h_f32.deinit();
         const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, self.final_norm_f32.?, cfg.rms_norm_eps);
         defer hidden_final_f32.deinit();
@@ -1951,6 +2039,15 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
 
     try rejectVisionTokens(ids);
     if (ids.len <= 1) return error.VerifyNeedsSequence;
+
+    // Arm the verify-shape qmm kernels for the duration of this forward only
+    // (decode, prefill and the drafter keep using stock MLX qmm). While armed
+    // the MLP must take the eager path: the compiled SwiGLU closures call
+    // quantizedMatmul inside a traced graph, which the custom kernels cannot
+    // be substituted into.
+    verify_qmm.arm();
+    defer verify_qmm.disarm();
+    const routed = verify_qmm.isArmed();
 
     const ids_i32 = try allocator.alloc(i32, ids.len);
     defer allocator.free(ids_i32);
@@ -2013,18 +2110,26 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
         const normed2 = r1.normed;
         defer normed2.deinit();
         const mlp_out = blk: {
-            if (self.mlp_swiglu_fused_compiled) |mc| {
-                if (lp.mlp_gate_up != null) {
-                    if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+            // While routed, skip the compiled SwiGLU closures: they call
+            // quantizedMatmul inside a traced graph, so the verify-shape
+            // kernels cannot be substituted in. The eager path goes through
+            // QuantLinear.apply, which is routed.
+            if (!routed) {
+                if (self.mlp_swiglu_fused_compiled) |mc| {
+                    if (lp.mlp_gate_up != null) {
+                        if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+                            break :blk mo;
+                        } else |_| {}
+                    }
+                }
+                if (self.mlp_swiglu_compiled) |mc| {
+                    if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
                         break :blk mo;
                     } else |_| {}
                 }
             }
-            if (self.mlp_swiglu_compiled) |mc| {
-                if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
-                    break :blk mo;
-                } else |_| {}
-            }
+            // Verify path: the fused gate|up eager variant measured NEUTRAL
+            // (verify 98.6-101.7 vs 96.6-97.0 ms/round, 2026-10-30) — reverted.
             break :blk try mlpForwardPersistent(ctx, lp, normed2);
         };
         defer mlp_out.deinit();
