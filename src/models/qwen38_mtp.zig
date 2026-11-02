@@ -27,6 +27,7 @@ const reduce_mod = @import("mlx").reduce;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
+const sort_mod = @import("mlx").sort;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const glm53 = @import("glm53.zig");
 
@@ -99,6 +100,13 @@ pub const Qwen38Mtp = struct {
     /// The head's own KV cache (one full-attention layer). Grows by one per
     /// accepted token; rollback is a length truncation (Task 3).
     cache: qwen38_attn.Qwen38AttnCache = .{},
+
+    // --- coarse draft head (plan doc §28.4 / §32) --------------------------
+    // A 3-bit gs128 copy of the shared lm_head, used ONLY to propose draft
+    // tokens. Built lazily on first use; `coarse_state` makes the attempt
+    // once so a failure costs nothing per step.
+    coarse_head: ?MtpLinear = null,
+    coarse_state: enum { untried, ready, failed } = .untried,
 
     /// Prompt pass: run the head over the prompt so the drafter's KV cache
     /// covers the confirmed sequence with correct RoPE offsets. Inputs follow
@@ -191,6 +199,7 @@ pub const Qwen38Mtp = struct {
         self.mlp_gate.deinit();
         self.mlp_up.deinit();
         self.mlp_down.deinit();
+        if (self.coarse_head) |ch| ch.deinit();
         self.cache.deinit();
     }
 
@@ -361,9 +370,29 @@ pub const Qwen38Mtp = struct {
         embed_table_bf16: Array,
         lm_head: MtpLinear,
     ) !MtpForwardOut {
+        const ctx = self.ctx;
+        const hidden_out = try self.forwardBodyIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+        errdefer hidden_out.deinit();
+        const h3 = try ops.reshape(ctx, hidden_out, &[_]i32{ 1, 1, @as(i32, @intCast(self.dims.hidden_size)) });
+        defer h3.deinit();
+        const logits_bf16 = try lm_head.apply(ctx, h3);
+        defer logits_bf16.deinit();
+        const logits = try ops.astype(ctx, logits_bf16, .float32);
+        errdefer logits.deinit();
+        return .{ .logits = logits, .hidden_out = hidden_out };
+    }
+
+    /// forwardIds minus the lm_head: returns the final-normed hidden row
+    /// ([1, hidden] bf16) that feeds both lm_head and the next chained step.
+    fn forwardBodyRaw(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array, // [1] i32
+        embed_table_bf16: Array,
+    ) !Array {
         _ = allocator; // id array is supplied by the caller
         const ctx = self.ctx;
-        const hidden: i32 = @intCast(self.dims.hidden_size);
         const eps = self.dims.rms_norm_eps;
 
         // e = normE(embed(token)); h = normH(hidden)
@@ -413,16 +442,263 @@ pub const Qwen38Mtp = struct {
         // Final norm → hidden_out (this tensor feeds both lm_head and, in
         // chained drafting, the next pass's pre_fc_norm_hidden).
         stageChk("dec", ctx, dec_out);
-        const hidden_out = try rmsNormBf16(ctx, dec_out, self.norm_f32, eps);
-        errdefer hidden_out.deinit();
-        stageChk("normed", ctx, hidden_out);
-        const h3 = try ops.reshape(ctx, hidden_out, &[_]i32{ 1, 1, hidden });
+        return ops.copy(ctx, dec_out);
+    }
+
+    /// Body-only step for a CPU-side token id. Used by the commit replay,
+    /// which needs nothing but the KV-cache side effect: it discarded the
+    /// logits immediately, yet still built the full-vocab lm_head node
+    /// (248320 x 5120 at 4 bits = 715 MB, 3.1 ms) on every replayed draft.
+    /// Whether MLX's laziness already pruned that is measured, not assumed
+    /// (plan doc §35).
+    pub fn forwardBodyToken(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        token_id: u32,
+        embed_table_bf16: Array,
+    ) !Array {
+        const id_arr = try Array.fromData(allocator, i32, &[_]i32{@intCast(token_id)}, &[_]i32{1});
+        defer id_arr.deinit();
+        return self.forwardBodyIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+    }
+
+    /// Final-normed body output (the head's defined output; feeds lm_head).
+    pub fn forwardBodyIds(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array,
+        embed_table_bf16: Array,
+    ) !Array {
+        const dec = try self.forwardBodyRaw(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+        defer dec.deinit();
+        return rmsNormBf16(self.ctx, dec, self.norm_f32, self.dims.rms_norm_eps);
+    }
+
+    /// As forwardBodyIds, but also hands back the PRE-final-norm decoder
+    /// output so a caller can chain on it.
+    ///
+    /// Why this exists: draft 1 consumes the BACKBONE's pre-final-norm hidden
+    /// (the convention the head was trained on), while drafts 2..N consume the
+    /// HEAD's post-final-norm output. RMSNorm makes the magnitude difference
+    /// irrelevant, but post-norm is pre-norm reweighted channel-by-channel by
+    /// `norm_f32`, so the two steps feed genuinely different distributions.
+    /// Our measured conditional acceptance drops from p1 = 0.86 to
+    /// p2 = 0.68 while omlx, on the same drafter weights, measures 0.76 ->
+    /// 0.82 -> 0.83 -> 0.94 (plan doc §34). This is the cheapest testable
+    /// candidate for that cliff: `DMLX_MTP_CHAIN_PRENORM=1` chains on the
+    /// pre-norm output so every step sees the same kind of input.
+    fn forwardBodyIdsPair(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array,
+        embed_table_bf16: Array,
+    ) !struct { normed: Array, pre_norm: Array } {
+        const ctx = self.ctx;
+        const dec = try self.forwardBodyRaw(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+        errdefer dec.deinit();
+        const normed = try rmsNormBf16(ctx, dec, self.norm_f32, self.dims.rms_norm_eps);
+        return .{ .normed = normed, .pre_norm = dec };
+    }
+
+    /// Rows dequantized/requantized per chunk when building the coarse head.
+    /// 16384 x 5120 bf16 = 168 MB of transient dense weight, which bounds
+    /// peak memory during the one-time build.
+    const coarse_chunk_rows: i32 = 16384;
+    /// Candidates rescored against the exact head. 64 is omlx's choice
+    /// (`batch_generator._COARSE_CANDIDATES`) and is far above the rank at
+    /// which a 3-bit head misplaces the true argmax.
+    const coarse_candidates: i32 = 64;
+    /// Bit width of the coarse draft head. Raising the depth ceiling to 7
+    /// (§39) made the drafter the largest single per-round item — 4.1 ms per
+    /// step, up to 7 steps — and 2.24 ms of each step is this head reading
+    /// 517 MB at 3 bits. 2 bits reads 358 MB (~1.55 ms), and the quality
+    /// argument is unchanged: the proposal only has to put the true token
+    /// inside the top-`coarse_candidates`, after which the EXACT head decides.
+    /// `DMLX_MTP_COARSE_BITS` overrides it for A/B.
+    const coarse_bits_default: u8 = 2;
+    const coarse_group: i32 = 128;
+
+    fn coarseBits() u8 {
+        const s = std.c.getenv("DMLX_MTP_COARSE_BITS") orelse return coarse_bits_default;
+        const v = std.fmt.parseInt(u8, std.mem.span(s), 10) catch return coarse_bits_default;
+        return switch (v) {
+            2, 3, 4, 5, 6, 8 => v,
+            else => coarse_bits_default,
+        };
+    }
+    /// Below this vocabulary the full head is already cheap and the extra
+    /// resident copy is not worth it.
+    const coarse_min_vocab: i32 = 65536;
+
+    /// Build a 3-bit gs128 copy of `lm_head`.
+    ///
+    /// Why this is quality-neutral: a draft token is only a GUESS. Acceptance
+    /// is decided by comparing it against the TARGET's own argmax in the
+    /// verify step, so a coarser proposal can lower the acceptance rate but
+    /// cannot change the emitted sequence. The top-`coarse_candidates` rescore
+    /// against the exact head's gathered rows removes most of even that loss,
+    /// because the true argmax is essentially always inside the coarse top-64
+    /// while 64 x hidden of exact weight is negligible traffic.
+    ///
+    /// Cost: ~517 MB resident for this model (477 MB of 3-bit weight + 40 MB
+    /// of scales/biases) against 715 MB read per draft step by the 4-bit gs64
+    /// head — 3.10 ms/step down to ~2.24 ms at the measured 231 GB/s.
+    fn buildCoarseHead(self: *Qwen38Mtp, allocator: std.mem.Allocator, lm_head: MtpLinear) !MtpLinear {
+        const ctx = self.ctx;
+        const scales = lm_head.scales orelse return error.HeadNotQuantized;
+        const biases = lm_head.biases orelse return error.HeadNotQuantized;
+        if (lm_head.cfg.mode != .affine) return error.HeadNotAffine;
+        const ws = lm_head.w.shape();
+        if (ws.len != 2) return error.HeadRank;
+        const rows: i32 = ws[0];
+        if (rows < coarse_min_vocab) return error.HeadTooSmall;
+        const wcols: i32 = ws[1];
+        const scols: i32 = scales.shape()[1];
+
+        var w_parts = std.ArrayList(Array).empty;
+        defer w_parts.deinit(allocator);
+        var s_parts = std.ArrayList(Array).empty;
+        defer s_parts.deinit(allocator);
+        var b_parts = std.ArrayList(Array).empty;
+        defer b_parts.deinit(allocator);
+        errdefer {
+            for (w_parts.items) |x| x.deinit();
+            for (s_parts.items) |x| x.deinit();
+            for (b_parts.items) |x| x.deinit();
+        }
+
+        var start: i32 = 0;
+        while (start < rows) : (start += coarse_chunk_rows) {
+            const end = @min(rows, start + coarse_chunk_rows);
+            const wc = try ops.slice(ctx, lm_head.w, &[_]i32{ start, 0 }, &[_]i32{ end, wcols }, &[_]i32{ 1, 1 });
+            defer wc.deinit();
+            const sc = try ops.slice(ctx, scales, &[_]i32{ start, 0 }, &[_]i32{ end, scols }, &[_]i32{ 1, 1 });
+            defer sc.deinit();
+            const bc = try ops.slice(ctx, biases, &[_]i32{ start, 0 }, &[_]i32{ end, scols }, &[_]i32{ 1, 1 });
+            defer bc.deinit();
+            const qw = quantize_mod.QuantizedWeight{
+                .data = wc,
+                .scales = sc,
+                .biases = bc,
+                .config = lm_head.cfg,
+                .original_shape = &[_]i32{},
+            };
+            const dense = try quantize_mod.dequantizeAs(ctx, qw, .bfloat16);
+            defer dense.deinit();
+            const part = try quantize_mod.quantize(ctx, dense, .{
+                .bits = coarseBits(),
+                .group_size = coarse_group,
+                .mode = .affine,
+            });
+            // Materialize per chunk so the transient dense array is released
+            // before the next one is built.
+            try part.data.eval();
+            try part.scales.eval();
+            try part.biases.eval();
+            try w_parts.append(allocator, part.data);
+            try s_parts.append(allocator, part.scales);
+            try b_parts.append(allocator, part.biases);
+        }
+
+        const w3 = try shape_mod.concatenateAxis(ctx, w_parts.items, 0);
+        errdefer w3.deinit();
+        const s3 = try shape_mod.concatenateAxis(ctx, s_parts.items, 0);
+        errdefer s3.deinit();
+        const b3 = try shape_mod.concatenateAxis(ctx, b_parts.items, 0);
+        errdefer b3.deinit();
+        try w3.eval();
+        try s3.eval();
+        try b3.eval();
+        for (w_parts.items) |x| x.deinit();
+        for (s_parts.items) |x| x.deinit();
+        for (b_parts.items) |x| x.deinit();
+        w_parts.clearRetainingCapacity();
+        s_parts.clearRetainingCapacity();
+        b_parts.clearRetainingCapacity();
+        return .{
+            .w = w3,
+            .scales = s3,
+            .biases = b3,
+            .cfg = .{ .bits = coarseBits(), .group_size = coarse_group, .mode = .affine },
+        };
+    }
+
+    fn coarseHead(self: *Qwen38Mtp, allocator: std.mem.Allocator, lm_head: MtpLinear) ?*const MtpLinear {
+        if (std.c.getenv("DMLX_MTP_NO_COARSE_HEAD") != null) return null;
+        switch (self.coarse_state) {
+            .ready => return &self.coarse_head.?,
+            .failed => return null,
+            .untried => {},
+        }
+        if (self.buildCoarseHead(allocator, lm_head)) |ch| {
+            self.coarse_head = ch;
+            self.coarse_state = .ready;
+            std.log.info("[MTP] coarse draft head built ({d}-bit gs{d})", .{ coarseBits(), coarse_group });
+            return &self.coarse_head.?;
+        } else |err| {
+            self.coarse_state = .failed;
+            std.log.warn("[MTP] coarse draft head unavailable ({s}); drafting on the full head", .{@errorName(err)});
+            return null;
+        }
+    }
+
+    /// Draft token from the coarse head + exact top-k rescore, as a GPU [1]
+    /// i32 array (chainable, like the full-head path).
+    fn coarseDraftToken(self: *Qwen38Mtp, body: Array, lm_head: MtpLinear, coarse: *const MtpLinear) !Array {
+        const ctx = self.ctx;
+        const hidden: i32 = @intCast(self.dims.hidden_size);
+        const h3 = try ops.reshape(ctx, body, &[_]i32{ 1, 1, hidden });
         defer h3.deinit();
-        const logits_bf16 = try lm_head.apply(ctx, h3);
-        defer logits_bf16.deinit();
-        const logits = try ops.astype(ctx, logits_bf16, .float32);
-        errdefer logits.deinit();
-        return .{ .logits = logits, .hidden_out = hidden_out };
+        const approx3 = try coarse.apply(ctx, h3);
+        defer approx3.deinit();
+        const vocab: i32 = approx3.shape()[2];
+        if (vocab <= coarse_candidates) return error.VocabTooSmall;
+        const approx = try ops.reshape(ctx, approx3, &[_]i32{ 1, vocab });
+        defer approx.deinit();
+        const approx_f = try ops.astype(ctx, approx, .float32);
+        defer approx_f.deinit();
+
+        // Top-K by argpartition: everything at or after kth is >= the kth
+        // element, so the last K indices are the K largest (unordered, which
+        // is fine — the exact rescore below decides the order).
+        const part = try sort_mod.argpartitionAxis(ctx, approx_f, vocab - coarse_candidates, 1);
+        defer part.deinit();
+        const ids2 = try ops.slice(ctx, part, &[_]i32{ 0, vocab - coarse_candidates }, &[_]i32{ 1, vocab }, &[_]i32{ 1, 1 });
+        defer ids2.deinit();
+        const ids = try ops.reshape(ctx, ids2, &[_]i32{coarse_candidates});
+        defer ids.deinit();
+
+        // Exact rescore: gather those rows of the real head (64 x hidden of
+        // 4-bit weight, negligible bytes) and run the small matmul.
+        const w_rows = try shape_mod.takeAxis(ctx, lm_head.w, ids, 0);
+        defer w_rows.deinit();
+        const s_rows = try shape_mod.takeAxis(ctx, lm_head.scales.?, ids, 0);
+        defer s_rows.deinit();
+        const b_rows = try shape_mod.takeAxis(ctx, lm_head.biases.?, ids, 0);
+        defer b_rows.deinit();
+        const qw = quantize_mod.QuantizedWeight{
+            .data = w_rows,
+            .scales = s_rows,
+            .biases = b_rows,
+            .config = lm_head.cfg,
+            .original_shape = &[_]i32{},
+        };
+        const body2 = try ops.reshape(ctx, body, &[_]i32{ 1, hidden });
+        defer body2.deinit();
+        const exact = try quantize_mod.quantizedMatmul(ctx, body2, qw, true);
+        defer exact.deinit();
+        const am = try reduce_mod.argmax(ctx, exact, false);
+        defer am.deinit();
+        const am_i32 = try ops.astype(ctx, am, .int32);
+        defer am_i32.deinit();
+        const am1 = try ops.reshape(ctx, am_i32, &[_]i32{1});
+        defer am1.deinit();
+        const picked = try shape_mod.takeAxis(ctx, ids, am1, 0);
+        defer picked.deinit();
+        return ops.astype(ctx, picked, .int32);
     }
 
     /// Greedy GPU-chained step: forwardIds + argmax, returning the token id
@@ -440,6 +716,66 @@ pub const Qwen38Mtp = struct {
         lm_head: MtpLinear,
     ) !MtpGreedyStepOut {
         const ctx = self.ctx;
+        if (std.c.getenv("DMLX_MTP_NO_LM_HEAD") != null) {
+            // DIAGNOSTIC ONLY: prices the drafter's full-vocab lm_head
+            // (5120 x 248320 at 4 bits = 636 MB read per draft step) by
+            // replacing it with an argmax over the hidden row. Drafts are
+            // garbage, so acceptance collapses — read ms/round only, and
+            // only at a FIXED depth.
+            const body = try self.forwardBodyIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+            errdefer body.deinit();
+            const am = try reduce_mod.argmax(ctx, body, false);
+            defer am.deinit();
+            const am_i32 = try ops.astype(ctx, am, .int32);
+            defer am_i32.deinit();
+            const tok = try ops.reshape(ctx, am_i32, &[_]i32{1});
+            errdefer tok.deinit();
+            return .{ .tok_gpu = tok, .hidden_out = body };
+        }
+        // Coarse draft head: propose from a 3-bit copy of lm_head, then
+        // rescore the top-64 against the exact rows. Quality-neutral (the
+        // target's verify decides acceptance) and saves ~0.9 ms of the
+        // 3.10 ms/step the full 4-bit head costs. See buildCoarseHead.
+        if (self.coarseHead(allocator, lm_head)) |coarse| {
+            // `DMLX_MTP_CHAIN_PRENORM=1`: chain the next step on the PRE-final
+            // -norm output so every draft step sees the same kind of hidden as
+            // draft 1 (which gets the backbone's pre-norm row). See
+            // forwardBodyIdsPair — this is the p_i-cliff experiment.
+            const chain_prenorm = std.c.getenv("DMLX_MTP_CHAIN_PRENORM") != null;
+            var body: Array = undefined;
+            var chain: Array = undefined;
+            if (chain_prenorm) {
+                const pair = try self.forwardBodyIdsPair(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+                body = pair.normed;
+                chain = pair.pre_norm;
+            } else {
+                body = try self.forwardBodyIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+                chain = body;
+            }
+            errdefer body.deinit();
+            errdefer if (chain_prenorm) chain.deinit();
+            if (self.coarseDraftToken(body, lm_head, coarse)) |tok| {
+                if (chain_prenorm) body.deinit();
+                return .{ .tok_gpu = tok, .hidden_out = chain };
+            } else |err| {
+                if (chain_prenorm) chain.deinit();
+                // One-shot downgrade: never retry per step.
+                self.coarse_state = .failed;
+                std.log.warn("[MTP] coarse draft token failed ({s}); full head from here", .{@errorName(err)});
+                const h3 = try ops.reshape(ctx, body, &[_]i32{ 1, 1, @as(i32, @intCast(self.dims.hidden_size)) });
+                defer h3.deinit();
+                const lg = try lm_head.apply(ctx, h3);
+                defer lg.deinit();
+                const lgf = try ops.astype(ctx, lg, .float32);
+                defer lgf.deinit();
+                const am0 = try reduce_mod.argmax(ctx, lgf, false);
+                defer am0.deinit();
+                const am0i = try ops.astype(ctx, am0, .int32);
+                defer am0i.deinit();
+                const tok0 = try ops.reshape(ctx, am0i, &[_]i32{1});
+                return .{ .tok_gpu = tok0, .hidden_out = body };
+            }
+        }
         var out = try self.forwardIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16, lm_head);
         defer out.logits.deinit();
         const am = try reduce_mod.argmax(ctx, out.logits, false); // scalar
