@@ -327,3 +327,16 @@ filed for a separate fix.
   near-tie fidelity class (3/5 byte-diverge with coherent alternates);
   empty-think arm 4/5, divergence on the math prompt at a coherent branch
   point.
+
+### Controller tuning epilogue (2026-11-02): rejected variants
+
+Two restructurings of the calibration/explore ordering were tried and
+rejected on 8-sample A/B (the bc1dbb1 config = explore-at-max_n with
+early-exit @3 samples/1.15 margin stands):
+
+- calibrate-first (deepest-first) + exit@5/1.20: code 43.1 but math 34.7 —
+  the full calibration sweep costs ~570 ms before exploration can exit,
+  re-taxing the content the exit exists to protect.
+- cold shallow-first sweep + exit@3/1.20: code 43.2 / prose 22.4 /
+  math 37.1 / count 50.7 vs committed 42.6 / 23.3 / 38.5 / 48.6 —
+  within noise on all four; not adopted (keeps history simple).
