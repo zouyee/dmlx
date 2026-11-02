@@ -1293,3 +1293,22 @@ prefill edge at 2048: 17.2s vs 15.7s TTFT).
   thinking-on content it hits the documented fidelity class (near-tie
   flips). Gate = mtp_fidelity_profile (currently neutral: median
   first-divergence 209, 4/6 identical, both arms equal).
+
+### FINAL fair scorecard (2026-11-02, both engines empty-think, 6-rep interleaved, raw-sample means)
+
+| prompt | dmlx | omlx-mtp | delta |
+|---|---|---|---|
+| code  | 42.3 (dec 47.7) | 38.3 (dec 44.6) | **+10.3% dmlx wins** |
+| prose | 22.7 (dec 25.2) | 23.9 (dec 25.5) | -5.3% |
+| math  | 34.1 (dec 38.7) | 39.9 (dec 46.8) | -14.5% (real, see below) |
+| count | 54.0 (dec 61.6) | 42.3 (dec 50.5) | **+27.7% dmlx wins** |
+
+TTFT 0.28s vs 0.78s; prefill 122.8 vs 138.5 tok/s (they keep the long-prefill
+edge: ttft@2048 17.5s vs 15.9s).
+
+math residual (-14.5%) decomposes to: (a) the known verify marginal row at
+depth 4-5 (~5.5 ms/round), (b) per-request calibration cost — each fresh
+request pays explore rounds, and the harness restarts servers per visit so
+no warm-up carries (their controller starts deep and sheds, paying nothing
+upfront on easy content). math probes within a warm session measured 39.5
+vs their 39.3 (parity) — the harness gap is partly cold-start calibration.
