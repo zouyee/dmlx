@@ -1307,7 +1307,33 @@ pub const EngineLoop = struct {
         /// 2.0 means "sampled at least as often as the probe cadence".
         const ladder_confident_floor: f32 = 2.0;
         /// How much worse a trusted rung may score before probing stops.
-        const ladder_give_up_ratio: f64 = 1.10;
+        ///
+        /// Both this and `exploreGiveUpRatio` were set by eye and both MISS on
+        /// code by a hair, which is expensive: the depth traces
+        /// (artifacts/code_modes_20261103.json) show every draw parking at
+        /// N=3 with N=3 the best depth in all ten, while 15 of ~45 rounds go
+        /// to N=5 and N=7 —
+        ///   draw[1]  N=3 31.7 ms/tok   N=5 33.5 (1.057x)   N=7 36.0 (1.136x)
+        ///   draw[7]  N=3 46.7 ms/tok   N=5 54.5 (1.167x)   N=7 59.7 (1.278x)
+        /// 1.057 is under the 1.10 give-up here and 1.136 is under the 1.15
+        /// explore give-up, so neither hatch opens and code pays a ~33% round
+        /// tax on depths it has already proven worse. Tightening both has to
+        /// be measured against math, where deep genuinely wins and quitting
+        /// early would cost the ladder's whole gain.
+        const ladder_give_up_default: f64 = 1.10;
+        fn ladderGiveUpRatio() f64 {
+            const v = std.c.getenv("DMLX_MTP_LADDER_GIVE_UP") orelse
+                return ladder_give_up_default;
+            return std.fmt.parseFloat(f64, std.mem.span(v)) catch
+                ladder_give_up_default;
+        }
+        const explore_give_up_default: f64 = 1.15;
+        fn exploreGiveUpRatio() f64 {
+            const v = std.c.getenv("DMLX_MTP_EXPLORE_GIVE_UP") orelse
+                return explore_give_up_default;
+            return std.fmt.parseFloat(f64, std.mem.span(v)) catch
+                explore_give_up_default;
+        }
         /// OFF by default: gating the probe on rung staleness measured away
         /// the entire math win (artifacts/ladder_stalegate_20261103.json,
         /// 3 interleaved passes, nonced):
@@ -1541,7 +1567,7 @@ pub const EngineLoop = struct {
             if (self.reached[rung - 1] < ladder_confident_floor) return true;
             const rung_score = self.score(rung) orelse return true;
             const inc_score = self.score(self.last_pick) orelse return true;
-            return rung_score <= inc_score * ladder_give_up_ratio;
+            return rung_score <= inc_score * ladderGiveUpRatio();
         }
 
         /// Depth for the next round, in 1..max_n.
@@ -1608,7 +1634,7 @@ pub const EngineLoop = struct {
                                 if (s < alt) alt = s;
                             }
                         }
-                        if (found and deep_score > alt * 1.15) keep_exploring = false;
+                        if (found and deep_score > alt * exploreGiveUpRatio()) keep_exploring = false;
                     }
                 }
                 if (keep_exploring) return self.max_n;

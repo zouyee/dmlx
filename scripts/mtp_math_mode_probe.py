@@ -172,16 +172,21 @@ def run_arm(name: str, env_extra: dict[str, str], requests: int,
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--prompt", choices=sorted(PROMPTS), default="math",
+                    help="which compare_engines prompt to trace")
     ap.add_argument("--requests", type=int, default=8)
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--out", default="artifacts/mtp_math_modes.json")
     args = ap.parse_args()
+    global PROMPT
+    PROMPT = PROMPTS[args.prompt]
+    print(f"prompt [{args.prompt}]: {PROMPT}")
 
     arms = [
-        ("h090", {}),                                        # head
-        ("h095", {"DMLX_MTP_HYSTERESIS": "0.95"}),
-        ("h098", {"DMLX_MTP_HYSTERESIS": "0.98"}),
-        ("h100", {"DMLX_MTP_HYSTERESIS": "1.0"}),
+        ("default", {}),                                     # 1.15 / 1.10
+        ("tight", {"DMLX_MTP_EXPLORE_GIVE_UP": "1.08",
+                   "DMLX_MTP_LADDER_GIVE_UP": "1.04"}),
+        ("tight_explore_only", {"DMLX_MTP_EXPLORE_GIVE_UP": "1.08"}),
     ]
     results = []
     for name, env in arms:
