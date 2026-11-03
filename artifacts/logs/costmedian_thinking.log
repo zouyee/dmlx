@@ -1,0 +1,23 @@
+prefix-cache nonce: run17775 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] omlx-mtp ...
+   failed: server did not become healthy
+[pass 2/3] dmlx ...
+[pass 2/3] omlx-mtp ...
+   failed: server did not become healthy
+[pass 3/3] dmlx ...
+[pass 3/3] omlx-mtp ...
+   failed: server did not become healthy
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:a4d7ab1code            34.1       28.2     0.81
+dmlx        git:a4d7ab1prose           26.6       23.1     0.78
+dmlx        git:a4d7ab1math            39.8       30.4     0.82
+dmlx        git:a4d7ab1count*          34.3       28.2     0.83
+dmlx                  HEADLINE        33.5
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.776s        122.6      564-2100      4.532s     17.057s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/costmedian_thinking_20261103.json

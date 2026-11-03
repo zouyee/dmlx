@@ -1489,6 +1489,28 @@ pub const EngineLoop = struct {
         /// calibration value — biasing the controller toward whatever it is
         /// NOT currently running.
         const cost_alpha = 0.25;
+        /// Rounds kept per depth for the median cost estimate.
+        ///
+        /// omlx stores `deque(maxlen=8)` per depth and scores on
+        /// `median(costs)` (omlx/patches/mlx_lm_mtp/batch_policy.py `score`),
+        /// where we had only an EMA at alpha 0.25. The difference is
+        /// robustness, and it matches the symptom exactly: one slow round
+        /// moves an alpha-0.25 EMA by 25%, which is more than enough to flip
+        /// the argmin off the incumbent, after which a stale estimate takes
+        /// over for the rest of the request — two fixed points, i.e. the
+        /// bimodal readings measured on code (per-request samples
+        /// [33.2, 37.9, 33.7, 38.7, 33.0, 38.1] against omlx's tight
+        /// 34.6-36.2). A median of 8 cannot be moved by a single outlier, so
+        /// omlx lands in the same place every request.
+        ///
+        /// Round cost genuinely has outliers here — page faults, thermal
+        /// steps, and the occasional long verify — and they carry no
+        /// information about which depth is better, which is the case for a
+        /// median rather than a mean over the same window.
+        const cost_window = 8;
+        fn costMedian() bool {
+            return std.c.getenv("DMLX_MTP_COST_EMA") == null;
+        }
 
         max_n: usize,
         fixed: bool,
@@ -1508,6 +1530,8 @@ pub const EngineLoop = struct {
         accepted_slow: [max_depth]f32 = @splat(0),
         cost_ms: [max_depth]f64 = @splat(0),
         cost_n: [max_depth]u32 = @splat(0),
+        /// Last `cost_window` round times per depth, for a MEDIAN cost.
+        cost_ring: [max_depth][cost_window]f64 = @splat(@splat(0)),
         used: [max_depth]u32 = @splat(0),
         rounds: u64 = 0,
         /// Last argmin-chosen depth. Switching requires beating the incumbent
@@ -1570,7 +1594,16 @@ pub const EngineLoop = struct {
 
         fn meanCostMs(self: *const MtpDepthController, n: usize) ?f64 {
             if (self.cost_n[n - 1] == 0) return null;
-            return self.cost_ms[n - 1];
+            if (!costMedian()) return self.cost_ms[n - 1];
+            const have = @min(self.cost_n[n - 1], cost_window);
+            var buf: [cost_window]f64 = undefined;
+            for (0..have) |i| buf[i] = self.cost_ring[n - 1][i];
+            const s = buf[0..have];
+            std.mem.sort(f64, s, {}, std.sort.asc(f64));
+            return if (s.len % 2 == 1)
+                s[s.len / 2]
+            else
+                (s[s.len / 2 - 1] + s[s.len / 2]) / 2.0;
         }
 
         /// Estimated ms per emitted token at depth `n`, or null if we have
@@ -1848,6 +1881,9 @@ pub const EngineLoop = struct {
                     ms
                 else
                     cost_alpha * ms + (1.0 - cost_alpha) * self.cost_ms[n - 1];
+                // Ring slot, oldest first: index by the sample count so the
+                // window holds the last `cost_window` rounds at this depth.
+                self.cost_ring[n - 1][self.cost_n[n - 1] % cost_window] = ms;
                 self.cost_n[n - 1] +|= 1;
             }
             // Decay stale acceptance evidence toward the Laplace prior, then

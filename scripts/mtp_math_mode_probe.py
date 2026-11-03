@@ -183,11 +183,8 @@ def main() -> int:
     print(f"prompt [{args.prompt}]: {PROMPT}")
 
     arms = [
-        ("trendgate", {}),                                   # head: tight only when flat
-        ("loose", {"DMLX_MTP_NO_TREND_GATE": "1"}),           # always loose (prev default)
-        ("alwaystight", {"DMLX_MTP_NO_TREND_GATE": "1",
-                         "DMLX_MTP_EXPLORE_GIVE_UP": "1.08",
-                         "DMLX_MTP_LADDER_GIVE_UP": "1.04"}),
+        ("median8", {}),                                     # head: median of last 8
+        ("ema025", {"DMLX_MTP_COST_EMA": "1"}),               # previous: EMA alpha 0.25
     ]
     results = []
     for name, env in arms:
