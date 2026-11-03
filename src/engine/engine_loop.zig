@@ -1250,6 +1250,88 @@ pub const EngineLoop = struct {
         /// Rounds between forced probes. A probe both refreshes that depth's
         /// cost estimate and (for deep probes) the pooled p_i tail.
         const probe_period = 16;
+        /// The deep arm gets its OWN cadence, because the descending rotation
+        /// below cannot reach it inside a real request. The rotation returns
+        /// `max_n - (rounds / probe_period) % max_n`, so any one depth comes
+        /// up every `max_n * probe_period` rounds = 112 at max_n = 7, while a
+        /// 128-token request runs ~30 rounds. Depth 7 was therefore probed
+        /// exactly never after exploration ended.
+        ///
+        /// Measured consequence (scripts/mtp_math_mode_probe.py,
+        /// artifacts/mtp_math_modes.json, 8 draws/arm on the math prompt):
+        /// requests split into two depth fixed points,
+        ///   slow ~26 t/s  N=2:28r  N=7:4r   N=7 reads 32.0 ms/tok, E[t]=4.1
+        ///   fast ~30 t/s  N=2:13r  N=7:13r  N=7 reads 28.4 ms/tok, E[t]=4.7
+        /// and the `N=5:1r N=6:1r` tail in the slow trace is the rotation
+        /// hitting slots 1 and 2 at rounds 16 and 32 — never slot 0.
+        /// Depth 7 is genuinely ~15% better per token here (27.1-28.4 vs
+        /// 31.3-32.8); the controller just could not get back to it. Whether
+        /// a request lands fast or slow then depends on whether exploration
+        /// happened to straddle math's low-acceptance opening phase, which is
+        /// a coin flip, and it swamped every cost-model tweak we A/B'd.
+        /// DEFAULT 0 (off): probing the deep arm more measured WORSE, and the
+        /// reason reframes the whole problem. Set to 12 to re-enable.
+        ///
+        /// A/B at 8 draws per arm (artifacts/mtp_math_modes_deepprobe.json):
+        /// a 12-round deep cadence plus the score latch below did fix
+        /// reachability — all 8 draws got 7-13 rounds at depth 7, versus
+        /// 3 of 8 stuck at `N=7:4r` without it — and still LOST, 27.4 vs
+        /// 28.9 tok/s median. The traces show the deep arm's own estimate
+        /// degrading as it was sampled more:
+        ///   with cadence     N=7 reads 28.8-35.3 ms/tok, E[t] 3.71-4.53
+        ///   parked (no cad.) N=7 reads 26.8-29.9 ms/tok, E[t] 4.46-4.93
+        ///
+        /// Acceptance evidence is decayed EVERY round (0.9), and a shallow
+        /// round observes nothing past p_2, so while the incumbent sits at
+        /// N=2 the `reached[3..7]` counters decay toward the prior. Returning
+        /// to depth 7 for one or two rounds out of twelve therefore measures
+        /// it against a tail that the intervening shallow rounds just erased,
+        /// which underestimates E[t] and sends the argmin straight back to
+        /// N=2. Interleaved sampling is self-defeating here; PARKING is what
+        /// keeps the deep tail fresh, and it is self-sustaining once reached.
+        ///
+        /// So the slow fixed point is not "could not reach depth 7", it is
+        /// "left depth 7 and could never get a fair re-measurement". The
+        /// lever is therefore how the controller first parks, i.e. the
+        /// exploration early exit, not the probe cadence.
+        const deep_probe_period_default = 0;
+        /// Cadence for the ladder probe in `pick` (rungs just above the
+        /// incumbent). 6 rather than the rotation's 16: a ~30-round request
+        /// has to get several samples of the rung for the argmin to act on
+        /// it, and the rung is a cheaper round than a max_n probe.
+        const ladder_probe_period_default = 6;
+        /// Decayed-`reached` level below which a rung counts as unobserved.
+        const ladder_stale_floor: f32 = 1.0;
+        /// OFF by default: gating the probe on rung staleness measured away
+        /// the entire math win (artifacts/ladder_stalegate_20261103.json,
+        /// 3 interleaved passes, nonced):
+        ///   gated 31.0   ungated 34.1   no probe at all 31.5
+        /// `reached[rung]` is left above the floor by the exploration rounds
+        /// and decays too slowly to drop under it inside a request, so the
+        /// gate suppressed nearly every probe and the arm collapsed onto the
+        /// no-probe behaviour. The same run also showed the other three
+        /// prompts unaffected by the ungated probe (code 33.7 vs 33.3,
+        /// prose 25.6 vs 25.8, count 28.3 vs 28.2), so the 2-4% dip seen in
+        /// the previous run was noise and there is nothing here to protect
+        /// against. Kept as an opt-in because the floor is the only part
+        /// that was wrong, not the idea.
+        fn ladderStaleOnly() bool {
+            return std.c.getenv("DMLX_MTP_LADDER_STALE_ONLY") != null;
+        }
+        fn ladderProbePeriod() u64 {
+            if (std.c.getenv("DMLX_MTP_NO_LADDER_PROBE") != null) return 0;
+            const v = std.c.getenv("DMLX_MTP_LADDER_PROBE_PERIOD") orelse
+                return ladder_probe_period_default;
+            return std.fmt.parseInt(u64, std.mem.span(v), 10) catch
+                ladder_probe_period_default;
+        }
+        fn deepProbePeriod() u64 {
+            if (std.c.getenv("DMLX_MTP_NO_DEEP_PROBE") != null) return 0;
+            const v = std.c.getenv("DMLX_MTP_DEEP_PROBE_PERIOD") orelse
+                return deep_probe_period_default;
+            return std.fmt.parseInt(u64, std.mem.span(v), 10) catch
+                deep_probe_period_default;
+        }
         /// Rounds spent at `max_n` at the start of every request before the
         /// argmin is trusted. DEFAULT 0 — measured net-negative, see below.
         ///
@@ -1440,7 +1522,17 @@ pub const EngineLoop = struct {
             if (self.used[self.max_n - 1] < exploreRounds()) {
                 const deep_used = self.used[self.max_n - 1];
                 var keep_exploring = true;
-                if (deep_used >= 3) {
+                // The early exit is what drops a request into the slow fixed
+                // point: the draws that ended at `N=7:4r` / `N=7:6r` are
+                // exactly the ones where it fired, and they ran 26 t/s against
+                // 29-30 for the draws that explored through and parked deep.
+                // It judges the deep arm on 3 rounds taken during math's
+                // documented low-acceptance opening (~15 rounds at k=2.6/7),
+                // then never revisits — and per the deep-cadence result above,
+                // revisiting cannot work, so this one decision is final.
+                // Opt-out so the threshold stays A/B-able; it was tuned on
+                // 2026-11-02, before evidence decay existed.
+                if (deep_used >= 3 and std.c.getenv("DMLX_MTP_NO_EXPLORE_EARLY_EXIT") == null) {
                     if (self.score(self.max_n)) |deep_score| {
                         var alt: f64 = std.math.floatMax(f64);
                         var found = false;
@@ -1465,8 +1557,66 @@ pub const EngineLoop = struct {
             // Periodic probe, cycling from the deepest downward: the chosen
             // depth stops generating evidence for p_i beyond it, and every
             // unchosen depth's cost estimate would otherwise go stale.
+            // Deep probe on its own short cadence (see deep_probe_period).
+            // Checked BEFORE the rotation so it is never crowded out.
+            const deep_period = deepProbePeriod();
+            if (deep_period != 0 and self.rounds % deep_period == 0 and
+                self.last_pick != self.max_n)
+            {
+                return self.max_n;
+            }
+            // Ladder probe: refresh the rungs immediately above the incumbent.
+            //
+            // The argmin cannot climb because `reached[i]` for i above the
+            // incumbent decays every round (evidence decay 0.9) while a
+            // shallow round observes nothing past p_2. Parked at N=2, depth
+            // 4's E[tokens] is computed from a p_3/p_4 tail that has decayed
+            // back toward the Laplace prior, so depth 4 looks worse than it
+            // is and never gets chosen — self-reinforcing, one rung up from
+            // the old depth-1 collapse.
+            //
+            // Why +2 and not max_n: measured (artifacts/
+            // fixed_depth_20261103.json, 3 interleaved passes, nonced) the
+            // best FIXED depth on math is 4, not 7 —
+            //   math   adaptive 29.8   fix7 32.3   fix4 34.8
+            // so the controller is leaving 17% on the table there, and the
+            // target it needs to reach is two rungs up, not five. Probing
+            // max_n instead measured WORSE (see deep_probe_period_default):
+            // it is a dearer round and it refreshes p_5..p_7, which are not
+            // what gates the step from 2 to 4.
+            //
+            // Adaptive is still the right default overall — it wins code
+            // (33.8 vs 29.1), prose (23.8 vs 21.4) and count (28.8 vs 27.6)
+            // against fix4 — so the goal is to keep that and recover math,
+            // not to pin the depth.
+            // Only fire when the rung's evidence is actually STALE. The probe
+            // exists to refresh decayed evidence, so paying for it where the
+            // rung is already being observed every round is pure overhead.
+            // Content that parks deep (code, count) reaches the rung as a
+            // matter of course; content that parks shallow (math) does not.
+            //
+            // Under decay 0.9 a rung sampled every round settles near
+            // 1/(1-0.9) = 10, and an unsampled one falls below 1.0 in about
+            // 22 rounds, so 1.0 reads as "effectively unobserved". Measured
+            // cost of firing unconditionally (artifacts/
+            // ladder_probe_20261103.json): math +8.9% but code -2.2%,
+            // prose -2.3%, count -3.7%.
+            const ladder_period = ladderProbePeriod();
+            if (ladder_period != 0 and self.last_pick != 0 and
+                self.rounds % ladder_period == 0)
+            {
+                const rung = @min(self.last_pick + 2, self.max_n);
+                if (rung != self.last_pick and
+                    (!ladderStaleOnly() or self.reached[rung - 1] < ladder_stale_floor))
+                {
+                    return rung;
+                }
+            }
             if (self.rounds % probe_period == 0) {
-                const slot = (self.rounds / probe_period) % self.max_n;
+                // Skip slot 0: that is `max_n`, which now has its own cadence,
+                // and spending the rotation slot on it would leave the middle
+                // depths staler than before.
+                const slot = 1 + (self.rounds / probe_period) % (self.max_n - 1);
                 return self.max_n - slot;
             }
             var best: usize = 1;
@@ -1531,6 +1681,37 @@ pub const EngineLoop = struct {
                 k + 1 >= n and n >= self.max_n - 1 and self.force_explore == 0)
             {
                 self.force_explore = 3;
+            }
+            // Score latch: a deep probe that MEASURED better than the
+            // incumbent earns two more rounds to firm the estimate up.
+            //
+            // The near-full-acceptance latch above is effectively dead at
+            // ceiling 7: it needs k + 1 >= n, i.e. k >= 6, while the deep arm
+            // runs E[t] ~= 4.7 (about 3.7 accepted of 7) even in its GOOD
+            // phase. So the one amplifier the deep probe had almost never
+            // fired, and a lone probe round cannot win on its own — Laplace
+            // smoothing keeps a single sample near the prior and the 10%
+            // hysteresis then protects the incumbent.
+            //
+            // Latching on the score instead tests exactly the quantity the
+            // argmin uses, so it cannot fire on content where depth really
+            // loses, and the hysteresis still gates the actual switch; all
+            // this buys is enough samples for that decision to be made on
+            // evidence rather than on one diluted round.
+            // Part of the deep-cadence package, so it is off with it: on its
+            // own it would be inert anyway (with the cadence disabled the
+            // rotation skips slot 0, so `n == max_n` only happens during
+            // exploration, when `last_pick` is still 0).
+            if (deepProbePeriod() != 0 and
+                std.c.getenv("DMLX_MTP_NO_SCORE_LATCH") == null and
+                n == self.max_n and self.force_explore == 0 and
+                self.last_pick != 0 and self.last_pick != self.max_n)
+            {
+                if (self.score(self.max_n)) |deep| {
+                    if (self.score(self.last_pick)) |inc| {
+                        if (deep < inc) self.force_explore = 2;
+                    }
+                }
             }
         }
     };

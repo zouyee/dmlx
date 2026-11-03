@@ -65,10 +65,20 @@ def wait_up(timeout: int = 300) -> bool:
 
 
 def one_request(max_tokens: int) -> tuple[float, int]:
-    """Return (decode_tok_s, generated_tokens) for one non-streaming request.
+    """Return (wall_seconds, generated_tokens) for one non-streaming request.
 
     Non-streaming is mandatory: dmlx only runs the speculative path off the
     streaming fast path, so a streaming client would measure the wrong engine.
+
+    This returns WALL TIME, not a rate, because the rate has to have prefill
+    taken out of it before it means anything. The first version of this script
+    reported tokens/wall, i.e. effective tok/s: on a 103-token math answer
+    that folds ~0.78 s of prefill into a ~3.7 s request, so it understated
+    decode by ~22% AND let the varying answer length (98-116 tokens) move the
+    prefill fraction between draws. Three controller A/Bs run that way all
+    came back "neutral" because the dilution and the extra variance were
+    larger than the effects being tested. Callers must divide by
+    `wall - ttft` using the per-arm TTFT calibrated by `measure_ttft`.
     """
     body = json.dumps({
         "model": "m",
@@ -89,7 +99,19 @@ def one_request(max_tokens: int) -> tuple[float, int]:
     # The server reports generated_tokens in its own log; approximate with the
     # engine's usage block when present, else fall back to a word-ish count.
     n = (payload.get("usage") or {}).get("completion_tokens") or max(1, len(text) // 4)
-    return n / dt, n
+    return dt, n
+
+
+def measure_ttft(reps: int = 3) -> float:
+    """Prefill + first token, from max_tokens=1 requests.
+
+    Measured directly rather than modelled: the server emits no prefill
+    timing line, and a one-token request isolates exactly the term that has
+    to come out of the wall clock. Median of `reps` — the first one pays
+    cache effects the later ones do not.
+    """
+    v = sorted(one_request(1)[0] for _ in range(reps))
+    return v[len(v) // 2]
 
 
 def run_arm(name: str, env_extra: dict[str, str], requests: int,
@@ -109,11 +131,17 @@ def run_arm(name: str, env_extra: dict[str, str], requests: int,
         # warmup and drafter priming, which is the very effect under test and
         # must not land in the sample.
         one_request(max_tokens)
+        ttft = measure_ttft()
         marker = log_path.stat().st_size
         rows = []
         for _ in range(requests):
-            tok_s, n = one_request(max_tokens)
-            rows.append({"tok_s": tok_s, "tokens": n})
+            wall, n = one_request(max_tokens)
+            decode_s = wall - ttft
+            rows.append({
+                "tok_s": (n - 1) / decode_s if decode_s > 0 else float("nan"),
+                "effective_tok_s": n / wall,
+                "tokens": n, "wall_s": wall,
+            })
         time.sleep(0.5)
         tail = log_path.read_text()[marker:]
     finally:
@@ -130,7 +158,8 @@ def run_arm(name: str, env_extra: dict[str, str], requests: int,
         r["acc"] = accs[i].strip() if i < len(accs) else "?"
         r["round_ms"] = (f"draft={reqs[i][3]} verify={reqs[i][4]}"
                          if i < len(reqs) else "?")
-    return {"name": name, "env": env_extra, "rows": rows, "log": str(log_path)}
+    return {"name": name, "env": env_extra, "ttft_s": ttft,
+            "rows": rows, "log": str(log_path)}
 
 
 def main() -> int:
@@ -141,14 +170,15 @@ def main() -> int:
     args = ap.parse_args()
 
     arms = [
-        ("excl", {}),                                      # round-1 cost skipped (current)
-        ("count", {"DMLX_MTP_COUNT_ROUND1_COST": "1"}),    # round-1 cost counted (pre-fix)
+        ("ladder", {}),                                    # ladder probe ON (head)
+        ("noladder", {"DMLX_MTP_NO_LADDER_PROBE": "1"}),
     ]
     results = []
     for name, env in arms:
         print(f"\n=== arm {name}  env={env or 'baseline'}", flush=True)
         res = run_arm(name, env, args.requests, args.max_tokens)
         results.append(res)
+        print(f"  ttft {res['ttft_s']:.3f}s (subtracted)")
         for i, r in enumerate(res["rows"]):
             print(f"  [{i}] {r['tok_s']:5.1f} tok/s  {r['tokens']:>4}tok  "
                   f"{r['round_ms']}\n       {r['depth']}\n       {r['acc']}",

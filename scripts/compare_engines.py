@@ -202,6 +202,52 @@ def engines() -> dict[str, Engine]:
                  "--port", str(PORT)],
             note="adaptive MTP, ceiling 7",
         ),
+        # Fixed-depth arms. These exist because the adaptive controller's
+        # choice on math is a coin flip between two fixed points, and every
+        # heuristic tried so far loses (see engine_loop.zig
+        # deep_probe_period_default and the explore early-exit comment). The
+        # mode traces say cost(7) and cost(2) per ROUND are both ~132 ms and
+        # the whole difference is E[tokens] — 4.7 parked at 7 versus 2.6 at
+        # 2 — so a fixed deep depth should win outright if the controller is
+        # the problem rather than the depth. Fixed depth also removes the
+        # mode lottery, which is the dominant variance source on math.
+        "dmlx-fix7": Engine(
+            name="dmlx-fix7",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "7"},
+            note="FIXED depth 7, controller disabled",
+        ),
+        "dmlx-fix4": Engine(
+            name="dmlx-fix4",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "4",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "4"},
+            note="FIXED depth 4, controller disabled",
+        ),
+        # A/B arm: disable the ladder probe (rungs above the incumbent).
+        # Head has it ON; this is the pre-ladder baseline.
+        "dmlx-noladder": Engine(
+            name="dmlx-noladder",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_NO_LADDER_PROBE": "1"},
+            note="adaptive MTP ceiling 7, no ladder probe",
+        ),
+        # A/B arm: ladder probe on its ungated cadence (fires every period
+        # regardless of whether the rung's evidence has decayed). Head gates
+        # it on staleness; this arm measures what that gate is worth.
+        "dmlx-ladderalways": Engine(
+            name="dmlx-ladderalways",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_LADDER_ALWAYS": "1"},
+            note="adaptive MTP ceiling 7, ladder probe ungated",
+        ),
         # A/B arm: REVERT the round-1 cost exclusion. The controller's
         # cost(n) EMA now skips a request's first round, because drafter
         # repriming over the prompt is lazy-evaluated into the first draft
