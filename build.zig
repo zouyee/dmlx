@@ -735,21 +735,11 @@ pub fn build(b: *std.Build) void {
     const run_bench_verify_kernel_step = b.step("run-bench-verify-kernel", "Split-K verify kernel vs stock qmm at M=2..6");
     run_bench_verify_kernel_step.dependOn(&run_bench_verify_kernel.step);
 
-    // Does the number of distinct weight buffers change streaming bandwidth?
-    const bench_weight_layout = b.addExecutable(.{
-        .name = "bench-weight-layout",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/bench_weight_layout.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    bench_weight_layout.root_module.addImport("mlx", mlx_z_module);
-    const run_bench_weight_layout = b.addRunArtifact(bench_weight_layout);
-    if (b.args) |args| run_bench_weight_layout.addArgs(args);
-    const run_bench_weight_layout_step = b.step("run-bench-weight-layout", "Weight buffer count vs achieved streaming bandwidth");
-    run_bench_weight_layout_step.dependOn(&run_bench_weight_layout.step);
+    // The weight-buffer-layout question is answered in
+    // scripts/weight_residency_bench.py: the per-tensor copy is NOT the
+    // plain-decode gap (copied 156.1 GB/s vs mmap 135.3 on real checkpoint
+    // tensors). The Zig bench that used to live here reported 0.1 GB/s for
+    // every layout and was removed rather than left as a trap.
 
     // --- Scratch: weight bit-width sweep at decode shapes (uncommitted) ---
     const bench_bits = b.addExecutable(.{
