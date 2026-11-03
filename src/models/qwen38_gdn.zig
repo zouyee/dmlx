@@ -92,6 +92,12 @@ var gdn_prof: struct {
     v_states_ns: u64 = 0,
     v_tail_ns: u64 = 0,
     v_layers: u64 = 0,
+    // Host-side build-time counters (DMLX_MTP_DEBUG=1), no barriers.
+    v_front_host_ns: u64 = 0,
+    v_rec_host_ns: u64 = 0,
+    v_tail_host_ns: u64 = 0,
+    v_submit_host_ns: u64 = 0,
+    v_layers_host: u64 = 0,
     f_proj_ns: u64 = 0,
     f_conv_ns: u64 = 0,
     f_gate_ns: u64 = 0,
@@ -101,6 +107,29 @@ var gdn_prof: struct {
     tail_ns: u64 = 0,
     layers: u64 = 0,
 } = .{};
+
+/// Print and reset the host-side build-time counters (DMLX_MTP_DEBUG=1).
+pub fn gdnVerifyHostProfReport() void {
+    if (gdn_prof.v_layers_host == 0) return;
+    const f = struct {
+        fn ms(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    };
+    const per = @as(f64, @floatFromInt(gdn_prof.v_layers_host));
+    std.debug.print("gdn verify host build/layer: front={d:.3}ms rec={d:.3}ms tail={d:.3}ms submit={d:.3}ms (n_layers={d})\n", .{
+        f.ms(gdn_prof.v_front_host_ns) / per,
+        f.ms(gdn_prof.v_rec_host_ns) / per,
+        f.ms(gdn_prof.v_tail_host_ns) / per,
+        f.ms(gdn_prof.v_submit_host_ns) / per,
+        gdn_prof.v_layers_host,
+    });
+    gdn_prof.v_front_host_ns = 0;
+    gdn_prof.v_rec_host_ns = 0;
+    gdn_prof.v_tail_host_ns = 0;
+    gdn_prof.v_submit_host_ns = 0;
+    gdn_prof.v_layers_host = 0;
+}
 
 var gdn_prof_enabled: ?bool = null;
 var verify_prof_enabled: ?bool = null;
@@ -2957,6 +2986,11 @@ pub const Qwen38GDN = struct {
     q_norm_w: Array, // [D] f32, ones * D^-1 (folded q scale) for fast.rmsNorm
     k_norm_w: Array, // [D] f32, ones * D^-0.5 (folded k scale) for fast.rmsNorm
     qk_idx: Array, // [Hv] i32, value head h -> key head h / (Hv/Hk)
+    // Hoisted per-round constants (optional; null = compute per call).
+    // prefillFront otherwise re-casts conv1d_t to f32 and re-computes
+    // exp(A_log) on EVERY prefill/verify call — two ops x 48 layers per round.
+    conv1d_t_f32: ?Array = null, // [K, QKV] f32
+    e_a_log: ?Array = null, // [HV] f32, exp(astype(A_log, f32))
 
     // Optional quantized forms (affine 4-bit gs=64 in the real checkpoint).
     qkv_scales: ?Array = null,
@@ -2989,6 +3023,8 @@ pub const Qwen38GDN = struct {
         self.q_norm_w.deinit();
         self.k_norm_w.deinit();
         self.qk_idx.deinit();
+        if (self.conv1d_t_f32) |a| a.deinit();
+        if (self.e_a_log) |a| a.deinit();
         if (self.qkv_scales) |a| a.deinit();
         if (self.qkv_biases) |a| a.deinit();
         if (self.a_scales) |a| a.deinit();
@@ -3161,8 +3197,8 @@ pub const Qwen38GDN = struct {
         // Fast path: one kernel for the K taps + silu, no concatenated
         // window and no separate silu pass (see `convAccumSeqFused`).
         var used_fused = true;
-        const w_f32 = try ops.astype(ctx, self.conv1d_t, .float32);
-        defer w_f32.deinit();
+        const w_f32 = if (self.conv1d_t_f32) |w| w else try ops.astype(ctx, self.conv1d_t, .float32);
+        defer if (self.conv1d_t_f32 == null) w_f32.deinit();
         const qkv = blk: {
             if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K)) |fused| {
                 break :blk fused;
@@ -3224,10 +3260,14 @@ pub const Qwen38GDN = struct {
         defer a_dt.deinit();
         const sp = try softplusStep(ctx, a_dt);
         defer sp.deinit();
-        const a_log_f32 = try ops.astype(ctx, self.A_log, .float32);
-        defer a_log_f32.deinit();
-        const e_a_log = try ops.exp(ctx, a_log_f32);
-        defer e_a_log.deinit();
+        var e_a_log_owned: ?Array = null;
+        defer if (e_a_log_owned) |*e| e.deinit();
+        const e_a_log = if (self.e_a_log) |e| e else blk: {
+            const a_log_f32 = try ops.astype(ctx, self.A_log, .float32);
+            defer a_log_f32.deinit();
+            e_a_log_owned = try ops.exp(ctx, a_log_f32);
+            break :blk e_a_log_owned.?;
+        };
         const g_pre = try ops.multiply(ctx, e_a_log, sp);
         defer g_pre.deinit();
         const g_neg = try ops.negative(ctx, g_pre);
@@ -3494,9 +3534,15 @@ pub const Qwen38GDN = struct {
         // as §17.2 for prefill). Dump with `gdnVerifyProfReport`.
         const vp = gdnVerifyProfEnabled();
         var vt: i128 = if (vp) nowNs() else 0;
+        const hp = std.c.getenv("DMLX_MTP_DEBUG") != null;
+        var ht: i128 = if (hp) nowNs() else 0;
 
         var front = try self.prefillFront(x, cache);
         defer front.deinit();
+        if (hp) {
+            gdn_prof.v_front_host_ns += @intCast(nowNs() - ht);
+            ht = nowNs();
+        }
         if (vp) {
             // Force EVERY front output: `z` has its own qmm and is consumed in
             // the tail, so leaving it lazy charges that qmm to the tail (the
@@ -3588,6 +3634,10 @@ pub const Qwen38GDN = struct {
             gdn_prof.v_rec_ns += @intCast(nowNs() - vt);
             vt = nowNs();
         }
+        if (hp) {
+            gdn_prof.v_rec_host_ns += @intCast(nowNs() - ht);
+            ht = nowNs();
+        }
 
         // Per-step conv states: rows [t+1, t+K) of the window. By default we
         // hand the window itself to the caller and let commitVerifyStates cut
@@ -3622,6 +3672,10 @@ pub const Qwen38GDN = struct {
 
         const out = try self.prefillTail(y, front.z, front.qkv.dtype());
         errdefer out.deinit();
+        if (hp) {
+            gdn_prof.v_tail_host_ns += @intCast(nowNs() - ht);
+            ht = nowNs();
+        }
         if (vp) {
             out.eval() catch {};
             gdn_prof.v_tail_ns += @intCast(nowNs() - vt);
@@ -3629,11 +3683,27 @@ pub const Qwen38GDN = struct {
         }
         // Materialize everything the caller may commit: all retained states.
         // `conv_window` is deliberately NOT evaluated — commit slices it.
-        if (conv_states.len > 0) try eval_mod.asyncEval(allocator, conv_states);
-        if (s_all) |s| {
-            try eval_mod.asyncEval(allocator, &[_]Array{s});
-        } else if (ssm_states.len > 0) {
-            try eval_mod.asyncEval(allocator, ssm_states);
+        //
+        // The per-layer asyncEval submits DOUBLE as CPU/GPU overlap: while the
+        // host builds layer i+1's graph, the GPU runs layer i. Removing them
+        // (measured 2026-11-03) dropped total verify host build 70 -> 2 ms but
+        // the serial final eval grew 18 -> 85+ ms and decode fell ~10%
+        // (34.9 -> 30.7 tok/s thinking code) — the GPU needs the whole ~85 ms
+        // regardless, so overlapping it with the host build is strictly
+        // better. DMLX_VERIFY_LAYER_SUBMIT=0 disables for experiments.
+        if (std.c.getenv("DMLX_VERIFY_LAYER_SUBMIT") == null or
+            !std.mem.eql(u8, std.mem.span(std.c.getenv("DMLX_VERIFY_LAYER_SUBMIT").?), "0"))
+        {
+            if (conv_states.len > 0) try eval_mod.asyncEval(allocator, conv_states);
+            if (s_all) |s| {
+                try eval_mod.asyncEval(allocator, &[_]Array{s});
+            } else if (ssm_states.len > 0) {
+                try eval_mod.asyncEval(allocator, ssm_states);
+            }
+        }
+        if (hp) {
+            gdn_prof.v_submit_host_ns += @intCast(nowNs() - ht);
+            gdn_prof.v_layers_host += 1;
         }
         return .{
             .out = out,

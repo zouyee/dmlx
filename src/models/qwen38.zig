@@ -177,6 +177,14 @@ pub fn gdnBranch(
     defer pre.deinit();
     const a_log = try ws.tensor(fmtName(&nbuf, "{s}.A_log", .{la}));
     defer a_log.deinit();
+    // Hoisted per-round constants for prefillFront (verify runs it 48x/round):
+    // the f32 conv weight cast and exp(A_log) are layer constants.
+    const conv1d_t_f32 = try ops.astype(ctx, pre.conv1d_t, .float32);
+    try conv1d_t_f32.eval();
+    const a_log_f32_h = try ops.astype(ctx, a_log, .float32);
+    defer a_log_f32_h.deinit();
+    const e_a_log_h = try ops.exp(ctx, a_log_f32_h);
+    try e_a_log_h.eval();
     const dt_bias = try ws.tensor(fmtName(&nbuf, "{s}.dt_bias", .{la}));
     defer dt_bias.deinit();
     const norm_w = try ws.tensor(fmtName(&nbuf, "{s}.norm.weight", .{la}));
@@ -196,6 +204,8 @@ pub fn gdnBranch(
         .q_norm_w = pre.q_norm_w,
         .k_norm_w = pre.k_norm_w,
         .qk_idx = pre.qk_idx,
+        .conv1d_t_f32 = conv1d_t_f32,
+        .e_a_log = e_a_log_h,
         .in_proj_a = a_q.data,
         .in_proj_b = b_q.data,
         .in_proj_z = z_q.data,
@@ -2099,6 +2109,16 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
     var normed1_carry: ?Array = null;
     defer if (normed1_carry) |*nc| nc.deinit();
 
+    var prof_gdn_ns: i128 = 0;
+    var prof_attn_ns: i128 = 0;
+    var prof_mlp_ns: i128 = 0;
+    var prof_ts: std.c.timespec = undefined;
+    var prof_mark: i128 = 0;
+    if (prof) {
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_ts);
+        prof_mark = @as(i128, prof_ts.sec) * std.time.ns_per_s + prof_ts.nsec;
+    }
+
     for (self.layers, 0..) |*lp, layer| {
         const normed1 = if (normed1_carry) |nc| blk: {
             normed1_carry = null;
@@ -2121,6 +2141,12 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
                 break :blk try a.forward(normed1, cache);
             },
         };
+        if (prof) {
+            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_ts);
+            const now = @as(i128, prof_ts.sec) * std.time.ns_per_s + prof_ts.nsec;
+            if (lp.module == .gdn) prof_gdn_ns += now - prof_mark else prof_attn_ns += now - prof_mark;
+            prof_mark = now;
+        }
         defer if (lp.module != .gdn) attn_out.deinit();
         // h += attn_out, then rmsNorm(h, ln2) for the MLP branch.
         const r1 = try addRmsNorm(ctx, h, attn_out, lp.ln2_f32, cfg.rms_norm_eps);
@@ -2151,6 +2177,12 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
             // (verify 98.6-101.7 vs 96.6-97.0 ms/round, 2026-10-30) — reverted.
             break :blk try mlpForwardPersistent(ctx, lp, normed2);
         };
+        if (prof) {
+            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_ts);
+            const now = @as(i128, prof_ts.sec) * std.time.ns_per_s + prof_ts.nsec;
+            prof_mlp_ns += now - prof_mark;
+            prof_mark = now;
+        }
         defer mlp_out.deinit();
         if (layer + 1 < self.layers.len) {
             const r2 = try addRmsNorm(ctx, h, mlp_out, self.layers[layer + 1].ln1_f32, cfg.rms_norm_eps);
@@ -2192,6 +2224,16 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
         const build_ms = @as(f64, @floatFromInt(@as(i128, prof_t1.sec - prof_t0.sec) * std.time.ns_per_s + (prof_t1.nsec - prof_t0.nsec))) / 1e6;
         const eval_ms = @as(f64, @floatFromInt(@as(i128, t2.sec - prof_t1.sec) * std.time.ns_per_s + (t2.nsec - prof_t1.nsec))) / 1e6;
         std.debug.print("verify split: build={d:.1}ms eval={d:.1}ms\n", .{ build_ms, eval_ms });
+        if (prof_gdn_ns + prof_attn_ns + prof_mlp_ns > 0) {
+            const f = 1e6;
+            std.debug.print("verify build parts: gdn={d:.1}ms attn={d:.1}ms mlp+rms={d:.1}ms other={d:.1}ms\n", .{
+                @as(f64, @floatFromInt(prof_gdn_ns)) / f,
+                @as(f64, @floatFromInt(prof_attn_ns)) / f,
+                @as(f64, @floatFromInt(prof_mlp_ns)) / f,
+                build_ms - @as(f64, @floatFromInt(prof_gdn_ns + prof_attn_ns + prof_mlp_ns)) / f,
+            });
+            qwen38_gdn.gdnVerifyHostProfReport();
+        }
     }
 
     return .{

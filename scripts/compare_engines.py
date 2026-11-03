@@ -300,11 +300,18 @@ def engines() -> dict[str, Engine]:
         # and only the engine differs.
         "omlx-mtp": Engine(
             name="omlx-mtp",
+            # --no-cache: the paged SSD prefix cache breaks the two-point
+            # decode measurement — the long request of a pair reuses the
+            # short request's just-written prompt prefix, shrinking t_long
+            # and inflating decode_tok_s (measured: alternating 53/40 t/s
+            # samples, 2026-11-03). The nonce only defeats CROSS-run reuse,
+            # not within-pair reuse.
             cmd=[OMLX_PY, "-m", "omlx.cli", "serve",
                  "--model-dir", os.path.dirname(OMLX_MTP_MODEL),
+                 "--no-cache",
                  "--port", str(PORT)],
             model_id=os.path.basename(OMLX_MTP_MODEL),
-            note="native Lightning MTP, adaptive depth",
+            note="native Lightning MTP, adaptive depth, prefix cache off (measurement hygiene)",
         ),
         # Parity arm: omlx's DEFAULT on this model is thinking-ON with the
         # reasoning-effort system prompt (reasoning_tokens ~86% of the
@@ -318,10 +325,11 @@ def engines() -> dict[str, Engine]:
             name="omlx-mtp-nothink",
             cmd=[OMLX_PY, "-m", "omlx.cli", "serve",
                  "--model-dir", os.path.dirname(OMLX_MTP_MODEL),
+                 "--no-cache",
                  "--port", str(PORT)],
             model_id=os.path.basename(OMLX_MTP_MODEL),
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-            note="omlx-mtp with enable_thinking=false (parity with dmlx-nothink)",
+            note="omlx-mtp with enable_thinking=false, prefix cache off (parity with dmlx-nothink)",
         ),
     }
 
