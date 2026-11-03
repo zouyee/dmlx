@@ -415,3 +415,48 @@ chunked numerics tradeoff).
 Full scorecard r3 (artifacts/prefill_close_20261102_r3.json): code +13.5%,
 count +27%, math/prose inside their decode sigma, TTFT short 0.28 vs 0.78 s,
 ttft@512 4.32 vs 4.64 s, ttft@2048 16.14 vs 15.76 s.
+
+## Thinking-mode decode attribution (2026-11-03)
+
+The thinking-mode scoreboard (dmlx 32.5 vs omlx 46.8 HEADLINE, -30%) was
+mostly a MEASUREMENT ARTIFACT. Root cause chain:
+
+1. omlx per-request two-point samples alternated strictly 53/40/53/40 t/s.
+   The 8-token request of each pair writes the prompt prefix into omlx's
+   paged SSD cache; the 128-token request then reuses it, shrinking t_long
+   and inflating decode_tok_s. The --nonce flag only defeats CROSS-run
+   reuse, not within-pair. Fixed with --no-cache on both omlx arms
+   (compare_engines.py, ef56873).
+2. True same-window comparison on the code prompt (fresh servers, two-point
+   8->128): dmlx 34.9 vs omlx 35.0-35.9 tok/s — dead even. On 8->256:
+   omlx ~42. omlx's own steady-state log: 3.87-3.88 tok/cycle at ~87
+   ms/cycle ~= 44 tok/s.
+
+Physics floor: the model is DENSE 27B (16 GB @ 4-bit). Any full forward
+reads ~16 GB -> ~58 ms @ 273 GB/s. Both engines' verify rounds cost
+~84-90 ms (ours: draft 12.4 + verify ~90 + accept/commit 0.6; theirs:
+mtp ~2 + backbone ~84 + cache ~1.5 — but their lazy-eval smears the draft
+lm_head cost into "backbone", so the honest comparison is cycle totals:
+103 vs 87 ms with EQUAL tokens/round, 3.94 vs 3.87).
+
+Verify cost anatomy (DMLX_MTP_DEBUG build/eval split + GDN host breakdown):
+- host build 70 ms, of which 62 ms = the per-layer asyncEval submits
+  (1.30 ms x 48 layers). Those submits double as CPU/GPU overlap: removing
+  them (DMLX_VERIFY_LAYER_SUBMIT=0) drops build to 2.1 ms but the serial
+  final eval grows 18 -> 85 ms and decode falls ~10% — the GPU needs the
+  whole ~85 ms either way, so the overlap is strictly good.
+- GPU eval ~85 ms for an 8-token forward; plain decode (M=1) is ~60-67 ms
+  (16 GB read). The M=8..9 verify marginal over M=1 is compute + the
+  per-layer state retention.
+- GDN per-layer: front (4 proj qmm + conv + gates) 68%, tail 22%, recur
+  10% (barriered; inflates small kernels).
+
+Also verified: depth cap is already optimal (7: 34.9 / 4: 32.0 / 3: 32.6
+tok/s) — the depth-7 ceiling survives because verify cost is dominated by
+the full-weight pass, not by row count.
+
+Remaining real gap: ~5 ms/round (draft chain 12.4 vs their ~7 hidden).
+S1 (compile draft step) + S3 (GPU-resident verify input) stay on the table
+at ~+3.5% combined. The omlx-only structural remainder is their fused
+verify-op stack (custom_kernels/qwen35_prefill): ~30 small per-layer ops
+fused away.
