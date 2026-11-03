@@ -170,8 +170,10 @@ def main() -> int:
     args = ap.parse_args()
 
     arms = [
-        ("ladder", {}),                                    # ladder probe ON (head)
-        ("noladder", {"DMLX_MTP_NO_LADDER_PROBE": "1"}),
+        ("h090", {}),                                        # head
+        ("h095", {"DMLX_MTP_HYSTERESIS": "0.95"}),
+        ("h098", {"DMLX_MTP_HYSTERESIS": "0.98"}),
+        ("h100", {"DMLX_MTP_HYSTERESIS": "1.0"}),
     ]
     results = []
     for name, env in arms:

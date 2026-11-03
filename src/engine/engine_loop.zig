@@ -1318,6 +1318,31 @@ pub const EngineLoop = struct {
         fn ladderStaleOnly() bool {
             return std.c.getenv("DMLX_MTP_LADDER_STALE_ONLY") != null;
         }
+        /// How many rungs above the incumbent to probe. 2 was the first value
+        /// tried and the one the fixed-depth references pointed at (math wants
+        /// 4 while the controller parks at 2); it has not been swept.
+        const ladder_rung_default: usize = 2;
+        /// Challenger must beat the incumbent by this factor to take over.
+        /// Tunable because it was tuned BEFORE the ladder probe existed: the
+        /// 10% margin was protecting against noise in evidence that nothing
+        /// was refreshing, and now the rung above the incumbent is sampled
+        /// every 6 rounds, so the same margin may just be blocking a real
+        /// climb. The fixed-depth references say depth 4 is ~17% better than
+        /// the controller's pick on math, but an 8%-better rung would be
+        /// vetoed outright.
+        const hysteresis_default: f64 = 0.90;
+        fn hysteresis() f64 {
+            const v = std.c.getenv("DMLX_MTP_HYSTERESIS") orelse
+                return hysteresis_default;
+            return std.fmt.parseFloat(f64, std.mem.span(v)) catch
+                hysteresis_default;
+        }
+        fn ladderRung() usize {
+            const v = std.c.getenv("DMLX_MTP_LADDER_RUNG") orelse
+                return ladder_rung_default;
+            return std.fmt.parseInt(usize, std.mem.span(v), 10) catch
+                ladder_rung_default;
+        }
         fn ladderProbePeriod() u64 {
             if (std.c.getenv("DMLX_MTP_NO_LADDER_PROBE") != null) return 0;
             const v = std.c.getenv("DMLX_MTP_LADDER_PROBE_PERIOD") orelse
@@ -1605,7 +1630,7 @@ pub const EngineLoop = struct {
             if (ladder_period != 0 and self.last_pick != 0 and
                 self.rounds % ladder_period == 0)
             {
-                const rung = @min(self.last_pick + 2, self.max_n);
+                const rung = @min(self.last_pick + ladderRung(), self.max_n);
                 if (rung != self.last_pick and
                     (!ladderStaleOnly() or self.reached[rung - 1] < ladder_stale_floor))
                 {
@@ -1633,7 +1658,7 @@ pub const EngineLoop = struct {
             // what this filters out is noise-level thrash.
             if (self.last_pick != 0 and best != self.last_pick) {
                 if (self.score(self.last_pick)) |inc| {
-                    if (best_score > inc * 0.90) best = self.last_pick;
+                    if (best_score > inc * hysteresis()) best = self.last_pick;
                 }
             }
             self.last_pick = best;
