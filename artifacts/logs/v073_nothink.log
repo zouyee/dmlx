@@ -1,0 +1,26 @@
+prefix-cache nonce: run19793 (every prompt is textually novel)
+[pass 1/3] dmlx-nothink ...
+[pass 1/3] omlx-mtp-nothink ...
+[pass 2/3] dmlx-nothink ...
+[pass 2/3] omlx-mtp-nothink ...
+[pass 3/3] dmlx-nothink ...
+[pass 3/3] omlx-mtp-nothink ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx-nothink?         code            50.4       44.4     0.36
+dmlx-nothink?         prose           24.8       22.4     0.59
+dmlx-nothink?         math            46.9       39.9     0.50
+dmlx-nothink?         count*          62.0       54.3     0.31
+dmlx-nothink          HEADLINE        40.7
+omlx-mtp-nothink?         code            43.0       37.4     0.47
+omlx-mtp-nothink?         prose           25.4       24.0     0.35
+omlx-mtp-nothink?         math            44.0       35.5     0.71
+omlx-mtp-nothink?         count*          47.8       40.7     0.49
+omlx-mtp-nothink          HEADLINE        37.5
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx-nothink      0.279s        129.1      524-2060      4.353s     16.272s
+omlx-mtp-nothink      0.901s        137.6      564-2100      4.559s     15.723s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/v073_nothink_20261103.json

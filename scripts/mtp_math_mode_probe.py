@@ -183,8 +183,8 @@ def main() -> int:
     print(f"prompt [{args.prompt}]: {PROMPT}")
 
     arms = [
-        ("median8", {}),                                     # head: median of last 8
-        ("ema025", {"DMLX_MTP_COST_EMA": "1"}),               # previous: EMA alpha 0.25
+        ("fusedgates", {}),                                  # head
+        ("eagergates", {"DMLX_GDN_NO_FUSED_GATES": "1"}),
     ]
     results = []
     for name, env in arms:

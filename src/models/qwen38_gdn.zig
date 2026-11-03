@@ -2767,6 +2767,103 @@ fn softplusStep(ctx: EagerContext, x: Array) !Array {
     return ops.where(ctx, big, x, lp);
 }
 
+/// The verify/prefill gate chain as one compiled kernel.
+///
+/// `prefillFront` computes the gates as 11 separate elementwise dispatches
+/// over tiny [L, HV] tensors — add, exp, log1p, scalar, greater, where,
+/// multiply, negative, exp, sigmoid, astype. The verify forward reuses
+/// prefill's code, so that runs 48 times per verify round, and the decode
+/// path by contrast does the whole of its equivalent inside one monolithic
+/// kernel (`gdnConvTailWide`).
+///
+/// omlx fuses exactly this region. `qwen35_gdn_prework` collapses its
+/// conv-concat / conv1d / SiLU / split / two ones-weight RMS norms / scalar
+/// scales / next-conv-slice chain into a single Metal launch, and its own
+/// header prices the unfused version at ~10 dispatches per GDN layer per
+/// verify cycle, "the largest remaining verify-cycle cost after the
+/// attention split" (48 layers x ~0.29 ms measured on their side).
+///
+/// This is the cheap half of that idea: the gates are pure elementwise over
+/// one shape, so `mlx_compile` fuses them with no hand-written Metal and no
+/// new numerics. Op order is preserved exactly, so results are bit-identical
+/// to the eager chain. The gathers and RMS norms are left alone — they are
+/// not elementwise and would need the real kernel.
+fn gateClosureBody(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 4) return error.MlxError;
+    const ctx = closureGpuCtx(allocator);
+    defer ctx.deinit();
+    const a_flat = inputs[0];
+    const dt_bias = inputs[1];
+    const e_a_log = inputs[2];
+    const b_flat = inputs[3];
+
+    const a_dt = ops.add(ctx, a_flat, dt_bias) catch return error.MlxError;
+    defer a_dt.deinit();
+    const sp = softplusStep(ctx, a_dt) catch return error.MlxError;
+    defer sp.deinit();
+    const g_pre = ops.multiply(ctx, e_a_log, sp) catch return error.MlxError;
+    defer g_pre.deinit();
+    const g_neg = ops.negative(ctx, g_pre) catch return error.MlxError;
+    defer g_neg.deinit();
+    const g = ops.exp(ctx, g_neg) catch return error.MlxError;
+    errdefer g.deinit();
+
+    const beta_raw = ops.sigmoid(ctx, b_flat) catch return error.MlxError;
+    defer beta_raw.deinit();
+    const beta = ops.astype(ctx, beta_raw, .float32) catch return error.MlxError;
+    errdefer beta.deinit();
+
+    const out = allocator.alloc(Array, 2) catch return error.MlxError;
+    out[0] = g;
+    out[1] = beta;
+    return out;
+}
+
+var gate_closure: ?Closure = null;
+var gate_closure_failed: bool = false;
+
+/// Compiled gate chain, or null when compilation is off or has failed.
+fn gateClosure(allocator: std.mem.Allocator) ?Closure {
+    // OPT-IN. Collapsing the 11 elementwise gate dispatches into one compiled
+    // kernel is bit-identical (decode_env_ab_text 6/6 byte-identical) and
+    // measurement-neutral, so it does not earn being on by default:
+    //   code  mean +3.1%  median +9.9%  pairwise 55/100 (50 = chance)
+    //   math  mean -0.9%  median +0.4%  pairwise 47/100
+    // (10 draws/arm, artifacts/fusedgates_code_20261104.json,
+    // fusedgates_math_20261104.json. The code median moved more than the
+    // distribution did — the two sets straddle each other, which is what a
+    // median does on overlapping samples and why the pairwise count is the
+    // statistic to read.)
+    //
+    // The useful part is what this rules OUT. omlx's `qwen35_gdn_prework`
+    // header attributes its verify-cycle win to collapsing ~10 dispatches per
+    // GDN layer, and the natural reading is that the dispatch COUNT is the
+    // cost. On this machine it is not: removing 11 of ~27 non-qmm dispatches
+    // per GDN layer, ~530 per verify round, changes nothing measurable. That
+    // agrees with the earlier finding that dependent launch cost here is ~0
+    // (DMLX_DECODE_EXTRA_LAUNCH, +192 launches = 0 ms).
+    //
+    // So the verify forward's non-qmm time is real tensor work, not launch
+    // overhead: the conv kernel, the two rmsNorms, the two takeAxis gathers
+    // and the 7-op tail. A fused prework kernel would have to subsume THOSE
+    // to pay, and the gathers and norms are the parts that actually move
+    // bytes. Enable with DMLX_GDN_FUSED_GATES=1.
+    if (std.c.getenv("DMLX_GDN_FUSED_GATES") == null) return null;
+    if (gate_closure) |cl| return cl;
+    if (gate_closure_failed) return null;
+    const base = Closure.init(&gateClosureBody, allocator) catch {
+        gate_closure_failed = true;
+        return null;
+    };
+    defer base.deinit();
+    const compiled = compile_mod.compile(base, false) catch {
+        gate_closure_failed = true;
+        return null;
+    };
+    gate_closure = compiled;
+    return compiled;
+}
+
 /// One GDN decode token as a pure function of arrays. Body mirrors
 /// Qwen38GDN.forward exactly (same op sequence, same dtypes), but takes every
 /// weight/state as an explicit input and returns the new states instead of
@@ -3256,10 +3353,6 @@ pub const Qwen38GDN = struct {
         // kernel (decode rounds beta to b's dtype; widening back is lossless).
         const a_flat = try ops.reshape(ctx, a, &[_]i32{ L, HV });
         defer a_flat.deinit();
-        const a_dt = try ops.add(ctx, a_flat, self.dt_bias);
-        defer a_dt.deinit();
-        const sp = try softplusStep(ctx, a_dt);
-        defer sp.deinit();
         var e_a_log_owned: ?Array = null;
         defer if (e_a_log_owned) |*e| e.deinit();
         const e_a_log = if (self.e_a_log) |e| e else blk: {
@@ -3268,18 +3361,45 @@ pub const Qwen38GDN = struct {
             e_a_log_owned = try ops.exp(ctx, a_log_f32);
             break :blk e_a_log_owned.?;
         };
-        const g_pre = try ops.multiply(ctx, e_a_log, sp);
-        defer g_pre.deinit();
-        const g_neg = try ops.negative(ctx, g_pre);
-        defer g_neg.deinit();
-        const g = try ops.exp(ctx, g_neg); // [L, HV] f32
-        errdefer g.deinit();
-
         const b_flat = try ops.reshape(ctx, b, &[_]i32{ L, HV });
         defer b_flat.deinit();
-        const beta_raw = try ops.sigmoid(ctx, b_flat); // [L, HV]
-        defer beta_raw.deinit();
-        const beta = try ops.astype(ctx, beta_raw, .float32);
+
+        // Fused path: the 11 elementwise gate dispatches as one compiled
+        // kernel (see gateClosureBody). Falls back to the eager chain when
+        // compilation is unavailable, so this can never break the model.
+        var g: Array = undefined;
+        var beta: Array = undefined;
+        var gates_fused = false;
+        if (gateClosure(self.ctx.allocator)) |cl| fused: {
+            const ins = [_]Array{ a_flat, self.dt_bias, e_a_log, b_flat };
+            const outs = cl.apply(&ins, self.ctx.allocator) catch break :fused;
+            defer self.ctx.allocator.free(outs);
+            if (outs.len != 2) {
+                for (outs) |o| o.deinit();
+                break :fused;
+            }
+            g = outs[0];
+            beta = outs[1];
+            gates_fused = true;
+        }
+        if (!gates_fused) {
+            const a_dt = try ops.add(ctx, a_flat, self.dt_bias);
+            defer a_dt.deinit();
+            const sp = try softplusStep(ctx, a_dt);
+            defer sp.deinit();
+            const g_pre = try ops.multiply(ctx, e_a_log, sp);
+            defer g_pre.deinit();
+            const g_neg = try ops.negative(ctx, g_pre);
+            defer g_neg.deinit();
+            g = try ops.exp(ctx, g_neg); // [L, HV] f32
+            const beta_raw = try ops.sigmoid(ctx, b_flat); // [L, HV]
+            defer beta_raw.deinit();
+            beta = ops.astype(ctx, beta_raw, .float32) catch |e| {
+                g.deinit();
+                return e;
+            };
+        }
+        errdefer g.deinit();
         errdefer beta.deinit();
 
         if (fp) {
