@@ -1332,6 +1332,12 @@ pub const EngineLoop = struct {
             const s = std.c.getenv("DMLX_MTP_EVIDENCE_DECAY") orelse return evidence_decay_default;
             return std.fmt.parseFloat(f32, std.mem.span(s)) catch evidence_decay_default;
         }
+        /// Revert switch for the round-1 cost exclusion below. Exists so the
+        /// change is A/B-able: a cost-model change that cannot be toggled
+        /// cannot be measured against its own baseline in an alternating run.
+        fn countRound1Cost() bool {
+            return std.c.getenv("DMLX_MTP_COUNT_ROUND1_COST") != null;
+        }
 
         fn init(max_n: usize) MtpDepthController {
             return .{
@@ -1491,12 +1497,21 @@ pub const EngineLoop = struct {
             self.rounds +|= 1;
             if (n == 0 or n > max_depth) return;
             self.used[n - 1] +|= 1;
-            const ms = @as(f64, @floatFromInt(round_ns)) / 1e6;
-            self.cost_ms[n - 1] = if (self.cost_n[n - 1] == 0)
-                ms
-            else
-                cost_alpha * ms + (1.0 - cost_alpha) * self.cost_ms[n - 1];
-            self.cost_n[n - 1] +|= 1;
+            // The FIRST round of a request carries one-time per-request work
+            // (drafter repriming over the prompt is lazy-evaluated into the
+            // first draft phase: measured draft=31.9 ms on request 1 vs
+            // ~9-13 ms steady). Explore always runs round 1 at max_n, so
+            // cost(max_n) alone would absorb every request's priming —
+            // systematically biasing the argmin against depth. Skip the cost
+            // sample; still count the round for acceptance evidence.
+            if (self.rounds > 1 or countRound1Cost()) {
+                const ms = @as(f64, @floatFromInt(round_ns)) / 1e6;
+                self.cost_ms[n - 1] = if (self.cost_n[n - 1] == 0)
+                    ms
+                else
+                    cost_alpha * ms + (1.0 - cost_alpha) * self.cost_ms[n - 1];
+                self.cost_n[n - 1] +|= 1;
+            }
             // Decay stale acceptance evidence toward the Laplace prior, then
             // fold this round in. ~4-round effective window at 0.75.
             const decay = evidenceDecay();

@@ -186,6 +186,7 @@ def engines() -> dict[str, Engine]:
             cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
                  "--model", MODEL, "--speculative-mtp", "7",
                  "--port", str(PORT)],
+            env={"DMLX_MTP_ROUND_LOG": "1"} if os.environ.get("CMP_ROUND_LOG") else {},
             note="adaptive MTP depth (ceiling 7), verify-shape kernels armed",
         ),
         # Same engine, higher adaptive depth CEILING. The flag is an upper
@@ -200,6 +201,24 @@ def engines() -> dict[str, Engine]:
                  "--model", MODEL, "--speculative-mtp", "7",
                  "--port", str(PORT)],
             note="adaptive MTP, ceiling 7",
+        ),
+        # A/B arm: REVERT the round-1 cost exclusion. The controller's
+        # cost(n) EMA now skips a request's first round, because drafter
+        # repriming over the prompt is lazy-evaluated into the first draft
+        # phase (measured draft=31.9 ms on round 1 vs ~9-13 ms steady) and
+        # explore always runs round 1 at max_n — so cost(max_n) alone
+        # absorbed every request's priming and the argmin was biased against
+        # depth. This arm sets DMLX_MTP_COUNT_ROUND1_COST=1 to restore the
+        # old behaviour. Both arms are the SAME binary, so interleaving them
+        # measures the change without the cross-engine drift that makes
+        # dmlx-vs-omlx deltas unstable within a session.
+        "dmlx-r1cost": Engine(
+            name="dmlx-r1cost",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_COUNT_ROUND1_COST": "1"},
+            note="adaptive MTP ceiling 7, round-1 cost counted (pre-fix baseline)",
         ),
         # A/B arm for the trunk-hidden convention: DMLX_MTP_TRUNK_POSTNORM=1
         # feeds the head the backbone hidden AFTER the final RMSNorm (omlx's
@@ -495,6 +514,9 @@ def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL,
     }
 
 
+_MEASURE_IDX = 0
+
+
 def measure(engine: Engine, reps_prompt: int, max_tokens: int,
             prefill_lengths: list[int] | None = None) -> dict:
     """Start the engine, warm it, measure every prompt, stop it."""
@@ -504,9 +526,14 @@ def measure(engine: Engine, reps_prompt: int, max_tokens: int,
     subprocess.run(["pkill", "-f", "omlx"], capture_output=True)
     time.sleep(2)
 
+    global _MEASURE_IDX
+    _MEASURE_IDX += 1
     env = dict(os.environ)
     env.update(engine.env)
-    log = open(f"/tmp/cmp_{engine.name}.log", "w")
+    log_path = f"/tmp/cmp_{engine.name}.log"
+    if os.environ.get("CMP_KEEP_PASS_LOGS"):
+        log_path = f"/tmp/cmp_{engine.name}_pass{_MEASURE_IDX}.log"
+    log = open(log_path, "w")
     proc = subprocess.Popen(engine.cmd, stdout=log, stderr=subprocess.STDOUT,
                             env=env, start_new_session=True)
     out: dict = {"ok": False, "per_prompt": {}, "per_prompt_raw": {}}
