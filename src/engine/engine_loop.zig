@@ -1300,13 +1300,38 @@ pub const EngineLoop = struct {
         max_n: usize,
         fixed: bool,
         /// Pooled conditional acceptance: `reached[i]` rounds got as far as
-        /// draft i+1, `accepted[i]` of them accepted it.
-        reached: [max_depth]u32 = @splat(0),
-        accepted: [max_depth]u32 = @splat(0),
+        /// draft i+1, `accepted[i]` of them accepted it. Both are DECAYED
+        /// every round (evidence window, not lifetime counts): acceptance is
+        /// content-PHASE-dependent within a single request — on math the
+        /// first ~15 rounds after prefill average k=2.6/7 while rounds 16+
+        /// run k=7/7 (measured 2026-11-03). Lifetime counts poison the deep
+        /// tail with the early phase and never recover, locking the request
+        /// shallow; decayed evidence tracks the current phase in ~4 rounds.
+        reached: [max_depth]f32 = @splat(0),
+        accepted: [max_depth]f32 = @splat(0),
         cost_ms: [max_depth]f64 = @splat(0),
         cost_n: [max_depth]u32 = @splat(0),
         used: [max_depth]u32 = @splat(0),
         rounds: u64 = 0,
+        /// Last argmin-chosen depth. Switching requires beating the incumbent
+        /// by >10% (hysteresis): with decayed evidence the per-depth scores
+        /// carry window noise, and on flat-acceptance content (prose) the
+        /// argmin otherwise thrashes into wasted deep rounds.
+        last_pick: usize = 0,
+        /// Forced deep rounds after a near-full-acceptance probe: a strong
+        /// deep round means the content phase changed in favor of depth, so
+        /// re-explore immediately instead of waiting for the next 1-in-16
+        /// probe slot.
+        force_explore: u32 = 0,
+        /// Per-round evidence decay (see reached/accepted). 0.9 swept best
+        /// of {0.75, 0.85, 0.9} on the 4-domain thinking A/B (2026-11-03):
+        /// slower decay keeps math/count phase recovery while damping the
+        /// prose/code thrash.
+        const evidence_decay_default: f32 = 0.9;
+        fn evidenceDecay() f32 {
+            const s = std.c.getenv("DMLX_MTP_EVIDENCE_DECAY") orelse return evidence_decay_default;
+            return std.fmt.parseFloat(f32, std.mem.span(s)) catch evidence_decay_default;
+        }
 
         fn init(max_n: usize) MtpDepthController {
             return .{
@@ -1318,8 +1343,8 @@ pub const EngineLoop = struct {
         /// Laplace-smoothed conditional acceptance for draft `i` (1-based),
         /// so an unobserved depth is optimistic-but-bounded rather than 0/0.
         fn condAccept(self: *const MtpDepthController, i: usize) f64 {
-            const a: f64 = @floatFromInt(self.accepted[i - 1]);
-            const r: f64 = @floatFromInt(self.reached[i - 1]);
+            const a: f64 = @floatCast(self.accepted[i - 1]);
+            const r: f64 = @floatCast(self.reached[i - 1]);
             return (a + 1.0) / (r + 2.0);
         }
 
@@ -1361,10 +1386,12 @@ pub const EngineLoop = struct {
             self.accepted = @splat(0);
             self.used = @splat(0);
             self.rounds = 0;
+            self.force_explore = 0;
+            self.last_pick = 0;
         }
 
         /// Depth for the next round, in 1..max_n.
-        fn pick(self: *const MtpDepthController) usize {
+        fn pick(self: *MtpDepthController) usize {
             if (self.fixed or self.max_n == 1) return self.max_n;
             // Acceptance exploration, BEFORE the cost calibration below.
             //
@@ -1396,6 +1423,14 @@ pub const EngineLoop = struct {
             // (deep-tail p_i stayed at the Laplace prior, so the argmin
             // never committed to depth 7 where code wins). Adaptive:
             // deep content keeps exploring, math-class content exits early.
+            // A near-full deep probe means the content phase turned
+            // deep-friendly: re-explore now rather than waiting out the
+            // 1-in-16 probe cycle (math: the great phase starts ~15 rounds
+            // in; the explore phase at rounds 1-9 sampled the bad one).
+            if (self.force_explore > 0) {
+                self.force_explore -= 1;
+                return self.max_n;
+            }
             if (self.used[self.max_n - 1] < exploreRounds()) {
                 const deep_used = self.used[self.max_n - 1];
                 var keep_exploring = true;
@@ -1437,6 +1472,15 @@ pub const EngineLoop = struct {
                     best = n;
                 }
             }
+            // Hysteresis: keep the incumbent unless the challenger wins by
+            // >10%. A phase change blows past 10% (math: 30 -> 20 ms/tok);
+            // what this filters out is noise-level thrash.
+            if (self.last_pick != 0 and best != self.last_pick) {
+                if (self.score(self.last_pick)) |inc| {
+                    if (best_score > inc * 0.90) best = self.last_pick;
+                }
+            }
+            self.last_pick = best;
             return best;
         }
 
@@ -1453,9 +1497,26 @@ pub const EngineLoop = struct {
             else
                 cost_alpha * ms + (1.0 - cost_alpha) * self.cost_ms[n - 1];
             self.cost_n[n - 1] +|= 1;
+            // Decay stale acceptance evidence toward the Laplace prior, then
+            // fold this round in. ~4-round effective window at 0.75.
+            const decay = evidenceDecay();
+            for (0..max_depth) |i| {
+                self.reached[i] *= decay;
+                self.accepted[i] *= decay;
+            }
             const reached_upto = @min(k + 1, n);
-            for (1..reached_upto + 1) |i| self.reached[i - 1] +|= 1;
-            for (1..k + 1) |i| self.accepted[i - 1] +|= 1;
+            for (1..reached_upto + 1) |i| self.reached[i - 1] += 1;
+            for (1..k + 1) |i| self.accepted[i - 1] += 1;
+            // Near-full acceptance at a deep round (probe or chosen): the
+            // content phase favors depth right now — force a few deep rounds
+            // so the argmin sees fresh tail evidence immediately.
+            // Opt-out: DMLX_MTP_NO_REEXPLORE=1 (A/B showed the re-entry
+            // overshooting on code-class mid-acceptance content).
+            if (std.c.getenv("DMLX_MTP_NO_REEXPLORE") == null and
+                k + 1 >= n and n >= self.max_n - 1 and self.force_explore == 0)
+            {
+                self.force_explore = 3;
+            }
         }
     };
 
@@ -1905,6 +1966,9 @@ pub const EngineLoop = struct {
             {
                 const round_ns = prof_now() - round_t0;
                 depth_ctl.record(n_round, if (round_ns > 0) @intCast(round_ns) else 0, k);
+                if (std.c.getenv("DMLX_MTP_ROUND_LOG") != null) {
+                    std.debug.print("MTP-ROUND r={d} n={d} k={d} ms={d:.1}\n", .{ depth_ctl.rounds, n_round, k, @as(f64, @floatFromInt(round_ns)) / 1e6 });
+                }
             }
         }
         hidden.deinit();
@@ -1918,7 +1982,7 @@ pub const EngineLoop = struct {
             const rounds = if (prof_rounds > 0) prof_rounds else 1;
             // Depth controller trace: rounds spent at each depth and the
             // converged ms/token estimate that drove the choice.
-            var depth_buf: [192]u8 = undefined;
+            var depth_buf: [512]u8 = undefined;
             var depth_len: usize = 0;
             for (1..depth_ctl.max_n + 1) |n| {
                 if (depth_ctl.used[n - 1] == 0) continue;
@@ -1940,13 +2004,13 @@ pub const EngineLoop = struct {
             var p_len: usize = 0;
             for (1..depth_ctl.max_n + 1) |i| {
                 const reached = depth_ctl.reached[i - 1];
-                if (reached == 0) continue;
+                if (reached < 0.05) continue;
                 const acc = depth_ctl.accepted[i - 1];
-                const chunk = std.fmt.bufPrint(p_buf[p_len..], " p{d}={d:.3}({d}/{d})", .{
+                const chunk = std.fmt.bufPrint(p_buf[p_len..], " p{d}={d:.3}(~{d:.1}/{d:.1})", .{
                     i,
-                    @as(f64, @floatFromInt(acc)) / @as(f64, @floatFromInt(reached)),
-                    acc,
-                    reached,
+                    if (reached > 0) @as(f64, @floatCast(acc / reached)) else 0.0,
+                    @as(f64, @floatCast(acc)),
+                    @as(f64, @floatCast(reached)),
                 }) catch break;
                 p_len += chunk.len;
             }
