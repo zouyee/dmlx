@@ -1334,6 +1334,60 @@ pub const EngineLoop = struct {
             return std.fmt.parseFloat(f64, std.mem.span(v)) catch
                 explore_give_up_default;
         }
+        /// Tight ratios, applied only where the trend says acceptance is FLAT.
+        /// These are the values the sweep found good for code and bad for
+        /// math; gating them on the trend is what lets code have them without
+        /// math paying for them.
+        const explore_give_up_flat_default: f64 = 1.08;
+        const ladder_give_up_flat_default: f64 = 1.04;
+        fn exploreGiveUpFlat() f64 {
+            const v = std.c.getenv("DMLX_MTP_EXPLORE_GIVE_UP_FLAT") orelse
+                return explore_give_up_flat_default;
+            return std.fmt.parseFloat(f64, std.mem.span(v)) catch
+                explore_give_up_flat_default;
+        }
+        fn ladderGiveUpFlat() f64 {
+            const v = std.c.getenv("DMLX_MTP_LADDER_GIVE_UP_FLAT") orelse
+                return ladder_give_up_flat_default;
+            return std.fmt.parseFloat(f64, std.mem.span(v)) catch
+                ladder_give_up_flat_default;
+        }
+        /// OFF by default: the trend cannot be observed in time to use it.
+        ///
+        /// The idea was to let code have the tight give-up ratios while math
+        /// keeps the loose ones, selecting by whether acceptance is rising.
+        /// It takes math's whole loss and only part of code's gain, i.e. it is
+        /// worse than either pure setting (8 draws/arm, base = loose):
+        ///              code                    math
+        ///   loose      26.2                    32.7
+        ///   trend      26.7  +2.0% 40/64       30.4  -6.8% 20/64
+        ///   tight      27.4  +4.9% 36/64       30.5  -6.8%  7/64
+        ///
+        /// The explore give-up fires at rounds 3-9, while math's acceptance
+        /// rise begins around round 15. At the moment of the decision math
+        /// looks flat too, so the gate hands it the tight ratio and throws
+        /// away the ladder probe's gain. This is not a threshold to tune: the
+        /// evidence that would justify persevering does not exist yet when the
+        /// choice has to be made.
+        ///
+        /// Which bounds what this controller can do. Distinguishing
+        /// "persevere" from "quit" needs information from BEYOND the current
+        /// request's first ten rounds — prior knowledge about this kind of
+        /// content. Within-request adaptation cannot supply it, so the
+        /// remaining code/count gaps are not reachable from here; a
+        /// cross-request memory keyed on content class would be, and omlx's
+        /// persistent per-model settings are worth reading with that in mind.
+        /// Set DMLX_MTP_TREND_GATE=1 to re-enable.
+        fn trendGatingOff() bool {
+            return std.c.getenv("DMLX_MTP_TREND_GATE") == null;
+        }
+        /// Slower evidence window for the trend comparison. 0.98 against the
+        /// fast window's 0.9 is a ~50-round memory against ~10, so the pair
+        /// spans math's documented ~15-round phase change.
+        const trend_slow_decay: f32 = 0.98;
+        /// Minimum rise in conditional acceptance to count as a trend rather
+        /// than window noise.
+        const trend_epsilon: f64 = 0.02;
         /// OFF by default: gating the probe on rung staleness measured away
         /// the entire math win (artifacts/ladder_stalegate_20261103.json,
         /// 3 interleaved passes, nonced):
@@ -1448,6 +1502,10 @@ pub const EngineLoop = struct {
         /// shallow; decayed evidence tracks the current phase in ~4 rounds.
         reached: [max_depth]f32 = @splat(0),
         accepted: [max_depth]f32 = @splat(0),
+        /// A second, slower-decaying copy of the same evidence, used ONLY to
+        /// ask whether acceptance is rising. See `trendRising`.
+        reached_slow: [max_depth]f32 = @splat(0),
+        accepted_slow: [max_depth]f32 = @splat(0),
         cost_ms: [max_depth]f64 = @splat(0),
         cost_n: [max_depth]u32 = @splat(0),
         used: [max_depth]u32 = @splat(0),
@@ -1533,10 +1591,39 @@ pub const EngineLoop = struct {
         fn resetForRequest(self: *MtpDepthController) void {
             self.reached = @splat(0);
             self.accepted = @splat(0);
+            self.reached_slow = @splat(0);
+            self.accepted_slow = @splat(0);
             self.used = @splat(0);
             self.rounds = 0;
             self.force_explore = 0;
             self.last_pick = 0;
+        }
+
+        /// Is acceptance at position `i` RISING rather than merely low?
+        ///
+        /// This is the discriminator the give-up ratios could not express.
+        /// Sweeping those ratios showed code and math wanting opposite values
+        /// (artifacts/giveup_code_20261103.json, giveup_math_20261103.json):
+        /// tightening to 1.08/1.04 moved code +4.4% at 40/64 pairwise, inside
+        /// chance, while costing math -4.7% at 3/64 and -8.2% at 1/64, which
+        /// is not. A threshold on the LEVEL of a score cannot separate them,
+        /// because at the moment of the decision the two look the same —
+        ///   math: acceptance rises after ~15 rounds, so early deep evidence
+        ///         is pessimistic and persevering is what makes the ladder
+        ///         probe pay
+        ///   code: acceptance is stable, so early evidence is already right
+        ///         and persevering just burns rounds at a worse depth
+        /// What differs is the DERIVATIVE, and it needs no new measurement:
+        /// comparing the fast evidence window against a slower one over the
+        /// same observations reads the trend directly.
+        fn trendRising(self: *const MtpDepthController, i: usize) bool {
+            const r_fast: f64 = @floatCast(self.reached[i - 1]);
+            const r_slow: f64 = @floatCast(self.reached_slow[i - 1]);
+            // Both windows need real evidence or the comparison is prior-vs-prior.
+            if (r_fast < 1.0 or r_slow < 2.0) return true;
+            const fast = (@as(f64, @floatCast(self.accepted[i - 1])) + 1.0) / (r_fast + 2.0);
+            const slow = (@as(f64, @floatCast(self.accepted_slow[i - 1])) + 1.0) / (r_slow + 2.0);
+            return fast > slow + trend_epsilon;
         }
 
         /// Probe the rung unless we CONFIDENTLY know it is worse.
@@ -1567,7 +1654,11 @@ pub const EngineLoop = struct {
             if (self.reached[rung - 1] < ladder_confident_floor) return true;
             const rung_score = self.score(rung) orelse return true;
             const inc_score = self.score(self.last_pick) orelse return true;
-            return rung_score <= inc_score * ladderGiveUpRatio();
+            const ratio = if (trendGatingOff() or self.trendRising(rung))
+                ladderGiveUpRatio()
+            else
+                ladderGiveUpFlat();
+            return rung_score <= inc_score * ratio;
         }
 
         /// Depth for the next round, in 1..max_n.
@@ -1634,7 +1725,11 @@ pub const EngineLoop = struct {
                                 if (s < alt) alt = s;
                             }
                         }
-                        if (found and deep_score > alt * exploreGiveUpRatio()) keep_exploring = false;
+                        const ratio = if (trendGatingOff() or self.trendRising(self.max_n))
+                            exploreGiveUpRatio()
+                        else
+                            exploreGiveUpFlat();
+                        if (found and deep_score > alt * ratio) keep_exploring = false;
                     }
                 }
                 if (keep_exploring) return self.max_n;
@@ -1800,6 +1895,12 @@ pub const EngineLoop = struct {
                 self.reached[i] *= decay;
                 self.accepted[i] *= decay;
             }
+            for (0..max_depth) |i| {
+                self.reached_slow[i] *= trend_slow_decay;
+                self.accepted_slow[i] *= trend_slow_decay;
+            }
+            for (1..reached_upto + 1) |i| self.reached_slow[i - 1] += 1;
+            for (1..k + 1) |i| self.accepted_slow[i - 1] += 1;
             for (1..reached_upto + 1) |i| self.reached[i - 1] += 1;
             for (1..k + 1) |i| self.accepted[i - 1] += 1;
             // Near-full acceptance at a deep round (probe or chosen): the
