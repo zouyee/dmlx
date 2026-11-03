@@ -1,0 +1,35 @@
+prefix-cache nonce: run12067 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-ungated ...
+[pass 1/3] omlx-mtp ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-ungated ...
+[pass 2/3] omlx-mtp ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-ungated ...
+[pass 3/3] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            38.1       30.7     0.83
+dmlx        git:2dc1779prose           29.5       25.1     0.80
+dmlx        git:2dc1779math            40.4       31.6     0.73
+dmlx        git:2dc1779count*          35.3       29.0     0.82
+dmlx                  HEADLINE        36.0
+dmlx-ungated?         code            34.6       28.7     0.82
+dmlx-ungated?         prose           29.4       25.0     0.80
+dmlx-ungated?         math            38.8       30.5     0.75
+dmlx-ungated?         count*          34.2       28.1     0.84
+dmlx-ungated          HEADLINE        34.3
+omlx-mtp    ?         code            35.4       28.3     0.94
+omlx-mtp    ?         prose           29.1       24.3     0.90
+omlx-mtp    ?         math            40.5       29.7     0.95
+omlx-mtp    ?         count*          38.4       30.0     0.96
+omlx-mtp              HEADLINE        35.0
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.757s        126.1      564-2100      4.416s     17.365s
+dmlx-ungated      0.775s        125.9      564-2100      4.551s     16.755s
+omlx-mtp          0.899s        139.0      564-2100      4.502s     15.551s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/ladder_gated_20261103.json

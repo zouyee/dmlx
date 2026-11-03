@@ -1302,6 +1302,12 @@ pub const EngineLoop = struct {
         const ladder_probe_period_default = 6;
         /// Decayed-`reached` level below which a rung counts as unobserved.
         const ladder_stale_floor: f32 = 1.0;
+        /// Decayed-`reached` at or above which the rung's score is trusted.
+        /// Under decay 0.9 a rung probed every 6 rounds settles near 1.7, so
+        /// 2.0 means "sampled at least as often as the probe cadence".
+        const ladder_confident_floor: f32 = 2.0;
+        /// How much worse a trusted rung may score before probing stops.
+        const ladder_give_up_ratio: f64 = 1.10;
         /// OFF by default: gating the probe on rung staleness measured away
         /// the entire math win (artifacts/ladder_stalegate_20261103.json,
         /// 3 interleaved passes, nonced):
@@ -1435,6 +1441,10 @@ pub const EngineLoop = struct {
         /// slower decay keeps math/count phase recovery while damping the
         /// prose/code thrash.
         const evidence_decay_default: f32 = 0.9;
+        /// Decay only the positions a round observed (omlx's behaviour).
+        fn decayReachedOnly() bool {
+            return std.c.getenv("DMLX_MTP_DECAY_REACHED_ONLY") != null;
+        }
         fn evidenceDecay() f32 {
             const s = std.c.getenv("DMLX_MTP_EVIDENCE_DECAY") orelse return evidence_decay_default;
             return std.fmt.parseFloat(f32, std.mem.span(s)) catch evidence_decay_default;
@@ -1501,6 +1511,37 @@ pub const EngineLoop = struct {
             self.rounds = 0;
             self.force_explore = 0;
             self.last_pick = 0;
+        }
+
+        /// Probe the rung unless we CONFIDENTLY know it is worse.
+        ///
+        /// The probe is not free — it spends one round in six at a deeper,
+        /// dearer depth — so it has to be an investment, not a reflex. On
+        /// math it pays for itself many times over, but on prose it is a pure
+        /// tax, and the fixed-depth references show how large:
+        /// (artifacts/shallow_depth_20261103.json, same session, ~1% harness
+        /// precision from the null A/B in artifacts/null_ab_20261103.json)
+        ///   prose   fix2 28.8   fix3 27.4   adaptive 25.9   omlx 28.6
+        ///   math    fix3 37.5                adaptive 37.8   omlx 34.4
+        /// Adaptive on prose is below BOTH neighbouring fixed depths, which
+        /// means the loss is not a mis-picked depth — it is the cost of
+        /// looking. Fixed depth 2 would beat omlx on prose outright.
+        ///
+        /// The distinction that makes this safe is between "bad because
+        /// unobserved" and "bad because observed and genuinely poor".
+        /// `reached[i]` separates them: a decayed, unsampled rung has a low
+        /// `reached` and a score dragged down by the Laplace prior, which is
+        /// exactly the math case the probe exists to rescue, so uncertainty
+        /// must keep probing. A rung with real recent evidence and a clearly
+        /// worse score is the prose case, and there is nothing to learn by
+        /// paying for it again. Gating on the score ALONE would re-create the
+        /// math trap, because decayed evidence also scores badly.
+        fn ladderWorthProbing(self: *const MtpDepthController, rung: usize) bool {
+            if (std.c.getenv("DMLX_MTP_LADDER_UNGATED") != null) return true;
+            if (self.reached[rung - 1] < ladder_confident_floor) return true;
+            const rung_score = self.score(rung) orelse return true;
+            const inc_score = self.score(self.last_pick) orelse return true;
+            return rung_score <= inc_score * ladder_give_up_ratio;
         }
 
         /// Depth for the next round, in 1..max_n.
@@ -1632,7 +1673,8 @@ pub const EngineLoop = struct {
             {
                 const rung = @min(self.last_pick + ladderRung(), self.max_n);
                 if (rung != self.last_pick and
-                    (!ladderStaleOnly() or self.reached[rung - 1] < ladder_stale_floor))
+                    (!ladderStaleOnly() or self.reached[rung - 1] < ladder_stale_floor) and
+                    self.ladderWorthProbing(rung))
                 {
                     return rung;
                 }
@@ -1690,11 +1732,48 @@ pub const EngineLoop = struct {
             // Decay stale acceptance evidence toward the Laplace prior, then
             // fold this round in. ~4-round effective window at 0.75.
             const decay = evidenceDecay();
-            for (0..max_depth) |i| {
+            const reached_upto = @min(k + 1, n);
+            // Decay ONLY the positions this round actually observed.
+            //
+            // Decaying all of them (the original behaviour, still available
+            // via DMLX_MTP_DECAY_ALL=1) is self-defeating: a shallow round
+            // observes nothing past p_2, so parking at N=2 pulls p_3..p_7
+            // back to the Laplace prior at 0.9 per round and the deep tail is
+            // gone in ~20 rounds. The argmin then cannot see that depth is
+            // worth taking, which is the depth trap the ladder probe (4f18d93)
+            // was built to work around by force-feeding fresh samples.
+            //
+            // omlx does not have the trap because it does not have the decay.
+            // `BatchPolicy.observe_mtp` (omlx/patches/mlx_lm_mtp/
+            // batch_policy.py) runs `for position in range(depth)` and breaks
+            // the moment a position was not reached, so an unobserved p_i
+            // simply keeps its last value — a per-position EMA, not a global
+            // pull toward a prior.
+            //
+            // Decay still earns its keep on the positions that ARE observed,
+            // which is why this is a restriction rather than a removal:
+            // acceptance is phase-dependent inside one request (on math the
+            // first ~15 rounds average k=2.6/7 while rounds 16+ run k=7/7), so
+            // lifetime counts would pin the estimate to the opening phase.
+            // Decaying the observed prefix tracks the phase; leaving the
+            // unobserved tail alone preserves what we last knew about it.
+            // DEFAULT is still the global decay: restricting it measured a
+            // small LOSS next to the ladder probe, which already keeps the
+            // tail fresh, so the two are substitutes and the probe is the
+            // better of the pair. Same session, 3 interleaved passes
+            // (artifacts/decay_tail_20261103.json): global 33.6 vs
+            // reached-only 33.3, and global was ahead on all four prompts.
+            // A second session (artifacts/tail_vs_probe_20261103.json) put
+            // global+no-probe at 33.2 against reached-only+probe at 33.1 and
+            // reached-only+no-probe at 31.6 — so whichever single mechanism
+            // keeps the tail alive is what matters, and having both is not
+            // better than having the probe. Set DMLX_MTP_DECAY_REACHED_ONLY=1
+            // for omlx's behaviour.
+            const decay_upto: usize = if (decayReachedOnly()) reached_upto else max_depth;
+            for (0..decay_upto) |i| {
                 self.reached[i] *= decay;
                 self.accepted[i] *= decay;
             }
-            const reached_upto = @min(k + 1, n);
             for (1..reached_upto + 1) |i| self.reached[i - 1] += 1;
             for (1..k + 1) |i| self.accepted[i - 1] += 1;
             // Near-full acceptance at a deep round (probe or chosen): the

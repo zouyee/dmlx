@@ -1,0 +1,26 @@
+prefix-cache nonce: run13183 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] omlx-mtp ...
+[pass 2/3] dmlx ...
+[pass 2/3] omlx-mtp ...
+[pass 3/3] dmlx ...
+[pass 3/3] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            32.6       27.3     0.80
+dmlx        git:2dc1779prose           29.4       25.0     0.80
+dmlx        git:2dc1779math            38.5       30.5     0.74
+dmlx        git:2dc1779count*          32.8       27.3     0.83
+dmlx                  HEADLINE        33.5
+omlx-mtp    ?         code            36.1       28.7     0.94
+omlx-mtp    ?         prose           28.1       23.7     0.88
+omlx-mtp    ?         math            39.9       29.2     0.97
+omlx-mtp    ?         count*          42.3       32.2     0.97
+omlx-mtp              HEADLINE        34.7
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.770s        125.7      564-2100      4.495s     17.036s
+omlx-mtp          0.917s        135.1      564-2100      4.652s     16.112s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/confirm_thinking_20261103.json

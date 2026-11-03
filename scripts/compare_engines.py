@@ -227,6 +227,103 @@ def engines() -> dict[str, Engine]:
             env={"DMLX_MTP_FIXED_N": "4"},
             note="FIXED depth 4, controller disabled",
         ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so the
+        # optimum there is unknown and could be under the controller's pick.
+        "dmlx-fix1": Engine(
+            name="dmlx-fix1",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "1",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "1"},
+            note="FIXED depth 1, controller disabled",
+        ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so the
+        # optimum there is unknown and could be under the controller's pick.
+        "dmlx-fix2": Engine(
+            name="dmlx-fix2",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "2",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "2"},
+            note="FIXED depth 2, controller disabled",
+        ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so the
+        # optimum there is unknown and could be under the controller's pick.
+        "dmlx-fix3": Engine(
+            name="dmlx-fix3",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "3",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "3"},
+            note="FIXED depth 3, controller disabled",
+        ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so its
+        # optimum is unknown and may sit below the controller's pick.
+        "dmlx-fix1": Engine(
+            name="dmlx-fix1",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "1",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "1"},
+            note="FIXED depth 1, controller disabled",
+        ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so its
+        # optimum is unknown and may sit below the controller's pick.
+        "dmlx-fix2": Engine(
+            name="dmlx-fix2",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "2",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "2"},
+            note="FIXED depth 2, controller disabled",
+        ),
+        # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
+        # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so its
+        # optimum is unknown and may sit below the controller's pick.
+        "dmlx-fix3": Engine(
+            name="dmlx-fix3",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "3",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "3"},
+            note="FIXED depth 3, controller disabled",
+        ),
+        # A/B arm: ladder probe without the confidence gate, i.e. it fires on
+        # cadence even when the rung has recent evidence of being worse.
+        "dmlx-ungated": Engine(
+            name="dmlx-ungated",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_LADDER_UNGATED": "1"},
+            note="adaptive MTP ceiling 7, ladder probe ungated",
+        ),
+        # A/B arm: BOTH reverted — global decay and no ladder probe. This is
+        # the controller as of 809bbc9, i.e. the original depth trap.
+        "dmlx-old": Engine(
+            name="dmlx-old",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_DECAY_REACHED_ONLY": "1", "DMLX_MTP_NO_LADDER_PROBE": "1"},
+            note="pre-ladder, global decay: the original depth trap",
+        ),
+        # A/B arm: restore the global evidence decay (decay every p_i every
+        # round, not just the positions the round observed). Head keeps the
+        # unobserved tail; this arm is the pre-change behaviour.
+        "dmlx-decayall": Engine(
+            name="dmlx-decayall",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_DECAY_REACHED_ONLY": "1"},
+            note="adaptive MTP ceiling 7, global evidence decay (pre-change)",
+        ),
         # A/B arm: disable the ladder probe (rungs above the incumbent).
         # Head has it ON; this is the pre-ladder baseline.
         "dmlx-noladder": Engine(

@@ -1,0 +1,35 @@
+prefix-cache nonce: run00972 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-noladder ...
+[pass 1/3] dmlx-old ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-noladder ...
+[pass 2/3] dmlx-old ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-noladder ...
+[pass 3/3] dmlx-old ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            36.1       29.6     0.80
+dmlx        git:2dc1779prose           26.6       23.1     0.76
+dmlx        git:2dc1779math            36.7       27.5     0.83
+dmlx        git:2dc1779count*          29.3       25.0     0.80
+dmlx                  HEADLINE        33.1
+dmlx-noladder?         code            34.6       28.8     0.79
+dmlx-noladder?         prose           29.2       24.8     0.81
+dmlx-noladder?         math            31.0       24.5     0.79
+dmlx-noladder?         count*          30.2       25.7     0.79
+dmlx-noladder          HEADLINE        31.6
+dmlx-old    ?         code            38.6       31.0     0.84
+dmlx-old    ?         prose           29.6       25.2     0.79
+dmlx-old    ?         math            31.4       24.8     0.79
+dmlx-old    ?         count*          30.3       25.6     0.78
+dmlx-old              HEADLINE        33.2
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.754s        126.2      564-2100      4.473s     16.859s
+dmlx-noladder      0.755s        124.7      564-2100      4.462s     16.978s
+dmlx-old          0.752s        128.7      564-2100      4.395s     16.560s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/tail_vs_probe_20261103.json

@@ -1,0 +1,26 @@
+prefix-cache nonce: run00296 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-decayall ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-decayall ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-decayall ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            34.0       28.2     0.80
+dmlx        git:2dc1779prose           28.7       24.6     0.77
+dmlx        git:2dc1779math            37.3       27.9     0.82
+dmlx        git:2dc1779count*          26.1       22.7     0.77
+dmlx                  HEADLINE        33.3
+dmlx-decayall?         code            34.2       28.4     0.80
+dmlx-decayall?         prose           28.8       24.7     0.76
+dmlx-decayall?         math            37.9       28.2     0.82
+dmlx-decayall?         count*          26.8       23.2     0.77
+dmlx-decayall          HEADLINE        33.6
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.755s        125.1      564-2100      4.389s     16.666s
+dmlx-decayall      0.763s        124.6      564-2100      4.411s     17.027s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/decay_tail_20261103.json

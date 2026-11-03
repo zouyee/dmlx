@@ -1,0 +1,53 @@
+prefix-cache nonce: run02647 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-fix1 ...
+[pass 1/3] dmlx-fix2 ...
+[pass 1/3] dmlx-fix3 ...
+[pass 1/3] omlx-mtp ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-fix1 ...
+[pass 2/3] dmlx-fix2 ...
+[pass 2/3] dmlx-fix3 ...
+[pass 2/3] omlx-mtp ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-fix1 ...
+[pass 3/3] dmlx-fix2 ...
+[pass 3/3] dmlx-fix3 ...
+[pass 3/3] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            34.5       28.7     0.78
+dmlx        git:2dc1779prose           25.9       22.7     0.73
+dmlx        git:2dc1779math            37.8       28.2     0.82
+dmlx        git:2dc1779count*          31.1       26.4     0.78
+dmlx                  HEADLINE        32.7
+dmlx-fix1   ?         code            25.9       22.5     0.78
+dmlx-fix1   ?         prose           24.0       21.2     0.76
+dmlx-fix1   ?         math            26.2       22.0     0.79
+dmlx-fix1   ?         count*          24.0       21.2     0.76
+dmlx-fix1             HEADLINE        25.4
+dmlx-fix2   ?         code            31.3       26.5     0.78
+dmlx-fix2   ?         prose           28.8       24.8     0.76
+dmlx-fix2   ?         math            33.9       27.0     0.80
+dmlx-fix2   ?         count*          28.8       24.7     0.76
+dmlx-fix2             HEADLINE        31.3
+dmlx-fix3   ?         code            34.0       28.6     0.74
+dmlx-fix3   ?         prose           27.4       24.0     0.69
+dmlx-fix3   ?         math            37.5       29.5     0.76
+dmlx-fix3   ?         count*          29.9       25.4     0.79
+dmlx-fix3             HEADLINE        32.9
+omlx-mtp    ?         code            36.6       29.3     0.90
+omlx-mtp    ?         prose           28.6       24.3     0.84
+omlx-mtp    ?         math            34.4       25.5     0.90
+omlx-mtp    ?         count*          35.7       28.8     0.89
+omlx-mtp              HEADLINE        33.2
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.753s        129.7      564-2100      4.358s     16.197s
+dmlx-fix1         0.753s        129.7      564-2100      4.350s     16.198s
+dmlx-fix2         0.754s        129.6      564-2100      4.349s     16.211s
+dmlx-fix3         0.753s        129.6      564-2100      4.358s     16.732s
+omlx-mtp          0.894s        139.2      564-2100      4.499s     15.535s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/shallow_depth_20261103.json

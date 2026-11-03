@@ -1,0 +1,26 @@
+prefix-cache nonce: run01934 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx7 ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx7 ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx7 ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:2dc1779code            40.2       32.3     0.81
+dmlx        git:2dc1779prose           25.9       22.7     0.74
+dmlx        git:2dc1779math            32.0       25.1     0.78
+dmlx        git:2dc1779count*          32.2       27.0     0.79
+dmlx                  HEADLINE        32.7
+dmlx7       ?         code            40.3       32.3     0.81
+dmlx7       ?         prose           25.9       22.7     0.74
+dmlx7       ?         math            32.0       25.1     0.78
+dmlx7       ?         count*          32.1       27.0     0.79
+dmlx7                 HEADLINE        32.7
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.753s        129.4      564-2100      4.350s     16.395s
+dmlx7             0.753s        129.6      564-2100      4.343s     16.198s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/null_ab_20261103.json

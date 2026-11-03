@@ -41,7 +41,15 @@ HERE = Path(__file__).resolve().parent.parent
 CLI = HERE / "zig-out/bin/dmlx"
 MODEL = Path.home() / "models/Qwen3.8-27B-4bit"
 PORT = int(os.environ.get("PORT", "18131"))
-PROMPT = "What is 17 * 23? Show your working briefly."
+# Kept identical to compare_engines.PROMPTS so the depth traces here explain
+# that harness's per-prompt numbers rather than a paraphrase of them.
+PROMPTS = {
+    "code": "Write a Python function that merges two sorted lists.",
+    "prose": "Explain in one paragraph why unified memory helps local LLM inference.",
+    "math": "What is 17 * 23? Show your working briefly.",
+    "count": "Count from 1 to 50.",
+}
+PROMPT = PROMPTS["math"]
 
 DEPTH_RE = re.compile(r"MTP depth ((?:N=\d+:\d+r/[\d.]+ms/tok\(E\[t\]=[\d.]+\)\s*)+)")
 ACC_RE = re.compile(r"MTP cond-acceptance (p1=[\d.]+.*)")
