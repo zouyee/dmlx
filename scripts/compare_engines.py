@@ -497,8 +497,39 @@ def engines() -> dict[str, Engine]:
                  "--no-cache",
                  "--port", str(PORT)],
             model_id=os.path.basename(OMLX_MTP_MODEL),
-            note="native Lightning MTP, adaptive depth, prefix cache off (measurement hygiene)",
+            note="native Lightning MTP, adaptive depth, prefix cache off "
+                 "(measurement hygiene). NOT LIKE-FOR-LIKE AGAINST `dmlx`: "
+                 "see the warning below.",
         ),
+        # WARNING, 2026-11-04. `dmlx` vs `omlx-mtp` is NOT a valid pair and
+        # its headline difference is a content artifact, not engine speed.
+        # The reason is the note immediately below, which was written for the
+        # NOTHINK pair and never applied to this one: omlx's default on this
+        # model is thinking-ON with the reasoning-effort system prompt, so its
+        # decode rate is measured on highly predictable think boilerplate.
+        # Measured reasoning share of its completion (artifacts/
+        # thinking_acceptance.json): code 68%, prose 105%, math 43%,
+        # count 72%. dmlx runs no such system prompt, so the two arms decode
+        # different KINDS of text and omlx's rate is inflated by how
+        # predictable its own boilerplate is.
+        #
+        # This is what the "thinking -7.8%" chased all through 2026-11-03/04
+        # actually was. Pooled over 10 runs the gap was uniform (-7.8% code,
+        # -7.9% math, -4.1% prose), which is the signature of a content-type
+        # effect rather than any per-prompt or per-component cause — and every
+        # component was separately measured and found ours or under 3% of the
+        # round (see the measure: commits of 2026-11-04).
+        #
+        # The like-for-like pair is dmlx-nothink vs omlx-mtp-nothink, where
+        # both are pinned to the same content configuration; there dmlx leads
+        # by +8.5% headline. Independent confirmation on an identical
+        # controlled task (scripts/decode_vs_context.py): dmlx +9.6% at ctx 64
+        # and +26.8% at ctx 1024.
+        #
+        # To compare the two engines IN the thinking regime, give dmlx the
+        # same reasoning-effort system prompt rather than comparing against
+        # omlx's default. Until that arm exists, do not quote a thinking-mode
+        # headline from this pair.
         # Parity arm: omlx's DEFAULT on this model is thinking-ON with the
         # reasoning-effort system prompt (reasoning_tokens ~86% of the
         # completion — its decode rate is measured on highly predictable
