@@ -63,6 +63,10 @@ PROMPTS = {
 DMLX_ACC = re.compile(r"acceptance ([\d.]+)% \((\d+)/(\d+) drafts\)")
 # omlx: "MTP[0] ... tok/cycle=3.08 accept=25/29 (86.2%)"
 OMLX_ACC = re.compile(r"tok/cycle=([\d.]+) accept=(\d+)/(\d+) \(([\d.]+)%\)")
+# dmlx: "ms/round draft=8.3 verify=80.1 accept=0.3 commit=0.1"
+DMLX_ROUND = re.compile(r"ms/round draft=([\d.]+) verify=([\d.]+)")
+# dmlx: "N=2:28r/31.4ms/tok(E[t]=2.61) N=7:3r/39.3ms/tok(E[t]=3.34)"
+DMLX_DEPTH = re.compile(r"N=(\d+):(\d+)r/([\d.]+)ms/tok\(E\[t\]=([\d.]+)\)")
 
 
 def kill_all() -> None:
@@ -71,7 +75,11 @@ def kill_all() -> None:
     time.sleep(3)
 
 
-def ask(model_id: str, prompt: str, cap: int) -> tuple[float, int, int]:
+NOTHINK_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
+
+
+def ask(model_id: str, prompt: str, cap: int,
+        extra: dict | None = None) -> tuple[float, int, int]:
     """Returns (wall_s, reasoning_tokens_estimate, completion_tokens)."""
     body = {
         "model": model_id,
@@ -80,6 +88,8 @@ def ask(model_id: str, prompt: str, cap: int) -> tuple[float, int, int]:
         "temperature": 0,
         "stream": False,
     }
+    if extra:
+        body.update(extra)
     req = urllib.request.Request(
         f"http://localhost:{PORT}/v1/chat/completions",
         data=json.dumps(body).encode(),
@@ -94,32 +104,36 @@ def ask(model_id: str, prompt: str, cap: int) -> tuple[float, int, int]:
     return dt, len(think) // 4, int(n)
 
 
-def wait_ready(model_id: str, timeout: int = 900) -> bool:
+def wait_ready(model_id: str, timeout: int = 900,
+               extra: dict | None = None) -> bool:
     """Ready means it can complete; omlx answers /health before loading."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            ask(model_id, "ready?", 1)
+            ask(model_id, "ready?", 1, extra)
             return True
         except Exception:
             time.sleep(3)
     return False
 
 
-def run(name: str, cmd: list[str], model_id: str) -> dict:
+def run(name: str, cmd: list[str], model_id: str,
+        env: dict, extra: dict | None) -> dict:
     kill_all()
     Path("artifacts/logs").mkdir(parents=True, exist_ok=True)
     path = Path(f"artifacts/logs/think_{name}.log")
     log = path.open("w")
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
+    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                            env={**os.environ, **env})
     try:
-        if not wait_ready(model_id):
+        if not wait_ready(model_id, extra=extra):
             raise RuntimeError(f"{name}: never answered a completion")
         out = {}
         for key, prompt in PROMPTS.items():
             mark = path.stat().st_size
             dt, think_tok, n = ask(
-                model_id, f"{prompt} (ref {uuid.uuid4().hex[:6]})", MAX_TOKENS)
+                model_id, f"{prompt} (ref {uuid.uuid4().hex[:6]})", MAX_TOKENS,
+                extra)
             time.sleep(1.0)
             tail = path.read_text(errors="ignore")[mark:]
             acc = None
@@ -130,8 +144,23 @@ def run(name: str, cmd: list[str], model_id: str) -> dict:
                 ms = OMLX_ACC.findall(tail)
                 if ms:
                     acc = float(ms[-1][3])
+            rnd = None
+            mr = DMLX_ROUND.search(tail)
+            if mr:
+                rnd = float(mr.group(1)) + float(mr.group(2))
+            et = depth = None
+            ds = DMLX_DEPTH.findall(tail)
+            if ds:
+                tot = sum(int(r) for _, r, _, _ in ds) or 1
+                et = sum(int(r) * float(e) for _, r, _, e in ds) / tot
+                depth = sum(int(r) * int(nn) for nn, r, _, _ in ds) / tot
+            else:
+                mo = OMLX_ACC.findall(tail)
+                if mo:
+                    et = float(mo[-1][0])          # omlx tok/cycle
             out[key] = {"wall_s": dt, "tokens": n,
                         "reasoning_tok_est": think_tok, "accept_pct": acc,
+                        "round_ms": rnd, "e_t": et, "mean_depth": depth,
                         "tok_s": n / dt}
             print(f"  {key:<6} {n:>4} tok in {dt:5.2f}s = {n/dt:5.1f} tok/s  "
                   f"reasoning~{think_tok:>4} tok  accept="
@@ -147,30 +176,46 @@ def run(name: str, cmd: list[str], model_id: str) -> dict:
 
 
 def main() -> int:
-    engines = {
-        "dmlx": ([str(HERE / "zig-out/bin/dmlx"), "serve", "--model",
-                  str(MODEL), "--speculative-mtp", "7", "--port", str(PORT)],
-                 "m"),
-        "omlx-mtp": ([OMLX_PY, "-m", "omlx.cli", "serve", "--model-dir",
-                      str(OMLX_MODEL_DIR), "--no-cache", "--port", str(PORT)],
-                     OMLX_MODEL_ID),
-    }
+    """Four configurations in one session: each engine x {thinking, nothink}.
+
+    Splits the measured asymmetry — removing thinking content speeds dmlx
+    +29% but omlx only +16% — into its two factors, since
+    tok/s = E[tokens per round] / round_ms. Each engine is read with its OWN
+    instrumentation: dmlx reports per-depth E[t] and the draft/verify round
+    split, omlx reports tok/cycle and accepted drafts.
+    """
+    dmlx_cmd = [str(HERE / "zig-out/bin/dmlx"), "serve", "--model",
+                str(MODEL), "--speculative-mtp", "7", "--port", str(PORT)]
+    omlx_cmd = [OMLX_PY, "-m", "omlx.cli", "serve", "--model-dir",
+                str(OMLX_MODEL_DIR), "--no-cache", "--port", str(PORT)]
+    configs = [
+        ("dmlx-think",   dmlx_cmd, "m",            {}, None),
+        ("dmlx-nothink", dmlx_cmd, "m",            {"DMLX_CHAT_EMPTY_THINK": "1"}, None),
+        ("omlx-think",   omlx_cmd, OMLX_MODEL_ID,  {}, None),
+        ("omlx-nothink", omlx_cmd, OMLX_MODEL_ID,  {}, NOTHINK_BODY),
+    ]
     res = {}
-    for name, (cmd, mid) in engines.items():
-        print(f"=== {name} (thinking mode)", flush=True)
-        res[name] = run(name, cmd, mid)
+    for name, cmd, mid, env, extra in configs:
+        print(f"=== {name}", flush=True)
+        res[name] = run(name, cmd, mid, env, extra)
     kill_all()
 
-    print(f"\n  {'prompt':<7} {'dmlx t/s':>9} {'omlx t/s':>9} "
-          f"{'dmlx acc':>9} {'omlx acc':>9} {'dmlx think':>11} {'omlx think':>11}")
-    for k in PROMPTS:
-        a, b = res["dmlx"][k], res["omlx-mtp"][k]
-        fa = "n/a" if a["accept_pct"] is None else f"{a['accept_pct']:.1f}%"
-        fb = "n/a" if b["accept_pct"] is None else f"{b['accept_pct']:.1f}%"
-        print(f"  {k:<7} {a['tok_s']:>9.1f} {b['tok_s']:>9.1f} {fa:>9} {fb:>9} "
-              f"{a['reasoning_tok_est']:>11} {b['reasoning_tok_est']:>11}")
-    Path("artifacts/thinking_acceptance.json").write_text(json.dumps(res, indent=1))
-    print("\nJSON: artifacts/thinking_acceptance.json")
+    print(f"\n  {'config':<14}{'tok/s':>7}{'E[t]':>7}{'depth':>7}"
+          f"{'round ms':>9}{'accept':>8}")
+    for n, r in res.items():
+        v = [x for x in r.values() if x["tok_s"]]
+        f = lambda k: [x[k] for x in r.values() if x.get(k)]
+        g = lambda k: (sum(f(k)) / len(f(k))) if f(k) else float("nan")
+        print(f"  {n:<14}{sum(x['tok_s'] for x in v)/len(v):>7.1f}"
+              f"{g('e_t'):>7.2f}{g('mean_depth'):>7.2f}{g('round_ms'):>9.1f}"
+              f"{g('accept_pct'):>7.1f}%")
+    for eng in ("dmlx", "omlx"):
+        t = res[f"{eng}-think"]; n = res[f"{eng}-nothink"]
+        mt = sum(x["tok_s"] for x in t.values()) / len(t)
+        mn = sum(x["tok_s"] for x in n.values()) / len(n)
+        print(f"  {eng}: nothink is {100*(mn/mt-1):+.1f}% over thinking")
+    Path("artifacts/asymmetry.json").write_text(json.dumps(res, indent=1))
+    print("\nJSON: artifacts/asymmetry.json")
     return 0
 
 

@@ -1,0 +1,108 @@
+2026-11-04 18:48:53,982 - omlx.settings - INFO - Saved settings to /Users/zouyee/.omlx/settings.json
+INFO:     Uvicorn running on http://127.0.0.1:18181 (Press CTRL+C to quit)
+2026-11-04 18:48:55,214 - omlx.scheduler - INFO - ChunkedKVCache patch: methods already present upstream, skipped: size
+2026-11-04 18:48:55,991 - omlx.server - INFO - CORS origins: ['*']
+2026-11-04 18:48:55,992 - omlx.model_settings - INFO - Loaded settings for 6 models
+2026-11-04 18:48:56,007 - omlx.model_discovery - INFO - Discovered model: DeepSeek-V4-Flash-4bit (type: llm, engine: batched, size: 148.13GB)
+2026-11-04 18:48:56,030 - omlx.model_discovery - WARNING - Skipping incomplete model 'DeepSeek-V4-Flash-Base': 46 weight shard(s) referenced by model.safetensors.index.json are missing from /Users/zouyee/models/DeepSeek-V4-Flash-Base (e.g. model-00001-of-00046.safetensors, model-00002-of-00046.safetensors, model-00003-of-00046.safetensors) — likely an interrupted or still-running download; re-run the download to resume it (finished shards are kept and reused).
+2026-11-04 18:48:56,055 - omlx.model_discovery - WARNING - Skipping incomplete model 'DeepSeek-V4-Flash-DSpark': 45 weight shard(s) referenced by model.safetensors.index.json are missing from /Users/zouyee/models/DeepSeek-V4-Flash-DSpark (e.g. model-00001-of-00048.safetensors, model-00002-of-00048.safetensors, model-00003-of-00048.safetensors) — likely an interrupted or still-running download; re-run the download to resume it (finished shards are kept and reused).
+2026-11-04 18:48:56,058 - omlx.model_discovery - INFO - glm5_next detected as mlx-vlm native text model
+2026-11-04 18:48:56,087 - omlx.model_discovery - INFO - Discovered model: GLM-5.3-Flash-MLX-mixed-4_8bit-dmlx (type: vlm, engine: vlm, size: 182.65GB, text-only: 181.55GB)
+2026-11-04 18:48:56,091 - omlx.model_discovery - INFO - Discovered model: Qwen3.8-27B-4bit (type: vlm, engine: vlm, size: 15.70GB, text-only: 14.80GB)
+2026-11-04 18:48:56,094 - omlx.model_discovery - INFO - Discovered model: Qwen3.8-27B-4bit-mtp (type: vlm, engine: vlm, size: 15.93GB, text-only: 15.03GB)
+2026-11-04 18:48:56,095 - omlx.model_discovery - INFO - Discovered model: Qwen3.8-27B-MTP-4bit (type: llm, engine: batched, size: 0.23GB)
+2026-11-04 18:48:56,101 - omlx.model_discovery - INFO - Model type 'qwen3' has both embedding and LLM variants, but architecture ['Qwen3ForCausalLM'] is not an embedding architecture — treating as LLM
+2026-11-04 18:48:56,101 - omlx.model_discovery - INFO - Discovered model: mlx-community--Qwen3-1.7B-4bit (type: llm, engine: batched, size: 0.95GB)
+2026-11-04 18:48:56,103 - omlx.engine_pool - INFO - Discovered 6 models
+2026-11-04 18:48:56,103 - omlx.server_metrics - INFO - Loaded all-time stats from /Users/zouyee/.omlx/stats.json
+2026-11-04 18:48:56,108 - omlx.server - INFO - Server initialized with 6 models
+2026-11-04 18:48:56,108 - omlx.server - INFO - Default model: DeepSeek-V4-Flash-4bit
+2026-11-04 18:48:56,108 - omlx.server - INFO - Memory guard tier: balanced (guard on)
+2026-11-04 18:48:56,108 - omlx.server - INFO - Default max tokens: 32768
+2026-11-04 18:48:56,108 - omlx.server - INFO - HF Downloader initialized
+2026-11-04 18:48:56,109 - omlx.server - INFO - ModelScope SDK not installed, MS downloader disabled
+2026-11-04 18:48:56,110 - omlx.server - INFO - oQ Quantizer initialized
+2026-11-04 18:48:56,114 - omlx.server - INFO - HF Uploader initialized
+INFO:     Started server process [83807]
+INFO:     Waiting for application startup.
+2026-11-04 18:48:56,140 - omlx.process_memory_enforcer - WARNING - Metal cap (37.4GB, Apple max_recommended_working_set_size) is below the oMLX static ceiling (44.2GB); leaving Apple's default Metal cap active because iogpu.wired_limit_mb is unset. Raise it with: sudo sysctl iogpu.wired_limit_mb=45219
+2026-11-04 18:48:56,140 - omlx.process_memory_enforcer - INFO - Process memory enforcer started (tier=balanced, ceiling=32.6GB, interval=1.0s)
+INFO:     Application startup complete.
+2026-11-04 18:48:56,662 - omlx.engine_pool - INFO - Loading model: Qwen3.8-27B-4bit-mtp
+2026-11-04 18:48:56,664 - omlx.utils.model_loading - INFO - M5 sorted gather_qmm reroute installed (issue #2267)
+2026-11-04 18:48:56,678 - omlx.patches.mlx_lm_mtp.qwen35_model - INFO - Qwen3.5/3.6 MTP model patch applied (PR 990)
+2026-11-04 18:48:56,680 - omlx.patches.mlx_lm_mtp.nemotron_h_chain - INFO - nemotron_h MTP chain patch applied (depth-k drafting, sequential fused verify, replay-free rollback)
+2026-11-04 18:48:56,681 - omlx.patches.qwen35_verify_qmm - INFO - MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma)
+2026-11-04 18:48:56,681 - omlx.utils.model_loading - INFO - Speculative backend selected for /Users/zouyee/models/Qwen3.8-27B-4bit-mtp: Lightning MTP (model_type=qwen3_5, active)
+2026-11-04 18:48:56,683 - omlx.patches.mlx_vlm_mtp.qwen35_vlm_model - INFO - Patched mlx_vlm.models.qwen3_5.Model.sanitize for MTP
+2026-11-04 18:48:56,685 - omlx.patches.mlx_vlm_mtp.qwen35_moe_vlm_model - INFO - Patched mlx_vlm.models.qwen3_5_moe.Model.sanitize for MTP
+2026-11-04 18:48:56,690 - omlx.patches.mlx_vlm_inkling_compat - INFO - Inkling mlx-vlm compatibility patch applied
+2026-11-04 18:48:56,690 - omlx.utils.model_loading - INFO - mlx-vlm MTP sanitize patch applied for /Users/zouyee/models/Qwen3.8-27B-4bit-mtp
+2026-11-04 18:48:56,690 - omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime - INFO - mlx-vlm Qwen3.5 (dense) runtime MTP patch applied
+2026-11-04 18:48:56,690 - omlx.utils.model_loading - INFO - mlx-vlm runtime MTP patch applied for /Users/zouyee/models/Qwen3.8-27B-4bit-mtp
+2026-11-04 18:48:56,691 - omlx.patches.qwen35_gdn_prework - INFO - mlx-vlm Qwen3.5 GDN q/k normalization follows mlx-lm normalize_qk
+2026-11-04 18:48:58,504 - omlx.engine.vlm - INFO - Vision feature cache enabled (SSD: disabled)
+2026-11-04 18:48:59,809 - omlx.scheduler - INFO - Loaded 1 additional EOS token(s) from generation_config.json: {248044}
+2026-11-04 18:48:59,815 - omlx.scheduler - INFO - Decode KV cache materialization interval set to 256 tokens
+2026-11-04 18:48:59,815 - omlx.memory_monitor - INFO - MemoryMonitor initialized (estimator-only, eviction disabled)
+2026-11-04 18:48:59,832 - omlx.memory_monitor - INFO - Model info set: 64 layers (16 KVCache), 4 KV heads, 24 Q heads, 256 head_dim. Estimated memory per 64-token block: 4.00 MB
+2026-11-04 18:48:59,832 - omlx.scheduler - INFO - oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)
+2026-11-04 18:48:59,833 - omlx.engine_core - INFO - Engine started
+2026-11-04 18:48:59,834 - omlx.patches.sdpa256_attention - INFO - sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=8192, always force bounded for qualifying calls (#2025))
+2026-11-04 18:48:59,955 - omlx.patches.qwen35_fa256_attention - INFO - Qwen FA-256 dispatch budget auto-calibrated: 5.35e+09 work/s -> 53455451 (target 10ms/dispatch)
+2026-11-04 18:48:59,956 - omlx.patches.qwen35_fa256_attention - INFO - Qwen3.5/3.6 FA-256 steel attention patch applied (min_kv_len=2048, q_block=32, k_block=8, dispatch_budget=53455451)
+2026-11-04 18:48:59,957 - omlx.patches.qwen35_gdn_verify_fused - INFO - GDN verify replay commit patch applied
+2026-11-04 18:48:59,957 - omlx.patches.qwen35_gdn_prework - INFO - Qwen fused GDN prework patch applied
+2026-11-04 18:48:59,958 - omlx.patches.qwen35_verify_sdpa_split - INFO - Qwen3.5/3.6 verify-width causal vector attention patch applied
+2026-11-04 18:48:59,959 - omlx.patches.qwen35_gdn_chunked - INFO - Qwen3.5/3.6 GDN prefill kernel patch applied (Metal, impl=pipelined, min_t=64)
+2026-11-04 18:48:59,959 - omlx.patches.qwen35_q4_mlp - INFO - Qwen quantized MLP prefill patch applied (variant=8, min_tokens=2048, q8_min_tokens=16384)
+2026-11-04 18:48:59,962 - omlx.patches.qwen35_moe_router - INFO - Qwen MoE fused router top-k patch applied
+2026-11-04 18:48:59,963 - omlx.patches.qwen35_moe_routed_decode - INFO - Qwen MoE fused routed-expert decode patch applied
+2026-11-04 18:48:59,964 - omlx.patches.qwen35_moe_weighted_sum - INFO - Qwen3.5/3.6 MoE weighted-sum patch applied (min_tokens=1024)
+2026-11-04 18:48:59,964 - omlx.patches.qwen35_ragged_decode - INFO - qwen3_5 ragged decode threadgroup fallback patch applied
+2026-11-04 18:49:00,020 - omlx.engine.vlm - INFO - VLM tool calling enabled: parser=qwen3_coder
+2026-11-04 18:49:00,023 - omlx.engine.vlm - INFO - VLMBatchedEngine loaded: /Users/zouyee/models/Qwen3.8-27B-4bit-mtp
+2026-11-04 18:49:00,027 - omlx.engine_pool - INFO - Loaded model: Qwen3.8-27B-4bit-mtp (actual: 15.61GB, local estimate: 15.93GB, full model: 15.93GB, total: 15.93GB)
+2026-11-04 18:49:00,432 - omlx.patches.qwen35_gdn_prework - INFO - Qwen B1/T1 fused GDN prework engaged
+2026-11-04 18:49:00,652 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP path activated for uid=0 (model has mtp_forward, batch=1, primed=14)
+2026-11-04 18:49:00,652 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP[0] finish=length tokens=1 cycles=0 tok/cycle=0.00 accept=0/0 (n/a) emits[init=1,draft=0,bonus=0,verify=0] timing[backbone=0.0ms mtp=0.0ms sample=0.0ms cache=0.0ms]
+2026-11-04 18:49:00,890 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=0.1ms/1
+2026-11-04 18:49:00,891 - omlx.server - INFO - Chat completion: model=Qwen3.8-27B-4bit-mtp, 1 tokens in 0.85s (1.2 tok/s), prompt: 14, finish_reason=length, max_tokens=1, request_max_tokens=1
+2026-11-04 18:49:01,308 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP path activated for uid=1 (model has mtp_forward, batch=1, primed=32)
+2026-11-04 18:49:01,324 - omlx.patches.qwen35_gdn_prework - INFO - [gdn-prework] fused verify prework engaged (S=5, l2=False)
+2026-11-04 18:49:01,325 - omlx.patches.qwen35_verify_sdpa_split - INFO - [verify-split] hd-256 causal vector attention engaged (q_len=5)
+2026-11-04 18:49:01,608 - omlx.patches.qwen35_verify_sdpa_split - INFO - [verify-split] hd-256 causal vector attention engaged (q_len=4)
+2026-11-04 18:49:01,697 - omlx.patches.qwen35_verify_sdpa_split - INFO - [verify-split] hd-256 causal vector attention engaged (q_len=3)
+2026-11-04 18:49:01,774 - omlx.patches.qwen35_verify_sdpa_split - INFO - [verify-split] hd-256 causal vector attention engaged (q_len=2)
+2026-11-04 18:49:04,302 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP[1] finish=length tokens=128 cycles=33 tok/cycle=3.88 accept=93/102 (91.2%) depth[d1=28/30,d2=25/27,d3=22/24,d4=18/21] d0=3 emits[init=2,draft=93,bonus=24,verify=9] timing[backbone=2866.9ms mtp=59.5ms sample=1.5ms cache=28.5ms]
+2026-11-04 18:49:04,316 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=13.4ms/2
+2026-11-04 18:49:04,317 - omlx.server - INFO - Chat completion: model=Qwen3.8-27B-4bit-mtp, 128 tokens in 3.42s (37.4 tok/s), prompt: 32, finish_reason=length, max_tokens=128, request_max_tokens=128
+2026-11-04 18:49:05,989 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP path activated for uid=2 (model has mtp_forward, batch=1, primed=35)
+2026-11-04 18:49:10,562 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP[2] finish=stop tokens=120 cycles=48 tok/cycle=2.50 accept=70/105 (66.7%) depth[d1=32/45,d2=20/31,d3=11/18,d4=7/11] d0=3 emits[init=2,draft=70,bonus=13,verify=35] timing[backbone=4292.9ms mtp=157.7ms sample=2.9ms cache=84.4ms]
+2026-11-04 18:49:10,577 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=26.0ms/3
+2026-11-04 18:49:10,578 - omlx.server - INFO - Chat completion: model=Qwen3.8-27B-4bit-mtp, 119 tokens in 5.25s (22.7 tok/s), prompt: 35, finish_reason=stop, max_tokens=128, request_max_tokens=128
+2026-11-04 18:49:12,248 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP path activated for uid=3 (model has mtp_forward, batch=1, primed=37)
+2026-11-04 18:49:15,202 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP[3] finish=stop tokens=128 cycles=31 tok/cycle=4.13 accept=95/102 (93.1%) depth[d1=28/28,d2=25/27,d3=24/24,d4=18/23] d0=3 emits[init=2,draft=95,bonus=24,verify=7] timing[backbone=2800.7ms mtp=78.7ms sample=2.0ms cache=31.6ms]
+2026-11-04 18:49:15,216 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=40.3ms/4
+2026-11-04 18:49:15,217 - omlx.server - INFO - Chat completion: model=Qwen3.8-27B-4bit-mtp, 127 tokens in 3.63s (35.0 tok/s), prompt: 37, finish_reason=stop, max_tokens=128, request_max_tokens=128
+2026-11-04 18:49:16,658 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP path activated for uid=4 (model has mtp_forward, batch=1, primed=30)
+2026-11-04 18:49:19,380 - omlx.patches.mlx_lm_mtp.batch_generator - INFO - MTP[4] finish=length tokens=128 cycles=29 tok/cycle=4.41 accept=97/98 (99.0%) depth[d1=26/26,d2=25/25,d3=24/24,d4=22/23] d0=3 emits[init=2,draft=97,bonus=28,verify=1] timing[backbone=2617.2ms mtp=58.2ms sample=1.9ms cache=23.4ms]
+2026-11-04 18:49:19,395 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=54.8ms/5
+2026-11-04 18:49:19,396 - omlx.server - INFO - Chat completion: model=Qwen3.8-27B-4bit-mtp, 128 tokens in 3.17s (40.4 tok/s), prompt: 30, finish_reason=length, max_tokens=128, request_max_tokens=128
+INFO:     Shutting down
+INFO:     Waiting for application shutdown.
+2026-11-04 18:49:20,531 - omlx.process_memory_enforcer - INFO - Process memory enforcer stopped
+2026-11-04 18:49:20,531 - omlx.server - INFO - Process memory enforcer stopped
+2026-11-04 18:49:20,531 - omlx.admin.hf_downloader - INFO - HF Downloader shut down
+2026-11-04 18:49:20,531 - omlx.server - INFO - HF Downloader stopped
+2026-11-04 18:49:20,532 - omlx.engine_pool - INFO - Unloading model: Qwen3.8-27B-4bit-mtp (immediate abort)
+2026-11-04 18:49:20,532 - omlx.engine_core - INFO - Engine stopped
+2026-11-04 18:49:20,538 - omlx.scheduler - INFO - Scheduler shutdown initiated...
+2026-11-04 18:49:20,538 - omlx.scheduler - INFO - Scheduler shutdown completed
+2026-11-04 18:49:20,630 - omlx.scheduler - INFO - Deep reset completed - all caches cleared
+2026-11-04 18:49:20,757 - omlx.engine.vlm - INFO - VLMBatchedEngine stopped
+2026-11-04 18:49:21,416 - omlx.engine_pool - INFO - Unloaded model: Qwen3.8-27B-4bit-mtp, freed=17.30GB (expected>=13.93GB), active_memory: 198.61KB (settled)
+2026-11-04 18:49:21,513 - omlx.engine_pool - INFO - Engine pool shutdown complete
+2026-11-04 18:49:21,513 - omlx.server - INFO - Engine pool shutdown
+INFO:     Application shutdown complete.
+INFO:     Finished server process [83807]
