@@ -1,0 +1,148 @@
+{
+  "schema": "dmlx-engine-comparison-v1",
+  "model": "/Users/zouyee/models/Qwen3.8-27B-4bit",
+  "max_tokens": 32,
+  "metric_defs": {
+    "prefill_tok_s": "prompt_tokens / ttft (not reported per-prompt: prompt_tokens is engine-reported and not uniformly available over SSE)",
+    "decode_tok_s": "(streamed_chunks - 1) / (t_last_chunk - t_first_chunk) \u2014 excludes prefill",
+    "effective_tok_s": "streamed_chunks / (t_last_chunk - t_request_start) \u2014 includes prefill and thinking",
+    "caveat": "chunks are SSE content deltas, which equal tokens for all engines here but are not guaranteed to; verify per engine before citing"
+  },
+  "engines": {
+    "omlx-mtp": {
+      "version": "?",
+      "note": "native Lightning MTP, adaptive depth, prefix cache off (measurement hygiene). NOT LIKE-FOR-LIKE AGAINST `dmlx`: see the warning below.",
+      "per_prompt": {
+        "code": {
+          "decode_tok_s": 34.179062369325926,
+          "effective_tok_s": 17.59527863171087,
+          "ttft_s": 0.9115935635715384,
+          "chunks": 32.0,
+          "samples": 2
+        },
+        "prose": {
+          "decode_tok_s": 38.38697349660689,
+          "effective_tok_s": 18.446321331455284,
+          "ttft_s": 0.9268188466782401,
+          "chunks": 32.0,
+          "samples": 2
+        },
+        "math": {
+          "decode_tok_s": 32.744465439647314,
+          "effective_tok_s": 17.35035296582711,
+          "ttft_s": 0.8975039984804123,
+          "chunks": 32.0,
+          "samples": 2
+        },
+        "count": {
+          "decode_tok_s": 34.49972249068297,
+          "effective_tok_s": 17.609695584352437,
+          "ttft_s": 0.9187084038209529,
+          "chunks": 32.0,
+          "samples": 2
+        }
+      },
+      "per_request_raw": {
+        "code": [
+          {
+            "decode_tok_s": 33.67100988417563,
+            "effective_tok_s": 17.630260248102072,
+            "ttft_s": 0.8943878185988675
+          },
+          {
+            "decode_tok_s": 34.580922183892014,
+            "effective_tok_s": 17.67494601227273,
+            "ttft_s": 0.9140242484803215
+          },
+          {
+            "decode_tok_s": 32.96094144072442,
+            "effective_tok_s": 17.362895414350074,
+            "ttft_s": 0.9025034662336111
+          },
+          {
+            "decode_tok_s": 33.77720255475984,
+            "effective_tok_s": 17.51561125114901,
+            "ttft_s": 0.9091628786627552
+          }
+        ],
+        "prose": [
+          {
+            "decode_tok_s": 39.53553710384798,
+            "effective_tok_s": 18.706374786895307,
+            "ttft_s": 0.9265421026151065
+          },
+          {
+            "decode_tok_s": 39.18454243873314,
+            "effective_tok_s": 18.62714994434925,
+            "ttft_s": 0.9267942113632064
+          },
+          {
+            "decode_tok_s": 37.238409889365805,
+            "effective_tok_s": 18.18626787601526,
+            "ttft_s": 0.9270955907413736
+          },
+          {
+            "decode_tok_s": 37.214797940929245,
+            "effective_tok_s": 18.00008085626118,
+            "ttft_s": 0.9447678219548834
+          }
+        ],
+        "math": [
+          {
+            "decode_tok_s": 33.41058761323869,
+            "effective_tok_s": 17.522854722665432,
+            "ttft_s": 0.8983368685549067
+          },
+          {
+            "decode_tok_s": 33.41665065138743,
+            "effective_tok_s": 17.56606080019852,
+            "ttft_s": 0.8940134653870094
+          },
+          {
+            "decode_tok_s": 32.07228022790721,
+            "effective_tok_s": 17.1346451314557,
+            "ttft_s": 0.900994531573815
+          },
+          {
+            "decode_tok_s": 31.97033685570901,
+            "effective_tok_s": 17.18888498353805,
+            "ttft_s": 0.8920193284514729
+          }
+        ],
+        "count": [
+          {
+            "decode_tok_s": 34.631330861744075,
+            "effective_tok_s": 17.79817728730104,
+            "ttft_s": 0.9027937264581851
+          },
+          {
+            "decode_tok_s": 34.939227581245014,
+            "effective_tok_s": 17.808420628142002,
+            "ttft_s": 0.9096478750131306
+          },
+          {
+            "decode_tok_s": 34.060217400120926,
+            "effective_tok_s": 17.410970540562868,
+            "ttft_s": 0.9277689326287751
+          },
+          {
+            "decode_tok_s": 33.296260398809245,
+            "effective_tok_s": 17.476540475123144,
+            "ttft_s": 0.8999905134708872
+          }
+        ]
+      },
+      "headline_decode_tok_s": 35.103500435193375,
+      "ttft_short_s": 0.903746083000442,
+      "prefill_tok_s": 129.7788923716049,
+      "prefill_span": [
+        565,
+        2100
+      ],
+      "prefill_points": {
+        "512": 4.561838166002417,
+        "2048": 16.38964754200424
+      }
+    }
+  }
+}
