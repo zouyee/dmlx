@@ -1,6 +1,22 @@
 === dmlx
-    ctx~   64  rep0     nan tok/s  (ttft 4.06s)
-    ctx~   64  rep1    56.7 tok/s  (ttft 1.91s)
-    ctx~  512  rep0   114.5 tok/s  (ttft 9.70s)
-    ctx~  512  rep1     nan tok/s  (ttft 11.76s)
-    ctx~ 2048  rep0    16.4 tok/s  (ttft 39.44s)
+    ctx~   64  rep0    53.9 tok/s  (ttft 1.79s)
+    ctx~   64  rep1    60.7 tok/s  (ttft 1.90s)
+    ctx~   64  rep2    54.6 tok/s  (ttft 1.78s)
+    ctx~ 1024  rep0   207.4 tok/s  (ttft 20.10s)
+    ctx~ 1024  rep1    61.6 tok/s  (ttft 20.85s)
+    ctx~ 1024  rep2    45.3 tok/s  (ttft 17.28s)
+=== omlx-mtp
+    ctx~   64  rep0    49.8 tok/s  (ttft 1.89s)
+    ctx~   64  rep1    49.9 tok/s  (ttft 1.89s)
+    ctx~   64  rep2    49.2 tok/s  (ttft 1.89s)
+    ctx~ 1024  rep0    48.7 tok/s  (ttft 17.07s)
+    ctx~ 1024  rep1    48.6 tok/s  (ttft 17.06s)
+    ctx~ 1024  rep2    48.3 tok/s  (ttft 16.32s)
+
+   ctx tokens      dmlx      omlx   dmlx/omlx
+           64      54.6      49.8       +9.6%
+         1024      61.6      48.6      +26.8%
+  dmlx      degradation 64 -> 1024: +12.7%
+  omlx-mtp  degradation 64 -> 1024: -2.5%
+
+JSON: artifacts/decode_vs_context.json

@@ -64,6 +64,10 @@ FILLER = ("Item {i}: the quarterly figure was recorded and filed without "
 # measurement is about context, not about who guesses better.
 TASK = ("\n\nIgnoring all of the above, do exactly this and nothing else: "
         "count from 1 to 300, separated by commas.")
+# Caps for the two-point difference, and the minimum token gap that makes it
+# meaningful.
+SHORT_CAP = 8
+MIN_TOKEN_DELTA = 16
 
 
 def kill_all() -> None:
@@ -72,13 +76,31 @@ def kill_all() -> None:
     time.sleep(3)
 
 
-def wait_up(timeout: int = 420) -> bool:
-    for _ in range(timeout):
+def wait_up(model_id: str, extra_body: dict | None,
+            timeout: int = 900) -> bool:
+    """Ready means it can COMPLETE, not that /health answers.
+
+    omlx serves /health before its model is loaded (engine_pool reports
+    loaded_count=0 at that point), so a /health probe returns long before the
+    server can answer, and the first real request then races the weight load —
+    which showed up as `Connection refused` after the probe had already
+    succeeded. Probing with a one-token completion makes readiness mean what
+    the caller needs it to mean.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            with urllib.request.urlopen(f"http://localhost:{PORT}/health", timeout=2):
-                return True
+            with urllib.request.urlopen(
+                    f"http://localhost:{PORT}/health", timeout=2):
+                pass
         except (urllib.error.URLError, OSError):
             time.sleep(1)
+            continue
+        try:
+            request(model_id, "ready?", 1, extra_body, timeout=600)
+            return True
+        except Exception:
+            time.sleep(2)
     return False
 
 
@@ -95,7 +117,8 @@ def build_prompt(target_tokens: int, nonce: str) -> str:
     return "".join(out) + TASK
 
 
-def measure(model_id: str, prompt: str, max_tokens: int,
+def measure(model_id: str, prompt_short: str, prompt_long: str,
+            max_tokens: int,
             extra_body: dict | None = None) -> tuple[float, int, float]:
     """Return (decode_tok_s, tokens, ttft_s) using the two-point method.
 
@@ -104,36 +127,68 @@ def measure(model_id: str, prompt: str, max_tokens: int,
     matters because dmlx only runs its speculative path off the non-streaming
     route.
     """
-    def one(cap: int) -> tuple[float, int]:
-        body = {
-            "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": cap,
-            "temperature": 0,
-            "stream": False,
-        }
-        # Thinking is disabled per engine the way compare_engines does it:
-        # omlx takes chat_template_kwargs in the body, dmlx takes the
-        # DMLX_CHAT_EMPTY_THINK env var and rejects the body field with a 400.
-        if extra_body:
-            body.update(extra_body)
-        req = urllib.request.Request(
-            f"http://localhost:{PORT}/v1/chat/completions",
-            data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json"})
-        t0 = time.perf_counter()
-        with urllib.request.urlopen(req, timeout=2400) as r:
-            payload = json.load(r)
-        dt = time.perf_counter() - t0
-        n = (payload.get("usage") or {}).get("completion_tokens") or cap
-        return dt, n
-
-    t_short, n_short = one(8)
-    t_long, n_long = one(max_tokens)
+    # The two requests must use DIFFERENT prompts of the same length. Sharing
+    # one prompt lets the second request reuse the first's just-written
+    # prefix, which shrinks its prefill and can make the LONG request finish
+    # in less wall time than the short one — measured here as d_t <= 0, and
+    # the same trap compare_engines documents for omlx's paged prefix cache.
+    # Distinct prompts of equal length make the prefill term cancel in
+    # expectation instead of being reused.
+    t_short, n_short = request(model_id, prompt_short, SHORT_CAP, extra_body)
+    t_long, n_long = request(model_id, prompt_long, max_tokens, extra_body)
     d_tok = n_long - n_short
     d_t = t_long - t_short
-    rate = d_tok / d_t if d_t > 0 and d_tok > 0 else float("nan")
-    return rate, n_long, t_short
+    # Fail loudly rather than returning nan, which let a whole sweep look like
+    # it had run.
+    if d_tok < MIN_TOKEN_DELTA:
+        raise RuntimeError(
+            f"two-point collapsed on TOKENS: short cap {SHORT_CAP} gave "
+            f"{n_short}, long cap {max_tokens} gave {n_long} (delta {d_tok}, "
+            f"need >= {MIN_TOKEN_DELTA}). The task stops before the long cap; "
+            f"lengthen it or lower the cap.")
+    if d_t <= 0:
+        raise RuntimeError(
+            f"two-point collapsed on TIME: long request took {t_long:.2f}s, "
+            f"short took {t_short:.2f}s. The long request was faster, which "
+            f"means prefill was not comparable between the pair (prefix "
+            f"reuse, or thermal drift).")
+    return d_tok / d_t, n_long, t_short
+
+
+def request(model_id: str, prompt: str, cap: int,
+            extra_body: dict | None, timeout: int = 2400) -> tuple[float, int]:
+    """One non-streaming greedy completion. Returns (wall_s, tokens_emitted).
+
+    Token count comes from the engine's own usage block, never from `cap` —
+    assuming the cap was reached is what produced the collapsed measurements.
+    """
+    body = {
+        "model": model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": cap,
+        "temperature": 0,
+        "stream": False,
+    }
+    # Thinking is disabled per engine the way compare_engines does it: omlx
+    # takes chat_template_kwargs in the body, dmlx rejects that field with
+    # HTTP 400 and takes DMLX_CHAT_EMPTY_THINK=1 as an env var instead.
+    if extra_body:
+        body.update(extra_body)
+    req = urllib.request.Request(
+        f"http://localhost:{PORT}/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    t0 = time.perf_counter()
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        payload = json.load(r)
+    dt = time.perf_counter() - t0
+    usage = payload.get("usage") or {}
+    n = usage.get("completion_tokens")
+    if n is None:
+        msg = payload["choices"][0]["message"]
+        text = (msg.get("reasoning_content") or "") + (msg.get("content") or "")
+        n = max(1, len(text) // 4)
+    return dt, int(n)
 
 
 def run_engine(name: str, cmd: list[str], model_id: str, lengths: list[int],
@@ -145,17 +200,19 @@ def run_engine(name: str, cmd: list[str], model_id: str, lengths: list[int],
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                             env={**os.environ, **env})
     try:
-        if not wait_up():
-            raise RuntimeError(f"{name}: server never became healthy")
+        if not wait_up(model_id, extra_body):
+            raise RuntimeError(f"{name}: never answered a completion")
         # Warm the weights once so the first length does not pay load cost.
-        measure(model_id, build_prompt(64, "warm"), 32, extra_body)
+        measure(model_id, build_prompt(64, "warmA"),
+                build_prompt(64, "warmB"), 32, extra_body)
         out = {}
         for L in lengths:
             rates = []
             for r in range(reps):
-                nonce = uuid.uuid4().hex[:8]
+                a, b = uuid.uuid4().hex[:8], uuid.uuid4().hex[:8]
                 rate, _, ttft = measure(
-                    model_id, build_prompt(L, nonce), max_tokens, extra_body)
+                    model_id, build_prompt(L, a), build_prompt(L, b),
+                    max_tokens, extra_body)
                 rates.append(rate)
                 print(f"    ctx~{L:>5}  rep{r}  {rate:6.1f} tok/s  "
                       f"(ttft {ttft:.2f}s)", flush=True)
