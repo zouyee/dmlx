@@ -1,0 +1,16 @@
+prefix-cache nonce: run93927 (every prompt is textually novel)
+[pass 1/2] omlx-mtp ...
+[pass 2/2] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+omlx-mtp    ?         code            33.3       17.4     0.90
+omlx-mtp    ?         prose           38.0       18.3     0.93
+omlx-mtp    ?         math            29.0       16.4     0.88
+omlx-mtp    ?         count*          33.1       17.4     0.90
+omlx-mtp              HEADLINE        33.5
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+omlx-mtp          0.911s        135.3      564-2100      4.622s     15.974s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/omlx_nofa.json
