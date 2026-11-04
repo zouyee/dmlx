@@ -1,0 +1,16 @@
+prefix-cache nonce: run94548 (every prompt is textually novel)
+[pass 1/2] omlx-mtp-aligned ...
+[pass 2/2] omlx-mtp-aligned ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+omlx-mtp-aligned?         code            32.0       24.4     1.27
+omlx-mtp-aligned?         prose           26.0       20.9     1.24
+omlx-mtp-aligned?         math            40.8       27.7     1.22
+omlx-mtp-aligned?         count*          39.5       29.0     1.20
+omlx-mtp-aligned          HEADLINE        33.0
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+omlx-mtp-aligned      0.924s        135.4      564-2100      4.669s     16.014s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/omlx_noprework.json
