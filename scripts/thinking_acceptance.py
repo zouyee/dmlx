@@ -52,6 +52,12 @@ OMLX_MODEL_ID = "Qwen3.8-27B-4bit-mtp"
 PORT = int(os.environ.get("PORT", "18171"))
 MAX_TOKENS = 128
 
+# Same directive the harness's aligned arm sends, so acceptance is compared on
+# comparable reasoning text rather than on each engine's own default style.
+DIRECTIVE = ("Before answering, reason step by step inside <think> and "
+             "</think> tags. Keep the reasoning brief and structured, then "
+             "give the final answer.")
+
 PROMPTS = {
     "code": "Write a Python function that merges two sorted lists.",
     "prose": "Explain in one paragraph why unified memory helps local LLM inference.",
@@ -75,15 +81,18 @@ def kill_all() -> None:
     time.sleep(3)
 
 
+SYSTEM = [""]
 NOTHINK_BODY = {"chat_template_kwargs": {"enable_thinking": False}}
 
 
 def ask(model_id: str, prompt: str, cap: int,
         extra: dict | None = None) -> tuple[float, int, int]:
     """Returns (wall_s, reasoning_tokens_estimate, completion_tokens)."""
+    msgs = ([{"role": "system", "content": SYSTEM[0]}] if SYSTEM[0] else [])
+    msgs = msgs + [{"role": "user", "content": prompt}]
     body = {
         "model": model_id,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": msgs,
         "max_tokens": cap,
         "temperature": 0,
         "stream": False,
@@ -189,15 +198,15 @@ def main() -> int:
     omlx_cmd = [OMLX_PY, "-m", "omlx.cli", "serve", "--model-dir",
                 str(OMLX_MODEL_DIR), "--no-cache", "--port", str(PORT)]
     configs = [
-        ("dmlx-think",   dmlx_cmd, "m",            {}, None),
-        ("dmlx-nothink", dmlx_cmd, "m",            {"DMLX_CHAT_EMPTY_THINK": "1"}, None),
-        ("omlx-think",   omlx_cmd, OMLX_MODEL_ID,  {}, None),
-        ("omlx-nothink", omlx_cmd, OMLX_MODEL_ID,  {}, NOTHINK_BODY),
+        ("dmlx-think-aligned", dmlx_cmd, "m",           {}, None, DIRECTIVE),
+        ("omlx-think",         omlx_cmd, OMLX_MODEL_ID, {}, None, ""),
     ]
     res = {}
-    for name, cmd, mid, env, extra in configs:
-        print(f"=== {name}", flush=True)
+    for name, cmd, mid, env, extra, sysmsg in configs:
+        print(f"=== {name}  system={'yes' if sysmsg else 'no'}", flush=True)
+        SYSTEM[0] = sysmsg
         res[name] = run(name, cmd, mid, env, extra)
+    SYSTEM[0] = ""
     kill_all()
 
     print(f"\n  {'config':<14}{'tok/s':>7}{'E[t]':>7}{'depth':>7}"
@@ -209,7 +218,10 @@ def main() -> int:
         print(f"  {n:<14}{sum(x['tok_s'] for x in v)/len(v):>7.1f}"
               f"{g('e_t'):>7.2f}{g('mean_depth'):>7.2f}{g('round_ms'):>9.1f}"
               f"{g('accept_pct'):>7.1f}%")
+    # Only when both halves of a pair were actually run.
     for eng in ("dmlx", "omlx"):
+        if f"{eng}-think" not in res or f"{eng}-nothink" not in res:
+            continue
         t = res[f"{eng}-think"]; n = res[f"{eng}-nothink"]
         mt = sum(x["tok_s"] for x in t.values()) / len(t)
         mn = sum(x["tok_s"] for x in n.values()) / len(n)

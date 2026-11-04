@@ -1,0 +1,22 @@
+=== dmlx-think-aligned  system=yes
+  code    128 tok in  6.01s =  21.3 tok/s  reasoning~   0 tok  accept=58.8%
+  prose   128 tok in  5.35s =  23.9 tok/s  reasoning~   0 tok  accept=57.4%
+  math    112 tok in  4.47s =  25.0 tok/s  reasoning~   0 tok  accept=61.8%
+  count   128 tok in  3.82s =  33.6 tok/s  reasoning~   0 tok  accept=88.3%
+=== omlx-think  system=no
+  code    128 tok in  4.44s =  28.9 tok/s  reasoning~  87 tok  accept=86.1%
+  prose   128 tok in  5.59s =  22.9 tok/s  reasoning~ 137 tok  accept=66.0%
+  math    101 tok in  3.57s =  28.3 tok/s  reasoning~  45 tok  accept=87.7%
+  count   128 tok in  4.28s =  29.9 tok/s  reasoning~  53 tok  accept=87.6%
+
+  config          tok/s   E[t]  depth round ms  accept
+  dmlx-think-aligned   26.0   3.40   4.18    113.1   66.6%
+  omlx-think       27.5   3.25    nan      nan   81.8%
+Traceback (most recent call last):
+  File "/Users/zouyee/work/code/dmlx/scripts/thinking_acceptance.py", line 232, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/Users/zouyee/work/code/dmlx/scripts/thinking_acceptance.py", line 222, in main
+    t = res[f"{eng}-think"]; n = res[f"{eng}-nothink"]
+        ~~~^^^^^^^^^^^^^^^^
+KeyError: 'dmlx-think'
