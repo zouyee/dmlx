@@ -1,0 +1,50 @@
+{
+ "dmlx": {
+  "math": {
+   "tokens": [
+    104,
+    102
+   ],
+   "texts": [
+    "We need answer simple arithmetic. Need final with brief working. Compute 17*23 = 17*(20+3)=340+51=391. Or 20*23-3*23=460-69=391. Final concise.\n</think>\n\n17 \u00d7 23 = 17 \u00d7 (20 + 3) = 340 + 51 = **391**<|im_end|>",
+    "We need answer simple arithmetic. Need final with brief working. Compute 17*23 = 17*(20+3)=340+51=391. Or 23*(10+7)=230+161=391. Final concise.\n</think>\n\n17 \u00d7 23 = 17 \u00d7 (20 + 3) = 340 + 51 = **391**<|im_end|>"
+   ],
+   "self_identical": false
+  },
+  "prose": {
+   "tokens": [
+    198,
+    198
+   ],
+   "texts": [
+    "We need to answer user: \"Explain in one paragraph why unified memory helps local LLM inference.\" Need one paragraph. Need final concise. Explain unified memory: shared memory pool between CPU/GPU, avoids copying weights/activations, enables larger models to fit, reduces latency, improves bandwidth? Local LLM inference often bottlenecked by memory capacity and data movement. Unified memory allows OS/driver to manage pages, keep model weights accessible, offload, dynamic allocation, less fragmentation, better utilization. Need one paragraph only. Ensure not too long.\n</think>\n\nUnified memory helps local LLM inference by letting the CPU and GPU share a single memory pool, so large model weights, KV-cache data, and activations can be placed where they are needed without expensive copies between separate devices. This reduces memory bottlenecks, makes it easier to run models that would not fit in discrete GPU memory, and improves overall efficiency by allowing the system to dynamically manage data placement and avoid fragmentation.<|im_end|>",
+    "We need to answer user: \"Explain in one paragraph why unified memory helps local LLM inference.\" Need one paragraph. Need final concise. Explain unified memory: shared memory pool between CPU/GPU, avoids copying weights/activations, enables larger models to fit, reduces latency, improves bandwidth? Local LLM inference often bottlenecked by memory capacity and data movement. Unified memory allows OS/driver to manage pages, keep model weights accessible, offload, dynamic allocation, less fragmentation, better utilization. Need one paragraph only. Ensure not too long.\n</think>\n\nUnified memory helps local LLM inference by letting the CPU and GPU share a single memory pool, so large model weights, KV-cache data, and activations can be placed where they are needed without expensive copies between separate devices. This reduces memory bottlenecks, makes it easier to run models that would not fit in discrete GPU memory, and improves overall efficiency by allowing the system to dynamically manage data placement and avoid fragmentation.<|im_end|>"
+   ],
+   "self_identical": true
+  }
+ },
+ "omlx-mtp": {
+  "math": {
+   "tokens": [
+    101,
+    101
+   ],
+   "texts": [
+    "We need answer simple arithmetic. Need final with brief working. Compute 17*23 = 17*(20+3)=340+51=391. Or 23*(10+7)=230+161=391. Final concise.17 \u00d7 23 = 17 \u00d7 (20 + 3) = 340 + 51 = **391**",
+    "We need answer simple arithmetic. Need final with brief working. Compute 17*23 = 17*(20+3)=340+51=391. Or 23*(10+7)=230+161=391. Final concise.17 \u00d7 23 = 17 \u00d7 (20 + 3) = 340 + 51 = **391**"
+   ],
+   "self_identical": true
+  },
+  "prose": {
+   "tokens": [
+    195,
+    188
+   ],
+   "texts": [
+    "We need answer user's request: \"Explain in one paragraph why unified memory helps local LLM inference.\" Need one paragraph. Need final concise one paragraph. Explain unified memory: CPU/GPU share same physical memory pool, avoids copying model weights/activations between separate RAM and VRAM, enables larger models to fit if total system memory sufficient, reduces latency/bottlenecks, improves context length and batch, especially Apple Silicon/Mac. Need one paragraph only. Ensure no extra.Unified memory helps local LLM inference because it lets the CPU and GPU share the same physical memory pool, so model weights, KV-cache, and activations don\u2019t need to be repeatedly copied between separate system RAM and GPU VRAM. This reduces data-transfer bottlenecks, lowers latency, and makes it practical to run larger models or longer contexts on a single machine, since the model can use the full available memory rather than being limited by a small discrete GPU memory budget.",
+    "We need answer user's request: \"Explain in one paragraph why unified memory helps local LLM inference.\" Need one paragraph. Need final concise one paragraph. Explain unified memory: CPU/GPU share same physical memory pool, avoids copying model weights/activations between separate RAM and VRAM, enables larger models to fit if total system memory sufficient, reduces latency/bottlenecks, improves context length and batch, especially Apple Silicon/Mac. Need one paragraph only. Ensure no extra.Unified memory helps local LLM inference because it lets the CPU and GPU share the same physical memory pool, so model weights, KV-cache, and activations don\u2019t need to be repeatedly copied between separate system RAM and GPU VRAM. This reduces data-transfer bottlenecks, makes it easier to run larger models or longer contexts on a single machine, and improves overall responsiveness by keeping the data close to whichever component needs it at each step."
+   ],
+   "self_identical": false
+  }
+ }
+}
