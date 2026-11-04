@@ -183,8 +183,9 @@ def main() -> int:
     print(f"prompt [{args.prompt}]: {PROMPT}")
 
     arms = [
-        ("fusedgates", {}),                                  # head
-        ("eagergates", {"DMLX_GDN_NO_FUSED_GATES": "1"}),
+        ("fold", {"DMLX_MTP_FIXED_N": "4"}),                  # dmlx default: target-hidden replay
+        ("replayfree", {"DMLX_MTP_FIXED_N": "4",
+                        "DMLX_MTP_REPLAY_FREE": "1"}),        # omlx: keep head chain states
     ]
     results = []
     for name, env in arms:
