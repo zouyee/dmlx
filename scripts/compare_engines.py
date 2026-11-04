@@ -94,6 +94,14 @@ PROMPTS = {
 }
 HEADLINE = ("code", "prose", "math")
 
+# Mirrors what omlx's reasoning_effort chat-template kwarg elicits: a short,
+# structured reasoning pass before the answer. Sent to BOTH arms of an aligned
+# comparison so neither engine is measured on a different kind of text.
+REASONING_DIRECTIVE = (
+    "Before answering, reason step by step inside <think> and </think> tags. "
+    "Keep the reasoning brief and structured, then give the final answer."
+)
+
 # Prefix-cache nonce.
 #
 # omlx keeps a 24 GB persisted prefix/GDN-state cache under ~/.omlx/cache and
@@ -129,6 +137,14 @@ class Engine:
     # Merged verbatim into every request body (e.g. omlx's
     # chat_template_kwargs={"enable_thinking": false} for think-mode parity).
     extra_body: dict = field(default_factory=dict)
+    # Prepended as a system message to every request. Exists to ALIGN the
+    # thinking regime: omlx applies a reasoning_effort chat-template kwarg and
+    # dmlx applies none, so by default the two arms decode different kinds of
+    # text (measured reasoning share of omlx's completion: 43-105%). An
+    # explicit directive sent to dmlx makes its reasoning comparably
+    # structured, which is the only way to get a thinking-mode number that is
+    # about the engines rather than about their prompts.
+    system: str = ""
 
     def available(self) -> tuple[bool, str]:
         exe = self.cmd[0]
@@ -225,6 +241,19 @@ def engines() -> dict[str, Engine]:
                  "--model", MODEL, "--speculative-mtp", "5",
                  "--port", str(PORT)],
             note="adaptive MTP, ceiling 5",
+        ),
+        # ALIGNED thinking arm: dmlx with an explicit reasoning directive, so
+        # it produces a structured reasoning block like omlx's
+        # reasoning_effort template does. This is the pair to quote a
+        # thinking-mode number from; `dmlx` vs `omlx-mtp` is not.
+        "dmlx-think-aligned": Engine(
+            name="dmlx-think-aligned",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            system=REASONING_DIRECTIVE,
+            note="adaptive MTP ceiling 7 + explicit reasoning directive "
+                 "(content parity with omlx's reasoning_effort default)",
         ),
         # Fixed-depth arms. These exist because the adaptive controller's
         # choice on math is a coin flip between two fixed points, and every
@@ -564,6 +593,7 @@ def wait_health(timeout: int = 240) -> bool:
 
 
 def one_request(prompt: str, max_tokens: int, model_id: str = MODEL,
+                system: str = "",
                 extra_body: dict | None = None) -> dict | None:
     """One NON-streaming completion; returns wall time and usage counts.
 
@@ -578,7 +608,8 @@ def one_request(prompt: str, max_tokens: int, model_id: str = MODEL,
     # makes it 404 on every request. dmlx ignores the field.
     payload = {
         "model": model_id,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": ([{"role": "system", "content": system}] if system else [])
+                    + [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
         "temperature": 0,
     }
@@ -678,6 +709,7 @@ def prefill_sweep(model_id: str, lengths: list[int], reps: int,
 
 
 def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL,
+              system: str = "",
               extra_body: dict | None = None) -> dict | None:
     """Prefill-free decode rate from two non-streaming requests.
 
@@ -689,10 +721,10 @@ def two_point(prompt: str, short: int, long_: int, model_id: str = MODEL,
     streaming timestamps or any engine-reported timing field. The same
     formula is applied to every engine, which is the point.
     """
-    a = one_request(prompt, short, model_id, extra_body)
+    a = one_request(prompt, short, model_id, system, extra_body)
     if a is None:
         return None
-    b = one_request(prompt, long_, model_id, extra_body)
+    b = one_request(prompt, long_, model_id, system, extra_body)
     if b is None:
         return None
     dc = b["completion_tokens"] - a["completion_tokens"]
@@ -745,7 +777,7 @@ def measure(engine: Engine, reps_prompt: int, max_tokens: int,
             runs = []
             for _ in range(reps_prompt):
                 r = two_point(prompt_text(key), 8, max_tokens, engine.model_id,
-                              engine.extra_body)
+                              engine.system, engine.extra_body)
                 if r:
                     runs.append(r)
             if not runs:

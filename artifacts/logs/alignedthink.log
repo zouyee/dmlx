@@ -1,0 +1,35 @@
+prefix-cache nonce: run89642 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-think-aligned ...
+[pass 1/3] omlx-mtp ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-think-aligned ...
+[pass 2/3] omlx-mtp ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-think-aligned ...
+[pass 3/3] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:c0d15a0code            37.0       29.5     0.91
+dmlx        git:c0d15a0prose           24.7       21.8     0.74
+dmlx        git:c0d15a0math            32.6       26.0     0.83
+dmlx        git:c0d15a0count*          30.7       25.9     0.80
+dmlx                  HEADLINE        31.4
+dmlx-think-aligned?         code            34.0       26.2     1.17
+dmlx-think-aligned?         prose           24.4       20.2     1.13
+dmlx-think-aligned?         math            38.4       27.9     1.02
+dmlx-think-aligned?         count*          48.5       34.7     1.07
+dmlx-think-aligned          HEADLINE        32.3
+omlx-mtp    ?         code            34.7       27.9     0.93
+omlx-mtp    ?         prose           25.0       21.6     0.84
+omlx-mtp    ?         math            35.6       26.1     0.93
+omlx-mtp    ?         count*          30.6       25.4     0.90
+omlx-mtp              HEADLINE        31.8
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.772s        121.9      564-2100      4.573s     17.330s
+dmlx-think-aligned      0.768s        123.2      564-2100      4.598s     17.063s
+omlx-mtp          0.919s        134.6      564-2100      4.651s     16.075s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/aligned_think_20261104.json
