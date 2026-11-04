@@ -3328,6 +3328,15 @@ pub const Qwen38GDN = struct {
         defer if (self.conv1d_t_f32 == null) w_f32.deinit();
         const qkv = blk: {
             if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K)) |fused| {
+                // DIAGNOSTIC (DMLX_VERIFY_PRICE_CONV=1): price the fused conv
+                // kernel by running it twice and averaging (see priceTwice).
+                // Output stays bit-correct.
+                if (std.c.getenv("DMLX_VERIFY_PRICE_CONV") != null) {
+                    defer fused.deinit();
+                    const f2 = try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K) orelse break :blk fused;
+                    defer f2.deinit();
+                    break :blk try priceTwice(ctx, fused, f2);
+                }
                 break :blk fused;
             }
             used_fused = false;
