@@ -356,9 +356,49 @@ fn getSplitk(allocator: std.mem.Allocator, m: i32) !c.c.mlx_fast_metal_kernel {
 
 const Sg8Geom = struct { nsg: i32, ct: i32 };
 
+/// Columns-per-threadgroup for the K < 16384 shapes, i.e. everything in this
+/// model except `mlp_down`. Tunable because the per-shape bandwidth says this
+/// is where sg8 leaves room. At M=8, over the distinct verify shapes:
+///
+///   shape       N       K      ct   GB/s   % of 273
+///   attn_kv     1024    5120    1    134      49
+///   mlp_gate    17408   5120    1    181      66
+///   lm_head     248320  5120    4    190      69
+///   mlp_down    5120    17408   2    198      72
+///
+/// `mlp_down` and `mlp_gate` move identical bytes (50.1 MB) and `mlp_down` is
+/// 9% faster. The difference is work per threadgroup: `mlp_down` gets ct=2 and
+/// PER = K/GS/NSG = 34, `mlp_gate` gets ct=1 and PER = 10. Every K=5120 shape
+/// therefore runs the thinnest possible tile, and the whole set averages
+/// 187 GB/s = 69% of peak against mlx-lm's demonstrated 81%.
+///
+/// Raising ct multiplies the accumulators and the weight columns a
+/// threadgroup holds, which cuts threadgroup count by the same factor
+/// (mlp_gate: 2176 -> 1088 at ct=2) and amortises the x_shared load and the
+/// simdgroup reduction over more output. It also raises register pressure,
+/// so it is a sweep, not a derivation.
+const sg8_ct_default: i32 = 1;
+fn sg8Ct() i32 {
+    const s = std.c.getenv("DMLX_VERIFY_QMM_SG8_CT") orelse return sg8_ct_default;
+    const v = std.fmt.parseInt(i32, std.mem.span(s), 10) catch return sg8_ct_default;
+    // sg8_kernels is indexed by ct and has 5 slots.
+    return if (v >= 1 and v <= 4) v else sg8_ct_default;
+}
+
+/// Simdgroups per threadgroup. `lm_head` already uses 4 and posts the best
+/// per-shape bandwidth of the set, so 4 is worth testing everywhere: halving
+/// NSG doubles PER (groups of K per simdgroup), trading threadgroup count for
+/// per-simdgroup work in the other direction from `ct`.
+const sg8_nsg_default: i32 = 8;
+fn sg8Nsg() i32 {
+    const s = std.c.getenv("DMLX_VERIFY_QMM_SG8_NSG") orelse return sg8_nsg_default;
+    const v = std.fmt.parseInt(i32, std.mem.span(s), 10) catch return sg8_nsg_default;
+    return if (v == 4 or v == 8) v else sg8_nsg_default;
+}
+
 fn sg8Geometry(k: i32, n: i32) Sg8Geom {
     if (n >= 65536) return .{ .nsg = 4, .ct = 4 };
-    return .{ .nsg = 8, .ct = if (k >= 16384) 2 else 1 };
+    return .{ .nsg = sg8Nsg(), .ct = if (k >= 16384) 2 else sg8Ct() };
 }
 
 fn buildSg8Source(allocator: std.mem.Allocator, ct: i32) ![]u8 {
