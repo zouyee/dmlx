@@ -1,0 +1,6 @@
+=== dmlx
+    ctx~   64  rep0     nan tok/s  (ttft 4.06s)
+    ctx~   64  rep1    56.7 tok/s  (ttft 1.91s)
+    ctx~  512  rep0   114.5 tok/s  (ttft 9.70s)
+    ctx~  512  rep1     nan tok/s  (ttft 11.76s)
+    ctx~ 2048  rep0    16.4 tok/s  (ttft 39.44s)

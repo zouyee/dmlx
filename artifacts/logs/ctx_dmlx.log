@@ -1,0 +1,244 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 6ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:18155
+info: [ACCEPT] Connection accepted (accept took 242.3ms)
+info: [HTTP] Request received: 125 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.0ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 0.9ms)
+info: [HTTP] Request received: 914 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=1.4ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: Qwen3.8 MTP: loading drafter from /Users/zouyee/models/Qwen3.8-27B-MTP-4bit (7 drafts/round)
+info: Loaded index from cache (31 entries, 0ms)
+info: [MTP] coarse draft head built (2-bit gs128)
+info: [Engine] MTP depth N=7:1r/0.0ms/tok(E[t]=2.80)
+info: [Engine] MTP cond-acceptance p1=1.000(~1.0/1.0) p2=1.000(~1.0/1.0) p3=1.000(~1.0/1.0) p4=1.000(~1.0/1.0) p5=1.000(~1.0/1.0) p6=0.000(~0.0/1.0)
+info: [Engine] MTP request 1: acceptance 75.0% (6/8 drafts); ms/round draft=532.1 verify=616.8 accept=0.6 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 94ms
+info: [OpenAI] waitForToken returned
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=140 generated_tokens=8 duration_ms=3939.34 tokens_per_sec=2.03
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=3939.5ms calls=1
+info: [TIMING] generateChatCompletion=3940.9ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 3941.1ms
+info: [HTTP] Connection lifetime: 3941.1ms
+info: [ACCEPT] Connection accepted (accept took 3941.9ms)
+info: [HTTP] Request received: 915 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 2 submitted to queue (prepare=1.2ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 2 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:4r/31.3ms/tok(E[t]=4.27)
+info: [Engine] MTP cond-acceptance p1=1.000(~3.4/3.4) p2=1.000(~3.4/3.4) p3=1.000(~3.4/3.4) p4=1.000(~3.4/3.4) p5=1.000(~3.4/3.4) p6=0.788(~2.7/3.4) p7=1.000(~2.7/2.7)
+info: [Engine] MTP request 2: acceptance 93.1% (27/29 drafts); ms/round draft=26.5 verify=108.6 accept=0.3 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 48ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=32, wait=2028.3ms calls=1
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176171372.81 tokens_per_sec=0.00
+info: [TIMING] generateChatCompletion=2029.5ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 2029.6ms
+info: [HTTP] Connection lifetime: 2029.7ms
+info: [ACCEPT] Connection accepted (accept took 2030.4ms)
+info: [HTTP] Request received: 942 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 3 submitted to queue (prepare=1.3ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 3 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth
+info: [Engine] MTP cond-acceptance
+info: [Engine] MTP request 3: acceptance 100.0% (7/7 drafts); ms/round draft=378.2 verify=1037.2 accept=1.3 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 97ms
+info: [OpenAI] waitForToken returned
+info: [RequestLog] id=3 model=m streaming=false prompt_tokens=168 generated_tokens=8 duration_ms=4057.71 tokens_per_sec=1.97
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=4058.1ms calls=1
+info: [TIMING] generateChatCompletion=4059.4ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 4059.5ms
+info: [HTTP] Connection lifetime: 4059.5ms
+info: [ACCEPT] Connection accepted (accept took 4060.1ms)
+info: [HTTP] Request received: 943 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 4 submitted to queue (prepare=1.2ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 4 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:9r/25.8ms/tok(E[t]=5.23)
+info: [Engine] MTP cond-acceptance p1=1.000(~6.1/6.1) p2=1.000(~6.1/6.1) p3=1.000(~6.1/6.1) p4=1.000(~6.1/6.1) p5=1.000(~6.1/6.1) p6=1.000(~6.1/6.1) p7=0.837(~5.1/6.1)
+info: [Engine] MTP request 4: acceptance 98.4% (62/63 drafts); ms/round draft=26.2 verify=121.4 accept=0.3 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 70ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=72, wait=2948.2ms calls=1
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176178383.33 tokens_per_sec=0.00
+info: [TIMING] generateChatCompletion=2949.4ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 2949.5ms
+info: [HTTP] Connection lifetime: 2949.6ms
+info: [ACCEPT] Connection accepted (accept took 2950.7ms)
+info: [HTTP] Request received: 942 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 5 submitted to queue (prepare=1.4ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 5 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:1r/64.1ms/tok(E[t]=2.10)
+info: [Engine] MTP cond-acceptance p1=1.000(~1.0/1.0) p2=0.000(~0.0/1.0)
+info: [Engine] MTP request 5: acceptance 50.0% (6/12 drafts); ms/round draft=38.1 verify=132.2 accept=0.4 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 45ms
+info: [OpenAI] waitForToken returned
+info: [RequestLog] id=5 model=m streaming=false prompt_tokens=189 generated_tokens=8 duration_ms=1910.24 tokens_per_sec=4.19
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=1911.3ms calls=1
+info: [TIMING] generateChatCompletion=1912.7ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 1912.9ms
+info: [HTTP] Connection lifetime: 1912.9ms
+info: [ACCEPT] Connection accepted (accept took 1913.8ms)
+info: [HTTP] Request received: 943 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 6 submitted to queue (prepare=1.3ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 6 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:9r/26.9ms/tok(E[t]=5.03)
+info: [Engine] MTP cond-acceptance p1=1.000(~6.1/6.1) p2=0.930(~5.7/6.1) p3=1.000(~5.7/5.7) p4=1.000(~5.7/5.7) p5=1.000(~5.7/5.7) p6=1.000(~5.7/5.7) p7=1.000(~5.7/5.7)
+info: [Engine] MTP request 6: acceptance 91.2% (62/68 drafts); ms/round draft=25.8 verify=117.5 accept=0.3 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 72ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=72, wait=3040.7ms calls=1
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176183340.61 tokens_per_sec=0.00
+info: [TIMING] generateChatCompletion=3042.1ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 3042.2ms
+info: [HTTP] Connection lifetime: 3042.2ms
+info: [ACCEPT] Connection accepted (accept took 3043.3ms)
+info: [HTTP] Request received: 4158 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 7 submitted to queue (prepare=6.1ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 7 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:1r/64.1ms/tok(E[t]=2.10)
+info: [Engine] MTP cond-acceptance p1=1.000(~1.0/1.0) p2=0.000(~0.0/1.0)
+info: [Engine] MTP request 7: acceptance 50.0% (6/12 drafts); ms/round draft=131.7 verify=142.9 accept=0.4 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 232ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=9694.3ms calls=1
+info: [RequestLog] id=7 model=m streaming=false prompt_tokens=1117 generated_tokens=8 duration_ms=9694.23 tokens_per_sec=0.83
+info: [TIMING] generateChatCompletion=9700.5ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 9700.6ms
+info: [HTTP] Connection lifetime: 9700.6ms
+info: [ACCEPT] Connection accepted (accept took 9701.5ms)
+info: [HTTP] Request received: 4159 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 8 submitted to queue (prepare=7.3ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 8 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:9r/26.8ms/tok(E[t]=5.03)
+info: [Engine] MTP cond-acceptance p1=1.000(~6.1/6.1) p2=0.930(~5.7/6.1) p3=1.000(~5.7/5.7) p4=1.000(~5.7/5.7) p5=1.000(~5.7/5.7) p6=1.000(~5.7/5.7) p7=1.000(~5.7/5.7)
+info: [Engine] MTP request 8: acceptance 91.2% (62/68 drafts); ms/round draft=28.9 verify=118.3 accept=0.4 commit=0.4
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 246ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=72, wait=10252.3ms calls=1
+info: [TIMING] generateChatCompletion=10259.7ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 10259.9ms
+info: [HTTP] Connection lifetime: 10259.9ms
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176203303.36 tokens_per_sec=0.00
+info: [ACCEPT] Connection accepted (accept took 10261.7ms)
+info: [HTTP] Request received: 4158 bytes (read=0.1ms)
+[HTTP] Request received
+info: [HTTP] Request 9 submitted to queue (prepare=12.6ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 9 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:1r/63.9ms/tok(E[t]=2.10)
+info: [Engine] MTP cond-acceptance p1=1.000(~1.0/1.0) p2=0.000(~0.0/1.0)
+info: [Engine] MTP request 9: acceptance 50.0% (6/12 drafts); ms/round draft=212.7 verify=756.2 accept=0.4 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 281ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=11746.6ms calls=1
+info: [RequestLog] id=9 model=m streaming=false prompt_tokens=1073 generated_tokens=8 duration_ms=11746.27 tokens_per_sec=0.68
+info: [TIMING] generateChatCompletion=11759.2ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 11759.5ms
+info: [HTTP] Connection lifetime: 11759.5ms
+info: [ACCEPT] Connection accepted (accept took 11760.4ms)
+info: [HTTP] Request received: 4159 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 10 submitted to queue (prepare=6.8ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 10 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:9r/27.4ms/tok(E[t]=5.03)
+info: [Engine] MTP cond-acceptance p1=1.000(~6.1/6.1) p2=0.930(~5.7/6.1) p3=1.000(~5.7/5.7) p4=1.000(~5.7/5.7) p5=1.000(~5.7/5.7) p6=1.000(~5.7/5.7) p7=1.000(~5.7/5.7)
+info: [Engine] MTP request 10: acceptance 91.2% (62/68 drafts); ms/round draft=28.4 verify=124.0 accept=0.3 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 246ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=72, wait=10269.2ms calls=1
+info: [TIMING] generateChatCompletion=10276.0ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 10276.2ms
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176225341.92 tokens_per_sec=0.00
+info: [HTTP] Connection lifetime: 10276.2ms
+info: [ACCEPT] Connection accepted (accept took 10277.2ms)
+info: [HTTP] Request received: 15366 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 11 submitted to queue (prepare=22.5ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 11 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth
+info: [Engine] MTP cond-acceptance
+info: [Engine] MTP request 11: acceptance 100.0% (7/7 drafts); ms/round draft=418.5 verify=3238.3 accept=1.5 commit=0.2
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 945ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=8, wait=39411.3ms calls=1
+info: [RequestLog] id=11 model=m streaming=false prompt_tokens=4044 generated_tokens=8 duration_ms=39410.63 tokens_per_sec=0.20
+info: [TIMING] generateChatCompletion=39433.9ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 39434.2ms
+info: [HTTP] Connection lifetime: 39434.2ms
+info: [ACCEPT] Connection accepted (accept took 39436.0ms)
+info: [HTTP] Request received: 15367 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 12 submitted to queue (prepare=22.8ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 12 dequeued, queue_wait=0.0ms
+info: [Engine] MTP depth N=7:8r/29.2ms/tok(E[t]=5.17)
+info: [Engine] MTP cond-acceptance p1=1.000(~5.7/5.7) p2=1.000(~5.7/5.7) p3=1.000(~5.7/5.7) p4=1.000(~5.7/5.7) p5=1.000(~5.7/5.7) p6=1.000(~5.7/5.7) p7=1.000(~5.7/5.7)
+info: [Engine] MTP request 12: acceptance 100.0% (63/63 drafts); ms/round draft=154.0 verify=595.1 accept=0.5 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 1039ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=72, wait=43301.2ms calls=1
+info: [RequestLog] id=0 model= streaming=false prompt_tokens=0 generated_tokens=0 duration_ms=176308103.43 tokens_per_sec=0.00
+info: [TIMING] generateChatCompletion=43324.2ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 43324.4ms
+info: [HTTP] Connection lifetime: 43324.4ms
+info: [ACCEPT] Connection accepted (accept took 43327.2ms)
+info: [HTTP] Request received: 15366 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 13 submitted to queue (prepare=23.5ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 13 dequeued, queue_wait=0.0ms
+info: [Engine] Shutdown requested
