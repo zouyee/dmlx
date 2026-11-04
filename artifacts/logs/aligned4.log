@@ -1,0 +1,44 @@
+prefix-cache nonce: run82616 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-nothink ...
+[pass 1/3] omlx-mtp ...
+[pass 1/3] omlx-mtp-nothink ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-nothink ...
+[pass 2/3] omlx-mtp ...
+[pass 2/3] omlx-mtp-nothink ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-nothink ...
+[pass 3/3] omlx-mtp ...
+[pass 3/3] omlx-mtp-nothink ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:4a61ee2code            30.3       25.6     0.81
+dmlx        git:4a61ee2prose           25.2       21.9     0.75
+dmlx        git:4a61ee2math            36.7       27.5     0.83
+dmlx        git:4a61ee2count*          28.0       24.1     0.78
+dmlx                  HEADLINE        30.7
+dmlx-nothink?         code            49.8       44.0     0.36
+dmlx-nothink?         prose           24.5       22.1     0.60
+dmlx-nothink?         math            44.8       38.4     0.49
+dmlx-nothink?         count*          61.4       54.0     0.31
+dmlx-nothink          HEADLINE        39.7
+omlx-mtp    ?         code            30.0       25.0     0.89
+omlx-mtp    ?         prose           27.7       23.6     0.86
+omlx-mtp    ?         math            36.6       26.6     0.92
+omlx-mtp    ?         count*          35.2       28.3     0.91
+omlx-mtp              HEADLINE        31.4
+omlx-mtp-nothink?         code            41.0       35.7     0.49
+omlx-mtp-nothink?         prose           24.2       22.7     0.35
+omlx-mtp-nothink?         math            43.7       35.4     0.71
+omlx-mtp-nothink?         count*          47.3       40.5     0.48
+omlx-mtp-nothink          HEADLINE        36.3
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.756s        124.7      564-2100      4.559s     17.085s
+dmlx-nothink      0.280s        126.1      524-2060      4.345s     16.522s
+omlx-mtp          0.903s        137.9      564-2100      4.636s     15.795s
+omlx-mtp-nothink      0.921s        135.8      564-2100      4.656s     16.473s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/aligned_4arm_20261104.json
