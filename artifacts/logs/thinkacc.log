@@ -1,0 +1,18 @@
+=== dmlx (thinking mode)
+  code    128 tok in  6.32s =  20.3 tok/s  reasoning~   0 tok  accept=39.9%
+  prose   128 tok in  5.62s =  22.8 tok/s  reasoning~   0 tok  accept=45.9%
+  math    114 tok in  4.25s =  26.9 tok/s  reasoning~   0 tok  accept=59.0%
+  count   128 tok in  5.22s =  24.5 tok/s  reasoning~   0 tok  accept=51.5%
+=== omlx-mtp (thinking mode)
+  code    128 tok in  4.43s =  28.9 tok/s  reasoning~  87 tok  accept=85.1%
+  prose   128 tok in  5.98s =  21.4 tok/s  reasoning~ 134 tok  accept=59.4%
+  math    111 tok in  4.10s =  27.0 tok/s  reasoning~  48 tok  accept=83.5%
+  count   128 tok in  4.97s =  25.7 tok/s  reasoning~  92 tok  accept=76.2%
+
+  prompt   dmlx t/s  omlx t/s  dmlx acc  omlx acc  dmlx think  omlx think
+  code         20.3      28.9     39.9%     85.1%           0          87
+  prose        22.8      21.4     45.9%     59.4%           0         134
+  math         26.9      27.0     59.0%     83.5%           0          48
+  count        24.5      25.7     51.5%     76.2%           0          92
+
+JSON: artifacts/thinking_acceptance.json

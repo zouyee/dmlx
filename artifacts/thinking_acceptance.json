@@ -1,0 +1,62 @@
+{
+ "dmlx": {
+  "code": {
+   "wall_s": 6.315348125004675,
+   "tokens": 128,
+   "reasoning_tok_est": 0,
+   "accept_pct": 39.9,
+   "tok_s": 20.268083004514537
+  },
+  "prose": {
+   "wall_s": 5.622601334005594,
+   "tokens": 128,
+   "reasoning_tok_est": 0,
+   "accept_pct": 45.9,
+   "tok_s": 22.76526333564745
+  },
+  "math": {
+   "wall_s": 4.245673916011583,
+   "tokens": 114,
+   "reasoning_tok_est": 0,
+   "accept_pct": 59.0,
+   "tok_s": 26.850860959923278
+  },
+  "count": {
+   "wall_s": 5.2233570409880485,
+   "tokens": 128,
+   "reasoning_tok_est": 0,
+   "accept_pct": 51.5,
+   "tok_s": 24.505313153126433
+  }
+ },
+ "omlx-mtp": {
+  "code": {
+   "wall_s": 4.425849542021751,
+   "tokens": 128,
+   "reasoning_tok_est": 87,
+   "accept_pct": 85.1,
+   "tok_s": 28.9210012190177
+  },
+  "prose": {
+   "wall_s": 5.980407750001177,
+   "tokens": 128,
+   "reasoning_tok_est": 134,
+   "accept_pct": 59.4,
+   "tok_s": 21.403222882248254
+  },
+  "math": {
+   "wall_s": 4.104332249989966,
+   "tokens": 111,
+   "reasoning_tok_est": 48,
+   "accept_pct": 83.5,
+   "tok_s": 27.044594160297663
+  },
+  "count": {
+   "wall_s": 4.974677791993599,
+   "tokens": 128,
+   "reasoning_tok_est": 92,
+   "accept_pct": 76.2,
+   "tok_s": 25.730309650608362
+  }
+ }
+}
