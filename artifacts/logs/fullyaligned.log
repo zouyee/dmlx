@@ -1,0 +1,26 @@
+prefix-cache nonce: run91722 (every prompt is textually novel)
+[pass 1/3] dmlx-think-aligned ...
+[pass 1/3] omlx-mtp-aligned ...
+[pass 2/3] dmlx-think-aligned ...
+[pass 2/3] omlx-mtp-aligned ...
+[pass 3/3] dmlx-think-aligned ...
+[pass 3/3] omlx-mtp-aligned ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx-think-aligned?         code            31.7       24.7     1.15
+dmlx-think-aligned?         prose           25.7       21.1     1.12
+dmlx-think-aligned?         math            38.0       28.2     0.98
+dmlx-think-aligned?         count*          28.3       23.7     0.93
+dmlx-think-aligned          HEADLINE        31.8
+omlx-mtp-aligned?         code            31.6       24.4     1.23
+omlx-mtp-aligned?         prose           26.4       21.3     1.19
+omlx-mtp-aligned?         math            41.4       28.2     1.20
+omlx-mtp-aligned?         count*          44.6       31.6     1.21
+omlx-mtp-aligned          HEADLINE        33.2
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx-think-aligned      0.769s        125.9      564-2100      4.581s     16.783s
+omlx-mtp-aligned      0.902s        137.0      564-2100      4.551s     15.762s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/fully_aligned_20261104.json

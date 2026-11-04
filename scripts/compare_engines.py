@@ -255,6 +255,25 @@ def engines() -> dict[str, Engine]:
             note="adaptive MTP ceiling 7 + explicit reasoning directive "
                  "(content parity with omlx's reasoning_effort default)",
         ),
+        # The OTHER half of the aligned thinking pair: omlx with the SAME
+        # explicit directive dmlx gets. Sending it to only one arm aligned the
+        # generated content but left prompt LENGTH unaligned, which made that
+        # arm's TTFT incomparable (1.02-1.17 s against 0.90 s) because the
+        # directive occupies prompt tokens omlx carries inside its chat
+        # template instead. With both arms carrying the same system message,
+        # prompt length matches too and TTFT becomes quotable alongside the
+        # decode rate.
+        "omlx-mtp-aligned": Engine(
+            name="omlx-mtp-aligned",
+            cmd=[OMLX_PY, "-m", "omlx.cli", "serve",
+                 "--model-dir", os.path.dirname(OMLX_MTP_MODEL),
+                 "--no-cache",
+                 "--port", str(PORT)],
+            model_id=os.path.basename(OMLX_MTP_MODEL),
+            system=REASONING_DIRECTIVE,
+            note="omlx-mtp + the same explicit reasoning directive "
+                 "(content AND prompt-length parity with dmlx-think-aligned)",
+        ),
         # Fixed-depth arms. These exist because the adaptive controller's
         # choice on math is a coin flip between two fixed points, and every
         # heuristic tried so far loses (see engine_loop.zig
