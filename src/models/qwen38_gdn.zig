@@ -2767,6 +2767,36 @@ fn softplusStep(ctx: EagerContext, x: Array) !Array {
     return ops.where(ctx, big, x, lp);
 }
 
+fn pricingNorms() bool {
+    return std.c.getenv("DMLX_VERIFY_PRICE_NORMS") != null;
+}
+fn pricingBcast() bool {
+    return std.c.getenv("DMLX_VERIFY_PRICE_BCAST") != null;
+}
+
+/// Price a region by DUPLICATING it, not by replacing it.
+///
+/// Replacement stand-ins both failed here, in the two ways the ablation rules
+/// warn about. A scalar multiply for the q/k rmsNorms produced garbage, which
+/// ended generation after ONE round — nothing left to time. A mean+broadcast
+/// for the kv-group gathers ran the round at 108.8 ms against a 76.3 ms
+/// baseline, because `broadcastTo` leaves a stride-0 axis that the downstream
+/// delta-rule kernel handles worse than the real gather; total time rose, so
+/// by rule (c) the reading was void.
+///
+/// Duplication avoids both. `(f(x) + f(x)) * 0.5` is exactly `f(x)` in IEEE
+/// for finite values, so the output stays bit-correct and generation behaves
+/// normally, while the round pays for one extra evaluation of `f` plus one
+/// add and one scale over the same shape. The round-time delta is therefore
+/// an UPPER bound on what `f` costs: cost(f) <= delta - cost(add+scale).
+fn priceTwice(ctx: EagerContext, a: Array, b: Array) !Array {
+    const sum = try ops.add(ctx, a, b);
+    defer sum.deinit();
+    const half = try ops.scalarF32(ctx, 0.5);
+    defer half.deinit();
+    return ops.multiply(ctx, sum, half);
+}
+
 /// The verify/prefill gate chain as one compiled kernel.
 ///
 /// `prefillFront` computes the gates as 11 separate elementwise dispatches
@@ -3342,9 +3372,28 @@ pub const Qwen38GDN = struct {
         const v = try ops.reshape(ctx, v_parts, &[_]i32{ L, HV, D });
         errdefer v.deinit();
 
-        const q = try fast_mod.rmsNorm(ctx, q_resh, self.q_norm_w, 1e-6); // [L, HK, D]
+        // DIAGNOSTIC (DMLX_VERIFY_PRICE_NORMS=1): price the two q/k rmsNorms
+        // by running each twice and averaging (see priceTwice). Output stays
+        // bit-correct, so the round-time rise is an upper bound on the cost
+        // of one norm pass plus one add+scale.
+        const price_norms = pricingNorms();
+        const q = blk: {
+            const n1 = try fast_mod.rmsNorm(ctx, q_resh, self.q_norm_w, 1e-6); // [L, HK, D]
+            if (!price_norms) break :blk n1;
+            defer n1.deinit();
+            const n2 = try fast_mod.rmsNorm(ctx, q_resh, self.q_norm_w, 1e-6);
+            defer n2.deinit();
+            break :blk try priceTwice(ctx, n1, n2);
+        };
         errdefer q.deinit();
-        const k = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm_w, 1e-6);
+        const k = blk: {
+            const n1 = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm_w, 1e-6);
+            if (!price_norms) break :blk n1;
+            defer n1.deinit();
+            const n2 = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm_w, 1e-6);
+            defer n2.deinit();
+            break :blk try priceTwice(ctx, n1, n2);
+        };
         errdefer k.deinit();
 
         // 4. Gates over [L, HV]: g = exp(-exp(A_log_f32) * softplus(a +
@@ -3410,9 +3459,29 @@ pub const Qwen38GDN = struct {
         }
 
         // Broadcast q/k to value heads via the precomputed gather indices.
-        const q_full = try shape_mod.takeAxis(ctx, q, self.qk_idx, 1); // [L, HV, D]
+        //
+        // DIAGNOSTIC (DMLX_VERIFY_PRICE_BCAST=1): price these two gathers by
+        // running each twice and averaging (see priceTwice). Output stays
+        // bit-correct, so the round-time rise is an upper bound on the cost
+        // of one gather pass plus one add+scale.
+        const price_bcast = pricingBcast();
+        const q_full = blk: {
+            const g1 = try shape_mod.takeAxis(ctx, q, self.qk_idx, 1); // [L, HV, D]
+            if (!price_bcast) break :blk g1;
+            defer g1.deinit();
+            const g2 = try shape_mod.takeAxis(ctx, q, self.qk_idx, 1);
+            defer g2.deinit();
+            break :blk try priceTwice(ctx, g1, g2);
+        };
         errdefer q_full.deinit();
-        const k_full = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
+        const k_full = blk: {
+            const g1 = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
+            if (!price_bcast) break :blk g1;
+            defer g1.deinit();
+            const g2 = try shape_mod.takeAxis(ctx, k, self.qk_idx, 1);
+            defer g2.deinit();
+            break :blk try priceTwice(ctx, g1, g2);
+        };
         errdefer k_full.deinit();
         if (fp) {
             q_full.eval() catch {};

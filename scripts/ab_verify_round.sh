@@ -40,13 +40,28 @@ run_one() {
     kill "$pid" 2>/dev/null; sleep 1
     # Second request's rounds only: drop the first half of the lines.
     local stats
-    stats=$(grep -o 'ms=[0-9.]*' "$log" | sed 's/ms=//' | python3 -c "
+    # Anchor on MTP-ROUND lines. A bare 'ms=' also matches `duration_ms=` in
+    # [RequestLog], which put a 9.5e7 "round" into the sample and made both
+    # the mean and (with few real rounds) the median meaningless.
+    stats=$(grep -ao 'MTP round: n=[0-9]* ms=[0-9.]*' "$log" | grep -o 'ms=[0-9.]*$' | sed 's/ms=//' | python3 -c "
 import sys,statistics
 v=[float(x) for x in sys.stdin]
 v=v[len(v)//2:]
 print(f'{len(v)} rounds  median={statistics.median(v):.1f} ms  mean={statistics.fmean(v):.1f}')
 " 2>/dev/null)
-    echo "  [${extra:-baseline}] ${stats:-NO DATA (see $log)}"
+    # Host-side GDN graph-build time per round, from the same log. Reported
+    # next to the round time because the two together say whether the build is
+    # real CPU work or the host blocking on the GPU — a distinction this
+    # project has already got wrong once (an 80 ms "graph build" that was
+    # asyncEval blocking mis-attributed).
+    local hb
+    hb=$(grep -ao 'verify build parts: gdn=[0-9.]*' "$log" | sed 's/.*gdn=//' | python3 -c "
+import sys,statistics
+v=[float(x) for x in sys.stdin]
+v=v[len(v)//2:]
+print(f'hostbuild median={statistics.median(v):.1f} ms' if v else 'hostbuild n/a')
+" 2>/dev/null)
+    echo "  [${extra:-baseline}] ${stats:-NO DATA (see $log)}  ${hb:-}"
 }
 
 echo "verify-round A/B  N=${N}  max_tokens=${MAXTOK}"
