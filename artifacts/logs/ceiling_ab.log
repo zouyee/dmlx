@@ -1,0 +1,44 @@
+prefix-cache nonce: run68845 (every prompt is textually novel)
+[pass 1/3] dmlx ...
+[pass 1/3] dmlx-c4 ...
+[pass 1/3] dmlx-c5 ...
+[pass 1/3] omlx-mtp ...
+[pass 2/3] dmlx ...
+[pass 2/3] dmlx-c4 ...
+[pass 2/3] dmlx-c5 ...
+[pass 2/3] omlx-mtp ...
+[pass 3/3] dmlx ...
+[pass 3/3] dmlx-c4 ...
+[pass 3/3] dmlx-c5 ...
+[pass 3/3] omlx-mtp ...
+
+engine      version   prompt    decode t/s  effective   ttft s
+dmlx        git:9e93370code            37.6       30.7     0.80
+dmlx        git:9e93370prose           27.5       23.8     0.75
+dmlx        git:9e93370math            34.3       27.3     0.80
+dmlx        git:9e93370count*          28.8       24.7     0.77
+dmlx                  HEADLINE        33.1
+dmlx-c4     ?         code            34.0       28.5     0.76
+dmlx-c4     ?         prose           26.2       23.0     0.71
+dmlx-c4     ?         math            36.2       28.5     0.79
+dmlx-c4     ?         count*          28.2       24.4     0.73
+dmlx-c4               HEADLINE        32.1
+dmlx-c5     ?         code            35.9       29.6     0.78
+dmlx-c5     ?         prose           27.6       24.0     0.74
+dmlx-c5     ?         math            35.7       28.1     0.79
+dmlx-c5     ?         count*          28.4       24.5     0.75
+dmlx-c5               HEADLINE        33.1
+omlx-mtp    ?         code            38.8       30.6     0.91
+omlx-mtp    ?         prose           30.0       25.1     0.86
+omlx-mtp    ?         math            37.7       27.3     0.92
+omlx-mtp    ?         count*          32.9       27.1     0.88
+omlx-mtp              HEADLINE        35.5
+
+engine        TTFT short  prefill t/s          span    ttft@512   ttft@2048
+dmlx              0.754s        129.4      564-2100      4.354s     16.394s
+dmlx-c4           0.754s        129.4      564-2100      4.363s     16.549s
+dmlx-c5           0.753s        129.4      564-2100      4.363s     16.243s
+omlx-mtp          0.893s        139.1      564-2100      4.499s     15.551s
+
+* excluded from HEADLINE (anomalously predictable prompt)
+JSON: artifacts/ceiling_ab_20261104.json

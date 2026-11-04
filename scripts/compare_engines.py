@@ -202,6 +202,30 @@ def engines() -> dict[str, Engine]:
                  "--port", str(PORT)],
             note="adaptive MTP, ceiling 7",
         ),
+        # ADAPTIVE with a lower CEILING (not fixed depth). The ceiling was
+        # raised 4 -> 7 under the old cost curve; the median-of-8 round cost
+        # (7c0d203) changed that model, and the thinking gap is concentrated
+        # on code where the depth traces show N=3 best in 10/10 draws while
+        # 15 of ~45 rounds go to N=5/N=7. omlx caps at 4.
+        "dmlx-c4": Engine(
+            name="dmlx-c4",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "4",
+                 "--port", str(PORT)],
+            note="adaptive MTP, ceiling 4",
+        ),
+        # ADAPTIVE with a lower CEILING (not fixed depth). The ceiling was
+        # raised 4 -> 7 under the old cost curve; the median-of-8 round cost
+        # (7c0d203) changed that model, and the thinking gap is concentrated
+        # on code where the depth traces show N=3 best in 10/10 draws while
+        # 15 of ~45 rounds go to N=5/N=7. omlx caps at 4.
+        "dmlx-c5": Engine(
+            name="dmlx-c5",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "5",
+                 "--port", str(PORT)],
+            note="adaptive MTP, ceiling 5",
+        ),
         # Fixed-depth arms. These exist because the adaptive controller's
         # choice on math is a coin flip between two fixed points, and every
         # heuristic tried so far loses (see engine_loop.zig
