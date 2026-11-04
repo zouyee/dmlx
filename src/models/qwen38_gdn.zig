@@ -3524,7 +3524,18 @@ pub const Qwen38GDN = struct {
         // gated_delta_update returns y.astype(qkv.dtype): round before norm.
         const y = try ops.astype(ctx, y_f32, qkv_dtype);
         defer y.deinit();
-        const y_normed = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
+        // DIAGNOSTIC (DMLX_VERIFY_PRICE_TAIL=1): price the tail's non-qmm
+        // chain — out-gate rmsNorm and the silu+multiply below — by running
+        // the norm twice and averaging (see priceTwice). Bit-correct.
+        const price_tail = std.c.getenv("DMLX_VERIFY_PRICE_TAIL") != null;
+        const y_normed = blk: {
+            const n1 = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
+            if (!price_tail) break :blk n1;
+            defer n1.deinit();
+            const n2 = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
+            defer n2.deinit();
+            break :blk try priceTwice(ctx, n1, n2);
+        };
         defer y_normed.deinit();
         const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
         defer y_normed_f32.deinit();
@@ -3532,7 +3543,14 @@ pub const Qwen38GDN = struct {
         defer z_resh.deinit();
         const z_f32 = try ops.astype(ctx, z_resh, .float32);
         defer z_f32.deinit();
-        const z_act = try activations.silu(ctx, z_f32);
+        const z_act = blk: {
+            const a1 = try activations.silu(ctx, z_f32);
+            if (!price_tail) break :blk a1;
+            defer a1.deinit();
+            const a2 = try activations.silu(ctx, z_f32);
+            defer a2.deinit();
+            break :blk try priceTwice(ctx, a1, a2);
+        };
         defer z_act.deinit();
         const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
         defer y_gated_f32.deinit();
@@ -3774,7 +3792,19 @@ pub const Qwen38GDN = struct {
             // draft was rejected. Removes (L-1) x 3.1 MB x 48 layers of
             // unconditional s_all writes — 1.04 GB per round at L=8.
             if (try deltaRulePrefillFused(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr| {
-                y = fr.y;
+                // DIAGNOSTIC (DMLX_VERIFY_PRICE_RECUR=1): price the delta-rule
+                // kernel by running it a second time and averaging y (see
+                // priceTwice). The duplicate's state is discarded; the kept
+                // state and the averaged y are both bit-correct.
+                if (std.c.getenv("DMLX_VERIFY_PRICE_RECUR") != null) {
+                    if (try deltaRulePrefillFused(ctx, cache.ssm_state, front.k_full, front.v, front.beta, front.g, front.q_full, HV, D)) |fr2| {
+                        defer fr2.s_new.deinit();
+                        defer fr2.y.deinit();
+                        const avg = try priceTwice(ctx, fr.y, fr2.y);
+                        fr.y.deinit();
+                        y = avg;
+                    } else y = fr.y;
+                } else y = fr.y;
                 defer fr.s_new.deinit();
                 s_all = try ops.reshape(ctx, fr.s_new, &[_]i32{ 1, HV, D, D });
                 replay_inputs = .{
