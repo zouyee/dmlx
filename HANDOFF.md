@@ -154,9 +154,13 @@ compile per process, not per prompt length), a fused prefill out-gate
 kernel, and v8-tile routing in `QuantLinear.apply`. Ruled out by
 measurement: GEMM-floor optimism (cold-weight qmm streams at the same
 6.4-6.7 TF/s), omlx's W4A8 backend (NAX/M5-only), omlx fused GDN prework
-(Qwen3.5 prefill keeps the stock path), and the prefill sync cadence.
-Residual: both layer kinds sit ~15% over the v8 GEMM floor (~0.8 s, needs a
-per-kernel GPU timeline to split further), plus recur ~0.2 s and conv ~0.07 s.
+(Qwen3.5 prefill keeps the stock path), the prefill sync cadence, and — via
+a synthetic one-layer bench (`b6480e2`) — any hidden structural overhead:
+the serving per-layer cost equals the op-level sum. The "~15% over the v8
+floor" reading in between was thermal drift. Priced and deliberately
+deferred: the out_proj gate is f32 (conv emits f32), which bars the v8 tile
+— ~240 ms at L=1901 — but rounding it bf16 is a dtype-policy change across
+every tail path (numpy fixtures key on f32), not a local patch.
 
 dmlx has by far the lowest fixed overhead (2.75x better than omlx) but the
 lowest prefill throughput (-13%), so it wins TTFT only below ~258 tokens
