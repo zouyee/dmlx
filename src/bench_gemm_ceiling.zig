@@ -138,4 +138,47 @@ pub fn main() !void {
         std.debug.print("  -> FAIL, 4-bit qmm is already near the dense ceiling;\n" ++
             "     no prefill GEMM kernel can deliver 15%. Kill workstream A.\n", .{});
     }
+
+    // Streaming variant: the loop above reuses ONE weight tensor, so the GPU
+    // may keep it partially cached across reps. Real prefill streams 13.5 GB
+    // of weights exactly once. Cycle through N distinct weight copies so every
+    // rep reads cold weights; the gap to the reused rate is the floor error.
+    std.debug.print("\nStreaming q4 (cold weights each rep), M=2048:\n", .{});
+    const n_streams = 8;
+    for (shapes) |s| {
+        const m: i32 = 2048;
+        const x = try random.normal(ctx, &[_]i32{ m, s.in }, .bfloat16, 0.0, 0.02, null);
+        defer x.deinit();
+        try x.eval();
+        var qws: [n_streams]quantize_mod.QuantizedWeight = undefined;
+        for (0..n_streams) |i| {
+            const w = try random.normal(ctx, &[_]i32{ s.out, s.in }, .bfloat16, 0.0, 0.02, null);
+            defer w.deinit();
+            qws[i] = try quantize_mod.quantize(ctx, w, .{ .bits = 4, .group_size = 64, .mode = .affine });
+        }
+        defer for (0..n_streams) |i| {
+            qws[i].data.deinit();
+            qws[i].scales.deinit();
+            qws[i].biases.deinit();
+        };
+        // warm each copy once (compile + first-touch), then time one cold pass each
+        for (0..n_streams) |i| {
+            const y = try quantize_mod.quantizedMatmul(ctx, x, qws[i], true);
+            defer y.deinit();
+            try y.eval();
+        }
+        var pending = std.ArrayList(Array).empty;
+        defer pending.deinit(allocator);
+        defer for (pending.items) |y| y.deinit();
+        for (0..n_streams) |i| {
+            const y = try quantize_mod.quantizedMatmul(ctx, x, qws[i], true);
+            try pending.append(allocator, y);
+        }
+        const t = std.c.mach_absolute_time();
+        try eval_mod.asyncEval(allocator, pending.items);
+        try pending.items[n_streams - 1].eval();
+        const per_ms = elapsedMs(t) / n_streams;
+        const flop = 2.0 * 2048.0 * @as(f64, @floatFromInt(s.out)) * @as(f64, @floatFromInt(s.in));
+        std.debug.print("  {s: <24} {d:.2} ms  {d:.2} TF/s\n", .{ s.name, per_ms, flop / (per_ms / 1e3) / 1e12 });
+    }
 }
