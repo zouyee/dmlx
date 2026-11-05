@@ -927,7 +927,8 @@ const out_gate_kernel_body =
     \\    const float yw = yn * float(norm_w[dv]);
     \\    const float zz = float(z[h * {[d]} + dv]);
     \\    const float zact = zz / (1.0f + metal::exp(-zz));
-    \\    out[h * {[d]} + dv] = zact * yw;
+    \\    // OT store rounds the f32 gate exactly like the eager chain's astype.
+    \\    out[h * {[d]} + dv] = {[ot]s}(zact * yw);
     \\
 ;
 
@@ -1111,7 +1112,7 @@ fn markConvTailBroken(key: ConvTailKernelKey) void {
 }
 
 pub const ConvTailOut = struct {
-    y: Array, // [1, HV*D] f32, ready for out_proj
+    y: Array, // [1, HV*D] f32 (bf16 when the quantized out_proj gate applies), ready for out_proj
     s_new: Array, // [HV, D, D] f32
     conv_state: Array, // [K-1, QKV] f32
 };
@@ -1119,7 +1120,7 @@ pub const ConvTailOut = struct {
 // --- v4 "wide" kernel cache (two kernels; see wide_tail_kernel_body) -------
 
 var wide_tail_entries: [8]?ConvTailKernelEntry = .{ null, null, null, null, null, null, null, null };
-var out_gate_entries: [4]?struct { d: i32, kernel: c.c.mlx_fast_metal_kernel, broken: bool = false } =
+var out_gate_entries: [4]?struct { d: i32, bf16_out: bool, kernel: c.c.mlx_fast_metal_kernel, broken: bool = false } =
     .{ null, null, null, null };
 
 fn createWideTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) !c.c.mlx_fast_metal_kernel {
@@ -1157,10 +1158,10 @@ fn createWideTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) !c
     return c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, source_z.ptr, header_z.ptr, true, false);
 }
 
-fn createOutGateKernel(allocator: std.mem.Allocator, d: i32) !c.c.mlx_fast_metal_kernel {
-    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_out_gate_d{d}", .{d}, 0);
+fn createOutGateKernel(allocator: std.mem.Allocator, d: i32, bf16_out: bool) !c.c.mlx_fast_metal_kernel {
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "gdn_out_gate_d{d}_{c}", .{ d, if (bf16_out) @as(u8, 'b') else 'f' }, 0);
     defer allocator.free(name_z);
-    const source_z = try std.fmt.allocPrintSentinel(allocator, out_gate_kernel_body, .{ .d = d }, 0);
+    const source_z = try std.fmt.allocPrintSentinel(allocator, out_gate_kernel_body, .{ .d = d, .ot = if (bf16_out) "bfloat16_t" else "float" }, 0);
     defer allocator.free(source_z);
     const header_z = try allocator.dupeZ(u8, "");
     defer allocator.free(header_z);
@@ -1190,19 +1191,19 @@ fn getWideTailKernel(allocator: std.mem.Allocator, key: ConvTailKernelKey) ?c.c.
     return null;
 }
 
-fn getOutGateKernel(allocator: std.mem.Allocator, d: i32) ?c.c.mlx_fast_metal_kernel {
+fn getOutGateKernel(allocator: std.mem.Allocator, d: i32, bf16_out: bool) ?c.c.mlx_fast_metal_kernel {
     for (&out_gate_entries) |*slot| {
         if (slot.*) |*e| {
-            if (e.d == d) return if (e.broken) null else e.kernel;
+            if (e.d == d and e.bf16_out == bf16_out) return if (e.broken) null else e.kernel;
         }
     }
-    const kernel = createOutGateKernel(allocator, d) catch |err| {
+    const kernel = createOutGateKernel(allocator, d, bf16_out) catch |err| {
         convTailWarn(err);
         return null;
     };
     for (&out_gate_entries) |*slot| {
         if (slot.* == null) {
-            slot.* = .{ .d = d, .kernel = kernel };
+            slot.* = .{ .d = d, .bf16_out = bf16_out, .kernel = kernel };
             return kernel;
         }
     }
@@ -1238,6 +1239,9 @@ fn decodeWideTail() bool {
 /// v4 conv+tail: grid (32, D, HV) / threadgroup (32, 4, 1) so the delta
 /// rule's state access coalesces, plus a small second kernel for the
 /// out gate. Same math as gdnConvTailFused; null when ineligible.
+/// `gate_bf16` makes the out-gate kernel store bf16 (the eager chain's
+/// astype rounding) so a quantized out_proj takes the fast bf16 path without
+/// a separate astype launch.
 fn gdnConvTailWide(
     ctx: EagerContext,
     qkv_lin: Array,
@@ -1251,6 +1255,7 @@ fn gdnConvTailWide(
     hk: i32,
     d: i32,
     k: i32,
+    gate_bf16: bool,
 ) !?ConvTailOut {
     // Threadgroup size must equal D (phase 1 is one channel per thread) and
     // D/4 must equal the 32 lanes, so this kernel is D == 128 only.
@@ -1273,7 +1278,7 @@ fn gdnConvTailWide(
         .b_bf16 = b.dtype() == .bfloat16,
     };
     const kernel = getWideTailKernel(ctx.allocator, key) orelse return null;
-    const gate_kernel = getOutGateKernel(ctx.allocator, d) orelse return null;
+    const gate_kernel = getOutGateKernel(ctx.allocator, d, gate_bf16) orelse return null;
     const qkv_dim: i32 = key.pk * (2 + key.ratio);
 
     // --- kernel 1: conv + norms + gates + delta rule -> y, s_out, conv_out
@@ -1332,7 +1337,7 @@ fn gdnConvTailWide(
     defer c.c.mlx_fast_metal_kernel_config_free(cfg2);
     try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg2, d, hv, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg2, d, 1, 1));
-    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]i32{ 1, hv * d }, 2, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]i32{ 1, hv * d }, 2, if (gate_bf16) c.c.MLX_BFLOAT16 else c.c.MLX_FLOAT32));
 
     const in2 = c.c.mlx_vector_array_new();
     defer _ = c.c.mlx_vector_array_free(in2);
@@ -2933,10 +2938,29 @@ var verify_tail_logged: bool = false;
 /// the gate f32, sending out_proj back to the stock qmm).
 var verify_tail_f32_gate: ?bool = null;
 
+fn f32GateKilled() bool {
+    if (verify_tail_f32_gate == null) verify_tail_f32_gate = std.c.getenv("DMLX_VERIFY_TAIL_F32_GATE") != null;
+    return verify_tail_f32_gate.?;
+}
+
+/// Gate dtype handed to out_proj in the verify forward: bf16 when the verify
+/// qmm kernels are armed (they only accept bf16), else the qkv dtype.
 fn verifyGateDt(qkv_dtype: dtype_mod.Dtype) dtype_mod.Dtype {
     if (qkv_dtype != .float32 or !verify_qmm.isArmed()) return qkv_dtype;
-    if (verify_tail_f32_gate == null) verify_tail_f32_gate = std.c.getenv("DMLX_VERIFY_TAIL_F32_GATE") != null;
-    return if (verify_tail_f32_gate.?) .float32 else .bfloat16;
+    return if (f32GateKilled()) .float32 else .bfloat16;
+}
+
+/// Gate dtype handed to out_proj in prefill and decode: bf16 when out_proj
+/// is quantized, so the qmm takes the fast bf16 path (the v8 tile at prefill
+/// M; decode already ran bf16 gates before the f32 promotion). This restores
+/// the pre-5e8ef27 numerics class — the promotion was for conv-kernel
+/// eligibility, and it silently knocked out_proj back to the stock f32-input
+/// qmm (~25.5 vs ~19.9 ms/layer at L≈1900). Toy test modules are
+/// unquantized: they keep the qkv dtype, so the 1e-5 prefill↔decode
+/// equivalences and golden fixtures are untouched by construction.
+fn outGateDt(o_scales: ?Array, qkv_dtype: dtype_mod.Dtype) dtype_mod.Dtype {
+    if (o_scales == null or f32GateKilled()) return qkv_dtype;
+    return .bfloat16;
 }
 
 fn verifyTailFused(
@@ -3285,8 +3309,9 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
         y_sub.deinit();
         return .{ .out = out_sub, .conv_state = cs_sub, .ssm_state = ss_sub };
     }
+    const gate_bf16 = outGateDt(w.out_scales, .float32) == .bfloat16;
     const wide: ?ConvTailOut = if (decodeWideTail())
-        try gdnConvTailWide(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)
+        try gdnConvTailWide(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K, gate_bf16)
     else
         null;
     const tail_res: ConvTailOut = wide orelse (try gdnConvTailFused(ctx, qkv_lin, w.conv_state, w.conv1d_t, a, b, z, tw, HV, HK, D, K)) orelse blk: {
@@ -3315,7 +3340,21 @@ pub fn step(ctx: EagerContext, w: StepWeights) !StepOutput {
     defer tail_res.y.deinit();
     const s_new = tail_res.s_new;
 
-    const out = try linearQuantParts(ctx, tail_res.y, w.out_w, w.out_scales, w.out_biases);
+    // Same gate rounding as the prefill tail: bf16 when out_proj is
+    // quantized. The wide kernel stores bf16 in-kernel (gate_bf16 above);
+    // this astype is the safety net for the f32-emitting fallbacks (v3 always
+    // emits f32; v2/eager emit the qkv dtype). Skipped when the gate is
+    // already bf16, and unquantized toy modules keep the f32 gate so the
+    // equivalence tests are untouched.
+    var y_proj = tail_res.y;
+    var y_proj_owned = false;
+    if (outGateDt(w.out_scales, tail_res.y.dtype()) != tail_res.y.dtype()) {
+        y_proj = try ops.astype(ctx, tail_res.y, .bfloat16);
+        y_proj_owned = true;
+    }
+    defer if (y_proj_owned) y_proj.deinit();
+
+    const out = try linearQuantParts(ctx, y_proj, w.out_w, w.out_scales, w.out_biases);
     errdefer out.deinit();
     return .{ .out = out, .conv_state = tail_res.conv_state, .ssm_state = s_new };
 }
@@ -3863,13 +3902,11 @@ pub const Qwen38GDN = struct {
             // bf16-z/f32-w checks reject; prefill keeps its existing path.
             //
             // When the verify qmm kernels are armed, emit the gate in bf16
-            // so the out_proj qmm takes the fast verify path: the f32
-            // promotion (5e8ef27) was for conv-kernel eligibility, but it
-            // silently knocked out_proj (the tail's dominant cost) back to
-            // the stock f32-input qmm. The bf16 store is the eager chain's
-            // f32 gate followed by the same astype the fallback below does.
+            // so the out_proj qmm takes the fast verify path. The bf16 store
+            // is the eager chain's f32 gate followed by the same astype the
+            // fallback below does.
             if (L <= 16) {
-                const gate_dt = verifyGateDt(qkv_dtype);
+                const gate_dt = if (verify_qmm.isArmed()) verifyGateDt(qkv_dtype) else outGateDt(self.o_scales, qkv_dtype);
                 if (try verifyTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype, gate_dt)) |gated| {
                     defer gated.deinit(); // [L*HV, D], gate_dt
                     const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
@@ -3877,8 +3914,18 @@ pub const Qwen38GDN = struct {
                     return linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
                 }
             }
-            if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype)) |gated| {
-                defer gated.deinit(); // [L*HV, D] bf16
+            if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype)) |gated_raw| {
+                defer gated_raw.deinit(); // [L*HV, D], qkv dtype
+                // Round the gate like the eager chain below (a no-op view
+                // when dtypes already agree — unquantized toy modules).
+                const gate_dt = outGateDt(self.o_scales, qkv_dtype);
+                var gated = gated_raw;
+                var gated_owned = false;
+                if (gate_dt != gated_raw.dtype()) {
+                    gated = try ops.astype(ctx, gated_raw, gate_dt);
+                    gated_owned = true;
+                }
+                defer if (gated_owned) gated.deinit();
                 const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
                 defer y_flat.deinit();
                 return linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
@@ -3914,8 +3961,9 @@ pub const Qwen38GDN = struct {
         defer z_act.deinit();
         const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
         defer y_gated_f32.deinit();
-        // Match the fused verify kernel's gate dtype (see the L <= 16 branch).
-        const gate_dt = if (L <= 16) verifyGateDt(qkv_dtype) else qkv_dtype;
+        // Gate dtype handed to out_proj: bf16 when quantized (fast qmm path;
+        // same rounding as the fused kernels above and the decode step).
+        const gate_dt = if (verify_qmm.isArmed()) verifyGateDt(qkv_dtype) else outGateDt(self.o_scales, qkv_dtype);
         const y_gated = try ops.astype(ctx, y_gated_f32, gate_dt);
         defer y_gated.deinit();
         const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, L, HV * D });
