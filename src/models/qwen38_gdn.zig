@@ -2859,6 +2859,198 @@ fn prefillTailFused(
     return Array.fromHandle(h);
 }
 
+// ============================================================
+// Fused verify tail: out-gate norm + silu(z) gate, omlx layout
+// ============================================================
+//
+// Verify-regime (small L) twin of prefillTailFused, ported from omlx's
+// qwen35_gdn_verify_fused `_norm_gate` kernel (Apache-2.0): one simdgroup of
+// 32 lanes per (token, head) row, each lane owns PER = D/32 contiguous
+// values. The sum-of-squares is each lane's serial partial over its PER
+// values followed by one simd_sum — MLX rms_norm's GPU reduction order for a
+// 128-wide row, which omlx verifies bit-exact against the separate ops. The
+// prefillTailFused kernel instead gives each row a full D-thread threadgroup
+// with a barrier; at L <= 16 there are too few rows to fill the GPU that
+// way, and the barrier costs more than the simd_sum it replaces.
+//
+// Roundings follow the eager chain exactly as in prefillTailFused: y rounds
+// to T (the qkv dtype) before the norm, the norm computes in f32 and rounds
+// to T before AND after the norm_w multiply (MLX rms_norm casts w to
+// result_type(y, w) = T and computes in T), silu is f32 (MLX 0.32's Sigmoid:
+// 1/(1+precise::exp(|g|)) then select), the gate multiply is f32, output
+// rounds to T. Serving is y f32, z/norm_w stored bf16, T=f32 — the storage
+// loads are exact and every T-rounding is an identity.
+
+const verify_tail_kernel_body =
+    \\    const uint lane = thread_position_in_threadgroup.x;
+    \\    const uint row = thread_position_in_grid.y;
+    \\    const device {[yt]s}* yp = y + row * {[d]} + lane * {[per]};
+    \\    float x[{[per]}];
+    \\    float ss = 0.0f;
+    \\    for (int i = 0; i < {[per]}; ++i) {{
+    \\        // y rounds to T before the norm (gated_delta_update returns
+    \\        // y.astype(q.dtype)); the YT load itself is exact.
+    \\        x[i] = float({[t]s}(float(yp[i])));
+    \\        ss += x[i] * x[i];
+    \\    }}
+    \\    ss = metal::simd_sum(ss);
+    \\    const float inv = metal::precise::rsqrt(ss / {[d]}.0f + {[eps]s});
+    \\    const device {[zt]s}* zp = z + row * {[d]} + lane * {[per]};
+    \\    device {[ot]s}* op = out + row * {[d]} + lane * {[per]};
+    \\    for (int i = 0; i < {[per]}; ++i) {{
+    \\        const float yn = float({[t]s}(x[i] * inv));
+    \\        // rms_norm casts w to the compute type T before the multiply.
+    \\        const float yw = float({[t]s}(yn * float({[t]s}(norm_w[lane * {[per]} + i]))));
+    \\        const float g = float(zp[i]);
+    \\        const float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
+    \\        const float sig = (g < 0.0f) ? sy : 1.0f - sy;
+    \\        // OT is the gate storage type: the eager chain computes the gate
+    \\        // in f32 and astypes it to OT for the out_proj qmm.
+    \\        op[i] = {[ot]s}((g * sig) * yw);
+    \\    }}
+    \\
+;
+
+// d/eps and the storage dtypes are baked into the source, so the cache key
+// covers all of them (the toy test modules exercise head_dim 32 with f32;
+// serving is d=128 with y f32, z/norm_w bf16, T=f32).
+const VerifyTailCached = struct {
+    kernel: c.c.mlx_fast_metal_kernel,
+    d: i32,
+    eps: f32,
+    t: dtype_mod.Dtype,
+    yt: dtype_mod.Dtype,
+    zt: dtype_mod.Dtype,
+    wt: dtype_mod.Dtype,
+    ot: dtype_mod.Dtype,
+};
+var verify_tail_cache: [8]?VerifyTailCached = .{null} ** 8;
+var verify_tail_broken: bool = false;
+var verify_tail_off: ?bool = null;
+var verify_tail_logged: bool = false;
+
+/// Kill switch for the bf16 gate store (`DMLX_VERIFY_TAIL_F32_GATE=1` keeps
+/// the gate f32, sending out_proj back to the stock qmm).
+var verify_tail_f32_gate: ?bool = null;
+
+fn verifyGateDt(qkv_dtype: dtype_mod.Dtype) dtype_mod.Dtype {
+    if (qkv_dtype != .float32 or !verify_qmm.isArmed()) return qkv_dtype;
+    if (verify_tail_f32_gate == null) verify_tail_f32_gate = std.c.getenv("DMLX_VERIFY_TAIL_F32_GATE") != null;
+    return if (verify_tail_f32_gate.?) .float32 else .bfloat16;
+}
+
+fn verifyTailFused(
+    ctx: EagerContext,
+    y_f32: Array, // [L, HV, D], recurrence output (f32 in verify)
+    z: Array, // [1, L, HV*D], bf16 or f32
+    norm_w: Array, // [D], bf16 or f32
+    eps: f32,
+    L: i32,
+    hv: i32,
+    d: i32,
+    qkv_dtype: dtype_mod.Dtype, // compute/rounding type T of the eager chain
+    out_dtype: dtype_mod.Dtype, // gate storage type OT (== T unless the qmm wants bf16)
+) !?Array {
+    if (verify_tail_off == null) verify_tail_off = std.c.getenv("DMLX_NO_VERIFY_TAIL_FUSION") != null;
+    if (verify_tail_off.?) return null;
+    if (verify_tail_broken) return null;
+    if (@mod(d, 32) != 0) return null; // one 32-lane simdgroup owns a row
+    const yt = y_f32.dtype();
+    const zt = z.dtype();
+    const wt = norm_w.dtype();
+    for ([_]dtype_mod.Dtype{ yt, zt, wt, qkv_dtype, out_dtype }) |dt| {
+        if (dt != .float32 and dt != .bfloat16) return null;
+    }
+    const allocator = ctx.allocator;
+    var kernel: ?c.c.mlx_fast_metal_kernel = null;
+    for (&verify_tail_cache) |*e| {
+        if (e.*) |v| {
+            if (v.d == d and v.eps == eps and v.t == qkv_dtype and v.yt == yt and v.zt == zt and v.wt == wt and v.ot == out_dtype) {
+                kernel = v.kernel;
+                break;
+            }
+        }
+    }
+    if (kernel == null) {
+        const t_name: []const u8 = if (qkv_dtype == .float32) "float" else "bfloat16_t";
+        const yt_name: []const u8 = if (yt == .float32) "float" else "bfloat16_t";
+        const zt_name: []const u8 = if (zt == .float32) "float" else "bfloat16_t";
+        const wt_name: []const u8 = if (wt == .float32) "float" else "bfloat16_t";
+        const ot_name: []const u8 = if (out_dtype == .float32) "float" else "bfloat16_t";
+        const per: i32 = @divExact(d, 32);
+        const name_z = std.fmt.allocPrintSentinel(allocator, "gdn_verify_tail_{s}_{s}_{s}_{s}_{s}_d{d}", .{ t_name, yt_name, zt_name, wt_name, ot_name, d }, 0) catch return null;
+        defer allocator.free(name_z);
+        const eps_z = f32MetalLit(allocator, eps) catch return null;
+        defer allocator.free(eps_z);
+        const body = std.fmt.allocPrint(allocator, verify_tail_kernel_body, .{
+            .t = t_name,
+            .yt = yt_name,
+            .zt = zt_name,
+            .ot = ot_name,
+            .d = d,
+            .per = per,
+            .eps = eps_z,
+        }) catch return null;
+        defer allocator.free(body);
+        const src_z = allocator.dupeZ(u8, body) catch return null;
+        defer allocator.free(src_z);
+        const header_z = allocator.dupeZ(u8, "") catch return null;
+        defer allocator.free(header_z);
+        const in_vec = makeStringVec(allocator, &.{ "y", "z", "norm_w" }) catch return null;
+        defer _ = c.c.mlx_vector_string_free(in_vec);
+        const out_vec = makeStringVec(allocator, &.{"out"}) catch return null;
+        defer _ = c.c.mlx_vector_string_free(out_vec);
+        const k = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
+        var stored = false;
+        for (&verify_tail_cache) |*e| {
+            if (e.* == null) {
+                e.* = .{ .kernel = k, .d = d, .eps = eps, .t = qkv_dtype, .yt = yt, .zt = zt, .wt = wt, .ot = out_dtype };
+                stored = true;
+                break;
+            }
+        }
+        if (!stored) {
+            verify_tail_broken = true; // cache full: fall back permanently
+            return null;
+        }
+        kernel = k;
+    }
+
+    const rows = L * hv;
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    // One simdgroup per row, 8 rows per threadgroup (omlx's geometry).
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 32, rows, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 8, 1));
+    const out_ml_dtype: c.c.mlx_dtype = if (out_dtype == .float32) c.c.MLX_FLOAT32 else c.c.MLX_BFLOAT16;
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ rows, d }, 2, out_ml_dtype));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ y_f32, z, norm_w }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel.?, in_vec, cfg, fusedStream())) catch |err| {
+        verify_tail_broken = true;
+        prefillRecWarn(err);
+        return null;
+    };
+    var h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+    if (!verify_tail_logged) {
+        verify_tail_logged = true;
+        std.log.info("fused GDN verify tail kernel active (d={d})", .{d});
+    }
+    return Array.fromHandle(h);
+}
+
+/// Test hook for the fused verify tail (out-gate norm + silu gate).
+pub fn testVerifyTailFused(ctx: EagerContext, y_f32: Array, z: Array, norm_w: Array, eps: f32, L: i32, hv: i32, d: i32, qkv_dtype: dtype_mod.Dtype, out_dtype: dtype_mod.Dtype) !?Array {
+    return verifyTailFused(ctx, y_f32, z, norm_w, eps, L, hv, d, qkv_dtype, out_dtype);
+}
+
 fn convAccumSeq(ctx: EagerContext, conv1d_t: Array, window: Array, L: i32, qkv_dim: i32) !Array {
     const k: i32 = @intCast(conv1d_t.shape()[0]);
     const w_f32 = try ops.astype(ctx, conv1d_t, .float32);
@@ -3665,6 +3857,26 @@ pub const Qwen38GDN = struct {
         // armed — the price would no longer measure the eager ops.
         const price_tail = std.c.getenv("DMLX_VERIFY_PRICE_TAIL") != null;
         if (!price_tail) {
+            // Verify regime (small L): one simdgroup per (token, head) row,
+            // omlx layout. Handles the actual serving dtypes (y f32,
+            // z/norm_w bf16 storage, f32 compute) that prefillTailFused's
+            // bf16-z/f32-w checks reject; prefill keeps its existing path.
+            //
+            // When the verify qmm kernels are armed, emit the gate in bf16
+            // so the out_proj qmm takes the fast verify path: the f32
+            // promotion (5e8ef27) was for conv-kernel eligibility, but it
+            // silently knocked out_proj (the tail's dominant cost) back to
+            // the stock f32-input qmm. The bf16 store is the eager chain's
+            // f32 gate followed by the same astype the fallback below does.
+            if (L <= 16) {
+                const gate_dt = verifyGateDt(qkv_dtype);
+                if (try verifyTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype, gate_dt)) |gated| {
+                    defer gated.deinit(); // [L*HV, D], gate_dt
+                    const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
+                    defer y_flat.deinit();
+                    return linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
+                }
+            }
             if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype)) |gated| {
                 defer gated.deinit(); // [L*HV, D] bf16
                 const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
@@ -3702,7 +3914,9 @@ pub const Qwen38GDN = struct {
         defer z_act.deinit();
         const y_gated_f32 = try ops.multiply(ctx, z_act, y_normed_f32);
         defer y_gated_f32.deinit();
-        const y_gated = try ops.astype(ctx, y_gated_f32, qkv_dtype);
+        // Match the fused verify kernel's gate dtype (see the L <= 16 branch).
+        const gate_dt = if (L <= 16) verifyGateDt(qkv_dtype) else qkv_dtype;
+        const y_gated = try ops.astype(ctx, y_gated_f32, gate_dt);
         defer y_gated.deinit();
         const y_flat = try ops.reshape(ctx, y_gated, &[_]i32{ 1, L, HV * D });
         defer y_flat.deinit();
@@ -5151,4 +5365,90 @@ test "prefill fused conv path produces the same new conv state" {
     defer mx.deinit();
     try mx.eval();
     try std.testing.expectEqual(@as(f32, 0.0), (try mx.dataSlice(f32))[0]);
+}
+
+test "verifyTailFused matches the eager out-gate norm + silu gate" {
+    // The serving verify regime: y f32, z f32, norm_w f32 — every rounding
+    // in the fused kernel is an identity, so the only tolerated drift vs the
+    // eager chain is reduction/transcendental ulps, well under 1e-5.
+    const allocator = std.testing.allocator;
+    c.initErrorHandler();
+    const ctx = EagerContext.init(allocator);
+
+    const HV: i32 = 4;
+    const D: i32 = 128;
+    const eps: f32 = 1e-6;
+    // Serving verify is y f32, z bf16, norm_w bf16 (T=f32); the all-f32 combo
+    // covers the storage-exact load paths too.
+    for ([_]bool{ false, true }) |bf16_zw| {
+        for ([_]i32{ 1, 4, 8, 16 }) |L| {
+            const y = try makeTestWeight(allocator, &[_]i32{ L, HV, D });
+            defer y.deinit();
+            const z_f32 = try makeTestWeight(allocator, &[_]i32{ 1, L, HV * D });
+            defer z_f32.deinit();
+            const w_f32 = try makeTestWeight(allocator, &[_]i32{D});
+            defer w_f32.deinit();
+            var z = z_f32;
+            var norm_w = w_f32;
+            if (bf16_zw) {
+                z = try ops.astype(ctx, z_f32, .bfloat16);
+                norm_w = try ops.astype(ctx, w_f32, .bfloat16);
+            }
+            defer if (bf16_zw) {
+                z.deinit();
+                norm_w.deinit();
+            };
+
+            const fused = (try testVerifyTailFused(ctx, y, z, norm_w, eps, L, HV, D, .float32, .float32)) orelse
+                return error.SkipZigTest;
+            defer fused.deinit();
+
+            const y_normed = try fast_mod.rmsNorm(ctx, y, norm_w, eps);
+            defer y_normed.deinit();
+            const y_normed_f32 = try ops.astype(ctx, y_normed, .float32);
+            defer y_normed_f32.deinit();
+            const z_resh = try ops.reshape(ctx, z, &[_]i32{ L, HV, D });
+            defer z_resh.deinit();
+            const z_f32b = try ops.astype(ctx, z_resh, .float32);
+            defer z_f32b.deinit();
+            const z_act = try activations.silu(ctx, z_f32b);
+            defer z_act.deinit();
+            const want_flat = try ops.multiply(ctx, z_act, y_normed_f32);
+            defer want_flat.deinit();
+            const want = try ops.reshape(ctx, want_flat, &[_]i32{ L * HV, D });
+            defer want.deinit();
+
+            const d = try ops.subtract(ctx, fused, want);
+            defer d.deinit();
+            const ad = try ops.abs(ctx, d);
+            defer ad.deinit();
+            const mx = try ops.max(ctx, ad);
+            defer mx.deinit();
+            try mx.eval();
+            const worst = (try mx.dataSlice(f32))[0];
+            if (!(worst <= 1e-5)) {
+                std.debug.print("verifyTailFused mismatch at L={d} bf16_zw={}: max abs diff {e}\n", .{ L, bf16_zw, worst });
+                return error.TestUnexpectedResult;
+            }
+
+            // bf16 output (the armed verify regime): the kernel's f32 gate
+            // rounds to bf16 exactly like an astype of the eager result.
+            const fused_b = (try testVerifyTailFused(ctx, y, z, norm_w, eps, L, HV, D, .float32, .bfloat16)).?;
+            defer fused_b.deinit();
+            const want_b = try ops.astype(ctx, want, .bfloat16);
+            defer want_b.deinit();
+            const db = try ops.subtract(ctx, try ops.astype(ctx, fused_b, .float32), try ops.astype(ctx, want_b, .float32));
+            defer db.deinit();
+            const adb = try ops.abs(ctx, db);
+            defer adb.deinit();
+            const mxb = try ops.max(ctx, adb);
+            defer mxb.deinit();
+            try mxb.eval();
+            const worst_b = (try mxb.dataSlice(f32))[0];
+            if (!(worst_b <= 2e-4)) { // one bf16 ulp at these magnitudes
+                std.debug.print("verifyTailFused bf16-out mismatch at L={d} bf16_zw={}: max abs diff {e}\n", .{ L, bf16_zw, worst_b });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
 }

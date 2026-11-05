@@ -460,3 +460,27 @@ S1 (compile draft step) + S3 (GPU-resident verify input) stay on the table
 at ~+3.5% combined. The omlx-only structural remainder is their fused
 verify-op stack (custom_kernels/qwen35_prefill): ~30 small per-layer ops
 fused away.
+
+### Depth-controller phase tracking (2026-11-03, commit 809bbc9)
+
+Root cause found via DMLX_MTP_ROUND_LOG per-round tracing: acceptance is
+content-PHASE-dependent within a single request (math at depth 7: rounds
+1-15 k_mean=2.6, rounds 16+ k=7/7 steady). The old controller pooled
+lifetime per-request acceptance counts, so the front-loaded explore phase
+(rounds 1-9, the BAD phase) poisoned the deep tail forever and the argmin
+locked shallow (math realized N=3 at 28 ms/tok while fixed-N=7 realized
+20.6 ms/tok on the same content).
+
+Fix: per-round evidence decay x0.9 (~10-round window) + near-full deep
+rounds force 3 immediate re-explore rounds + 10% incumbent hysteresis.
+Fixed-depth ceiling check: fixed N=7 = count 46 / math 48.6 / code 34 /
+prose 21 tok/s; the oracle policy is per-content, so the controller (not
+the ceiling) was the lever.
+
+Caveat: harness math/count are NONCE-SENSITIVE — the nonce prefix changes
+the generated text's predictability class (count: 46 tok/s without nonce,
+26-34 with). Cross-pass swings (29 vs 35 vs 41) are the controller's
+cost-EMA seed diverging under machine noise, not content differences (the
+text is deterministic per nonce). omlx's shallow cap (depth 3-4) makes it
+insensitive to all of this — one more argument for flattening our
+cost(depth) curve.
