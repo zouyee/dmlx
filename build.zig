@@ -735,6 +735,22 @@ pub fn build(b: *std.Build) void {
     const run_bench_verify_kernel_step = b.step("run-bench-verify-kernel", "Split-K verify kernel vs stock qmm at M=2..6");
     run_bench_verify_kernel_step.dependOn(&run_bench_verify_kernel.step);
 
+    // Per-shape bandwidth bench for the production verify_qmm routing.
+    const bench_verify_sg8 = b.addExecutable(.{
+        .name = "bench-verify-sg8",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_verify_sg8.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_verify_sg8.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_verify_sg8 = b.addRunArtifact(bench_verify_sg8);
+    if (b.args) |args| run_bench_verify_sg8.addArgs(args);
+    const run_bench_verify_sg8_step = b.step("run-bench-verify-sg8", "Production verify_qmm per-shape GB/s at M=4..8");
+    run_bench_verify_sg8_step.dependOn(&run_bench_verify_sg8.step);
+
     // The weight-buffer-layout question is answered in
     // scripts/weight_residency_bench.py: the per-tensor copy is NOT the
     // plain-decode gap (copied 156.1 GB/s vs mmap 135.3 on real checkpoint
