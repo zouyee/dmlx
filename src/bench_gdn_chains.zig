@@ -121,4 +121,26 @@ pub fn main() !void {
         try y.eval();
     }
     std.debug.print("conv fused+silu: {d:.3} ms/layer  ({d:.0} ms / 48 layers)\n", .{ elapsedMs(t) / REPS, elapsedMs(t) / REPS * 48 });
+
+    // --- fused prefill tail: out-gate norm + silu(z) gate, one kernel ---
+    {
+        const y2 = try random.normal(ctx, &[_]i32{ L, HV, D }, .float32, 0.0, 1.0, null);
+        defer y2.deinit();
+        const z2 = try random.normal(ctx, &[_]i32{ 1, L, HV * D }, .bfloat16, 0.0, 1.0, null);
+        defer z2.deinit();
+        try y2.eval();
+        try z2.eval();
+        for (0..2) |_| {
+            const o = (try gdn.testPrefillTailFused(ctx, y2, z2, norm_w, 1e-6, L, HV, D)).?;
+            defer o.deinit();
+            try o.eval();
+        }
+        t = std.c.mach_absolute_time();
+        for (0..REPS) |_| {
+            const o = (try gdn.testPrefillTailFused(ctx, y2, z2, norm_w, 1e-6, L, HV, D)).?;
+            defer o.deinit();
+            try o.eval();
+        }
+        std.debug.print("prefill tail fused: {d:.3} ms/layer  ({d:.0} ms / 48 layers)\n", .{ elapsedMs(t) / REPS, elapsedMs(t) / REPS * 48 });
+    }
 }

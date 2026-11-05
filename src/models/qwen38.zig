@@ -1857,6 +1857,20 @@ pub const Qwen38ServingModel = struct {
     const HiddenCapture = enum { none, last, all };
     const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
+    // DMLX_LAYER_PROF=1: barrier after every layer and accumulate per-kind
+    // wall time. Diagnostic only — the per-layer sync costs a few percent
+    // (see the prefill sync-cadence note above), so the numbers attribute
+    // cost but sum to slightly more than the real wall.
+    var layer_prof_on: ?bool = null;
+    var layer_prof_gdn_ns: u64 = 0;
+    var layer_prof_attn_ns: u64 = 0;
+
+    fn layerProfNow() i128 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+
     /// `last_logits_only` applies the final norm and lm_head to ONLY the last
     /// position. Prefill never needs the other rows — the sampler slices the
     /// last one (`generation.zig`) — but computing them is expensive and
@@ -1904,6 +1918,10 @@ pub const Qwen38ServingModel = struct {
         var normed1_carry: ?Array = null;
         defer if (normed1_carry) |*nc| nc.deinit();
         var gdn_seen: usize = 0;
+
+        if (layer_prof_on == null) layer_prof_on = std.c.getenv("DMLX_LAYER_PROF") != null;
+        const lp_on = layer_prof_on.? and ids.len > 1;
+        var lp_t = layerProfNow();
 
         for (self.layers, 0..) |*lp, layer| {
             // Attention sub-block (mirrors Qwen38Model.forward).
@@ -1993,6 +2011,26 @@ pub const Qwen38ServingModel = struct {
                 h.deinit();
                 h = next;
             }
+            if (lp_on) {
+                h.eval() catch {};
+                const now = layerProfNow();
+                const dt: u64 = @intCast(now - lp_t);
+                lp_t = now;
+                switch (lp.module) {
+                    .gdn => layer_prof_gdn_ns += dt,
+                    .attn => layer_prof_attn_ns += dt,
+                }
+            }
+        }
+        if (lp_on) {
+            const ms = struct {
+                fn f(ns: u64) f64 {
+                    return @as(f64, @floatFromInt(ns)) / 1e6;
+                }
+            }.f;
+            std.debug.print("layer prof (L={d}): gdn {d:.0} ms / 48, attn {d:.0} ms / 16\n", .{ ids.len, ms(layer_prof_gdn_ns), ms(layer_prof_attn_ns) });
+            layer_prof_gdn_ns = 0;
+            layer_prof_attn_ns = 0;
         }
 
         // Final norm → bf16 → lm_head (mirrors Qwen38Model.forward).

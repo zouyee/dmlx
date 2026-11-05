@@ -2732,6 +2732,11 @@ pub fn testConvAccumSeqFused(ctx: EagerContext, conv1d_t_f32: Array, conv_state:
     return convAccumSeqFused(ctx, conv1d_t_f32, conv_state, x_f32, L, qkv_dim, K);
 }
 
+/// Bench hook for the fused prefill tail (out-gate norm + silu gate).
+pub fn testPrefillTailFused(ctx: EagerContext, y_f32: Array, z: Array, norm_w: Array, eps: f32, L: i32, hv: i32, d: i32) !?Array {
+    return prefillTailFused(ctx, y_f32, z, norm_w, eps, L, hv, d, .bfloat16);
+}
+
 // ============================================================
 // Fused prefill tail: out-gate norm + silu(z) gate in one pass
 // ============================================================
@@ -2755,11 +2760,15 @@ const prefill_tail_kernel_body =
     \\    // y rounds to T before the norm (gated_delta_update returns
     \\    // y.astype(q.dtype)).
     \\    const float yv = float({[t]s}(y[row * {[d]} + t]));
-    \\    threadgroup float ys[{[d]}];
-    \\    ys[t] = yv;
+    \\    // Block reduction over D threads: simd_sum per 32-lane group, then
+    \\    // partials through shared memory (a per-thread serial sum over all D
+    \\    // costs D threadgroup reads per thread — 128x redundant traffic).
+    \\    float local = metal::simd_sum(yv * yv);
+    \\    threadgroup float red[{[d]} / 32];
+    \\    if (t % 32 == 0) red[t / 32] = local;
     \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\    float ssq = 0.0f;
-    \\    for (int i = 0; i < {[d]}; ++i) ssq += ys[i] * ys[i];
+    \\    for (int i = 0; i < {[d]} / 32; ++i) ssq += red[i];
     \\    const float yn = float({[t]s}(yv * metal::rsqrt(ssq / {[d]}.0f + {[eps]s})));
     \\    const float yw = float({[t]s}(yn * float(norm_w[t])));
     \\    const float zz = float(z[row * {[d]} + t]);
@@ -2769,6 +2778,7 @@ const prefill_tail_kernel_body =
 ;
 
 var prefill_tail_kernel: ?c.c.mlx_fast_metal_kernel = null;
+var prefill_tail_kernel_f32: ?c.c.mlx_fast_metal_kernel = null;
 var prefill_tail_broken: bool = false;
 var prefill_tail_off: ?bool = null;
 
@@ -2781,19 +2791,34 @@ fn prefillTailFused(
     L: i32,
     hv: i32,
     d: i32,
+    qkv_dtype: dtype_mod.Dtype,
 ) !?Array {
     if (prefill_tail_off == null) prefill_tail_off = std.c.getenv("DMLX_NO_PREFILL_TAIL_FUSION") != null;
     if (prefill_tail_off.?) return null;
     if (prefill_tail_broken) return null;
     if (y_f32.dtype() != .float32 or z.dtype() != .bfloat16 or norm_w.dtype() != .float32) return null;
+    // T is the qkv dtype: the eager chain rounds y to it before the norm and
+    // emits the gate in it. With T=float every rounding is an identity — the
+    // serving case, since the (fused or eager) conv emits f32.
+    const t_name: []const u8 = switch (qkv_dtype) {
+        .bfloat16 => "bfloat16_t",
+        .float32 => "float",
+        else => return null,
+    };
+    const out_dtype: c.c.mlx_dtype = switch (qkv_dtype) {
+        .bfloat16 => c.c.MLX_BFLOAT16,
+        .float32 => c.c.MLX_FLOAT32,
+        else => return null,
+    };
     const allocator = ctx.allocator;
-    if (prefill_tail_kernel == null) {
-        const name_z = allocator.dupeZ(u8, "gdn_prefill_tail") catch return null;
+    const slot = if (qkv_dtype == .float32) &prefill_tail_kernel_f32 else &prefill_tail_kernel;
+    if (slot.* == null) {
+        const name_z = std.fmt.allocPrintSentinel(allocator, "gdn_prefill_tail_{s}", .{t_name}, 0) catch return null;
         defer allocator.free(name_z);
         const eps_z = f32MetalLit(allocator, eps) catch return null;
         defer allocator.free(eps_z);
         const body = std.fmt.allocPrint(allocator, prefill_tail_kernel_body, .{
-            .t = "bfloat16_t",
+            .t = t_name,
             .d = d,
             .eps = eps_z,
         }) catch return null;
@@ -2806,16 +2831,16 @@ fn prefillTailFused(
         defer _ = c.c.mlx_vector_string_free(in_vec);
         const out_vec = makeStringVec(allocator, &.{"out"}) catch return null;
         defer _ = c.c.mlx_vector_string_free(out_vec);
-        prefill_tail_kernel = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
+        slot.* = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
     }
-    const kernel = prefill_tail_kernel.?;
+    const kernel = slot.*.?;
 
     const rows = L * hv;
     const cfg = c.c.mlx_fast_metal_kernel_config_new();
     defer c.c.mlx_fast_metal_kernel_config_free(cfg);
     try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, rows, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
-    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ rows, d }, 2, c.c.MLX_BFLOAT16));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ rows, d }, 2, out_dtype));
 
     const in_vec = c.c.mlx_vector_array_new();
     defer _ = c.c.mlx_vector_array_free(in_vec);
@@ -3640,7 +3665,7 @@ pub const Qwen38GDN = struct {
         // armed — the price would no longer measure the eager ops.
         const price_tail = std.c.getenv("DMLX_VERIFY_PRICE_TAIL") != null;
         if (!price_tail) {
-            if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D)) |gated| {
+            if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D, qkv_dtype)) |gated| {
                 defer gated.deinit(); // [L*HV, D] bf16
                 const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
                 defer y_flat.deinit();

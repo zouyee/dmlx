@@ -24,6 +24,7 @@ const ops = @import("mlx").ops;
 const random = @import("mlx").random;
 const quantize_mod = @import("mlx").quantize;
 const eval_mod = @import("mlx").eval;
+const qmm_v8 = @import("models/qwen38_qmm_v8.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -174,11 +175,40 @@ pub fn main() !void {
             const y = try quantize_mod.quantizedMatmul(ctx, x, qws[i], true);
             try pending.append(allocator, y);
         }
-        const t = std.c.mach_absolute_time();
+        var t = std.c.mach_absolute_time();
         try eval_mod.asyncEval(allocator, pending.items);
         try pending.items[n_streams - 1].eval();
-        const per_ms = elapsedMs(t) / n_streams;
+        var per_ms = elapsedMs(t) / n_streams;
         const flop = 2.0 * 2048.0 * @as(f64, @floatFromInt(s.out)) * @as(f64, @floatFromInt(s.in));
-        std.debug.print("  {s: <24} {d:.2} ms  {d:.2} TF/s\n", .{ s.name, per_ms, flop / (per_ms / 1e3) / 1e12 });
+        std.debug.print("  {s: <24} stock {d:.2} ms  {d:.2} TF/s\n", .{ s.name, per_ms, flop / (per_ms / 1e3) / 1e12 });
+
+        // Same, through the v8 tile: reused vs cold weights, same x.
+        const V8 = struct {
+            x: Array,
+            qw: quantize_mod.QuantizedWeight,
+            fn run(self: @This(), cx: EagerContext) !Array {
+                return (try qmm_v8.maybeApply(cx, self.x, self.qw.data, self.qw.scales, self.qw.biases)).?;
+            }
+        };
+        const t_v8_warm = try timeBatched(allocator, ctx, V8, .{ .x = x, .qw = qws[0] }, 3);
+        for (0..n_streams) |i| {
+            const y = (try qmm_v8.maybeApply(ctx, x, qws[i].data, qws[i].scales, qws[i].biases)).?;
+            defer y.deinit();
+            try y.eval();
+        }
+        var pending2 = std.ArrayList(Array).empty;
+        defer pending2.deinit(allocator);
+        defer for (pending2.items) |y| y.deinit();
+        for (0..n_streams) |i| {
+            const y = (try qmm_v8.maybeApply(ctx, x, qws[i].data, qws[i].scales, qws[i].biases)).?;
+            try pending2.append(allocator, y);
+        }
+        t = std.c.mach_absolute_time();
+        try eval_mod.asyncEval(allocator, pending2.items);
+        try pending2.items[n_streams - 1].eval();
+        per_ms = elapsedMs(t) / n_streams;
+        std.debug.print("  {s: <24} v8 warm {d:.2} ms ({d:.2} TF/s)  v8 cold {d:.2} ms ({d:.2} TF/s)\n", .{
+            s.name, t_v8_warm, flop / (t_v8_warm / 1e3) / 1e12, per_ms, flop / (per_ms / 1e3) / 1e12,
+        });
     }
 }
