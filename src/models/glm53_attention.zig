@@ -28,6 +28,7 @@
 /// oracle's cache!=None branch.
 const std = @import("std");
 const verify_qmm = @import("verify_qmm.zig");
+const qmm_v8 = @import("qwen38_qmm_v8.zig");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
@@ -81,6 +82,11 @@ pub const QuantLinear = struct {
         // MLP gate/up/down and lm_head come through here. Routed to the
         // verify-shape kernels only while armed (see verify_qmm.zig).
         if (try verify_qmm.maybeQmm(ctx, x, qw)) |y| return y;
+        // Prefill-shape routing to omlx's variant-8 qmm tile (bit-exact vs
+        // stock, ~1.06x at M>=256 on every projection shape). This is the
+        // same routing linearQuantParts has; without it the MLP (72% of
+        // prefill FLOPs) and lm_head never see the tile.
+        if (try qmm_v8.maybeApply(ctx, x, self.w, self.scales, self.biases)) |y| return y;
         return quantize_mod.quantizedMatmul(ctx, x, qw, true);
     }
 };

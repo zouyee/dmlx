@@ -2586,6 +2586,7 @@ fn buildConvSeqSource(allocator: std.mem.Allocator, k: i32, tpt: i32) ![]u8 {
     try w.raw(
         \\    const uint c = thread_position_in_grid.x;
         \\    const int t0 = int(thread_position_in_grid.y) * TPT;
+        \\    const int L = lp[0]; // runtime L: one compile serves every prompt length
         \\    if (c >= QKV || t0 >= L) { return; }
         \\
     );
@@ -2647,7 +2648,7 @@ fn getConvSeqKernel(allocator: std.mem.Allocator) ?c.c.mlx_fast_metal_kernel {
     defer allocator.free(src_z);
     const header_z = allocator.dupeZ(u8, "") catch return null;
     defer allocator.free(header_z);
-    const in_vec = makeStringVec(allocator, &.{ "x", "cs", "w" }) catch return null;
+    const in_vec = makeStringVec(allocator, &.{ "x", "cs", "w", "lp" }) catch return null;
     defer _ = c.c.mlx_vector_string_free(in_vec);
     const out_vec = makeStringVec(allocator, &.{"y"}) catch return null;
     defer _ = c.c.mlx_vector_string_free(out_vec);
@@ -2700,15 +2701,18 @@ fn convAccumSeqFused(
     try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, qkv_dim, grid_y, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, qkv_dim }, 2, c.c.MLX_FLOAT32));
-    try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "L", L));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "QKV", qkv_dim));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", K));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KM1", K - 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TPT", rows_per_thread));
 
+    // L as a runtime [1] int32 input (kernel caches one compile for all L).
+    const l_arr = try Array.fromData(allocator, i32, &[_]i32{L}, &[_]i32{1});
+    defer l_arr.deinit();
+
     const in_vec = c.c.mlx_vector_array_new();
     defer _ = c.c.mlx_vector_array_free(in_vec);
-    for ([_]Array{ x_f32, conv_state, conv1d_t_f32 }) |inp| {
+    for ([_]Array{ x_f32, conv_state, conv1d_t_f32, l_arr }) |inp| {
         try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
     }
     var out_vec = c.c.mlx_vector_array_new();
@@ -2726,6 +2730,108 @@ fn convAccumSeqFused(
 /// Bench hook for the fused whole-sequence causal conv (+silu inside).
 pub fn testConvAccumSeqFused(ctx: EagerContext, conv1d_t_f32: Array, conv_state: Array, x_f32: Array, L: i32, qkv_dim: i32, K: i32) !?Array {
     return convAccumSeqFused(ctx, conv1d_t_f32, conv_state, x_f32, L, qkv_dim, K);
+}
+
+// ============================================================
+// Fused prefill tail: out-gate norm + silu(z) gate in one pass
+// ============================================================
+//
+// prefillTail's eager chain is astype → rmsNorm → astype f32 → reshape →
+// astype f32 → silu → multiply → astype T: eight elementwise passes over
+// [L, HV, D] (~250-280 ms at L=1790 over 48 layers; the floor is reading y
+// and z once and writing the gate, ~30 ms). One threadgroup of D threads per
+// (token, head) row; the norm reduction goes through one threadgroup buffer
+// + barrier, same shape as the decode tail kernel.
+//
+// Every rounding of the eager chain is replicated: y (the recurrence's f32
+// output) rounds to T before the norm; the norm computes in f32 and rounds
+// to T before AND after the norm_w multiply (mlx fast.rms_norm semantics,
+// see the decode tail kernel note); z is read in T, silu is f32, the gate
+// multiply is f32, and the output rounds to T.
+
+const prefill_tail_kernel_body =
+    \\    const uint t = thread_position_in_grid.x;
+    \\    const uint row = thread_position_in_grid.y;
+    \\    // y rounds to T before the norm (gated_delta_update returns
+    \\    // y.astype(q.dtype)).
+    \\    const float yv = float({[t]s}(y[row * {[d]} + t]));
+    \\    threadgroup float ys[{[d]}];
+    \\    ys[t] = yv;
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    float ssq = 0.0f;
+    \\    for (int i = 0; i < {[d]}; ++i) ssq += ys[i] * ys[i];
+    \\    const float yn = float({[t]s}(yv * metal::rsqrt(ssq / {[d]}.0f + {[eps]s})));
+    \\    const float yw = float({[t]s}(yn * float(norm_w[t])));
+    \\    const float zz = float(z[row * {[d]} + t]);
+    \\    const float zact = zz / (1.0f + metal::exp(-zz));
+    \\    out[row * {[d]} + t] = {[t]s}(zact * yw);
+    \\
+;
+
+var prefill_tail_kernel: ?c.c.mlx_fast_metal_kernel = null;
+var prefill_tail_broken: bool = false;
+var prefill_tail_off: ?bool = null;
+
+fn prefillTailFused(
+    ctx: EagerContext,
+    y_f32: Array, // [L, HV, D] f32, recurrence output
+    z: Array, // [1, L, HV*D], qkv dtype
+    norm_w: Array, // [D] f32
+    eps: f32,
+    L: i32,
+    hv: i32,
+    d: i32,
+) !?Array {
+    if (prefill_tail_off == null) prefill_tail_off = std.c.getenv("DMLX_NO_PREFILL_TAIL_FUSION") != null;
+    if (prefill_tail_off.?) return null;
+    if (prefill_tail_broken) return null;
+    if (y_f32.dtype() != .float32 or z.dtype() != .bfloat16 or norm_w.dtype() != .float32) return null;
+    const allocator = ctx.allocator;
+    if (prefill_tail_kernel == null) {
+        const name_z = allocator.dupeZ(u8, "gdn_prefill_tail") catch return null;
+        defer allocator.free(name_z);
+        const eps_z = f32MetalLit(allocator, eps) catch return null;
+        defer allocator.free(eps_z);
+        const body = std.fmt.allocPrint(allocator, prefill_tail_kernel_body, .{
+            .t = "bfloat16_t",
+            .d = d,
+            .eps = eps_z,
+        }) catch return null;
+        defer allocator.free(body);
+        const src_z = allocator.dupeZ(u8, body) catch return null;
+        defer allocator.free(src_z);
+        const header_z = allocator.dupeZ(u8, "") catch return null;
+        defer allocator.free(header_z);
+        const in_vec = makeStringVec(allocator, &.{ "y", "z", "norm_w" }) catch return null;
+        defer _ = c.c.mlx_vector_string_free(in_vec);
+        const out_vec = makeStringVec(allocator, &.{"out"}) catch return null;
+        defer _ = c.c.mlx_vector_string_free(out_vec);
+        prefill_tail_kernel = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
+    }
+    const kernel = prefill_tail_kernel.?;
+
+    const rows = L * hv;
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, d, rows, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, d, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ rows, d }, 2, c.c.MLX_BFLOAT16));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ y_f32, z, norm_w }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, fusedStream())) catch |err| {
+        prefill_tail_broken = true;
+        prefillRecWarn(err);
+        return null;
+    };
+    var h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+    return Array.fromHandle(h);
 }
 
 fn convAccumSeq(ctx: EagerContext, conv1d_t: Array, window: Array, L: i32, qkv_dim: i32) !Array {
@@ -3312,13 +3418,21 @@ pub const Qwen38GDN = struct {
         // 2. Causal depthwise conv over the whole sequence (f32) + silu.
         const qkv_lin2 = try ops.reshape(ctx, qkv_lin, &[_]i32{ L, QKV });
         defer qkv_lin2.deinit();
+        // The projections output bf16 (qmm keeps the activation dtype), but
+        // the fused conv kernel only accepts f32 — without this promotion the
+        // whole prefill silently falls back to the eager conv (window concat +
+        // K tap passes + separate silu, ~1 s at L=1790 vs ~70 ms fused).
+        // Promoting here also makes `new_conv_state` f32, matching the dtype
+        // the cache was initialized with.
+        const qkv_lin_f32 = try ops.astype(ctx, qkv_lin2, .float32);
+        defer qkv_lin_f32.deinit();
         // `window` stays for the VERIFY path, which slices per-position conv
         // states out of it. In the prefill path nothing consumes it (the fused
         // kernel reads conv_state and qkv_lin2 separately, and the new conv
         // state is sliced from qkv_lin2), so MLX never materializes the
         // concat — keeping it is free. Do NOT eval it in the profiler, or the
         // dead 84 MB copy comes back.
-        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin2 }, 0); // [L+K-1, QKV] f32
+        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin_f32 }, 0); // [L+K-1, QKV] f32
         errdefer window.deinit();
 
         // Fast path: one kernel for the K taps + silu, no concatenated
@@ -3327,13 +3441,13 @@ pub const Qwen38GDN = struct {
         const w_f32 = if (self.conv1d_t_f32) |w| w else try ops.astype(ctx, self.conv1d_t, .float32);
         defer if (self.conv1d_t_f32 == null) w_f32.deinit();
         const qkv = blk: {
-            if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K)) |fused| {
+            if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin_f32, L, QKV, K)) |fused| {
                 // DIAGNOSTIC (DMLX_VERIFY_PRICE_CONV=1): price the fused conv
                 // kernel by running it twice and averaging (see priceTwice).
                 // Output stays bit-correct.
                 if (std.c.getenv("DMLX_VERIFY_PRICE_CONV") != null) {
                     defer fused.deinit();
-                    const f2 = try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K) orelse break :blk fused;
+                    const f2 = try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin_f32, L, QKV, K) orelse break :blk fused;
                     defer f2.deinit();
                     break :blk try priceTwice(ctx, fused, f2);
                 }
@@ -3355,7 +3469,7 @@ pub const Qwen38GDN = struct {
         // With L >= K-1 those are exactly qkv_lin2's last K-1 rows, so the
         // fused path never touches `window`.
         const new_conv_state = blk: {
-            const src: Array = if (used_fused) qkv_lin2 else window;
+            const src: Array = if (used_fused) qkv_lin_f32 else window;
             const row0: i32 = if (used_fused) L - (K - 1) else L;
             const row1: i32 = if (used_fused) L else L + K - 1;
             const tail = try ops.slice(ctx, src, &[_]i32{ row0, 0 }, &[_]i32{ row1, QKV }, &[_]i32{ 1, 1 });
@@ -3521,13 +3635,22 @@ pub const Qwen38GDN = struct {
         const D: i32 = @intCast(self.head_dim);
         const L: i32 = @intCast(y_f32.shape()[0]);
 
+        // Fused out-gate norm + silu gate (one pass, same roundings as the
+        // eager chain below). Skip when the diagnostic tail-pricing hook is
+        // armed — the price would no longer measure the eager ops.
+        const price_tail = std.c.getenv("DMLX_VERIFY_PRICE_TAIL") != null;
+        if (!price_tail) {
+            if (try prefillTailFused(ctx, y_f32, z, self.norm_w, self.norm_eps, L, HV, D)) |gated| {
+                defer gated.deinit(); // [L*HV, D] bf16
+                const y_flat = try ops.reshape(ctx, gated, &[_]i32{ 1, L, HV * D });
+                defer y_flat.deinit();
+                return linearQuantParts(ctx, y_flat, self.out_proj, self.o_scales, self.o_biases);
+            }
+        }
+
         // gated_delta_update returns y.astype(qkv.dtype): round before norm.
         const y = try ops.astype(ctx, y_f32, qkv_dtype);
         defer y.deinit();
-        // DIAGNOSTIC (DMLX_VERIFY_PRICE_TAIL=1): price the tail's non-qmm
-        // chain — out-gate rmsNorm and the silu+multiply below — by running
-        // the norm twice and averaging (see priceTwice). Bit-correct.
-        const price_tail = std.c.getenv("DMLX_VERIFY_PRICE_TAIL") != null;
         const y_normed = blk: {
             const n1 = try fast_mod.rmsNorm(ctx, y, self.norm_w, self.norm_eps);
             if (!price_tail) break :blk n1;

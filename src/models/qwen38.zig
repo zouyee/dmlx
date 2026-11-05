@@ -802,6 +802,19 @@ fn mlpForwardPersistent(ctx: EagerContext, lp: *const LayerPersistent, x: Array)
 // (A fused gate|up verify-path variant was tried and measured neutral —
 // 2026-10-30 — and removed.)
 
+// Diagnostic (temporary): report which MLP path prefill vs decode actually
+// takes, once per path-kind per M. Remove after the prefill GEMM audit.
+var mlp_path_seen: [3]i64 = .{ -1, -1, -1 };
+fn mlpPathNote(kind: enum { fused_compiled, compiled, eager }, x: Array) void {
+    if (std.c.getenv("DMLX_MLP_PATH_DEBUG") == null) return;
+    const i: usize = @intFromEnum(kind);
+    const xs = x.shape();
+    const m: i64 = @intCast(@divTrunc(@as(i64, @intCast(x.size())), xs[xs.len - 1]));
+    if (mlp_path_seen[i] == m) return;
+    mlp_path_seen[i] = m;
+    std.debug.print("mlp path {s} first seen at M={d}\n", .{ @tagName(kind), m });
+}
+
 // ============================================================
 // Compiled decode steps (mx.compile) — dispatch-bound fix
 // ============================================================
@@ -1953,15 +1966,18 @@ pub const Qwen38ServingModel = struct {
                 if (self.mlp_swiglu_fused_compiled) |mc| {
                     if (lp.mlp_gate_up != null) {
                         if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+                            mlpPathNote(.fused_compiled, normed2);
                             break :blk mo;
                         } else |_| {} // fall through to the unfused path
                     }
                 }
                 if (self.mlp_swiglu_compiled) |mc| {
                     if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
+                        mlpPathNote(.compiled, normed2);
                         break :blk mo;
                     } else |_| {} // fall through to the eager path
                 }
+                mlpPathNote(.eager, normed2);
                 break :blk try mlpForwardPersistent(ctx, lp, normed2);
             };
             defer mlp_out.deinit();
@@ -2020,6 +2036,7 @@ pub const Qwen38ServingModel = struct {
         // sampling. Step N+1's graph then references materialized states.
         try self.asyncEvalCacheStates();
         try logits.eval();
+        if (ids.len > 1) qwen38_gdn.gdnPrefillProfReport(); // DMLX_GDN_PREFILL_PROF
         return .{ .logits = logits, .hidden = hidden_cap };
     }
 };
