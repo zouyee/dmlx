@@ -141,9 +141,22 @@ and intercept (fixed overhead):
 
 | engine | prefill tok/s | fixed overhead | short TTFT | ttft@2k (normalized) |
 |---|---|---|---|---|
-| dmlx | 117.4 | **-0.036 s** | **0.277 s** | 17.41 s |
+| dmlx | 117.4 → **123.7-129.6** (2026-11-05) | **-0.036 s** | **0.277 s** | 17.41 → ~16.3-17.3 s |
 | mlx-vlm 0.7.8 | 133.1 | 0.224 s | 0.376 s | 15.61 s |
-| omlx 0.7.1 | **134.5** | 0.354 s | 0.762 s | **15.58 s** |
+| omlx 0.7.1 | **134.5 → 137.5-139.4** (0.7.3) | 0.354 s | 0.762 s | **15.58-15.91 s** |
+
+2026-11-05 (commits `5e8ef27`, `3356161`, `8ad3fd3`): the prefill gap was
+-11.6% and is now ~-8.5% (median of medians; same-code spread is ±4%). The
+biggest single piece was the GDN causal conv silently running its eager
+fallback in every serving prefill (qmm returns bf16, the fused kernel only
+accepted f32) — ~0.9 s at L=1790. Also landed: runtime-L conv kernel (one
+compile per process, not per prompt length), a fused prefill out-gate
+kernel, and v8-tile routing in `QuantLinear.apply`. Ruled out by
+measurement: GEMM-floor optimism (cold-weight qmm streams at the same
+6.4-6.7 TF/s), omlx's W4A8 backend (NAX/M5-only), omlx fused GDN prework
+(Qwen3.5 prefill keeps the stock path), and the prefill sync cadence.
+Residual: both layer kinds sit ~15% over the v8 GEMM floor (~0.8 s, needs a
+per-kernel GPU timeline to split further), plus recur ~0.2 s and conv ~0.07 s.
 
 dmlx has by far the lowest fixed overhead (2.75x better than omlx) but the
 lowest prefill throughput (-13%), so it wins TTFT only below ~258 tokens
