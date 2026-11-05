@@ -1329,3 +1329,65 @@ request pays explore rounds, and the harness restarts servers per visit so
 no warm-up carries (their controller starts deep and sheds, paying nothing
 upfront on easy content). math probes within a warm session measured 39.5
 vs their 39.3 (parity) — the harness gap is partly cold-start calibration.
+
+## 2026-11-05 — thinking-regime parity -> win: round-cost attribution and the fused verify tail
+
+The aligned thinking pair (`dmlx-think-aligned` vs `omlx-mtp-aligned`,
+SAME reasoning directive on both arms so content AND prompt length match)
+opened the day at **-4.4%** (34.9 vs 36.5) and closed at **+8.2%**
+(39.7 vs 36.7; code +12.9%, prose +6.8%, math +3.7%). Full attribution
+chain, each step measured:
+
+1. NOT drafter weights: dmlx's drafter (`~/models/Qwen3.8-27B-MTP-4bit`)
+   and omlx's (`...-4bit-mtp/model-mtp.safetensors`) are the same 31
+   tensors, byte-identical.
+2. NOT acceptance semantics: the harness sends temperature 0, so both
+   engines run greedy longest-prefix walks (ours: batched argmax compare
+   in engine_loop.zig; theirs: mlx-vlm `_speculative_walk`).
+3. NOT depth policy: fix3 == fix5 == adaptive == ~-4.4%. omlx pins
+   block_size=3 and only extends when the last-32-round full-depth hit
+   rate >= 65% (mlx-vlm `_effective_mtp_block_size`); observed tok/cycle
+   3.46-4.13 with depth reaching d4.
+4. REAL: round economics. dmlx adaptive won tok/round (~4.1 vs 3.46) but
+   paid 110-114 ms/round vs omlx's ~90 ms. verify GPU grew +6.5 ms per
+   verify token (L=4: 82 ms, L=8: 108 ms; DMLX_VERIFY_LAYER_SUBMIT=0 to
+   isolate GPU from host build), and the draft chain cost 3.3 ms/step.
+
+Commits, in order:
+
+- `1cca39c` verify_qmm sg8 CT default 1->2 (-2.3 ms/round at M=8, neutral
+  at M=4, bit-identical: CT only repacks output columns per threadgroup)
+  + bf16 argpartition in the coarse draft head (draft stream
+  bit-identical). Also added compare_engines `dmlx-think-fix3/fix5` arms
+  and `scripts/mine_mtp_logs.py` (per-prompt round-economics miner for
+  CMP_KEEP_PASS_LOGS server logs).
+- `74de036` group/swiglu sg8 auto-enabled at M>=6 (they lose at M=4-5,
+  win at M>=6; the controller parks deep on thinking content). verify
+  104.8 -> 102.6 ms at L=8.
+- `0ad07a0` **the big one**: fused GDN verify tail kernel (port of
+  omlx's `_norm_gate`, one simdgroup per (token,head) row, MLX rms_norm
+  reduction order, gated to L<=16) + bf16 gate storage while verify_qmm
+  is armed so out_proj routes to the fast verify qmm instead of the
+  stock f32 path (the 5e8ef27 conv-f32 promotion had silently excluded
+  it). tail 0.66 -> 0.25 ms/layer; **verify 102.6 -> 84.7 ms/round at
+  L=8 (-17.5%)**. Kill switches: DMLX_NO_VERIFY_TAIL_FUSION,
+  DMLX_VERIFY_TAIL_F32_GATE. Watch item: the bf16 gate shifts the draft
+  stream at ULP level; L=4 acceptance on one probe moved 58.3->50.7%
+  (target-verify still decides tokens; thinking-pair result improved
+  regardless).
+- `de911fb` `zig build run-bench-verify-sg8`: per-shape GB/s harness for
+  the production verify_qmm routing. Baseline: 160-200 GB/s at M=8 —
+  the SAME class as omlx's kernels (shared lineage), which is what
+  exonerated qmm bandwidth and pointed at the tail.
+
+Refuted today: CHAIN_PRENORM for the p6/p7 acceptance cliff (p1 0.79 ->
+0.49, rejected), lm_head sg8 routing (no A/B delta), GROUP/SWIGLU at
+M=4 (confirmed worse, hence the M-gate), DMLX_VERIFY_QMM_SG8_NSG=4.
+
+Remaining thinking-mode margin vs omlx is now POSITIVE; the known next
+kernel-level upside (not needed for the win, would extend it): verify
+qmm bandwidth 180 -> ~230 GB/s (mlx-lm's demonstrated 81% class; no
+reference design at these shapes — research, not port), draft-step body
+fusion (1.12 ms/step floor ~0.4). The prefill@2048 gap (~-4%, 16.2s vs
+15.6s) is untouched by today's work; its remaining known item is the
+out_proj f32 dtype policy (~270 ms) deferred earlier.
