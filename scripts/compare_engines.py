@@ -299,6 +299,29 @@ def engines() -> dict[str, Engine]:
             env={"DMLX_MTP_FIXED_N": "4"},
             note="FIXED depth 4, controller disabled",
         ),
+        # Thinking-regime fixed-depth probes (2026-11-05): the aligned
+        # thinking pair showed dmlx -4.4% with identical drafter weights, and
+        # omlx/mlx-vlm pins block_size=3 (extends only on >=65% full-depth
+        # hit rate). These arms replay the thinking pair at pinned depths to
+        # attribute the gap: depth policy vs per-round cost.
+        "dmlx-think-fix3": Engine(
+            name="dmlx-think-fix3",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "3",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "3"},
+            system=REASONING_DIRECTIVE,
+            note="FIXED depth 3 + reasoning directive (omlx block_size=3 analogue)",
+        ),
+        "dmlx-think-fix5": Engine(
+            name="dmlx-think-fix5",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "5",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_FIXED_N": "5"},
+            system=REASONING_DIRECTIVE,
+            note="FIXED depth 5 + reasoning directive (depth-policy probe)",
+        ),
         # Shallow fixed-depth reference. prose prefers shallow (adaptive 23.8 >
         # fix4 21.4 > fix7 18.9) but depths below 4 were never measured, so the
         # optimum there is unknown and could be under the controller's pick.

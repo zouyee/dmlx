@@ -377,7 +377,12 @@ const Sg8Geom = struct { nsg: i32, ct: i32 };
 /// (mlp_gate: 2176 -> 1088 at ct=2) and amortises the x_shared load and the
 /// simdgroup reduction over more output. It also raises register pressure,
 /// so it is a sweep, not a derivation.
-const sg8_ct_default: i32 = 1;
+// Measured 2026-11-05 on the thinking-regime operating point (M=8, fixed
+// depth 7): CT=2 cuts ~2.3 ms/round off verify (104.8 vs 107.1) and is
+// neutral at M=4 (82.7 vs 82.6). CT only packs more output columns per
+// threadgroup — each output keeps the same K reduction order, so results
+// are bit-identical to CT=1.
+const sg8_ct_default: i32 = 2;
 fn sg8Ct() i32 {
     const s = std.c.getenv("DMLX_VERIFY_QMM_SG8_CT") orelse return sg8_ct_default;
     const v = std.fmt.parseInt(i32, std.mem.span(s), 10) catch return sg8_ct_default;

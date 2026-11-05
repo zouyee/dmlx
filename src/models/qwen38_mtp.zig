@@ -658,13 +658,15 @@ pub const Qwen38Mtp = struct {
         if (vocab <= coarse_candidates) return error.VocabTooSmall;
         const approx = try ops.reshape(ctx, approx3, &[_]i32{ 1, vocab });
         defer approx.deinit();
-        const approx_f = try ops.astype(ctx, approx, .float32);
-        defer approx_f.deinit();
 
         // Top-K by argpartition: everything at or after kth is >= the kth
         // element, so the last K indices are the K largest (unordered, which
-        // is fine — the exact rescore below decides the order).
-        const part = try sort_mod.argpartitionAxis(ctx, approx_f, vocab - coarse_candidates, 1);
+        // is fine — the exact rescore below decides the order). Runs
+        // directly on the bf16 head output: bf16 ties only reshuffle the
+        // candidate SET boundary, and the exact rescore decides among the
+        // candidates, so skipping the f32 promotion is quality-neutral
+        // while removing a full-vocab 1 MB write+read per draft step.
+        const part = try sort_mod.argpartitionAxis(ctx, approx, vocab - coarse_candidates, 1);
         defer part.deinit();
         const ids2 = try ops.slice(ctx, part, &[_]i32{ 0, vocab - coarse_candidates }, &[_]i32{ 1, vocab }, &[_]i32{ 1, 1 });
         defer ids2.deinit();
