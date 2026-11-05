@@ -547,6 +547,174 @@ fn getSg8(allocator: std.mem.Allocator, ct: i32) !c.c.mlx_fast_metal_kernel {
 }
 
 // ---------------------------------------------------------------------------
+// mma (M = 4..8, experimental; DMLX_VERIFY_QMM_MMA=1)
+// ---------------------------------------------------------------------------
+//
+// Morphology adapted from upstream MLX's `affine_qmv_mma`
+// (mlx/backend/metal/kernels/quantized.h, MIT), built to test whether the
+// sg8 bandwidth level (~65% of the 273 GB/s peak at M=8) is a code-structure
+// artifact: per 128-wide K block each lane takes ONE uint4 (16 B) weight
+// load instead of four 4 B loads, the block body is fully unrolled so loads
+// hoist across the MMAs, and dequant is inline (half `1024 + q` trick + fma
+// of scale/bias into the fp32 A fragment), so there is no per-group xsum
+// shuffle epilogue. WK=4 simdgroups split K; a threadgroup reduction
+// combines the partial tiles.
+//
+// VERDICT (2026-11-06, bench-verify-sg8, numerics validated): 157-182 GB/s
+// vs sg8's 165-198 across the verify shape set — parity inside run-to-run
+// spread. Two morphologies with completely different load widths, epilogues,
+// and unroll structures converge on ~175 GB/s, so the verify-qmm ceiling is
+// the DRAM access pattern (weight streaming at M <= 8), not the kernel
+// code. Kept as an opt-in experiment; not routed by default.
+//
+// One deliberate deviation from upstream: the scale/bias index. MMA (g, i)
+// at frag position k' covers BUFFER k = k + 16*k' + 4*g + i (both operands —
+// the frag layout strides buffer k by 16 per frag column), so an element's
+// group is k/GS + (16*(fn_+e))/GS with e the element index: one pair of
+// scale/bias values per lane per ELEMENT, hoisted out of the (g, i) body
+// because the offset term 16*(fn_+e)/GS = (fn_+e)/(GS/16) is invariant
+// across (g, i) (4*g+i < 16 never carries). Upstream indexes k/GS once per
+// block, which is only exact at GS = 128. Validated by the bench's
+// stock-vs-routed rel diff at GS = 64.
+//
+// fp32 accumulation, K order differs from both stock and sg8 — same
+// bf16-ULP deviation class as the other routed kernels.
+fn buildMmaSource(allocator: std.mem.Allocator, bn: i32) ![]u8 {
+    var s = std.ArrayList(u8).empty;
+    errdefer s.deinit(allocator);
+    const w = Emit{ .a = allocator, .buf = &s };
+    const tn: i32 = @divExact(bn, 8);
+
+    try w.raw(
+        \\    const uint sgid = simdgroup_index_in_threadgroup;
+        \\    const uint lane = thread_index_in_simdgroup;
+        \\    // Apple 8x8 simdgroup_matrix thread-element mapping.
+        \\    const uint qid = lane >> 2;
+        \\    const uint fm = (qid & 4) | ((lane >> 1) & 3);
+        \\    const uint fn_ = ((qid & 2) << 1) | ((lane & 1) << 1);
+        \\    constexpr int WK = 4;
+        \\    constexpr int BK = 128;
+        \\    constexpr long ROW_BYTES = long(K) / 2;
+        \\    constexpr int GROUPS = K / GS;
+        \\    const long y_col = long(threadgroup_position_in_grid.y) * BN;
+        \\    const bool r0 = int(fn_) < M;
+        \\    const bool r1 = int(fn_) + 1 < M;
+        \\    // Lane's weight nibbles for a block start at 8*fn_ bytes
+        \\    // (32 codes); its x rows are fn_/fn_+1 at k offset 16*fm.
+        \\    const device uchar* wl = (const device uchar*)w_q
+        \\        + (y_col + long(fm)) * ROW_BYTES + 8 * fn_;
+        \\    const device T* x0 = x + min(int(fn_), M - 1) * K + 16 * fm;
+        \\    const device T* x1 = x + min(int(fn_) + 1, M - 1) * K + 16 * fm;
+        \\
+    );
+    var t: i32 = 0;
+    while (t < tn) : (t += 1)
+        try w.fmt("    simdgroup_matrix<float, 8, 8> acc{d} = simdgroup_matrix<float, 8, 8>(0.0f);\n", .{t});
+    try w.raw(
+        \\    for (int k = int(sgid) * BK; k < K; k += WK * BK) {
+        \\        const vec<T, 8> xa0 = *((const device vec<T, 8>*)(x0 + k));
+        \\        const vec<T, 8> xb0 = *((const device vec<T, 8>*)(x0 + k + 8));
+        \\        const vec<T, 8> xa1 = *((const device vec<T, 8>*)(x1 + k));
+        \\        const vec<T, 8> xb1 = *((const device vec<T, 8>*)(x1 + k + 8));
+        \\
+    );
+    t = 0;
+    while (t < tn) : (t += 1) {
+        try w.fmt("        const uint4 wq{d} = *((const device uint4*)(wl + {d} * ROW_BYTES + k / 2));\n", .{ t, t * 8 });
+        // Per-element scale/bias: element e covers buffer k offset
+        // 16*(fn_+e), so its group is k/GS + (fn_+e)/(GS/16) (see the
+        // morphology comment). The selector is (g, i)-invariant.
+        try w.fmt("        const float sc{d}_0 = float(scales[(y_col + long(fm) + {d}) * GROUPS + k / GS + int(fn_) / (GS / 16)]);\n", .{ t, t * 8 });
+        try w.fmt("        const float bs{d}_0 = float(biases[(y_col + long(fm) + {d}) * GROUPS + k / GS + int(fn_) / (GS / 16)]);\n", .{ t, t * 8 });
+        try w.fmt("        const float sc{d}_1 = float(scales[(y_col + long(fm) + {d}) * GROUPS + k / GS + (int(fn_) + 1) / (GS / 16)]);\n", .{ t, t * 8 });
+        try w.fmt("        const float bs{d}_1 = float(biases[(y_col + long(fm) + {d}) * GROUPS + k / GS + (int(fn_) + 1) / (GS / 16)]);\n", .{ t, t * 8 });
+    }
+    var g: i32 = 0;
+    while (g < 4) : (g += 1) {
+        t = 0;
+        while (t < tn) : (t += 1) {
+            var i: i32 = 0;
+            while (i < 4) : (i += 1) {
+                const f = g * 4 + i;
+                const lo = g >> 1;
+                const hi = 2 + (g >> 1);
+                const xa = if (f < 8) "xa" else "xb";
+                try w.raw("        {\n            const uint qv = ");
+                if (@mod(g, 2) == 0) {
+                    try w.fmt("(wq{d}[{d}] & 0xFFFFu) | (wq{d}[{d}] << 16)", .{ t, lo, t, hi });
+                } else {
+                    try w.fmt("(wq{d}[{d}] >> 16) | (wq{d}[{d}] & 0xFFFF0000u)", .{ t, lo, t, hi });
+                }
+                try w.fmt(
+                    \\;
+                    \\            const uint pr = ((qv >> {d}) & 0x000F000Fu) | 0x64006400u;
+                    \\            const half2 hv = as_type<half2>(pr) - half2(1024.0h);
+                    \\            simdgroup_matrix<float, 8, 8> ma, mb;
+                    \\            ma.thread_elements()[0] = fma(float(hv.x), sc{d}_0, bs{d}_0);
+                    \\            ma.thread_elements()[1] = fma(float(hv.y), sc{d}_1, bs{d}_1);
+                    \\            mb.thread_elements()[0] = float({s}0[{d}]);
+                    \\            mb.thread_elements()[1] = float({s}1[{d}]);
+                    \\            simdgroup_multiply_accumulate(acc{d}, ma, mb, acc{d});
+                    \\        }}
+                    \\
+                , .{ 4 * i, t, t, t, t, xa, @mod(f, 8), xa, @mod(f, 8), t, t });
+            }
+        }
+    }
+    try w.raw("    }\n");
+    try w.fmt("    threadgroup float2 part[(WK - 1) * {d} * 32];\n", .{tn});
+    try w.raw("    if (sgid > 0) {\n");
+    t = 0;
+    while (t < tn) : (t += 1)
+        try w.fmt("        part[((int(sgid) - 1) * {d} + {d}) * 32 + int(lane)] = float2(acc{d}.thread_elements()[0], acc{d}.thread_elements()[1]);\n", .{ tn, t, t, t });
+    try w.raw(
+        \\    }
+        \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (sgid == 0) {
+        \\
+    );
+    t = 0;
+    while (t < tn) : (t += 1) {
+        try w.fmt(
+            \\        {{
+            \\            float2 tot = float2(acc{d}.thread_elements()[0], acc{d}.thread_elements()[1]);
+            \\            for (int wk = 0; wk < WK - 1; ++wk) {{ tot += part[(wk * {d} + {d}) * 32 + int(lane)]; }}
+            \\            const long n = y_col + {d} + long(fm);
+            \\            if (r0) {{ y[long(fn_) * N + n] = T(tot.x); }}
+            \\            if (r1) {{ y[(long(fn_) + 1) * N + n] = T(tot.y); }}
+            \\        }}
+            \\
+        , .{ t, t, tn, t, t * 8 });
+    }
+    try w.raw("    }\n");
+    return s.toOwnedSlice(allocator);
+}
+
+var mma_kernels = [_]?c.c.mlx_fast_metal_kernel{null} ** 3;
+
+fn getMma(allocator: std.mem.Allocator, bn: i32) !c.c.mlx_fast_metal_kernel {
+    const idx: usize = @intCast(@divExact(bn, 16));
+    if (mma_kernels[idx]) |k| return k;
+    const body = try buildMmaSource(allocator, bn);
+    defer allocator.free(body);
+    var nbuf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nbuf, "dmlx_vk_mma_q4_bn{d}", .{bn});
+    const k = try newKernel(allocator, name, body);
+    mma_kernels[idx] = k;
+    return k;
+}
+
+var mma_enabled: ?bool = null;
+
+/// Experimental mma morphology: off unless DMLX_VERIFY_QMM_MMA=1.
+fn mmaEnabled() bool {
+    if (mma_enabled) |v| return v;
+    const v = envTrue("DMLX_VERIFY_QMM_MMA");
+    mma_enabled = v;
+    return v;
+}
+
+// ---------------------------------------------------------------------------
 // sg8 group (one launch for every same-input projection tuple) + swiglu
 // ---------------------------------------------------------------------------
 //
@@ -1110,11 +1278,11 @@ pub fn maybeSwiglu(ctx: EagerContext, x: Array, gate: quantize_mod.QuantizedWeig
 // Dispatch
 // ---------------------------------------------------------------------------
 
-const Kind = enum { splitk, sg8 };
+const Kind = enum { splitk, sg8, mma };
 
 /// A morphology whose kernel failed to COMPILE is never retried — but per
 /// morphology: an sg8 build failure says nothing about split-K.
-var compile_broken: [2]bool = .{ false, false };
+var compile_broken: [3]bool = .{ false, false, false };
 
 /// Shapes whose DISPATCH failed, so they fall back to stock without taking
 /// anything else down with them.
@@ -1144,7 +1312,7 @@ fn markShapeFailed(kind: Kind, k: i32, n: i32) void {
         failed_count += 1;
     } else {
         // Table full: something is systematically wrong, so stop trying.
-        compile_broken = .{ true, true };
+        compile_broken = .{ true, true, true };
     }
 }
 
@@ -1165,6 +1333,7 @@ const TallyRow = struct {
     n: i32 = 0,
     sg8: u32 = 0,
     splitk: u32 = 0,
+    mma: u32 = 0,
     stock: u32 = 0,
 };
 var tally: [48]TallyRow = @splat(.{});
@@ -1190,6 +1359,7 @@ fn tallyRecord(m: i32, k: i32, n: i32, kind: ?Kind) void {
         }) {
             .sg8 => row.sg8 += 1,
             .splitk => row.splitk += 1,
+            .mma => row.mma += 1,
         }
         return;
     }
@@ -1205,11 +1375,11 @@ pub fn tallyReport() void {
     }
     if (!any) return;
     std.debug.print("\n=== verify_qmm routing tally (M, K, N -> calls) ===\n", .{});
-    std.debug.print("  {s: >3} {s: >6} {s: >8} {s: >7} {s: >8} {s: >7}\n", .{ "M", "K", "N", "sg8", "split-K", "stock" });
+    std.debug.print("  {s: >3} {s: >6} {s: >8} {s: >7} {s: >8} {s: >7} {s: >7}\n", .{ "M", "K", "N", "sg8", "split-K", "mma", "stock" });
     for (&tally) |*row| {
         if (row.n == 0) continue;
-        std.debug.print("  {d: >3} {d: >6} {d: >8} {d: >7} {d: >8} {d: >7}{s}\n", .{
-            row.m,                                                 row.k, row.n, row.sg8, row.splitk, row.stock,
+        std.debug.print("  {d: >3} {d: >6} {d: >8} {d: >7} {d: >8} {d: >7} {d: >7}{s}\n", .{
+            row.m,                                                 row.k, row.n, row.sg8, row.splitk, row.mma, row.stock,
             if (row.stock > 0 and row.m >= 4) "  <- MISS" else "",
         });
         row.* = .{};
@@ -1246,6 +1416,10 @@ fn pick(m: i32, k: i32, n: i32, gs: i32, bits: u8) ?Kind {
     // `DMLX_VERIFY_QMM_SG8_MIN_M` overrides the non-lm_head threshold (6);
     // setting it to 4 restores the old sg8-always-wins routing for A/B.
     const sg8_min_m: i32 = if (n >= lm_head_n_floor) 4 else sg8MinM();
+    // Experimental mma morphology (DMLX_VERIFY_QMM_MMA=1) takes every shape
+    // sg8 could serve, for bench A/B. BN needs N % 16 == 0 (BN=32 preferred,
+    // 16 as fallback — picked at launch); the K loop needs whole 128-blocks.
+    if (mmaEnabled() and m >= 4 and m <= 8 and @mod(k, 128) == 0 and @mod(n, 16) == 0) return .mma;
     if (m >= sg8_min_m and m <= 8) {
         const g = sg8Geometry(k, n);
         if (@mod(k, gs * g.nsg) == 0 and @mod(n, 8 * g.ct) == 0) return .sg8;
@@ -1267,7 +1441,7 @@ fn pick(m: i32, k: i32, n: i32, gs: i32, bits: u8) ?Kind {
 /// `x` must be [M, K] or [1, M, K] row-contiguous bf16; the output matches
 /// the input rank.
 pub fn maybeQmm(ctx: EagerContext, x: Array, qw: quantize_mod.QuantizedWeight) !?Array {
-    if (!armed or (compile_broken[0] and compile_broken[1])) return null;
+    if (!armed or (compile_broken[0] and compile_broken[1] and compile_broken[2])) return null;
     // Metal kernels only run on the GPU. On the default CPU stream (unit
     // tests) stay on stock without attempting — a failed apply logs an MLX
     // error, which the Zig test runner counts as a test failure. NOTE:
@@ -1328,6 +1502,15 @@ pub fn maybeQmm(ctx: EagerContext, x: Array, qw: quantize_mod.QuantizedWeight) !
                 return null;
             };
         },
+        .mma => blk: {
+            const bn: i32 = if (@mod(n, 32) == 0) 32 else 16;
+            try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, 128, @divExact(n, bn), 1));
+            try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+            break :blk getMma(allocator, bn) catch {
+                compile_broken[@intFromEnum(Kind.mma)] = true;
+                return null;
+            };
+        },
     };
 
     try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ m, n }, 2, c.c.MLX_BFLOAT16));
@@ -1344,6 +1527,10 @@ pub fn maybeQmm(ctx: EagerContext, x: Array, qw: quantize_mod.QuantizedWeight) !
         },
         .splitk => {
             try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K_PARTS", splitk_k_parts));
+        },
+        .mma => {
+            const bn: i32 = if (@mod(n, 32) == 0) 32 else 16;
+            try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BN", bn));
         },
     }
 
@@ -1395,6 +1582,17 @@ test "verify_qmm: source generation is unrolled and array-free" {
         try std.testing.expect(std.mem.indexOf(u8, src, "out[") == null);
         try std.testing.expect(std.mem.indexOf(u8, src, "0x43004300u") != null);
     }
+    // mma: same codegen discipline (named fragments only), uint4 weight
+    // loads, the half 1024+q dequant, and the lane-exact scale index.
+    for ([_]i32{ 16, 32 }) |bn| {
+        const src = try buildMmaSource(allocator, bn);
+        defer allocator.free(src);
+        try std.testing.expect(std.mem.indexOf(u8, src, "acc[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "wq[") == null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "uint4 wq") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "0x64006400u") != null);
+        try std.testing.expect(std.mem.indexOf(u8, src, "int(fn_) / (GS / 16)") != null);
+    }
 }
 
 test "verify_qmm: group and swiglu source generation" {
@@ -1437,6 +1635,7 @@ test "verify_qmm: dispatch picks the right morphology and respects gates" {
     route_lm_head = false;
     sg8_min_m_cached = sg8_min_m_default;
     min_route_n_cached = min_route_n_default;
+    mma_enabled = false;
     // Morphology is shape-dependent (see `pick`): on ordinary projections
     // split-K wins all the way to M=5 and sg8 only takes over at M>=6.
     // Asserting sg8 from M=4 here is what let the mis-routing ship — it cost
@@ -1478,4 +1677,12 @@ test "verify_qmm: dispatch picks the right morphology and respects gates" {
     try std.testing.expect(pick(4, 5120, 10240, 64, 8) == null);
     try std.testing.expect(pick(1, 5120, 10240, 64, 4) == null);
     try std.testing.expect(pick(9, 5120, 10240, 64, 4) == null);
+    // The mma morphology is opt-in: it takes sg8-eligible shapes only when
+    // DMLX_VERIFY_QMM_MMA=1, and keeps its own K/N geometry gates.
+    mma_enabled = true;
+    try std.testing.expectEqual(Kind.mma, pick(6, 5120, 10240, 64, 4).?);
+    try std.testing.expectEqual(Kind.mma, pick(4, 5120, 10240, 64, 4).?);
+    try std.testing.expectEqual(Kind.splitk, pick(3, 5120, 10240, 64, 4).?); // M < 4
+    try std.testing.expect(pick(6, 5128, 10240, 64, 4) == null); // K % 128 != 0
+    mma_enabled = false;
 }
