@@ -1425,3 +1425,19 @@ upstream's `k/GS` is only right at GS=128. Gate: `DMLX_VERIFY_QMM_MMA=1`
 (opt-in, M 4..8, K%128==0, N%16==0, BN=32 preferred/16 fallback).
 Codegen keeps the no-thread-local-arrays discipline; unit tests assert
 the source properties and the pick() gates.
+
+**C VERDICT (commit `6c76797`)**: mma morphology implemented and
+numerically validated (one-hot probes + bench rel diff 1e-5..4e-3;
+two bugs found en route — upstream's per-block scale index is only
+exact at GS=128, fixed per-element via `(fn_+e)/(GS/16)`; and a
+Zig `@divExact(3,2)`-is-UB-in-ReleaseFast emission bug that scrambled
+the g=3 weight words). **Bandwidth: 157-182 GB/s vs sg8's 165-198 —
+parity.** Two morphologies with completely different load widths
+(4x4B vs 1x16B per lane-block), epilogues (xsum shuffle vs inline
+dequant), and unroll structure converge on ~175 GB/s, so the verify-qmm
+ceiling is the DRAM access pattern of weight streaming at M<=8, NOT
+kernel code. The mlx-lm 81% number must come from different
+shapes/conditions. Kept opt-in (`DMLX_VERIFY_QMM_MMA=1`), not routed by
+default. Remaining decode-side upside is elsewhere: draft-step fusion
+(1.12 ms/step vs ~0.4 floor), and the ~0.9 s prefill@2048 residual
+needs a fresh span profile.
