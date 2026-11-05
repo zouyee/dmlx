@@ -850,7 +850,6 @@ fn buildSg8SwigluSource(allocator: std.mem.Allocator, ct: i32) ![]u8 {
 
 var sg8_swiglu_kernels = [_]?c.c.mlx_fast_metal_kernel{null} ** 5;
 var swiglu_broken: bool = false;
-var swiglu_disabled: ?bool = null;
 
 fn getSg8Swiglu(allocator: std.mem.Allocator, ct: i32) !c.c.mlx_fast_metal_kernel {
     if (sg8_swiglu_kernels[@intCast(ct)]) |k| return k;
@@ -872,7 +871,6 @@ const GroupCacheEntry = struct {
 };
 var group_kernels: [8]?GroupCacheEntry = [_]?GroupCacheEntry{null} ** 8;
 var group_broken: bool = false;
-var group_disabled: ?bool = null;
 
 fn getSg8Group(allocator: std.mem.Allocator, ns: []const i32) !c.c.mlx_fast_metal_kernel {
     for (&group_kernels) |*e| {
@@ -971,15 +969,15 @@ pub const GroupOut = struct {
 /// Returns null when anything is ineligible — the caller falls back to the
 /// per-projection path. Kill switch: DMLX_VERIFY_NO_GROUP_SG8=1.
 pub fn maybeGroupQmm(ctx: EagerContext, x: Array, qws: []const quantize_mod.QuantizedWeight) !?GroupOut {
-    // OPT-IN (DMLX_VERIFY_GROUP_SG8=1). Measured 2026-11-02 (plan doc,
-    // close-decode-gap fusion program): WORSE at the controller's parking
-    // depth (M=4: 95.4 vs 94.1 ms/round median) because sg8 loses to our
-    // split-K per-kernel at M=4-5; better at M=6 (114.0 vs 117.6) but the
-    // deeper chain still loses on ms/token (32.8 vs 31.6 at depth 3). Kept
-    // for a future operating point at M >= 6.
-    if (group_disabled == null) group_disabled = !envTrue("DMLX_VERIFY_GROUP_SG8");
-    if (group_disabled.?) return null;
+    // Auto-gated by M: sg8 loses to our split-K per-kernel at M=4-5 (measured
+    // 2026-11-02: 95.4 vs 94.1 ms/round at M=4) but wins at M>=6 (114.0 vs
+    // 117.6 at M=6), and the depth controller parks at M=7-8 on thinking
+    // content. Default ON at M>=6, OFF below. DMLX_VERIFY_GROUP_SG8=1 forces
+    // it on at all M (A/B), DMLX_VERIFY_NO_GROUP_SG8=1 forces it off.
+    if (envTrue("DMLX_VERIFY_NO_GROUP_SG8")) return null;
+    const force_on = envTrue("DMLX_VERIFY_GROUP_SG8");
     const xe = groupEligibleX(ctx, x) orelse return null;
+    if (xe.m < 6 and !force_on) return null;
     if (group_broken) return null;
     const gs = groupEligibleWs(qws, xe.k) orelse return null;
 
@@ -1048,12 +1046,13 @@ pub fn maybeGroupQmm(ctx: EagerContext, x: Array, qws: []const quantize_mod.Quan
 /// ineligible; the caller runs the separate projections + elementwise ops.
 /// Kill switch: DMLX_VERIFY_NO_SWIGLU_SG8=1.
 pub fn maybeSwiglu(ctx: EagerContext, x: Array, gate: quantize_mod.QuantizedWeight, up: quantize_mod.QuantizedWeight) !?Array {
-    // OPT-IN (DMLX_VERIFY_SWIGLU_SG8=1) — same measurement as the group
-    // kernel above: worse at M=4 (96.2 vs 94.1 ms/round), kept for M >= 6
-    // operating points.
-    if (swiglu_disabled == null) swiglu_disabled = !envTrue("DMLX_VERIFY_SWIGLU_SG8");
-    if (swiglu_disabled.?) return null;
+    // Same M-gating as maybeGroupQmm: worse at M=4 (96.2 vs 94.1 ms/round),
+    // wins at M>=6. Default ON at M>=6; DMLX_VERIFY_SWIGLU_SG8=1 forces on,
+    // DMLX_VERIFY_NO_SWIGLU_SG8=1 forces off.
+    if (envTrue("DMLX_VERIFY_NO_SWIGLU_SG8")) return null;
+    const force_on = envTrue("DMLX_VERIFY_SWIGLU_SG8");
     const xe = groupEligibleX(ctx, x) orelse return null;
+    if (xe.m < 6 and !force_on) return null;
     if (swiglu_broken) return null;
     const pair = [_]quantize_mod.QuantizedWeight{ gate, up };
     const gs = groupEligibleWs(&pair, xe.k) orelse return null;
