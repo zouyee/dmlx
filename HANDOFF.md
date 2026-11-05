@@ -1391,3 +1391,37 @@ reference design at these shapes — research, not port), draft-step body
 fusion (1.12 ms/step floor ~0.4). The prefill@2048 gap (~-4%, 16.2s vs
 15.6s) is untouched by today's work; its remaining known item is the
 out_proj f32 dtype policy (~270 ms) deferred earlier.
+
+## 2026-11-06 — prefill out_proj bf16 gate (task A) + verify_qmm mma morphology (task C)
+
+**A (commit `9599ced`)**: the last dtype-policy gap on the prefill side —
+the GDN prefill/conv path handed an f32 gate to out_proj, which the dtype
+policy kept off the fast quantized qmm route. All stored state stays f32;
+only the gate handed to out_proj is bf16-rounded (and only when
+`o_scales != null`; new `outGateDt()` decides; decode wide path stores
+bf16 in-kernel; verify keeps `0ad07a0` behavior). `prefillTailFused`
+untouched (serving never hits it; follow-up).
+Measured: GDN prefill tail 1116→980 ms (−130 ms); ab_prefill span
+−0.1..−0.26 s (inside ±0.3 s noise); decode throughput unchanged; L=8
+acceptance 88/274 vs 87/275 (unchanged).
+End-to-end prefill@2048 after A, two interleaved runs
+(`artifacts/prefill_check_a1/a2_20261106.json`): dmlx 16.88/16.63 s vs
+omlx 15.81/15.72 s → **−0.9..−1.1 s remains (−5.4..−6.3%)**, worse than
+the 2026-11-05 baseline (−0.53 s) but BOTH engines drifted +0.1..+0.7 s
+slower today, so A is neutral-to-small-positive and the residual gap is
+NOT the out_proj dtype. Decode headline meanwhile: dmlx 46.1 vs omlx
+36.7 (+25.6%). **Open: the remaining ~0.9 s prefill gap needs a fresh
+span profile — the earlier ~1.0 s "unattributed" term is still the
+whole story.**
+
+**C (in progress)**: verify_qmm third morphology `mma`, adapted from
+upstream MLX `affine_qmv_mma` (MIT): one uint4 (16 B) weight load per
+lane per 128-wide K block (sg8 does four 4 B loads), fully unrolled
+block body, inline dequant (half `1024+q` + fma scale/bias into the
+fp32 A fragment — no xsum shuffle epilogue), WK=4 simdgroups splitting
+K with a threadgroup reduction. Deliberate deviation: scale index is
+`(k + 16*fn_)/GS` (the group of the nibbles the lane actually loaded);
+upstream's `k/GS` is only right at GS=128. Gate: `DMLX_VERIFY_QMM_MMA=1`
+(opt-in, M 4..8, K%128==0, N%16==0, BN=32 preferred/16 fallback).
+Codegen keeps the no-thread-local-arrays discipline; unit tests assert
+the source properties and the pick() gates.
