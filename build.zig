@@ -751,6 +751,21 @@ pub fn build(b: *std.Build) void {
     const run_bench_verify_sg8_step = b.step("run-bench-verify-sg8", "Production verify_qmm per-shape GB/s at M=4..8");
     run_bench_verify_sg8_step.dependOn(&run_bench_verify_sg8.step);
 
+    // Coarse draft head per-stage bench (same mlx-c as the server).
+    const bench_coarse_head = b.addExecutable(.{
+        .name = "bench-coarse-head",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_coarse_head.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_coarse_head.root_module.addImport("mlx", mlx_z_module);
+    const run_bench_coarse_head = b.addRunArtifact(bench_coarse_head);
+    const run_bench_coarse_head_step = b.step("run-bench-coarse-head", "MTP coarse draft head per-stage ms");
+    run_bench_coarse_head_step.dependOn(&run_bench_coarse_head.step);
+
     // The weight-buffer-layout question is answered in
     // scripts/weight_residency_bench.py: the per-tensor copy is NOT the
     // plain-decode gap (copied 156.1 GB/s vs mmap 135.3 on real checkpoint
