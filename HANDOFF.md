@@ -1523,3 +1523,16 @@ prefix-cache store 缺 vtable_serial 门控 —— lookup 永不命中导致每
 请求都 store（48 层 GDN 状态 ~160MB/请求，6-14s/请求！），且
 pc_prompt 非引擎持有 → HTTP 释放后 dupe 触发 @memcpy 别名 panic
 （~第 6 个长请求必崩）。修复后 plain 长 prompt 23-31s → 16.6-17.6s。
+
+## 思考对 math 红格修复（2372805 + 复测 artifacts/think_latch_20261106.json）
+
+深度彩票根因：梯子探针在 incumbent+2=5 打出 5/5 满接受，但
+"近满接受重探索"门栓要求 n≥max_n-1=6 —— 探针永远够不到。慢局卡
+N=3 到请求结束，快局与慢局差 38%。修复：门栓 floor 下探到
+max_n-2（DMLX_MTP_REEXPLORE_FLOOR 可调）。
+
+复测（思考对 reps=5，前值→现值）：
+- math decode 38.5→**46.6** vs omlx 42.3：**-7.0% → +10.2%** ✅
+- code 47.1 vs 37.7：**+24.9%**；prose +3.7%
+- headline 38.0→**40.5** vs 35.6：+6.4% → **+13.8%**
+- 思考对实现全领域无红格。
