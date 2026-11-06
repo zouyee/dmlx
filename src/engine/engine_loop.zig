@@ -478,8 +478,13 @@ pub const EngineLoop = struct {
             }
         }
 
-        // After generation: store caches if this was a miss.
-        if (!prefix_hit and self.prefix_cache != null) {
+        // After generation: store caches if this was a miss. vtable_serial
+        // models are excluded like they are at lookup above: their state
+        // cannot be restored from a KV snapshot, and there pc_prompt is NOT
+        // engine-owned (req.prompt_tokens, freed by the HTTP handler when
+        // generation signals completion) — storing it was a use-after-free
+        // that panicked as "@memcpy arguments alias" in store's dupe.
+        if (!prefix_hit and !self.vtable_serial and self.prefix_cache != null) {
             const pc = &self.prefix_cache.?;
             if (!pc.isCached(pc_prompt)) {
                 if (pc.store(pc_prompt, caches)) {
