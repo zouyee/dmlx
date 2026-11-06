@@ -2141,6 +2141,10 @@ pub const EngineLoop = struct {
             // 1. Draft chain.
             var drafts = std.ArrayList(u32).empty;
             defer drafts.deinit(allocator);
+            // DMLX_MTP_AVTRACE: per-step (l_max, margin) features, aligned
+            // with `drafts` when the coarse head produced them.
+            var draft_feats = std.ArrayList([2]f32).empty;
+            defer draft_feats.deinit(allocator);
             var draft_logits = std.ArrayList(Array).empty;
             defer {
                 for (draft_logits.items) |l| l.deinit();
@@ -2160,6 +2164,11 @@ pub const EngineLoop = struct {
                     for (gpu_toks.items) |t2| t2.deinit();
                     gpu_toks.deinit(allocator);
                 }
+                var gpu_feats = std.ArrayList(Array).empty;
+                defer {
+                    for (gpu_feats.items) |f2| f2.deinit();
+                    gpu_feats.deinit(allocator);
+                }
                 const tok0 = array_mod.Array.fromData(allocator, i32, &[_]i32{@intCast(tok)}, &[_]i32{1}) catch {
                     draft_failed = true;
                     break :blk;
@@ -2175,6 +2184,11 @@ pub const EngineLoop = struct {
                     if (steps > 0) h_cur.deinit(); // previous chained hidden
                     steps += 1;
                     h_cur = g.hidden;
+                    if (g.feat) |f| {
+                        gpu_feats.append(allocator, f) catch {
+                            f.deinit();
+                        };
+                    }
                     gpu_toks.append(allocator, g.tok_gpu) catch {
                         g.tok_gpu.deinit();
                         draft_failed = true;
@@ -2201,6 +2215,19 @@ pub const EngineLoop = struct {
                         draft_failed = true;
                         break :blk;
                     };
+                    if (gpu_feats.items.len == gpu_toks.items.len) {
+                        if (shape_mod.concatenateAxis(self.ctx, gpu_feats.items, 0)) |fall| {
+                            defer fall.deinit();
+                            if (fall.eval()) |_| {
+                                if (fall.dataSlice(f32)) |fv| {
+                                    var fi: usize = 0;
+                                    while (fi + 1 < fv.len) : (fi += 2) {
+                                        draft_feats.append(allocator, .{ fv[fi], fv[fi + 1] }) catch break;
+                                    }
+                                } else |_| {}
+                            } else |_| {}
+                        } else |_| {}
+                    }
                 }
             } else for (0..n_round) |_| {
                 const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
@@ -2372,6 +2399,29 @@ pub const EngineLoop = struct {
                     if (generation_mod.isStopToken(drafts.items[i], gen_config.stop_tokens)) {
                         stop_in_drafts = true;
                         break;
+                    }
+                }
+            }
+            // Acceptance labels for the AVTRACE features: positions before
+            // the first rejection are 1, the rejecting position is 0, and
+            // anything past it is unlabeled (same rule as vLLM AV fitting).
+            if (std.c.getenv("DMLX_MTP_AVTRACE")) |trace_path_z| {
+                if (draft_feats.items.len == drafts.items.len and drafts.items.len > 0) {
+                    const labeled: usize = if (rejected) @min(k + 1, drafts.items.len) else k;
+                    if (labeled > 0) {
+                        var buf: [160]u8 = undefined;
+                        const path = std.mem.span(trace_path_z);
+                        if (std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false })) |f| {
+                            defer f.close(self.io);
+                            const size = if (f.stat(self.io)) |st| st.size else |_| 0;
+                            var off: u64 = size;
+                            for (0..labeled) |i| {
+                                const y: u8 = if (i < k) 1 else 0;
+                                const line = std.fmt.bufPrint(&buf, "{{\"pos\":{d},\"lmax\":{d:.4},\"margin\":{d:.4},\"y\":{d}}}\n", .{ i, draft_feats.items[i][0], draft_feats.items[i][1], y }) catch continue;
+                                f.writePositionalAll(self.io, line, off) catch break;
+                                off += line.len;
+                            }
+                        } else |_| {}
                     }
                 }
             }

@@ -786,7 +786,7 @@ pub const Qwen38VTableAdapter = struct {
         const out = try m.forwardGreedyGpu(self.allocator, hidden, tok_gpu, self.model.embed_table_bf16.?, self.mtpLmHead());
         errdefer out.tok_gpu.deinit();
         errdefer out.hidden_out.deinit();
-        return .{ .tok_gpu = out.tok_gpu, .hidden = out.hidden_out };
+        return .{ .tok_gpu = out.tok_gpu, .hidden = out.hidden_out, .feat = out.feat };
     }
 
     fn mtpVerify(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpVerifyHandle {

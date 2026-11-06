@@ -84,6 +84,10 @@ pub const MtpStepOut = struct {
 pub const MtpGreedyDraftOut = struct {
     tok_gpu: Array,
     hidden: Array,
+    /// DMLX_MTP_AVTRACE only: [2] f32 (l_max, top1-top2 margin) from the
+    /// drafter head's exact rescore, kept on GPU for the batch readback.
+    /// Null on every non-traced step.
+    feat: ?Array = null,
 };
 
 /// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).

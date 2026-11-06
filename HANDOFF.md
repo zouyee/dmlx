@@ -1572,3 +1572,30 @@ speculative sampling(min(1,p/q) 接受 +(p-q)+ 重采样),dmlx 早已实现
 价值是 bitwise 确定性(fold-group attention 程序、row-invariant GEMM)
 而非速度。移植到 Metal 是自研 kernel 大工程,无吞吐收益;若将来做
 "确定性模式"差异化特性可再议。
+
+## AV 接受率估计器评估(2026-11-06 深夜)——早退证伪,Phase 2 不做
+
+缘起:vLLM 2026-10 PR #52228(Adaptive Verification 在线估计器,
+logistic 回归 σ(ω·logit(q_max)+β_i),IRLS 在线拟合,免训练)。
+评估是否移植到 dmlx 的 MTP 草稿链。
+
+**Phase 1(DMLX_MTP_AVTRACE,本 commit)**:greedy GPU 链逐步从
+coarse head 精确 rescore 提取 (l_max, top1-top2 margin) 特征,verify
+后按 vLLM 规则打标签(首个拒绝位之前=1,拒绝位=0),写 JSONL。
+4 prompt × 5 reps × 128 tok 采集 2178 条标注。
+
+离线拟合(标准化特征,共享斜率+每位置截距,IRLS):
+- **判别力优秀**:pooled AUC 0.918(vLLM 报 0.834),logloss 0.269,
+  margin 特征权重最大(3.73 vs lmax 0.70,标准化后)
+- **但早退模拟全线亏损**:τ=0.1..0.7 扫参,最好 +0.1%,普遍 -1~-11%。
+  原因:我们 greedy+MTP 头的每位置接受率 0.76-0.96,survival 很难塌到
+  阈值以下;draft 步成本(2-10ms)相对 verify(82-148ms)和被放弃的
+  已接受 token(每个 ~25ms)太小,省一步不抵丢一个 token。
+- vLLM 自己也有同样 caveat:"a smaller fixed length often outperforms
+  AV"。他们的收益场景是 batch=64 compute-bound 裁 verify 宽度,与我们
+  单请求带宽受限场景无关。
+
+**结论**:早退(Phase 2)不做,EV 不成立。估计器唯一残余价值是给深度
+控制器的 E[t] 模型供预测 p̂(解决跨深度证据陈旧问题),但需对未观测
+深度外推,预期收益小,缓议。AVTRACE 作为诊断工具保留(默认关闭,
+开销可忽略:64 元素 sort/步)。

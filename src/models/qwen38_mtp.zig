@@ -1017,7 +1017,12 @@ pub const Qwen38Mtp = struct {
 
     /// Draft token from the coarse head + exact top-k rescore, as a GPU [1]
     /// i32 array (chainable, like the full-head path).
-    fn coarseDraftToken(self: *Qwen38Mtp, body: Array, lm_head: MtpLinear, coarse: *const MtpLinear) !Array {
+    const CoarseDraftOut = struct {
+        tok: Array,
+        feat: ?Array = null,
+    };
+
+    fn coarseDraftToken(self: *Qwen38Mtp, body: Array, lm_head: MtpLinear, coarse: *const MtpLinear) !CoarseDraftOut {
         const ctx = self.ctx;
         const hidden: i32 = @intCast(self.dims.hidden_size);
         const h3 = try ops.reshape(ctx, body, &[_]i32{ 1, 1, hidden });
@@ -1070,7 +1075,39 @@ pub const Qwen38Mtp = struct {
         defer am1.deinit();
         const picked = try shape_mod.takeAxis(ctx, ids, am1, 0);
         defer picked.deinit();
-        return ops.astype(ctx, picked, .int32);
+        const tok = try ops.astype(ctx, picked, .int32);
+        errdefer tok.deinit();
+
+        // DMLX_MTP_AVTRACE: per-step acceptance-estimator features from the
+        // exact rescore — (l_max, top1-top2 margin) as [2] f32, unevaluated.
+        // The acceptance labels come from the target's verify, so an offline
+        // fit can score how well drafter confidence predicts acceptance
+        // (vLLM Adaptive-Verification design, PR #52228).
+        var feat: ?Array = null;
+        if (std.c.getenv("DMLX_MTP_AVTRACE") != null) {
+            const ncand: i32 = exact.shape()[1];
+            if (ncand >= 2) {
+                const feat_blk: ?Array = blk: {
+                    const ef = try ops.astype(ctx, exact, .float32);
+                    defer ef.deinit();
+                    const srt = try sort_mod.sortAxis(ctx, ef, 1);
+                    defer srt.deinit();
+                    const l1 = try ops.slice(ctx, srt, &[_]i32{ 0, ncand - 1 }, &[_]i32{ 1, ncand }, &[_]i32{ 1, 1 });
+                    defer l1.deinit();
+                    const l2 = try ops.slice(ctx, srt, &[_]i32{ 0, ncand - 2 }, &[_]i32{ 1, ncand - 1 }, &[_]i32{ 1, 1 });
+                    defer l2.deinit();
+                    const mg = try ops.subtract(ctx, l1, l2);
+                    defer mg.deinit();
+                    const l1f = try ops.reshape(ctx, l1, &[_]i32{1});
+                    defer l1f.deinit();
+                    const mgf = try ops.reshape(ctx, mg, &[_]i32{1});
+                    defer mgf.deinit();
+                    break :blk try shape_mod.concatenateAxis(ctx, &[_]Array{ l1f, mgf }, 0);
+                };
+                feat = feat_blk;
+            }
+        }
+        return .{ .tok = tok, .feat = feat };
     }
 
     /// Greedy GPU-chained step: forwardIds + argmax, returning the token id
@@ -1126,9 +1163,9 @@ pub const Qwen38Mtp = struct {
             }
             errdefer body.deinit();
             errdefer if (chain_prenorm) chain.deinit();
-            if (self.coarseDraftToken(body, lm_head, coarse)) |tok| {
+            if (self.coarseDraftToken(body, lm_head, coarse)) |tok_out| {
                 if (chain_prenorm) body.deinit();
-                return .{ .tok_gpu = tok, .hidden_out = chain };
+                return .{ .tok_gpu = tok_out.tok, .hidden_out = chain, .feat = tok_out.feat };
             } else |err| {
                 if (chain_prenorm) chain.deinit();
                 // One-shot downgrade: never retry per step.
@@ -1163,6 +1200,9 @@ pub const Qwen38Mtp = struct {
 pub const MtpGreedyStepOut = struct {
     tok_gpu: Array, // [1] i32 (unevaled)
     hidden_out: Array, // [1, hidden] bf16
+    /// DMLX_MTP_AVTRACE only: [2] f32 (l_max, top1-top2 margin) from the
+    /// exact top-64 rescore. Null otherwise.
+    feat: ?Array = null,
 };
 
 fn rmsNormBf16(ctx: EagerContext, x: Array, w_f32: Array, eps: f32) !Array {
