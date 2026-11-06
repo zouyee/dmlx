@@ -2589,16 +2589,25 @@ fn buildConvSeqSource(allocator: std.mem.Allocator, k: i32, tpt: i32) ![]u8 {
     const w = Emit{ .a = allocator, .buf = &s };
 
     try w.raw(
-        \\    const uint c = thread_position_in_grid.x;
+        \\    // One thread owns a channel QUAD: every load/store is vectorized
+        \\    // (float4 for the f32 buffers, vec<bfloat16_t,4> for x — 8/16 B
+        \\    // instead of 4 B), which is what took the scalar predecessor from
+        \\    // ~24 GB/s effective to bandwidth-bound. x is read in bf16
+        \\    // directly: the widening is exact, so results are bit-identical
+        \\    // to the old "astype f32, then conv" chain, and the 1.5x-size
+        \\    // f32 promotion pass disappears.
+        \\    constexpr int QKV4 = QKV / 4;
+        \\    const int c4 = int(thread_position_in_grid.x);
         \\    const int t0 = int(thread_position_in_grid.y) * TPT;
         \\    const int L = lp[0]; // runtime L: one compile serves every prompt length
-        \\    if (c >= QKV || t0 >= L) { return; }
+        \\    if (c4 >= QKV4 || t0 >= L) { return; }
+        \\    const int c = c4 * 4;
         \\
     );
-    // Tap weights for this channel, reused by every row below.
+    // Tap weights for this channel quad, reused by every row below.
     var j: i32 = 0;
     while (j < k) : (j += 1) {
-        try w.fmt("    const float wv{d} = w[{d} * QKV + c];\n", .{ j, j });
+        try w.fmt("    const float4 wv{d} = *((const device float4*)(w + {d} * QKV + c));\n", .{ j, j });
     }
     try w.raw(
         \\
@@ -2611,8 +2620,8 @@ fn buildConvSeqSource(allocator: std.mem.Allocator, k: i32, tpt: i32) ![]u8 {
     while (i < k - 1 + tpt) : (i += 1) {
         try w.fmt(
             \\    const int r{d} = t0 + {d};
-            \\    const float xv{d} = (r{d} < KM1) ? cs[r{d} * QKV + c]
-            \\        : ((r{d} - KM1) < L ? x[(r{d} - KM1) * QKV + c] : 0.0f);
+            \\    const float4 xv{d} = (r{d} < KM1) ? *((const device float4*)(cs + r{d} * QKV + c))
+            \\        : ((r{d} - KM1) < L ? float4(*((const device vec<bfloat16_t, 4>*)(x + (r{d} - KM1) * QKV + c))) : float4(0.0f));
             \\
         , .{ i, i, i, i, i, i, i });
     }
@@ -2621,14 +2630,14 @@ fn buildConvSeqSource(allocator: std.mem.Allocator, k: i32, tpt: i32) ![]u8 {
     while (row < tpt) : (row += 1) {
         try w.fmt("    if (t0 + {d} < L) {{\n", .{row});
         // Same accumulation order as the eager taps: tap 0 first, then +=.
-        try w.fmt("        float acc = xv{d} * wv0;\n", .{row});
+        try w.fmt("        float4 acc = xv{d} * wv0;\n", .{row});
         j = 1;
         while (j < k) : (j += 1) {
             try w.fmt("        acc += xv{d} * wv{d};\n", .{ row + j, j });
         }
         // silu, folded in to avoid a separate full-tensor pass.
         try w.fmt(
-            "        y[(t0 + {d}) * QKV + c] = acc / (1.0f + metal::exp(-acc));\n    }}\n",
+            "        *((device float4*)(y + (t0 + {d}) * QKV + c)) = acc / (1.0f + metal::exp(-acc));\n    }}\n",
             .{row},
         );
     }
@@ -2645,7 +2654,7 @@ var conv_seq_broken: bool = false;
 fn getConvSeqKernel(allocator: std.mem.Allocator) ?c.c.mlx_fast_metal_kernel {
     if (conv_seq_broken) return null;
     if (conv_seq_kernel) |k| return k;
-    const name_z = allocator.dupeZ(u8, "gdn_conv_seq_silu") catch return null;
+    const name_z = allocator.dupeZ(u8, "gdn_conv_seq_silu_v2") catch return null;
     defer allocator.free(name_z);
     const body = buildConvSeqSource(allocator, 4, conv_seq_tpt) catch return null;
     defer allocator.free(body);
@@ -2685,25 +2694,27 @@ fn convAccumSeqFused(
     ctx: EagerContext,
     conv1d_t_f32: Array,
     conv_state: Array,
-    x_f32: Array,
+    x: Array,
     L: i32,
     qkv_dim: i32,
     K: i32,
 ) !?Array {
     if (convFusionDisabled()) return null;
     if (L < K - 1) return null; // new-state slice below assumes L >= K-1
-    if (conv1d_t_f32.dtype() != .float32 or x_f32.dtype() != .float32 or
+    // x is read as bf16 in-kernel (widening is exact); cs/w/y stay f32.
+    if (@mod(qkv_dim, 4) != 0) return null;
+    if (conv1d_t_f32.dtype() != .float32 or x.dtype() != .bfloat16 or
         conv_state.dtype() != .float32) return null;
     const allocator = ctx.allocator;
     const kernel = getConvSeqKernel(allocator) orelse return null;
 
     const cfg = c.c.mlx_fast_metal_kernel_config_new();
     defer c.c.mlx_fast_metal_kernel_config_free(cfg);
-    // One thread per output element, channel-major so the K reads coalesce
-    // across the threadgroup.
+    // One thread per output channel-quad (vectorized loads), channel-major
+    // so the K reads coalesce across the threadgroup.
     const rows_per_thread = conv_seq_tpt;
     const grid_y = @divFloor(L + rows_per_thread - 1, rows_per_thread);
-    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, qkv_dim, grid_y, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(qkv_dim, 4), grid_y, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{ L, qkv_dim }, 2, c.c.MLX_FLOAT32));
     try c.check(c.c.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "QKV", qkv_dim));
@@ -2717,7 +2728,7 @@ fn convAccumSeqFused(
 
     const in_vec = c.c.mlx_vector_array_new();
     defer _ = c.c.mlx_vector_array_free(in_vec);
-    for ([_]Array{ x_f32, conv_state, conv1d_t_f32, l_arr }) |inp| {
+    for ([_]Array{ x, conv_state, conv1d_t_f32, l_arr }) |inp| {
         try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
     }
     var out_vec = c.c.mlx_vector_array_new();
@@ -2733,8 +2744,9 @@ fn convAccumSeqFused(
 }
 
 /// Bench hook for the fused whole-sequence causal conv (+silu inside).
-pub fn testConvAccumSeqFused(ctx: EagerContext, conv1d_t_f32: Array, conv_state: Array, x_f32: Array, L: i32, qkv_dim: i32, K: i32) !?Array {
-    return convAccumSeqFused(ctx, conv1d_t_f32, conv_state, x_f32, L, qkv_dim, K);
+/// x is bf16 (read in-kernel, exact widening); conv weights/state are f32.
+pub fn testConvAccumSeqFused(ctx: EagerContext, conv1d_t_f32: Array, conv_state: Array, x: Array, L: i32, qkv_dim: i32, K: i32) !?Array {
+    return convAccumSeqFused(ctx, conv1d_t_f32, conv_state, x, L, qkv_dim, K);
 }
 
 /// Bench hook for the fused prefill tail (out-gate norm + silu gate).
@@ -3671,23 +3683,21 @@ pub const Qwen38GDN = struct {
             ft = nowNs();
         }
 
-        // 2. Causal depthwise conv over the whole sequence (f32) + silu.
+        // 2. Causal depthwise conv over the whole sequence + silu.
         const qkv_lin2 = try ops.reshape(ctx, qkv_lin, &[_]i32{ L, QKV });
         defer qkv_lin2.deinit();
-        // The projections output bf16 (qmm keeps the activation dtype), but
-        // the fused conv kernel only accepts f32 — without this promotion the
-        // whole prefill silently falls back to the eager conv (window concat +
-        // K tap passes + separate silu, ~1 s at L=1790 vs ~70 ms fused).
-        // Promoting here also makes `new_conv_state` f32, matching the dtype
-        // the cache was initialized with.
+        // The v2 fused conv kernel reads the projection output in BF16
+        // directly (widening is exact), so the full-tensor f32 promotion
+        // leaves the hot path. The f32 form below is a LAZY graph node: the
+        // eager fallback consumes it when the kernel is unavailable, and the
+        // verify path's conv window is built from it — materialized only if
+        // a consumer evals it, which for prefill-sized L never happens (the
+        // big prefill's window is deinit'd unread; verify calls this with
+        // L <= 8, where materialization is trivial).
         const qkv_lin_f32 = try ops.astype(ctx, qkv_lin2, .float32);
         defer qkv_lin_f32.deinit();
-        // `window` stays for the VERIFY path, which slices per-position conv
-        // states out of it. In the prefill path nothing consumes it (the fused
-        // kernel reads conv_state and qkv_lin2 separately, and the new conv
-        // state is sliced from qkv_lin2), so MLX never materializes the
-        // concat — keeping it is free. Do NOT eval it in the profiler, or the
-        // dead 84 MB copy comes back.
+        // `window` is consumed by the VERIFY path (per-position conv-state
+        // slices). Lazy: never materialized unless a slice is evaled.
         const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin_f32 }, 0); // [L+K-1, QKV] f32
         errdefer window.deinit();
 
@@ -3697,19 +3707,20 @@ pub const Qwen38GDN = struct {
         const w_f32 = if (self.conv1d_t_f32) |w| w else try ops.astype(ctx, self.conv1d_t, .float32);
         defer if (self.conv1d_t_f32 == null) w_f32.deinit();
         const qkv = blk: {
-            if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin_f32, L, QKV, K)) |fused| {
+            if (try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K)) |fused| {
                 // DIAGNOSTIC (DMLX_VERIFY_PRICE_CONV=1): price the fused conv
                 // kernel by running it twice and averaging (see priceTwice).
                 // Output stays bit-correct.
                 if (std.c.getenv("DMLX_VERIFY_PRICE_CONV") != null) {
                     defer fused.deinit();
-                    const f2 = try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin_f32, L, QKV, K) orelse break :blk fused;
+                    const f2 = try convAccumSeqFused(ctx, w_f32, cache.conv_state, qkv_lin2, L, QKV, K) orelse break :blk fused;
                     defer f2.deinit();
                     break :blk try priceTwice(ctx, fused, f2);
                 }
                 break :blk fused;
             }
             used_fused = false;
+            // Eager fallback: window concat + K tap passes + separate silu.
             const conv_acc = try convAccumSeq(ctx, self.conv1d_t, window, L, QKV);
             defer conv_acc.deinit(); // [L, QKV] f32
             break :blk try activations.silu(ctx, conv_acc);
@@ -3721,14 +3732,19 @@ pub const Qwen38GDN = struct {
             ft = nowNs();
         }
 
-        // New conv state: the last K-1 rows of the RAW (pre-silu) window.
-        // With L >= K-1 those are exactly qkv_lin2's last K-1 rows, so the
-        // fused path never touches `window`.
+        // New conv state: the last K-1 rows of the RAW (pre-silu) projection
+        // output. With L >= K-1 those are exactly qkv_lin2's last K-1 rows.
+        // The cache stores f32; the fused path widens just the [K-1, QKV]
+        // tail (not the whole tensor), the fallback reuses the window rows.
         const new_conv_state = blk: {
-            const src: Array = if (used_fused) qkv_lin_f32 else window;
-            const row0: i32 = if (used_fused) L - (K - 1) else L;
-            const row1: i32 = if (used_fused) L else L + K - 1;
-            const tail = try ops.slice(ctx, src, &[_]i32{ row0, 0 }, &[_]i32{ row1, QKV }, &[_]i32{ 1, 1 });
+            if (used_fused) {
+                const tail = try ops.slice(ctx, qkv_lin2, &[_]i32{ L - (K - 1), 0 }, &[_]i32{ L, QKV }, &[_]i32{ 1, 1 });
+                defer tail.deinit();
+                const tail_f32 = try ops.astype(ctx, tail, .float32);
+                defer tail_f32.deinit();
+                break :blk try ops.copy(ctx, tail_f32);
+            }
+            const tail = try ops.slice(ctx, window, &[_]i32{ L, 0 }, &[_]i32{ L + K - 1, QKV }, &[_]i32{ 1, 1 });
             defer tail.deinit();
             break :blk try ops.copy(ctx, tail);
         };
@@ -5346,8 +5362,14 @@ test "convAccumSeqFused matches the eager taps + silu" {
     const K: i32 = 4;
     const QKV: i32 = 256;
     for ([_]i32{ 3, 8, 37, 64 }) |L| {
-        const x = try makeTestWeight(allocator, &[_]i32{ L, QKV });
+        const x_f32 = try makeTestWeight(allocator, &[_]i32{ L, QKV });
+        defer x_f32.deinit();
+        // The kernel reads x in bf16 (widening is exact); the eager
+        // reference consumes the same values via an explicit widening.
+        const x = try ops.astype(ctx, x_f32, .bfloat16);
         defer x.deinit();
+        const x_widen = try ops.astype(ctx, x, .float32);
+        defer x_widen.deinit();
         const cs = try makeTestWeight(allocator, &[_]i32{ K - 1, QKV });
         defer cs.deinit();
         const w = try makeTestWeight(allocator, &[_]i32{ K, QKV });
@@ -5359,7 +5381,7 @@ test "convAccumSeqFused matches the eager taps + silu" {
         };
         defer fused.deinit();
 
-        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cs, x }, 0);
+        const window = try shape_mod.concatenateAxis(ctx, &[_]Array{ cs, x_widen }, 0);
         defer window.deinit();
         const acc = try convAccumSeq(ctx, w, window, L, QKV);
         defer acc.deinit();

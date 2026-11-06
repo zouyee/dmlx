@@ -100,7 +100,7 @@ pub fn main() !void {
     // --- fused causal conv + silu over [L, 10240] f32 ---
     const QKV: i32 = 10240;
     const K: i32 = 4;
-    const x_f32 = try random.normal(ctx, &[_]i32{ L, QKV }, .float32, 0.0, 1.0, null);
+    const x_f32 = try random.normal(ctx, &[_]i32{ L, QKV }, .bfloat16, 0.0, 1.0, null);
     defer x_f32.deinit();
     const conv_state = try random.normal(ctx, &[_]i32{ K - 1, QKV }, .float32, 0.0, 1.0, null);
     defer conv_state.deinit();
