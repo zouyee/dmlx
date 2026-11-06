@@ -1536,3 +1536,21 @@ max_n-2（DMLX_MTP_REEXPLORE_FLOOR 可调）。
 - code 47.1 vs 37.7：**+24.9%**；prose +3.7%
 - headline 38.0→**40.5** vs 35.6：+6.4% → **+13.8%**
 - 思考对实现全领域无红格。
+
+## "GEMM tile 差距"证伪（2026-11-06 深夜）——v8 tile 早已在分支上
+
+调查 prefill 残差时发现：omlx 的 GEMM 优势（自定义 qmm tile
+BM=64/BK=32/BN=64，实测 +4%）**本分支早已移植**——
+`src/models/qwen38_qmm_v8.zig`（commit `10cc8f7`，flatten_qmm_v8.py
+预扁平化 4813 行 steel header，M≥256 路由，bit-exact）。子代理重跑
+run-bench-prefill-v8：7 个投影 shape 1.045-1.123x，dmlx tiled ≈
+omlx tile（±2% 噪声内）。所以 prefill GEMM 从未落后——今日残差
+-0.2~0.3s 全部是非 GEMM 散项（conv/tail 已清）+ 噪声。
+
+子代理新增的冗余路由层（M≥1024 再路由到同一 kernel）已回退；
+功能与 harness 都是重复建设。教训：开工前先 grep 现有 kernel 目录。
+
+另一个被证伪的假设：MLX 运行时 JIT **不能**解析
+`#include "mlx/backend/..."`（custom_kernel.cpp 只拼接扁平化
+utils 文本，无 include 搜索路径；python 侧的"成功"是 lazy eval
+没编译的假阳性）——v8 当年的预扁平化是必要的。
