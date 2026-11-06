@@ -1505,3 +1505,21 @@ omlx 36.1（**+19.7%**）；思考对 dmlx 38.0 vs omlx 35.7
 （前提数字来自错误的 mlx 构建；真实上限 ~0.5ms/步 ≈ 3%，见
 bench-coarse-head）。剩余长课题：Soft-MTP 接受率上限、M5/NAX
 packed GEMM 移植（换机时）、ANE 混合 prefill（私有 API，灰色）。
+
+## prefill 抖动归因（2026-11-06 晚）
+
+用户观察到 dmlx prefill 抖动大于 omlx。对照探针（同一 server 10 连发
+~2100-token 请求，max_tokens=1）：
+
+- dmlx-plain: stdev 0.33s / dmlx-mtp: 0.59s / omlx-mtp: 0.32s
+  （omlx 需排除 rep0 的 kernel 编译 warmup 22.1s）
+- 之前引用的"四场 16.88/16.63/16.22/15.89"不是纯噪声——主体是
+  conv/tail 修复的真实改进 + 跨场热漂移。
+- MTP 模式残存稍高的方差来自更多 kernel 暴露于环境波动（非单调，
+  无泄漏迹象；无状态累积）。
+
+**顺带抓到一个生产 bug（08ba203）**：plain（非 MTP）路径的
+prefix-cache store 缺 vtable_serial 门控 —— lookup 永不命中导致每
+请求都 store（48 层 GDN 状态 ~160MB/请求，6-14s/请求！），且
+pc_prompt 非引擎持有 → HTTP 释放后 dupe 触发 @memcpy 别名 panic
+（~第 6 个长请求必崩）。修复后 plain 长 prompt 23-31s → 16.6-17.6s。
