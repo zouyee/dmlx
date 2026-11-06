@@ -1262,6 +1262,28 @@ pub const Qwen38Attn = struct {
         return self.linear(gated, self.o_proj, self.o_scales, self.o_biases, self.o_quant);
     }
 
+    /// Decode attention core for an externally-computed pre-cache segment
+    /// (MTP drafter's compiled step): KV slab append + decode SDPA.
+    /// Returns [1, H, 1, D] bf16. Numerically identical to the corresponding
+    /// slice of postCache.
+    pub fn cacheAppendAndSdpa(self: *Qwen38Attn, cache: *Qwen38AttnCache, q_t: Array, k_t: Array, v_t: Array) !Array {
+        const ctx = self.ctx;
+        const H: i32 = @intCast(self.num_heads);
+        const HKV: i32 = @intCast(self.num_kv_heads);
+        const D: i32 = @intCast(self.head_dim);
+
+        try cacheAppend(ctx, cache, k_t, v_t, 1, HKV, D);
+
+        const kv_len: i32 = cache.len();
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        if (try sdpaDecodeFused(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, kv_len)) |attn| return attn;
+        const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer k_view.deinit();
+        const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer v_view.deinit();
+        return fast_mod.scaledDotProductAttention(ctx, q_t, k_view, v_view, scale, "", null, null);
+    }
+
     /// Test-only constructor: toy dims hidden=16, H=2, HKV=1, D=8, rotary=2.
     pub fn makeTestModule(allocator: std.mem.Allocator, ctx: EagerContext) !Qwen38Attn {
         const fill = struct {

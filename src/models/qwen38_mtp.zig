@@ -33,9 +33,12 @@ const glm53 = @import("glm53.zig");
 
 const qwen38_attn = @import("qwen38_attn.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
+const closure_mod = @import("mlx").closure;
+const compile_mod = @import("mlx").compile;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
+const Closure = closure_mod.Closure;
 const QuantConfig = quantize_mod.QuantConfig;
 const WeightSource = glm53.WeightSource;
 
@@ -74,6 +77,231 @@ pub const MtpLinear = struct {
     }
 };
 
+// ============================================================
+// Compiled decode-step segments (launch-fusion program)
+// ============================================================
+//
+// The eager drafter step (forwardBodyRaw + final norm) issues ~30 MLX op
+// dispatches per token: gather, 5 RMSNorms at 3 dispatches each (astype /
+// rmsNorm / astype), concat, 8 quantized projections, 2 q/k norms, 2 ropes,
+// sigmoid, 2 cache sliceUpdates, SDPA, gate multiply, 2 residual adds, silu,
+// multiply, copy. GPU time per step is dominated by the coarse-head read
+// (~0.4 ms), so the step is launch-bound; mx.compile fuses the elementwise
+// chains and collapses the per-op CPU dispatch cost (same precedent as the
+// backbone's compiled GDN step / MLP swiglu / attention pre-cache).
+//
+// Two closures bracket the stateful middle (KV slab append + custom decode
+// SDPA stay eager):
+//   pre : id, embed, hidden, norms, fc, ln1, qkv weights, q/k_norm, offset
+//         -> [fused, q_t, k_t, v_t, gate_sig]
+//   post: attn, gate_sig, fused, o, ln2, gate/up/down weights, norm
+//         -> [normed, dec(pre-norm)]
+// Trace-time constants (rotary dims / theta / eps, output gate) are baked;
+// the compiled path is gated on the serving config matching them. Kill
+// switch: DMLX_MTP_NO_COMPILE=1. DMLX_MTP_STAGE forces the eager path so the
+// stage checkpoints stay observable.
+
+const MtpPreSegOut = struct {
+    fused: Array, // [1, hidden] bf16 (residual for the post segment)
+    q_t: Array, // [1, H, 1, D] roped
+    k_t: Array, // [1, HKV, 1, D] roped
+    v_t: Array, // [1, HKV, 1, D]
+    gate_sig: Array, // [1, H*D] sigmoid(output gate)
+};
+
+/// Pre-attention segment, pure function of arrays. Mirrors the eager op
+/// sequence of forwardBodyRaw up to the KV-cache read exactly (same order,
+/// same dtypes).
+fn mtpPreSeg(
+    ctx: EagerContext,
+    id_arr: Array, // [1] i32
+    embed_table: Array, // [vocab, hidden] bf16
+    hidden_in: Array, // [1, hidden] bf16
+    w_e: Array, // pre_fc_norm_embedding, [hidden] f32
+    w_h: Array, // pre_fc_norm_hidden, [hidden] f32
+    fc: MtpLinear,
+    ln1: Array, // [hidden] f32
+    qw: qwen38_attn.PreCacheWeights, // .x is overridden with n1 below
+    rotary_dims: i32,
+    rope_theta: f32,
+    eps: f32,
+) !MtpPreSegOut {
+    const row = try shape_mod.takeAxis(ctx, embed_table, id_arr, 0);
+    defer row.deinit();
+    const e = try rmsNormBf16(ctx, row, w_e, eps);
+    defer e.deinit();
+    const h = try rmsNormBf16(ctx, hidden_in, w_h, eps);
+    defer h.deinit();
+    const cat = try shape_mod.concatenateAxis(ctx, &[_]Array{ e, h }, 1);
+    defer cat.deinit();
+    const fused = try fc.apply(ctx, cat);
+    errdefer fused.deinit();
+    const n1 = try rmsNormBf16(ctx, fused, ln1, eps);
+    defer n1.deinit();
+
+    var w = qw;
+    w.x = n1;
+    var pre = try qwen38_attn.preCacheStep(ctx, w, rotary_dims, rope_theta, eps, true);
+    errdefer pre.deinit();
+    return .{
+        .fused = fused,
+        .q_t = pre.q_t,
+        .k_t = pre.k_t,
+        .v_t = pre.v_t,
+        .gate_sig = pre.gate_sig.?,
+    };
+}
+
+const MtpPostSegOut = struct {
+    normed: Array, // [1, hidden] bf16 (final-normed; feeds lm_head / chaining)
+    dec: Array, // [1, hidden] bf16 pre-final-norm (CHAIN_PRENORM experiment)
+};
+
+/// Same pair, named at module scope so the eager and compiled step drivers
+/// share one return type.
+pub const MtpBodyPair = struct {
+    normed: Array,
+    pre_norm: Array,
+};
+
+/// Post-attention segment: gate multiply, o_proj, both residual adds, the
+/// SwiGLU MLP and the final norm. Mirrors forwardBodyRaw/forwardBodyIds
+/// exactly.
+fn mtpPostSeg(
+    ctx: EagerContext,
+    attn4: Array, // [1, H, 1, D] bf16 (decode SDPA output)
+    gate_sig: Array, // [1, H*D] bf16
+    fused: Array, // [1, hidden] bf16 residual
+    o: MtpLinear,
+    ln2: Array, // [hidden] f32
+    gate: MtpLinear,
+    up: MtpLinear,
+    down: MtpLinear,
+    norm_w: Array, // [hidden] f32
+    eps: f32,
+) !MtpPostSegOut {
+    const hd: i32 = gate_sig.shape()[1];
+    const attn_t = try ops.squeeze(ctx, attn4);
+    defer attn_t.deinit();
+    const attn_flat = try ops.reshape(ctx, attn_t, &[_]i32{ 1, hd });
+    defer attn_flat.deinit();
+    const gated = try ops.multiply(ctx, attn_flat, gate_sig);
+    defer gated.deinit();
+    const ao = try o.apply(ctx, gated);
+    defer ao.deinit();
+    const h2 = try ops.add(ctx, fused, ao);
+    defer h2.deinit();
+
+    const n2 = try rmsNormBf16(ctx, h2, ln2, eps);
+    defer n2.deinit();
+    const g = try gate.apply(ctx, n2);
+    defer g.deinit();
+    const u = try up.apply(ctx, n2);
+    defer u.deinit();
+    const act = try activations.silu(ctx, g);
+    defer act.deinit();
+    const hh = try ops.multiply(ctx, act, u);
+    defer hh.deinit();
+    const mlp_out = try down.apply(ctx, hh);
+    defer mlp_out.deinit();
+    const dec = try ops.add(ctx, h2, mlp_out);
+    errdefer dec.deinit();
+    const normed = try rmsNormBf16(ctx, dec, norm_w, eps);
+    return .{ .normed = normed, .dec = dec };
+}
+
+/// Closures are traced on the GPU stream so the compiled graph dispatches to
+/// the same device as the eager path (same convention as qwen38_attn).
+fn mtpClosureGpuCtx(allocator: std.mem.Allocator) EagerContext {
+    return EagerContext.initWithStream(allocator, .{ .inner = c.c.mlx_default_gpu_stream_new() });
+}
+
+fn preSegToSlice(res: MtpPreSegOut, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    const out = allocator.alloc(Array, 5) catch return error.MlxError;
+    out[0] = res.fused;
+    out[1] = res.q_t;
+    out[2] = res.k_t;
+    out[3] = res.v_t;
+    out[4] = res.gate_sig;
+    return out;
+}
+
+fn postSegToSlice(res: MtpPostSegOut, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    const out = allocator.alloc(Array, 2) catch return error.MlxError;
+    out[0] = res.normed;
+    out[1] = res.dec;
+    return out;
+}
+
+/// Quantized real-config pre segment. Input order (21): id, embed, hidden,
+/// w_e, w_h, fc(w,s,b), ln1, q(w,s,b), k(w,s,b), v(w,s,b), q_norm, k_norm,
+/// offset.
+fn mtpPreClosureQuant(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 21) return error.MlxError;
+    const ctx = mtpClosureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = mtpPreSeg(ctx, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], .{
+        .w = inputs[5],
+        .scales = inputs[6],
+        .biases = inputs[7],
+    }, inputs[8], .{
+        .x = inputs[2], // overridden with n1 inside mtpPreSeg
+        .q_w = inputs[9],
+        .q_scales = inputs[10],
+        .q_biases = inputs[11],
+        .k_w = inputs[12],
+        .k_scales = inputs[13],
+        .k_biases = inputs[14],
+        .v_w = inputs[15],
+        .v_scales = inputs[16],
+        .v_biases = inputs[17],
+        .q_norm = inputs[18],
+        .k_norm = inputs[19],
+        .offset = inputs[20],
+    }, qwen38_attn.COMPILED_ROTARY_DIMS, qwen38_attn.COMPILED_ROPE_THETA, qwen38_attn.COMPILED_RMS_EPS) catch return error.MlxError;
+    return preSegToSlice(res, allocator);
+}
+
+/// Quantized real-config post segment. Input order (17): attn, gate_sig,
+/// fused, o(w,s,b), ln2, gate(w,s,b), up(w,s,b), down(w,s,b), norm.
+fn mtpPostClosureQuant(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 17) return error.MlxError;
+    const ctx = mtpClosureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = mtpPostSeg(ctx, inputs[0], inputs[1], inputs[2], .{
+        .w = inputs[3],
+        .scales = inputs[4],
+        .biases = inputs[5],
+    }, inputs[6], .{
+        .w = inputs[7],
+        .scales = inputs[8],
+        .biases = inputs[9],
+    }, .{
+        .w = inputs[10],
+        .scales = inputs[11],
+        .biases = inputs[12],
+    }, .{
+        .w = inputs[13],
+        .scales = inputs[14],
+        .biases = inputs[15],
+    }, inputs[16], qwen38_attn.COMPILED_RMS_EPS) catch return error.MlxError;
+    return postSegToSlice(res, allocator);
+}
+
+/// Build the mx.compile'd drafter pre-attention segment (real quantized
+/// config). Trace happens on first apply.
+fn compiledMtpStepPre(allocator: std.mem.Allocator) !Closure {
+    const base = try Closure.init(&mtpPreClosureQuant, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
+}
+
+fn compiledMtpStepPost(allocator: std.mem.Allocator) !Closure {
+    const base = try Closure.init(&mtpPostClosureQuant, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
+}
+
 pub const MtpForwardOut = struct {
     logits: Array, // [1, 1, vocab] f32
     /// Post-final-norm decoder output [1, hidden] bf16 — feed this as
@@ -100,6 +328,12 @@ pub const Qwen38Mtp = struct {
     /// The head's own KV cache (one full-attention layer). Grows by one per
     /// accepted token; rollback is a length truncation (Task 3).
     cache: qwen38_attn.Qwen38AttnCache = .{},
+
+    /// mx.compile'd decode-step segments (see the "Compiled decode-step
+    /// segments" section above). null = eager fallback. Traced lazily on the
+    /// first compiled apply.
+    step_pre_compiled: ?Closure = null,
+    step_post_compiled: ?Closure = null,
 
     // --- coarse draft head (plan doc §28.4 / §32) --------------------------
     // A 3-bit gs128 copy of the shared lm_head, used ONLY to propose draft
@@ -200,6 +434,8 @@ pub const Qwen38Mtp = struct {
         self.mlp_up.deinit();
         self.mlp_down.deinit();
         if (self.coarse_head) |ch| ch.deinit();
+        if (self.step_pre_compiled) |cc| cc.deinit();
+        if (self.step_post_compiled) |cc| cc.deinit();
         self.cache.deinit();
     }
 
@@ -333,11 +569,52 @@ pub const Qwen38Mtp = struct {
         };
     }
 
+    /// The compiled decode step is traced for one fixed config: fully
+    /// quantized (4-bit affine) linears, rotary dims/theta/eps matching the
+    /// baked closure constants, output gate on. Anything else stays eager.
+    fn compiledStepEligible(self: *const Qwen38Mtp) bool {
+        if (std.c.getenv("DMLX_MTP_NO_COMPILE") != null) return false;
+        const d = self.dims;
+        if (!d.output_gate) return false;
+        if (d.rotary_dims != qwen38_attn.COMPILED_ROTARY_DIMS) return false;
+        if (@abs(d.rope_theta - qwen38_attn.COMPILED_ROPE_THETA) >= 1.0) return false;
+        if (@abs(d.rms_norm_eps - qwen38_attn.COMPILED_RMS_EPS) >= 1e-12) return false;
+        const lins = [_]MtpLinear{ self.fc, self.mlp_gate, self.mlp_up, self.mlp_down };
+        for (lins) |l| {
+            if (l.scales == null or l.biases == null) return false;
+        }
+        const a = &self.attn;
+        if (a.q_scales == null or a.q_biases == null or
+            a.k_scales == null or a.k_biases == null or
+            a.v_scales == null or a.v_biases == null or
+            a.o_scales == null or a.o_biases == null) return false;
+        return true;
+    }
+
+    fn initCompiledStep(self: *Qwen38Mtp, allocator: std.mem.Allocator) void {
+        if (!self.compiledStepEligible()) return;
+        const pre = compiledMtpStepPre(allocator) catch {
+            std.log.warn("[MTP] compiled pre-attention segment build failed — eager drafter step", .{});
+            return;
+        };
+        const post = compiledMtpStepPost(allocator) catch {
+            std.log.warn("[MTP] compiled post-attention segment build failed — eager drafter step", .{});
+            pre.deinit();
+            return;
+        };
+        self.step_pre_compiled = pre;
+        self.step_post_compiled = post;
+        std.log.info("[MTP] compiled drafter decode step active", .{});
+    }
+
     /// Load from a drafter checkpoint directory (safetensors + index).
     pub fn load(allocator: std.mem.Allocator, ctx: EagerContext, model_dir: []const u8, dims: Qwen38MtpDims) !Qwen38Mtp {
         var index = try safetensors_reader.loadOrBuildIndex(allocator, model_dir);
         defer index.deinit();
-        return loadFromSource(ctx, WeightSource.fromIndex(&index), dims);
+        var mtp = try loadFromSource(ctx, WeightSource.fromIndex(&index), dims);
+        errdefer mtp.deinit();
+        mtp.initCompiledStep(allocator);
+        return mtp;
     }
 
     /// One MTP decode step. `hidden_pre_norm`: [1, hidden] bf16 (backbone
@@ -463,6 +740,82 @@ pub const Qwen38Mtp = struct {
         return self.forwardBodyIds(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
     }
 
+    /// Compiled decode step: two mx.compile'd segments bracketing the eager
+    /// KV-cache append + decode SDPA. Numerically identical to the eager
+    /// forwardBodyRaw + final norm (same op sequence/dtypes; elementwise
+    /// fusion only). Returns the post-norm hidden and the pre-norm decoder
+    /// output, mirroring forwardBodyIdsPair.
+    fn forwardBodyCompiled(
+        self: *Qwen38Mtp,
+        hidden_pre_norm: Array,
+        id_arr: Array,
+        embed_table_bf16: Array,
+    ) !MtpBodyPair {
+        const ctx = self.ctx;
+        const a = &self.attn;
+        const allocator = ctx.allocator;
+
+        const offset_arr = try ops.scalarI32(ctx, self.cache.len());
+        defer offset_arr.deinit();
+        const pre_inputs = [_]Array{
+            id_arr,                         embed_table_bf16,            hidden_pre_norm,
+            self.pre_fc_norm_embedding_f32, self.pre_fc_norm_hidden_f32, self.fc.w,
+            self.fc.scales.?,               self.fc.biases.?,            self.ln1_f32,
+            a.q_proj,                       a.q_scales.?,                a.q_biases.?,
+            a.k_proj,                       a.k_scales.?,                a.k_biases.?,
+            a.v_proj,                       a.v_scales.?,                a.v_biases.?,
+            a.q_norm,                       a.k_norm,                    offset_arr,
+        };
+        const pre_outs = self.step_pre_compiled.?.apply(&pre_inputs, allocator) catch |err| {
+            // Pre-segment failure happens BEFORE the cache append, so the
+            // eager fallback below sees an untouched cache.
+            std.log.warn("[MTP] compiled pre segment apply failed ({s}); eager step", .{@errorName(err)});
+            return self.forwardBodyIdsPairEager(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+        };
+        defer allocator.free(pre_outs);
+        if (pre_outs.len != 5) {
+            for (pre_outs) |o| o.deinit();
+            return error.MlxError;
+        }
+        const fused = pre_outs[0];
+        defer fused.deinit();
+        const q_t = pre_outs[1];
+        defer q_t.deinit();
+        const k_t = pre_outs[2];
+        defer k_t.deinit();
+        const v_t = pre_outs[3];
+        defer v_t.deinit();
+        const gate_sig = pre_outs[4];
+        defer gate_sig.deinit();
+
+        // Stateful middle: slab append (mutates the cache) + decode SDPA.
+        const attn = try a.cacheAppendAndSdpa(&self.cache, q_t, k_t, v_t);
+        defer attn.deinit();
+
+        const post_inputs = [_]Array{
+            attn,                   gate_sig,        fused,
+            a.o_proj,               a.o_scales.?,    a.o_biases.?,
+            self.ln2_f32,           self.mlp_gate.w, self.mlp_gate.scales.?,
+            self.mlp_gate.biases.?, self.mlp_up.w,   self.mlp_up.scales.?,
+            self.mlp_up.biases.?,   self.mlp_down.w, self.mlp_down.scales.?,
+            self.mlp_down.biases.?, self.norm_f32,
+        };
+        const post_outs = try self.step_post_compiled.?.apply(&post_inputs, allocator);
+        defer allocator.free(post_outs);
+        if (post_outs.len != 2) {
+            for (post_outs) |o| o.deinit();
+            return error.MlxError;
+        }
+        return .{ .normed = post_outs[0], .pre_norm = post_outs[1] };
+    }
+
+    fn compiledStepActive(self: *const Qwen38Mtp) bool {
+        // DMLX_MTP_STAGE forces the eager path so the stage checkpoints stay
+        // observable.
+        return self.step_pre_compiled != null and self.step_post_compiled != null and
+            std.c.getenv("DMLX_MTP_STAGE") == null;
+    }
+
     /// Final-normed body output (the head's defined output; feeds lm_head).
     pub fn forwardBodyIds(
         self: *Qwen38Mtp,
@@ -471,6 +824,11 @@ pub const Qwen38Mtp = struct {
         id_arr: Array,
         embed_table_bf16: Array,
     ) !Array {
+        if (self.compiledStepActive()) {
+            const pair = try self.forwardBodyCompiled(hidden_pre_norm, id_arr, embed_table_bf16);
+            pair.pre_norm.deinit();
+            return pair.normed;
+        }
         const dec = try self.forwardBodyRaw(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
         defer dec.deinit();
         return rmsNormBf16(self.ctx, dec, self.norm_f32, self.dims.rms_norm_eps);
@@ -495,7 +853,19 @@ pub const Qwen38Mtp = struct {
         hidden_pre_norm: Array,
         id_arr: Array,
         embed_table_bf16: Array,
-    ) !struct { normed: Array, pre_norm: Array } {
+    ) !MtpBodyPair {
+        if (self.compiledStepActive())
+            return self.forwardBodyCompiled(hidden_pre_norm, id_arr, embed_table_bf16);
+        return self.forwardBodyIdsPairEager(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
+    }
+
+    fn forwardBodyIdsPairEager(
+        self: *Qwen38Mtp,
+        allocator: std.mem.Allocator,
+        hidden_pre_norm: Array,
+        id_arr: Array,
+        embed_table_bf16: Array,
+    ) !MtpBodyPair {
         const ctx = self.ctx;
         const dec = try self.forwardBodyRaw(allocator, hidden_pre_norm, id_arr, embed_table_bf16);
         errdefer dec.deinit();
@@ -878,6 +1248,168 @@ fn makeTestMtp(allocator: std.mem.Allocator, ctx: EagerContext) !Qwen38Mtp {
         .mlp_up = .{ .w = try makeWeight(allocator, &[_]i32{ inter, hidden }) },
         .mlp_down = .{ .w = try makeWeight(allocator, &[_]i32{ hidden, inter }) },
     };
+}
+
+/// Toy-config (plain weights, rotary=2, theta=1e4, eps=1e-6, output gate)
+/// pre-segment closure for the compiled-step unit test. Input order (13):
+/// id, embed, hidden, w_e, w_h, fc.w, ln1, q_w, k_w, v_w, q_norm, k_norm,
+/// offset. Returns [fused, q_t, k_t, v_t, gate_sig].
+fn mtpPreClosurePlainTest(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 13) return error.MlxError;
+    const ctx = mtpClosureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = mtpPreSeg(ctx, inputs[0], inputs[1], inputs[2], inputs[3], inputs[4], .{
+        .w = inputs[5],
+    }, inputs[6], .{
+        .x = inputs[2],
+        .q_w = inputs[7],
+        .k_w = inputs[8],
+        .v_w = inputs[9],
+        .q_norm = inputs[10],
+        .k_norm = inputs[11],
+        .offset = inputs[12],
+    }, 2, 10000.0, 1e-6) catch return error.MlxError;
+    return preSegToSlice(res, allocator);
+}
+
+/// Toy-config post-segment closure. Input order (9): attn, gate_sig, fused,
+/// o_w, ln2, gate_w, up_w, down_w, norm. Returns [normed, dec].
+fn mtpPostClosurePlainTest(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 9) return error.MlxError;
+    const ctx = mtpClosureGpuCtx(allocator);
+    defer ctx.deinit();
+    const res = mtpPostSeg(ctx, inputs[0], inputs[1], inputs[2], .{ .w = inputs[3] }, inputs[4], .{ .w = inputs[5] }, .{ .w = inputs[6] }, .{ .w = inputs[7] }, inputs[8], 1e-6) catch return error.MlxError;
+    return postSegToSlice(res, allocator);
+}
+
+test "Qwen38Mtp: compiled decode-step segments match the eager step" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const hidden: i32 = 16;
+    const vocab: i32 = 64;
+
+    var mtp_e = try makeTestMtp(allocator, ctx);
+    defer mtp_e.deinit();
+    var mtp_c = try makeTestMtp(allocator, ctx);
+    defer mtp_c.deinit();
+
+    const emb_f32 = try makeWeight(allocator, &[_]i32{ vocab, hidden });
+    defer emb_f32.deinit();
+    const emb = try ops.astype(ctx, emb_f32, .bfloat16);
+    defer emb.deinit();
+    const hidden_in = try makeWeight(allocator, &[_]i32{ 1, hidden });
+    defer hidden_in.deinit();
+    const id_arr = try Array.fromData(allocator, i32, &[_]i32{5}, &[_]i32{1});
+    defer id_arr.deinit();
+
+    // Eager reference (advances mtp_e's cache).
+    const eager = try mtp_e.forwardBodyIdsPairEager(allocator, hidden_in, id_arr, emb);
+    defer eager.normed.deinit();
+    defer eager.pre_norm.deinit();
+    try eager.normed.eval();
+    try eager.pre_norm.eval();
+    try std.testing.expectEqual(@as(i32, 1), mtp_e.cache.len());
+
+    // Compiled segments over mtp_c (toy-config closures).
+    const base_pre = try Closure.init(&mtpPreClosurePlainTest, allocator);
+    defer base_pre.deinit();
+    const cc_pre = try compile_mod.compile(base_pre, false);
+    defer cc_pre.deinit();
+    const base_post = try Closure.init(&mtpPostClosurePlainTest, allocator);
+    defer base_post.deinit();
+    const cc_post = try compile_mod.compile(base_post, false);
+    defer cc_post.deinit();
+
+    const offset_arr = try ops.scalarI32(ctx, mtp_c.cache.len());
+    defer offset_arr.deinit();
+    const pre_inputs = [_]Array{
+        id_arr,                          emb,                          hidden_in,
+        mtp_c.pre_fc_norm_embedding_f32, mtp_c.pre_fc_norm_hidden_f32, mtp_c.fc.w,
+        mtp_c.ln1_f32,                   mtp_c.attn.q_proj,            mtp_c.attn.k_proj,
+        mtp_c.attn.v_proj,               mtp_c.attn.q_norm,            mtp_c.attn.k_norm,
+        offset_arr,
+    };
+    const pre_outs = try cc_pre.apply(&pre_inputs, allocator);
+    defer allocator.free(pre_outs);
+    defer for (pre_outs) |o| o.deinit();
+    try std.testing.expectEqual(@as(usize, 5), pre_outs.len);
+
+    const attn = try mtp_c.attn.cacheAppendAndSdpa(&mtp_c.cache, pre_outs[1], pre_outs[2], pre_outs[3]);
+    defer attn.deinit();
+    try std.testing.expectEqual(@as(i32, 1), mtp_c.cache.len());
+
+    const post_inputs = [_]Array{
+        attn,              pre_outs[4],      pre_outs[0],
+        mtp_c.attn.o_proj, mtp_c.ln2_f32,    mtp_c.mlp_gate.w,
+        mtp_c.mlp_up.w,    mtp_c.mlp_down.w, mtp_c.norm_f32,
+    };
+    const post_outs = try cc_post.apply(&post_inputs, allocator);
+    defer allocator.free(post_outs);
+    defer for (post_outs) |o| o.deinit();
+    try std.testing.expectEqual(@as(usize, 2), post_outs.len);
+
+    // bf16-ULP parity on both the post-norm output and the pre-norm decoder
+    // output.
+    for ([_]Array{ post_outs[0], post_outs[1] }, [_]Array{ eager.normed, eager.pre_norm }) |got, exp| {
+        const gf = try ops.astype(ctx, got, .float32);
+        defer gf.deinit();
+        const ef = try ops.astype(ctx, exp, .float32);
+        defer ef.deinit();
+        const diff = try ops.subtract(ctx, gf, ef);
+        defer diff.deinit();
+        const abs_diff = try ops.abs(ctx, diff);
+        defer abs_diff.deinit();
+        const max_diff = try reduce_mod.max(ctx, abs_diff, false);
+        defer max_diff.deinit();
+        try max_diff.eval();
+        try std.testing.expect(try max_diff.item(f32) <= 1e-4);
+    }
+
+    // Offset-invariance: a second chained step at cache offset 1 must not
+    // retrace into different semantics — compare against eager step 2.
+    const eager2 = try mtp_e.forwardBodyIdsPairEager(allocator, eager.normed, id_arr, emb);
+    defer eager2.normed.deinit();
+    defer eager2.pre_norm.deinit();
+    try eager2.normed.eval();
+
+    const offset1 = try ops.scalarI32(ctx, mtp_c.cache.len());
+    defer offset1.deinit();
+    const pre_inputs1 = [_]Array{
+        id_arr,                          emb,                          post_outs[0],
+        mtp_c.pre_fc_norm_embedding_f32, mtp_c.pre_fc_norm_hidden_f32, mtp_c.fc.w,
+        mtp_c.ln1_f32,                   mtp_c.attn.q_proj,            mtp_c.attn.k_proj,
+        mtp_c.attn.v_proj,               mtp_c.attn.q_norm,            mtp_c.attn.k_norm,
+        offset1,
+    };
+    const pre_outs1 = try cc_pre.apply(&pre_inputs1, allocator);
+    defer allocator.free(pre_outs1);
+    defer for (pre_outs1) |o| o.deinit();
+    const attn1 = try mtp_c.attn.cacheAppendAndSdpa(&mtp_c.cache, pre_outs1[1], pre_outs1[2], pre_outs1[3]);
+    defer attn1.deinit();
+    try std.testing.expectEqual(@as(i32, 2), mtp_c.cache.len());
+    const post_inputs1 = [_]Array{
+        attn1,             pre_outs1[4],     pre_outs1[0],
+        mtp_c.attn.o_proj, mtp_c.ln2_f32,    mtp_c.mlp_gate.w,
+        mtp_c.mlp_up.w,    mtp_c.mlp_down.w, mtp_c.norm_f32,
+    };
+    const post_outs1 = try cc_post.apply(&post_inputs1, allocator);
+    defer allocator.free(post_outs1);
+    defer for (post_outs1) |o| o.deinit();
+
+    const gf = try ops.astype(ctx, post_outs1[0], .float32);
+    defer gf.deinit();
+    const ef = try ops.astype(ctx, eager2.normed, .float32);
+    defer ef.deinit();
+    const diff = try ops.subtract(ctx, gf, ef);
+    defer diff.deinit();
+    const abs_diff = try ops.abs(ctx, diff);
+    defer abs_diff.deinit();
+    const max_diff = try reduce_mod.max(ctx, abs_diff, false);
+    defer max_diff.deinit();
+    try max_diff.eval();
+    try std.testing.expect(try max_diff.item(f32) <= 1e-4);
 }
 
 test "Qwen38Mtp: shape, determinism, cache advance, chaining" {
