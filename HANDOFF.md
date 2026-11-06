@@ -1472,3 +1472,20 @@ top-64 + merge，省 1MB logits 写回 + argpartition），预期
 3.0 -> ~1.4ms/step，depth 7 时约 -10ms/round。
 
 C 任务结论已在前一节（mma morphology，带宽上限判定）。
+
+### 追平→超越分析（2026-11-06 pm2）
+
+逐项定价（ab_prefill @~1900 tok, 单 rep, ±0.3-0.5s 噪声）：
+- NORMS/TAIL/BCAST ≈ 0（bcast 是惰性死代码，profiler 假成本）
+- RECUR +0.9-1.2s 是 verify 路径 hook，max_tokens=1 下被长短抵消，存疑
+- **关键结构事实：omlx 的 packed_linear（tensor-unit GEMM）是 NAX/M5
+  专属，本机 M4 Pro 不可用——两边 prefill GEMM 都是 stock MLX qmm
+  6.67 TF/s，追平只需清非-GEMM 项，超越需要 GEMM 级突破（独立课题）**
+
+修复序列：conv v2（b2c21fd，~0.4-0.6s）→ prefill tail 接受 bf16
+norm_w（本次，~0.1s，md5 位平等）。tail 融合从此在 serving 激活。
+
+**结果（61f94b2 后，artifacts/prefill_tail_fix_20261106.json）**：
+ttft@2048 **dmlx 15.89s vs omlx 15.70s = -1.2%**（起点 -11.6%，噪声
+±4% 内）——prefill 战线宣告实质性追平。轨迹：16.88 -> 16.63
+(bf16 门控) -> 16.22 (conv v2) -> 15.89 (tail 融合生效)。
