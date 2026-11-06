@@ -1,280 +1,370 @@
-# dmlx — The Local AI-Native Engine for Apple Silicon
+# dmlx
+
+**A Zig inference runtime for Apple Silicon, built for model-specific speculative decoding and memory-bounded local execution.**
 
 [![CI](https://github.com/zouyee/dmlx/actions/workflows/ci.yml/badge.svg)](https://github.com/zouyee/dmlx/actions/workflows/ci.yml)
+[![macOS](https://img.shields.io/badge/platform-macOS-black?logo=apple)](https://support.apple.com/macos)
+[![Apple Silicon](https://img.shields.io/badge/hardware-Apple%20Silicon-555)](https://support.apple.com/en-us/116943)
+[![Zig](https://img.shields.io/badge/Zig-0.16%2B-F7A41D?logo=zig&logoColor=white)](https://ziglang.org/)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Frontier models, fully on your Mac — and faster than the frameworks built for it.**
+`dmlx` runs local language models through a Zig-controlled serving and inference stack backed by Apple MLX, custom Metal kernels, and a separate native path for SSD-streamed MoE models.
 
-dmlx is a Zig-native inference engine for Apple Silicon: no Python runtime, a custom Metal
-kernel layer over MLX, and a serving core built for local-first AI — private, offline,
-zero API cost. It runs **Qwen3.8-27B with MTP speculative decoding faster than omlx-mtp**
-(the current fastest MLX-based MTP stack) and **284B-parameter DeepSeek V4 Flash on a
-48GB MacBook Pro** through packed expert streaming.
+Its two flagship paths are:
 
-```
-Local-first: your weights, your memory, your wire speed — nothing leaves the machine.
-```
+- **Qwen3.8-27B-4bit + MTP** — model-specific speculative decoding with GPU-chained drafts, multi-token verification, rollback, and an adaptive draft-depth controller.
+- **DeepSeek V4 Flash + native expert streaming** — a 284B-parameter MoE checkpoint running within a 48GB unified-memory budget by keeping a bounded expert hot set in RAM and reading cold experts from SSD.
 
----
-
-## Benchmarks: dmlx vs omlx-mtp (Qwen3.8-27B-4bit, M4 Pro 48GB, 2026-11-06)
-
-Same model, same greedy workloads, interleaved A/B (reps=3-5, prefix-cache nonce):
-
-| Metric | dmlx | omlx-mtp | Δ |
-|---|---:|---:|---:|
-| Decode headline (non-thinking) | **43.2 t/s** | 36.1 t/s | **+19.7%** |
-| Decode headline (thinking, aligned) | **40.5 t/s** | 35.6 t/s | **+13.8%** |
-| — code (thinking) | 47.1 | 37.7 | +24.9% |
-| — math (thinking) | 46.6 | 42.3 | +10.2% |
-| TTFT (short prompt) | **0.28 s** | 0.91 s | **3.2× faster** |
-| TTFT @512 tokens | **4.34 s** | 4.62 s | +6% |
-| TTFT @2048 tokens | 16.15 s | 15.94 s | parity (−1.3%, within noise) |
-
-Prefill on both engines is bound by the same stock 4-bit qmm rate (6.7 TF/s on M4 Pro);
-dmlx ships the steel BM=64 tile (bit-exact, 1.05-1.12× over stock) plus fused GDN
-conv/tail kernels, closing prefill to parity. Decode wins come from the verify engine:
-fused GDN verify tail, sg8/split-K verify qmm routing, a compiled drafter step, and an
-adaptive draft-depth controller with per-content acceptance tracking.
-
-Artifacts: `artifacts/final_nothink_20261106.json`, `artifacts/final_think_20261106.json`,
-`artifacts/think_latch_20261106.json`. Harness: `scripts/compare_engines.py`.
+> **Project status:** experimental. The flagship configurations below are benchmarked and exercised regularly. Other registered model architectures are compatibility paths, not equivalent claims of production readiness.
 
 ---
 
-## Quick Start
+## Why dmlx
 
-```bash
-# Install dependencies
-brew install zig mlx-c
+### Model-aware speculative decoding
 
-# Build
-git clone https://github.com/zouyee/dmlx.git && cd dmlx
-make
+The Qwen3.8 path does more than call a generic draft model:
 
-# Serve Qwen3.8-27B with MTP speculative decoding (recommended)
-./zig-out/bin/dmlx serve --model ~/models/Qwen3.8-27B-4bit \
-  --speculative-mtp 7 --port 8080
+- a dedicated MTP head with its own cache
+- GPU-chained greedy drafting with one synchronization per round
+- one target forward over the proposed block
+- transactional commit and rollback of target and drafter state
+- online depth selection from observed round cost and conditional acceptance
+- shape-routed quantized matmul kernels for verify workloads
 
-# DeepSeek V4 Flash (native mode; one-time expert packing required)
-python3 scripts/repack_experts.py ~/models/DeepSeek-V4-Flash-4bit
-./zig-out/bin/dmlx serve --model ~/models/DeepSeek-V4-Flash-4bit \
-  --port 8080 \
-  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
-  --native
+### Models larger than unified memory
 
-# Query the server (OpenAI-compatible)
-curl http://localhost:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}]}'
-```
+The DeepSeek V4 native path does not try to preload every routed expert. It combines:
 
----
+- packed expert files with direct `pread`
+- a bounded SMELT hot-expert cache
+- asynchronous cold-expert loading
+- native Metal kernels for attention and routed MoE execution
 
-## Positioning: Local AI-Native
+On a 48GB Mac, the safe default is `NATIVE_SMELT_N=20`. Full expert preload would require roughly 147GB and is intentionally unsupported on this hardware class.
 
-Not "a Python framework ported to Mac" — an engine designed from the metal up for
-**running frontier models locally**:
+### An inspectable local runtime
 
-| | Python stacks (mlx-lm / vLLM-ish) | dmlx |
-|---|---|---|
-| Runtime | ~500MB+ Python, GC pauses | ~10MB static Zig binary, zero GC |
-| Kernels | stock MLX dispatch | custom Metal layer: fused GDN conv/tail, verify-regime qmm (sg8/split-K/mma), compiled drafter steps |
-| Speculative decoding | fixed depth | adaptive controller, per-content acceptance evidence, greedy GPU-chained drafts |
-| Long context | RAM-limited | RAM+SSD tiered KV, 128K+ |
-| MoE at 284B | OOM on 48GB | packed expert streaming, bounded hot cache |
-| iOS embedding | No | Yes (C ABI) |
+The service, scheduler, model adapters, cache management, and performance-critical dispatch logic live in Zig. Python is used for conversion, oracle checks, and benchmark tooling, but the serving process does not require a Python runtime.
 
-**The point is not just speed — it is that the model is yours: offline, private,
-inspectable down to the kernel.**
+The MLX-backed path still depends on `mlx-c`; “Zig-controlled” does not mean “MLX-free.” The DeepSeek V4 `--native` path is the separate native execution path.
 
 ---
 
-## The Two Flagship Paths
+## Choose a path
 
-### Qwen3.8-27B (dense hybrid GDN + attention, MTP)
-
-```bash
-./zig-out/bin/dmlx serve --model ~/models/Qwen3.8-27B-4bit --speculative-mtp 7
-```
-
-- MTP speculative decoding with an adaptive depth controller (1-7), greedy GPU-chained
-  draft chain (one sync per round), target-verify with commit/rollback
-- Hybrid GDN (linear attention) + partial-RoPE full attention; fused prefill conv (v2,
-  vectorized bf16-direct) and fused out-gate norm tails on both prefill and verify
-- Verify qmm routing: split-K (M=2-5) / sg8 simdgroup-matrix (M=6-8) / experimental mma
-  (`DMLX_VERIFY_QMM_MMA=1`); steel BM=64 tile on prefill projections (bit-exact)
-- Thinking-mode aligned comparisons supported (`dmlx-think-aligned` arm)
-
-### DeepSeek V4 Flash (284B MoE on 48GB)
-
-| Metric | Measured value |
-|---|---:|
-| Standard short-run effective throughput | **1.236 tok/s** (median of 3×5-token requests) |
-| Long-decode diagnostic | 1.950 tok/s (100 tokens, diagnostic only) |
-| Startup to health-ready | 6.163 s |
-| Correctness | Paris PASS; 7/7 E2E PASS |
-
-Machine-readable artifact: [`performance-benchmark.json`](docs/en/analysis/performance-benchmark.md).
-**Native mode (`--native`) is the recommended path**, with `NATIVE_SMELT_N=20` as the
-safe 48GB default.
+| Path | Execution | Best for | Status |
+|---|---|---|---|
+| Qwen3.8-27B-4bit + MTP | Zig runtime + `mlx-c` + custom Metal kernels | Fast local decode and speculative-decoding research | **Flagship / benchmarked** |
+| DeepSeek V4 Flash | Native engine + packed SSD-streamed experts | Running a 284B MoE model under a 48GB memory budget | **Flagship / benchmarked** |
+| Llama-like, Mistral, Qwen2/3, Gemma, GLM-4, Phi/Phi-3, LLaVA, GLM-5 Next | MLX-backed registry adapters | Compatibility and development | **Implemented / model-dependent** |
+| n-gram speculation, PLD, EAGLE, DSpark and alternate Metal paths | Mixed | Kernel and decoding experiments | **Experimental** |
 
 ---
 
-## How It Works: 5-Layer Memory Optimization (DSV4)
+## Quick start
 
-```
-Full model (568GB BF16)
-  │
-  ├─ Layer 1: MoE Expert Streaming    138GB → 10GB   (load only active 6/256 experts)
-  ├─ Layer 2: Exact Q4 + SMELT N=20     ~11GB hot expert cache (safe 48GB default)
-  ├─ Layer 3: CSA/HCA Attention         KV cache 9.5× smaller than V3
-  ├─ Layer 4: 6 KV Cache Strategies     Standard|Rotating|Quantized|Paged|Tiered
-  └─ Layer 5: Zero-Copy Loading         137s → 46s startup (mmap + batched I/O)
-```
+### Requirements
 
-<details>
-<summary><b>Layer details</b></summary>
-
-- **Layer 1: MoE Expert Streaming** — top-6 of 256 experts per token, on-demand pread
-  from SSD (Trust OS mode). `src/models/expert_stream.zig`, `src/models/expert_cache.zig`.
-- **Layer 2: SMELT** — bounded hot expert residency; full 256-expert preload (~147GB)
-  is prohibited on 48GB; `NATIVE_SMELT_N=20` ≈ 11GB is the safe default.
-- **Layer 3: CSA + HCA hybrid attention** — Compressed Sparse (m=4) + Heavily
-  Compressed (m'=128), FP8 KV: 9.5× smaller KV cache than V3.
-- **Layer 4: Six KV cache strategies** — Standard / Rotating / Quantized / Paged
-  (default, 32-token pages + CoW) / PagedQuantized / Tiered (RAM hot + SSD cold).
-- **Layer 5: Zero-Copy Loading** — binary index cache (67s → ~1s), direct mmap,
-  sequential readahead. 137s → 46s startup.
-
-</details>
-
----
-
-## Features
-
-**Inference Engine**
-- Architectures: DeepSeek V4, Qwen3.5/3.8 (hybrid GDN), LLaMA, Mistral, Qwen2/3,
-  Gemma, GLM-4, Phi, Phi-3
-- OpenAI + Anthropic API compatible HTTP server (SSE streaming)
-- Speculative decoding: MTP (Qwen3.8, adaptive depth), PLD + EAGLE
-- Guided decoding (JSON Schema / Regex FSM), prefix cache with LRU eviction
-- Quantization: INT4/INT8, MXFP4, FP8, TurboQuant
-- QLoRA fine-tuning, tool calling, vision (LLaVA)
-
-**MLX Bindings**
-- 200+ operations, autograd, NN layers, mx.compile op fusion
-- Type-safe Zig API over mlx-c (Metal GPU + CPU Accelerate)
-
-**Custom Metal kernel layer** (code-generated at runtime, all with kill switches)
-- GDN: fused prefill conv+silu, fused out-gate norm tails (prefill + verify regimes),
-  pipelined delta-rule recurrence (ported from oMLX, Apache-2.0)
-- verify qmm: split-K / sg8 / mma morphologies with shape-based routing
-- coarse 2-bit draft head + exact top-k rescore
-- steel BM=64 prefill qmm tile (flattened steel headers, bit-exact vs stock)
-
----
-
-## Installation
-
-**Requirements**: macOS Apple Silicon (M1-M4) + Zig 0.16.0 + mlx-c
+- macOS on Apple Silicon
+- Zig 0.16 or newer
+- `mlx-c`, discoverable through `pkg-config` or an explicit prefix
 
 ```bash
 brew install zig mlx-c
+
+zig version
+pkg-config --modversion mlxc
 ```
 
-**Build from source:**
+If `pkg-config` cannot locate `mlx-c`, set `MLX_C_PREFIX` or pass `-Dmlx_prefix=/path/to/mlx-c` to `zig build`.
+
+### Build
 
 ```bash
 git clone https://github.com/zouyee/dmlx.git
 cd dmlx
-make              # Build (ReleaseFast)
-make test         # Unit tests (460+)
-make benchmark    # Full benchmark (build + unit tests + perf + 7-prompt e2e + report)
-make check        # Everything: build + test + verify + benchmark
+zig build -Doptimize=ReleaseFast
 ```
 
-The native benchmark emits both the human-readable report and the authoritative
-schema-v1 JSON artifact:
+The binary is written to `zig-out/bin/dmlx`.
+
+### Serve Qwen3.8-27B with MTP
+
+The target model and MTP drafter are separate checkpoints.
 
 ```bash
-NATIVE_SMELT_N=20 bash scripts/run_benchmark.sh
+export DMLX_QWEN38_MTP_DIR=~/models/Qwen3.8-27B-MTP-4bit
+
+./zig-out/bin/dmlx serve \
+  --model ~/models/Qwen3.8-27B-4bit \
+  --mlx \
+  --speculative-mtp 7 \
+  --port 8080
 ```
 
-The standard result is always the median of three 5-token requests. The 100-token
-request is a separate diagnostic. Packed experts are required at
-`<model_path>/packed_experts/`.
+`--speculative-mtp 7` sets the adaptive controller’s ceiling; it does not force every round to draft seven tokens.
 
-**As a Zig dependency** (`build.zig.zon`):
+MTP performance measurements must use non-streaming requests. The current streaming route does not exercise the same speculative path.
 
-```zig
-.dependencies = .{
-    .dmlx = .{
-        .url = "https://github.com/zouyee/dmlx/archive/refs/tags/v0.0.5.tar.gz",
-        .hash = "...",
-    },
-},
+### Serve DeepSeek V4 Flash in native mode
+
+Pack the routed experts once:
+
+```bash
+python3 scripts/repack_experts.py ~/models/DeepSeek-V4-Flash-4bit
 ```
+
+Then start one server instance:
+
+```bash
+pkill -f "dmlx serve" 2>/dev/null; sleep 1
+
+NATIVE_SMELT_N=20 ./zig-out/bin/dmlx serve \
+  --model ~/models/DeepSeek-V4-Flash-4bit \
+  --expert-packed-dir ~/models/DeepSeek-V4-Flash-4bit/packed_experts \
+  --native \
+  --port 8080
+```
+
+Do not use full expert preload on a 48GB machine. One DeepSeek V4 server already holds model weights and an expert cache; running two instances can exhaust unified memory.
+
+### Query the server
+
+```bash
+curl http://127.0.0.1:8080/health
+
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "default",
+    "messages": [{"role": "user", "content": "Explain unified memory briefly."}],
+    "max_tokens": 64,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+The server exposes OpenAI-style Chat Completions and an Anthropic-style Messages endpoint. It does not claim full compatibility with every endpoint or response field from either hosted API.
 
 ---
 
-## Architecture
+## Benchmarks
 
+Benchmark claims in this README are deliberately narrow. Each result names its model, hardware, content mode, and raw artifact. Do not compare results across different prompt templates, thinking modes, sampling settings, cache states, or metric definitions.
+
+### Qwen3.8-27B-4bit speculative decode
+
+- **Hardware:** Apple M4 Pro, 48GB unified memory
+- **Model:** local Qwen3.8-27B-4bit target with the same MTP drafter for both engines
+- **Protocol:** greedy, non-streaming, one server at a time, prefix cache disabled or defeated, interleaved A/B
+- **Metric:** streamed token-equivalent content deltas per second during decode; the protocol observed one delta per token for these engines, but SSE does not guarantee this generally
+
+| Workload | dmlx | omlx-mtp | Difference | Source |
+|---|---:|---:|---:|---|
+| Non-thinking decode headline | **43.2/s** | 36.1/s | **+19.7%** | [`final_nothink_20261106.json`](artifacts/final_nothink_20261106.json) |
+| Aligned thinking decode headline | **40.5/s** | 35.6/s | **+13.8%** | [`think_latch_20261106.json`](artifacts/think_latch_20261106.json) |
+| Thinking, code | **47.1/s** | 37.7/s | **+24.9%** | [`think_latch_20261106.json`](artifacts/think_latch_20261106.json) |
+| Thinking, math | **46.6/s** | 42.3/s | **+10.2%** | [`think_latch_20261106.json`](artifacts/think_latch_20261106.json) |
+| Short-prompt TTFT, non-thinking | **0.28s** | 0.91s | **3.2× lower** | [`final_nothink_20261106.json`](artifacts/final_nothink_20261106.json) |
+
+The headline is the arithmetic mean of the `code`, `prose`, and `math` prompt results. The intentionally predictable `count` prompt is excluded. “Aligned thinking” means both arms receive the same explicit reasoning directive; unaligned thinking outputs are not comparable because speculative acceptance depends on the text each engine generates.
+
+The harness, prompt set, aggregation, cache controls, and metric definitions are in [`scripts/compare_engines.py`](scripts/compare_engines.py). The raw artifacts currently report engine versions as `?`; treat the figures as a recorded local result, not a portable guarantee.
+
+Historical comparisons against `mlx-vlm` and `mlx-lm` are not used as headline claims because several earlier runs mixed decode-only rates with end-to-end rates or compared speculative and non-speculative execution. The common-basis result against `mlx-vlm` was parity, not a demonstrated win. See [`HANDOFF.md`](HANDOFF.md) for the measurement history and withdrawn conclusions.
+
+### DeepSeek V4 Flash native path
+
+- **Hardware:** Apple M4 Pro, 48GB
+- **Configuration:** native mode, packed experts, `NATIVE_SMELT_N=20`
+- **Source of truth:** [`performance-benchmark.json`](docs/en/analysis/performance-benchmark.json)
+
+| Metric | Result |
+|---|---:|
+| Standard effective completion throughput | **1.236 tok/s** — median of three 5-token HTTP requests |
+| Long-decode diagnostic | 1.950 tok/s — 100 tokens, excluded from the standard median |
+| Startup to health-ready | 7.218s |
+| Peak RSS | 21,829,861,376 bytes, about 20.3GiB |
+| Correctness | Paris PASS; 7/7 end-to-end prompts PASS |
+
+See the [human-readable report](docs/en/analysis/performance-benchmark.md) for request-level timings, telemetry coverage, configuration, and unavailable metrics. In particular, the report does **not** claim a true HTTP TTFT measurement for this run.
+
+### Reproduce locally
+
+```bash
+# Qwen3.8 benchmark
+EXTRA_SERVE_FLAGS="--speculative-mtp 7" \
+  bash scripts/run_benchmark_qwen38.sh ~/models/Qwen3.8-27B-4bit
+
+# DeepSeek V4 correctness
+bash scripts/dsv4_smoke.sh
+bash scripts/run_kernel_tests.sh
+bash scripts/run_mla_attention_test.sh
+
+# DeepSeek V4 standard benchmark
+NATIVE_SMELT_N=20 bash scripts/run_benchmark.sh --native \
+  ~/models/DeepSeek-V4-Flash-4bit
 ```
+
+Benchmark numbers are hardware-, model-, prompt-, and version-specific. Please attach the raw artifact when reporting a result.
+
+---
+
+## How the Qwen3.8 MTP path works
+
+```text
+prompt
+  │
+  ├─ target prefill ───────────────► first target token
+  │                                      │
+  │                                 MTP head cache
+  │                                      │
+  └─► adaptive draft chain: d1 → d2 → … → dN
+                                         │
+                         one target verify over [token, d1…dN]
+                                         │
+                         accept longest matching prefix
+                                         │
+                         commit accepted state / rollback rejected state
+                                         └─► next round
+```
+
+Important implementation points:
+
+- `src/models/qwen38_mtp.zig` — MTP head, cache, chained draft body, coarse candidate head
+- `src/models/qwen38_gdn.zig` — Gated DeltaNet prefill, verify, decode, and custom kernels
+- `src/models/verify_qmm.zig` — shape-based split-K and simdgroup-matrix routing
+- `src/model_registry.zig` — target/drafter adapter, prompt priming, commit, and rollback
+- `src/engine/engine_loop.zig` — speculative request loop and adaptive depth controller
+
+---
+
+## How DeepSeek V4 fits in 48GB
+
+The routed MoE has 256 experts per layer and activates six per token. Loading every expert for every layer would require about 147GB even in the packed format, so the native path uses a bounded working set:
+
+```text
+request
+  │
+  ├─ resident non-expert weights
+  ├─ SMELT hot experts in unified memory
+  └─ cold expert miss
+       └─ async pread from packed_experts/
+            └─ routed Metal kernel
+```
+
+Approximate memory budget for the tested 48GB machine:
+
+| Component | Approximate memory |
+|---|---:|
+| Non-expert model weights | ~5GB |
+| Attention and mHC weights | ~2GB |
+| SMELT expert cache, `N=20` | ~11GB |
+| Metal buffers | ~2–3GB |
+| OS and other processes | ~3–5GB |
+
+`N=20` leaves room for the OS page cache and is the recommended default. Larger hot sets can improve hit rate but approach the machine’s memory limit quickly.
+
+---
+
+## API and runtime boundaries
+
+Currently exposed routes:
+
+- `POST /v1/chat/completions`
+- `POST /v1/messages`
+- `GET /health`
+- `POST /shutdown`
+
+Current boundaries:
+
+- the HTTP service starts with one configured model
+- request handling is currently serialized through the active engine path
+- MTP performance measurements use non-streaming requests
+- registered architecture support is broader than the set of continuously benchmarked checkpoints
+- experimental speculative methods and alternate Metal paths may have no stable server entry point
+
+These boundaries are intentional documentation, not a roadmap promise.
+
+---
+
+## Build, test, and benchmark
+
+```bash
+make                 # ReleaseFast build
+make test            # build + unit tests
+make verify          # model-backed DeepSeek V4 verification
+make benchmark       # DeepSeek V4 benchmark; requires local model and packed experts
+make check           # test + verify + benchmark
+```
+
+Metal changes should also run:
+
+```bash
+bash scripts/run_kernel_tests.sh
+bash scripts/run_mla_attention_test.sh
+```
+
+Model-backed commands require the corresponding local checkpoints and enough unified memory. They are not part of a lightweight dependency-only test run.
+
+---
+
+## Repository map
+
+```text
 src/
-├── main.zig                # CLI (chat, serve, benchmark)
-├── models/                 # DeepSeek V4, Qwen3.8, LLaMA, Qwen, Gemma, ...
-│   ├── deepseek_v4.zig     # MLA + CSA/HCA + MoE
-│   ├── qwen38.zig          # Qwen3.8 serving model (hybrid GDN + attention)
-│   ├── qwen38_gdn.zig      # GDN block: fused conv/tail kernels, pipelined recurrence
-│   ├── qwen38_mtp.zig      # MTP drafter: compiled decode steps, coarse draft head
-│   ├── verify_qmm.zig      # verify-regime quantized matmul routing (sg8/split-K/mma)
-│   ├── qwen38_qmm_v8.zig   # steel BM=64 prefill qmm tile
-│   ├── expert_stream.zig   # On-demand expert loading from SSD
-│   └── expert_cache.zig    # Expert cache (disabled by default — Trust OS)
-├── engine/                 # Inference engine
-│   ├── engine_loop.zig     # Main loop + prefix cache + MTP depth controller
-│   └── prefix_cache.zig    # LRU prefix cache
-├── server/                 # HTTP server (OpenAI + Anthropic API)
-├── kvcache/                # 6 strategies (standard → tiered)
-├── tokenizer/              # BPE tokenizer
-├── speculative.zig         # PLD + EAGLE
-├── guided.zig              # JSON/Regex constrained decoding
-└── trainer.zig             # QLoRA + AdamW
+├── main.zig                 CLI and command dispatch
+├── model_registry.zig       model adapters and MTP integration
+├── engine/                  request loop, scheduling, prefix cache
+├── server/                  HTTP endpoints and request handling
+├── models/
+│   ├── qwen38.zig           Qwen3.8 target model
+│   ├── qwen38_mtp.zig       Qwen3.8 MTP drafter
+│   ├── qwen38_gdn.zig       GDN implementation and kernels
+│   ├── verify_qmm.zig       verify-shape quantized matmul routing
+│   ├── deepseek_v4.zig      DeepSeek V4 model path
+│   ├── expert_stream.zig    packed expert I/O
+│   └── expert_cache.zig     bounded expert residency
+├── kvcache/                 KV-cache strategies
+├── tokenizer/               tokenizer implementations
+├── guided.zig               regex and JSON-constrained decoding
+└── trainer.zig              local training experiments
+
+scripts/                     conversion, correctness, profiling, benchmarks
+artifacts/                   raw benchmark and diagnostic outputs
+docs/                        design notes and measured reports
 ```
-
----
-
-## Use Cases
-
-- **Local inference** — frontier-class intelligence on-device, zero API costs
-- **Privacy/compliance** — HIPAA/GDPR: all data stays on your hardware
-- **Edge server** — Mac mini as a team inference server (OpenAI API drop-in)
-- **Offline** — download once, run anywhere without internet
-- **Research** — modify MoE routing, swap KV strategies, test quantization formats,
-  iterate on speculative-decoding depth policy
 
 ---
 
 ## Documentation
 
-| | |
+| Document | Purpose |
 |---|---|
-| [Technical Deep Dive](docs/en/deepseek-moe/README.md) | How 284B runs on 48GB |
-| [Performance Benchmark](docs/en/analysis/performance-benchmark.md) | DSV4 numbers |
-| [HANDOFF.md](HANDOFF.md) | Qwen3.8 MTP campaign log (kernel-level attribution) |
-| [Optimization Roadmap](docs/analysis/optimization-roadmap.md) | What's next |
-| [Contributing](CONTRIBUTING.md) | Developer guidelines |
+| [DeepSeek V4 benchmark report](docs/en/analysis/performance-benchmark.md) | Current native benchmark, protocol, and telemetry |
+| [DeepSeek MoE technical notes](docs/en/deepseek-moe/README.md) | Packed experts and native MoE execution |
+| [Qwen3.8 MTP engineering history](HANDOFF.md) | Optimization campaign, measurement corrections, and remaining limits |
+| [MTP framework plan](docs/analysis/mtp-framework-plan.md) | Direction for a reusable speculative-decoding framework |
+| [Contributing](CONTRIBUTING.md) | Development workflow |
+| [Changelog](CHANGELOG.md) | Release history |
+
+Some files under `docs/analysis/` are engineering journals rather than current user documentation. Prefer the benchmark artifact and current source when a historical note conflicts with a measured result.
 
 ---
 
 ## Acknowledgments
 
-Built on [Apple MLX](https://github.com/ml-explore/mlx) and `mlx-c`. Custom Metal
-kernels adapted from [DeepSeek TileKernels](https://github.com/deepseek-ai/tilekernels);
-verify-qmm and GDN recurrence morphologies ported from oMLX,
-[MTPLX](https://github.com/youssofal/mtplx), and
-[Splash](https://github.com/incoai/splash) (Apache-2.0); steel GEMM headers
-from MLX (MIT).
+Built on [Apple MLX](https://github.com/ml-explore/mlx) and [`mlx-c`](https://github.com/ml-explore/mlx-c).
+
+Custom kernels and techniques include work adapted from:
+
+- [oMLX](https://github.com/jundot/omlx)
+- [MTPLX](https://github.com/youssofal/mtplx)
+- [Splash](https://github.com/incoai/splash)
+- [DeepSeek TileKernels](https://github.com/deepseek-ai/TileKernels)
+
+See source headers for per-kernel provenance and licenses. Adapted Apache-2.0 and MIT code retains its required attribution.
 
 ## License
 
