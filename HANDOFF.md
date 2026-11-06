@@ -1441,3 +1441,34 @@ shapes/conditions. Kept opt-in (`DMLX_VERIFY_QMM_MMA=1`), not routed by
 default. Remaining decode-side upside is elsewhere: draft-step fusion
 (1.12 ms/step vs ~0.4 floor), and the ~0.9 s prefill@2048 residual
 needs a fresh span profile.
+
+## 2026-11-06 (pm) — conv v2 (prefill 残差) + drafter 编译步 + draft 阶段重新定性
+
+**Prefill@2048 残差收敛（-1.0s -> -0.67s，已进噪声带 ±4%）**。
+新归因（DMLX_LAYER_PROF + GDN_PREFILL_PROF @L=2345）：GDN front 的
+conv 段 26 ms/层（~24 GB/s 有效）是最大项；PRICE_CONV 定价 0.61 s/
+请求。修复（commit `b2c21fd`）：conv kernel v2 = 每线程 channel-quad
+向量化（float4 / vec<bf16,4>）+ x bf16 直读（全张量 f32 promotion
+变 lazy）。bench-gdn-chains：conv 1.18 ms/层（原定价 12.7 ms/层）。
+位平等：同 prompt 温度 0 与 eager fallback 逐字一致。
+compare_engines 复测（`artifacts/prefill_conv_fix_20261106.json`）：
+ttft@2048 dmlx 16.22 vs omlx 15.55（-4.1%，前值 -5.4..-6.3%）。
+
+**Drafter 编译步（commit `17f268f`）**：drafter decode 步 48 次 eager
+dispatch 经 mx.compile 双段（pre/post，中段 KV append + decode SDPA
+保持 eager）压到 ~13 次。kill-switch DMLX_MTP_NO_COMPILE；pre 段失败
+在 cache append 前回退（状态安全）。**实测 wall time 中性**
+（draft=9.9 vs 9.8 ms/round，acceptance 52.1% 逐 token 一致）——
+因为单 sync 的 GPU 链里 CPU 构建时间本就藏在 GPU 后面；价值在并发
+场景的 CPU 释放，不在单流 decode。
+
+**Draft 阶段重新定性（推翻 launch-bound 假设）**：draft=9.9ms/round
+(7 步) 是 GPU-bound：coarse 2-bit lm_head（318MB 读，microbench
+1.69ms @188GB/s）+ argpartition top-64（1.33ms！）每步 ~3.0ms。
+注意 microbench 与 in-context 的 2 倍差异未解（in-context 更快），
+下一步先给 coarseDraftToken 加 in-context 计时再动手。
+**下一个 decode 杠杆：coarse qmm + top-k 单 kernel 融合**（tile 局部
+top-64 + merge，省 1MB logits 写回 + argpartition），预期
+3.0 -> ~1.4ms/step，depth 7 时约 -10ms/round。
+
+C 任务结论已在前一节（mma morphology，带宽上限判定）。
