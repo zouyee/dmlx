@@ -1489,3 +1489,19 @@ norm_w（本次，~0.1s，md5 位平等）。tail 融合从此在 serving 激活
 ttft@2048 **dmlx 15.89s vs omlx 15.70s = -1.2%**（起点 -11.6%，噪声
 ±4% 内）——prefill 战线宣告实质性追平。轨迹：16.88 -> 16.63
 (bf16 门控) -> 16.22 (conv v2) -> 15.89 (tail 融合生效)。
+
+## 终验（2026-11-06 晚，reps=5/reps=3，artifacts/final_{nothink,think}_20261106.json）
+
+**prefill@2048 追平确认**（两个 pair 一致）：
+- 非思考对：dmlx 16.16s vs omlx 15.94s = **-1.3%**
+- 思考对：dmlx 16.35s vs omlx 16.04s = **-1.9%**
+- 均在 ±4% 机器噪声带内；dmlx 六场样本 15.89-16.88。战役起点 -11.6%。
+
+**decode headline（同场，机器热漂移后）**：非思考对 dmlx 43.2 vs
+omlx 36.1（**+19.7%**）；思考对 dmlx 38.0 vs omlx 35.7
+（**+6.4%**）。全天峰值记录：非思考 46.9（+25.6%）、思考 39.7（+8.2%）。
+
+全战线终态：decode 两对全胜，prefill 追平。coarse-head 融合证伪
+（前提数字来自错误的 mlx 构建；真实上限 ~0.5ms/步 ≈ 3%，见
+bench-coarse-head）。剩余长课题：Soft-MTP 接受率上限、M5/NAX
+packed GEMM 移植（换机时）、ANE 混合 prefill（私有 API，灰色）。
