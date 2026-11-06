@@ -179,6 +179,12 @@ fn softmaxProbs(logits: []const f32, temperature: f32, allocator: std.mem.Alloca
 
 /// Speculative-sampling acceptance probability for a draft token:
 /// min(1, p_target / q_draft) with both distributions temperature-shaped.
+fn monotonicNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 fn mtpAcceptProb(target_logits: Array, draft_logits: Array, token: u32, temperature: f32, allocator: std.mem.Allocator) !f32 {
     const p_data = try target_logits.dataSlice(f32);
     const q_data = try draft_logits.dataSlice(f32);
@@ -561,12 +567,16 @@ pub const EngineLoop = struct {
             };
             defer prompt_arr.deinit();
 
+            const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
             const result = generation_mod.generateStep(self.model, prompt_arr, req_caches[i], &req.sampler, self.ctx) catch {
                 req.completion.deliverError(self.io, "Generation failed during prefill");
                 req.phase = .done;
                 success_mask[i] = false;
                 continue;
             };
+            if (pf_t0 != 0) {
+                std.log.info("[PREFILL_TRACE] plain req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+            }
 
             // Check stop tokens.
             if (generation_mod.isStopToken(result.token, req.stop_tokens) or req.max_tokens <= 1) {
@@ -987,6 +997,7 @@ pub const EngineLoop = struct {
             return;
         }
 
+        const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
         const tokens = generation_mod.generate(
             self.model,
             req.prompt_tokens,
@@ -999,6 +1010,9 @@ pub const EngineLoop = struct {
             return;
         };
         defer self.allocator.free(tokens);
+        if (pf_t0 != 0) {
+            std.log.info("[PREFILL_TRACE] plain req={d} prompt={d} generate_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+        }
 
         // Decode all tokens to text.
         const text = self.tokenizer.decode(tokens, self.allocator) catch {
@@ -2037,12 +2051,16 @@ pub const EngineLoop = struct {
         };
 
         // Prefill (resets backbone + drafter) → first token.
+        const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
         const pf = mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
             std.log.err("EngineLoop: MTP prefill failed: {}", .{err});
             req.completion.deliverError(self.io, "MTP: prefill failed");
             return;
         };
         defer pf.logits.deinit();
+        if (pf_t0 != 0) {
+            std.log.info("[PREFILL_TRACE] mtp req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+        }
         var hidden = pf.hidden; // owned; reassigned per round
 
         var t_next = req.sampler.sample(pf.logits, allocator) catch {
