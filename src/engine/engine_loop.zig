@@ -1949,8 +1949,23 @@ pub const EngineLoop = struct {
             // so the argmin sees fresh tail evidence immediately.
             // Opt-out: DMLX_MTP_NO_REEXPLORE=1 (A/B showed the re-entry
             // overshooting on code-class mid-acceptance content).
+            //
+            // Floor is max_n - 2, not max_n - 1 (2026-11-06, math mode
+            // lottery): the ladder probe runs at incumbent+2, so from an
+            // incumbent of 3 it samples depth 5 — and the old max_n-1 floor
+            // never let a 5/5 probe fire the latch. The traces are unambiguous
+            // (math thinking, 6 draws): slow draws park at N=3 and their
+            // rung probes hit 5/5 THREE separate times (e.g. draw 2 rounds
+            // 16/18/20) with no effect; fast draws differ only in having
+            // parked at 7 early. A full-acceptance rung probe is exactly the
+            // phase-change signal the latch was built for — it just could not
+            // reach it. Restore the old floor with DMLX_MTP_REEXPLORE_FLOOR=6.
+            const reexplore_floor: usize = blk: {
+                const s = std.c.getenv("DMLX_MTP_REEXPLORE_FLOOR") orelse break :blk self.max_n -| 2;
+                break :blk std.fmt.parseInt(usize, std.mem.span(s), 10) catch self.max_n -| 2;
+            };
             if (std.c.getenv("DMLX_MTP_NO_REEXPLORE") == null and
-                k + 1 >= n and n >= self.max_n - 1 and self.force_explore == 0)
+                k + 1 >= n and n >= reexplore_floor and self.force_explore == 0)
             {
                 self.force_explore = 3;
             }
