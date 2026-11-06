@@ -2803,7 +2803,7 @@ fn prefillTailFused(
     ctx: EagerContext,
     y_f32: Array, // [L, HV, D] f32, recurrence output
     z: Array, // [1, L, HV*D], qkv dtype
-    norm_w: Array, // [D] f32
+    norm_w: Array, // [D] f32 or bf16 (serving storage; value-exact either way)
     eps: f32,
     L: i32,
     hv: i32,
@@ -2813,7 +2813,11 @@ fn prefillTailFused(
     if (prefill_tail_off == null) prefill_tail_off = std.c.getenv("DMLX_NO_PREFILL_TAIL_FUSION") != null;
     if (prefill_tail_off.?) return null;
     if (prefill_tail_broken) return null;
-    if (y_f32.dtype() != .float32 or z.dtype() != .bfloat16 or norm_w.dtype() != .float32) return null;
+    // norm_w may be bf16 storage (serving): the kernel reads it with
+    // float(norm_w[t]), which is the exact same value the eager chain sees
+    // when MLX's rms_norm widens the bf16 weight — so this is value-exact.
+    if (y_f32.dtype() != .float32 or z.dtype() != .bfloat16 or
+        (norm_w.dtype() != .float32 and norm_w.dtype() != .bfloat16)) return null;
     // T is the qkv dtype: the eager chain rounds y to it before the norm and
     // emits the gate in it. With T=float every rounding is an identity — the
     // serving case, since the (fused or eager) conv emits f32.
@@ -3914,8 +3918,9 @@ pub const Qwen38GDN = struct {
         if (!price_tail) {
             // Verify regime (small L): one simdgroup per (token, head) row,
             // omlx layout. Handles the actual serving dtypes (y f32,
-            // z/norm_w bf16 storage, f32 compute) that prefillTailFused's
-            // bf16-z/f32-w checks reject; prefill keeps its existing path.
+            // z/norm_w bf16 storage, f32 compute); the prefill regime
+            // (L > 16) takes prefillTailFused, which accepts the same
+            // dtypes (norm_w bf16 storage is value-exact, see its check).
             //
             // When the verify qmm kernels are armed, emit the gate in bf16
             // so the out_proj qmm takes the fast verify path. The bf16 store
