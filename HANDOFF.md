@@ -1554,3 +1554,21 @@ omlx tile（±2% 噪声内）。所以 prefill GEMM 从未落后——今日残�
 `#include "mlx/backend/..."`（custom_kernel.cpp 只拼接扁平化
 utils 文本，无 include 搜索路径；python 侧的"成功"是 lazy eval
 没编译的假阳性）——v8 当年的预扁平化是必要的。
+
+## 抖动治理终局 + Soft-MTP/pi-attn 评估(2026-11-06 深夜)
+
+**抖动归因定论**(探针 DMLX_PREFILL_TRACE,commit 36eda65):
+HTTP 墙钟方差 ≈ 引擎内部方差,host 侧增量恒定 ≤30ms —— 抖动 100%
+在 GPU 执行内部(热/功耗/带宽),非代码可调度部分。三天数据 MTP
+0.59/0.25/0.48、plain 0.33/0.53/0.17,模式间大小关系跨会话翻转,
+omlx 0.32 同带。"dmlx 抖动更大"不成立,是采样时机差。无修复项。
+
+**Soft-MTP 评估(~/work/code/Soft-MTP)**:推理侧 = 经典 Leviathan
+speculative sampling(min(1,p/q) 接受 +(p-q)+ 重采样),dmlx 早已实现
+(engine_loop.zig mtpAcceptProb/mtpResampleAdjusted,温度>0 无损)。
+其增益全在训练侧(KL 梯度恢复 trick),与我们"不重训"定位冲突,不适用。
+
+**pi-attn 评估(~/work/code/pi-attn)**:CUDA 专用(sm_80/89),核心
+价值是 bitwise 确定性(fold-group attention 程序、row-invariant GEMM)
+而非速度。移植到 Metal 是自研 kernel 大工程,无吞吐收益;若将来做
+"确定性模式"差异化特性可再议。
