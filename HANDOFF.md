@@ -1599,3 +1599,48 @@ coarse head 精确 rescore 提取 (l_max, top1-top2 margin) 特征,verify
 控制器的 E[t] 模型供预测 p̂(解决跨深度证据陈旧问题),但需对未观测
 深度外推,预期收益小,缓议。AVTRACE 作为诊断工具保留(默认关闭,
 开销可忽略:64 元素 sort/步)。
+
+## SpecExtend 前提实测(2026-11-07)——B 证伪,不适用
+
+问题:我们的 MTP 头在长上下文是否像 EAGLE 系 drafter 那样退化
+(论文:EAGLE-3 在 4K 后 τ 4.65→1.82)。方法:MTP server,重复
+filler 词构造 1K/4K/8K/16K prompt,greedy 128 tok,每档 3 发,
+读 server 日志的逐请求接受率:
+
+- 1K: 52.0/50.0/44.9(均值 ~49%)
+- 4K: 53.3/54.9/52.8(~54%)
+- 8K: 49.2/48.0/53.6(~50%)
+- 16K: 50.0/48.9/63.3(~54%)
+
+接受率完全平坦(条件接受率 p1 稳定 0.71-0.87)。厂商 MTP 头训练
+覆盖了长上下文,SpecExtend/CMR 针对的问题在我们这里不存在。
+verify 时间随上下文增长(87→272ms/round)是 attention 成本,与
+draft 质量无关。CMR 类方案不修不存在的问题,关闭。
+caveat:filler 词内容只压 KV 长度不压语义检索;长推理(32K 生成)
+场景未覆盖,但 16K 已远超 EAGLE-3 崩溃点(4K),前提已足够证伪。
+
+## NPUMoE/ANE 方向 spike(2026-11-07)——D 证伪,不做
+
+方法:scripts/bench_ane_gemm.py(coremltools 9.0,~/venvs/dmlx-ane
+py3.13;cmp venv 的 py3.14 无 coremltools native wheel)。CoreML FP16
+静态 matmul,CPU_AND_NE,M=2048,7 个 prefill 投影 shape vs dmlx v8
+qmm 同 shape 实测(run-bench-prefill-v8,本机同日下午):
+
+| shape | CoreML FP16 | dmlx v8 4bit | 比 |
+|---|---|---|---|
+| gdn_qkv | 38.8ms | 31.4ms | 0.81x |
+| gdn_z | 24.0 | 19.0 | 0.79x |
+| gdn_out | 34.8 | 18.9 | 0.54x |
+| attn_q | 46.1 | 37.8 | 0.82x |
+| attn_o | 34.6 | 18.8 | 0.54x |
+| mlp_gate | 65.2 | 53.1 | 0.81x |
+| mlp_down | 359.3(疑 fallback) | 53.4 | 0.15x |
+
+加权全 pass:CoreML 33.1s(2.28 TF/s)vs dmlx 11.0s(6.75 TF/s)。
+即使修掉 mlp_down 异常、扣掉 fp32 I/O cast 开销,天花板 ~5.6 TF/s
+FP16 仍低于 4-bit qmm 的 6.75。另有结构性成本未计:CPU↔ANE 同步、
+routing/top-k 留 CPU、GDN 层(64 层中 48 层)CoreML 无算子。
+
+结论:ANE 的价值是相对 CPU 基线(NPUMoE 论文的基线正是 CoreML
+CPU),不是相对调优 GPU;能效场景另说,但对"prefill 反超"目标
+无益。方向关闭,不用 CoreML/ANE 做 GEMM 加速。
