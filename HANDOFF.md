@@ -1684,3 +1684,44 @@ prose 的 +9.7% 不能复现,math 的大幅波动是已知慢模态彩票而非
 opt-in(与既有 DMLX_MTP_* 死方向开关同一约定),默认关闭,
 不再迭代。剩余差距回到清单第 1 项(KV cache 量化,长上下文
 verify 成本 87→272ms/round 是实测的线性增长)。
+
+## Verify split-KV SDPA(FlashDecoding 式)落地(2026-11-07)
+
+动机:16K 上下文 verify 180-193ms/轮,DMLX_VERIFY_NO_ATTN_CORE=1
+诊断显示 attention 核占 ~100-110ms(~55%)。M=1 decode 早有融合
+SDPA + 2-pass split(kv>=1024),verify(L=2..8 行)一直走 stock
+composed 路径(L*GQA=48 超出向量 kernel 32 行预算)。
+
+实现(src/models/qwen38_attn.zig sdpaVerifySplit):移植 omlx
+patches/qwen35_verify_sdpa_split.py 的 `_wide_causal_sdpa`——
+每 (q head, KV 分块) 一个 threadgroup 持全部 8 行(4 个 simdgroup
+各 64 维),32-key 块在线 softmax,第二个 kernel 按 LSE 合并分块。
+硬编 D=256/H=24/HKV=4/bf16(落闸不满足即回退 stock);
+`DMLX_VERIFY_SDPA_SPLIT=0` 可关。一次性日志 `[verify-split]`
+报落闸原因/engaged。数值等价单测(L=3/8 × T=40/1500 含多分块,
+bf16 容差 2e-2)随 473 测试全绿。
+
+测量:
+- kernel 级(scripts/bench_verify_sdpa.py,H24/HKV4/D256/L8/bf16,
+  kv=16400):stock 63.2ms vs wide 8.0ms,8×,max|Δ|=3e-4。
+  注意:stock 的 63ms 主要是 python 侧 composed 路径的 dispatch
+  开销,引擎内 eager stream 里 stock 远没这么慢——kernel 微基准
+  不能外推到引擎内收益。
+- 引擎内 16K(scripts/ab_verify_split16k.sh,逐请求交错 3rep×2臂,
+  verify ms/round):ON 108.0/121.0/110.2(均 113.1)vs OFF
+  133.8/124.4/123.3(均 127.2)——**-11%**。非交错会话间绝对值
+  漂到 143-193ms,只有交错数可信。
+- 短上下文 4 域回归(artifacts/verify_split_shortctx_20261107.json,
+  dmlx vs dmlx-nosplit):code 40.2/40.3、prose 32.5/32.7、
+  math 38.6/39.1、count 38.7/38.5——零回退,默认 ON 安全。
+
+遗留(下一个挖点):attention 核 100-110ms 里 SDPA 只兑现了 ~14ms;
+其余 ~85ms 是每层 cacheAppend/转置/rope/gate 等 dispatch 密集小
+op(16 层 × ~5 op),方向是把这些融进 kernel 或减少层间同步。
+
+## 发现:16K prefill 病态(未查)
+
+12000 词(~16K tok)prompt 的 wall time ~112s,其中 decode 只占
+~7s——prefill ~100s+,而 2048 tok 只要 1.66s(线性外推 ~13s)。
+超线性爆炸,疑 chunked prefill 或 GDN prefill 长上下文路径。
+与 split-KV 无关,单独立案。

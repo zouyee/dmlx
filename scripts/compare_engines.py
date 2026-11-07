@@ -229,6 +229,16 @@ def engines() -> dict[str, Engine]:
             env={"DMLX_MTP_CLASS_MEMORY": "1", "DMLX_MTP_CLASS_CONFIDENT": "1"},
             note="adaptive MTP ceiling 7 + cross-request content-class memory",
         ),
+        # dmlx with the verify-width split-KV SDPA disabled (A/B arm for the
+        # FlashDecoding-style verify attention kernel; default is ON).
+        "dmlx-nosplit": Engine(
+            name="dmlx-nosplit",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_VERIFY_SDPA_SPLIT": "0"},
+            note="adaptive MTP ceiling 7, verify split-KV SDPA OFF",
+        ),
         # ADAPTIVE with a lower CEILING (not fixed depth). The ceiling was
         # raised 4 -> 7 under the old cost curve; the median-of-8 round cost
         # (7c0d203) changed that model, and the thinking gap is concentrated

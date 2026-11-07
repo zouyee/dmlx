@@ -930,6 +930,354 @@ fn sdpaDecodeFused(
     return Array.fromHandle(out_handle);
 }
 
+// Verify-width split-KV SDPA (L = 2..8 rows) — port of omlx
+// patches/qwen35_verify_sdpa_split.py `_wide_causal_sdpa` (Apache-2.0, tile
+// design adapted there from Splash paged_attention_tile.h). Hardcoded to the
+// Qwen3.8 dense layout: D=256, H=24, HKV=4, 8 padded rows, bf16.
+//
+// Why: stock scaled_dot_product_attention routes this shape (L*GQA = 48 > the
+// vector kernel's 32-row budget) to the composed unfused path, which at 16K
+// context costs ~100-110 ms of a ~190 ms verify round (measured with
+// DMLX_VERIFY_NO_ATTN_CORE=1, 2026-11-07). Here one threadgroup per (q head,
+// key split) holds all 8 rows: 4 simdgroups own 64 head dims each, partial
+// scores meet in threadgroup memory once per 32-key block, online softmax
+// runs 16 threads per row, and a second launch merges the splits with the
+// log-sum-exp pairs. Causal: row r attends keys <= kv_len - L + r (the same
+// bottom-right alignment stock "causal" gives this shape).
+const sdpa_verify_partial_body =
+    \\    constexpr int D = 256;
+    \\    constexpr int BK = 32;
+    \\    constexpr int SS = 36;   // padded partial-S row stride (floats)
+    \\    constexpr int PS = 40;   // padded P row stride (bf16)
+    \\    uint tid = thread_position_in_threadgroup.x;
+    \\    uint sg = tid / 32;
+    \\    uint lane = tid % 32;
+    \\    int qh = int(threadgroup_position_in_grid.x);
+    \\    int split = int(threadgroup_position_in_grid.y);
+    \\    int h = qh / 6;          // GQA factor 6: kv head = q head / 6
+    \\    int T = int(params[0]);
+    \\    int L = int(params[1]);
+    \\    int chunk = int(params[2]);
+    \\    float scale = as_type<float>(params[4]);
+    \\    int t_begin = split * chunk;
+    \\    int t_end = min(t_begin + chunk, T);
+    \\    const int khs = k_head_stride_in[0];
+    \\    const int kss = k_seq_stride_in[0];
+    \\    const int vhs = v_head_stride_in[0];
+    \\    const int vss = v_seq_stride_in[0];
+    \\
+    \\    threadgroup float Sp[4 * 8 * SS];
+    \\    threadgroup bfloat16_t P[8 * PS];
+    \\    threadgroup float st_m[8];
+    \\    threadgroup float st_l[8];
+    \\    threadgroup float st_a[8];
+    \\
+    \\    const device bfloat16_t* qp = q + qh * 8 * D + int(sg) * 64;
+    \\    simdgroup_matrix<bfloat16_t, 8, 8> qa[8];
+    \\    for (int dk = 0; dk < 8; ++dk)
+    \\        simdgroup_load(qa[dk], qp + dk * 8, D);
+    \\    const device bfloat16_t* kh = k + h * khs + int(sg) * 64;
+    \\    const device bfloat16_t* vh = v + h * vhs + int(sg) * 64;
+    \\
+    \\    simdgroup_matrix<float, 8, 8> o[8];
+    \\    for (int j = 0; j < 8; ++j) o[j] = simdgroup_matrix<float, 8, 8>(0.0f);
+    \\    if (tid < 8) {
+    \\        st_m[tid] = -INFINITY;
+    \\        st_l[tid] = 0.0f;
+    \\    }
+    \\    short qid = short(lane / 4);
+    \\    short fm = (qid & 4) + short((lane / 2) % 4);
+    \\
+    \\    for (int t0 = t_begin; t0 < t_end; t0 += BK) {
+    \\        for (int c = 0; c < 4; ++c) {
+    \\            int ts = min(t0 + c * 8, T - 8);
+    \\            simdgroup_matrix<float, 8, 8> s = simdgroup_matrix<float, 8, 8>(0.0f);
+    \\            for (int dk = 0; dk < 8; ++dk) {
+    \\                simdgroup_matrix<bfloat16_t, 8, 8> kb;
+    \\                simdgroup_load(kb, kh + ts * kss + dk * 8, kss, ulong2(0, 0), true);
+    \\                simdgroup_multiply_accumulate(s, qa[dk], kb, s);
+    \\            }
+    \\            simdgroup_store(s, Sp + int(sg) * 8 * SS + c * 8, SS);
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\        {
+    \\            int r = int(tid) / 16;
+    \\            int cp = (int(tid) % 16) * 2;
+    \\            float sv[2];
+    \\            float rmax = -INFINITY;
+    \\            for (int e = 0; e < 2; ++e) {
+    \\                int col = cp + e;
+    \\                int c = col / 8;
+    \\                int base = t0 + c * 8;
+    \\                int key = min(base, T - 8) + (col - c * 8);
+    \\                bool ok = r < L && key >= base && key < t_end && key <= T - L + r;
+    \\                float val = Sp[r * SS + col] + Sp[8 * SS + r * SS + col]
+    \\                    + Sp[16 * SS + r * SS + col] + Sp[24 * SS + r * SS + col];
+    \\                sv[e] = ok ? val * scale : -INFINITY;
+    \\                rmax = max(rmax, sv[e]);
+    \\            }
+    \\            for (int off = 1; off < 16; off <<= 1)
+    \\                rmax = max(rmax, simd_shuffle_xor(rmax, ushort(off)));
+    \\            float m_old = st_m[r];
+    \\            float m_new = max(m_old, rmax);
+    \\            float rsum = 0.0f;
+    \\            for (int e = 0; e < 2; ++e) {
+    \\                float p = m_new == -INFINITY ? 0.0f : exp(sv[e] - m_new);
+    \\                rsum += p;
+    \\                P[r * PS + cp + e] = bfloat16_t(p);
+    \\            }
+    \\            for (int off = 1; off < 16; off <<= 1)
+    \\                rsum += simd_shuffle_xor(rsum, ushort(off));
+    \\            threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\            if ((tid % 16) == 0) {
+    \\                float alpha = m_new == -INFINITY ? 1.0f : exp(m_old - m_new);
+    \\                st_a[r] = alpha;
+    \\                st_l[r] = st_l[r] * alpha + rsum;
+    \\                st_m[r] = m_new;
+    \\            }
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\        float alpha = st_a[fm];
+    \\        for (int j = 0; j < 8; ++j) {
+    \\            o[j].thread_elements()[0] *= alpha;
+    \\            o[j].thread_elements()[1] *= alpha;
+    \\        }
+    \\        for (int kt = 0; kt < 4; ++kt) {
+    \\            simdgroup_matrix<bfloat16_t, 8, 8> pa;
+    \\            simdgroup_load(pa, P + kt * 8, PS);
+    \\            int ts = min(t0 + kt * 8, T - 8);
+    \\            simdgroup_matrix<bfloat16_t, 8, 8> vb[8];
+    \\            for (int j = 0; j < 8; ++j)
+    \\                simdgroup_load(vb[j], vh + ts * vss + j * 8, vss);
+    \\            for (int j = 0; j < 8; ++j)
+    \\                simdgroup_multiply_accumulate(o[j], pa, vb[j], o[j]);
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\
+    \\    device float* ob = o_part + ((split * 24 + qh) * 8) * D + int(sg) * 64;
+    \\    for (int j = 0; j < 8; ++j)
+    \\        simdgroup_store(o[j], ob + j * 8, D);
+    \\    if (tid < 8) {
+    \\        ml_part[((split * 24 + qh) * 8 + int(tid)) * 2] = st_m[tid];
+    \\        ml_part[((split * 24 + qh) * 8 + int(tid)) * 2 + 1] = st_l[tid];
+    \\    }
+;
+
+const sdpa_verify_combine_body =
+    \\    constexpr int D = 256;
+    \\    uint d = thread_position_in_threadgroup.x;
+    \\    int r = int(threadgroup_position_in_grid.x);
+    \\    int qh = int(threadgroup_position_in_grid.y);
+    \\    int L = int(params[1]);
+    \\    int n_splits = int(params[3]);
+    \\    float M = -INFINITY;
+    \\    for (int s = 0; s < n_splits; ++s)
+    \\        M = max(M, ml_part[((s * 24 + qh) * 8 + r) * 2]);
+    \\    float total = 0.0f, acc = 0.0f;
+    \\    for (int s = 0; s < n_splits; ++s) {
+    \\        int idx = (s * 24 + qh) * 8 + r;
+    \\        float m = ml_part[idx * 2];
+    \\        if (m == -INFINITY) continue;
+    \\        float w = exp(m - M);
+    \\        total += w * ml_part[idx * 2 + 1];
+    \\        acc += w * o_part[idx * D + d];
+    \\    }
+    \\    out[(qh * L + r) * D + d] = bfloat16_t(acc / total);
+;
+
+const SdpaVerifyEntry = struct {
+    kernel1: c.c.mlx_fast_metal_kernel,
+    kernel2: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var sdpa_verify_entry: ?SdpaVerifyEntry = null;
+var sdpa_verify_off: ?bool = null;
+var sdpa_verify_gate_logged: u32 = 0;
+pub var sdpa_verify_applies: u64 = 0;
+
+/// One-shot observability: which gate rejected the split kernel (or that it
+/// engaged). Bit-coded so each reason logs once per process.
+fn sdpaVerifyGateLog(bit: u32, msg: []const u8) void {
+    if (sdpa_verify_gate_logged & bit != 0) return;
+    sdpa_verify_gate_logged |= bit;
+    std.log.info("[verify-split] {s}", .{msg});
+}
+
+/// Escape hatch / A/B toggle: DMLX_VERIFY_SDPA_SPLIT=0 forces stock SDPA.
+fn sdpaVerifySplitDisabled() bool {
+    if (sdpa_verify_off == null) {
+        sdpa_verify_off = if (std.c.getenv("DMLX_VERIFY_SDPA_SPLIT")) |v| v[0] == '0' else false;
+    }
+    return sdpa_verify_off.?;
+}
+
+fn getSdpaVerifyKernels(allocator: std.mem.Allocator) ?*SdpaVerifyEntry {
+    if (sdpa_verify_entry) |*e| return if (e.broken) null else e;
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+
+    const name1_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_partial") catch return null;
+    defer allocator.free(name1_z);
+    const src1_z = allocator.dupeZ(u8, sdpa_verify_partial_body) catch return null;
+    defer allocator.free(src1_z);
+    const in1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "q", "k", "v", "params", "k_head_stride_in", "k_seq_stride_in", "v_head_stride_in", "v_seq_stride_in" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in1_vec);
+    const out1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "o_part", "ml_part" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out1_vec);
+    const k1 = c.c.mlx_fast_metal_kernel_new(name1_z.ptr, in1_vec, out1_vec, src1_z.ptr, header_z.ptr, true, false);
+    // mlx returns null-ish handle on compile failure; validated on first apply.
+
+    const name2_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_combine") catch return null;
+    defer allocator.free(name2_z);
+    const src2_z = allocator.dupeZ(u8, sdpa_verify_combine_body) catch return null;
+    defer allocator.free(src2_z);
+    const in2_vec = qwen38_gdn.makeStringVec(allocator, &.{ "o_part", "ml_part", "params" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in2_vec);
+    const out2_vec = qwen38_gdn.makeStringVec(allocator, &.{"out"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out2_vec);
+    const k2 = c.c.mlx_fast_metal_kernel_new(name2_z.ptr, in2_vec, out2_vec, src2_z.ptr, header_z.ptr, true, false);
+
+    sdpa_verify_entry = .{ .kernel1 = k1, .kernel2 = k2 };
+    return &sdpa_verify_entry.?;
+}
+
+/// Split-KV causal SDPA for the verify block: q_pad [1, H, 8, D] bf16
+/// (L valid rows), k/v the contiguous slabs [1, HKV, cap, D]. Returns
+/// [1, H, L, D] bf16, or null when the shape is unsupported / kernel broken.
+fn sdpaVerifySplit(
+    ctx: EagerContext,
+    q_t: Array, // [1, H, L, D] bf16 contiguous
+    k: Array,
+    v: Array,
+    scale: f32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    l: i32,
+    kv_len: i32,
+) !?Array {
+    if (sdpaVerifySplitDisabled()) return null;
+    // Hardcoded kernel layout: D=256, GQA=6, H=24, padded to 8 rows.
+    if (d != 256 or h != 24 or hkv != 4 or l < 2 or l > 8) {
+        sdpaVerifyGateLog(1, "shape gate (d/h/hkv/l)");
+        return null;
+    }
+    const dt = dtype_mod.Dtype.bfloat16;
+    if (q_t.dtype() != dt or k.dtype() != dt or v.dtype() != dt) {
+        sdpaVerifyGateLog(2, "dtype gate");
+        return null;
+    }
+    const cap: i32 = @intCast(k.shape()[2]);
+    if (!isContiguous4D(q_t, 1, h, l, d)) {
+        sdpaVerifyGateLog(4, "q not contiguous");
+        return null;
+    }
+    if (!isContiguous4D(k, 1, hkv, cap, d) or !isContiguous4D(v, 1, hkv, cap, d)) {
+        sdpaVerifyGateLog(8, "kv slab not contiguous");
+        return null;
+    }
+    const entry = getSdpaVerifyKernels(ctx.allocator) orelse {
+        sdpaVerifyGateLog(16, "kernel compile failed");
+        return null;
+    };
+    sdpaVerifyGateLog(128, "engaged");
+
+    // Pad rows L..8 with zeros (garbage rows are masked/discarded).
+    var q8 = q_t;
+    var q8_owned = false;
+    var pad: ?Array = null;
+    defer if (pad) |p| p.deinit();
+    if (l < 8) {
+        pad = try array_mod.zeros(ctx.allocator, &[_]i32{ 1, h, 8 - l, d }, dt);
+        var cat_parts = [_]Array{ q_t, pad.? };
+        q8 = try shape_mod.concatenateAxis(ctx, &cat_parts, 2);
+        q8_owned = true;
+    }
+    defer if (q8_owned) q8.deinit();
+
+    // Chunk heuristic from omlx (M3 Ultra tuned): ~16 splits per head,
+    // 32-aligned, clamped [512, 2048]; very long caches use 512-key splits.
+    var chunk: i32 = @min(2048, @max(512, @divTrunc(@divTrunc(kv_len + 15, 16) + 31, 32) * 32));
+    if (kv_len > 32768) chunk = 512;
+    const n_splits: i32 = @divTrunc(kv_len + chunk - 1, chunk);
+
+    const params = try Array.fromData(ctx.allocator, u32, &[_]u32{
+        @intCast(kv_len),
+        @intCast(l),
+        @intCast(chunk),
+        @intCast(n_splits),
+        @bitCast(scale),
+    }, &[_]i32{5});
+    defer params.deinit();
+    const khs = try makeI32Scalar(ctx.allocator, cap * d);
+    defer khs.deinit();
+    const kss = try makeI32Scalar(ctx.allocator, d);
+    defer kss.deinit();
+    const vhs = try makeI32Scalar(ctx.allocator, cap * d);
+    defer vhs.deinit();
+    const vss = try makeI32Scalar(ctx.allocator, d);
+    defer vss.deinit();
+
+    // Pass 1: one 128-thread group per (q head, key split).
+    const cfg1 = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg1);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg1, h * 128, n_splits, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg1, 128, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg1, &[_]i32{ n_splits, h, 8, d }, 4, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg1, &[_]i32{ n_splits, h, 8, 2 }, 4, c.c.MLX_FLOAT32));
+
+    const in1_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in1_vec);
+    for ([_]Array{ q8, k, v, params, khs, kss, vhs, vss }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in1_vec, inp.inner));
+    }
+    var out1_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out1_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out1_vec, entry.kernel1, in1_vec, cfg1, qwen38_gdn.fusedStream())) catch |err| {
+        sdpa_verify_entry.?.broken = true;
+        sdpaDecodeWarn(err);
+        return null;
+    };
+
+    var o_part_h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&o_part_h, out1_vec, 0));
+    var ml_part_h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&ml_part_h, out1_vec, 1));
+    const o_part = Array.fromHandle(o_part_h);
+    defer o_part.deinit();
+    const ml_part = Array.fromHandle(ml_part_h);
+    defer ml_part.deinit();
+
+    // Pass 2: LSE merge over splits, one 256-thread group per (row, q head).
+    const cfg2 = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg2);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg2, l * 256, h, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg2, 256, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]i32{ 1, h, l, d }, 4, c.c.MLX_BFLOAT16));
+
+    const in2_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in2_vec);
+    for ([_]Array{ o_part, ml_part, params }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in2_vec, inp.inner));
+    }
+    var out2_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out2_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out2_vec, entry.kernel2, in2_vec, cfg2, qwen38_gdn.fusedStream())) catch |err| {
+        sdpa_verify_entry.?.broken = true;
+        sdpaDecodeWarn(err);
+        return null;
+    };
+
+    var out_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&out_handle, out2_vec, 0));
+    sdpa_verify_applies += 1;
+    return Array.fromHandle(out_handle);
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -1160,16 +1508,20 @@ pub const Qwen38Attn = struct {
         defer v_view.deinit();
 
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn = try fast_mod.scaledDotProductAttention(
-            ctx,
-            q_t,
-            k_view,
-            v_view,
-            scale,
-            "causal",
-            null,
-            null,
-        );
+        // Verify-width split-KV (FlashDecoding-style): one threadgroup per
+        // (q head, key split) holds all rows; stock composed SDPA is the
+        // fallback for shapes the kernel does not cover.
+        const attn = (try sdpaVerifySplit(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, L, kv_len)) orelse
+            try fast_mod.scaledDotProductAttention(
+                ctx,
+                q_t,
+                k_view,
+                v_view,
+                scale,
+                "causal",
+                null,
+                null,
+            );
         defer attn.deinit(); // [1, H, L, D]
 
         // Back to [1, L, H*D].
@@ -1637,4 +1989,81 @@ test "compiled pre-cache segment matches eager preCacheStep" {
     defer m3.deinit();
     try m3.eval();
     try std.testing.expect(try m3.item(f32) <= 1e-5);
+}
+
+test "sdpaVerifySplit matches stock causal SDPA (bf16, split-KV)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const H: i32 = 24;
+    const HKV: i32 = 4;
+    const D: i32 = 256;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    // Pseudo-random but deterministic fill (xorshift64 over the indices).
+    const fillBuf = struct {
+        fn call(alloc: std.mem.Allocator, n: usize, seed: u64) ![]f32 {
+            const buf = try alloc.alloc(f32, n);
+            var s = seed;
+            for (0..n) |i| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                buf[i] = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(s >> 33)), 2000) - 1000)) / 1000.0;
+            }
+            return buf;
+        }
+    }.call;
+
+    for ([_]i32{ 3, 8 }) |L| {
+        for ([_]i32{ 40, 1500 }) |T| {
+            const cap = T;
+            // q [1, H, L, D] bf16
+            const qn: usize = @intCast(H * L * D);
+            const qb = try fillBuf(allocator, qn, 11);
+            defer allocator.free(qb);
+            const qf = try Array.fromData(allocator, f32, qb, &[_]i32{ 1, H, L, D });
+            defer qf.deinit();
+            const q = try ops.astype(ctx, qf, .bfloat16);
+            defer q.deinit();
+            // k/v slabs [1, HKV, cap, D] bf16
+            const kn: usize = @intCast(HKV * cap * D);
+            const kb = try fillBuf(allocator, kn, 22);
+            defer allocator.free(kb);
+            const vb = try fillBuf(allocator, kn, 33);
+            defer allocator.free(vb);
+            const kf = try Array.fromData(allocator, f32, kb, &[_]i32{ 1, HKV, cap, D });
+            defer kf.deinit();
+            const vf = try Array.fromData(allocator, f32, vb, &[_]i32{ 1, HKV, cap, D });
+            defer vf.deinit();
+            const k = try ops.astype(ctx, kf, .bfloat16);
+            defer k.deinit();
+            const v = try ops.astype(ctx, vf, .bfloat16);
+            defer v.deinit();
+
+            const split = (try sdpaVerifySplit(ctx, q, k, v, scale, H, HKV, D, L, T)) orelse
+                return error.TestUnexpectedResult; // kernel must apply to this shape
+            defer split.deinit();
+
+            const k_view = try ops.slice(ctx, k, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, T, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer k_view.deinit();
+            const v_view = try ops.slice(ctx, v, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, T, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer v_view.deinit();
+            const stock = try fast_mod.scaledDotProductAttention(ctx, q, k_view, v_view, scale, "causal", null, null);
+            defer stock.deinit();
+
+            const split32 = try ops.astype(ctx, split, .float32);
+            defer split32.deinit();
+            const stock32 = try ops.astype(ctx, stock, .float32);
+            defer stock32.deinit();
+            const diff = try ops.subtract(ctx, split32, stock32);
+            defer diff.deinit();
+            const adiff = try ops.abs(ctx, diff);
+            defer adiff.deinit();
+            const m = try reduce_mod.max(ctx, adiff, false);
+            defer m.deinit();
+            try m.eval();
+            // Both compute in fp32 and round to bf16 on output; tolerance is
+            // a couple of bf16 ulps at O(1) magnitude.
+            try std.testing.expect(try m.item(f32) <= 2e-2);
+        }
+    }
 }
