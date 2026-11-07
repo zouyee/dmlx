@@ -218,6 +218,17 @@ def engines() -> dict[str, Engine]:
                  "--port", str(PORT)],
             note="adaptive MTP, ceiling 7",
         ),
+        # dmlx + cross-request content-class memory (DMLX_MTP_CLASS_MEMORY=1):
+        # prompt classifier seeds the depth controller's p_i and picks the
+        # give-up ratios from per-class history instead of the Laplace prior.
+        "dmlx-classmem": Engine(
+            name="dmlx-classmem",
+            cmd=[os.path.join(here, "zig-out/bin/dmlx"), "serve",
+                 "--model", MODEL, "--speculative-mtp", "7",
+                 "--port", str(PORT)],
+            env={"DMLX_MTP_CLASS_MEMORY": "1", "DMLX_MTP_CLASS_CONFIDENT": "1"},
+            note="adaptive MTP ceiling 7 + cross-request content-class memory",
+        ),
         # ADAPTIVE with a lower CEILING (not fixed depth). The ceiling was
         # raised 4 -> 7 under the old cost curve; the median-of-8 round cost
         # (7c0d203) changed that model, and the thinking gap is concentrated

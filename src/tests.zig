@@ -65,6 +65,7 @@ pub const expert_stream_tests = @import("models/expert_stream.zig");
 pub const engine_property_tests = @import("tests/engine_property_tests.zig");
 pub const expert_dedup_verification_tests = @import("tests/expert_dedup_verification_test.zig");
 pub const prefix_cache_tests = @import("engine/prefix_cache.zig");
+pub const content_class_tests = @import("engine/content_class.zig");
 pub const glm53_loader_tests = @import("models/glm53_loader.zig");
 pub const glm53_kda_tests = @import("models/glm53_kda.zig");
 pub const glm53_attention_tests = @import("models/glm53_attention.zig");
@@ -144,6 +145,7 @@ test {
     _ = engine_property_tests;
     _ = expert_dedup_verification_tests;
     _ = prefix_cache_tests;
+    _ = content_class_tests;
     _ = glm53_loader_tests;
     _ = glm53_kda_tests;
     _ = glm53_attention_tests;

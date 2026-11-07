@@ -29,6 +29,7 @@ const dsv4_loader = @import("../models/deepseek_v4_loader.zig");
 const speculative_mod = @import("../speculative.zig");
 const guided_mod = @import("../guided.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const content_class = @import("content_class.zig");
 
 const Array = array_mod.Array;
 const ScopedArrayArena = array_arena_mod.ScopedArrayArena;
@@ -1563,6 +1564,69 @@ pub const EngineLoop = struct {
         /// re-explore immediately instead of waiting for the next 1-in-16
         /// probe slot.
         force_explore: u32 = 0,
+        class_mem: [content_class.n_classes]ClassMemory = @splat(.{}),
+        active_class: content_class.ContentClass = .general,
+        /// Per-round acceptance ratios (k/n) of THIS request, for the
+        /// first-half/second-half trend written back at `finishRequest`.
+        round_acc: [64]f32 = @splat(0),
+        round_acc_len: usize = 0,
+
+        /// Cross-request content memory. Acceptance behaviour is a property
+        /// of the content CLASS, not the single request: code stays flat and
+        /// shallow-friendly, math starts bad and turns deep-friendly ~15
+        /// rounds in. The per-request evidence cannot know which regime it
+        /// is in until the explore decision is already behind it (see the
+        /// trend-gate postmortem at `trendGatingOff`), so a prompt
+        /// classifier (content_class.zig) keys a per-class memory that
+        /// (a) seeds p_i at request start, replacing the content-blind
+        /// Laplace prior, and (b) supplies the rising/flat verdict the
+        /// give-up ratios need at round 3, not round 15. A wrong class only
+        /// costs a weak prior: per-request evidence decays the seed away at
+        /// 0.9/round and `.general` requests neither read nor write memory.
+        /// Opt-in via DMLX_MTP_CLASS_MEMORY=1 until the A/B lands.
+        const ClassMemory = struct {
+            /// Requests folded in so far.
+            samples: u32 = 0,
+            /// EMA of the conditional acceptance p_i (1-based position i).
+            p: [max_depth]f32 = @splat(0.5),
+            /// EMA of (second-half acceptance) - (first-half acceptance)
+            /// within a request: positive means the class turns
+            /// deep-friendly as it goes (math), ~0 means flat (code/prose).
+            rising: f32 = 0,
+        };
+        /// Seed strength in rounds-equivalent: weak enough to be overridden
+        /// by ~10 rounds of live evidence, strong enough to inform the
+        /// explore early-exit at rounds 3-9.
+        const class_seed_weight: f32 = 3.0;
+        /// Minimum folded requests before the class verdict drives ratios.
+        const class_confident_default: u32 = 2;
+        fn classConfidentSamples() u32 {
+            const v = std.c.getenv("DMLX_MTP_CLASS_CONFIDENT") orelse
+                return class_confident_default;
+            return std.fmt.parseInt(u32, std.mem.span(v), 10) catch
+                class_confident_default;
+        }
+        /// |rising| above which a class counts as rising (deep-friendly late).
+        const class_rising_epsilon: f32 = 0.05;
+        /// EMA weight of the newest request in the memory update.
+        const class_mem_alpha: f32 = 0.5;
+        /// Requests shorter than this carry no reliable class signal.
+        const class_min_rounds: u64 = 6;
+
+        fn classMemoryOn() bool {
+            return std.c.getenv("DMLX_MTP_CLASS_MEMORY") != null;
+        }
+
+        /// The class memory's verdict on whether acceptance RISES over a
+        /// request, or null when there is no confident opinion (feature off,
+        /// general class, or too few samples). Callers fall back to the
+        /// in-request trend (or the loose default) on null.
+        fn classRising(self: *const MtpDepthController) ?bool {
+            if (!classMemoryOn()) return null;
+            const mem = &self.class_mem[@intFromEnum(self.active_class)];
+            if (mem.samples < classConfidentSamples()) return null;
+            return mem.rising > class_rising_epsilon;
+        }
         /// Per-round evidence decay (see reached/accepted). 0.9 swept best
         /// of {0.75, 0.85, 0.9} on the 4-domain thinking A/B (2026-11-03):
         /// slower decay keeps math/count phase recovery while damping the
@@ -1640,7 +1704,7 @@ pub const EngineLoop = struct {
         /// 4 of them calibrating was eating a third of the request.
         /// Acceptance IS content-dependent, so `p_i` starts fresh (it
         /// re-converges within a few rounds — every round updates p_1..p_k+1).
-        fn resetForRequest(self: *MtpDepthController) void {
+        fn resetForRequest(self: *MtpDepthController, class: content_class.ContentClass) void {
             self.reached = @splat(0);
             self.accepted = @splat(0);
             self.reached_slow = @splat(0);
@@ -1649,6 +1713,77 @@ pub const EngineLoop = struct {
             self.rounds = 0;
             self.force_explore = 0;
             self.last_pick = 0;
+            self.round_acc_len = 0;
+            self.active_class = if (classMemoryOn()) class else .general;
+            // Seed p_i from the class memory: the Laplace prior treats every
+            // prompt as identical, so the explore early-exit judges a code
+            // prompt's deep arm on three unlucky rounds and the math prompt's
+            // deep tail starts from 0.5 optimism. The class prior is what
+            // previous requests of this kind actually measured; the 0.9/round
+            // decay washes it out within ~10 rounds if it is wrong.
+            if (self.active_class != .general) {
+                const mem = &self.class_mem[@intFromEnum(self.active_class)];
+                if (mem.samples > 0) {
+                    for (0..max_depth) |i| {
+                        self.reached[i] = class_seed_weight;
+                        self.accepted[i] = class_seed_weight * mem.p[i];
+                        self.reached_slow[i] = class_seed_weight;
+                        self.accepted_slow[i] = class_seed_weight * mem.p[i];
+                    }
+                }
+                // Confident class: seat the incumbent at the class-optimal
+                // depth directly. Without this a flat class skips explore and
+                // then has to climb from depth 1 through the 10% hysteresis —
+                // count measured the failure: argmin wanted 7 (26.8 vs 29.9
+                // ms/tok) but the hysteresis threshold landed at 26.91 and
+                // the request parked at 3 for 24 of 30 rounds (-7.7%). The
+                // seeded score uses carried cost(n) + class p_i, i.e. exactly
+                // the information the explore rounds would have re-measured.
+                if (mem.samples >= classConfidentSamples()) {
+                    var best: usize = 0;
+                    var best_score: f64 = std.math.floatMax(f64);
+                    for (1..self.max_n + 1) |n| {
+                        const s = self.score(n) orelse continue;
+                        if (s < best_score) {
+                            best_score = s;
+                            best = n;
+                        }
+                    }
+                    self.last_pick = best;
+                }
+            }
+        }
+
+        /// Fold this request's evidence into its class memory. Called once
+        /// at the end of a completed MTP request (not on error paths).
+        fn finishRequest(self: *MtpDepthController) void {
+            if (!classMemoryOn()) return;
+            if (self.active_class == .general) return;
+            if (self.rounds < class_min_rounds) return;
+            const mem = &self.class_mem[@intFromEnum(self.active_class)];
+            const alpha: f32 = if (mem.samples == 0) 1.0 else class_mem_alpha;
+            // p_i: only positions with real evidence this request (a decayed
+            // `reached` below 1 was barely observed and is prior-dominated).
+            for (0..self.max_n) |i| {
+                const r = self.reached[i];
+                if (r < 2.0) continue;
+                const p_req = self.accepted[i] / r;
+                mem.p[i] = alpha * p_req + (1.0 - alpha) * mem.p[i];
+            }
+            // Trend: mean acceptance ratio of the second half of the rounds
+            // minus the first half. Positive = the content turned
+            // deep-friendly as it went (math); ~0 = flat (code/prose).
+            if (self.round_acc_len >= 4) {
+                const half = self.round_acc_len / 2;
+                var first: f32 = 0;
+                var second: f32 = 0;
+                for (self.round_acc[0..half]) |v| first += v;
+                for (self.round_acc[half..self.round_acc_len]) |v| second += v;
+                first /= @floatFromInt(half);
+                second /= @floatFromInt(self.round_acc_len - half);
+                mem.rising = alpha * (second - first) + (1.0 - alpha) * mem.rising;
+            }
+            mem.samples += 1;
         }
 
         /// Is acceptance at position `i` RISING rather than merely low?
@@ -1706,10 +1841,11 @@ pub const EngineLoop = struct {
             if (self.reached[rung - 1] < ladder_confident_floor) return true;
             const rung_score = self.score(rung) orelse return true;
             const inc_score = self.score(self.last_pick) orelse return true;
-            const ratio = if (trendGatingOff() or self.trendRising(rung))
-                ladderGiveUpRatio()
-            else
-                ladderGiveUpFlat();
+            // A confident class verdict beats the in-request trend: it is
+            // available at round 3 instead of round 15 (see classRising).
+            const rising = self.classRising() orelse
+                (trendGatingOff() or self.trendRising(rung));
+            const ratio = if (rising) ladderGiveUpRatio() else ladderGiveUpFlat();
             return rung_score <= inc_score * ratio;
         }
 
@@ -1754,7 +1890,17 @@ pub const EngineLoop = struct {
                 self.force_explore -= 1;
                 return self.max_n;
             }
-            if (self.used[self.max_n - 1] < exploreRounds()) {
+            // Confident-flat classes skip exploration entirely: the class
+            // memory already holds this content's p_i curve (seeded at
+            // reset), and the explore tax is the whole reason the memory
+            // exists — on code it is 9 forced deep rounds plus the probes
+            // they trigger, ~15 of ~45 rounds at depths the class has
+            // already proven worse. Only a FLAT verdict skips: a rising
+            // class (math) still needs the deep sampling, and an unknown
+            // class explores as before. Mid-request phase changes are still
+            // caught by the near-full-acceptance re-explore latch.
+            const class_skip_explore = if (self.classRising()) |rising| !rising else false;
+            if (!class_skip_explore and self.used[self.max_n - 1] < exploreRounds()) {
                 const deep_used = self.used[self.max_n - 1];
                 var keep_exploring = true;
                 // The early exit is what drops a request into the slow fixed
@@ -1777,10 +1923,9 @@ pub const EngineLoop = struct {
                                 if (s < alt) alt = s;
                             }
                         }
-                        const ratio = if (trendGatingOff() or self.trendRising(self.max_n))
-                            exploreGiveUpRatio()
-                        else
-                            exploreGiveUpFlat();
+                        const rising = self.classRising() orelse
+                            (trendGatingOff() or self.trendRising(self.max_n));
+                        const ratio = if (rising) exploreGiveUpRatio() else exploreGiveUpFlat();
                         if (found and deep_score > alt * ratio) keep_exploring = false;
                     }
                 }
@@ -1887,6 +2032,14 @@ pub const EngineLoop = struct {
             self.rounds +|= 1;
             if (n == 0 or n > max_depth) return;
             self.used[n - 1] +|= 1;
+            // Per-round acceptance ratio, for the class-memory trend written
+            // back at finishRequest. Ring is capped; a request longer than
+            // 64 rounds simply measures its trend on the first 64.
+            if (self.round_acc_len < self.round_acc.len) {
+                self.round_acc[self.round_acc_len] =
+                    @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(n));
+                self.round_acc_len += 1;
+            }
             // The FIRST round of a request carries one-time per-request work
             // (drafter repriming over the prompt is lazy-evaluated into the
             // first draft phase: measured draft=31.9 ms on request 1 vs
@@ -2109,11 +2262,20 @@ pub const EngineLoop = struct {
 
         // Depth controller persists across requests (cost estimates are
         // hardware properties); only the acceptance evidence is per-request.
+        // With DMLX_MTP_CLASS_MEMORY the prompt is classified once so the
+        // controller can seed p_i and the give-up verdict from the
+        // cross-request memory of this content class.
+        const prompt_class: content_class.ContentClass = blk: {
+            if (std.c.getenv("DMLX_MTP_CLASS_MEMORY") == null) break :blk .general;
+            const prompt_text = self.tokenizer.decode(req.prompt_tokens, allocator) catch
+                break :blk .general;
+            defer allocator.free(prompt_text);
+            break :blk content_class.classify(prompt_text);
+        };
         if (self.mtp_depth == null or self.mtp_depth.?.max_n != @min(n_drafts, MtpDepthController.max_depth)) {
             self.mtp_depth = MtpDepthController.init(n_drafts);
-        } else {
-            self.mtp_depth.?.resetForRequest();
         }
+        self.mtp_depth.?.resetForRequest(prompt_class);
         const depth_ctl = &self.mtp_depth.?;
 
         // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
@@ -2601,6 +2763,14 @@ pub const EngineLoop = struct {
                 ms(prof_verify_ns / rounds),
                 ms(prof_accept_ns / rounds),
                 ms(prof_commit_ns / rounds),
+            });
+        }
+
+        depth_ctl.finishRequest();
+        if (MtpDepthController.classMemoryOn()) {
+            std.log.info("[Engine] MTP class={s} samples={d}", .{
+                @tagName(depth_ctl.active_class),
+                depth_ctl.class_mem[@intFromEnum(depth_ctl.active_class)].samples,
             });
         }
 

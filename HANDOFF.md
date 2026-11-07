@@ -1644,3 +1644,43 @@ routing/top-k 留 CPU、GDN 层(64 层中 48 层)CoreML 无算子。
 结论:ANE 的价值是相对 CPU 基线(NPUMoE 论文的基线正是 CoreML
 CPU),不是相对调优 GPU;能效场景另说,但对"prefill 反超"目标
 无益。方向关闭,不用 CoreML/ANE 做 GEMM 加速。
+
+## 跨请求内容记忆(class-memory)——三次迭代证伪,默认关闭(2026-11-07)
+
+动机(engine_loop.zig trendGatingOff 的 postmortem):区分"坚持"与
+"放弃"需要超出本请求前 10 轮的信息——内容类型的先验。code 类付
+~33% 探针税(15/45 轮在已证伪的 N=5/N=7),请求内自适应到顶。
+
+实现(opt-in,DMLX_MTP_CLASS_MEMORY=1;置信门限
+DMLX_MTP_CLASS_CONFIDENT,默认 2):
+- src/engine/content_class.zig:prompt 文本启发式分类
+  code/math/count/prose/general(错分代价低:种子 0.9/轮衰减,
+  ~10 轮内被活证据冲掉;general 不读不写)。
+- MtpDepthController 持久化 per-class 记忆:请求结束回写 p_i 曲线
+  EMA + 前半/后半接受率差(rising 趋势);resetForRequest(class)
+  按类播种 p_i(权重 3.0 轮当量);类趋势替代请求内 trend 选择
+  give-up 比率(flat→紧 1.08/1.04,rising→松 1.15/1.10)。
+
+三个机制变体,四场交错 A/B(dmlx vs dmlx-classmem,reps 3 ×
+reps-prompt 3,nonce,artifacts/classmem_ab{,_2,_3,_4}_20261107.json):
+
+- v1 仅播种:四域中位数全持平。归因(逐轮轨迹):种入的 p_i 让
+  code 深层臂得分"不够好也不坏"(28.7 vs 29.0 ms/tok),早期退出
+  阈值 1.15 不触发,9 轮 explore 照跑,探针税未省。
+- v2 +confident-flat 免探:math +6.3%(种子+rising 判据帮 math
+  停深层),但 count -7.7%——免探拿掉了托底的 9 轮深轮,argmin
+  想爬 7(26.8 vs 29.9)却被 hysteresis 阈值 26.91 挡一根头发丝,
+  卡 N=3 达 24/30 轮。
+- v3 +confident 类直接以(记忆 p_i × 携带成本)argmin 播种
+  incumbent:第一场 prose +9.7%/math -5.6%/code -2.5%,第二场
+  (复跑)prose +0.3%/math +20%(基线 math 抽到慢模态 33.9-44.6
+  的双峰彩票)/code -1.6%/count 持平。
+
+结论:没有任何一个变体在四域上给出可复现的一致方向性收益;
+prose 的 +9.7% 不能复现,math 的大幅波动是已知慢模态彩票而非
+机制效应。128-token 请求尺度上,请求内自适应(0.9 衰减 ~4 轮
+有效窗 + explore 9 轮)已经捕获了可得的几乎全部——"内容类先验"
+省下的探针税在 tok/s 上兑现不出来。按负结果处理:代码保留为
+opt-in(与既有 DMLX_MTP_* 死方向开关同一约定),默认关闭,
+不再迭代。剩余差距回到清单第 1 项(KV cache 量化,长上下文
+verify 成本 87→272ms/round 是实测的线性增长)。
