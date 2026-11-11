@@ -20,11 +20,15 @@ multimodal prefill, and dumps float32 .npy segments plus meta.json:
 
 Usage:
     /Users/zouyee/venvs/dmlx-omlx/bin/python scripts/qwen38_vision_oracle_dump.py \
-        tests/fixtures/vision/photo.jpg artifacts/qwen38_vision_oracle \
+        tests/fixtures/vision/photo.png artifacts/qwen38_vision_oracle \
         [--model /Users/zouyee/models/Qwen3.8-27B-4bit]
 
-Segments to regenerate the fixture image:
-    python3 scripts/qwen38_vision_oracle_dump.py --make-fixture tests/fixtures/vision/photo.jpg
+The fixture is a lossless PNG on purpose: at 512x384 smart_resize is the
+identity, so the only pixel delta vs the Zig (stb_image) path would be JPEG
+IDCT decoder differences. PNG decodes identically on both sides.
+
+To regenerate the fixture image:
+    python3 scripts/qwen38_vision_oracle_dump.py --make-fixture tests/fixtures/vision/photo.png
 """
 
 import argparse
@@ -46,7 +50,7 @@ PROMPT_TEMPLATE = (
 
 
 def make_fixture(path: Path) -> None:
-    """Deterministic 512x384 photo-like JPEG: sky/ground gradient, a sun disc,
+    """Deterministic 512x384 photo-like PNG: sky/ground gradient, a sun disc,
     a dark rectangle 'barn', diagonal stripes, and seeded smooth noise."""
     from PIL import Image
 
@@ -81,7 +85,9 @@ def make_fixture(path: Path) -> None:
     )
     img = np.clip(img + (noise - 127.5) * 0.25, 0, 255).astype(np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
-    Image.fromarray(img).save(path, quality=88)
+    # PNG: deterministic, lossless, and decoder-identical in PIL and
+    # stb_image (no quality flag — that is JPEG-only).
+    Image.fromarray(img).save(path)
     print(f"wrote fixture {path} ({path.stat().st_size} bytes)", flush=True)
 
 
@@ -134,6 +140,11 @@ def main():
 
         if hasattr(q35lang, "gated_delta_update"):
             q35lang.gated_delta_update = naive
+        # Cheap guard against a future mlx-vlm refactor silently no-opping
+        # the patch: every alias must point at the wrapper now.
+        assert gd.gated_delta_update is naive
+        assert not hasattr(q35lang, "gated_delta_update") or \
+            q35lang.gated_delta_update is naive
         print("GDN kernel disabled (naive ops path)", flush=True)
 
     # --- Prompt with the image-pad block ---
@@ -225,6 +236,11 @@ def main():
         # hidden_sink: per-layer PRE-norm residuals (capture ids), then the
         # post-final-norm hidden appended by LanguageModel.__call__.
         layer_ids = [0, 3, 8, 16, 24, 32, 40, 48, 56, 63]
+        # hidden_sink entries arrive in capture order followed by the final
+        # post-norm hidden — assert the layout before zipping.
+        assert len(out.hidden_states) == len(layer_ids) + 1, (
+            f"expected {len(layer_ids) + 1} hidden captures, "
+            f"got {len(out.hidden_states)}")
         for li, h in zip(layer_ids, out.hidden_states):
             dumps[f"lm_hidden_layer{li}"] = h[0]
         dumps["lm_hidden_final_normed"] = out.hidden_states[-1][0]

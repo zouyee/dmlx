@@ -16,10 +16,12 @@
 ///   6. Qwen38ServingModel.forwardTokensWithVision -> last-position logits,
 ///      gate cos >= 0.995 (see noise-floor note below)
 ///
-/// Noise floor (measured, see docs/superpowers/plans vision task 6 report):
+/// Noise floor (measured, reproducible via
+/// scripts/compare_qwen38_vision_oracle.py artifacts/qwen38_vision_oracle{,_naive}):
 /// the reference tower bf16-vs-f32 differs from ITSELF at cos 0.99934
-/// (per-row min 0.9965), and python fused-vs-naive GDN differs at logits cos
-/// 0.99971 — with the reference bf16 stack, an independent reimplementation
+/// (per-row min 0.9965), and python fused-vs-naive GDN differs at
+/// logits_last cos 0.99940 / layer-63 hidden cos 0.98748 — with the
+/// reference bf16 stack, an independent reimplementation
 /// cannot exceed ~0.9995 on tower features and ~0.997 on last-position
 /// logits for this 207-token multimodal prefill. The tower/merged/position/
 /// cos-sin gates hold at their exact/0.999 targets; the logits gate is set
@@ -85,11 +87,14 @@ fn readNpy(allocator: std.mem.Allocator, io: std.Io, path: []const u8, expect_de
         hlen = std.mem.readInt(u16, raw[8..10], .little);
         off = 10;
     } else {
+        if (raw.len < 12) return error.BadNpy;
         hlen = std.mem.readInt(u32, raw[8..12], .little);
         off = 12;
     }
+    if (off + hlen > raw.len) return error.BadNpy;
     const header = raw[off .. off + hlen];
     const dstart = (std.mem.indexOf(u8, header, "'descr': '") orelse return error.BadNpy) + "'descr': '".len;
+    if (dstart + 3 > header.len) return error.BadNpy;
     if (!std.mem.eql(u8, header[dstart .. dstart + 3], expect_descr)) {
         std.log.err("{s}: descr {s} != {s}", .{ path, header[dstart .. dstart + 3], expect_descr });
         return error.BadNpy;
@@ -188,6 +193,7 @@ const Meta = struct {
     rope_delta: i64,
     merge_size: i64,
     image_token_id: u32,
+    image: []const u8,
 };
 
 fn loadMeta(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.json.Parsed(Meta) {
@@ -195,7 +201,9 @@ fn loadMeta(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !std.jso
         error.FileNotFound => return error.SkipZigTest,
         else => return err,
     };
-    defer allocator.free(text);
+    // NOTE: `text` intentionally outlives the parse — string fields of Meta
+    // (e.g. image) slice into it. Callers use an arena, so this is reclaimed
+    // in bulk; do not free it here.
     return std.json.parseFromSlice(Meta, allocator, text, .{ .ignore_unknown_fields = true });
 }
 
@@ -246,6 +254,11 @@ fn run(init: std.process.Init) !void {
 
     const meta = try loadMeta(aa, io, try std.fmt.allocPrint(aa, "{s}/meta.json", .{artifacts_dir}));
     defer meta.deinit();
+    // The dump must come from the same fixture this harness preprocesses.
+    if (!std.mem.eql(u8, std.fs.path.basename(meta.value.image), std.fs.path.basename(FIXTURE))) {
+        std.log.err("meta image '{s}' != fixture '{s}'", .{ meta.value.image, FIXTURE });
+        return error.BadNpy;
+    }
     const ids = meta.value.input_ids;
     const L = ids.len;
 
@@ -422,8 +435,8 @@ fn run(init: std.process.Init) !void {
         const got = try mf.dataSlice(f32);
         const want = merged_np.f32s();
         const hidden: usize = @intCast(cfg.hidden_size);
-        try gateEq(usize, L * hidden, want.len, "merged length");
-        try gateEq(usize, want.len, got.len, "merged length");
+        try gateEq(usize, L * hidden, want.len, "merged oracle length");
+        try gateEq(usize, want.len, got.len, "merged zig length");
         var img_cos_min: f64 = 1.0;
         var text_exact = true;
         for (0..L) |i| {
