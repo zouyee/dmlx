@@ -14,6 +14,8 @@ const conv_mod = @import("mlx").conv;
 const fast_mod = @import("mlx").fast;
 const math_mod = @import("mlx").math;
 const activations = @import("mlx").activations;
+const dtype_mod = @import("mlx").dtype;
+const reduce_mod = @import("mlx").reduce;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -68,6 +70,7 @@ fn geluExact(ctx: EagerContext, x: Array) !Array {
 fn rotateHalf(ctx: EagerContext, x: Array) !Array {
     const sh = x.shape();
     const nd = sh.len;
+    std.debug.assert(nd <= 8);
     const d: i32 = sh[nd - 1];
     const half: i32 = @divExact(d, 2);
     var start1 = [_]i32{0} ** 8;
@@ -210,6 +213,14 @@ pub const Qwen38Vit = struct {
             };
         }
 
+        // Sanity-check config dims against the weight shapes.
+        if (cfg.depth > 0) {
+            std.debug.assert(blocks[0].fc1_w.shape()[0] == cfg.intermediate);
+            std.debug.assert(blocks[0].qkv_w.shape()[0] == 3 * cfg.hidden);
+        }
+        const merger_fc2_w = try lookup(weights, allocator, prefix, "merger.linear_fc2.weight");
+        std.debug.assert(merger_fc2_w.shape()[0] == cfg.out_hidden);
+
         return .{
             .allocator = allocator,
             .ctx = ctx,
@@ -222,7 +233,7 @@ pub const Qwen38Vit = struct {
             .merger_norm_b = try lookup(weights, allocator, prefix, "merger.norm.bias"),
             .merger_fc1_w = try lookup(weights, allocator, prefix, "merger.linear_fc1.weight"),
             .merger_fc1_b = try lookup(weights, allocator, prefix, "merger.linear_fc1.bias"),
-            .merger_fc2_w = try lookup(weights, allocator, prefix, "merger.linear_fc2.weight"),
+            .merger_fc2_w = merger_fc2_w,
             .merger_fc2_b = try lookup(weights, allocator, prefix, "merger.linear_fc2.bias"),
         };
     }
@@ -268,6 +279,7 @@ pub const Qwen38Vit = struct {
         const w: usize = @intCast(grid_w);
         const side: usize = @intFromFloat(@sqrt(@as(f64, @floatFromInt(self.cfg.num_pos))));
         std.debug.assert(side * side == @as(usize, @intCast(self.cfg.num_pos)));
+        std.debug.assert(h % m == 0 and w % m == 0);
         const hidden: usize = @intCast(self.cfg.hidden);
         const n_hw = h * w;
 
@@ -359,6 +371,7 @@ pub const Qwen38Vit = struct {
         const w: usize = @intCast(grid_w);
         const max_hw: usize = @max(h, w);
         const n_hw = h * w;
+        std.debug.assert(h % m == 0 and w % m == 0);
 
         // Host freq table [max_hw, n_freq] (f64 -> f32).
         const table = try self.allocator.alloc(f32, max_hw * n_freq);
@@ -460,6 +473,8 @@ pub const Qwen38Vit = struct {
         const n_merged: i32 = grid_t * @divExact(grid_h, m) * @divExact(grid_w, m);
 
         var hidden = try self.patchEmbed(pixels, n);
+        var hidden_consumed = false;
+        errdefer if (!hidden_consumed) hidden.deinit();
 
         const pos = try self.posEmbedInterpolate(grid_t, grid_h, grid_w);
         defer pos.deinit();
@@ -480,6 +495,7 @@ pub const Qwen38Vit = struct {
         // [n_merged, hidden*m*m], fc1 -> GELU(exact) -> fc2.
         const normed = try fast_mod.layerNorm(ctx, hidden, self.merger_norm_w, self.merger_norm_b, LN_EPS);
         hidden.deinit();
+        hidden_consumed = true;
         defer normed.deinit();
         const resh = try ops.reshape(ctx, normed, &[_]i32{ n_merged, self.cfg.hidden * m * m });
         defer resh.deinit();
@@ -502,25 +518,34 @@ fn toyFill(buf: []f32) void {
 }
 
 fn putToy(allocator: std.mem.Allocator, map: *std.StringHashMap(Array), name: []const u8, shape_: []const i32) !void {
+    const key = try allocator.dupe(u8, name);
+    errdefer allocator.free(key);
     var n: usize = 1;
     for (shape_) |s| n *= @intCast(s);
     const buf = try allocator.alloc(f32, n);
     defer allocator.free(buf);
     toyFill(buf);
-    try map.put(name, try Array.fromData(allocator, f32, buf, shape_));
+    try map.put(key, try Array.fromData(allocator, f32, buf, shape_));
 }
 
 fn putToyNorm(allocator: std.mem.Allocator, map: *std.StringHashMap(Array), name: []const u8, dim: i32) !void {
     const buf = try allocator.alloc(f32, @intCast(dim));
     defer allocator.free(buf);
     for (buf, 0..) |*v, i| v.* = 1.0 + 0.01 * @as(f32, @floatFromInt(i));
-    try map.put(name, try Array.fromData(allocator, f32, buf, &[_]i32{dim}));
+    try putToyArr(allocator, map, name, buf, &[_]i32{dim});
     const zeros = try allocator.alloc(f32, @intCast(dim));
     defer allocator.free(zeros);
     @memset(zeros, 0.0);
-    const bias_name = try std.fmt.allocPrint(allocator, "{s}", .{name[0 .. name.len - ".weight".len]});
+    std.debug.assert(std.mem.endsWith(u8, name, ".weight"));
+    const bias_name = try std.fmt.allocPrint(allocator, "{s}.bias", .{name[0 .. name.len - ".weight".len]});
     defer allocator.free(bias_name);
-    try map.put(try std.fmt.allocPrint(allocator, "{s}.bias", .{bias_name}), try Array.fromData(allocator, f32, zeros, &[_]i32{dim}));
+    try putToyArr(allocator, map, bias_name, zeros, &[_]i32{dim});
+}
+
+fn putToyArr(allocator: std.mem.Allocator, map: *std.StringHashMap(Array), name: []const u8, data: []const f32, shape_: []const i32) !void {
+    const key = try allocator.dupe(u8, name);
+    errdefer allocator.free(key);
+    try map.put(key, try Array.fromData(allocator, f32, data, shape_));
 }
 
 /// Toy tower: depth 1, hidden 16, heads 2, patch 2, temporal_patch 2,
@@ -536,24 +561,24 @@ fn makeToyMap(allocator: std.mem.Allocator, merge: i32) !std.StringHashMap(Array
     }
     const H: i32 = 16;
     const m2 = merge * merge;
-    try putToy(allocator, &map, try allocator.dupe(u8, "patch_embed.proj.weight"), &[_]i32{ H, 2, 2, 2, 3 });
-    try putToy(allocator, &map, try allocator.dupe(u8, "patch_embed.proj.bias"), &[_]i32{H});
-    try putToy(allocator, &map, try allocator.dupe(u8, "pos_embed.weight"), &[_]i32{ 16, H });
-    try putToyNorm(allocator, &map, try allocator.dupe(u8, "blocks.0.norm1.weight"), H);
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.attn.qkv.weight"), &[_]i32{ 3 * H, H });
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.attn.qkv.bias"), &[_]i32{3 * H});
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.attn.proj.weight"), &[_]i32{ H, H });
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.attn.proj.bias"), &[_]i32{H});
-    try putToyNorm(allocator, &map, try allocator.dupe(u8, "blocks.0.norm2.weight"), H);
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.mlp.linear_fc1.weight"), &[_]i32{ 32, H });
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.mlp.linear_fc1.bias"), &[_]i32{32});
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.mlp.linear_fc2.weight"), &[_]i32{ H, 32 });
-    try putToy(allocator, &map, try allocator.dupe(u8, "blocks.0.mlp.linear_fc2.bias"), &[_]i32{H});
-    try putToyNorm(allocator, &map, try allocator.dupe(u8, "merger.norm.weight"), H);
-    try putToy(allocator, &map, try allocator.dupe(u8, "merger.linear_fc1.weight"), &[_]i32{ H * m2, H * m2 });
-    try putToy(allocator, &map, try allocator.dupe(u8, "merger.linear_fc1.bias"), &[_]i32{H * m2});
-    try putToy(allocator, &map, try allocator.dupe(u8, "merger.linear_fc2.weight"), &[_]i32{ 8, H * m2 });
-    try putToy(allocator, &map, try allocator.dupe(u8, "merger.linear_fc2.bias"), &[_]i32{8});
+    try putToy(allocator, &map, "patch_embed.proj.weight", &[_]i32{ H, 2, 2, 2, 3 });
+    try putToy(allocator, &map, "patch_embed.proj.bias", &[_]i32{H});
+    try putToy(allocator, &map, "pos_embed.weight", &[_]i32{ 16, H });
+    try putToyNorm(allocator, &map, "blocks.0.norm1.weight", H);
+    try putToy(allocator, &map, "blocks.0.attn.qkv.weight", &[_]i32{ 3 * H, H });
+    try putToy(allocator, &map, "blocks.0.attn.qkv.bias", &[_]i32{3 * H});
+    try putToy(allocator, &map, "blocks.0.attn.proj.weight", &[_]i32{ H, H });
+    try putToy(allocator, &map, "blocks.0.attn.proj.bias", &[_]i32{H});
+    try putToyNorm(allocator, &map, "blocks.0.norm2.weight", H);
+    try putToy(allocator, &map, "blocks.0.mlp.linear_fc1.weight", &[_]i32{ 32, H });
+    try putToy(allocator, &map, "blocks.0.mlp.linear_fc1.bias", &[_]i32{32});
+    try putToy(allocator, &map, "blocks.0.mlp.linear_fc2.weight", &[_]i32{ H, 32 });
+    try putToy(allocator, &map, "blocks.0.mlp.linear_fc2.bias", &[_]i32{H});
+    try putToyNorm(allocator, &map, "merger.norm.weight", H);
+    try putToy(allocator, &map, "merger.linear_fc1.weight", &[_]i32{ H * m2, H * m2 });
+    try putToy(allocator, &map, "merger.linear_fc1.bias", &[_]i32{H * m2});
+    try putToy(allocator, &map, "merger.linear_fc2.weight", &[_]i32{ 8, H * m2 });
+    try putToy(allocator, &map, "merger.linear_fc2.bias", &[_]i32{8});
     return map;
 }
 
@@ -620,9 +645,6 @@ fn toyVitTest(allocator: std.mem.Allocator, grid_t: i32, grid_h: i32, grid_w: i3
     try max_diff.eval();
     try std.testing.expectEqual(@as(f32, 0.0), try max_diff.item(f32));
 }
-
-const dtype_mod = @import("mlx").dtype;
-const reduce_mod = @import("mlx").reduce;
 
 test "Qwen38Vit toy tower: shape + determinism (merge=1, t=2)" {
     c.initErrorHandler();
