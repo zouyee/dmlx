@@ -197,7 +197,7 @@ fn forwardPrefillProfiled(
                 const cache = &model.caches[layer].gdn;
                 break :blk try g.prefill(allocator, normed1, cache, gdn_seen % 8 == 0 or layer + 1 == model.layers.len);
             },
-            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn),
+            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn, null),
         };
         defer attn_out.deinit();
         try attn_out.eval();
@@ -309,7 +309,7 @@ fn forwardStepProfiled(model: *qwen38.Qwen38ServingModel, id: u32, acc: *Accum) 
                 defer step_out.deinit();
                 break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
             },
-            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn),
+            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn, null),
         };
         defer attn_out.deinit();
         try attn_out.eval();
@@ -423,7 +423,7 @@ fn forwardStepBuildSplit(model: *qwen38.Qwen38ServingModel, id: u32, build_ns: *
                 defer step_out.deinit();
                 break :blk try ops.reshape(ctx, step_out, &[_]i32{ 1, 1, hidden });
             },
-            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn),
+            .attn => |*a| try a.forward(normed1, &model.caches[layer].attn, null),
         };
         defer attn_out.deinit();
         {
@@ -600,7 +600,7 @@ fn forwardStepApplyProf(model: *qwen38.Qwen38ServingModel, id: u32, acc: *ApplyA
                     break :blk r;
                 }
                 t.reset();
-                const r = try a.forward(normed1, cache);
+                const r = try a.forward(normed1, cache, null);
                 acc.eager_ns += t.lap();
                 break :blk r;
             },

@@ -392,7 +392,7 @@ pub const Qwen38Mtp = struct {
         defer fused3.deinit();
         const n1 = try rmsNormBf16(ctx, fused3, self.ln1_f32, eps);
         defer n1.deinit();
-        const attn_out = try self.attn.forward(n1, &self.cache); // [1, L-1, hidden]
+        const attn_out = try self.attn.forward(n1, &self.cache, null); // [1, L-1, hidden]
         defer attn_out.deinit();
         const h2 = try ops.add(ctx, fused3, attn_out);
         defer h2.deinit();
@@ -694,7 +694,7 @@ pub const Qwen38Mtp = struct {
         const n1 = try rmsNormBf16(ctx, fused, self.ln1_f32, eps);
         defer n1.deinit();
         stageChk("n1", ctx, n1);
-        const attn_out = try self.attn.forward(n1, &self.cache); // [1, hidden]
+        const attn_out = try self.attn.forward(n1, &self.cache, null); // [1, hidden]
         defer attn_out.deinit();
         stageChk("attn", ctx, attn_out);
         const h2 = try ops.add(ctx, fused, attn_out);
@@ -755,7 +755,9 @@ pub const Qwen38Mtp = struct {
         const a = &self.attn;
         const allocator = ctx.allocator;
 
-        const offset_arr = try ops.scalarI32(ctx, self.cache.len());
+        // rope offset = cache len + the backbone's MRoPE rope_delta
+        // (rope_extra, 0 on the text path).
+        const offset_arr = try ops.scalarI32(ctx, self.cache.len() + a.rope_extra);
         defer offset_arr.deinit();
         const pre_inputs = [_]Array{
             id_arr,                         embed_table_bf16,            hidden_pre_norm,

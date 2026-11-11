@@ -313,7 +313,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     const x = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 16 });
     defer x.deinit();
 
-    const out1 = try attn.forward(x, &cache);
+    const out1 = try attn.forward(x, &cache, null);
     defer out1.deinit();
     try out1.eval();
     const oshape = out1.shape();
@@ -321,7 +321,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     try std.testing.expectEqual(@as(i32, 16), oshape[1]);
     try std.testing.expectEqual(@as(i32, 1), cache.len());
 
-    const out2 = try attn.forward(x, &cache);
+    const out2 = try attn.forward(x, &cache, null);
     defer out2.deinit();
     try out2.eval();
     try std.testing.expectEqual(@as(i32, 2), cache.len());
@@ -331,7 +331,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     defer attn2.deinit();
     var cache2 = Qwen38AttnCache{};
     defer cache2.deinit();
-    const out3 = try attn2.forward(x, &cache2);
+    const out3 = try attn2.forward(x, &cache2, null);
     defer out3.deinit();
     const diff = try ops.subtract(ctx, out1, out3);
     defer diff.deinit();
@@ -1508,6 +1508,60 @@ fn sdpaVerifySplit(
     return Array.fromHandle(out_handle);
 }
 
+/// Precomputed MRoPE tables for one vision prefill: cos/sin [1, 1, L, RD]
+/// f32 in rotate-half (half-split) layout — cos[t, j] for j < RD/2 pairs dim
+/// j with dim j + RD/2, and the second half repeats the first. Built on the
+/// host from computePositionIds + the interleaved position selector.
+pub const MropeApply = struct {
+    cos: Array,
+    sin: Array,
+
+    pub fn deinit(self: *MropeApply) void {
+        self.cos.deinit();
+        self.sin.deinit();
+    }
+};
+
+/// Explicit cos/sin rotary on the first RD dims of x [1, H, L, D]; the
+/// remaining dims pass through. Mirrors mlx_vlm's
+/// `_apply_interleaved_rotary_pos_emb_axis1` with half-split pairing
+/// (rotate_half), computed in f32 and cast back to x's dtype.
+fn applyMropeCosSin(ctx: EagerContext, x: Array, mr: MropeApply) !Array {
+    const sh = x.shape();
+    const H = sh[1];
+    const L = sh[2];
+    const D = sh[3];
+    const rd: i32 = mr.cos.shape()[3];
+    const half = @divExact(rd, 2);
+
+    const x_rot = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, H, L, rd }, &[_]i32{ 1, 1, 1, 1 });
+    defer x_rot.deinit();
+    const x_f32 = try ops.astype(ctx, x_rot, .float32);
+    defer x_f32.deinit();
+    // rotate_half: [-x[half:], x[:half]]
+    const x1 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, H, L, half }, &[_]i32{ 1, 1, 1, 1 });
+    defer x1.deinit();
+    const x2 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0, 0, half }, &[_]i32{ 1, H, L, rd }, &[_]i32{ 1, 1, 1, 1 });
+    defer x2.deinit();
+    const neg2 = try ops.negative(ctx, x2);
+    defer neg2.deinit();
+    const rot = try shape_mod.concatenateAxis(ctx, &[_]Array{ neg2, x1 }, 3);
+    defer rot.deinit();
+    // x * cos + rotate_half(x) * sin; cos/sin [1, 1, L, RD] broadcast over H.
+    const p1 = try ops.multiply(ctx, x_f32, mr.cos);
+    defer p1.deinit();
+    const p2 = try ops.multiply(ctx, rot, mr.sin);
+    defer p2.deinit();
+    const emb = try ops.add(ctx, p1, p2);
+    defer emb.deinit();
+    const emb_x = try ops.astype(ctx, emb, x.dtype());
+    defer emb_x.deinit();
+    if (rd == D) return ops.copy(ctx, emb_x);
+    const x_pass = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0, rd }, &[_]i32{ 1, H, L, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer x_pass.deinit();
+    return shape_mod.concatenateAxis(ctx, &[_]Array{ emb_x, x_pass }, 3);
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -1518,6 +1572,10 @@ pub const Qwen38Attn = struct {
     rope_theta: f32,
     rms_norm_eps: f32,
     output_gate: bool = true,
+    /// Extra rope offset added to cache.len() on every rope application —
+    /// the MRoPE rope_delta left over by a vision prefill (0 on the text
+    /// path; set/cleared by Qwen38ServingModel).
+    rope_extra: i32 = 0,
 
     // q_proj packs per-head [q head_dim | gate head_dim]: out = H * 2 * D.
     q_proj: Array,
@@ -1581,7 +1639,10 @@ pub const Qwen38Attn = struct {
 
     /// x: [1, hidden] single token OR [1, L, hidden] prefill.
     /// Returns the same leading shape with hidden last dim. Advances cache.
-    pub fn forward(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache) !Array {
+    /// `mrope` (prefill only) replaces the scalar-offset fast.rope with
+    /// explicit per-position cos/sin tables (vision MRoPE); null keeps the
+    /// text path byte-identical.
+    pub fn forward(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache, mrope: ?MropeApply) !Array {
         const ctx = self.ctx;
         const H: i32 = @intCast(self.num_heads);
         const HKV: i32 = @intCast(self.num_kv_heads);
@@ -1589,7 +1650,7 @@ pub const Qwen38Attn = struct {
         const xshape = x.shape();
         const prefill = xshape.len == 3;
         const L: i32 = if (prefill) xshape[1] else 1;
-        const offset: i32 = cache.len();
+        const offset: i32 = cache.len() + self.rope_extra;
 
         // Decode (L=1): shared pre-cache segment (ropeDynamic — numerically
         // equal to static rope, verified by unit test) + eager remainder.
@@ -1682,9 +1743,15 @@ pub const Qwen38Attn = struct {
         defer v_t.deinit();
 
         const rd: i32 = @intCast(self.rotary_dims);
-        const q_t = try fast_mod.rope(ctx, q_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        const q_t = if (mrope) |mr|
+            try applyMropeCosSin(ctx, q_t0, mr)
+        else
+            try fast_mod.rope(ctx, q_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer q_t.deinit();
-        const k_t = try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        const k_t = if (mrope) |mr|
+            try applyMropeCosSin(ctx, k_t0, mr)
+        else
+            try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer k_t.deinit();
 
         // DIAGNOSTIC ONLY (`DMLX_VERIFY_NO_ATTN_CORE=1`): price the
@@ -1924,7 +1991,7 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     const x = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
     defer x.deinit();
 
-    const out = try attn.forward(x, &cache);
+    const out = try attn.forward(x, &cache, null);
     defer out.deinit();
     try out.eval();
     const oshape = out.shape();
@@ -1940,13 +2007,123 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     }
     const xt = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 16 });
     defer xt.deinit();
-    const out_t = try attn.forward(xt, &cache);
+    const out_t = try attn.forward(xt, &cache, null);
     defer out_t.deinit();
     try out_t.eval();
     const tshape = out_t.shape();
     try std.testing.expectEqual(@as(i32, 1), tshape[0]);
     try std.testing.expectEqual(@as(i32, 16), tshape[1]);
     try std.testing.expectEqual(@as(i32, 4), cache.len());
+}
+
+test "Qwen38Attn mrope: explicit cos/sin matches fast.rope on text positions" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Toy module: rotary_dims=2, head_dim=8, theta=1e4 → one freq slot,
+    // inv_freq = theta^0 = 1, so angle = position. cos/sin [1, 1, L, 2] in
+    // half-split layout ([c, c]).
+    var buf: [48]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+
+    var attn_ref = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_ref.deinit();
+    var cache_ref = Qwen38AttnCache{};
+    defer cache_ref.deinit();
+    const x1 = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer x1.deinit();
+    const out_ref = try attn_ref.forward(x1, &cache_ref, null);
+    defer out_ref.deinit();
+
+    var attn_m = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_m.deinit();
+    var cache_m = Qwen38AttnCache{};
+    defer cache_m.deinit();
+    var cos_buf: [6]f32 = undefined;
+    var sin_buf: [6]f32 = undefined;
+    for (0..3) |t| {
+        const p: f32 = @floatFromInt(t);
+        cos_buf[t * 2] = @cos(p);
+        cos_buf[t * 2 + 1] = @cos(p);
+        sin_buf[t * 2] = @sin(p);
+        sin_buf[t * 2 + 1] = @sin(p);
+    }
+    const cos_arr = try Array.fromData(allocator, f32, &cos_buf, &[_]i32{ 1, 1, 3, 2 });
+    defer cos_arr.deinit();
+    const sin_arr = try Array.fromData(allocator, f32, &sin_buf, &[_]i32{ 1, 1, 3, 2 });
+    defer sin_arr.deinit();
+    const x2 = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer x2.deinit();
+    const out_m = try attn_m.forward(x2, &cache_m, .{ .cos = cos_arr, .sin = sin_arr });
+    defer out_m.deinit();
+
+    const a32 = try ops.astype(ctx, out_ref, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, out_m, .float32);
+    defer b32.deinit();
+    const exp = try a32.dataSlice(f32);
+    const got = try b32.dataSlice(f32);
+    for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2);
+}
+
+test "Qwen38Attn rope_extra: decode offset shifts by delta (explicit cos/sin reference)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    var buf: [48]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+    var tok: [16]f32 = undefined;
+    for (&tok, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11) - 5)) * 0.1;
+    }
+
+    // Model A: prefill 3, then decode with rope_extra = 5 → rope offset 8.
+    var attn_a = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_a.deinit();
+    var cache_a = Qwen38AttnCache{};
+    defer cache_a.deinit();
+    const xa = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer xa.deinit();
+    const pre_a = try attn_a.forward(xa, &cache_a, null);
+    defer pre_a.deinit();
+    attn_a.rope_extra = 5;
+    const xt_a = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 16 });
+    defer xt_a.deinit();
+    const out_a = try attn_a.forward(xt_a, &cache_a, null);
+    defer out_a.deinit();
+
+    // Model B: same prefill, then a 1-row prefill carrying explicit cos/sin
+    // for position 8 — an independent rope implementation as reference.
+    var attn_b = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_b.deinit();
+    var cache_b = Qwen38AttnCache{};
+    defer cache_b.deinit();
+    const xb = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer xb.deinit();
+    const pre_b = try attn_b.forward(xb, &cache_b, null);
+    defer pre_b.deinit();
+    const cos_arr = try Array.fromData(allocator, f32, &[_]f32{ @cos(8.0), @cos(8.0) }, &[_]i32{ 1, 1, 1, 2 });
+    defer cos_arr.deinit();
+    const sin_arr = try Array.fromData(allocator, f32, &[_]f32{ @sin(8.0), @sin(8.0) }, &[_]i32{ 1, 1, 1, 2 });
+    defer sin_arr.deinit();
+    const xt_b = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 1, 16 });
+    defer xt_b.deinit();
+    const out_b = try attn_b.forward(xt_b, &cache_b, .{ .cos = cos_arr, .sin = sin_arr });
+    defer out_b.deinit();
+
+    const a32 = try ops.astype(ctx, out_a, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, out_b, .float32);
+    defer b32.deinit();
+    const got = try a32.dataSlice(f32);
+    const exp = try b32.dataSlice(f32);
+    for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2);
 }
 
 test "Qwen38Attn fused decode SDPA matches stock SDPA" {
@@ -2056,7 +2233,7 @@ test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" 
     for (0..N) |i| {
         const xt = try Array.fromData(allocator, f32, buf[i * HIDDEN ..][0..HIDDEN], &[_]i32{ 1, HIDDEN });
         defer xt.deinit();
-        dec_outs[i] = try attn_d.forward(xt, &cache_d);
+        dec_outs[i] = try attn_d.forward(xt, &cache_d, null);
         try dec_outs[i].eval();
     }
     defer for (&dec_outs) |*o| o.deinit();
@@ -2073,7 +2250,7 @@ test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" 
     defer cache_p.deinit();
     const xp = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, N, HIDDEN });
     defer xp.deinit();
-    const out_p = try attn_p.forward(xp, &cache_p);
+    const out_p = try attn_p.forward(xp, &cache_p, null);
     defer out_p.deinit();
     try out_p.eval();
     try std.testing.expectEqual(@as(i32, N), cache_p.len());
