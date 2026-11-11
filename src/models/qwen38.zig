@@ -164,7 +164,7 @@ pub fn mergeVisionFeatures(
 /// is tiled to [1, 1, L, rotary_dims] in half-split order ([c, c]) for the
 /// rotate-half apply (mirrors compute_mrope_frequencies + the concat tiling
 /// in mlx_vlm's rope_utils).
-fn buildMropeCosSin(
+pub fn buildMropeCosSin(
     allocator: std.mem.Allocator,
     cfg: *const qwen38_loader.Qwen38Config,
     pos: *const qwen38_mrope.MropeResult,
@@ -1962,6 +1962,11 @@ pub const Qwen38ServingModel = struct {
     /// cache.len() + delta. Returns last-position logits, same contract as
     /// forwardTokensLast. Always a fresh prefill (resets state).
     pub fn forwardTokensWithVision(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput) !Array {
+        const res = try self.forwardTokensWithVisionImpl(ids, vision, .none);
+        return res.logits;
+    }
+
+    fn forwardTokensWithVisionImpl(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput, capture: HiddenCapture) !ForwardCoreOut {
         const allocator = self.allocator;
         const ctx = self.ctx;
         const cfg = self.cfg;
@@ -1997,7 +2002,8 @@ pub const Qwen38ServingModel = struct {
         if (vision.blocks.len == 0) {
             // Text-only ids: delegate to the plain path — bitwise-identical,
             // and rope_delta stays 0.
-            return self.forwardTokensLast(ids);
+            const lg = try self.forwardTokensLast(ids);
+            return .{ .logits = lg, .hidden = null };
         }
         // buildMropeCosSin implements only the interleaved frequency layout.
         if (!cfg.mrope_interleaved) return error.UnsupportedMropeLayout;
@@ -2032,11 +2038,18 @@ pub const Qwen38ServingModel = struct {
         var mr = try buildMropeCosSin(allocator, cfg, &mres, ids.len);
         defer mr.deinit();
 
-        const res = try self.forwardTokensCoreCont(ids, .none, true, false, .{ .emb = emb, .mrope = mr });
+        const res = try self.forwardTokensCoreCont(ids, capture, true, false, .{ .emb = emb, .mrope = mr });
         // Only after the reset inside the prefill: decode/verify offsets
         // shift by the delta from here on.
         self.setRopeDelta(mres.rope_delta);
-        return res.logits;
+        return res;
+    }
+
+    /// forwardTokensWithVision with hidden-state capture (oracle bisection):
+    /// identical dataflow; `capture` .all returns the pre-final-norm hidden
+    /// [1, L, hidden] bf16, .last the last position only.
+    pub fn forwardTokensWithVisionCapture(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput, capture: HiddenCapture) !ForwardCoreOut {
+        return self.forwardTokensWithVisionImpl(ids, vision, capture);
     }
 
     /// forwardTokens + the pre-final-norm hidden at the last position (the
@@ -2059,8 +2072,8 @@ pub const Qwen38ServingModel = struct {
         return .{ .logits = res.logits, .hidden_all = res.hidden.? };
     }
 
-    const HiddenCapture = enum { none, last, all };
-    const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
+    pub const HiddenCapture = enum { none, last, all };
+    pub const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
     /// Vision prefill extras: merged embeddings (image features already
     /// spliced at the image-pad rows) and the MRoPE cos/sin tables for the

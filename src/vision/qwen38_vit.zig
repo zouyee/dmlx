@@ -464,36 +464,62 @@ pub const Qwen38Vit = struct {
         return ops.add(ctx, h1, f2);
     }
 
+    /// Optional per-stage trace hook for oracle bisection (Task 6).
+    pub const TraceHook = struct {
+        ctx: *anyopaque,
+        func: *const fn (*anyopaque, []const u8, Array) anyerror!void,
+    };
+
     /// pixels: [grid_t*grid_h*grid_w, in_ch*t*p*p] bf16 (preprocess output);
     /// returns [ grid_t*(grid_h/merge)*(grid_w/merge), out_hidden ] bf16.
     pub fn forward(self: *Qwen38Vit, pixels: Array, grid_t: i32, grid_h: i32, grid_w: i32) !Array {
+        return self.forwardTraced(pixels, grid_t, grid_h, grid_w, null);
+    }
+
+    pub fn forwardTraced(self: *Qwen38Vit, pixels: Array, grid_t: i32, grid_h: i32, grid_w: i32, hook: ?TraceHook) !Array {
+        const trace = struct {
+            fn emit(h: ?TraceHook, name: []const u8, t: Array) void {
+                if (h) |hh| hh.func(hh.ctx, name, t) catch |e|
+                    std.log.warn("qwen38_vit trace hook failed at {s}: {s}", .{ name, @errorName(e) });
+            }
+        }.emit;
         const ctx = self.ctx;
         const m: i32 = self.cfg.merge;
         const n: i32 = grid_t * grid_h * grid_w;
         const n_merged: i32 = grid_t * @divExact(grid_h, m) * @divExact(grid_w, m);
 
         var hidden = try self.patchEmbed(pixels, n);
+        trace(hook, "patch_embed", hidden);
         var hidden_consumed = false;
         errdefer if (!hidden_consumed) hidden.deinit();
 
         const pos = try self.posEmbedInterpolate(grid_t, grid_h, grid_w);
         defer pos.deinit();
+        trace(hook, "pos_embed", pos);
         const hidden_pos = try ops.add(ctx, hidden, pos);
         hidden.deinit();
         hidden = hidden_pos;
+        trace(hook, "pos_added", hidden);
 
         const rope = try self.rotPosEmb(grid_t, grid_h, grid_w);
         defer rope.deinit();
+        trace(hook, "rope_freqs", rope);
 
-        for (self.blocks) |*blk| {
+        for (self.blocks, 0..) |*blk, bi| {
             const out = try self.blockForward(blk, hidden, rope);
             hidden.deinit();
             hidden = out;
+            if (hook != null and (bi < 4 or bi + 1 == self.blocks.len)) {
+                var nb: [24]u8 = undefined;
+                const nm = std.fmt.bufPrint(&nb, "block{d}", .{bi}) catch unreachable;
+                trace(hook, nm, hidden);
+            }
         }
 
         // Merger (use_postshuffle_norm=false): LN on [N, hidden], reshape to
         // [n_merged, hidden*m*m], fc1 -> GELU(exact) -> fc2.
         const normed = try fast_mod.layerNorm(ctx, hidden, self.merger_norm_w, self.merger_norm_b, LN_EPS);
+        trace(hook, "merger_normed", normed);
         hidden.deinit();
         hidden_consumed = true;
         defer normed.deinit();
@@ -657,6 +683,8 @@ test "Qwen38Vit toy tower: shape + determinism (merge=2, t=1, 4x4 grid)" {
 }
 
 test "Qwen38Vit oracle parity vs mlx_vlm dump" {
-    // Parity artifacts are produced by Task 6; skip gracefully until then.
+    // Implemented by the Task 6 harness: src/test_qwen38_vision_oracle.zig
+    // (zig build test-qwen38-vision-oracle), a standalone executable because
+    // the 27B model load perturbs later GPU unit tests in-process.
     return error.SkipZigTest;
 }

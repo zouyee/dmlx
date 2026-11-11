@@ -474,6 +474,45 @@ pub fn build(b: *std.Build) void {
     );
     run_qwen38_oracle_dump_step.dependOn(&run_qwen38_oracle_dump.step);
 
+    // --- Qwen3.8 VISION oracle parity harness (pure Zig + mlx-c) ---
+    // Reads artifacts/qwen38_vision_oracle/*.npy from
+    // scripts/qwen38_vision_oracle_dump.py and gates tower features,
+    // position_ids, cos/sin, merged embeddings, and last-position logits.
+    // Standalone executable (not a zig test): the 27B load perturbs later
+    // GPU unit tests when they share a process. Exits 0 with SKIP when the
+    // artifacts or the local checkpoint are absent.
+    const qwen38_vision_oracle = b.addExecutable(.{
+        .name = "qwen38-vision-oracle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_qwen38_vision_oracle.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qwen38_vision_oracle.root_module.addImport("mlx", mlx_z_module);
+    qwen38_vision_oracle.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    qwen38_vision_oracle.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/stb_image_impl.c"),
+        .flags = &.{"-std=c11"},
+        .language = .c,
+    });
+    qwen38_vision_oracle.root_module.linkFramework("Metal", .{});
+    qwen38_vision_oracle.root_module.linkFramework("Foundation", .{});
+    const run_qwen38_vision_oracle = b.addRunArtifact(qwen38_vision_oracle);
+    if (b.args) |args| {
+        run_qwen38_vision_oracle.addArgs(args);
+    }
+    const run_qwen38_vision_oracle_step = b.step(
+        "test-qwen38-vision-oracle",
+        "Run the Qwen3.8 vision oracle parity gates against artifacts/qwen38_vision_oracle",
+    );
+    run_qwen38_vision_oracle_step.dependOn(&run_qwen38_vision_oracle.step);
+
     // --- Qwen3.8 decode profiler (TEMPORARY, uncommitted) ---
     // Section-level wall-clock breakdown of the serving decode path.
     const qwen38_profile = b.addExecutable(.{
