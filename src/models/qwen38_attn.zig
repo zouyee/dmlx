@@ -13,6 +13,7 @@ const creation = @import("mlx").creation;
 
 const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
+const eval_mod = @import("mlx").eval;
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const qmm_v8 = @import("qwen38_qmm_v8.zig");
@@ -206,6 +207,94 @@ pub const Qwen38AttnCache = struct {
     }
 };
 
+test "kvInplaceWrite: bf16 in-place slab append matches expected layout" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    if (kvInplaceDisabled()) {
+        // Force-enable for this test (the feature is opt-in by default).
+        kv_inplace_on = true;
+        kv_inplace_broken = false;
+        if (kvInplaceDisabled()) return error.SkipTest;
+    }
+    // The kernel mutates the slab asynchronously on the GPU stream; reads
+    // must be enqueued on the SAME stream to be ordered after the write
+    // (a CPU-stream ctx would race and read stale data).
+    const stream = c.c.mlx_default_gpu_stream_new();
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
+
+    const HKV: i32 = 2;
+    const D: i32 = 4;
+    const CAP: i32 = 8;
+    const slab = try creation.zeros(ctx, &[_]i32{ 1, HKV, CAP, D }, .bfloat16);
+    defer slab.deinit();
+
+    // rows1: [1, 2, 3, 4] with distinct values v = hk*100 + l*10 + d
+    var buf1: [2 * 3 * 4]f32 = undefined;
+    for (0..2) |hk| for (0..3) |l| for (0..4) |d| {
+        buf1[hk * 12 + l * 4 + d] = @floatFromInt(hk * 100 + l * 10 + d);
+    };
+    const r1f = try Array.fromData(allocator, f32, &buf1, &[_]i32{ 1, HKV, 3, D });
+    defer r1f.deinit();
+    const rows1 = try ops.astype(ctx, r1f, .bfloat16);
+    defer rows1.deinit();
+
+    try std.testing.expect(try kvInplaceWrite(ctx, slab, rows1, 2, 3, HKV, D));
+
+    // Interleave a dependent read between two writes to exercise ordering:
+    // read back slab[0, 1, 2..5, :] and check rows1's head-1 content landed.
+    {
+        const seg = try ops.slice(ctx, slab, &[_]i32{ 0, 1, 2, 0 }, &[_]i32{ 1, 2, 5, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer seg.deinit();
+        const segf = try ops.astype(ctx, seg, .float32);
+        defer segf.deinit();
+        try segf.eval();
+        const sv = try segf.dataSlice(f32);
+        // rows1[0, 1, 0..3, :] = [100..103, 110..113, 120..123]
+        try std.testing.expectApproxEqAbs(@as(f32, 100), sv[0], 1e-2);
+        try std.testing.expectApproxEqAbs(@as(f32, 123), sv[11], 1e-2);
+    }
+
+    var buf2: [2 * 2 * 4]f32 = undefined;
+    for (0..2) |hk| for (0..2) |l| for (0..4) |d| {
+        buf2[hk * 8 + l * 4 + d] = @floatFromInt(1000 + hk * 100 + l * 10 + d);
+    };
+    const r2f = try Array.fromData(allocator, f32, &buf2, &[_]i32{ 1, HKV, 2, D });
+    defer r2f.deinit();
+    const rows2 = try ops.astype(ctx, r2f, .bfloat16);
+    defer rows2.deinit();
+
+    try std.testing.expect(try kvInplaceWrite(ctx, slab, rows2, 5, 2, HKV, D));
+
+    // Read back exact regions.
+    const got1 = try ops.slice(ctx, slab, &[_]i32{ 0, 1, 3, 0 }, &[_]i32{ 1, 2, 4, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer got1.deinit();
+    const got32 = try ops.astype(ctx, got1, .float32);
+    defer got32.deinit();
+    try got32.eval();
+    // slab[0, 1, 3, :] == rows1[0, 1, 1, :] == [110, 111, 112, 113]
+    const g1 = try got32.dataSlice(f32);
+    try std.testing.expectApproxEqAbs(@as(f32, 110), g1[0], 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 113), g1[3], 1e-2);
+
+    const got2 = try ops.slice(ctx, slab, &[_]i32{ 0, 0, 5, 0 }, &[_]i32{ 1, 1, 6, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer got2.deinit();
+    const got2f = try ops.astype(ctx, got2, .float32);
+    defer got2f.deinit();
+    try got2f.eval();
+    const g2 = try got2f.dataSlice(f32);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), g2[0], 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1003), g2[3], 1.0);
+
+    // Untouched region stays zero.
+    const gotz = try ops.slice(ctx, slab, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, 1, 2, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer gotz.deinit();
+    const gotzf = try ops.astype(ctx, gotz, .float32);
+    defer gotzf.deinit();
+    try gotzf.eval();
+    const gz = try gotzf.dataSlice(f32);
+    for (gz) |v| try std.testing.expectEqual(@as(f32, 0), v);
+}
+
 test "Qwen38Attn.step: shapes, cache growth, determinism" {
     c.initErrorHandler();
     const allocator = std.testing.allocator;
@@ -254,9 +343,129 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     try std.testing.expectEqual(@as(f32, 0.0), try max_diff.item(f32));
 }
 
+// ============================================================
+// In-place KV slab append (OPT-IN, DMLX_KV_INPLACE=1; default OFF)
+//
+// slice_update is functional: every append copies the whole slab
+// (2 x [HKV, cap, D] per layer per token — ~1 GB per token at 16K ctx
+// across 16 layers). This kernel writes only the new L rows into the
+// existing slab buffer instead. MEASURED NEUTRAL-TO-NEGATIVE at 16K MTP
+// (see kvInplaceDisabled): the functional copies overlap compute, so the
+// O(cap) write traffic is not on the critical path. The kernel remains
+// correct (bit-identical outputs) and is kept as the reference pattern
+// for eager in-place mutation: the Metal input arrives as `const device`
+// (const_cast is deliberate), and mlx_fast_metal_kernel_apply is LAZY —
+// the sentinel output must be asyncEval'd for the write to be enqueued.
+// Ordering rests on all custom kernels and MLX evals sharing the default
+// GPU stream (fusedStream()).
+// ============================================================
+
+const kv_inplace_body =
+    \\    const uint3 gid = thread_position_in_grid;
+    \\    const uint offset = params[0];
+    \\    const uint cap = params[1];
+    \\    const uint L = params[2];
+    \\    const uint D = params[3];
+    \\    device bfloat16_t* slab_w = const_cast<device bfloat16_t*>(slab);
+    \\    slab_w[(gid.z * cap + offset + gid.y) * D + gid.x] = rows[(gid.z * L + gid.y) * D + gid.x];
+    \\    if (gid.x == 0 and gid.y == 0 and gid.z == 0) sentinel[0] = 1.0f;
+;
+
+var kv_inplace_kernel: ?c.c.mlx_fast_metal_kernel = null;
+var kv_inplace_broken: bool = false;
+var kv_inplace_on: ?bool = null;
+
+/// OPT-IN (DMLX_KV_INPLACE=1, default OFF). Measured neutral-to-slightly-
+/// negative at 16K MTP (2026-11-11, scripts/ab_kvinplace_16k.sh: verify
+/// 157.1/109.3 vs 141.4/106.7 ms/round, wall 112.6/109.3 vs 110.9/108.8s,
+/// output text bit-identical): the slice_update slab copies overlap compute
+/// and are not on the critical path — bandwidth math does not translate to
+/// wall time here, at any context length (copy and SDPA both scale ~T).
+/// Kept as a reference implementation of eager in-place mutation via
+/// const_cast + sentinel asyncEval; do not extend without new evidence.
+fn kvInplaceDisabled() bool {
+    if (kv_inplace_on == null) {
+        kv_inplace_on = if (std.c.getenv("DMLX_KV_INPLACE")) |v| v[0] == '1' else false;
+    }
+    return !kv_inplace_on.?;
+}
+
+fn getKvInplaceKernel(allocator: std.mem.Allocator) ?c.c.mlx_fast_metal_kernel {
+    if (kv_inplace_broken) return null;
+    if (kv_inplace_kernel) |k| return k;
+    const name_z = allocator.dupeZ(u8, "dmlx_kv_inplace_append") catch return null;
+    defer allocator.free(name_z);
+    const src_z = allocator.dupeZ(u8, kv_inplace_body) catch return null;
+    defer allocator.free(src_z);
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+    const in_vec = qwen38_gdn.makeStringVec(allocator, &.{ "slab", "rows", "params" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = qwen38_gdn.makeStringVec(allocator, &.{"sentinel"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+    const k = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
+    kv_inplace_kernel = k;
+    return k;
+}
+
+var kv_inplace_logged: bool = false;
+
+/// Write rows [1, HKV, L, D] into slab [1, HKV, cap, D] at [.., off..off+L, :]
+/// without copying the slab. Returns false on any shape/dtype/layout
+/// mismatch (caller falls back to slice_update).
+fn kvInplaceWrite(ctx: EagerContext, slab: Array, rows: Array, off: i32, L: i32, HKV: i32, D: i32) !bool {
+    if (kvInplaceDisabled() or kv_inplace_broken) return false;
+    const dt = dtype_mod.Dtype.bfloat16;
+    if (slab.dtype() != dt or rows.dtype() != dt) return false;
+    const cap: i32 = @intCast(slab.shape()[2]);
+    if (!isContiguous4D(slab, 1, HKV, cap, D)) return false;
+    if (!isContiguous4D(rows, 1, HKV, L, D)) return false;
+    const kernel = getKvInplaceKernel(ctx.allocator) orelse return false;
+
+    const params = try Array.fromData(ctx.allocator, u32, &[_]u32{ @intCast(off), @intCast(cap), @intCast(L), @intCast(D) }, &[_]i32{4});
+    defer params.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(D), @intCast(L), @intCast(HKV)));
+    const tg: c_int = @min(D, 128);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{1}, 1, c.c.MLX_FLOAT32));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ slab, rows, params }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, qwen38_gdn.fusedStream())) catch |err| {
+        kv_inplace_broken = true;
+        sdpaDecodeWarn(err);
+        return false;
+    };
+    // mlx_fast_metal_kernel_apply is LAZY: the kernel only runs when the
+    // outputs are evaluated. Submit the sentinel (non-blocking) so the
+    // slab write is enqueued on the GPU stream now — subsequent reads of
+    // the slab on the same stream are ordered after it.
+    if (c.c.mlx_vector_array_size(out_vec) > 0) {
+        var h = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+        var sentinel = Array.fromHandle(h);
+        defer sentinel.deinit();
+        try eval_mod.asyncEval(ctx.allocator, &[_]Array{sentinel});
+    }
+    if (!kv_inplace_logged) {
+        kv_inplace_logged = true;
+        std.log.info("[kv-inplace] engaged (in-place slab append, no slice_update copy)", .{});
+    }
+    return true;
+}
+
 /// Slab cache write: grow capacity (doubling, 256-token granularity) if
-/// needed, then one slice_update per tensor at [len, len+L). sliceUpdate
-/// returns a new array; swap it in and free the old buffer. On failure
+/// needed, then write the new rows at [len, len+L) — in-place via
+/// kvInplaceWrite when possible (O(L), no copy), else one slice_update
+/// per tensor (functional, copies the whole slab). On failure
 /// the cache stays consistent because `len` only advances at the end.
 fn cacheAppend(ctx: EagerContext, cache: *Qwen38AttnCache, k_t: Array, v_t: Array, L: i32, HKV: i32, D: i32) !void {
     const needed: i32 = cache.len_ + L;
@@ -285,6 +494,27 @@ fn cacheAppend(ctx: EagerContext, cache: *Qwen38AttnCache, k_t: Array, v_t: Arra
             cache.keys = k_grown;
             cache.values = v_grown;
         }
+    }
+    // In-place slab write: O(L) instead of the O(cap) slice_update copy.
+    // Rows that are not contiguous get a cheap same-shape copy first
+    // (rope/transposed views; at most [HKV, L, D]).
+    var k_owned: ?Array = null;
+    defer if (k_owned) |*o| o.deinit();
+    var v_owned: ?Array = null;
+    defer if (v_owned) |*o| o.deinit();
+    const k_c = if (isContiguous4D(k_t, 1, HKV, L, D)) k_t else blk: {
+        k_owned = try ops.copy(ctx, k_t);
+        break :blk k_owned.?;
+    };
+    const v_c = if (isContiguous4D(v_t, 1, HKV, L, D)) v_t else blk: {
+        v_owned = try ops.copy(ctx, v_t);
+        break :blk v_owned.?;
+    };
+    if (try kvInplaceWrite(ctx, cache.keys.?, k_c, cache.len_, L, HKV, D) and
+        try kvInplaceWrite(ctx, cache.values.?, v_c, cache.len_, L, HKV, D))
+    {
+        cache.len_ = needed;
+        return;
     }
     const start = &[_]i32{ 0, 0, cache.len_, 0 };
     const stop = &[_]i32{ 1, HKV, needed, D };

@@ -1766,3 +1766,23 @@ chunked prefill 代码保留为 **opt-in 默认关**(`DMLX_PREFILL_CHUNK=2048`;
 
 遗留真话:prefill ~8ms/token 里 qmm 占大头(~7 TF/s 有效,与 ANE 表
 里的 6.75 TF/s 一致),再提速只能动 qmm 本身(超出本次范围)。
+
+## KV cache append in-place spike——中性偏负,默认关,方案 2(分页 KV)不做(2026-11-11)
+
+背景:cacheAppend 的 slice_update 是函数式全 slab 拷贝,16K 下
+2×33MB×16 层 ≈ 1GB/token(decode)与 ~1GB/round(verify),账面
+~13% decode 税。spike:自研 Metal kernel 把新行原地写进 slab
+(`const device` 输入 + const_cast;`mlx_fast_metal_kernel_apply`
+是惰性的,必须 asyncEval 哨兵输出才真正入队;全部 kernel 与 eval
+共享 default GPU stream,顺序有保证)。正确性:贪心输出四臂 md5
+逐字一致。
+
+实测(scripts/ab_kvinplace_16k.sh,16K ctx,MTP 7,逐请求交错 2 rep):
+in-place verify 157.1/109.3 vs slice_update 141.4/106.7 ms/round;
+wall 112.6/109.3 vs 110.9/108.8s——差异在噪声内且两 rep 都是
+in-place 略慢(每次 append 的强制提前 eval 打碎了惰性图融合)。
+**拷贝与计算重叠,不占关键路径;拷贝与 SDPA 都随 T 线性增长,
+比率在 32K 也不会反转。** 结论:拷贝税是账面假象(§23 教训的又一例),
+in-place 保留为 opt-in(`DMLX_KV_INPLACE=1`,默认关),分页/分块 KV
+重构的性能动机不成立——它剩余的价值只有 32K+ 容量与 KV 量化挂载点,
+等真实需求驱动再做。清单第 1 项按此改写。
