@@ -55,6 +55,7 @@ pub const vision_preprocess_tests = @import("vision/preprocess.zig");
 pub const vision_vit_tests = @import("vision/vit.zig");
 pub const vision_qwen38_vit_tests = @import("vision/qwen38_vit.zig");
 pub const vision_qwen38_preprocess_tests = @import("vision/qwen38_preprocess.zig");
+pub const vision_prompt_tests = @import("vision_prompt.zig");
 pub const vision_llava_tests = @import("vision/llava.zig");
 
 pub const expert_remap_tests = @import("tests/expert_remap_test.zig");
@@ -138,6 +139,7 @@ test {
     _ = vision_vit_tests;
     _ = vision_qwen38_vit_tests;
     _ = vision_qwen38_preprocess_tests;
+    _ = vision_prompt_tests;
     _ = vision_llava_tests;
 
     _ = expert_remap_tests;

@@ -5,7 +5,7 @@
 #
 # Usage: bash scripts/ab_vision_smoke.sh
 # Env:   MODEL (default ~/models/Qwen3.8-27B-4bit), PORT (default 18098),
-#        MAXTOK (default 64), MTP (set to e.g. 4 to enable --speculative-mtp)
+#        MAXTOK (default 256), MTP (set to e.g. 4 to enable --speculative-mtp)
 set -uo pipefail
 DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "${DIR}/.." && pwd)"
@@ -15,18 +15,28 @@ PORT="${PORT:-18098}"
 MAXTOK="${MAXTOK:-256}"
 IMAGE="${IMAGE:-${PROJECT_DIR}/tests/fixtures/vision/photo.png}"
 LOG="/tmp/ab_vision_smoke_$$.log"
+PIDFILE="/tmp/ab_vision_smoke.port${PORT}.pid"
 
 MTP_ARGS=()
 if [ -n "${MTP:-}" ]; then
     MTP_ARGS=(--speculative-mtp "$MTP")
 fi
 
-pkill -f "dmlx serve" 2>/dev/null; sleep 2
+# Clean up a leftover server from a previous run of THIS script on this
+# port (recorded in the pidfile) — never blanket-pkill other servers.
+if [ -f "$PIDFILE" ]; then
+    old_pid=$(cat "$PIDFILE")
+    kill "$old_pid" 2>/dev/null
+    sleep 2
+    rm -f "$PIDFILE"
+fi
+
 # Empty-think keeps the smoke short: the model answers directly instead of
 # burning the token budget on a thinking block before the description.
 DMLX_CHAT_EMPTY_THINK=1 "$CLI" serve --model "$MODEL" --port "$PORT" ${MTP_ARGS[@]+"${MTP_ARGS[@]}"} >"$LOG" 2>&1 &
 pid=$!
-cleanup() { kill "$pid" 2>/dev/null; }
+echo "$pid" > "$PIDFILE"
+cleanup() { kill "$pid" 2>/dev/null; rm -f "$PIDFILE"; }
 trap cleanup EXIT
 
 ready=0

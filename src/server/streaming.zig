@@ -35,7 +35,11 @@ pub fn handleStreamingCompletion(
     const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
     const completion_id = created; // Use timestamp as unique ID
 
-    // 2. Send initial chunk with role
+    // 2. Send initial chunk with role. NOTE: this goes out BEFORE prompt
+    // validation (step 3-5) — SSE headers/role are already committed once
+    // the stream opens, so a later validation failure is reported as an
+    // error event mid-stream (followed by [DONE]) rather than an HTTP error
+    // status. That ordering is by design for SSE.
     const role_chunk = try formatSSEChunk(allocator, completion_id, created, req.model, null, null);
     defer allocator.free(role_chunk);
     try sse.sendEvent(role_chunk);
@@ -79,12 +83,13 @@ pub fn handleStreamingCompletion(
         .model_name = req.model,
         .vision = prepared.vision,
     };
-    // Vision ownership moves into the RequestState.
-    prepared.vision = null;
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
+    // On init failure `prepared`'s defer frees the vision payload.
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
     defer req_state.deinit();
+    // Vision ownership has moved into the RequestState.
+    prepared.vision = null;
 
     _ = state.active_requests.fetchAdd(1, .monotonic);
     defer _ = state.active_requests.fetchSub(1, .monotonic);

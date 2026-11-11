@@ -129,7 +129,8 @@ pub const VisionData = struct {
 /// at the image-pad positions and runs MRoPE. Null for text-only models.
 pub const VisionOps = struct {
     /// Token id of the image-pad placeholder (Qwen3.8: 248056 <|image_pad|>).
-    image_token_id: u32 = 248056,
+    /// Required: set from the model config by the implementing adapter.
+    image_token_id: u32,
     /// Preprocess one image and run the ViT tower → features + block + pad
     /// count (owned by the caller).
     processImage: *const fn (ctx: *anyopaque, image: VisionImage) anyerror!VisionImageOut,

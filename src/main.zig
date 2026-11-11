@@ -482,6 +482,9 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
     };
     var images = std.ArrayList([]const u8).empty;
     defer images.deinit(allocator);
+    // On a parse error, release any --image strings collected so far (the
+    // happy path moves them into cmd.images).
+    errdefer for (images.items) |s| allocator.free(s);
 
     var i: usize = 0;
     while (i < args.len) {

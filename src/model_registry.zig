@@ -35,6 +35,7 @@ const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
 const qwen38_vit = @import("vision/qwen38_vit.zig");
 const qwen38_preprocess = @import("vision/qwen38_preprocess.zig");
+const pthread = @cImport(@cInclude("pthread.h"));
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -592,14 +593,23 @@ pub const Qwen38VTableAdapter = struct {
     /// Model directory (owned) — the vision tower's weights are lazily read
     /// from here on the first image request.
     model_path: []const u8 = "",
-    /// Lazily-initialized vision tower + its resident weight map.
+    /// Serializes every adapter op that touches the model's MLX context.
+    /// The engine fiber drives forward/prefill/draft/verify; vision
+    /// processImage runs on HTTP connection fibers (src/server.zig spawns
+    /// one io.async fiber per connection on the Threaded backend) — without
+    /// this lock a tower forward on a connection fiber would build MLX
+    /// graphs on the same ctx/stream concurrently with engine decode steps.
+    /// Leaf lock: op fns never call each other while holding it (ensureVit
+    /// and mtpPrefillTail are called with the lock already held).
+    /// pthread mutex (repo pattern, cf. expert_pread.zig): std.Io.Mutex
+    /// needs an Io at lock time, which several op fns don't have.
+    mu: pthread.pthread_mutex_t,
+    /// Lazily-initialized vision tower + its resident weight map. Guarded by
+    /// mu (two concurrent first-image requests must not double-load).
     vit: ?*qwen38_vit.Qwen38Vit = null,
     vit_weights: ?std.StringHashMap(Array) = null,
-    vision_ops: generation.VisionOps = .{
-        .image_token_id = 248056,
-        .processImage = &visionProcessImage,
-        .prefill = &visionPrefill,
-    },
+    /// Set by qwen38Loader (image_token_id comes from the model config).
+    vision_ops: generation.VisionOps,
     /// MTP drafter state (lazily loaded on first enable()).
     mtp: ?*qwen38_mtp.Qwen38Mtp = null,
     /// Drafter KV length before the current round's draft chain; null when
@@ -630,6 +640,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn forward(ctx_ptr: *anyopaque, input: Array, mask: ?Array, caches: ?[]KVCacheStrategy) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         _ = mask;
         _ = caches;
         try input.eval();
@@ -644,7 +656,7 @@ pub const Qwen38VTableAdapter = struct {
     }
 
     /// Lazy-load the ViT tower weights (vision_tower.* tensors) and build
-    /// the tower on first use.
+    /// the tower on first use. CALL WITH self.mu HELD.
     fn ensureVit(self: *Qwen38VTableAdapter) !*qwen38_vit.Qwen38Vit {
         if (self.vit) |v| return v;
         if (self.cfg.vision.depth == 0) return error.VisionNotSupported;
@@ -667,15 +679,7 @@ pub const Qwen38VTableAdapter = struct {
             try map.put(try self.allocator.dupe(u8, name), try index.loadTensor(name));
             n_tensors += 1;
         }
-        if (n_tensors == 0) {
-            var it2 = map.iterator();
-            while (it2.next()) |e| {
-                self.allocator.free(e.key_ptr.*);
-                e.value_ptr.deinit();
-            }
-            map.deinit();
-            return error.VisionNotSupported;
-        }
+        if (n_tensors == 0) return error.VisionNotSupported;
         const cv = self.cfg.vision;
         const vcfg = qwen38_vit.Qwen38VitConfig{
             .depth = cv.depth,
@@ -700,6 +704,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn visionProcessImage(ctx_ptr: *anyopaque, image: generation.VisionImage) anyerror!generation.VisionImageOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const vit = try self.ensureVit();
         var pp = switch (image) {
             .path => |p| try qwen38_preprocess.preprocessImageFile(self.allocator, self.model.ctx, p),
@@ -718,6 +724,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn visionPrefill(ctx_ptr: *anyopaque, ids: []const u32, vision: generation.VisionData) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         return self.model.forwardTokensWithVision(ids, .{
             .features = vision.features,
             .blocks = vision.blocks,
@@ -741,6 +749,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpEnable(ctx_ptr: *anyopaque, num_drafts: usize) anyerror!bool {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         self.mtp_ops.num_drafts = num_drafts;
         if (self.mtp != null) return true;
         const dir = blk: {
@@ -793,6 +803,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const m = self.mtp.?;
         // Backbone: normal prefill path (reset + fused recurrence — NO
         // per-position state retention; verify-mode would pin L x 3.1 MB x 48
@@ -814,6 +826,8 @@ pub const Qwen38VTableAdapter = struct {
     /// by the same rope_delta the backbone decode steps use.
     fn mtpPrefillVision(ctx_ptr: *anyopaque, ids: []const u32, vision: generation.VisionData) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const m = self.mtp.?;
         m.cache.deinit();
         m.cache = .{};
@@ -889,6 +903,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpDraft(ctx_ptr: *anyopaque, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
@@ -908,6 +924,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpDraftGreedy(ctx_ptr: *anyopaque, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
@@ -922,6 +940,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpVerify(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpVerifyHandle {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
         errdefer self.allocator.destroy(box);
         box.* = try qwen38.forwardVerifyImpl(self.model, ids);
@@ -930,6 +950,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpVerifyLogits(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         const ctx = self.model.ctx;
         const vocab: i32 = v.logits.shape()[2];
@@ -942,6 +964,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpVerifyHidden(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         const ctx = self.model.ctx;
         const hidden: i32 = v.hidden_pre_norm_all.shape()[2];
@@ -956,6 +980,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpVerifyArgmax(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) anyerror!Array {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         const ctx = self.model.ctx;
         const L: i32 = v.logits.shape()[1];
@@ -969,6 +995,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize, tokens: []const u32) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         qwen38.commitVerify(self.model, v, accepted);
         // Drafter cache, mlx-vlm accept_verified_tokens semantics: drop every
@@ -1058,6 +1086,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpRollback(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         qwen38.rollbackVerify(self.model, v);
         const m = self.mtp.?;
@@ -1067,6 +1097,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn mtpFreeVerify(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         v.deinit(self.allocator);
         self.allocator.destroy(v);
@@ -1092,6 +1124,7 @@ pub const Qwen38VTableAdapter = struct {
             vw.deinit();
         }
         if (self.model_path.len > 0) allocator.free(self.model_path);
+        _ = pthread.pthread_mutex_destroy(&self.mu);
         self.model.deinit();
         allocator.destroy(self.model);
         var it = self.weights.iterator();
@@ -1167,8 +1200,14 @@ fn qwen38Loader(
         .weights = weights,
         .allocator = allocator,
         .model_path = try allocator.dupe(u8, model_path),
+        .vision_ops = .{
+            .image_token_id = cfg_ptr.image_token_id,
+            .processImage = &Qwen38VTableAdapter.visionProcessImage,
+            .prefill = &Qwen38VTableAdapter.visionPrefill,
+        },
+        .mu = undefined,
     };
-    adapter.vision_ops.image_token_id = cfg_ptr.image_token_id;
+    _ = pthread.pthread_mutex_init(&adapter.mu, null);
 
     return ModelVTable{
         .forward = &Qwen38VTableAdapter.forward,

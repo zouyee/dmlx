@@ -113,8 +113,10 @@ fn extractMessageContent(
 }
 
 /// Resolve one image_url: data URLs are base64-decoded inline (20 MB
-/// decoded cap); absolute file paths are passed through for local dev.
-/// Remote URLs are not fetched in v1.
+/// decoded cap; note the 16 MB HTTP body cap in http.zig makes this
+/// effectively ~12 MB of decoded image per request, since the base64 text
+/// inflates the payload by ~4/3); absolute file paths are passed through
+/// for local dev. Remote URLs are not fetched in v1.
 fn loadImageRef(
     allocator: std.mem.Allocator,
     url: []const u8,
@@ -330,12 +332,13 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         } else null,
         .vision = prepared.vision,
     };
-    // Vision ownership moves into the RequestState.
-    prepared.vision = null;
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
+    // On init failure `prepared`'s defer frees the vision payload.
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
     defer req_state.deinit();
+    // Vision ownership has moved into the RequestState.
+    prepared.vision = null;
 
     _ = state.active_requests.fetchAdd(1, .monotonic);
     defer _ = state.active_requests.fetchSub(1, .monotonic);

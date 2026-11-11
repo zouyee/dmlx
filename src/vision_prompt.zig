@@ -88,7 +88,11 @@ pub fn validatePadCount(tokens: []const u32, image_token_id: u32, want_pads: usi
     var n_pads: usize = 0;
     for (tokens) |t| n_pads += @intFromBool(t == image_token_id);
     if (n_pads != want_pads) {
-        std.log.err("vision prompt: {d} image pads encoded, tower produced {d}", .{ n_pads, want_pads });
+        // warn under `zig build test` (the runner fails tests on err logs).
+        if (@import("builtin").is_test)
+            std.log.warn("vision prompt: {d} image pads encoded, tower produced {d}", .{ n_pads, want_pads })
+        else
+            std.log.err("vision prompt: {d} image pads encoded, tower produced {d}", .{ n_pads, want_pads });
         return error.ImageBlockMismatch;
     }
 }
@@ -143,4 +147,12 @@ pub fn build(
     try validatePadCount(tokens, image_token_id, proc.n_pads);
 
     return .{ .tokens = tokens, .data = proc.data };
+}
+
+test "validatePadCount: matches and mismatch" {
+    const image_token: u32 = 248056;
+    const ids = [_]u32{ 248045, 846, 198, 248053, 248056, 248056, 248054, 198, 72240 };
+    try validatePadCount(&ids, image_token, 2);
+    try std.testing.expectError(error.ImageBlockMismatch, validatePadCount(&ids, image_token, 1));
+    try std.testing.expectError(error.ImageBlockMismatch, validatePadCount(&ids, image_token, 3));
 }
