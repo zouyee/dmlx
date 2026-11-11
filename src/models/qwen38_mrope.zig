@@ -119,6 +119,17 @@ pub fn interleavedPositionSelector(mrope_section: [3]u32, comptime freq_dim: usi
     return selector;
 }
 
+/// Runtime-freq_dim variant of interleavedPositionSelector (rotary dims come
+/// from the parsed config, not a comptime constant). Writes `out.len` slots.
+pub fn interleavedPositionSelectorRuntime(mrope_section: [3]u32, out: []u2) void {
+    @memset(out, 0);
+    for (1..3) |dim| {
+        const limit = @min(@as(usize, mrope_section[dim]) * 3, out.len);
+        var idx: usize = dim;
+        while (idx < limit) : (idx += 3) out[idx] = @intCast(dim);
+    }
+}
+
 const testing = std.testing;
 
 // Oracle values verified against mlx_vlm LanguageModel.get_rope_index
@@ -192,6 +203,22 @@ test "interleavedPositionSelector: [11,11,10] over 32 slots" {
     const sel = interleavedPositionSelector(.{ 11, 11, 10 }, 32);
     const expected = [32]u2{ 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1 };
     try testing.expectEqual(expected, sel);
+}
+
+test "interleavedPositionSelectorRuntime agrees with the comptime variant" {
+    const section = [3]u32{ 11, 11, 10 };
+    inline for (.{ 1, 4, 32, 48 }) |freq_dim| {
+        var buf: [freq_dim]u2 = undefined;
+        interleavedPositionSelectorRuntime(section, &buf);
+        try testing.expectEqual(interleavedPositionSelector(section, freq_dim), buf);
+    }
+    // Non-default sections, incl. truncation when section*3 exceeds freq_dim.
+    var buf4: [4]u2 = undefined;
+    interleavedPositionSelectorRuntime(.{ 8, 8, 16 }, &buf4);
+    try testing.expectEqual([4]u2{ 0, 1, 2, 0 }, buf4);
+    var buf8: [8]u2 = undefined;
+    interleavedPositionSelectorRuntime(.{ 2, 1, 1 }, &buf8);
+    try testing.expectEqual([8]u2{ 0, 1, 2, 0, 0, 0, 0, 0 }, buf8);
 }
 
 test "computePositionIds: failure paths" {

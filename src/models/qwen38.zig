@@ -124,6 +124,9 @@ pub const VisionInput = struct {
 /// positions with the next rows of `features` ([total_pads, hidden]). One
 /// image's pads are contiguous in the prompt, so each image is a single
 /// sliceUpdate span. Returns a new array (caller owns it).
+/// PRECONDITION (validated by forwardTokensWithVision): the image-pad count
+/// in `ids` must equal `features.shape()[0]` — spans index `features`
+/// unchecked beyond that.
 pub fn mergeVisionFeatures(
     ctx: EagerContext,
     emb_rows: Array,
@@ -173,12 +176,7 @@ fn buildMropeCosSin(
 
     const selector = try allocator.alloc(u2, half);
     defer allocator.free(selector);
-    @memset(selector, 0);
-    for (1..3) |dim| {
-        const limit = @min(@as(usize, cfg.mrope_section[dim]) * 3, half);
-        var idx: usize = dim;
-        while (idx < limit) : (idx += 3) selector[idx] = @intCast(dim);
-    }
+    qwen38_mrope.interleavedPositionSelectorRuntime(cfg.mrope_section, selector);
 
     const n = L * rd;
     const cos_buf = try allocator.alloc(f32, n);
@@ -2001,6 +1999,8 @@ pub const Qwen38ServingModel = struct {
             // and rope_delta stays 0.
             return self.forwardTokensLast(ids);
         }
+        // buildMropeCosSin implements only the interleaved frequency layout.
+        if (!cfg.mrope_interleaved) return error.UnsupportedMropeLayout;
         const fshape = vision.features.shape();
         if (fshape.len != 2 or fshape[0] != @as(i32, @intCast(n_pads)) or fshape[1] != hidden)
             return error.ImageBlockMismatch;
@@ -3568,5 +3568,30 @@ test "Qwen38ServingModel.forwardTokensWithVision: empty vision == text path; ima
             VisionError.VisionInputNotSupported,
             model_r.forwardTokensWithVision(&[_]u32{ 5, bad_tok, 9 }, .{ .features = dummy_feat, .blocks = &.{} }),
         );
+    }
+
+    // Non-interleaved MRoPE layout: vision prefill is rejected loudly (the
+    // cos/sin builder only implements the interleaved layout), while the
+    // text-only delegation is unaffected.
+    const fa2 = try allocator.dupe(u32, &[_]u32{1});
+    var cfg_chunked_layout = cfg;
+    cfg_chunked_layout.full_attn_layers = fa2;
+    cfg_chunked_layout.mrope_interleaved = false;
+    defer cfg_chunked_layout.deinit();
+    var model_ni = try mkModel(allocator, ctx, &cfg_chunked_layout);
+    defer deinitModel(&model_ni, allocator);
+    try std.testing.expectError(
+        error.UnsupportedMropeLayout,
+        model_ni.forwardTokensWithVision(&ids_img, .{ .features = feat, .blocks = &blocks }),
+    );
+    const l_ni = try model_ni.forwardTokensWithVision(&ids_text, .{ .features = dummy_feat, .blocks = &.{} });
+    defer l_ni.deinit();
+    {
+        const a32 = try ops.astype(ctx, l_ref, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_ni, .float32);
+        defer b32.deinit();
+        try std.testing.expectEqualSlices(f32, try a32.dataSlice(f32), try b32.dataSlice(f32));
+        try std.testing.expectEqual(@as(i32, 0), model_ni.rope_delta);
     }
 }
