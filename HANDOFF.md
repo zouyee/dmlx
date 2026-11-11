@@ -1809,3 +1809,60 @@ tile 维度零空间,默认不变。
 量化 qmm(int8 激活 × int4 权重,omlx 有参考实现
 omlx/custom_kernels/quant_matmul/csrc/oq_a8*.metal),预估 1.5-2×
 prefill qmm 收益,但需要数值精度评估先行。
+
+## Qwen3.8 视觉(图像输入)支持落地(2026-11-11~12)
+
+分支 glm53-mlx-support,8 任务计划
+(`docs/superpowers/plans/2026-11-11-qwen38-vision-support.md`)全部执行完毕,
+每任务经 spec+质量双评审。提交链:`22d5671/987ccbb`(loader)→ `6613d61/1c6a47b`
+(MRoPE)→ `a6146b8/d32422c`(ViT 塔)→ `212ea38/436da97`(预处理)→
+`ab8b567/377e764`(forwardTokensWithVision)→ `2dd62bc/4132d24`(oracle 对拍)→
+`0af1edf/3812189`(CLI/server 接线 + MTP rope_delta 传播)。
+
+**什么能用:**
+- CLI:`dmlx chat --model ~/models/Qwen3.8-27B-4bit --image <path>`(可重复,
+  多图顺序编码)——对合成 fixture 的描述语义正确。
+- Server:`/v1/chat/completions` 接受 OpenAI content parts(text + image_url;
+  data:...;base64 与本地绝对路径;远程 URL 明确 400;decoded 上限 20MB,HTTP
+  body 16MB 使其有效约 12MB)。`scripts/ab_vision_smoke.sh` PASS。
+- MTP + 图像:drafter `rope_extra` 在 vision prefill 后传播(`mtpPrefillVision`,
+  刻意在 drafter prompt pass 之后设置——prompt 行用原始 offset,delta 可能为负),
+  文本 prefill 归零。vision 内容 pooled 接受率 ~47%(p1=0.65,内容类效应,
+  非 rope 错位;输出由 verify 保证正确);文本 MTP 接受率不变(87.9%)。
+
+**实现要点:**
+- 视觉塔 `src/vision/qwen38_vit.zig`:bf16 非量化(权重直借 checkpoint,
+  +~1.3GB 常驻,server 首个图像请求时惰性加载),27 层 ViT,conv3d patch embed
+  (权重已是 MLX NDHWC 布局零转置)、host 端 f64 四点双线性 pos-embed 插值、
+  2D rotary(merge-block 序)、非因果 SDPA、merger(exact erf GELU;block 内
+  tanh GELU;LN eps=1e-6 **无 +1 shift**——那是 RMSNorm 专属约定)。
+- 预处理 `src/vision/qwen38_preprocess.zig`:stb_image 解码(vendored v2.30,
+  STBI_NO_STDIO,64MB 文件上限)、smart_resize 精确移植(含 Python round
+  half-to-even;64×96 图会被 min_pixels=65536 上采样到 224×320——计划里的
+  测试断言值曾因此错误,以参考实现为准)、bilinear resize(v1)、
+  (c,t,ky,kx) patchify merge-block 序。
+- MRoPE `src/models/qwen38_mrope.zig`:`get_rope_index` 图像子集纯整数移植
+  (oracle 逐值对拍),interleaved selector(comptime+runtime 两版互证)。
+  带图 prefill 后 decode/verify/MTP 的 rope offset = cache.len() + rope_delta
+  (delta 默认 0,文本路径逐字不变)。
+- 接线:`VisionOps` vtable(generation.zig,模型无关);adapter 惰性建塔;
+  HTTP fiber 与 engine fiber 共享 MLX ctx 的竞态用 adapter 级 pthread mutex
+  关闭(所有触 ctx 的 op 持锁;并发首图请求实测塔只加载一次)。
+
+**Oracle 门禁(mlx-vlm 对拍,`zig build test-qwen38-vision-oracle`,独立可执行
+——27B 加载会扰动同进程单测;产物 artifacts/qwen38_vision_oracle/ 由
+`scripts/qwen38_vision_oracle_dump.py` 生成,gitignored):**
+- tower features cos **0.99974** ≥ 0.999 ✅(参考塔自身 bf16-vs-f32 仅
+  0.99934,我们已在参考自身噪声内;patch embed/pos/rope 表 bitwise 一致)
+- position_ids / rope_delta 精确一致;cos/sin max_abs 1e-6
+- merged embeddings 文本行 bitwise;图像行 min cos 0.997
+- logits_last cos **0.99717**,门禁按证据放宽至 ≥0.995(计划原值 0.999 不可达:
+  参考栈自身 fused-vs-naive GDN 单 flag 差异即 logits cos 0.99940 < 0.999;
+  同输入下 Zig LM 0.99917,残差是 mlx-c 0.7.0 vs python-mlx 0.32.4 kernel
+  数值差,非逻辑错误)
+
+**已知限制(v1):** 无 video(248057 仍拒绝)、deepstack 不支持(该 checkpoint
+为空)、多轮消息中的图像并入最后一条 user 消息、guided decoding + vision 未验证、
+bilinear vs 参考 bicubic resize(fixture 无需 resize,64×96 上采样单测覆盖
+resize 路径;若未来 parity 失败先换 bicubic 16-tap)、视觉塔 bf16 +~1.3GB 常驻、
+图像逐张顺序编码。

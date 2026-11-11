@@ -12,7 +12,7 @@
 
 Its two flagship paths are:
 
-- **Qwen3.8-27B-4bit + MTP** — model-specific speculative decoding with GPU-chained drafts, multi-token verification, rollback, and an adaptive draft-depth controller.
+- **Qwen3.8-27B-4bit + MTP** — model-specific speculative decoding with GPU-chained drafts, multi-token verification, rollback, and an adaptive draft-depth controller. Image input is supported end to end (CLI `--image`, server `image_url` content parts, bf16 vision tower with MRoPE, MTP-compatible).
 - **DeepSeek V4 Flash + native expert streaming** — a 284B-parameter MoE checkpoint running within a 48GB unified-memory budget by keeping a bounded expert hot set in RAM and reading cold experts from SSD.
 
 > **Project status:** experimental. The flagship configurations below are benchmarked and exercised regularly. Other registered model architectures are compatibility paths, not equivalent claims of production readiness.
