@@ -9,7 +9,7 @@ pub const MropeResult = struct {
     }
 };
 
-pub const ComputeError = error{ ImageBlockMismatch, OutOfMemory };
+pub const ComputeError = error{ ImageBlockMismatch, InvalidGridDims, OutOfMemory };
 
 /// ids: full prompt token ids; image_blocks: one per image, in order of
 /// appearance: grid_t=1, grid_h/=merge, grid_w/=merge already divided.
@@ -31,19 +31,35 @@ pub fn computePositionIds(
     if (n_images > image_blocks.len) return error.ImageBlockMismatch;
 
     var channels: [3][]i32 = undefined;
-    for (&channels) |*ch| ch.* = try allocator.alloc(i32, ids.len);
-    errdefer for (channels) |ch| allocator.free(ch);
+    var n_alloc: usize = 0;
+    errdefer for (channels[0..n_alloc]) |ch| allocator.free(ch);
+    for (&channels) |*ch| {
+        ch.* = try allocator.alloc(i32, ids.len);
+        n_alloc += 1;
+    }
 
     var max_pos: i32 = -1;
     var st: usize = 0;
     var block_idx: usize = 0;
     while (block_idx < n_images) {
-        // Find the next image pad; the text run [st, ed) includes the
-        // vision_start token and everything before the first pad.
-        const ed_rel = std.mem.indexOfScalar(u32, ids[st..], image_token) orelse
-            return error.ImageBlockMismatch;
-        const ed = st + ed_rel;
+        // Find the next vision_start + image_token pair; the text run
+        // [st, ed) includes the vision_start token and everything before the
+        // first pad. Same detection rule as the counting pass above, so the
+        // two passes cannot disagree on what constitutes an image block.
+        var ed: usize = ids.len;
+        if (ids.len > 0) {
+            var i = st;
+            while (i + 1 < ids.len) : (i += 1) {
+                if (ids[i] == vision_start and ids[i + 1] == image_token) {
+                    ed = i + 1;
+                    break;
+                }
+            }
+        }
+        if (ed == ids.len) return error.ImageBlockMismatch;
         const block = image_blocks[block_idx];
+        if (block[0] <= 0 or block[1] <= 0 or block[2] <= 0)
+            return error.InvalidGridDims;
         const gt: usize = @intCast(block[0]);
         const gh: usize = @intCast(block[1]);
         const gw: usize = @intCast(block[2]);
@@ -176,4 +192,43 @@ test "interleavedPositionSelector: [11,11,10] over 32 slots" {
     const sel = interleavedPositionSelector(.{ 11, 11, 10 }, 32);
     const expected = [32]u2{ 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1, 2, 0, 1 };
     try testing.expectEqual(expected, sel);
+}
+
+test "computePositionIds: failure paths" {
+    const vs: u32 = 248053;
+    const img: u32 = 248056;
+    const ve: u32 = 248054;
+    const ids = [_]u32{ 10, vs, img, img, img, img, ve, 20 };
+
+    // Too few blocks for the detected images.
+    try testing.expectError(
+        error.ImageBlockMismatch,
+        computePositionIds(testing.allocator, &ids, &.{}, img, vs),
+    );
+
+    // Wrong pad count: block claims 8 pads but only 4 follow.
+    const bad_blocks = [_][3]i32{.{ 1, 2, 4 }};
+    try testing.expectError(
+        error.ImageBlockMismatch,
+        computePositionIds(testing.allocator, &ids, &bad_blocks, img, vs),
+    );
+
+    // Negative/zero grid dims are rejected instead of trapping in @intCast.
+    const neg_blocks = [_][3]i32{.{ 1, -2, 2 }};
+    try testing.expectError(
+        error.InvalidGridDims,
+        computePositionIds(testing.allocator, &ids, &neg_blocks, img, vs),
+    );
+    const zero_blocks = [_][3]i32{.{ 1, 0, 2 }};
+    try testing.expectError(
+        error.InvalidGridDims,
+        computePositionIds(testing.allocator, &ids, &zero_blocks, img, vs),
+    );
+
+    // A bare image_token without preceding vision_start is text, not an image.
+    var res = try computePositionIds(testing.allocator, &ids, &.{}, vs, img);
+    defer res.deinit(testing.allocator);
+    const expected = [_]i32{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    for (res.position_ids) |ch| try testing.expectEqualSlices(i32, &expected, ch);
+    try testing.expectEqual(@as(i32, 0), res.rope_delta);
 }
