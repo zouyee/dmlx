@@ -215,18 +215,18 @@ pub fn parseQwen38Config(allocator: std.mem.Allocator, json_text: []const u8) !Q
                 cfg.rope_theta = toF32(getFloat(rpo, "rope_theta"), cfg.rope_theta);
                 if (getBool(rpo, "mrope_interleaved")) |b| cfg.mrope_interleaved = b;
                 if (rpo.get("mrope_section")) |ms| {
-                    if (ms == .array and ms.array.items.len == 3) {
-                        var section: [3]u32 = undefined;
-                        for (ms.array.items, 0..) |item, i| {
-                            const n: i64 = switch (item) {
-                                .integer => |v| v,
-                                .float => |f| @intFromFloat(f),
-                                else => return LoadError.InvalidConfig,
-                            };
-                            section[i] = std.math.cast(u32, n) orelse return LoadError.InvalidConfig;
-                        }
-                        cfg.mrope_section = section;
+                    if (ms != .array) return LoadError.InvalidConfig;
+                    if (ms.array.items.len != 3) return LoadError.InvalidConfig;
+                    var section: [3]u32 = undefined;
+                    for (ms.array.items, 0..) |item, i| {
+                        const n: i64 = switch (item) {
+                            .integer => |v| v,
+                            .float => |f| @intFromFloat(f),
+                            else => return LoadError.InvalidConfig,
+                        };
+                        section[i] = std.math.cast(u32, n) orelse return LoadError.InvalidConfig;
                     }
+                    cfg.mrope_section = section;
                 }
             }
         }
@@ -382,6 +382,59 @@ test "parseQwen38Config: vision_config + mrope rope_parameters" {
     try std.testing.expectEqual(@as(u32, 248053), cfg.vision_start_token_id);
     try std.testing.expectEqual(@as(u32, 248054), cfg.vision_end_token_id);
     try std.testing.expectEqual(@as(f32, 1e7), cfg.rope_theta);
+}
+
+test "parseQwen38Config: vision_config + mrope parse non-default values" {
+    const allocator = std.testing.allocator;
+    const json_text =
+        \\{"model_type":"qwen3_5",
+        \\  "image_token_id":999,"video_token_id":998,
+        \\  "vision_start_token_id":997,"vision_end_token_id":996,
+        \\  "vision_config":{
+        \\    "depth":12,"hidden_size":64,"num_heads":4,
+        \\    "intermediate_size":128,"patch_size":14,
+        \\    "temporal_patch_size":1,"spatial_merge_size":4,
+        \\    "out_hidden_size":256,"num_position_embeddings":100,
+        \\    "in_channels":1
+        \\  },
+        \\  "text_config":{
+        \\    "rope_parameters":{
+        \\      "mrope_interleaved":false,"mrope_section":[8,8,16],
+        \\      "rope_theta":500000
+        \\    }
+        \\  }}
+    ;
+    var cfg = try parseQwen38Config(allocator, json_text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 12), cfg.vision.depth);
+    try std.testing.expectEqual(@as(u32, 64), cfg.vision.hidden);
+    try std.testing.expectEqual(@as(u32, 4), cfg.vision.heads);
+    try std.testing.expectEqual(@as(u32, 128), cfg.vision.intermediate);
+    try std.testing.expectEqual(@as(u32, 14), cfg.vision.patch);
+    try std.testing.expectEqual(@as(u32, 1), cfg.vision.temporal_patch);
+    try std.testing.expectEqual(@as(u32, 4), cfg.vision.merge);
+    try std.testing.expectEqual(@as(u32, 256), cfg.vision.out_hidden);
+    try std.testing.expectEqual(@as(u32, 100), cfg.vision.num_pos);
+    try std.testing.expectEqual(@as(u32, 1), cfg.vision.in_ch);
+    try std.testing.expectEqualSlices(u32, &.{ 8, 8, 16 }, &cfg.mrope_section);
+    try std.testing.expect(!cfg.mrope_interleaved);
+    try std.testing.expectEqual(@as(u32, 999), cfg.image_token_id);
+    try std.testing.expectEqual(@as(u32, 998), cfg.video_token_id);
+    try std.testing.expectEqual(@as(u32, 997), cfg.vision_start_token_id);
+    try std.testing.expectEqual(@as(u32, 996), cfg.vision_end_token_id);
+    try std.testing.expectEqual(@as(f32, 5e5), cfg.rope_theta);
+}
+
+test "parseQwen38Config: wrong-length mrope_section is rejected" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        LoadError.InvalidConfig,
+        parseQwen38Config(allocator, "{\"model_type\":\"qwen3_5\",\"text_config\":{\"rope_parameters\":{\"mrope_section\":[11,11]}}}"),
+    );
+    try std.testing.expectError(
+        LoadError.InvalidConfig,
+        parseQwen38Config(allocator, "{\"model_type\":\"qwen3_5\",\"text_config\":{\"rope_parameters\":{\"mrope_section\":\"11,11,10\"}}}"),
+    );
 }
 
 test "parseQwen38Config: vision defaults when vision_config absent" {
