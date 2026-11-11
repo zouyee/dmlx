@@ -71,13 +71,15 @@ assert text.count(old_sig) == 1, text.count(old_sig)
 text = text.replace(old_sig, new_sig)
 out = [text]
 
-# The kernel entry points: v8 tile (64,32,64), q4, gs=64, bf16 + f16.
+# The kernel entry point: tile shape is a template parameter triple
+# (BM, BK, BN) selected by the caller (zig substitutes literals), q4, gs=64,
+# bf16 + f16. Validated tiles: omlx's variant list (32/64/128 combos).
 out.append(
     r"""
-// ---- dmlx entry: affine_q4_qmm_t variant 8 (bm=64, bk=32, bn=64) ----
+// ---- dmlx entry: affine_q4_qmm_t, tile parameterized (BM, BK, BN) ----
 // threadgroup storage is declared by the caller (Metal only allows
 // threadgroup variables at kernel-function scope).
-template <typename T>
+template <typename T, int BM, int BK, int BN>
 void dmlx_qmm_v8_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -93,10 +95,6 @@ void dmlx_qmm_v8_impl(
     uint lid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int BM = 64;
-  constexpr int BK = 32;
-  constexpr int BN = 64;
-
   qmm_t_impl<T, 64, 4, true, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }

@@ -30,6 +30,20 @@ const shapes = [_]Shape{
 
 const REPS = 5;
 
+// omlx's instantiated affine_qmm_t tile variants (affine_qmm.metal).
+const sweep_tiles = [_]qmm_v8.Tile{
+    .{ .bm = 64, .bk = 32, .bn = 64 }, // v8 (current default)
+    .{ .bm = 32, .bk = 32, .bn = 32 },
+    .{ .bm = 32, .bk = 64, .bn = 32 },
+    .{ .bm = 32, .bk = 64, .bn = 64 },
+    .{ .bm = 64, .bk = 64, .bn = 64 },
+    .{ .bm = 16, .bk = 64, .bn = 64 },
+    .{ .bm = 64, .bk = 64, .bn = 128 },
+    .{ .bm = 128, .bk = 64, .bn = 64 },
+    .{ .bm = 128, .bk = 64, .bn = 32 },
+    .{ .bm = 128, .bk = 32, .bn = 64 },
+};
+
 pub fn main() !void {
     // DMLX_BENCH_M overrides the row count (sweep 2048..13248 to find the
     // qmm slowdown knee observed at 13K prefill).
@@ -44,6 +58,7 @@ pub fn main() !void {
 
     var stock_total: f64 = 0;
     var v8_total: f64 = 0;
+    const tile_sweep = std.c.getenv("DMLX_BENCH_TILE_SWEEP") != null;
     for (shapes) |s| {
         const x = try random.normal(ctx, &[_]i32{ M, s.in }, .bfloat16, 0.0, 0.02, null);
         defer x.deinit();
@@ -135,6 +150,34 @@ pub fn main() !void {
             try y.eval();
         }
         const t_stock = elapsedMs(t) / REPS;
+        if (tile_sweep) {
+            std.debug.print("{s} [{d:6},{d:6}] M={d}  stock {d:8.3} ms\n", .{ s.name, s.out, s.in, M, t_stock });
+            for (sweep_tiles) |tile| {
+                const got_t = (try qmm_v8.applyTile(ctx, x, qw.data, qw.scales, qw.biases, tile)) orelse {
+                    std.debug.print("  tile {d},{d},{d}: unavailable\n", .{ tile.bm, tile.bk, tile.bn });
+                    continue;
+                };
+                defer got_t.deinit();
+                const dt0 = try ops.subtract(ctx, ref, got_t);
+                defer dt0.deinit();
+                const da = try ops.abs(ctx, dt0);
+                defer da.deinit();
+                const daf = try ops.astype(ctx, da, .float32);
+                defer daf.deinit();
+                const dm = try ops.max(ctx, daf);
+                defer dm.deinit();
+                try dm.eval();
+                const t2 = std.c.mach_absolute_time();
+                for (0..REPS) |_| {
+                    const y = (try qmm_v8.applyTile(ctx, x, qw.data, qw.scales, qw.biases, tile)).?;
+                    defer y.deinit();
+                    try y.eval();
+                }
+                const t_tile = elapsedMs(t2) / REPS;
+                std.debug.print("  tile {d:3},{d:3},{d:3}  {d:8.3} ms  ratio {d:5.3}x  |diff| {e}\n", .{ tile.bm, tile.bk, tile.bn, t_tile, t_stock / t_tile, try dm.item(f32) });
+            }
+            continue;
+        }
         t = std.c.mach_absolute_time();
         for (0..REPS) |_| {
             const y = (try qmm_v8.apply(ctx, x, qw.data, qw.scales, qw.biases)).?;

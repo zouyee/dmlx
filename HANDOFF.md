@@ -1786,3 +1786,26 @@ in-place 略慢(每次 append 的强制提前 eval 打碎了惰性图融合)。
 in-place 保留为 opt-in(`DMLX_KV_INPLACE=1`,默认关),分页/分块 KV
 重构的性能动机不成立——它剩余的价值只有 32K+ 容量与 KV 量化挂载点,
 等真实需求驱动再做。清单第 1 项按此改写。
+
+## qmm tile sweep(2026-11-11)——v8 (64,32,64) 已最优,tile 维度无空间
+
+背景:prefill qmm 有效 ~6.75 TF/s vs dense bf16 GEMM 实测峰值 69 TF/s
+(M4 Pro),想找 kernel 级空间。先把两个测量假象钉死:
+- python 侧"stock qmm 33 TF/s"是惰性求值假象(循环里 `o=qmm(...)` 重绑定
+  导致前几个输出从未被 eval);sync/持续实测 stock ≈ v8(zig bench 一致)。
+- 单次 sync 调用受 GPU 时钟爬坡影响,只有持续负载数字可信。
+
+工作:qmm_v8 kernel 的 BM/BK/BN 模板化(DMLX_QMM_TILE="bm,bk,bn" 实验
+开关,entry 改为 template<T,BM,BK,BN>,threadgroup buffer 按
+BM/(BK+8)/BN 推导),bench-prefill-v8 加 DMLX_BENCH_TILE_SWEEP=1 扫
+omlx 全部 10 个实例化 tile 变体。
+
+结果(M=2048 与 M=16384 × 7 个投影 shape,全部 bit-exact):
+**(64,32,64) 在每个 shape、两个 M 点都是最优**,ratio 1.04-1.06× vs
+stock;次优 (64,64,64) 仅 ~1.00×;大 tile(64,64,128)跌至 0.73×。
+tile 维度零空间,默认不变。
+
+剩余可行方向(未做,有精度风险需 eval 门禁):oq_a8 式 activation
+量化 qmm(int8 激活 × int4 权重,omlx 有参考实现
+omlx/custom_kernels/quant_matmul/csrc/oq_a8*.metal),预估 1.5-2×
+prefill qmm 收益,但需要数值精度评估先行。
