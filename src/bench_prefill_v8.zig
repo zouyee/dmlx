@@ -28,10 +28,15 @@ const shapes = [_]Shape{
     .{ .name = "mlp_down", .out = 5120, .in = 17408, .per_pass = 64 },
 };
 
-const M: i32 = 2048;
 const REPS = 5;
 
 pub fn main() !void {
+    // DMLX_BENCH_M overrides the row count (sweep 2048..13248 to find the
+    // qmm slowdown knee observed at 13K prefill).
+    const M: i32 = if (std.c.getenv("DMLX_BENCH_M")) |s|
+        std.fmt.parseInt(i32, std.mem.span(s), 10) catch 2048
+    else
+        2048;
     const allocator = std.heap.c_allocator;
     c.initErrorHandler();
     const stream = c.c.mlx_default_gpu_stream_new();

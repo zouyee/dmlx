@@ -1885,13 +1885,96 @@ pub const Qwen38ServingModel = struct {
         capture: HiddenCapture,
         last_logits_only: bool,
     ) !ForwardCoreOut {
+        return self.forwardTokensCoreCont(ids, capture, last_logits_only, false);
+    }
+
+    var cached_prefill_chunk: ?usize = null;
+
+    /// Long-prefill chunk size, OPT-IN (default 0 = monolithic). Measured
+    /// neutral on wall (2026-11-11, scripts/ab_prefill_chunk16k.sh: 16K
+    /// prompt, 106.95/103.47s chunked vs 103.12/102.80s monolithic) — the
+    /// earlier "qmm collapses past M≈3K" reading was the per-(m,n,k) Metal
+    /// JIT compile (~1.6s one-off per shape), and prefill is in fact linear
+    /// at ~8 ms/token from 119 to 13243 tokens (at parity with omlx). Keep
+    /// available for peak-memory relief at >16K prompts (monolithic 16K
+    /// peaked at 53.5 GB). DMLX_PREFILL_CHUNK=2048 enables.
+    fn prefillChunkSize() usize {
+        if (cached_prefill_chunk) |v| return v;
+        var v: usize = 0;
+        if (std.c.getenv("DMLX_PREFILL_CHUNK")) |s| {
+            v = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 0;
+        }
+        cached_prefill_chunk = v;
+        return v;
+    }
+
+    /// Chunked prefill: run the prompt in `prefillChunkSize()` pieces with
+    /// layer state carried across chunks (GDN conv/ssm state and attn KV both
+    /// continue; rope offset comes from the cache length). Only the last
+    /// chunk contributes logits; `.all` hidden capture concatenates across
+    /// chunks. Bitwise differences vs a monolithic prefill are possible in
+    /// attention (chunk-boundary softmax splits) — covered by the
+    /// chunked-vs-monolithic consistency test.
+    fn forwardChunkedPrefill(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+    ) anyerror!ForwardCoreOut {
+        const ctx = self.ctx;
+        const chunk = prefillChunkSize();
+        try self.reset();
+        var hidden_all: ?Array = null;
+        errdefer if (hidden_all) |*ha| ha.deinit();
+        var logits: ?Array = null;
+        var pos: usize = 0;
+        while (pos < ids.len) {
+            const end = @min(pos + chunk, ids.len);
+            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0);
+            // Only the last chunk's logits are wanted (they are the
+            // last-position row either way).
+            if (logits) |l| l.deinit();
+            logits = res.logits;
+            if (capture == .all) {
+                if (hidden_all) |*ha| {
+                    const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ ha.*, res.hidden.? }, 1);
+                    ha.deinit();
+                    ha.* = merged;
+                    res.hidden.?.deinit();
+                } else {
+                    hidden_all = res.hidden.?;
+                }
+            }
+            pos = end;
+        }
+        return .{ .logits = logits.?, .hidden = hidden_all };
+    }
+
+    fn forwardTokensCoreCont(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+        continuation: bool,
+    ) anyerror!ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
         const hidden: i32 = @intCast(cfg.hidden_size);
 
         try rejectVisionTokens(ids);
-        if (ids.len > 1) try self.reset();
+        if (ids.len > 1 and !continuation) {
+            const chunk = prefillChunkSize();
+            // Opt-in chunked long prefill (see prefillChunkSize — perf-neutral,
+            // kept for peak-memory relief). Restricted to the serving captures:
+            // the oracle path (capture .none with full logits) stays monolithic.
+            if (chunk > 0 and ids.len > chunk and
+                (capture == .all or last_logits_only))
+            {
+                return self.forwardChunkedPrefill(ids, capture, last_logits_only);
+            }
+            try self.reset();
+        }
 
         const ids_i32 = try allocator.alloc(i32, ids.len);
         defer allocator.free(ids_i32);
@@ -2899,4 +2982,130 @@ test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
         const exp = try b32.dataSlice(f32);
         for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
     }
+}
+
+test "Qwen38ServingModel: chunked prefill matches monolithic (last logits)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const fa = try allocator.dupe(u32, &[_]u32{1});
+    var cfg = qwen38_loader.Qwen38Config{
+        .allocator = allocator,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .vocab_size = 64,
+        .intermediate_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 32,
+        .partial_rotary_factor = 0.25,
+        .linear_num_key_heads = 2,
+        .linear_num_value_heads = 8,
+        .linear_key_head_dim = 8,
+        .linear_value_head_dim = 8,
+        .full_attn_layers = fa,
+    };
+    defer cfg.deinit();
+
+    const mkModel = struct {
+        fn call(alloc: std.mem.Allocator, c2: EagerContext, c3: *qwen38_loader.Qwen38Config) !Qwen38ServingModel {
+            const hidden: i32 = 64;
+            const vocab: i32 = 64;
+            const inter: i32 = 128;
+            const gdn_qkv: i32 = 96;
+            const gdn_z: i32 = 64;
+            var map = std.StringHashMap(Array).init(alloc);
+            errdefer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    alloc.free(e.key_ptr.*);
+                    e.value_ptr.deinit();
+                }
+                map.deinit();
+            }
+            try putToyQuant(alloc, c2, &map, "language_model.model.embed_tokens", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.norm.weight", &[_]i32{hidden});
+            try putToyQuant(alloc, c2, &map, "language_model.lm_head", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.post_attention_layernorm.weight", &[_]i32{hidden});
+            const la = "language_model.model.layers.0.linear_attn";
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_qkv", gdn_qkv, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_a", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_b", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_z", gdn_z, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".out_proj", hidden, gdn_z);
+            try putToyTensor(alloc, &map, la ++ ".conv1d.weight", &[_]i32{ gdn_qkv, 4, 1 });
+            try putToyTensor(alloc, &map, la ++ ".A_log", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".dt_bias", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".norm.weight", &[_]i32{8});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.down_proj", hidden, inter);
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.post_attention_layernorm.weight", &[_]i32{hidden});
+            const sa = "language_model.model.layers.1.self_attn";
+            try putToyQuant(alloc, c2, &map, sa ++ ".q_proj", 128, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".k_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".v_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".o_proj", hidden, 64);
+            try putToyTensor(alloc, &map, sa ++ ".q_norm.weight", &[_]i32{32});
+            try putToyTensor(alloc, &map, sa ++ ".k_norm.weight", &[_]i32{32});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.down_proj", hidden, inter);
+            var m = try Qwen38ServingModel.init(alloc, c2, c3, map);
+            m.ws = WeightSource.fromMap(&m.weights, c2, &m.ws_backing);
+            return m;
+        }
+    }.call;
+
+    const ids = [_]u32{ 5, 9, 2, 40, 17, 23, 61, 8 };
+
+    // Monolithic reference: chunking disabled.
+    Qwen38ServingModel.cached_prefill_chunk = 0;
+    var ref = try mkModel(allocator, ctx, &cfg);
+    defer {
+        ref.deinit();
+        var it = ref.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        ref.weights.deinit();
+    }
+    const l_mono = try ref.forwardTokensLast(&ids);
+    defer l_mono.deinit();
+
+    // Chunked: 3-token pieces over 8 tokens (uneven tail).
+    Qwen38ServingModel.cached_prefill_chunk = 3;
+    var chunked = try mkModel(allocator, ctx, &cfg);
+    defer {
+        chunked.deinit();
+        var it = chunked.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        chunked.weights.deinit();
+    }
+    const l_chunk = try chunked.forwardTokensLast(&ids);
+    defer l_chunk.deinit();
+    Qwen38ServingModel.cached_prefill_chunk = null;
+
+    const a32 = try ops.astype(ctx, l_mono, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, l_chunk, .float32);
+    defer b32.deinit();
+    const d = try ops.subtract(ctx, a32, b32);
+    defer d.deinit();
+    const ad = try ops.abs(ctx, d);
+    defer ad.deinit();
+    const m = try ops.max(ctx, ad);
+    defer m.deinit();
+    try m.eval();
+    // Chunk boundaries split the attention softmax and the GDN scan; both
+    // sides are bf16 with fp32 accumulation, so allow a few bf16 ulps on
+    // O(1)-magnitude logits.
+    try std.testing.expect(try m.item(f32) <= 5e-2);
 }

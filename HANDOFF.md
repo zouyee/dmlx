@@ -1719,9 +1719,50 @@ bf16 容差 2e-2)随 473 测试全绿。
 其余 ~85ms 是每层 cacheAppend/转置/rope/gate 等 dispatch 密集小
 op(16 层 × ~5 op),方向是把这些融进 kernel 或减少层间同步。
 
-## 发现:16K prefill 病态(未查)
+**2026-11-11 复查(三臂实测,scripts/ab_verify3_16k.sh,16K ctx,
+逐请求交错 2 rep):** default 138.6/99.9 vs NO_ATTN_CORE 74.1/73.6
+(nocore 臂很稳;default 臂 run 间方差 39ms,与已知的跨会话漂移一致)。
+attention 核整体真实价值 ~45ms/round——不是 85ms,"小 op" 归因
+(barrier 份额外推)再度高估。内部构成:split SDPA ~14ms(KV 读取
+带宽地板 ~4ms)、**cacheAppend sliceUpdate 全 slab 拷贝 ~4-5ms**
+(2×33MB×16 层 ≈ 1GB/round @16K,随 T 线性增长;同一函数也在
+decode 路径,M=1 时每 token 同样 ~1GB,16K decode ~30ms/tok 里
+占 ~13%——这是它真正值钱的地方)、rope/norm/gate/转置余量 ~20ms
+(未再分解,按 §23 教训疑似大部分是伪影)。
+结论:唯一值得动手的是 cacheAppend 的 O(T) 拷贝 → 需要分页/分块
+KV 或 in-place slab 写(MLX 数组不可变,函数式 slice_update 必然
+全拷贝),即清单第 1 项 KV cache 重构的入口;其余方向关闭。
+nosplit 臂 114.7/155.6 vs default 之差在噪声内,split 的 -11% 以
+2026-11-07 的交错测量为准。
 
-12000 词(~16K tok)prompt 的 wall time ~112s,其中 decode 只占
-~7s——prefill ~100s+,而 2048 tok 只要 1.66s(线性外推 ~13s)。
-超线性爆炸,疑 chunked prefill 或 GDN prefill 长上下文路径。
-与 split-KV 无关,单独立案。
+## 发现:16K prefill 病态(未查)——2026-11-11 复查:不存在,基线错误
+
+原记录(2026-11-07):12000 词 prompt wall ~112s,decode 占 ~7s,而
+"2048 tok 只要 1.66s",看似超线性爆炸。**1.66s 基线是错的**:v8 kernel
+头注释自己写着 2048 tok prefill wall 是 17.5s;今日实测同 server 路径
+1746 tok = 14.7s(8.4ms/tok),13243 tok = 103s(7.8ms/tok),119 tok
+= 1.9s(15.6ms/tok,小 L 是 dispatch 地板)。**prefill 从 119 到 13243
+token 严格线性,且与 omlx/mlx-vlm 参考值(117-134 tok/s ≈ 7.5-8.5ms/tok)
+持平**。112s = 线性 prefill ~103s + decode ~7s,无爆炸。之前观察到的
+"qkv qmm 从 ~200ms 崩到 1.2-3.1s" 实为 v8 kernel 按 (m,n,k) JIT 的一次性
+编译(QMM_TRACE 里首个该 shape 调用 1878ms,稳态 255ms)。
+
+证据链(全部本机实测):
+- 交错 A/B(scripts/ab_prefill_chunk16k.sh,16K,maxtok=8):
+  chunk=2048 106.95/103.47s vs chunk=0 103.12/102.80s —— 中性。
+- barriered 分段(qwen38-profile --prefill N,N=2048..16384):MLP/GDN
+  每翻倍 ×2.0(线性);attn 分段 ×2.6/×3.2/×4.5 是 barrier 制造的伪热点
+  (见 §23 教训)——server 内 LAYER_PROF(DMLX_LAYER_PROF=1)实测每 token
+  成本与 chunk on/off 无关,恒 ~115µs/token/层。
+- MLX fast SDPA 在 D=256/H24/HKV4/bf16、引擎式 slab 切片视图下仍是 fused
+  kernel:16K 单层 212ms、峰值内存 0.75GB,16 层 ~3.4s,不是瓶颈。
+- QMM_TRACE(DMLX_QMM_TRACE=1,新增于 qwen38_gdn.linearQuantParts):
+  GDN qmm 在 M=16384 线性(qkv 268ms/out 255ms/z 169ms)。
+
+chunked prefill 代码保留为 **opt-in 默认关**(`DMLX_PREFILL_CHUNK=2048`;
+默认 0=monolithic),唯一真实价值是压峰值内存(monolithic 16K 峰值
+53.5GB,>16K prompt 或 48GB 机型可能需要)。一致性单测
+(chunked-vs-monolithic last-logits,容差 5e-2 bf16)随套件通过。
+
+遗留真话:prefill ~8ms/token 里 qmm 占大头(~7 TF/s 有效,与 ANE 表
+里的 6.75 TF/s 一致),再提速只能动 qmm 本身(超出本次范围)。
