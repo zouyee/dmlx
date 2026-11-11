@@ -16,7 +16,6 @@ const EagerContext = ops.EagerContext;
 
 extern fn stbi_load_from_memory(buffer: [*c]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) [*c]u8;
 extern fn stbi_image_free(data: ?*anyopaque) void;
-extern fn stbi_failure_reason() [*c]const u8;
 
 // preprocessor_config.json (Qwen3.8-27B-4bit): size.shortest_edge/longest_edge,
 // patch_size, temporal_patch_size, merge_size, image_mean/std = 0.5.
@@ -152,7 +151,6 @@ fn preprocessRgb(allocator: std.mem.Allocator, ctx: EagerContext, rgb: []const u
     const pixels_f32 = try Array.fromData(allocator, f32, flat, &[_]i32{ @intCast(n_patches), @intCast(row_dim) });
     defer pixels_f32.deinit();
     const pixels = try ops.astype(ctx, pixels_f32, .bfloat16);
-    errdefer pixels.deinit();
     return .{
         .pixels = pixels,
         .grid_thw = .{ 1, @intCast(gh), @intCast(gw) },
@@ -166,13 +164,7 @@ pub fn preprocessImageBytes(allocator: std.mem.Allocator, ctx: EagerContext, byt
     var ch: c_int = 0;
     const len: c_int = std.math.cast(c_int, bytes.len) orelse return error.ImageTooLarge;
     const data = stbi_load_from_memory(bytes.ptr, len, &x, &y, &ch, 3);
-    if (data == null) {
-        const reason = stbi_failure_reason();
-        if (reason != null) {
-            std.log.err("qwen38_preprocess: stb decode failed: {s}", .{reason});
-        }
-        return error.ImageDecodeFailed;
-    }
+    if (data == null) return error.ImageDecodeFailed;
     defer stbi_image_free(data);
     const w: usize = @intCast(x);
     const h: usize = @intCast(y);
@@ -280,11 +272,46 @@ test "patchifyNorm: merge-block row order and (c,t,ky,kx) element order" {
     try std.testing.expectEqual(img[(3 * w + 37) * 3 + 0], out[4 * row_dim + 3 * 16 + 5]);
 }
 
+const MAX_IMAGE_FILE_BYTES: usize = 64 * 1024 * 1024;
+
+test "resizeBilinearNormalized: 2x2 -> 4x4 known pattern" {
+    // All channels equal; source pixels [[0,255],[255,0]].
+    const rgb = [2 * 2 * 3]u8{
+        0,   0,   0,   255, 255, 255,
+        255, 255, 255, 0,   0,   0,
+    };
+    var out: [4 * 4 * 3]f32 = undefined;
+    resizeBilinearNormalized(&rgb, 2, 2, &out, 4, 4);
+    // Half-pixel bilinear: interior taps at 0.25/0.75 give 63.75/95.625/
+    // 159.375/191.25 -> normalized -0.5/-0.25/0.25/0.5; edges clamp.
+    const expected = [4][4]f32{
+        .{ -1.0, -0.5, 0.5, 1.0 },
+        .{ -0.5, -0.25, 0.25, 0.5 },
+        .{ 0.5, 0.25, -0.25, -0.5 },
+        .{ 1.0, 0.5, -0.5, -1.0 },
+    };
+    for (0..4) |y| {
+        for (0..4) |x| {
+            for (0..3) |ch| {
+                try std.testing.expectApproxEqAbs(expected[y][x], out[(y * 4 + x) * 3 + ch], 1e-6);
+            }
+        }
+    }
+}
+
+test "readFileBytes: ENOENT maps to FileNotFound" {
+    try std.testing.expectError(error.FileNotFound, readFileBytes(std.testing.allocator, "tests/fixtures/definitely_missing_9f3a.png"));
+}
+
 fn readFileBytes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     const path_z = try allocator.dupeZ(u8, path);
     defer allocator.free(path_z);
     const fd = std.c.open(path_z.ptr, .{});
-    if (fd < 0) return error.FileNotFound;
+    if (fd < 0) return switch (@as(std.c.E, @enumFromInt(std.c._errno().*))) {
+        .NOENT => error.FileNotFound,
+        .ACCES => error.AccessDenied,
+        else => error.OpenFailed,
+    };
     defer _ = std.c.close(fd);
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
@@ -292,6 +319,7 @@ fn readFileBytes(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
     while (true) {
         const n = try std.posix.read(fd, &chunk);
         if (n == 0) break;
+        if (buf.items.len + n > MAX_IMAGE_FILE_BYTES) return error.FileTooLarge;
         try buf.appendSlice(allocator, chunk[0..n]);
     }
     return buf.toOwnedSlice(allocator);
