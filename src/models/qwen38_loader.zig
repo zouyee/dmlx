@@ -7,6 +7,26 @@ pub const LoadError = error{
     UnsupportedArchitecture,
 };
 
+/// Vision-tower hyperparameters from top-level `vision_config`. Field names
+/// match what the Task-3 `Qwen38VitConfig` consumes; mapping from the JSON
+/// keys: depth->depth, hidden->hidden_size, heads->num_heads,
+/// intermediate->intermediate_size, patch->patch_size,
+/// temporal_patch->temporal_patch_size, merge->spatial_merge_size,
+/// out_hidden->out_hidden_size, num_pos->num_position_embeddings,
+/// in_ch->in_channels.
+pub const Qwen38VisionConfig = struct {
+    depth: u32 = 27,
+    hidden: u32 = 1152,
+    heads: u32 = 16,
+    intermediate: u32 = 4304,
+    patch: u32 = 16,
+    temporal_patch: u32 = 2,
+    merge: u32 = 2,
+    out_hidden: u32 = 5120,
+    num_pos: u32 = 2304,
+    in_ch: u32 = 3,
+};
+
 pub const Qwen38Config = struct {
     allocator: std.mem.Allocator,
     hidden_size: u32 = 5120,
@@ -29,6 +49,13 @@ pub const Qwen38Config = struct {
     full_attn_layers: []u32 = &.{},
     quant_bits_default: u8 = 4,
     quant_group_size: u32 = 64,
+    vision: Qwen38VisionConfig = .{},
+    image_token_id: u32 = 248056,
+    video_token_id: u32 = 248057,
+    vision_start_token_id: u32 = 248053,
+    vision_end_token_id: u32 = 248054,
+    mrope_section: [3]u32 = .{ 11, 11, 10 },
+    mrope_interleaved: bool = true,
 
     pub fn deinit(self: *Qwen38Config) void {
         if (self.eos_token_ids.len > 0) self.allocator.free(self.eos_token_ids);
@@ -180,14 +207,53 @@ pub fn parseQwen38Config(allocator: std.mem.Allocator, json_text: []const u8) !Q
     cfg.linear_value_head_dim = toU32(nestedInt(text, obj, "linear_value_head_dim"), cfg.linear_value_head_dim);
     cfg.linear_conv_kernel_dim = toU32(nestedInt(text, obj, "linear_conv_kernel_dim"), cfg.linear_conv_kernel_dim);
 
-    // rope_theta lives under text_config.rope_parameters.rope_theta.
+    // rope_theta + MRoPE layout live under text_config.rope_parameters.
     if (text) |t| {
         if (t.get("rope_parameters")) |rp| {
             if (rp == .object) {
-                cfg.rope_theta = toF32(getFloat(rp.object, "rope_theta"), cfg.rope_theta);
+                const rpo = rp.object;
+                cfg.rope_theta = toF32(getFloat(rpo, "rope_theta"), cfg.rope_theta);
+                if (getBool(rpo, "mrope_interleaved")) |b| cfg.mrope_interleaved = b;
+                if (rpo.get("mrope_section")) |ms| {
+                    if (ms == .array and ms.array.items.len == 3) {
+                        var section: [3]u32 = undefined;
+                        for (ms.array.items, 0..) |item, i| {
+                            const n: i64 = switch (item) {
+                                .integer => |v| v,
+                                .float => |f| @intFromFloat(f),
+                                else => return LoadError.InvalidConfig,
+                            };
+                            section[i] = std.math.cast(u32, n) orelse return LoadError.InvalidConfig;
+                        }
+                        cfg.mrope_section = section;
+                    }
+                }
             }
         }
     }
+
+    // Vision tower config (top-level `vision_config`).
+    if (obj.get("vision_config")) |vc| {
+        if (vc == .object) {
+            const v = vc.object;
+            cfg.vision.depth = toU32(getInt(v, "depth"), cfg.vision.depth);
+            cfg.vision.hidden = toU32(getInt(v, "hidden_size"), cfg.vision.hidden);
+            cfg.vision.heads = toU32(getInt(v, "num_heads"), cfg.vision.heads);
+            cfg.vision.intermediate = toU32(getInt(v, "intermediate_size"), cfg.vision.intermediate);
+            cfg.vision.patch = toU32(getInt(v, "patch_size"), cfg.vision.patch);
+            cfg.vision.temporal_patch = toU32(getInt(v, "temporal_patch_size"), cfg.vision.temporal_patch);
+            cfg.vision.merge = toU32(getInt(v, "spatial_merge_size"), cfg.vision.merge);
+            cfg.vision.out_hidden = toU32(getInt(v, "out_hidden_size"), cfg.vision.out_hidden);
+            cfg.vision.num_pos = toU32(getInt(v, "num_position_embeddings"), cfg.vision.num_pos);
+            cfg.vision.in_ch = toU32(getInt(v, "in_channels"), cfg.vision.in_ch);
+        }
+    }
+
+    // Special token ids for image/video spans.
+    cfg.image_token_id = toU32(getInt(obj, "image_token_id"), cfg.image_token_id);
+    cfg.video_token_id = toU32(getInt(obj, "video_token_id"), cfg.video_token_id);
+    cfg.vision_start_token_id = toU32(getInt(obj, "vision_start_token_id"), cfg.vision_start_token_id);
+    cfg.vision_end_token_id = toU32(getInt(obj, "vision_end_token_id"), cfg.vision_end_token_id);
 
     // eos_token_id: union of text_config and top-level values (each an integer
     // or array), deduplicated, text_config entries first.
@@ -272,6 +338,60 @@ test "parseQwen38Config: text_config nesting + layer_types" {
     try std.testing.expect(!cfg.isFullAttention(64)); // out of range is safe
     try std.testing.expectEqual(@as(u8, 4), cfg.quant_bits_default);
     try std.testing.expectEqual(@as(u32, 64), cfg.quant_group_size);
+}
+
+test "parseQwen38Config: vision_config + mrope rope_parameters" {
+    const allocator = std.testing.allocator;
+    const json_text =
+        \\{"model_type":"qwen3_5",
+        \\  "image_token_id":248056,"video_token_id":248057,
+        \\  "vision_start_token_id":248053,"vision_end_token_id":248054,
+        \\  "vision_config":{
+        \\    "deepstack_visual_indexes":[],"depth":27,
+        \\    "hidden_act":"gelu_pytorch_tanh","hidden_size":1152,
+        \\    "in_channels":3,"initializer_range":0.02,
+        \\    "intermediate_size":4304,"model_type":"qwen3_5",
+        \\    "num_heads":16,"num_position_embeddings":2304,
+        \\    "out_hidden_size":5120,"patch_size":16,
+        \\    "spatial_merge_size":2,"temporal_patch_size":2
+        \\  },
+        \\  "text_config":{
+        \\    "rope_parameters":{
+        \\      "mrope_interleaved":true,"mrope_section":[11,11,10],
+        \\      "partial_rotary_factor":0.25,"rope_theta":10000000,
+        \\      "rope_type":"default"
+        \\    }
+        \\  }}
+    ;
+    var cfg = try parseQwen38Config(allocator, json_text);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 27), cfg.vision.depth);
+    try std.testing.expectEqual(@as(u32, 1152), cfg.vision.hidden);
+    try std.testing.expectEqual(@as(u32, 16), cfg.vision.heads);
+    try std.testing.expectEqual(@as(u32, 4304), cfg.vision.intermediate);
+    try std.testing.expectEqual(@as(u32, 16), cfg.vision.patch);
+    try std.testing.expectEqual(@as(u32, 2), cfg.vision.temporal_patch);
+    try std.testing.expectEqual(@as(u32, 2), cfg.vision.merge);
+    try std.testing.expectEqual(@as(u32, 5120), cfg.vision.out_hidden);
+    try std.testing.expectEqual(@as(u32, 2304), cfg.vision.num_pos);
+    try std.testing.expectEqual(@as(u32, 3), cfg.vision.in_ch);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &cfg.mrope_section);
+    try std.testing.expect(cfg.mrope_interleaved);
+    try std.testing.expectEqual(@as(u32, 248056), cfg.image_token_id);
+    try std.testing.expectEqual(@as(u32, 248057), cfg.video_token_id);
+    try std.testing.expectEqual(@as(u32, 248053), cfg.vision_start_token_id);
+    try std.testing.expectEqual(@as(u32, 248054), cfg.vision_end_token_id);
+    try std.testing.expectEqual(@as(f32, 1e7), cfg.rope_theta);
+}
+
+test "parseQwen38Config: vision defaults when vision_config absent" {
+    const allocator = std.testing.allocator;
+    var cfg = try parseQwen38Config(allocator, "{\"model_type\":\"qwen3_5\",\"text_config\":{}}");
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(u32, 27), cfg.vision.depth);
+    try std.testing.expectEqual(@as(u32, 1152), cfg.vision.hidden);
+    try std.testing.expectEqualSlices(u32, &.{ 11, 11, 10 }, &cfg.mrope_section);
+    try std.testing.expect(cfg.mrope_interleaved);
 }
 
 test "parseQwen38Config: missing fields fall back to real-config defaults" {
