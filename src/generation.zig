@@ -62,6 +62,8 @@ pub const ModelVTable = struct {
     /// Optional MTP (multi-token prediction) speculative-decoding capability.
     /// Null for models without a drafter head. See MtpOps.
     mtp: ?*const MtpOps = null,
+    /// Optional vision capability (Qwen3.8). Null for text-only models.
+    vision: ?*const VisionOps = null,
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     config: ModelConfig,
     ptr: *anyopaque,
@@ -90,6 +92,54 @@ pub const MtpGreedyDraftOut = struct {
     feat: ?Array = null,
 };
 
+// ============================================================
+// Vision input plumbing (Qwen3.8; tower+preprocess live behind the vtable)
+// ============================================================
+
+/// One image supplied by a caller: a filesystem path (CLI) or encoded image
+/// bytes (server data-URL decode).
+pub const VisionImage = union(enum) {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+/// Tower output for ONE image: merge-divided features plus the prompt
+/// bookkeeping the caller needs to place the image-pad tokens.
+pub const VisionImageOut = struct {
+    features: Array, // [n_pads, hidden] bf16 (owned by the caller)
+    block: [3]i32, // (grid_t, grid_h/merge, grid_w/merge)
+    n_pads: usize,
+};
+
+/// Full per-request vision payload: per-image features concatenated in
+/// prompt order plus one merge-divided block per image. Owned by the
+/// container (CLI scope / RequestState); deinit releases both.
+pub const VisionData = struct {
+    features: Array, // [total_pads, hidden] bf16
+    blocks: [][3]i32,
+
+    pub fn deinit(self: *VisionData, allocator: std.mem.Allocator) void {
+        self.features.deinit();
+        allocator.free(self.blocks);
+    }
+};
+
+/// Vision capability: image preprocessing + tower forward are one op (the
+/// adapter lazily loads the tower weights), the prefill splices features in
+/// at the image-pad positions and runs MRoPE. Null for text-only models.
+pub const VisionOps = struct {
+    /// Token id of the image-pad placeholder (Qwen3.8: 248056 <|image_pad|>).
+    image_token_id: u32 = 248056,
+    /// Preprocess one image and run the ViT tower → features + block + pad
+    /// count (owned by the caller).
+    processImage: *const fn (ctx: *anyopaque, image: VisionImage) anyerror!VisionImageOut,
+    /// Vision prefill: ids carry the image-pad tokens; features/blocks are
+    /// the concatenated tower outputs in pad order. Resets backbone state
+    /// and installs the MRoPE rope_delta for subsequent decode steps.
+    /// Returns last-position logits [1, 1, vocab] (owned).
+    prefill: *const fn (ctx: *anyopaque, ids: []const u32, vision: VisionData) anyerror!Array,
+};
+
 /// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).
 pub const MtpVerifyHandle = *anyopaque;
 
@@ -103,6 +153,10 @@ pub const MtpOps = struct {
     /// Prefill the prompt (resets backbone + drafter state) → last-position
     /// logits + hidden.
     prefill: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpStepOut,
+    /// Optional vision variant of prefill: backbone MRoPE prefill + drafter
+    /// priming, with the drafter's rope offset shifted by the backbone's
+    /// rope_delta. Null → MTP cannot serve vision prompts.
+    prefillVision: ?*const fn (ctx: *anyopaque, ids: []const u32, vision: VisionData) anyerror!MtpStepOut = null,
     /// One drafter step: (hidden, token) → draft logits + chained hidden.
     draft: *const fn (ctx: *anyopaque, hidden: Array, token: u32) anyerror!MtpStepOut,
     /// Greedy-only GPU-chained drafter step: (hidden, tok_gpu [1] i32) →
@@ -226,6 +280,26 @@ pub fn generateStep(
     return results[0];
 }
 
+/// Sample one token from prefill logits [1, L, vocab] or [1, 1, vocab]
+/// (last position). Mirrors the tail of generateBatchStep.
+fn samplePrefillLogits(logits: Array, sampler: *SamplerConfig, ctx: EagerContext) !sampling_mod.SampleResult {
+    var arena = ScopedArrayArena.init(ctx.allocator);
+    defer arena.deinit();
+    const logits_shape = logits.shape();
+    const seq_len: usize = @intCast(logits_shape[1]);
+    const vocab_size: usize = @intCast(logits_shape[2]);
+    const last_logits = try arena.track(try ops.slice(
+        ctx,
+        logits,
+        &[_]i32{ 0, @intCast(seq_len - 1), 0 },
+        &[_]i32{ 1, @intCast(seq_len), @intCast(vocab_size) },
+        &[_]i32{ 1, 1, 1 },
+    ));
+    const squeezed = try arena.track(try shape_mod.squeezeAxes(ctx, last_logits, &[_]i32{ 0, 1 }));
+    const logits_f32 = try arena.track(try ops.astype(ctx, squeezed, .float32));
+    return sampler.sample(logits_f32, ctx.allocator);
+}
+
 // ============================================================
 // Layer 2: streamGenerate — per-token callback streaming
 // ============================================================
@@ -323,6 +397,34 @@ pub fn streamGenerateCtx(
     ctx_ptr: *anyopaque,
     callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
 ) !void {
+    return streamGenerateCtxImpl(model, prompt_tokens, config, caches, ctx, null, ctx_ptr, callback);
+}
+
+/// Vision variant of streamGenerateCtx: the prefill runs through the
+/// model's VisionOps (MRoPE + feature splice); decode steps are unchanged.
+pub fn streamGenerateCtxVision(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: VisionData,
+    ctx_ptr: *anyopaque,
+    callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
+) !void {
+    return streamGenerateCtxImpl(model, prompt_tokens, config, caches, ctx, vision, ctx_ptr, callback);
+}
+
+fn streamGenerateCtxImpl(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: ?VisionData,
+    ctx_ptr: *anyopaque,
+    callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
+) !void {
     var sampler = SamplerConfig{
         .temperature = config.temperature,
         .top_k = config.top_k,
@@ -333,18 +435,24 @@ pub fn streamGenerateCtx(
 
     // Prefill: run the full prompt through the model
     if (prompt_tokens.len > 0) {
-        const prompt_arr = try Array.fromData(
-            ctx.allocator,
-            u32,
-            prompt_tokens,
-            &[_]i32{ 1, @intCast(prompt_tokens.len) },
-        );
-        defer prompt_arr.deinit();
-
         var generated_tokens = std.ArrayList(u32).empty;
         defer generated_tokens.deinit(ctx.allocator);
 
-        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        const first_result = if (vision) |vis| blk: {
+            const vops = model.vision orelse return error.VisionNotSupported;
+            const prefill_logits = try vops.prefill(model.ptr, prompt_tokens, vis);
+            defer prefill_logits.deinit();
+            break :blk try samplePrefillLogits(prefill_logits, &sampler, ctx);
+        } else blk: {
+            const prompt_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                prompt_tokens,
+                &[_]i32{ 1, @intCast(prompt_tokens.len) },
+            );
+            defer prompt_arr.deinit();
+            break :blk try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        };
 
         if (isStopToken(first_result.token, config.stop_tokens)) {
             callback(ctx_ptr, first_result.token, true);
@@ -405,6 +513,30 @@ pub fn generate(
     caches: []KVCacheStrategy,
     ctx: EagerContext,
 ) ![]u32 {
+    return generateImpl(model, prompt_tokens, config, caches, ctx, null);
+}
+
+/// Vision variant of generate: prefill via the model's VisionOps, then the
+/// plain single-token decode loop.
+pub fn generateWithVision(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: VisionData,
+) ![]u32 {
+    return generateImpl(model, prompt_tokens, config, caches, ctx, vision);
+}
+
+fn generateImpl(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: ?VisionData,
+) ![]u32 {
     var sampler = SamplerConfig{
         .temperature = config.temperature,
         .top_k = config.top_k,
@@ -418,18 +550,24 @@ pub fn generate(
 
     // Prefill: run the full prompt through the model
     if (prompt_tokens.len > 0) {
-        const prompt_arr = try Array.fromData(
-            ctx.allocator,
-            u32,
-            prompt_tokens,
-            &[_]i32{ 1, @intCast(prompt_tokens.len) },
-        );
-        defer prompt_arr.deinit();
-
         var generated_tokens = std.ArrayList(u32).empty;
         defer generated_tokens.deinit(ctx.allocator);
 
-        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        const first_result = if (vision) |vis| blk: {
+            const vops = model.vision orelse return error.VisionNotSupported;
+            const prefill_logits = try vops.prefill(model.ptr, prompt_tokens, vis);
+            defer prefill_logits.deinit();
+            break :blk try samplePrefillLogits(prefill_logits, &sampler, ctx);
+        } else blk: {
+            const prompt_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                prompt_tokens,
+                &[_]i32{ 1, @intCast(prompt_tokens.len) },
+            );
+            defer prompt_arr.deinit();
+            break :blk try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        };
         try result.append(ctx.allocator, first_result.token);
         try generated_tokens.append(ctx.allocator, first_result.token);
         sampler.context_tokens = generated_tokens.items;

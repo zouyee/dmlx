@@ -10,6 +10,7 @@ const engine = @import("../engine/root.zig");
 const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
+const vision_prompt = @import("../vision_prompt.zig");
 const jsonEscapeInto = utils_mod.jsonEscapeInto;
 
 const ServerConfig = config_mod.ServerConfig;
@@ -36,7 +37,9 @@ pub const ChatCompletionRequest = struct {
 
     pub const Message = struct {
         role: []const u8,
-        content: []const u8,
+        /// String content, or an array of content parts
+        /// ({"type":"text","text":...} / {"type":"image_url","image_url":{"url":...}}).
+        content: std.json.Value,
     };
 
     pub const ResponseFormat = struct {
@@ -56,6 +59,191 @@ pub const ChatCompletionRequest = struct {
     };
 };
 
+/// Decoded image payload cap (20 MB) — plan risk register.
+pub const max_decoded_image_bytes: usize = 20 * 1024 * 1024;
+
+/// Extract the text of one message and collect any image inputs. Content
+/// may be a plain string or an array of text/image_url parts.
+fn extractMessageContent(
+    allocator: std.mem.Allocator,
+    content: std.json.Value,
+    images: *std.ArrayList(generation_mod.VisionImage),
+    decoded: *std.ArrayList([]u8),
+) ![]const u8 {
+    switch (content) {
+        .string => |s| return allocator.dupe(u8, s),
+        .array => |parts| {
+            var text = std.ArrayList(u8).empty;
+            errdefer text.deinit(allocator);
+            for (parts.items) |part| {
+                const obj = switch (part) {
+                    .object => |o| o,
+                    else => return error.InvalidContent,
+                };
+                const ty = switch (obj.get("type") orelse return error.InvalidContent) {
+                    .string => |s| s,
+                    else => return error.InvalidContent,
+                };
+                if (std.mem.eql(u8, ty, "text")) {
+                    switch (obj.get("text") orelse return error.InvalidContent) {
+                        .string => |s| try text.appendSlice(allocator, s),
+                        else => return error.InvalidContent,
+                    }
+                } else if (std.mem.eql(u8, ty, "image_url")) {
+                    const url = blk: {
+                        const iu = obj.get("image_url") orelse return error.InvalidContent;
+                        switch (iu) {
+                            .string => |s| break :blk s,
+                            .object => |io| break :blk switch (io.get("url") orelse return error.InvalidContent) {
+                                .string => |s| s,
+                                else => return error.InvalidContent,
+                            },
+                            else => return error.InvalidContent,
+                        }
+                    };
+                    try loadImageRef(allocator, url, images, decoded);
+                } else {
+                    return error.InvalidContent;
+                }
+            }
+            return text.toOwnedSlice(allocator);
+        },
+        else => return error.InvalidContent,
+    }
+}
+
+/// Resolve one image_url: data URLs are base64-decoded inline (20 MB
+/// decoded cap); absolute file paths are passed through for local dev.
+/// Remote URLs are not fetched in v1.
+fn loadImageRef(
+    allocator: std.mem.Allocator,
+    url: []const u8,
+    images: *std.ArrayList(generation_mod.VisionImage),
+    decoded: *std.ArrayList([]u8),
+) !void {
+    if (std.mem.startsWith(u8, url, "data:")) {
+        const comma = std.mem.indexOfScalar(u8, url, ',') orelse return error.BadImageUrl;
+        const meta = url[5..comma];
+        if (!std.mem.endsWith(u8, meta, ";base64")) return error.BadImageUrl;
+        const b64 = std.mem.trim(u8, url[comma + 1 ..], " \t\r\n");
+        const size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch |e| {
+            std.log.warn("image_url base64 size failed ({s}), b64 len={d} tail={s}", .{ @errorName(e), b64.len, b64[@max(b64.len, 8) - 8 ..] });
+            return error.BadImageUrl;
+        };
+        if (size > max_decoded_image_bytes) return error.ImageTooLarge;
+        const buf = try allocator.alloc(u8, size);
+        errdefer allocator.free(buf);
+        std.base64.standard.Decoder.decode(buf, b64) catch return error.BadImageUrl;
+        try decoded.append(allocator, buf);
+        try images.append(allocator, .{ .bytes = buf });
+        return;
+    }
+    if (std.mem.startsWith(u8, url, "/")) {
+        try images.append(allocator, .{ .path = url });
+        return;
+    }
+    return error.BadImageUrl;
+}
+
+/// Prompt ready for the engine: token ids + (for image requests) the
+/// tower features/blocks the vision prefill consumes.
+pub const PreparedPrompt = struct {
+    tokens: []u32, // owned
+    vision: ?generation_mod.VisionData, // owned when set
+
+    pub fn deinit(self: *PreparedPrompt, allocator: std.mem.Allocator) void {
+        allocator.free(self.tokens);
+        if (self.vision) |*v| v.deinit(allocator);
+    }
+};
+
+/// Build the chat-template prompt from OpenAI messages, handling both
+/// string content and array content parts. Image parts run through the
+/// model's VisionOps (preprocess + ViT tower) inline.
+pub fn preparePrompt(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    req: ChatCompletionRequest,
+    extra_system: ?[]const u8,
+) !PreparedPrompt {
+    var images = std.ArrayList(generation_mod.VisionImage).empty;
+    defer images.deinit(allocator);
+    var decoded = std.ArrayList([]u8).empty;
+    defer {
+        for (decoded.items) |b| allocator.free(b);
+        decoded.deinit(allocator);
+    }
+
+    const texts = try allocator.alloc([]const u8, req.messages.len);
+    var n_texts: usize = 0;
+    defer {
+        for (texts[0..n_texts]) |t| allocator.free(t);
+        allocator.free(texts);
+    }
+    var last_user_idx: ?usize = null;
+    for (req.messages, 0..) |msg, i| {
+        if (std.mem.eql(u8, msg.role, "user")) last_user_idx = i;
+        texts[i] = try extractMessageContent(allocator, msg.content, &images, &decoded);
+        n_texts += 1;
+    }
+
+    if (images.items.len == 0) {
+        const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, null);
+        return .{ .tokens = tokens, .vision = null };
+    }
+
+    const vops = state.vtable.vision orelse return error.VisionNotSupported;
+    const user_idx = last_user_idx orelse return error.InvalidContent;
+    var proc = try vision_prompt.processImages(allocator, state.ctx, vops, state.vtable.ptr, images.items);
+    defer allocator.free(proc.blocks_text);
+    errdefer proc.data.deinit(allocator);
+
+    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, .{
+        .user_idx = user_idx,
+        .blocks_text = proc.blocks_text,
+    });
+    errdefer allocator.free(tokens);
+    try vision_prompt.validatePadCount(tokens, vops.image_token_id, proc.n_pads);
+    return .{ .tokens = tokens, .vision = proc.data };
+}
+
+const VisionInsert = struct {
+    user_idx: usize,
+    blocks_text: []const u8,
+};
+
+/// Apply the chat template to the extracted message texts (optionally with
+/// the vision blocks prepended to one user message) and tokenize.
+fn tokenizeMessages(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    req_messages: []const ChatCompletionRequest.Message,
+    texts: []const []const u8,
+    extra_system: ?[]const u8,
+    vision: ?VisionInsert,
+) ![]u32 {
+    var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
+    defer messages.deinit(allocator);
+    var merged: ?[]u8 = null;
+    defer if (merged) |m| allocator.free(m);
+    if (extra_system) |sys| {
+        try messages.append(allocator, .{ .role = "system", .content = sys });
+    }
+    for (texts, 0..) |t, i| {
+        var content = t;
+        if (vision) |v| {
+            if (i == v.user_idx) {
+                merged = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ v.blocks_text, t });
+                content = merged.?;
+            }
+        }
+        try messages.append(allocator, .{ .role = req_messages[i].role, .content = content });
+    }
+    const prompt_text = try state.chat_template.apply(messages.items, true);
+    defer allocator.free(prompt_text);
+    return state.tokenizer_strategy.encode(prompt_text, false, allocator);
+}
+
 pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *ServerState, request_json: []const u8, server_config: ServerConfig) ![]u8 {
     const t_entry = std.c.mach_absolute_time();
     // 1. Parse request
@@ -68,11 +256,11 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         return try allocator.dupe(u8, "{\"error\":\"streaming_not_supported\"}");
     }
 
-    // 3. Build messages for chat template
-    var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
-    defer messages.deinit(allocator);
-
-    // 3a. If tools are provided, inject tool system prompt as the first message
+    // 3-5. Build the prompt: extract text/images from the messages, run any
+    // images through the vision tower inline, apply the chat template and
+    // tokenize. Tool definitions inject a leading system prompt.
+    var tool_system: ?[]u8 = null;
+    defer if (tool_system) |ts| allocator.free(ts);
     if (req.tools) |tools| {
         const family = tool_calling_mod.detectFamily(req.model);
         var tool_defs = std.ArrayList(tool_calling_mod.ToolDefinition).empty;
@@ -97,29 +285,24 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
             });
         }
         if (tool_defs.items.len > 0) {
-            const tool_prompt = try tool_calling_mod.buildToolSystemPrompt(allocator, tool_defs.items, family);
-            defer allocator.free(tool_prompt);
-            try messages.append(allocator, .{
-                .role = "system",
-                .content = tool_prompt,
-            });
+            tool_system = try tool_calling_mod.buildToolSystemPrompt(allocator, tool_defs.items, family);
         }
     }
 
-    for (req.messages) |msg| {
-        try messages.append(allocator, .{
-            .role = msg.role,
-            .content = msg.content,
-        });
-    }
-
-    // 4. Apply chat template
-    const prompt_text = try state.chat_template.apply(messages.items, true);
-    defer allocator.free(prompt_text);
-
-    // 5. Tokenize (template already includes special tokens)
-    const prompt_tokens = try state.tokenizer_strategy.encode(prompt_text, false, allocator);
-    defer allocator.free(prompt_tokens);
+    var prepared = preparePrompt(allocator, state, req, tool_system) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.VisionNotSupported => "vision input is not supported by the loaded model",
+            error.ImageTooLarge => "decoded image exceeds the 20MB limit",
+            error.BadImageUrl => "unsupported image_url (data:...;base64 URLs and absolute file paths only)",
+            error.InvalidContent => "invalid message content (string or text/image_url parts only)",
+            else => return err,
+        };
+        return try std.fmt.allocPrint(allocator,
+            \\{{"error":{{"message":"{s}","type":"invalid_request_error","code":"{s}"}}}}
+        , .{ msg, @errorName(err) });
+    };
+    defer prepared.deinit(allocator);
+    const prompt_tokens = prepared.tokens;
 
     // 6. Submit request to engine queue and wait for completion.
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
@@ -145,7 +328,10 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
             if (std.mem.eql(u8, rf.type, "regex")) break :blk rf.schema;
             break :blk null;
         } else null,
+        .vision = prepared.vision,
     };
+    // Vision ownership moves into the RequestState.
+    prepared.vision = null;
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);

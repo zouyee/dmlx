@@ -6,6 +6,7 @@
 const std = @import("std");
 const completion_signal = @import("completion_signal.zig");
 const sampling_mod = @import("../sampling.zig");
+const generation_mod = @import("../generation.zig");
 
 pub const CompletionSignal = completion_signal.CompletionSignal;
 pub const TokenEvent = completion_signal.TokenEvent;
@@ -50,6 +51,10 @@ pub const RequestConfig = struct {
     guided_json_schema: ?[]const u8 = null,
     /// Guided decoding: regex pattern constraint (null = unconstrained).
     guided_regex: ?[]const u8 = null,
+    /// Vision payload (Qwen3.8 image prompts): tower features + blocks for
+    /// the vision prefill. Null for text-only requests. Ownership transfers
+    /// to the RequestState.
+    vision: ?generation_mod.VisionData = null,
     /// Sequence index in the shared PagedKVCache (assigned by EngineLoop).
     seq_index: usize = 0,
 };
@@ -86,6 +91,8 @@ pub const RequestState = struct {
     guided_json_schema: ?[]const u8,
     /// Guided decoding: regex pattern constraint (null = unconstrained).
     guided_regex: ?[]const u8,
+    /// Vision payload for the prefill (owned; null for text-only requests).
+    vision: ?generation_mod.VisionData,
 
     // --- Mutable state (written by Engine via signal, read by HTTP after signal) ---
     /// Accumulated generated tokens.
@@ -143,6 +150,7 @@ pub const RequestState = struct {
             .model_name = config.model_name,
             .guided_json_schema = config.guided_json_schema,
             .guided_regex = config.guided_regex,
+            .vision = config.vision,
             .phase = .waiting,
             .seq_index = config.seq_index,
             .sampler = SamplerConfig.init(config.seed),
@@ -165,6 +173,7 @@ pub const RequestState = struct {
     pub fn deinit(self: *RequestState) void {
         const allocator = self.allocator;
         allocator.free(self.prompt_tokens);
+        if (self.vision) |*vis| vis.deinit(allocator);
         self.generated_tokens.deinit(allocator);
         self.text_buffer.deinit(allocator);
         self.completion.deinit();

@@ -46,6 +46,7 @@ const ChatCommand = struct {
     dspark_dir: ?[]const u8 = null, // DSpark Markov Head weights dir (speculative decoding)
     distributed: bool = false,
     raw: bool = false, // Skip chat template, use raw prompt completion
+    images: [][]const u8 = &.{}, // --image <path> (repeatable): vision prompts (Qwen3.8)
 };
 
 const ServerCommand = struct {
@@ -164,6 +165,8 @@ pub fn main(init: std.process.Init) !void {
         defer {
             allocator.free(cmd.model_path);
             allocator.free(cmd.prompt);
+            for (cmd.images) |img| allocator.free(img);
+            allocator.free(cmd.images);
         }
         try runChat(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "convert")) {
@@ -273,6 +276,7 @@ fn printUsage() void {
         \\  dmlx chat [options]
         \\    --model <path>      Path to model directory
         \\    --prompt <text>     Prompt text
+        \\    --image <path>      Image for a vision prompt (repeatable; Qwen3.8)
         \\    --max-tokens <n>    Maximum tokens (default: 256)
         \\    --temperature <t>   Sampling temperature (default: 0.8)
         \\    --top-k <k>         Top-k sampling (default: 50)
@@ -476,6 +480,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         .model_path = "",
         .prompt = "",
     };
+    var images = std.ArrayList([]const u8).empty;
+    defer images.deinit(allocator);
 
     var i: usize = 0;
     while (i < args.len) {
@@ -489,6 +495,8 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
             cmd.model_path = try allocator.dupe(u8, value);
         } else if (std.mem.eql(u8, flag, "--prompt")) {
             cmd.prompt = try allocator.dupe(u8, value);
+        } else if (std.mem.eql(u8, flag, "--image")) {
+            try images.append(allocator, try allocator.dupe(u8, value));
         } else if (std.mem.eql(u8, flag, "--max-tokens")) {
             cmd.max_tokens = try std.fmt.parseInt(usize, value, 10);
         } else if (std.mem.eql(u8, flag, "--temperature")) {
@@ -545,6 +553,7 @@ fn parseChatArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Chat
         return error.MissingRequiredArgument;
     }
 
+    cmd.images = try images.toOwnedSlice(allocator);
     return cmd;
 }
 
@@ -947,6 +956,48 @@ fn runQwen38Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx
         .stop_tokens = qwen_cfg.eos_token_ids,
         .seed = seed,
     };
+
+    if (cmd.images.len > 0) {
+        // Vision path: preprocess + tower per image, splice the pad blocks
+        // into the user message, vision prefill, then the plain decode loop.
+        const vops = vtable.vision orelse {
+            std.log.err("Model does not support vision input (--image)", .{});
+            return error.VisionNotSupported;
+        };
+        const images = try allocator.alloc(root.generation.VisionImage, cmd.images.len);
+        defer allocator.free(images);
+        for (cmd.images, 0..) |p, i| images[i] = .{ .path = p };
+        var vp = try root.vision_prompt.build(
+            allocator,
+            ctx,
+            &chat_template,
+            tokenizer,
+            vops,
+            vtable.ptr,
+            if (cmd.system_prompt.len > 0) cmd.system_prompt else null,
+            cmd.prompt,
+            images,
+            qwen_cfg.image_token_id,
+        );
+        defer vp.deinit(allocator);
+        std.log.info("Vision prompt: {d} tokens, {d} image(s)", .{ vp.tokens.len, cmd.images.len });
+
+        std.debug.print("Starting generation...\n", .{});
+        const new_tokens = try root.generation.generateWithVision(
+            vtable,
+            vp.tokens,
+            gen_config,
+            &[_]root.kvcache.KVCacheStrategy{},
+            ctx,
+            vp.data,
+        );
+        defer allocator.free(new_tokens);
+
+        const output_text = try tokenizer.decode(new_tokens, allocator);
+        defer allocator.free(output_text);
+        std.debug.print("\n{s}\n", .{output_text});
+        return;
+    }
 
     std.debug.print("Starting generation...\n", .{});
     const new_tokens = try root.generation.generate(

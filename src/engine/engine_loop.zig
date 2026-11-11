@@ -957,7 +957,22 @@ pub const EngineLoop = struct {
         );
         defer stream_ctx.deinit();
 
-        generation_mod.streamGenerateCtx(
+        if (req.vision) |vis| {
+            generation_mod.streamGenerateCtxVision(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+                vis,
+                @ptrCast(&stream_ctx),
+                &StreamCallbackCtx.callback,
+            ) catch |err| {
+                std.log.err("EngineLoop: streamGenerateCtxVision failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            };
+        } else generation_mod.streamGenerateCtx(
             self.model,
             req.prompt_tokens,
             gen_config,
@@ -993,23 +1008,39 @@ pub const EngineLoop = struct {
             if (self.tryMtpRequest(req, caches, gen_config, n_drafts)) return;
         }
         // If speculative decoding is enabled, use the speculative path.
-        if (self.speculative_ngram) |ngram_n| {
-            self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
-            return;
+        if (req.vision == null) {
+            if (self.speculative_ngram) |ngram_n| {
+                self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
+                return;
+            }
         }
 
         const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
-        const tokens = generation_mod.generate(
-            self.model,
-            req.prompt_tokens,
-            gen_config,
-            caches,
-            self.ctx,
-        ) catch |err| {
-            std.log.err("EngineLoop: generate failed: {}", .{err});
-            req.completion.deliverError(self.io, "Generation failed");
-            return;
-        };
+        const tokens = if (req.vision) |vis|
+            generation_mod.generateWithVision(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+                vis,
+            ) catch |err| {
+                std.log.err("EngineLoop: generateWithVision failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            }
+        else
+            generation_mod.generate(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+            ) catch |err| {
+                std.log.err("EngineLoop: generate failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            };
         defer self.allocator.free(tokens);
         if (pf_t0 != 0) {
             std.log.info("[PREFILL_TRACE] plain req={d} prompt={d} generate_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
@@ -2205,7 +2236,17 @@ pub const EngineLoop = struct {
 
         // Prefill (resets backbone + drafter) → first token.
         const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
-        const pf = mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
+        const pf = if (req.vision) |vis| blk: {
+            const pv = mtp.prefillVision orelse {
+                req.completion.deliverError(self.io, "MTP: vision prompts not supported by this drafter");
+                return;
+            };
+            break :blk pv(self.model.ptr, req.prompt_tokens, vis) catch |err| {
+                std.log.err("EngineLoop: MTP vision prefill failed: {}", .{err});
+                req.completion.deliverError(self.io, "MTP: prefill failed");
+                return;
+            };
+        } else mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
             std.log.err("EngineLoop: MTP prefill failed: {}", .{err});
             req.completion.deliverError(self.io, "MTP: prefill failed");
             return;

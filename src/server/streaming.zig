@@ -40,24 +40,26 @@ pub fn handleStreamingCompletion(
     defer allocator.free(role_chunk);
     try sse.sendEvent(role_chunk);
 
-    // 3. Build messages for chat template
-    var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
-    defer messages.deinit(allocator);
-
-    for (req.messages) |msg| {
-        try messages.append(allocator, .{
-            .role = msg.role,
-            .content = msg.content,
-        });
-    }
-
-    // 4. Apply chat template
-    const prompt_text = try state.chat_template.apply(messages.items, true);
-    defer allocator.free(prompt_text);
-
-    // 5. Tokenize
-    const prompt_tokens = try state.tokenizer_strategy.encode(prompt_text, false, allocator);
-    defer allocator.free(prompt_tokens);
+    // 3-5. Build the prompt (text + optional image content parts, chat
+    // template, tokenize). Shared with the non-streaming handler.
+    var prepared = openai_mod.preparePrompt(allocator, state, req, null) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.VisionNotSupported => "vision input is not supported by the loaded model",
+            error.ImageTooLarge => "decoded image exceeds the 20MB limit",
+            error.BadImageUrl => "unsupported image_url",
+            error.InvalidContent => "invalid message content",
+            else => "prompt preparation failed",
+        };
+        const chunk = try std.fmt.allocPrint(allocator,
+            \\{{"error":{{"message":"{s}","type":"invalid_request_error"}}}}
+        , .{msg});
+        defer allocator.free(chunk);
+        try sse.sendEvent(chunk);
+        try sse.sendEvent("[DONE]");
+        return;
+    };
+    defer prepared.deinit(allocator);
+    const prompt_tokens = prepared.tokens;
 
     // 6. Setup generation config and submit to engine queue.
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
@@ -75,7 +77,10 @@ pub fn handleStreamingCompletion(
         .stop_tokens = state.stop_tokens,
         .streaming = true,
         .model_name = req.model,
+        .vision = prepared.vision,
     };
+    // Vision ownership moves into the RequestState.
+    prepared.vision = null;
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);

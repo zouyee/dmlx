@@ -33,6 +33,8 @@ const glm53 = @import("models/glm53.zig");
 const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
+const qwen38_vit = @import("vision/qwen38_vit.zig");
+const qwen38_preprocess = @import("vision/qwen38_preprocess.zig");
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -587,6 +589,17 @@ pub const Qwen38VTableAdapter = struct {
     /// Resident weights — kept alive for the model's lifetime.
     weights: std.StringHashMap(Array),
     allocator: std.mem.Allocator,
+    /// Model directory (owned) — the vision tower's weights are lazily read
+    /// from here on the first image request.
+    model_path: []const u8 = "",
+    /// Lazily-initialized vision tower + its resident weight map.
+    vit: ?*qwen38_vit.Qwen38Vit = null,
+    vit_weights: ?std.StringHashMap(Array) = null,
+    vision_ops: generation.VisionOps = .{
+        .image_token_id = 248056,
+        .processImage = &visionProcessImage,
+        .prefill = &visionPrefill,
+    },
     /// MTP drafter state (lazily loaded on first enable()).
     mtp: ?*qwen38_mtp.Qwen38Mtp = null,
     /// Drafter KV length before the current round's draft chain; null when
@@ -602,6 +615,7 @@ pub const Qwen38VTableAdapter = struct {
     mtp_ops: generation.MtpOps = .{
         .enable = &mtpEnable,
         .prefill = &mtpPrefill,
+        .prefillVision = &mtpPrefillVision,
         .draft = &mtpDraft,
         .draftGreedy = &mtpDraftGreedy,
         .verify = &mtpVerify,
@@ -627,6 +641,87 @@ pub const Qwen38VTableAdapter = struct {
         const logits = try self.model.forwardTokensLast(ids);
         self.start_pos += len;
         return logits;
+    }
+
+    /// Lazy-load the ViT tower weights (vision_tower.* tensors) and build
+    /// the tower on first use.
+    fn ensureVit(self: *Qwen38VTableAdapter) !*qwen38_vit.Qwen38Vit {
+        if (self.vit) |v| return v;
+        if (self.cfg.vision.depth == 0) return error.VisionNotSupported;
+        var index = try safetensors_reader.loadOrBuildIndex(self.allocator, self.model_path);
+        defer index.deinit();
+        var map = std.StringHashMap(Array).init(self.allocator);
+        errdefer {
+            var it0 = map.iterator();
+            while (it0.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            map.deinit();
+        }
+        var it = index.entries.iterator();
+        var n_tensors: usize = 0;
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, name, "vision_tower.")) continue;
+            try map.put(try self.allocator.dupe(u8, name), try index.loadTensor(name));
+            n_tensors += 1;
+        }
+        if (n_tensors == 0) {
+            var it2 = map.iterator();
+            while (it2.next()) |e| {
+                self.allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            map.deinit();
+            return error.VisionNotSupported;
+        }
+        const cv = self.cfg.vision;
+        const vcfg = qwen38_vit.Qwen38VitConfig{
+            .depth = cv.depth,
+            .hidden = @intCast(cv.hidden),
+            .heads = @intCast(cv.heads),
+            .intermediate = @intCast(cv.intermediate),
+            .patch = @intCast(cv.patch),
+            .temporal_patch = @intCast(cv.temporal_patch),
+            .merge = @intCast(cv.merge),
+            .out_hidden = @intCast(cv.out_hidden),
+            .num_pos = @intCast(cv.num_pos),
+            .in_ch = @intCast(cv.in_ch),
+        };
+        const v = try self.allocator.create(qwen38_vit.Qwen38Vit);
+        errdefer self.allocator.destroy(v);
+        v.* = try qwen38_vit.Qwen38Vit.init(self.allocator, self.model.ctx, vcfg, &map);
+        self.vit = v;
+        self.vit_weights = map;
+        std.log.info("Qwen3.8 vision tower loaded: {d} tensors", .{n_tensors});
+        return v;
+    }
+
+    fn visionProcessImage(ctx_ptr: *anyopaque, image: generation.VisionImage) anyerror!generation.VisionImageOut {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const vit = try self.ensureVit();
+        var pp = switch (image) {
+            .path => |p| try qwen38_preprocess.preprocessImageFile(self.allocator, self.model.ctx, p),
+            .bytes => |b| try qwen38_preprocess.preprocessImageBytes(self.allocator, self.model.ctx, b),
+        };
+        defer pp.deinit();
+        const feats = try vit.forward(pp.pixels, pp.grid_thw[0], pp.grid_thw[1], pp.grid_thw[2]);
+        errdefer feats.deinit();
+        const merge: i32 = @intCast(self.cfg.vision.merge);
+        return .{
+            .features = feats,
+            .block = .{ pp.grid_thw[0], @divExact(pp.grid_thw[1], merge), @divExact(pp.grid_thw[2], merge) },
+            .n_pads = pp.n_image_pad,
+        };
+    }
+
+    fn visionPrefill(ctx_ptr: *anyopaque, ids: []const u32, vision: generation.VisionData) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        return self.model.forwardTokensWithVision(ids, .{
+            .features = vision.features,
+            .blocks = vision.blocks,
+        });
     }
 
     fn mtpDims(self: *Qwen38VTableAdapter) qwen38_mtp.Qwen38MtpDims {
@@ -699,7 +794,6 @@ pub const Qwen38VTableAdapter = struct {
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         const m = self.mtp.?;
-        const ctx = self.model.ctx;
         // Backbone: normal prefill path (reset + fused recurrence — NO
         // per-position state retention; verify-mode would pin L x 3.1 MB x 48
         // layers and OOM at long prompts).
@@ -709,12 +803,49 @@ pub const Qwen38VTableAdapter = struct {
         const out = try self.model.forwardTokensAllHidden(ids);
         defer out.logits.deinit();
         defer out.hidden_all.deinit();
+        // Text prefill: rope_delta is 0 (reset inside the backbone prefill);
+        // the drafter's rope offset carries no extra shift.
+        m.attn.rope_extra = 0;
+        return self.mtpPrefillTail(ids, out.logits, out.hidden_all);
+    }
+
+    /// Vision MTP prefill: backbone MRoPE prefill (resets state, installs
+    /// rope_delta) + drafter priming, with the drafter's rope offset shifted
+    /// by the same rope_delta the backbone decode steps use.
+    fn mtpPrefillVision(ctx_ptr: *anyopaque, ids: []const u32, vision: generation.VisionData) anyerror!generation.MtpStepOut {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        const m = self.mtp.?;
+        m.cache.deinit();
+        m.cache = .{};
+        self.mtp_round_old_len = null;
+        const res = try self.model.forwardTokensWithVisionCapture(ids, .{
+            .features = vision.features,
+            .blocks = vision.blocks,
+        }, .all);
+        defer res.logits.deinit();
+        defer res.hidden.?.deinit();
+        const out = try self.mtpPrefillTail(ids, res.logits, res.hidden.?);
+        // Propagate the backbone's MRoPE rope_delta to the drafter AFTER its
+        // prompt pass (which primes at raw sequence positions, same as the
+        // text path): subsequent draft/verify rope offsets are
+        // cache.len() + rope_delta, matching the backbone's full-attention
+        // layers. Setting it earlier would rope the prompt rows at negative
+        // offsets (rope_delta < 0 for wide images).
+        m.attn.rope_extra = self.model.rope_delta;
+        return out;
+    }
+
+    /// Shared tail of the MTP prefill: drafter prompt pass over the backbone
+    /// hidden rows, then last-position logits + last hidden for round 0.
+    fn mtpPrefillTail(self: *Qwen38VTableAdapter, ids: []const u32, out_logits: Array, hidden_all: Array) anyerror!generation.MtpStepOut {
+        const m = self.mtp.?;
+        const ctx = self.model.ctx;
 
         // Drafter prompt pass: populate the head's KV cache over the prompt
         // (head position j ← (backbone hidden row j, embed ids[j+1])).
         if (ids.len > 1) {
-            const hidden: i32 = out.hidden_all.shape()[2];
-            const rows = try ops.slice(ctx, out.hidden_all, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @as(i32, @intCast(ids.len)) - 1, hidden }, &[_]i32{ 1, 1, 1 });
+            const hidden: i32 = hidden_all.shape()[2];
+            const rows = try ops.slice(ctx, hidden_all, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @as(i32, @intCast(ids.len)) - 1, hidden }, &[_]i32{ 1, 1, 1 });
             defer rows.deinit();
             const rows2 = try ops.reshape(ctx, rows, &[_]i32{ @as(i32, @intCast(ids.len)) - 1, hidden });
             defer rows2.deinit();
@@ -728,19 +859,19 @@ pub const Qwen38VTableAdapter = struct {
         }
 
         // Last-position logits → [vocab] f32; last hidden row → [1, hidden].
-        const lshape = out.logits.shape();
+        const lshape = out_logits.shape();
         const vocab: i32 = lshape[2];
-        // `out.logits` is ALREADY only the last position (see
+        // `out_logits` is ALREADY only the last position (see
         // forwardTokensAllHidden), so its seq dim is 1 — the hidden row
         // index MUST come from hidden_all, which still has all L rows.
-        const L: i32 = out.hidden_all.shape()[1];
-        const flat = try ops.reshape(ctx, out.logits, &[_]i32{vocab});
+        const L: i32 = hidden_all.shape()[1];
+        const flat = try ops.reshape(ctx, out_logits, &[_]i32{vocab});
         defer flat.deinit();
         const logits = try ops.astype(ctx, flat, .float32);
         errdefer logits.deinit();
 
-        const hidden_dim: i32 = out.hidden_all.shape()[2];
-        const hrow = try ops.slice(ctx, out.hidden_all, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden_dim }, &[_]i32{ 1, 1, 1 });
+        const hidden_dim: i32 = hidden_all.shape()[2];
+        const hrow = try ops.slice(ctx, hidden_all, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden_dim }, &[_]i32{ 1, 1, 1 });
         defer hrow.deinit();
         const hflat = try ops.reshape(ctx, hrow, &[_]i32{ 1, hidden_dim });
         defer hflat.deinit();
@@ -948,6 +1079,19 @@ pub const Qwen38VTableAdapter = struct {
             m.deinit();
             allocator.destroy(m);
         }
+        if (self.vit) |v| {
+            v.deinit();
+            allocator.destroy(v);
+        }
+        if (self.vit_weights) |*vw| {
+            var vit0 = vw.iterator();
+            while (vit0.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            vw.deinit();
+        }
+        if (self.model_path.len > 0) allocator.free(self.model_path);
         self.model.deinit();
         allocator.destroy(self.model);
         var it = self.weights.iterator();
@@ -1022,11 +1166,14 @@ fn qwen38Loader(
         .cfg = cfg_ptr,
         .weights = weights,
         .allocator = allocator,
+        .model_path = try allocator.dupe(u8, model_path),
     };
+    adapter.vision_ops.image_token_id = cfg_ptr.image_token_id;
 
     return ModelVTable{
         .forward = &Qwen38VTableAdapter.forward,
         .mtp = &adapter.mtp_ops,
+        .vision = &adapter.vision_ops,
         .deinit = &Qwen38VTableAdapter.deinitFn,
         .config = ModelConfig{
             .num_layers = cfg_ptr.num_hidden_layers,
