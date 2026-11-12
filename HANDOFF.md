@@ -1905,3 +1905,36 @@ decode 两臂全胜;大图端到端仍略输 mlx-vlm-mtp 5%(11.69 vs 11.13),
 已持平。vmlx 无需单列——它是 mlx-vlm 的封装壳。
 工具:src/bench_vision_ttft.zig(`run-bench-vision-ttft` 分段计时)、
 scripts/ab_vision_drafter_delta.sh、/tmp/bench_vision.py(三引擎 A/B/C)。
+
+### Server API 面对齐补齐(2026-11-12)
+
+对照 mlx-vlm/omlx/vmlx 源码盘点后按性价比补齐(commits
+`e017eaa`+`990a7e8` → `03bd3db`+`2cb8541` → `85cc62c`+`a28f3b9`):
+
+- **`GET /v1/models`**:OpenAI 形状,id = model_path basename,created =
+  server 启动时间;model id 经 jsonEscape。
+- **per-request `top_p`/`top_k`**:chat completions + Anthropic 双端,校验
+  top_p∈(0,1]/top_k≥1(400),贯通 serial/streaming/MTP/batched-prefill
+  全部引擎路径。
+- **`tool_choice`**:auto(默认)/none(真剥离 tools)/required+named →
+  明确 400(无强制调用机制,不静默错);Anthropic 侧 auto/none 接受、
+  any/tool → 400。
+- **`POST /v1/responses` 最小兼容层**(src/server/responses.zig):纯翻译到
+  chat 机制——input string/array(input_text/input_image parts,图像走真
+  vision 管线)、instructions→system、max_output_tokens(u32 溢出防护)、
+  store/metadata 接受忽略;未知/不支持字段全部明确 400(allowlist)。
+  响应对象 resp_/msg_ id、usage、status completed/incomplete。
+  **流式也支持**:response.created → output_text.delta×N →
+  output_text.done → response.completed。引擎错误映射 HTTP 500,
+  请求错误 400。未经真 OpenAI SDK 验证(venv 无 openai 包)。
+- **`POST /v1/tokenize`(+ /tokenize)**:复用 chat 同款 BpeTokenizer
+  encode(与 HF transformers 逐 id 对拍一致,含多语言 golden 用例);
+  无 chat 模板;>1MB 拒绝;add_special 对 Qwen BPE 是 no-op(文档化)。
+
+单测 454→**525 passed / 2 skipped / 0 failed**。已知未修(pre-existing,
+与本次无关):SSE 中途断连偶发 segfault(疑似 keepAliveLoop 竞态);
+tool_calls 的 arguments JSON 转义缺陷;zig build test 的 --listen=-
+runner 间歇假失败 + test-exact-q4-producer 1% 计时门槛并发下偶超。
+
+剩余 API 缺口(未做,ROI 递减):embeddings/rerank、图像生成/音频、
+Ollama 兼容、metrics/cache 管理端点、多模型池。
