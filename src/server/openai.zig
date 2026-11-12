@@ -11,6 +11,7 @@ const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
 const vision_prompt = @import("../vision_prompt.zig");
+const qwen38_preprocess = @import("../vision/qwen38_preprocess.zig");
 const metrics_mod = @import("metrics.zig");
 const jsonEscapeInto = utils_mod.jsonEscapeInto;
 
@@ -288,6 +289,75 @@ const VisionInsert = struct {
     user_idx: usize,
     blocks_text: []const u8,
 };
+
+/// Token count for a chat request WITHOUT running generation: same chat
+/// template + tokenizer as preparePrompt, so the result equals the chat
+/// path's usage.prompt_tokens for the same messages.
+///
+/// Image semantics: image parts are preprocessed (smart_resize + patch
+/// count) but do NOT run the ViT tower — each image contributes exactly its
+/// n_image_pad <|image_pad|> tokens inside the standard
+/// <|vision_start|>...<|vision_end|> block (identical to what the real
+/// generation prompt carries). Pad counting currently uses the Qwen3.8
+/// preprocessor; a request with images on a model without vision ops
+/// returns error.VisionNotSupported.
+pub fn countPromptTokens(
+    allocator: std.mem.Allocator,
+    state: *ServerState,
+    req: ChatCompletionRequest,
+    extra_system: ?[]const u8,
+) !usize {
+    var images = std.ArrayList(generation_mod.VisionImage).empty;
+    defer images.deinit(allocator);
+    var decoded = std.ArrayList([]u8).empty;
+    defer {
+        for (decoded.items) |b| allocator.free(b);
+        decoded.deinit(allocator);
+    }
+
+    const texts = try allocator.alloc([]const u8, req.messages.len);
+    var n_texts: usize = 0;
+    defer {
+        for (texts[0..n_texts]) |t| allocator.free(t);
+        allocator.free(texts);
+    }
+    var last_user_idx: ?usize = null;
+    for (req.messages, 0..) |msg, i| {
+        if (std.mem.eql(u8, msg.role, "user")) last_user_idx = i;
+        texts[i] = try extractMessageContent(allocator, msg.content, &images, &decoded);
+        n_texts += 1;
+    }
+
+    if (images.items.len == 0) {
+        const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, null);
+        defer allocator.free(tokens);
+        return tokens.len;
+    }
+
+    // Preprocess-only pad counting (no tower forward — token count needs
+    // just the grid, and the tower would waste a GPU forward per image).
+    _ = state.vtable.vision orelse return error.VisionNotSupported;
+    const user_idx = last_user_idx orelse return error.InvalidContent;
+    var blocks_text = std.ArrayList(u8).empty;
+    defer blocks_text.deinit(allocator);
+    for (images.items) |img| {
+        var pp = switch (img) {
+            .path => |p| try qwen38_preprocess.preprocessImageFile(allocator, state.ctx, p),
+            .bytes => |b| try qwen38_preprocess.preprocessImageBytes(allocator, state.ctx, b),
+        };
+        defer pp.deinit();
+        try blocks_text.appendSlice(allocator, "<|vision_start|>");
+        for (0..pp.n_image_pad) |_| try blocks_text.appendSlice(allocator, "<|image_pad|>");
+        try blocks_text.appendSlice(allocator, "<|vision_end|>");
+    }
+
+    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, .{
+        .user_idx = user_idx,
+        .blocks_text = blocks_text.items,
+    });
+    defer allocator.free(tokens);
+    return tokens.len;
+}
 
 /// Apply the chat template to the extracted message texts (optionally with
 /// the vision blocks prepended to one user message) and tokenize.

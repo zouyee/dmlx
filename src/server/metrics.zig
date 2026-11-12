@@ -11,13 +11,18 @@ const std = @import("std");
 /// dispatch layer in http.zig matches on the same prefixes.
 pub const route_names = [_][]const u8{
     "/v1/chat/completions",
+    "/v1/completions",
     "/v1/models",
     "/health",
+    "/api/status",
     "/shutdown",
     "/v1/responses",
     "/v1/tokenize",
     "/tokenize",
+    "/v1/detokenize",
+    "/detokenize",
     "/v1/embeddings",
+    "/v1/messages/count_tokens",
     "/v1/messages",
     "/metrics",
     "/v1/metrics",
@@ -96,6 +101,15 @@ pub const Metrics = struct {
     pub fn addTokenCounts(self: *Metrics, prompt_tokens: u64, generated_tokens: u64) void {
         _ = self.prompt_tokens_total.fetchAdd(prompt_tokens, .monotonic);
         _ = self.generation_tokens_total.fetchAdd(generated_tokens, .monotonic);
+    }
+
+    /// Total HTTP requests handled across all routes (for /api/status).
+    pub fn totalRequests(self: *Metrics) u64 {
+        var total: u64 = 0;
+        for (&self.routes) |*route| {
+            total += route.duration_count.load(.monotonic);
+        }
+        return total;
     }
 
     pub fn addMtpDrafts(self: *Metrics, proposed: u64, accepted: u64) void {

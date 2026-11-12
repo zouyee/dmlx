@@ -21,6 +21,9 @@ pub const openai = @import("server/openai.zig");
 pub const streaming = @import("server/streaming.zig");
 pub const anthropic = @import("server/anthropic.zig");
 pub const responses = @import("server/responses.zig");
+pub const completions = @import("server/completions.zig");
+pub const detokenize = @import("server/detokenize.zig");
+pub const response_store = @import("server/response_store.zig");
 pub const tokenize = @import("server/tokenize.zig");
 pub const utils = @import("server/utils.zig");
 pub const tooling = @import("server/tooling.zig");
@@ -355,4 +358,7 @@ test {
     _ = openai;
     _ = anthropic;
     _ = responses;
+    _ = completions;
+    _ = detokenize;
+    _ = response_store;
 }

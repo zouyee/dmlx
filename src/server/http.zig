@@ -12,6 +12,9 @@ const openai_mod = @import("openai.zig");
 const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
 const responses_mod = @import("responses.zig");
+const completions_mod = @import("completions.zig");
+const detokenize_mod = @import("detokenize.zig");
+const response_store_mod = @import("response_store.zig");
 const tokenize_mod = @import("tokenize.zig");
 const embeddings_mod = @import("embeddings.zig");
 const metrics_mod = @import("metrics.zig");
@@ -337,6 +340,107 @@ fn handleRequest(
             status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/completions")) {
+        // Legacy OpenAI text completions (raw prompt, no chat template).
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            try completions_mod.handleCompletions(allocator, io, state, connection, server_config, body, &status_code);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/detokenize") or
+        std.mem.startsWith(u8, request, "POST /detokenize"))
+    {
+        // Token-id → text decode (full-sequence decode; see detokenize.zig).
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try detokenize_mod.handleDetokenizeRequest(allocator, state.tokenizer_strategy, body);
+            defer allocator.free(result.body);
+            status_code = result.status;
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/messages/count_tokens")) {
+        // Anthropic-style input token counting. Must precede the
+        // "POST /v1/messages" prefix match below.
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try detokenize_mod.handleCountTokensRequest(allocator, state, body);
+            defer allocator.free(result.body);
+            status_code = result.status;
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "GET /v1/responses/")) {
+        // Retrieve a stored Responses API object (see response_store.zig).
+        if (response_store_mod.extractResponseId(request, "GET /v1/responses/")) |resp_id| {
+            const stored = try state.response_store.get(allocator, resp_id);
+            if (stored) |obj| {
+                defer allocator.free(obj);
+                status_code = 200;
+                try writeJsonResponseAlloc(connection, 200, obj);
+            } else {
+                status_code = 404;
+                try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+            }
+        } else {
+            status_code = 404;
+            try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+        }
+    } else if (std.mem.startsWith(u8, request, "DELETE /v1/responses/")) {
+        if (response_store_mod.extractResponseId(request, "DELETE /v1/responses/")) |resp_id| {
+            if (state.response_store.remove(resp_id)) {
+                var escaped_id = std.ArrayList(u8).empty;
+                defer escaped_id.deinit(allocator);
+                try utils_mod.jsonEscapeInto(&escaped_id, allocator, resp_id);
+                const body = try std.fmt.allocPrint(allocator,
+                    \\{{"id":"{s}","object":"response.deleted","deleted":true}}
+                , .{escaped_id.items});
+                defer allocator.free(body);
+                status_code = 200;
+                try writeJsonResponse(connection, io, 200, body);
+            } else {
+                status_code = 404;
+                try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+            }
+        } else {
+            status_code = 404;
+            try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+        }
+    } else if (std.mem.startsWith(u8, request, "GET /api/status")) {
+        const now_unix = std.Io.Timestamp.now(io, .real).toSeconds();
+        const uptime: i64 = if (state.start_time_unix > 0 and now_unix > state.start_time_unix)
+            now_unix - state.start_time_unix
+        else
+            0;
+        var escaped_model = std.ArrayList(u8).empty;
+        defer escaped_model.deinit(allocator);
+        try utils_mod.jsonEscapeInto(&escaped_model, allocator, std.fs.path.basename(server_config.model_path));
+        const status_json = try std.fmt.allocPrint(allocator,
+            \\{{"status":"ok","model":"{s}","uptime_seconds":{d},"active_requests":{d},"requests_total":{d}}}
+        , .{
+            escaped_model.items,
+            uptime,
+            state.active_requests.load(.acquire),
+            metrics_mod.global.totalRequests(),
+        });
+        defer allocator.free(status_json);
+        status_code = 200;
+        try writeJsonResponse(connection, io, 200, status_json);
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {

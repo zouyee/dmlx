@@ -9,7 +9,9 @@
 ///   model (ignored — single-model server), input (string or message-item
 ///   array; content string or input_text/input_image parts), instructions
 ///   (prepended system message), max_output_tokens, temperature, top_p,
-///   stream, store (accepted, ignored — stateless v1), metadata (ignored).
+///   stream, store (default true: retain the completed/failed response
+///   object in the bounded in-memory store for GET/DELETE /v1/responses/{id};
+///   store:false skips retention), metadata (ignored).
 ///
 /// Streaming emits the minimal SSE sequence the OpenAI SDK needs:
 ///   response.created → response.output_text.delta* → response.completed.
@@ -37,6 +39,9 @@ pub const TranslateOutcome = union(enum) {
         /// Chat-completions request body (JSON).
         body: []u8,
         stream: bool,
+        /// OpenAI default is store=true; store:false = don't retain the
+        /// response object in the in-memory store (response_store.zig).
+        store: bool,
     },
     /// Complete JSON error body to return with HTTP 400.
     err: []u8,
@@ -70,8 +75,9 @@ const rejected_fields = [_]RejectedField{
     .{ .name = "top_logprobs", .reason = "logprobs are not supported" },
 };
 
-/// Fields that are accepted but have no effect on a stateless v1 server.
-const ignored_fields = [_][]const u8{ "store", "metadata" };
+/// Fields that are accepted but have no effect on this server. `store` is
+/// NOT in this list — it gates retention in the in-memory response store.
+const ignored_fields = [_][]const u8{"metadata"};
 
 fn invalidRequest(allocator: std.mem.Allocator, message: []const u8) !TranslateOutcome {
     return .{ .err = try openai_mod.invalidRequestJson(allocator, "unsupported_parameter", message) };
@@ -112,6 +118,7 @@ pub fn translateRequest(
             std.mem.eql(u8, name, "max_output_tokens") or
             std.mem.eql(u8, name, "temperature") or
             std.mem.eql(u8, name, "top_p") or
+            std.mem.eql(u8, name, "store") or
             std.mem.eql(u8, name, "stream")) continue;
         var is_ignored = false;
         for (ignored_fields) |f| {
@@ -200,6 +207,15 @@ pub fn translateRequest(
         }
     }
 
+    var store = true;
+    if (obj.get("store")) |v| {
+        switch (v) {
+            .bool => |b| store = b,
+            .null => {},
+            else => return invalidRequest(allocator, "'store' must be a boolean"),
+        }
+    }
+
     // Build the messages array JSON.
     var messages = std.ArrayList(u8).empty;
     defer messages.deinit(allocator);
@@ -240,7 +256,7 @@ pub fn translateRequest(
     if (top_p) |p| try out.print(allocator, ",\"top_p\":{d}", .{p});
     if (stream) try out.appendSlice(allocator, ",\"stream\":true");
     try out.append(allocator, '}');
-    return .{ .ok = .{ .body = try out.toOwnedSlice(allocator), .stream = stream } };
+    return .{ .ok = .{ .body = try out.toOwnedSlice(allocator), .stream = stream, .store = store } };
 }
 
 /// Append one Responses input item to the chat `messages` JSON array.
@@ -437,7 +453,7 @@ pub fn buildResponseObject(
 // HTTP handler
 // ------------------------------------------------------------------
 
-fn randomHexId(allocator: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]u8 {
+pub fn randomHexId(allocator: std.mem.Allocator, io: std.Io, prefix: []const u8) ![]u8 {
     var bytes: [12]u8 = undefined;
     io.random(&bytes);
     const hex = "0123456789abcdef";
@@ -479,7 +495,7 @@ pub fn handleResponses(
     if (translated.stream) {
         const parsed = try std.json.parseFromSlice(openai_mod.ChatCompletionRequest, allocator, translated.body, .{});
         defer parsed.deinit();
-        try handleResponsesStream(allocator, io, state, connection, server_config, parsed.value, resp_id, msg_id, status_out);
+        try handleResponsesStream(allocator, io, state, connection, server_config, parsed.value, resp_id, msg_id, translated.store, status_out);
         return;
     }
 
@@ -498,6 +514,7 @@ pub fn handleResponses(
 
     const response_json = try buildResponseObject(allocator, chat_response, resp_id, msg_id);
     defer allocator.free(response_json);
+    if (translated.store) try state.response_store.put(resp_id, response_json);
     status_out.* = 200;
     try http_mod.writeJsonResponse(connection, io, 200, response_json);
 }
@@ -550,6 +567,7 @@ fn handleResponsesStream(
     req: openai_mod.ChatCompletionRequest,
     resp_id: []const u8,
     msg_id: []const u8,
+    store: bool,
     status_out: *u16,
 ) !void {
     const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
@@ -655,9 +673,17 @@ fn handleResponsesStream(
         var escaped_err = std.ArrayList(u8).empty;
         defer escaped_err.deinit(allocator);
         try jsonEscapeInto(&escaped_err, allocator, err_msg);
-        const failed_payload = try std.fmt.allocPrint(allocator,
-            \\{{"type":"response.failed","response":{{"id":"{s}","object":"response","created_at":{d},"status":"failed","model":"{s}","output":[],"error":{{"message":"{s}","type":"server_error"}},"incomplete_details":null}}}}
+        const failed_response = try std.fmt.allocPrint(allocator,
+            \\{{"id":"{s}","object":"response","created_at":{d},"status":"failed","model":"{s}","output":[],"error":{{"message":"{s}","type":"server_error"}},"incomplete_details":null}}
         , .{ resp_id, created, escaped_model.items, escaped_err.items });
+        defer allocator.free(failed_response);
+        // Failed responses are retained too (store=false opts out) — clients
+        // polling GET /v1/responses/{id} after a background-less stream can
+        // see the terminal state.
+        if (store) try state.response_store.put(resp_id, failed_response);
+        const failed_payload = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.failed","response":{s}}}
+        , .{failed_response});
         defer allocator.free(failed_payload);
         try sendResponsesEvent(&sse, allocator, "response.failed", failed_payload);
         return;
@@ -684,6 +710,7 @@ fn handleResponsesStream(
         req_state.token_count,
     );
     defer allocator.free(final_response);
+    if (store) try state.response_store.put(resp_id, final_response);
     const completed_payload = try std.fmt.allocPrint(allocator,
         \\{{"type":"response.completed","response":{s}}}
     , .{final_response});
@@ -787,6 +814,27 @@ test "translateRequest: input_image maps to image_url part" {
         "data:image/png;base64,aGVsbG8=",
         img.get("image_url").?.object.get("url").?.string,
     );
+}
+
+test "translateRequest parses the store flag (default true)" {
+    const allocator = std.testing.allocator;
+    {
+        const outcome = try translateRequest(allocator, "{\"input\":\"hi\"}", "m");
+        defer outcome.deinit(allocator);
+        try std.testing.expect(switch (outcome) {
+            .ok => |o| o.store,
+            .err => return error.TestUnexpectedResult,
+        });
+    }
+    {
+        const outcome = try translateRequest(allocator, "{\"input\":\"hi\",\"store\":false}", "m");
+        defer outcome.deinit(allocator);
+        try std.testing.expect(!(switch (outcome) {
+            .ok => |o| o.store,
+            .err => return error.TestUnexpectedResult,
+        }));
+    }
+    try expectTranslateErr(allocator, "{\"input\":\"hi\",\"store\":\"no\"}", "store");
 }
 
 test "translateRequest rejects unsupported fields loudly" {
