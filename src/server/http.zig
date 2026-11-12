@@ -276,8 +276,7 @@ fn handleRequest(
         };
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
-            status_code = 200;
-            try responses_mod.handleResponses(allocator, io, state, connection, server_config, body);
+            try responses_mod.handleResponses(allocator, io, state, connection, server_config, body, &status_code);
         } else {
             status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
@@ -319,13 +318,17 @@ fn handleRequest(
                 .{ .ctx = state, .run = &embeddings_mod.engineEmbedRunner }
             else
                 null;
-            const result = try embeddings_mod.handleEmbeddingsRequest(
-                allocator,
-                state.tokenizer_strategy,
-                runner,
-                std.fs.path.basename(server_config.model_path),
-                body,
-            );
+            const result = blk: {
+                _ = state.active_requests.fetchAdd(1, .monotonic);
+                defer _ = state.active_requests.fetchSub(1, .monotonic);
+                break :blk try embeddings_mod.handleEmbeddingsRequest(
+                    allocator,
+                    state.tokenizer_strategy,
+                    runner,
+                    std.fs.path.basename(server_config.model_path),
+                    body,
+                );
+            };
             defer allocator.free(result.body);
             status_code = result.status;
             // 5120 floats ≈ 60KB JSON per item — heap-allocated response.
@@ -338,8 +341,7 @@ fn handleRequest(
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
-            status_code = 200;
-            try handleAnthropicMessages(allocator, io, state, connection, server_config, body);
+            try handleAnthropicMessages(allocator, io, state, connection, server_config, body, &status_code);
         } else {
             status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");

@@ -11,6 +11,7 @@ const state_mod = @import("state.zig");
 const jsonEscapeInto = utils_mod.jsonEscapeInto;
 const http_mod = @import("http.zig");
 const writeJsonResponse = http_mod.writeJsonResponse;
+const metrics_mod = @import("metrics.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;
@@ -82,8 +83,10 @@ pub fn handleAnthropicMessages(
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
     body: []const u8,
+    status_out: *u16,
 ) !void {
     const parsed = std.json.parseFromSlice(AnthropicRequest, allocator, body, .{}) catch {
+        status_out.* = 400;
         try writeJsonResponse(connection, io, 400, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid_json\"}}");
         return;
     };
@@ -107,6 +110,7 @@ pub fn handleAnthropicMessages(
                 \\{{"type":"error","error":{{"type":"invalid_request_error","message":"{s}"}}}}
             , .{msg});
             defer allocator.free(err_body);
+            status_out.* = 400;
             try writeJsonResponse(connection, io, 400, err_body);
             return;
         }
@@ -201,6 +205,8 @@ pub fn handleAnthropicMessages(
     );
     defer allocator.free(response);
 
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
+    status_out.* = 200;
     try writeJsonResponse(connection, io, 200, response);
 }
 

@@ -20,6 +20,7 @@ const state_mod = @import("state.zig");
 const utils_mod = @import("utils.zig");
 const http_mod = @import("http.zig");
 const sse_mod = @import("sse.zig");
+const metrics_mod = @import("metrics.zig");
 const openai_mod = @import("openai.zig");
 
 const ServerConfig = config_mod.ServerConfig;
@@ -456,12 +457,14 @@ pub fn handleResponses(
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
     body: []const u8,
+    status_out: *u16,
 ) !void {
     const default_model = std.fs.path.basename(server_config.model_path);
     const outcome = try translateRequest(allocator, body, default_model);
     defer outcome.deinit(allocator);
     const translated = switch (outcome) {
         .err => |err_body| {
+            status_out.* = 400;
             try http_mod.writeJsonResponse(connection, io, 400, err_body);
             return;
         },
@@ -476,7 +479,7 @@ pub fn handleResponses(
     if (translated.stream) {
         const parsed = try std.json.parseFromSlice(openai_mod.ChatCompletionRequest, allocator, translated.body, .{});
         defer parsed.deinit();
-        try handleResponsesStream(allocator, io, state, connection, server_config, parsed.value, resp_id, msg_id);
+        try handleResponsesStream(allocator, io, state, connection, server_config, parsed.value, resp_id, msg_id, status_out);
         return;
     }
 
@@ -488,12 +491,14 @@ pub fn handleResponses(
     // status (server_error → 500, everything else → 400).
     if (std.mem.indexOf(u8, chat_response, "\"error\"") != null) {
         const status = errorBodyStatus(allocator, chat_response);
+        status_out.* = status;
         try http_mod.writeJsonResponse(connection, io, status, chat_response);
         return;
     }
 
     const response_json = try buildResponseObject(allocator, chat_response, resp_id, msg_id);
     defer allocator.free(response_json);
+    status_out.* = 200;
     try http_mod.writeJsonResponse(connection, io, 200, response_json);
 }
 
@@ -545,6 +550,7 @@ fn handleResponsesStream(
     req: openai_mod.ChatCompletionRequest,
     resp_id: []const u8,
     msg_id: []const u8,
+    status_out: *u16,
 ) !void {
     const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
 
@@ -560,6 +566,7 @@ fn handleResponsesStream(
         };
         const err_body = try openai_mod.invalidRequestJson(allocator, @errorName(err), msg);
         defer allocator.free(err_body);
+        status_out.* = 400;
         try http_mod.writeJsonResponse(connection, io, 400, err_body);
         return;
     };
@@ -590,6 +597,7 @@ fn handleResponsesStream(
     prepared.vision = null;
 
     try sse_mod.writeSSEHeaders(connection, io);
+    status_out.* = 200; // SSE headers committed as 200; failures are in-stream events
     var sse = sse_mod.SSEWriter{ .connection = connection, .io = io };
 
     var escaped_model = std.ArrayList(u8).empty;
@@ -639,6 +647,8 @@ fn handleResponsesStream(
             }
         } else break;
     }
+
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 
     if (req_state.completion.hasError(io)) {
         const err_msg = req_state.completion.getError(io) orelse "Generation failed";

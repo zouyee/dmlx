@@ -472,6 +472,9 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     const wait_ms = @as(f64, @floatFromInt(t_wait_end - t_wait_start)) * 125.0 / 3_000_000.0;
     std.log.info("[OpenAI] Token loop done, all_text.len={d}, wait={d:.1}ms calls={d}", .{ all_text.items.len, wait_ms, wait_call_count });
 
+    // Count consumed tokens on both success and generation-failure paths.
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
+
     // Check if the engine signaled an error.
     if (req_state.completion.hasError(io)) {
         const err_msg = req_state.completion.getError(io) orelse "Generation failed";
@@ -482,7 +485,6 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 
     const final_text = all_text.items;
     const new_tokens_len = req_state.token_count;
-    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(new_tokens_len));
 
     // 8. Tool calling loop (single round)
     if (req.tools) |tools| {

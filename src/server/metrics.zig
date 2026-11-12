@@ -132,6 +132,7 @@ pub const Metrics = struct {
         }
 
         try out.appendSlice(allocator, "# HELP dmlx_request_duration_seconds Total time spent handling HTTP requests, by endpoint.\n");
+        try out.appendSlice(allocator, "# TYPE dmlx_request_duration_seconds summary\n");
         for (&self.routes, 0..) |*route, i| {
             const count = route.duration_count.load(.monotonic);
             if (count > 0) {
@@ -214,6 +215,7 @@ test "render produces valid Prometheus text exposition" {
     try std.testing.expect(body[body.len - 1] == '\n');
 
     try std.testing.expect(std.mem.indexOf(u8, body, "# TYPE dmlx_requests_total counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "# TYPE dmlx_request_duration_seconds summary\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "# TYPE dmlx_generation_tokens_total counter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "# TYPE dmlx_prompt_tokens_total counter\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "# TYPE dmlx_active_requests gauge\n") != null);
