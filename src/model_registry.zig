@@ -707,6 +707,14 @@ pub const Qwen38VTableAdapter = struct {
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const vit = try self.ensureVit();
+        // mx.compile's tracer/eval uses the CURRENT thread's default stream
+        // (transforms.cpp), unlike eager ops which take ctx explicitly. This
+        // op runs on an HTTP worker fiber with no default stream set, so
+        // point it at the model's GPU stream before the tower forward —
+        // otherwise the compiled ViT block fails with
+        // "no Stream(gpu, N) in current thread". Per-thread, harmless to the
+        // eager path (all its ops take ctx explicitly).
+        _ = c.c.mlx_set_default_stream(self.model.ctx.stream.inner);
         var pp = switch (image) {
             .path => |p| try qwen38_preprocess.preprocessImageFile(self.allocator, self.model.ctx, p),
             .bytes => |b| try qwen38_preprocess.preprocessImageBytes(self.allocator, self.model.ctx, b),
