@@ -1867,3 +1867,41 @@ prefill qmm 收益,但需要数值精度评估先行。
 bilinear vs 参考 bicubic resize(fixture 无需 resize,64×96 上采样单测覆盖
 resize 路径;若未来 parity 失败先换 bicubic 16-tap)、视觉塔 bf16 +~1.3GB 常驻、
 图像逐张顺序编码。
+
+### 视觉性能小杠杆收尾(2026-11-12)
+
+测量先行结论(scripts 见下,M4 Pro,~30 组实测):
+- TTFT 残差不在 LM 视觉路径:warm 后 vision-prefill ≈ 同长文本 prefill
+  (mrope/merge 稳态开销 ~0);残差 = 塔 (~10-45% 慢于参考) + 已知文本
+  prefill 速率差(~5%,与视觉无关)。
+- **杠杆 2(drafter rope 约定)证伪**:mlx-vlm 的 MTP drafter 本来就不
+  应用 rope_delta(qwen3_5_mtp.py 用纯 1D arange positions)。A/B
+  (`DMLX_MTP_VISION_DRAFTER_DELTA=0/1`,scripts/ab_vision_drafter_delta.sh):
+  接受率两臂完全相同(45.1%, 79/175, p_i 逐位接近)。视觉接受率是内容
+  绑定的,策略侧无空间;delta 传播保留(更正确且无副作用)。
+- **杠杆 1 落地(commit 75ed0f4)**:ViT block 经 mx.compile(shapeful,
+  每 patch 数 N 一次 trace;shapeless 因 slice workaround 无法推断输出
+  shape 而失败)编译,eager/编译共享同一 `blockCore` 实现。塔
+  1016→797ms @3072 patches(-18~25%,≈mlx-vlm 参考 813ms);oracle
+  tower cos 不变(0.99973569);eager/compiled 端到端输出 md5 逐字一致。
+  kill switch `DMLX_VIT_NO_COMPILE=1`;compile/apply 失败一次性回退 eager。
+- **附带真 bug(commit 82a1aee)**:mx.compile 的 tracer/eval 用当前线程
+  默认 stream(transforms.cpp),塔前向跑在 HTTP worker fiber 上直接报
+  "no Stream(gpu,N) in current thread"——且首次验证时静默回退 eager
+  造成假绿。修复:fiber 上 `mlx_set_default_stream` 指向模型 GPU stream。
+  教训:验证编译路径必须确认没有 fallback 日志,字节对拍才可能为空验证。
+
+**最终对比(图像 prompt, temp 0, min-of-2; mlx-vlm 模板少 41 tok ≈0.3s):**
+
+| 臂 | 小图 TTFT/decode | 大图 TTFT/decode | 大图 wall@128 |
+|---|---|---|---|
+| mlx-vlm / omlx(无投机) | 1.93-2.12s / 14.7-14.9 | 6.32-6.43s / 14.8-15.3 | 10.5-10.7s |
+| dmlx 无投机 | 2.12s / 14.6 | 6.83s / 14.5 | 10.9s |
+| mlx-vlm + MTP | 1.84s / 25.4 | 6.18s / 25.6 | 11.13s |
+| **dmlx + MTP** | 2.15s / **28.2** | 6.84s / **26.2** | 11.69s |
+
+decode 两臂全胜;大图端到端仍略输 mlx-vlm-mtp 5%(11.69 vs 11.13),
+差值 ≈ 模板 41 tok(~0.33s)+ 文本 prefill 速率差(~5%),视觉段本身
+已持平。vmlx 无需单列——它是 mlx-vlm 的封装壳。
+工具:src/bench_vision_ttft.zig(`run-bench-vision-ttft` 分段计时)、
+scripts/ab_vision_drafter_delta.sh、/tmp/bench_vision.py(三引擎 A/B/C)。
