@@ -11,6 +11,7 @@ const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
 const vision_prompt = @import("../vision_prompt.zig");
+const metrics_mod = @import("metrics.zig");
 const jsonEscapeInto = utils_mod.jsonEscapeInto;
 
 const ServerConfig = config_mod.ServerConfig;
@@ -481,6 +482,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 
     const final_text = all_text.items;
     const new_tokens_len = req_state.token_count;
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(new_tokens_len));
 
     // 8. Tool calling loop (single round)
     if (req.tools) |tools| {

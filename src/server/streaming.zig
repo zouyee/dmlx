@@ -9,6 +9,7 @@ const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
 const openai_mod = @import("openai.zig");
+const metrics_mod = @import("metrics.zig");
 const sse_mod = @import("sse.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const SSEWriter = sse_mod.SSEWriter;
@@ -130,6 +131,8 @@ pub fn handleStreamingCompletion(
             break;
         }
     }
+
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 }
 
 /// SSE keep-alive fiber: sends a comment every 5s until the first token

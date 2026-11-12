@@ -30,6 +30,7 @@ const speculative_mod = @import("../speculative.zig");
 const guided_mod = @import("../guided.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const content_class = @import("content_class.zig");
+const metrics_mod = @import("../server/metrics.zig");
 
 const Array = array_mod.Array;
 const ScopedArrayArena = array_arena_mod.ScopedArrayArena;
@@ -2770,6 +2771,7 @@ pub const EngineLoop = struct {
         hidden.deinit();
 
         if (drafts_proposed > 0) {
+            metrics_mod.global.addMtpDrafts(@intCast(drafts_proposed), @intCast(drafts_accepted));
             const ms = struct {
                 fn f(ns: u64) f64 {
                     return @as(f64, @floatFromInt(ns)) / 1e6;

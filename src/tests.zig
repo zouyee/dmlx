@@ -33,6 +33,7 @@ pub const native_engine_transaction_tests = @import("native_engine.zig");
 pub const server_tests = @import("server.zig");
 pub const server_tokenize_tests = @import("server/tokenize.zig");
 pub const server_embeddings_tests = @import("server/embeddings.zig");
+pub const server_metrics_tests = @import("server/metrics.zig");
 pub const embed_queue_tests = @import("engine/embed_queue.zig");
 pub const batch_builder_tests = @import("tests/batch_builder_tests.zig");
 pub const speculative_tests = @import("speculative.zig");
@@ -120,6 +121,7 @@ test {
     _ = server_tests;
     _ = server_tokenize_tests;
     _ = server_embeddings_tests;
+    _ = server_metrics_tests;
     _ = embed_queue_tests;
     _ = batch_builder_tests;
     _ = speculative_tests;

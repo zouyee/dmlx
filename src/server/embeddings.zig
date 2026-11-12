@@ -17,6 +17,7 @@
 const std = @import("std");
 const root = @import("../root.zig");
 const utils_mod = @import("utils.zig");
+const metrics_mod = @import("metrics.zig");
 
 const TokenizerStrategy = root.tokenizer.TokenizerStrategy;
 
@@ -197,6 +198,7 @@ pub fn handleEmbeddingsRequest(
     );
     defer allocator.free(tail);
     try out.appendSlice(allocator, tail);
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens), 0);
     return .{ .status = 200, .body = try out.toOwnedSlice(allocator) };
 }
 

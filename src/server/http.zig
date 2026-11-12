@@ -14,6 +14,7 @@ const anthropic_mod = @import("anthropic.zig");
 const responses_mod = @import("responses.zig");
 const tokenize_mod = @import("tokenize.zig");
 const embeddings_mod = @import("embeddings.zig");
+const metrics_mod = @import("metrics.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
@@ -110,6 +111,19 @@ fn handleRequest(
     const request = dyn_buf.items();
     std.log.info("[HTTP] Request received: {d} bytes (read={d:.1}ms)", .{ dyn_buf.len(), read_ms });
 
+    // Prometheus metrics: record route/status/duration when the handler
+    // returns. `status_code` defaults to 500 — a handler that throws before
+    // writing a response is counted as a server error. Sub-handlers that
+    // write responses internally (streaming, anthropic, responses) are
+    // recorded as 200 on successful return.
+    const route_idx = metrics_mod.Metrics.routeIndex(request);
+    var status_code: u16 = 500;
+    defer {
+        const t_end = std.c.mach_absolute_time();
+        const dur_ns = @as(u64, @intCast(t_end - t_http_enter)) * 125 / 3;
+        metrics_mod.global.recordRequest(route_idx, status_code, dur_ns);
+    }
+
     const libc = @cImport(@cInclude("unistd.h"));
     const msg = "[HTTP] Request received\n";
     _ = libc.write(2, msg, msg.len);
@@ -121,6 +135,7 @@ fn handleRequest(
             null,
             server_config.memory_config,
         ) catch {
+            status_code = 503;
             try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
             return;
         };
@@ -167,6 +182,7 @@ fn handleRequest(
 
             // Parse request to check for streaming
             const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{}) catch {
+                status_code = 400;
                 try writeJsonResponse(connection, io, 400, "{\"error\":\"invalid_json\"}");
                 return;
             };
@@ -177,17 +193,20 @@ fn handleRequest(
             // get a clean 400 instead of a mid-stream error event.
             if (try openai_mod.validateChatRequest(allocator, parsed.value)) |err_body| {
                 defer allocator.free(err_body);
+                status_code = 400;
                 try writeJsonResponse(connection, io, 400, err_body);
                 return;
             }
 
             if (parsed.value.stream orelse false) {
+                status_code = 200;
                 try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
             } else {
                 const t0 = std.c.mach_absolute_time();
                 const response = try generateChatCompletion(allocator, io, state, body, server_config);
                 defer allocator.free(response);
                 const t1 = std.c.mach_absolute_time();
+                status_code = 200;
                 try writeJsonResponse(connection, io, 200, response);
                 const t2 = std.c.mach_absolute_time();
                 const gen_ms = @as(f64, @floatFromInt(t1 - t0)) * 125.0 / 3_000_000.0;
@@ -195,6 +214,7 @@ fn handleRequest(
                 std.log.info("[TIMING] generateChatCompletion={d:.1}ms writeResponse={d:.1}ms", .{ gen_ms, write_ms });
             }
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else if (std.mem.startsWith(u8, request, "GET /v1/models")) {
@@ -209,6 +229,7 @@ fn handleRequest(
             state.start_time_unix,
         );
         defer allocator.free(models_json);
+        status_code = 200;
         try writeJsonResponse(connection, io, 200, models_json);
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
         const active = state.active_requests.load(.acquire);
@@ -221,9 +242,25 @@ fn handleRequest(
             .{ escaped_model.items, active },
         );
         defer allocator.free(health_json);
+        status_code = 200;
         try writeJsonResponse(connection, io, 200, health_json);
+    } else if (std.mem.startsWith(u8, request, "GET /metrics") or
+        std.mem.startsWith(u8, request, "GET /v1/metrics"))
+    {
+        // Prometheus text exposition format (v0.0.4). Counters live in the
+        // global metrics registry; gauges are computed at render time.
+        const body = try metrics_mod.global.render(
+            allocator,
+            state.active_requests.load(.acquire),
+            state.start_time_unix,
+            std.Io.Timestamp.now(io, .real).toSeconds(),
+        );
+        defer allocator.free(body);
+        status_code = 200;
+        try writeResponseAlloc(connection, 200, "text/plain; version=0.0.4", body);
     } else if (std.mem.startsWith(u8, request, "POST /shutdown")) {
         engine.requestShutdown();
+        status_code = 200;
         try writeJsonResponse(connection, io, 200, "{\"status\":\"shutting_down\"}");
     } else if (std.mem.startsWith(u8, request, "POST /v1/responses")) {
         // OpenAI Responses API — minimal compatibility layer (translation
@@ -233,13 +270,16 @@ fn handleRequest(
             null,
             server_config.memory_config,
         ) catch {
+            status_code = 503;
             try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
             return;
         };
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
+            status_code = 200;
             try responses_mod.handleResponses(allocator, io, state, connection, server_config, body);
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else if (std.mem.startsWith(u8, request, "POST /v1/tokenize") or
@@ -250,8 +290,10 @@ fn handleRequest(
             const body = request[header_end + 4 ..];
             const result = try tokenize_mod.handleTokenizeRequest(allocator, state.tokenizer_strategy, body);
             defer allocator.free(result.body);
+            status_code = result.status;
             try writeJsonResponseAlloc(connection, result.status, result.body);
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else if (std.mem.startsWith(u8, request, "POST /v1/embeddings")) {
@@ -265,6 +307,7 @@ fn handleRequest(
             null,
             server_config.memory_config,
         ) catch {
+            status_code = 503;
             try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
             return;
         };
@@ -284,20 +327,25 @@ fn handleRequest(
                 body,
             );
             defer allocator.free(result.body);
+            status_code = result.status;
             // 5120 floats ≈ 60KB JSON per item — heap-allocated response.
             try writeJsonResponseAlloc(connection, result.status, result.body);
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
+            status_code = 200;
             try handleAnthropicMessages(allocator, io, state, connection, server_config, body);
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else {
+        status_code = 404;
         try writeJsonResponse(connection, io, 404, "{\"error\":\"not_found\"}");
     }
 }
@@ -370,6 +418,11 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
 /// Heap-allocated variant of writeJsonResponse for bodies that can exceed
 /// the 8KB stack buffer (e.g. /v1/tokenize output for large inputs).
 pub fn writeJsonResponseAlloc(connection: std.Io.net.Stream, status: u16, body: []const u8) !void {
+    try writeResponseAlloc(connection, status, "application/json", body);
+}
+
+/// Heap-allocated response writer with an explicit Content-Type.
+pub fn writeResponseAlloc(connection: std.Io.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
     const status_text = switch (status) {
         200 => "OK",
         400 => "Bad Request",
@@ -380,7 +433,7 @@ pub fn writeJsonResponseAlloc(connection: std.Io.net.Stream, status: u16, body: 
     };
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
-    const resp = try std.fmt.allocPrint(arena.allocator(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, body.len, body });
+    const resp = try std.fmt.allocPrint(arena.allocator(), "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, content_type, body.len, body });
     try writeAllFd(connection.socket.handle, resp);
     _ = unistd_c.fsync(connection.socket.handle);
 }
