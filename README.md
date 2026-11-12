@@ -273,7 +273,10 @@ Approximate memory budget for the tested 48GB machine:
 Currently exposed routes:
 
 - `POST /v1/chat/completions`
+- `POST /v1/responses` (minimal Responses API compatibility layer)
 - `POST /v1/messages`
+- `POST /v1/tokenize` (also `/tokenize`)
+- `GET /v1/models`
 - `GET /health`
 - `POST /shutdown`
 
