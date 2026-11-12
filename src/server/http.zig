@@ -11,6 +11,7 @@ const state_mod = @import("state.zig");
 const openai_mod = @import("openai.zig");
 const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
+const responses_mod = @import("responses.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
@@ -222,6 +223,23 @@ fn handleRequest(
     } else if (std.mem.startsWith(u8, request, "POST /shutdown")) {
         engine.requestShutdown();
         try writeJsonResponse(connection, io, 200, "{\"status\":\"shutting_down\"}");
+    } else if (std.mem.startsWith(u8, request, "POST /v1/responses")) {
+        // OpenAI Responses API — minimal compatibility layer (translation
+        // onto the chat-completions machinery; see responses.zig).
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            try responses_mod.handleResponses(allocator, io, state, connection, server_config, body);
+        } else {
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {

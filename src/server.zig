@@ -20,6 +20,7 @@ pub const sse = @import("server/sse.zig");
 pub const openai = @import("server/openai.zig");
 pub const streaming = @import("server/streaming.zig");
 pub const anthropic = @import("server/anthropic.zig");
+pub const responses = @import("server/responses.zig");
 pub const utils = @import("server/utils.zig");
 pub const tooling = @import("server/tooling.zig");
 
@@ -350,4 +351,5 @@ test {
     _ = http;
     _ = openai;
     _ = anthropic;
+    _ = responses;
 }
