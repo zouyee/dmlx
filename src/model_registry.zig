@@ -845,7 +845,13 @@ pub const Qwen38VTableAdapter = struct {
         // cache.len() + rope_delta, matching the backbone's full-attention
         // layers. Setting it earlier would rope the prompt rows at negative
         // offsets (rope_delta < 0 for wide images).
-        m.attn.rope_extra = self.model.rope_delta;
+        // Experiment: DMLX_MTP_VISION_DRAFTER_DELTA=0 keeps the drafter at
+        // raw offsets everywhere (the mlx-vlm convention) for A/B.
+        const drafter_delta = if (std.c.getenv("DMLX_MTP_VISION_DRAFTER_DELTA")) |s|
+            std.mem.span(s)[0] != '0'
+        else
+            true;
+        m.attn.rope_extra = if (drafter_delta) self.model.rope_delta else 0;
         return out;
     }
 
