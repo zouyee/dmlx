@@ -513,6 +513,39 @@ pub fn build(b: *std.Build) void {
     );
     run_qwen38_vision_oracle_step.dependOn(&run_qwen38_vision_oracle.step);
 
+    // --- Scratch: vision TTFT stage breakdown (preprocess/tower/prefill) ---
+    const bench_vision_ttft = b.addExecutable(.{
+        .name = "bench-vision-ttft",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_vision_ttft.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_vision_ttft.root_module.addImport("mlx", mlx_z_module);
+    bench_vision_ttft.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    bench_vision_ttft.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/stb_image_impl.c"),
+        .flags = &.{"-std=c11"},
+        .language = .c,
+    });
+    bench_vision_ttft.root_module.linkFramework("Metal", .{});
+    bench_vision_ttft.root_module.linkFramework("Foundation", .{});
+    const run_bench_vision_ttft = b.addRunArtifact(bench_vision_ttft);
+    if (b.args) |args| {
+        run_bench_vision_ttft.addArgs(args);
+    }
+    const run_bench_vision_ttft_step = b.step(
+        "run-bench-vision-ttft",
+        "Vision TTFT stage breakdown: preprocess / tower / vision prefill vs text prefill",
+    );
+    run_bench_vision_ttft_step.dependOn(&run_bench_vision_ttft.step);
+
     // --- Qwen3.8 decode profiler (TEMPORARY, uncommitted) ---
     // Section-level wall-clock breakdown of the serving decode path.
     const qwen38_profile = b.addExecutable(.{
