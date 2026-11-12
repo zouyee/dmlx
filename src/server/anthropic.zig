@@ -20,12 +20,27 @@ const AnthropicRequest = struct {
     messages: []AnthropicMessage,
     max_tokens: u32 = 1024,
     temperature: ?f32 = null,
+    /// Per-request nucleus sampling override (must be in (0, 1]).
+    top_p: ?f32 = null,
+    /// Per-request top-k override (must be >= 1).
+    top_k: ?u32 = null,
     stream: ?bool = false,
     system: ?[]const u8 = null,
+    /// Anthropic tool_choice: {"type":"auto"|"any"|"none"|"tool"}. Mapped to
+    /// the OpenAI policy: auto→auto, none→none, any→required, tool→named.
+    /// Since this endpoint does not implement tool execution at all, "auto"
+    /// and "none" are accepted (both behave as none); "any"/"tool" would
+    /// require forced-call machinery we don't have and are rejected.
+    tool_choice: ?AnthropicToolChoice = null,
 
     pub const AnthropicMessage = struct {
         role: []const u8,
         content: []const u8,
+    };
+
+    pub const AnthropicToolChoice = struct {
+        type: []const u8,
+        name: ?[]const u8 = null,
     };
 };
 
@@ -66,6 +81,30 @@ pub fn handleAnthropicMessages(
     defer parsed.deinit();
     const req = parsed.value;
 
+    // Validate sampling overrides and tool_choice support before doing work.
+    {
+        var reject: ?[]const u8 = null;
+        if (req.top_p) |p| {
+            if (!(p > 0.0 and p <= 1.0)) reject = "top_p must be in the range (0, 1]";
+        }
+        if (req.top_k) |k| {
+            if (k == 0) reject = "top_k must be >= 1";
+        }
+        if (req.tool_choice) |tc| {
+            if (!std.mem.eql(u8, tc.type, "auto") and !std.mem.eql(u8, tc.type, "none")) {
+                reject = "tool_choice 'any'/'tool' (forced calls) are not supported by this server (use 'auto' or 'none')";
+            }
+        }
+        if (reject) |msg| {
+            const err_body = try std.fmt.allocPrint(allocator,
+                \\{{"type":"error","error":{{"type":"invalid_request_error","message":"{s}"}}}}
+            , .{msg});
+            defer allocator.free(err_body);
+            try writeJsonResponse(connection, io, 400, err_body);
+            return;
+        }
+    }
+
     // Map Anthropic messages to internal format
     var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
     defer messages.deinit(allocator);
@@ -97,8 +136,8 @@ pub fn handleAnthropicMessages(
         .prompt_tokens = prompt_tokens,
         .max_tokens = max_tokens,
         .temperature = temperature,
-        .top_k = server_config.top_k,
-        .top_p = server_config.top_p,
+        .top_k = if (req.top_k) |k| @as(usize, k) else server_config.top_k,
+        .top_p = req.top_p orelse server_config.top_p,
         .seed = seed,
         .stop_tokens = state.stop_tokens,
         .streaming = false,

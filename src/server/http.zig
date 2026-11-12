@@ -169,6 +169,15 @@ fn handleRequest(
             };
             defer parsed.deinit();
 
+            // Reject invalid sampling overrides / unsupported tool_choice
+            // forms up front so both the streaming and non-streaming paths
+            // get a clean 400 instead of a mid-stream error event.
+            if (try openai_mod.validateChatRequest(allocator, parsed.value)) |err_body| {
+                defer allocator.free(err_body);
+                try writeJsonResponse(connection, io, 400, err_body);
+                return;
+            }
+
             if (parsed.value.stream orelse false) {
                 try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
             } else {
@@ -185,6 +194,20 @@ fn handleRequest(
         } else {
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
+    } else if (std.mem.startsWith(u8, request, "GET /v1/models")) {
+        // OpenAI-compatible model listing. Single-model server: the id is
+        // the basename of the configured model directory (what clients
+        // should echo back in the `model` field), `created` is the server
+        // start time. `state.model_name` holds the config.json architecture
+        // name, which is not a useful client-facing id.
+        const model_id = std.fs.path.basename(server_config.model_path);
+        const models_json = try std.fmt.allocPrint(
+            allocator,
+            "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"}}]}}",
+            .{ model_id, state.start_time_unix },
+        );
+        defer allocator.free(models_json);
+        try writeJsonResponse(connection, io, 200, models_json);
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
         const active = state.active_requests.load(.acquire);
         const health_json = try std.fmt.allocPrint(

@@ -56,6 +56,8 @@ pub const ServerState = struct {
     is_native: bool = false,
     /// Model EOS stop tokens (e.g. Qwen3.5 multi-EOS list). Owned.
     stop_tokens: []const u32 = &.{},
+    /// Server start time (unix seconds), reported as `created` by /v1/models.
+    start_time_unix: i64 = 0,
 
     // Server V2: engine loop and request queue
     request_queue: engine.RequestQueue,
@@ -128,6 +130,7 @@ fn dummyDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 }
 
 pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !ServerState {
+    const start_time_unix = std.Io.Timestamp.now(io, .real).toSeconds();
     // 1. Read config.json
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "config.json" });
     defer allocator.free(config_path);
@@ -221,6 +224,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .tokenizer_strategy = undefined,
             .tokenizer_backend = tokenizer_backend,
             .model_name = model_name,
+            .start_time_unix = start_time_unix,
             .chat_template = chat_template,
             .caches = &[_]kvcache.KVCacheStrategy{},
             .model_pool = null,
@@ -443,6 +447,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .tokenizer_strategy = undefined,
         .tokenizer_backend = tokenizer_backend,
         .model_name = model_name,
+        .start_time_unix = start_time_unix,
         .chat_template = chat_template,
         .caches = caches,
         .model_pool = model_pool,

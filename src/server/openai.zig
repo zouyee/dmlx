@@ -21,6 +21,10 @@ pub const ChatCompletionRequest = struct {
     messages: []Message,
     stream: ?bool = false,
     temperature: ?f32 = null,
+    /// Per-request nucleus sampling override (must be in (0, 1]).
+    top_p: ?f32 = null,
+    /// Per-request top-k override (must be >= 1).
+    top_k: ?u32 = null,
     max_tokens: ?u32 = null,
     /// Optional seed for deterministic sampling.
     seed: ?u64 = null,
@@ -34,6 +38,10 @@ pub const ChatCompletionRequest = struct {
     /// Optional tool definitions for function calling.
     /// When provided, the model output is scanned for tool call patterns.
     tools: ?[]const ToolDefinition = null,
+    /// Optional tool_choice: "auto" (default), "none", "required", or
+    /// {"type":"function","function":{"name":...}}. v1 supports only "auto"
+    /// and "none" — see resolveToolChoice.
+    tool_choice: ?std.json.Value = null,
 
     pub const Message = struct {
         role: []const u8,
@@ -61,6 +69,72 @@ pub const ChatCompletionRequest = struct {
 
 /// Decoded image payload cap (20 MB) — plan risk register.
 pub const max_decoded_image_bytes: usize = 20 * 1024 * 1024;
+
+/// Validate per-request sampling overrides. top_p must be in (0, 1],
+/// top_k must be >= 1 (0 would be meaningless / trip the sampler).
+pub fn validateSampling(req: ChatCompletionRequest) !void {
+    if (req.top_p) |p| {
+        if (!(p > 0.0 and p <= 1.0)) return error.InvalidTopP;
+    }
+    if (req.top_k) |k| {
+        if (k == 0) return error.InvalidTopK;
+    }
+}
+
+/// Apply the request's tool_choice under the v1 support policy:
+///   - "auto" (default): current behavior — tool definitions are injected
+///     into the prompt and the output is scanned for tool-call patterns.
+///   - "none": strip the tools entirely, behaving as if none were given.
+///   - "required" / named-function ({"type":"function","function":...}):
+///     forcing a specific call needs prompt- or sampler-level machinery the
+///     codebase does not have (tool_calling only detects calls in free-form
+///     output), so these return error.UnsupportedToolChoice rather than
+///     silently behaving like "auto".
+pub fn resolveToolChoice(req: *ChatCompletionRequest) !void {
+    const tc = req.tool_choice orelse return;
+    switch (tc) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "auto")) return;
+            if (std.mem.eql(u8, s, "none")) {
+                req.tools = null;
+                return;
+            }
+            if (std.mem.eql(u8, s, "required")) return error.UnsupportedToolChoice;
+            return error.InvalidToolChoice;
+        },
+        .object => return error.UnsupportedToolChoice,
+        else => return error.InvalidToolChoice,
+    }
+}
+
+/// Build an OpenAI-style error body for a rejected chat request.
+pub fn invalidRequestJson(allocator: std.mem.Allocator, code: []const u8, message: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"error":{{"message":"{s}","type":"invalid_request_error","code":"{s}"}}}}
+    , .{ message, code });
+}
+
+/// Validate sampling params and tool_choice support; on failure returns
+/// the error body to send back (caller frees). Shared by the HTTP dispatch
+/// (400) and the non-streaming handler (defensive re-check).
+pub fn validateChatRequest(allocator: std.mem.Allocator, req: ChatCompletionRequest) !?[]u8 {
+    validateSampling(req) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.InvalidTopP => "top_p must be in the range (0, 1]",
+            error.InvalidTopK => "top_k must be >= 1",
+        };
+        return try invalidRequestJson(allocator, @errorName(err), msg);
+    };
+    var mut = req;
+    resolveToolChoice(&mut) catch |err| {
+        const msg: []const u8 = switch (err) {
+            error.UnsupportedToolChoice => "tool_choice 'required' and named-function selection are not supported by this server (use 'auto' or 'none')",
+            error.InvalidToolChoice => "tool_choice must be 'auto', 'none', 'required', or an object selecting a function",
+        };
+        return try invalidRequestJson(allocator, @errorName(err), msg);
+    };
+    return null;
+}
 
 /// Extract the text of one message and collect any image inputs. Content
 /// may be a plain string or an array of text/image_url parts.
@@ -251,12 +325,19 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     // 1. Parse request
     const parsed = try std.json.parseFromSlice(ChatCompletionRequest, allocator, request_json, .{});
     defer parsed.deinit();
-    const req = parsed.value;
+    var req = parsed.value;
 
     // 2. Streaming is handled by handleStreamingCompletion; reject here as safety net
     if (req.stream orelse false) {
         return try allocator.dupe(u8, "{\"error\":\"streaming_not_supported\"}");
     }
+
+    // 2b. Validate per-request sampling overrides and apply tool_choice
+    // ("none" strips the tools below; unsupported forms are rejected).
+    if (try validateChatRequest(allocator, req)) |err_body| {
+        return err_body;
+    }
+    try resolveToolChoice(&req);
 
     // 3-5. Build the prompt: extract text/images from the messages, run any
     // images through the vision tower inline, apply the chat template and
@@ -315,8 +396,8 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         .prompt_tokens = prompt_tokens,
         .max_tokens = max_tokens,
         .temperature = temperature,
-        .top_k = server_config.top_k,
-        .top_p = server_config.top_p,
+        .top_k = if (req.top_k) |k| @as(usize, k) else server_config.top_k,
+        .top_p = req.top_p orelse server_config.top_p,
         .seed = seed,
         .stop_strings = req.stop,
         .stop_tokens = state.stop_tokens,
