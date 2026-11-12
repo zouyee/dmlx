@@ -230,5 +230,13 @@ test "handleTokenizeRequest matches the real Qwen tokenizer (golden parity)" {
     const with_special = try handleTokenizeRequest(allocator, strategy, "{\"text\":\"Hello world\",\"add_special\":true}");
     defer allocator.free(with_special.body);
     try std.testing.expectEqualStrings(result.body, with_special.body);
+
+    // Multilingual case verified against HF transformers (2026-11-12).
+    const multi = try handleTokenizeRequest(allocator, strategy, "{\"text\":\"The quick brown fox jumps over the lazy dog. 12345 测试一下\"}");
+    defer allocator.free(multi.body);
+    try std.testing.expectEqual(@as(u16, 200), multi.status);
+    try std.testing.expectEqualStrings(
+        "{\"tokens\":[760,3841,13477,37550,33075,888,279,15217,5388,13,220,16,17,18,19,20,220,99449,97434],\"count\":19}",
+        multi.body,
+    );
 }
-// probe comment
