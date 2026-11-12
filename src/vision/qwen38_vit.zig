@@ -16,6 +16,10 @@ const math_mod = @import("mlx").math;
 const activations = @import("mlx").activations;
 const dtype_mod = @import("mlx").dtype;
 const reduce_mod = @import("mlx").reduce;
+const closure_mod = @import("mlx").closure;
+const compile_mod = @import("mlx").compile;
+
+const Closure = closure_mod.Closure;
 
 const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
@@ -142,6 +146,109 @@ const VitBlock = struct {
     fc2_b: Array,
 };
 
+/// Shared per-block math (LN → fused qkv → vision rope on q/k → non-causal
+/// SDPA → proj → residual → LN → fc1 → gelu-tanh → fc2 → residual). Used by
+/// BOTH the eager path and the mx.compile closure below — keep one
+/// implementation so the two paths cannot drift. The 3× ops.slice q/k/v
+/// extraction is deliberate: shape_mod.split segfaults in this mlx-c build.
+fn blockCore(ctx: EagerContext, cfg: Qwen38VitConfig, blk: *const VitBlock, x: Array, rope: Array) !Array {
+    const n: i32 = x.shape()[0];
+    const heads = cfg.heads;
+    const head_dim: i32 = @divExact(cfg.hidden, heads);
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    // Attention sub-block.
+    const n1 = try fast_mod.layerNorm(ctx, x, blk.norm1_w, blk.norm1_b, LN_EPS);
+    defer n1.deinit();
+    const qkv = try linear(ctx, n1, blk.qkv_w, blk.qkv_b); // [N, 3*hidden]
+    defer qkv.deinit();
+    const qkv_r = try ops.reshape(ctx, qkv, &[_]i32{ n, 3, heads, head_dim });
+    defer qkv_r.deinit();
+    const qkv_t = try ops.transposeAxes(ctx, qkv_r, &[_]i32{ 1, 0, 2, 3 }); // [3, N, heads, D]
+    defer qkv_t.deinit();
+    const ones3 = &[_]i32{ 1, 1, 1, 1 };
+    const q_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, n, heads, head_dim }, ones3);
+    defer q_raw.deinit();
+    const k_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 1, 0, 0, 0 }, &[_]i32{ 2, n, heads, head_dim }, ones3);
+    defer k_raw.deinit();
+    const v_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 2, 0, 0, 0 }, &[_]i32{ 3, n, heads, head_dim }, ones3);
+    defer v_raw.deinit();
+    const q = try applyRotaryVision(ctx, q_raw, rope); // [1, N, heads, D]
+    defer q.deinit();
+    const k = try applyRotaryVision(ctx, k_raw, rope);
+    defer k.deinit();
+    const q_t = try ops.transposeAxes(ctx, q, &[_]i32{ 0, 2, 1, 3 }); // [1, heads, N, D]
+    defer q_t.deinit();
+    const k_t = try ops.transposeAxes(ctx, k, &[_]i32{ 0, 2, 1, 3 });
+    defer k_t.deinit();
+    const v_t = try ops.transposeAxes(ctx, v_raw, &[_]i32{ 0, 2, 1, 3 });
+    defer v_t.deinit();
+    const attn = try fast_mod.scaledDotProductAttention(ctx, q_t, k_t, v_t, scale, "", null, null);
+    defer attn.deinit();
+    const attn_t = try ops.transposeAxes(ctx, attn, &[_]i32{ 0, 2, 1, 3 });
+    defer attn_t.deinit();
+    const attn_flat = try ops.reshape(ctx, attn_t, &[_]i32{ n, cfg.hidden });
+    defer attn_flat.deinit();
+    const proj = try linear(ctx, attn_flat, blk.proj_w, blk.proj_b);
+    defer proj.deinit();
+    const h1 = try ops.add(ctx, x, proj);
+    defer h1.deinit();
+
+    // MLP sub-block (GELU tanh).
+    const n2 = try fast_mod.layerNorm(ctx, h1, blk.norm2_w, blk.norm2_b, LN_EPS);
+    defer n2.deinit();
+    const f1 = try linear(ctx, n2, blk.fc1_w, blk.fc1_b);
+    defer f1.deinit();
+    const act = try activations.gelu(ctx, f1);
+    defer act.deinit();
+    const f2 = try linear(ctx, act, blk.fc2_w, blk.fc2_b);
+    defer f2.deinit();
+    return ops.add(ctx, h1, f2);
+}
+
+// ============================================================
+// Compiled block (mx.compile, shapeless — patch count N varies per image)
+// ============================================================
+//
+// The closure bakes the tower config as a trace-time global (set just before
+// Closure.init, mirroring COMPILED_RMS_EPS in qwen38.zig). All 14 arrays
+// (x, rope freqs, 12 weights) are passed as INPUTS — nothing is captured.
+var compiled_block_cfg: Qwen38VitConfig = undefined;
+
+fn vitBlockClosure(inputs: []const Array, allocator: std.mem.Allocator) error{MlxError}![]Array {
+    if (inputs.len != 14) return error.MlxError;
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = c.c.mlx_default_gpu_stream_new() });
+    defer ctx.deinit();
+    const blk = VitBlock{
+        .norm1_w = inputs[2],
+        .norm1_b = inputs[3],
+        .qkv_w = inputs[4],
+        .qkv_b = inputs[5],
+        .proj_w = inputs[6],
+        .proj_b = inputs[7],
+        .norm2_w = inputs[8],
+        .norm2_b = inputs[9],
+        .fc1_w = inputs[10],
+        .fc1_b = inputs[11],
+        .fc2_w = inputs[12],
+        .fc2_b = inputs[13],
+    };
+    const out = blockCore(ctx, compiled_block_cfg, &blk, inputs[0], inputs[1]) catch return error.MlxError;
+    const res = allocator.alloc(Array, 1) catch return error.MlxError;
+    res[0] = out;
+    return res;
+}
+
+/// Build the mx.compile'd block. Shapeful (shapeless=false): the q/k/v
+/// ops.slice workaround derives its bounds from the input shape, which
+/// shapeless tracing cannot infer — one trace is cached per patch count N.
+fn compiledVitBlock(allocator: std.mem.Allocator, cfg: Qwen38VitConfig) !Closure {
+    compiled_block_cfg = cfg;
+    const base = try Closure.init(&vitBlockClosure, allocator);
+    defer base.deinit();
+    return compile_mod.compile(base, false);
+}
+
 pub const Qwen38Vit = struct {
     allocator: std.mem.Allocator,
     ctx: EagerContext,
@@ -156,6 +263,23 @@ pub const Qwen38Vit = struct {
     merger_fc1_b: Array,
     merger_fc2_w: Array,
     merger_fc2_b: Array,
+    /// Lazily-built mx.compile'd per-block closure (null until first forward,
+    /// or permanently after a compile/apply failure). Only used by the
+    /// non-traced forward path.
+    compiled_block: ?Closure = null,
+    compile_failed: bool = false,
+    compile_enabled: bool,
+
+    fn envOn(name: [*:0]const u8) bool {
+        const v = std.c.getenv(name) orelse return false;
+        return !(v[0] == 0 or (v[0] == '0' and v[1] == 0));
+    }
+
+    fn compileWanted() bool {
+        if (envOn("DMLX_VIT_NO_COMPILE")) return false;
+        if (envOn("DMLX_VIT_COMPILE")) return true;
+        return true; // default on; DMLX_VIT_NO_COMPILE=1 is the kill switch
+    }
 
     fn lookup(weights: *const std.StringHashMap(Array), allocator: std.mem.Allocator, prefix: []const u8, name: []const u8) !Array {
         const full = try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix, name });
@@ -235,11 +359,14 @@ pub const Qwen38Vit = struct {
             .merger_fc1_b = try lookup(weights, allocator, prefix, "merger.linear_fc1.bias"),
             .merger_fc2_w = merger_fc2_w,
             .merger_fc2_b = try lookup(weights, allocator, prefix, "merger.linear_fc2.bias"),
+            .compile_enabled = compileWanted(),
         };
     }
 
     /// Borrows weights from the caller-owned map; only the block slice is ours.
     pub fn deinit(self: *Qwen38Vit) void {
+        if (self.compiled_block) |mc| mc.deinit();
+        self.compiled_block = null;
         self.allocator.free(self.blocks);
     }
 
@@ -406,62 +533,56 @@ pub const Qwen38Vit = struct {
         return Array.fromData(self.allocator, f32, emb, &[_]i32{ @intCast(t * n_hw), @intCast(rot_dim) });
     }
 
+    /// Eager per-block forward (shared math in blockCore).
     fn blockForward(self: *const Qwen38Vit, blk: *const VitBlock, x: Array, rope: Array) !Array {
-        const ctx = self.ctx;
-        const n: i32 = x.shape()[0];
-        const heads = self.cfg.heads;
-        const head_dim: i32 = @divExact(self.cfg.hidden, heads);
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        return blockCore(self.ctx, self.cfg, blk, x, rope);
+    }
 
-        // Attention sub-block.
-        const n1 = try fast_mod.layerNorm(ctx, x, blk.norm1_w, blk.norm1_b, LN_EPS);
-        defer n1.deinit();
-        const qkv = try linear(ctx, n1, blk.qkv_w, blk.qkv_b); // [N, 3*hidden]
-        defer qkv.deinit();
-        const qkv_r = try ops.reshape(ctx, qkv, &[_]i32{ n, 3, heads, head_dim });
-        defer qkv_r.deinit();
-        const qkv_t = try ops.transposeAxes(ctx, qkv_r, &[_]i32{ 1, 0, 2, 3 }); // [3, N, heads, D]
-        defer qkv_t.deinit();
-        // slice q/k/v out of the stacked tensor (shape_mod.split segfaults in
-        // this mlx-c build).
-        const ones3 = &[_]i32{ 1, 1, 1, 1 };
-        const q_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, n, heads, head_dim }, ones3);
-        defer q_raw.deinit();
-        const k_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 1, 0, 0, 0 }, &[_]i32{ 2, n, heads, head_dim }, ones3);
-        defer k_raw.deinit();
-        const v_raw = try ops.slice(ctx, qkv_t, &[_]i32{ 2, 0, 0, 0 }, &[_]i32{ 3, n, heads, head_dim }, ones3);
-        defer v_raw.deinit();
-        const q = try applyRotaryVision(ctx, q_raw, rope); // [1, N, heads, D]
-        defer q.deinit();
-        const k = try applyRotaryVision(ctx, k_raw, rope);
-        defer k.deinit();
-        const q_t = try ops.transposeAxes(ctx, q, &[_]i32{ 0, 2, 1, 3 }); // [1, heads, N, D]
-        defer q_t.deinit();
-        const k_t = try ops.transposeAxes(ctx, k, &[_]i32{ 0, 2, 1, 3 });
-        defer k_t.deinit();
-        const v_t = try ops.transposeAxes(ctx, v_raw, &[_]i32{ 0, 2, 1, 3 });
-        defer v_t.deinit();
-        const attn = try fast_mod.scaledDotProductAttention(ctx, q_t, k_t, v_t, scale, "", null, null);
-        defer attn.deinit();
-        const attn_t = try ops.transposeAxes(ctx, attn, &[_]i32{ 0, 2, 1, 3 });
-        defer attn_t.deinit();
-        const attn_flat = try ops.reshape(ctx, attn_t, &[_]i32{ n, self.cfg.hidden });
-        defer attn_flat.deinit();
-        const proj = try linear(ctx, attn_flat, blk.proj_w, blk.proj_b);
-        defer proj.deinit();
-        const h1 = try ops.add(ctx, x, proj);
-        defer h1.deinit();
+    /// Apply the compiled block closure. Input order (14): x, rope freqs,
+    /// norm1 w/b, qkv w/b, proj w/b, norm2 w/b, fc1 w/b, fc2 w/b. x/rope are
+    /// NOT consumed; the returned array is owned by the caller.
+    fn applyBlockCompiled(self: *Qwen38Vit, blk: *const VitBlock, x: Array, rope: Array) !Array {
+        const inputs = [_]Array{
+            x,           rope,
+            blk.norm1_w, blk.norm1_b,
+            blk.qkv_w,   blk.qkv_b,
+            blk.proj_w,  blk.proj_b,
+            blk.norm2_w, blk.norm2_b,
+            blk.fc1_w,   blk.fc1_b,
+            blk.fc2_w,   blk.fc2_b,
+        };
+        const outs = try self.compiled_block.?.apply(&inputs, self.allocator);
+        if (outs.len != 1) {
+            for (outs) |o| o.deinit();
+            self.allocator.free(outs);
+            return error.MlxError;
+        }
+        const out = outs[0];
+        self.allocator.free(outs);
+        return out;
+    }
 
-        // MLP sub-block (GELU tanh).
-        const n2 = try fast_mod.layerNorm(ctx, h1, blk.norm2_w, blk.norm2_b, LN_EPS);
-        defer n2.deinit();
-        const f1 = try linear(ctx, n2, blk.fc1_w, blk.fc1_b);
-        defer f1.deinit();
-        const act = try activations.gelu(ctx, f1);
-        defer act.deinit();
-        const f2 = try linear(ctx, act, blk.fc2_w, blk.fc2_b);
-        defer f2.deinit();
-        return ops.add(ctx, h1, f2);
+    /// Compiled when available, eager otherwise; any compile/apply failure
+    /// logs once and permanently reverts to eager (never crashes the tower).
+    fn blockForwardMaybeCompiled(self: *Qwen38Vit, blk: *const VitBlock, x: Array, rope: Array) !Array {
+        if (!self.compile_enabled or self.compile_failed) return self.blockForward(blk, x, rope);
+        if (self.compiled_block == null) {
+            self.compiled_block = compiledVitBlock(self.allocator, self.cfg) catch |e| blk2: {
+                std.log.warn("qwen38_vit: mx.compile block build failed ({s}); using eager blocks", .{@errorName(e)});
+                self.compile_failed = true;
+                break :blk2 null;
+            };
+        }
+        if (self.compiled_block) |_| {
+            return self.applyBlockCompiled(blk, x, rope) catch |e| {
+                std.log.warn("qwen38_vit: compiled block apply failed ({s}); reverting to eager blocks", .{@errorName(e)});
+                self.compile_failed = true;
+                self.compiled_block.?.deinit();
+                self.compiled_block = null;
+                return self.blockForward(blk, x, rope);
+            };
+        }
+        return self.blockForward(blk, x, rope);
     }
 
     /// Optional per-stage trace hook for oracle bisection (Task 6).
@@ -505,8 +626,14 @@ pub const Qwen38Vit = struct {
         defer rope.deinit();
         trace(hook, "rope_freqs", rope);
 
+        // Traced runs stay eager: the oracle bisection hook needs per-stage
+        // intermediates that the compiled block does not expose. Untraced
+        // runs use the mx.compile'd block when enabled.
         for (self.blocks, 0..) |*blk, bi| {
-            const out = try self.blockForward(blk, hidden, rope);
+            const out = if (hook == null)
+                try self.blockForwardMaybeCompiled(blk, hidden, rope)
+            else
+                try self.blockForward(blk, hidden, rope);
             hidden.deinit();
             hidden = out;
             if (hook != null and (bi < 4 or bi + 1 == self.blocks.len)) {
