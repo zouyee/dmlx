@@ -276,7 +276,9 @@ Currently exposed routes:
 - `POST /v1/responses` (minimal Responses API compatibility layer)
 - `POST /v1/messages`
 - `POST /v1/tokenize` (also `/tokenize`)
+- `POST /v1/embeddings` (last-hidden pooling, Qwen3.8 path)
 - `GET /v1/models`
+- `GET /metrics` (Prometheus text format, also `/v1/metrics`)
 - `GET /health`
 - `POST /shutdown`
 
