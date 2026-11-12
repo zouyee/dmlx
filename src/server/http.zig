@@ -305,6 +305,7 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         else => "Error",
     };
