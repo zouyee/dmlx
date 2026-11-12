@@ -46,6 +46,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
 
     // Initialize Server V2 fields.
     server_state.request_queue = engine.RequestQueue.init();
+    server_state.embed_queue = engine.EmbedQueue.init();
     server_state.engine_running = std.atomic.Value(bool).init(true);
     server_state.active_requests = std.atomic.Value(u32).init(0);
     server_state.next_request_id = std.atomic.Value(u64).init(1);
@@ -102,6 +103,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
             .speculative_ngram = server_state.speculative_ngram,
             .speculative_mtp = server_state.speculative_mtp,
             .prefix_cache_max_entries = server_config.prefix_cache_entries,
+            .embed_queue = &server_state.embed_queue,
         };
 
         var engine_loop = try engine.EngineLoop.init(engine_config);

@@ -61,6 +61,9 @@ pub const ServerState = struct {
 
     // Server V2: engine loop and request queue
     request_queue: engine.RequestQueue,
+    /// /v1/embeddings task queue — HTTP fibers push, the engine loop thread
+    /// executes (GPU forwards are thread-affine; see engine/embed_queue.zig).
+    embed_queue: engine.EmbedQueue,
     engine_loop: ?engine.EngineLoop,
     engine_running: std.atomic.Value(bool),
     active_requests: std.atomic.Value(u32),
@@ -238,6 +241,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .is_native = true,
             .running = true,
             .request_queue = undefined,
+            .embed_queue = undefined,
             .engine_loop = null,
             .engine_running = std.atomic.Value(bool).init(false),
             .active_requests = std.atomic.Value(u32).init(0),
@@ -465,6 +469,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .stop_tokens = stop_tokens,
         .running = true,
         .request_queue = undefined,
+        .embed_queue = undefined,
         .engine_loop = null,
         .engine_running = std.atomic.Value(bool).init(false),
         .active_requests = std.atomic.Value(u32).init(0),

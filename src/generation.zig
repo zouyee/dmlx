@@ -64,6 +64,14 @@ pub const ModelVTable = struct {
     mtp: ?*const MtpOps = null,
     /// Optional vision capability (Qwen3.8). Null for text-only models.
     vision: ?*const VisionOps = null,
+    /// Optional: text embedding from the last-layer hidden state
+    /// (/v1/embeddings). Contract: `ids` are raw-text tokens (no chat
+    /// template); the op runs a FRESH prefill (resets any recurrent/cache
+    /// state), takes the LAST position's POST-final-norm hidden, L2-normalizes
+    /// it, and returns it as an owned [hidden] f32 slice (allocator-owned).
+    /// Null for models without hidden-state access — the server maps that to
+    /// a 501 embedding_not_supported error.
+    embed: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, ids: []const u32) anyerror![]f32 = null,
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     config: ModelConfig,
     ptr: *anyopaque,

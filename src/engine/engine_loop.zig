@@ -40,6 +40,7 @@ const KVCacheStrategy = kvcache.KVCacheStrategy;
 const LayerConfig = kvcache.LayerConfig;
 const RequestState = request_state.RequestState;
 const RequestQueue = request_queue.RequestQueue;
+const EmbedQueue = @import("embed_queue.zig").EmbedQueue;
 const CompletionSignal = completion_signal.CompletionSignal;
 const TokenEvent = completion_signal.TokenEvent;
 const TokenFinishReason = completion_signal.TokenEvent.FinishReason;
@@ -262,6 +263,10 @@ pub const EngineConfig = struct {
     speculative_mtp: ?usize = null,
     /// Prefix cache: max number of prompts to cache KV state for (0 = disabled).
     prefix_cache_max_entries: usize = 16,
+    /// Embedding tasks from /v1/embeddings, drained each loop iteration and
+    /// executed on this (engine) thread — GPU forwards only work here (see
+    /// embed_queue.zig). Null: embed tasks are failed immediately.
+    embed_queue: ?*EmbedQueue = null,
 };
 
 pub const EngineLoop = struct {
@@ -298,6 +303,8 @@ pub const EngineLoop = struct {
     mtp_depth: ?MtpDepthController,
     /// Prefix cache for skipping prefill on repeated prompts.
     prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
+    /// Embedding tasks to execute on the engine thread (null = unsupported).
+    embed_queue: ?*EmbedQueue,
 
     pub fn init(config: EngineConfig) !EngineLoop {
         // Note: batch_caches is lazily initialized via BatchKVCache.merge()
@@ -329,6 +336,7 @@ pub const EngineLoop = struct {
                 prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
             else
                 null,
+            .embed_queue = config.embed_queue,
         };
     }
 
@@ -351,6 +359,7 @@ pub const EngineLoop = struct {
         defer std.log.info("[Engine] Engine loop exiting", .{});
 
         while (self.running.load(.acquire) and !g_shutdown_requested.load(.acquire)) {
+            self.drainEmbedTasks();
             // Drain new requests from the queue.
             const new_requests = self.request_queue.drainAll(self.allocator) catch {
                 threadSleepMs(1);
@@ -401,6 +410,39 @@ pub const EngineLoop = struct {
         // Drain remaining active requests before shutdown.
         while (self.active_requests.items.len > 0 and !g_shutdown_requested.load(.acquire)) {
             self.step();
+        }
+        // Fail any embed tasks still pending so their HTTP fibers unblock.
+        self.failEmbedTasks(error.ServerShuttingDown);
+    }
+
+    /// Run one pending batch of embedding tasks on the engine thread. The
+    /// MLX Metal backend registers command encoders per (thread, stream), so
+    /// model forwards only work here — never on HTTP worker threads.
+    fn drainEmbedTasks(self: *EngineLoop) void {
+        const eq = self.embed_queue orelse return;
+        const tasks = eq.drainAll(self.allocator) catch return;
+        defer self.allocator.free(tasks);
+        for (tasks) |task| {
+            if (self.model.embed) |embed_fn| {
+                task.result = embed_fn(self.model.ptr, task.allocator, task.ids) catch |err| blk: {
+                    task.err = err;
+                    break :blk null;
+                };
+            } else {
+                task.err = error.EmbeddingNotSupported;
+            }
+            task.done.store(true, .release);
+        }
+    }
+
+    /// Mark every queued embed task as failed (shutdown path).
+    fn failEmbedTasks(self: *EngineLoop, err: anyerror) void {
+        const eq = self.embed_queue orelse return;
+        const tasks = eq.drainAll(self.allocator) catch return;
+        defer self.allocator.free(tasks);
+        for (tasks) |task| {
+            task.err = err;
+            task.done.store(true, .release);
         }
     }
 

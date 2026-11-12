@@ -740,6 +740,39 @@ pub const Qwen38VTableAdapter = struct {
         });
     }
 
+    /// Embedding op (/v1/embeddings): fresh prefill over `ids` (raw text
+    /// tokens — the server tokenizes WITHOUT the chat template, same as
+    /// /v1/tokenize), LAST-position POST-final-norm hidden, L2-normalized.
+    /// Pooling: last-token, the standard choice for decoder-only LMs.
+    /// forwardTokensEmbed resets all GDN/attention state up front, and the
+    /// next chat prefill resets again, so embedding calls neither continue
+    /// nor pollute chat state. Takes the adapter mutex like every op that
+    /// touches the model ctx (see visionProcessImage).
+    fn embedTokens(ctx_ptr: *anyopaque, allocator: std.mem.Allocator, ids: []const u32) anyerror![]f32 {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (ids.len == 0) return error.EmptyInput;
+        const pre_norm = try self.model.forwardTokensEmbed(ids); // [1, hidden] bf16
+        defer pre_norm.deinit();
+        const ctx = self.model.ctx;
+        const xf = try ops.astype(ctx, pre_norm, .float32);
+        defer xf.deinit();
+        const nf = try fast_mod.rmsNorm(ctx, xf, self.model.final_norm_f32.?, self.cfg.rms_norm_eps);
+        defer nf.deinit();
+        try nf.eval();
+        const slice = try nf.dataSlice(f32);
+        const out = try allocator.dupe(f32, slice);
+        errdefer allocator.free(out);
+        var ssq: f64 = 0;
+        for (out) |v| ssq += @as(f64, v) * @as(f64, v);
+        if (ssq > 0) {
+            const inv: f32 = @floatCast(1.0 / @sqrt(ssq));
+            for (out) |*v| v.* *= inv;
+        }
+        return out;
+    }
+
     fn mtpDims(self: *Qwen38VTableAdapter) qwen38_mtp.Qwen38MtpDims {
         const cfg = self.cfg;
         return .{
@@ -1225,6 +1258,7 @@ fn qwen38Loader(
 
     return ModelVTable{
         .forward = &Qwen38VTableAdapter.forward,
+        .embed = &Qwen38VTableAdapter.embedTokens,
         .mtp = &adapter.mtp_ops,
         .vision = &adapter.vision_ops,
         .deinit = &Qwen38VTableAdapter.deinitFn,

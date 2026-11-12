@@ -13,6 +13,7 @@ const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
 const responses_mod = @import("responses.zig");
 const tokenize_mod = @import("tokenize.zig");
+const embeddings_mod = @import("embeddings.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
@@ -249,6 +250,41 @@ fn handleRequest(
             const body = request[header_end + 4 ..];
             const result = try tokenize_mod.handleTokenizeRequest(allocator, state.tokenizer_strategy, body);
             defer allocator.free(result.body);
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/embeddings")) {
+        // OpenAI-compatible embeddings from the loaded model's hidden states.
+        // Pooling/extraction: last-token POST-final-norm hidden, L2-normalized
+        // (see embeddings.zig). The forward runs behind the model adapter's
+        // embed op (null → 501 embedding_not_supported), serialized against
+        // chat traffic by the adapter mutex.
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            // The forward runs on the engine-loop thread via the embed task
+            // queue (GPU work is thread-affine); null runner → 501.
+            const runner: ?embeddings_mod.EmbedRunner = if (state.vtable.embed != null)
+                .{ .ctx = state, .run = &embeddings_mod.engineEmbedRunner }
+            else
+                null;
+            const result = try embeddings_mod.handleEmbeddingsRequest(
+                allocator,
+                state.tokenizer_strategy,
+                runner,
+                std.fs.path.basename(server_config.model_path),
+                body,
+            );
+            defer allocator.free(result.body);
+            // 5120 floats ≈ 60KB JSON per item — heap-allocated response.
             try writeJsonResponseAlloc(connection, result.status, result.body);
         } else {
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");

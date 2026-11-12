@@ -2072,6 +2072,19 @@ pub const Qwen38ServingModel = struct {
         return .{ .logits = res.logits, .hidden_all = res.hidden.? };
     }
 
+    /// Embedding entry (/v1/embeddings): ALWAYS a fresh prefill — resets all
+    /// GDN/attention state even for a single-token input (the plain core path
+    /// treats L==1 as a cached decode step, which would continue stale state).
+    /// Returns the LAST position's pre-final-norm hidden [1, hidden] bf16
+    /// (owned); the caller applies the final RMSNorm. Logits are
+    /// last-position-only and discarded here.
+    pub fn forwardTokensEmbed(self: *Qwen38ServingModel, ids: []const u32) !Array {
+        try self.reset();
+        const res = try self.forwardTokensCore(ids, .last, true);
+        res.logits.deinit();
+        return res.hidden.?;
+    }
+
     pub const HiddenCapture = enum { none, last, all };
     pub const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
