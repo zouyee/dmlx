@@ -1926,7 +1926,10 @@ scripts/ab_vision_drafter_delta.sh、/tmp/bench_vision.py(三引擎 A/B/C)。
   响应对象 resp_/msg_ id、usage、status completed/incomplete。
   **流式也支持**:response.created → output_text.delta×N →
   output_text.done → response.completed。引擎错误映射 HTTP 500,
-  请求错误 400。未经真 OpenAI SDK 验证(venv 无 openai 包)。
+  请求错误 400。**真 OpenAI SDK 已验证**(openai 3.49.0,一次性 venv):
+  models.list / chat.completions(流式+非流式)/ responses.create(非流式、
+  流式、图像 input_image、incomplete+max_output_tokens、不支持字段 400)/
+  embeddings(float+base64)10/10 PASS。
 - **`POST /v1/tokenize`(+ /tokenize)**:复用 chat 同款 BpeTokenizer
   encode(与 HF transformers 逐 id 对拍一致,含多语言 golden 用例);
   无 chat 模板;>1MB 拒绝;add_special 对 Qwen BPE 是 no-op(文档化)。
@@ -1938,3 +1941,24 @@ runner 间歇假失败 + test-exact-q4-producer 1% 计时门槛并发下偶超�
 
 剩余 API 缺口(未做,ROI 递减):embeddings/rerank、图像生成/音频、
 Ollama 兼容、metrics/cache 管理端点、多模型池。
+
+### embeddings + metrics 落地(2026-11-12)
+
+- **`POST /v1/embeddings`**(commit `e334404`):last-token pooling(post-final-norm
+  hidden)+ L2 归一化,raw text 无模板;batch ≤32/1MB;float 与 base64 两种
+  encoding_format;非 qwen38 适配器 → 501 embedding_not_supported。
+  **线程模型是重点**:MLX Metal backend 的 command encoder 是线程局部的,
+  HTTP fiber 上跑 backbone 前向必崩(vision 塔是例外)——新增
+  `src/engine/embed_queue.zig` MPSC 队列,embeddings 前向全部在 engine 线程
+  执行,fiber 阻塞等 done 标志,shutdown 时 pending 任务统一失败。
+  实测:dim 5120、norm≈1、cos(cat,dog)=0.68 > cos(cat,photosynthesis)=0.31、
+  重复调用 bit-identical、与 chat 交错互不影响。
+- **`GET /metrics`(+ /v1/metrics)**(commits `478ddf1`+`dfd5c233`):
+  Prometheus 文本格式;requests_total{endpoint,status}、
+  request_duration_seconds_sum/count、generation/prompt_tokens_total、
+  active_requests、uptime、mtp drafts 接受计数。评审后修正:子处理器
+  (responses/anthropic)的 400 原先被记成 200——status_out 出参修复;
+  token 钩子补齐 anthropic/responses-streaming/embeddings 路径。
+  实测计数与发出的请求逐条一致。
+- 图像生成不做:dmlx 的 Flux 管线是 stub(无文本编码器/权重加载/VAE 解码),
+  见 src/main.zig runImageGen——那不是 API 面缺口,是能力缺口。
