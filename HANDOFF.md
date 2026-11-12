@@ -22,10 +22,11 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
   streaming + non-streaming; 7-prompt acceptance (short QA / code / long
   instruction) all returned `finish_reason: "stop"`, server survives
   sequential requests (per-layer GDN/attention caches reset on each prefill).
-- Vision input rejected explicitly: token ids 248053–248057
-  (`<|vision_start|>`, `<|vision_end|>`, `<|vision_pad|>`, `<|image_pad|>`,
-  `<|video_pad|>`) raise `error.VisionInputNotSupported` from
-  `Qwen38ServingModel.forwardTokens` (`qwen38.rejectVisionTokens`).
+- Vision input: **supported since 2026-11-12** via `forwardTokensWithVision`
+  (CLI `--image`, server `image_url` parts) — see the vision section at the end
+  of this file. The plain `forwardTokens*` entries still reject vision token ids
+  248053–248057 (`qwen38.rejectVisionTokens`); video (248057) is rejected
+  everywhere.
 
 ## MTP speculative decoding (2026-10-23)
 

@@ -19,6 +19,9 @@ extern fn stbi_image_free(data: ?*anyopaque) void;
 
 // preprocessor_config.json (Qwen3.8-27B-4bit): size.shortest_edge/longest_edge,
 // patch_size, temporal_patch_size, merge_size, image_mean/std = 0.5.
+// Coupled with cfg.vision (qwen38_loader.Qwen38VisionConfig): the adapter divides
+// grid_thw by cfg.vision.merge, so a checkpoint with different patch/temporal/merge
+// must update BOTH places.
 pub const PATCH: usize = 16;
 pub const TEMPORAL_PATCH: usize = 2;
 pub const MERGE: usize = 2;
