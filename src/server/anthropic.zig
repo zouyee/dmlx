@@ -44,6 +44,15 @@ const AnthropicRequest = struct {
     };
 };
 
+/// Anthropic tool_choice support policy, mirroring the OpenAI one in
+/// openai.zig: "auto"/"none" are accepted (this endpoint executes no tools,
+/// so both behave as none); "any"/"tool" would force a call and are
+/// rejected with the message returned here.
+pub fn unsupportedToolChoiceMsg(tc: AnthropicRequest.AnthropicToolChoice) ?[]const u8 {
+    if (std.mem.eql(u8, tc.type, "auto") or std.mem.eql(u8, tc.type, "none")) return null;
+    return "tool_choice 'any'/'tool' (forced calls) are not supported by this server (use 'auto' or 'none')";
+}
+
 /// Format an Anthropic Messages API response.
 fn formatAnthropicResponse(
     allocator: std.mem.Allocator,
@@ -91,9 +100,7 @@ pub fn handleAnthropicMessages(
             if (k == 0) reject = "top_k must be >= 1";
         }
         if (req.tool_choice) |tc| {
-            if (!std.mem.eql(u8, tc.type, "auto") and !std.mem.eql(u8, tc.type, "none")) {
-                reject = "tool_choice 'any'/'tool' (forced calls) are not supported by this server (use 'auto' or 'none')";
-            }
+            reject = unsupportedToolChoiceMsg(tc) orelse reject;
         }
         if (reject) |msg| {
             const err_body = try std.fmt.allocPrint(allocator,
@@ -195,4 +202,32 @@ pub fn handleAnthropicMessages(
     defer allocator.free(response);
 
     try writeJsonResponse(connection, io, 200, response);
+}
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+test "unsupportedToolChoiceMsg accepts auto/none, rejects any/tool" {
+    try std.testing.expect(unsupportedToolChoiceMsg(.{ .type = "auto" }) == null);
+    try std.testing.expect(unsupportedToolChoiceMsg(.{ .type = "none" }) == null);
+    try std.testing.expect(unsupportedToolChoiceMsg(.{ .type = "any" }) != null);
+    try std.testing.expect(unsupportedToolChoiceMsg(.{ .type = "tool", .name = "f" }) != null);
+    try std.testing.expect(unsupportedToolChoiceMsg(.{ .type = "bogus" }) != null);
+}
+
+test "AnthropicRequest parses top_p/top_k/tool_choice" {
+    const allocator = std.testing.allocator;
+    const body =
+        \\{"model":"m","max_tokens":8,"top_p":0.5,"top_k":5,"tool_choice":{"type":"tool","name":"f"},"messages":[{"role":"user","content":"hi"}]}
+    ;
+    const parsed = try std.json.parseFromSlice(AnthropicRequest, allocator, body, .{});
+    defer parsed.deinit();
+    const req = parsed.value;
+    try std.testing.expectEqual(@as(f32, 0.5), req.top_p.?);
+    try std.testing.expectEqual(@as(u32, 5), req.top_k.?);
+    const tc = req.tool_choice.?;
+    try std.testing.expectEqualStrings("tool", tc.type);
+    try std.testing.expectEqualStrings("f", tc.name.?);
+    try std.testing.expect(unsupportedToolChoiceMsg(tc) != null);
 }

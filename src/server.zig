@@ -343,3 +343,11 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
         req.completion.deliverToken(server_state.io, 0, final_text, true, .stop);
     }
 }
+
+// Pull the server submodule tests into the test build (tests.zig only
+// references this file's decls).
+test {
+    _ = http;
+    _ = openai;
+    _ = anthropic;
+}

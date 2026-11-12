@@ -200,20 +200,22 @@ fn handleRequest(
         // should echo back in the `model` field), `created` is the server
         // start time. `state.model_name` holds the config.json architecture
         // name, which is not a useful client-facing id.
-        const model_id = std.fs.path.basename(server_config.model_path);
-        const models_json = try std.fmt.allocPrint(
+        const models_json = try formatModelsJson(
             allocator,
-            "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"}}]}}",
-            .{ model_id, state.start_time_unix },
+            std.fs.path.basename(server_config.model_path),
+            state.start_time_unix,
         );
         defer allocator.free(models_json);
         try writeJsonResponse(connection, io, 200, models_json);
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
         const active = state.active_requests.load(.acquire);
+        var escaped_model = std.ArrayList(u8).empty;
+        defer escaped_model.deinit(allocator);
+        try utils_mod.jsonEscapeInto(&escaped_model, allocator, state.model_name);
         const health_json = try std.fmt.allocPrint(
             allocator,
             "{{\"status\":\"ok\",\"model\":\"{s}\",\"active_requests\":{d}}}",
-            .{ state.model_name, active },
+            .{ escaped_model.items, active },
         );
         defer allocator.free(health_json);
         try writeJsonResponse(connection, io, 200, health_json);
@@ -236,6 +238,48 @@ fn handleRequest(
 // ------------------------------------------------------------------
 // HTTP response helpers
 // ------------------------------------------------------------------
+
+/// Build the GET /v1/models response body. The model id is JSON-escaped.
+pub fn formatModelsJson(allocator: std.mem.Allocator, model_id: []const u8, created_unix: i64) ![]u8 {
+    var escaped_id = std.ArrayList(u8).empty;
+    defer escaped_id.deinit(allocator);
+    try utils_mod.jsonEscapeInto(&escaped_id, allocator, model_id);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"}}]}}",
+        .{ escaped_id.items, created_unix },
+    );
+}
+
+test "formatModelsJson shape" {
+    const allocator = std.testing.allocator;
+    const body = try formatModelsJson(allocator, "Qwen3.8-27B-4bit", 1794458459);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("list", root_obj.get("object").?.string);
+    const data = root_obj.get("data").?.array;
+    try std.testing.expectEqual(@as(usize, 1), data.items.len);
+    const entry = data.items[0].object;
+    try std.testing.expectEqualStrings("Qwen3.8-27B-4bit", entry.get("id").?.string);
+    try std.testing.expectEqualStrings("model", entry.get("object").?.string);
+    try std.testing.expectEqual(@as(i64, 1794458459), entry.get("created").?.integer);
+    try std.testing.expectEqualStrings("dmlx", entry.get("owned_by").?.string);
+}
+
+test "formatModelsJson escapes quotes and backslashes in the id" {
+    const allocator = std.testing.allocator;
+    const body = try formatModelsJson(allocator, "evil\"id\\name", 0);
+    defer allocator.free(body);
+
+    // Must still be valid JSON and round-trip to the raw id.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.array;
+    try std.testing.expectEqualStrings("evil\"id\\name", data.items[0].object.get("id").?.string);
+}
 
 pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) !void {
     _ = io;

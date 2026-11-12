@@ -332,12 +332,14 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
         return try allocator.dupe(u8, "{\"error\":\"streaming_not_supported\"}");
     }
 
-    // 2b. Validate per-request sampling overrides and apply tool_choice
-    // ("none" strips the tools below; unsupported forms are rejected).
-    if (try validateChatRequest(allocator, req)) |err_body| {
-        return err_body;
-    }
-    try resolveToolChoice(&req);
+    // 2b. Sampling params and tool_choice support are validated at HTTP
+    // dispatch (http.zig, before the streaming/non-streaming split), so by
+    // the time this handler runs the request is guaranteed valid — a
+    // failure here would mean the dispatch check was bypassed. assert in
+    // Debug; resolveToolChoice is still applied unconditionally for its
+    // side effect of stripping tools when tool_choice is "none".
+    std.debug.assert((validateChatRequest(allocator, req) catch null) == null);
+    resolveToolChoice(&req) catch unreachable;
 
     // 3-5. Build the prompt: extract text/images from the messages, run any
     // images through the vision tower inline, apply the chat template and
@@ -566,3 +568,120 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 
 /// Keep-alive threshold in milliseconds (5 seconds).
 const keep_alive_threshold_ms: i64 = 5000;
+
+// ------------------------------------------------------------------
+// Tests
+// ------------------------------------------------------------------
+
+fn testRequest() ChatCompletionRequest {
+    // `messages` is a mutable slice in the struct; a zero-length const slice
+    // needs a const_cast (no element is ever written through it).
+    return .{ .model = "m", .messages = @constCast(&[_]ChatCompletionRequest.Message{}) };
+}
+
+test "validateChatRequest accepts defaults and boundary values" {
+    const allocator = std.testing.allocator;
+
+    var req = testRequest();
+    try std.testing.expect(try validateChatRequest(allocator, req) == null);
+
+    req.top_p = 1.0;
+    req.top_k = 1;
+    try std.testing.expect(try validateChatRequest(allocator, req) == null);
+}
+
+test "validateChatRequest rejects out-of-range sampling params" {
+    const allocator = std.testing.allocator;
+
+    for ([_]f32{ 0.0, -0.5, 1.5, std.math.nan(f32) }) |p| {
+        var req = testRequest();
+        req.top_p = p;
+        const body = (try validateChatRequest(allocator, req)) orelse
+            return error.TestUnexpectedResult;
+        defer allocator.free(body);
+        try std.testing.expect(std.mem.indexOf(u8, body, "InvalidTopP") != null);
+    }
+
+    var req = testRequest();
+    req.top_k = 0;
+    const body = (try validateChatRequest(allocator, req)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "InvalidTopK") != null);
+}
+
+fn parseToolChoiceReq(allocator: std.mem.Allocator, tc_json: []const u8) !std.json.Parsed(ChatCompletionRequest) {
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"model":"m","messages":[],"tool_choice":{s}}}
+    , .{tc_json});
+    defer allocator.free(body);
+    return std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{});
+}
+
+test "resolveToolChoice: auto keeps tools, none strips them" {
+    const allocator = std.testing.allocator;
+    const tools = [_]ChatCompletionRequest.ToolDefinition{.{ .function = .{ .name = "f" } }};
+
+    {
+        var parsed = try parseToolChoiceReq(allocator, "\"auto\"");
+        defer parsed.deinit();
+        var req = parsed.value;
+        req.tools = &tools;
+        try resolveToolChoice(&req);
+        try std.testing.expect(req.tools != null);
+    }
+    {
+        var parsed = try parseToolChoiceReq(allocator, "\"none\"");
+        defer parsed.deinit();
+        var req = parsed.value;
+        req.tools = &tools;
+        try resolveToolChoice(&req);
+        try std.testing.expect(req.tools == null);
+    }
+    // Absent tool_choice behaves like auto.
+    var req = testRequest();
+    req.tools = &tools;
+    try resolveToolChoice(&req);
+    try std.testing.expect(req.tools != null);
+}
+
+test "resolveToolChoice: required and named-function are rejected" {
+    const allocator = std.testing.allocator;
+
+    {
+        var parsed = try parseToolChoiceReq(allocator, "\"required\"");
+        defer parsed.deinit();
+        var req = parsed.value;
+        try std.testing.expectError(error.UnsupportedToolChoice, resolveToolChoice(&req));
+    }
+    {
+        var parsed = try parseToolChoiceReq(allocator, "{\"type\":\"function\",\"function\":{\"name\":\"f\"}}");
+        defer parsed.deinit();
+        var req = parsed.value;
+        try std.testing.expectError(error.UnsupportedToolChoice, resolveToolChoice(&req));
+    }
+    {
+        var parsed = try parseToolChoiceReq(allocator, "\"bogus\"");
+        defer parsed.deinit();
+        var req = parsed.value;
+        try std.testing.expectError(error.InvalidToolChoice, resolveToolChoice(&req));
+    }
+}
+
+test "validateChatRequest reports unsupported tool_choice forms" {
+    const allocator = std.testing.allocator;
+
+    var parsed = try parseToolChoiceReq(allocator, "\"required\"");
+    defer parsed.deinit();
+    const body = (try validateChatRequest(allocator, parsed.value)) orelse
+        return error.TestUnexpectedResult;
+    defer allocator.free(body);
+    try std.testing.expect(std.mem.indexOf(u8, body, "UnsupportedToolChoice") != null);
+    // The error body must be valid JSON.
+    const err_parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer err_parsed.deinit();
+    try std.testing.expectEqualStrings(
+        "invalid_request_error",
+        err_parsed.value.object.get("error").?.object.get("type").?.string,
+    );
+}
