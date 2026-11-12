@@ -21,6 +21,7 @@ pub const openai = @import("server/openai.zig");
 pub const streaming = @import("server/streaming.zig");
 pub const anthropic = @import("server/anthropic.zig");
 pub const responses = @import("server/responses.zig");
+pub const tokenize = @import("server/tokenize.zig");
 pub const utils = @import("server/utils.zig");
 pub const tooling = @import("server/tooling.zig");
 

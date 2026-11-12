@@ -12,6 +12,7 @@ const openai_mod = @import("openai.zig");
 const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
 const responses_mod = @import("responses.zig");
+const tokenize_mod = @import("tokenize.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
@@ -240,6 +241,18 @@ fn handleRequest(
         } else {
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/tokenize") or
+        std.mem.startsWith(u8, request, "POST /tokenize"))
+    {
+        // Raw-text tokenization for context budgeting (no chat template).
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try tokenize_mod.handleTokenizeRequest(allocator, state.tokenizer_strategy, body);
+            defer allocator.free(result.body);
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
@@ -313,15 +326,38 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
     // Build entire HTTP response in a single buffer, then write once.
     var resp_buf: [8192]u8 = undefined;
     const resp = try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, body.len, body });
-    const unistd_c = @cImport(@cInclude("unistd.h"));
-    var remaining = resp;
+    try writeAllFd(connection.socket.handle, resp);
+    // Flush by sync'ing the fd (no-op on socket but won't hurt)
+    _ = unistd_c.fsync(connection.socket.handle);
+}
+
+/// Heap-allocated variant of writeJsonResponse for bodies that can exceed
+/// the 8KB stack buffer (e.g. /v1/tokenize output for large inputs).
+pub fn writeJsonResponseAlloc(connection: std.Io.net.Stream, status: u16, body: []const u8) !void {
+    const status_text = switch (status) {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        else => "Error",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const resp = try std.fmt.allocPrint(arena.allocator(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, body.len, body });
+    try writeAllFd(connection.socket.handle, resp);
+    _ = unistd_c.fsync(connection.socket.handle);
+}
+
+const unistd_c = @cImport(@cInclude("unistd.h"));
+
+fn writeAllFd(fd: c_int, data: []const u8) !void {
+    var remaining = data;
     while (remaining.len > 0) {
-        const n = unistd_c.write(connection.socket.handle, remaining.ptr, remaining.len);
+        const n = unistd_c.write(fd, remaining.ptr, remaining.len);
         if (n < 0) return error.WriteFailed;
         remaining = remaining[@intCast(n)..];
     }
-    // Flush by sync'ing the fd (no-op on socket but won't hurt)
-    _ = unistd_c.fsync(connection.socket.handle);
 }
 
 pub fn streamWriteAll(stream: std.Io.net.Stream, io: std.Io, data: []const u8) !void {
