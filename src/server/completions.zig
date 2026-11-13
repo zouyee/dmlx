@@ -211,8 +211,14 @@ pub fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !ParseOutcom
         }
         if (stops.items.len > 0) {
             const owned = try allocator.alloc([]u8, stops.items.len);
+            var n_owned: usize = 0;
+            errdefer {
+                for (owned[0..n_owned]) |s| allocator.free(s);
+                allocator.free(owned);
+            }
             for (stops.items, 0..) |s, i| {
                 owned[i] = try allocator.dupe(u8, s);
+                n_owned += 1;
             }
             stop = owned;
         }
@@ -221,9 +227,14 @@ pub fn parseRequest(allocator: std.mem.Allocator, body: []const u8) !ParseOutcom
     const model_owned = try allocator.dupe(u8, model);
     errdefer allocator.free(model_owned);
     const prompts_owned = try allocator.alloc([]u8, prompts.items.len);
-    errdefer allocator.free(prompts_owned);
+    var n_prompts_owned: usize = 0;
+    errdefer {
+        for (prompts_owned[0..n_prompts_owned]) |p| allocator.free(p);
+        allocator.free(prompts_owned);
+    }
     for (prompts.items, 0..) |p, i| {
         prompts_owned[i] = try allocator.dupe(u8, p);
+        n_prompts_owned += 1;
     }
 
     return .{ .ok = .{

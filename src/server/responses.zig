@@ -38,6 +38,8 @@ pub const TranslateOutcome = union(enum) {
     ok: struct {
         /// Chat-completions request body (JSON).
         body: []u8,
+        /// Effective model id (owned) — request's `model` or the default.
+        model: []u8,
         stream: bool,
         /// OpenAI default is store=true; store:false = don't retain the
         /// response object in the in-memory store (response_store.zig).
@@ -48,7 +50,10 @@ pub const TranslateOutcome = union(enum) {
 
     pub fn deinit(self: TranslateOutcome, allocator: std.mem.Allocator) void {
         switch (self) {
-            .ok => |o| allocator.free(o.body),
+            .ok => |o| {
+                allocator.free(o.body);
+                allocator.free(o.model);
+            },
             .err => |b| allocator.free(b),
         }
     }
@@ -256,7 +261,12 @@ pub fn translateRequest(
     if (top_p) |p| try out.print(allocator, ",\"top_p\":{d}", .{p});
     if (stream) try out.appendSlice(allocator, ",\"stream\":true");
     try out.append(allocator, '}');
-    return .{ .ok = .{ .body = try out.toOwnedSlice(allocator), .stream = stream, .store = store } };
+    return .{ .ok = .{
+        .body = try out.toOwnedSlice(allocator),
+        .model = try allocator.dupe(u8, model),
+        .stream = stream,
+        .store = store,
+    } };
 }
 
 /// Append one Responses input item to the chat `messages` JSON array.
@@ -449,6 +459,60 @@ pub fn buildResponseObject(
     return formatResponseJson(allocator, resp_id, msg_id, created, model, text, finish, input_tokens, output_tokens);
 }
 
+/// Wrap a FAILED chat-path error body in a failed Responses object (status
+/// "failed", empty output, error carried over). Falls back to a generic
+/// server_error when the body doesn't parse. Caller owns the result.
+pub fn buildFailedResponseObject(
+    allocator: std.mem.Allocator,
+    chat_error_body: []const u8,
+    resp_id: []const u8,
+    created_at: u64,
+    model: []const u8,
+) ![]u8 {
+    var message: []const u8 = "generation failed";
+    var err_type: []const u8 = "server_error";
+    var message_owned: ?[]u8 = null;
+    defer if (message_owned) |m| allocator.free(m);
+    var type_owned: ?[]u8 = null;
+    defer if (type_owned) |t| allocator.free(t);
+    if (std.json.parseFromSlice(std.json.Value, allocator, chat_error_body, .{}) catch null) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("error")) |e| {
+                if (e == .object) {
+                    // Dupe: the parsed tree dies at this block's end.
+                    if (e.object.get("message")) |m| {
+                        if (m == .string) {
+                            message_owned = try allocator.dupe(u8, m.string);
+                            message = message_owned.?;
+                        }
+                    }
+                    if (e.object.get("type")) |t| {
+                        if (t == .string) {
+                            type_owned = try allocator.dupe(u8, t.string);
+                            err_type = type_owned.?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    var escaped_message = std.ArrayList(u8).empty;
+    defer escaped_message.deinit(allocator);
+    try jsonEscapeInto(&escaped_message, allocator, message);
+    var escaped_model = std.ArrayList(u8).empty;
+    defer escaped_model.deinit(allocator);
+    try jsonEscapeInto(&escaped_model, allocator, model);
+
+    var escaped_type = std.ArrayList(u8).empty;
+    defer escaped_type.deinit(allocator);
+    try jsonEscapeInto(&escaped_type, allocator, err_type);
+
+    return std.fmt.allocPrint(allocator,
+        \\{{"id":"{s}","object":"response","created_at":{d},"status":"failed","model":"{s}","output":[],"error":{{"message":"{s}","type":"{s}"}},"incomplete_details":null}}
+    , .{ resp_id, created_at, escaped_model.items, escaped_message.items, escaped_type.items });
+}
+
 // ------------------------------------------------------------------
 // HTTP handler
 // ------------------------------------------------------------------
@@ -504,10 +568,18 @@ pub fn handleResponses(
 
     // generateChatCompletion reports validation/generation failures as an
     // error body; pass those through, mapping the error type onto the HTTP
-    // status (server_error → 500, everything else → 400).
+    // status (server_error → 500, everything else → 400). Failed responses
+    // are retained in the store like completed ones (store=false opts out),
+    // matching the streaming path's response.failed retention.
     if (std.mem.indexOf(u8, chat_response, "\"error\"") != null) {
         const status = errorBodyStatus(allocator, chat_response);
         status_out.* = status;
+        if (translated.store) {
+            const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
+            const failed = try buildFailedResponseObject(allocator, chat_response, resp_id, created, translated.model);
+            defer allocator.free(failed);
+            try state.response_store.put(resp_id, failed);
+        }
         try http_mod.writeJsonResponse(connection, io, status, chat_response);
         return;
     }
@@ -906,6 +978,38 @@ test "translateRequest rejects max_output_tokens overflow" {
     );
     defer parsed.deinit();
     try std.testing.expectEqual(@as(i64, 4294967295), parsed.value.object.get("max_tokens").?.integer);
+}
+
+test "buildFailedResponseObject carries the chat error into a failed response" {
+    const allocator = std.testing.allocator;
+    const body = try buildFailedResponseObject(allocator,
+        \\{"error":{"message":"vision input \"bad\" is not supported","type":"invalid_request_error","code":"VisionNotSupported"}}
+    , "resp_fail", 1794458459, "Qwen3");
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("resp_fail", obj.get("id").?.string);
+    try std.testing.expectEqualStrings("response", obj.get("object").?.string);
+    try std.testing.expectEqualStrings("failed", obj.get("status").?.string);
+    try std.testing.expectEqualStrings("Qwen3", obj.get("model").?.string);
+    try std.testing.expectEqual(@as(usize, 0), obj.get("output").?.array.items.len);
+    const err = obj.get("error").?.object;
+    try std.testing.expectEqualStrings("vision input \"bad\" is not supported", err.get("message").?.string);
+    try std.testing.expectEqualStrings("invalid_request_error", err.get("type").?.string);
+    try std.testing.expect(std.meta.activeTag(obj.get("incomplete_details").?) == .null);
+}
+
+test "buildFailedResponseObject falls back on unparseable bodies" {
+    const allocator = std.testing.allocator;
+    const body = try buildFailedResponseObject(allocator, "not json", "resp_x", 1, "m");
+    defer allocator.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const err = parsed.value.object.get("error").?.object;
+    try std.testing.expectEqualStrings("generation failed", err.get("message").?.string);
+    try std.testing.expectEqualStrings("server_error", err.get("type").?.string);
 }
 
 test "errorBodyStatus maps server_error to 500, others to 400" {
