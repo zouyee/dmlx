@@ -402,6 +402,7 @@ pub const EngineLoop = struct {
             for (new_requests) |req| {
                 if (req.isCancelled()) {
                     req.completion.deliverError(self.io, "Request cancelled");
+                    req.markEngineDone();
                     continue;
                 }
                 if (self.dsv4_model != null or self.vtable_serial) {
@@ -476,6 +477,9 @@ pub const EngineLoop = struct {
     }
 
     fn processRequest(self: *EngineLoop, req: *RequestState) void {
+        // The HTTP handler waits on this before deinit: it must fire on every
+        // exit, including the early error returns below.
+        defer req.markEngineDone();
         // Record start time for request latency tracking.
         const engine_start = std.c.mach_absolute_time();
         req.start_time_ns = @intCast(engine_start);
@@ -535,6 +539,7 @@ pub const EngineLoop = struct {
             .top_p = req.top_p,
             .seed = req.seed,
             .stop_tokens = req.stop_tokens,
+            .cancel_flag = &req.cancel_requested,
         };
 
         if (self.dsv4_model) |model| {
@@ -612,9 +617,19 @@ pub const EngineLoop = struct {
         @memset(success_mask, false);
 
         for (requests, 0..) |req, i| {
+            // Cancelled while waiting for prefill (e.g. SSE disconnect during
+            // a preceding long request): never start it.
+            if (req.isCancelled()) {
+                req.completion.deliverError(self.io, "Request cancelled");
+                req.phase = .done;
+                req.markEngineDone();
+                continue;
+            }
             req_caches[i] = self.createCaches() catch {
                 std.log.err("[Engine] failed to create caches for request {d}", .{req.id});
                 req.completion.deliverError(self.io, "Failed to create KV caches");
+                req.phase = .done;
+                req.markEngineDone();
                 continue;
             };
             success_mask[i] = true;
@@ -634,6 +649,7 @@ pub const EngineLoop = struct {
             ) catch {
                 req.completion.deliverError(self.io, "Failed to create prompt array");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
@@ -643,6 +659,7 @@ pub const EngineLoop = struct {
             const result = generation_mod.generateStep(self.model, prompt_arr, req_caches[i], &req.sampler, self.ctx) catch {
                 req.completion.deliverError(self.io, "Generation failed during prefill");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
@@ -656,6 +673,7 @@ pub const EngineLoop = struct {
                 const finish_reason: TokenFinishReason = if (generation_mod.isStopToken(result.token, req.stop_tokens)) .stop else .length;
                 req.completion.deliverToken(self.io, result.token, "", true, finish_reason);
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             }
@@ -664,6 +682,7 @@ pub const EngineLoop = struct {
             req.generated_tokens.append(self.allocator, result.token) catch {
                 req.completion.deliverError(self.io, "Failed to store generated token");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
@@ -783,6 +802,7 @@ pub const EngineLoop = struct {
             self.active_requests.append(self.allocator, req) catch {
                 req.completion.deliverError(self.io, "Failed to add request to active batch");
                 req.phase = .done;
+                req.markEngineDone();
             };
         }
     }
@@ -854,9 +874,12 @@ pub const EngineLoop = struct {
             const result = results[i];
             req.token_count += 1;
 
-            // Check stop tokens.
+            // Check stop tokens. A client disconnect (SSE abort) cancels the
+            // request mid-decode: finish it on this step instead of burning
+            // GPU all the way to max_tokens.
+            const cancelled = req.isCancelled();
             const is_stop = generation_mod.isStopToken(result.token, req.stop_tokens);
-            const is_done = is_stop or req.token_count >= req.max_tokens;
+            const is_done = is_stop or cancelled or req.token_count >= req.max_tokens;
 
             // Store token.
             req.generated_tokens.append(self.allocator, result.token) catch {
@@ -873,7 +896,7 @@ pub const EngineLoop = struct {
             if (req.streaming) {
                 const token_text = self.streamTokenText(req, result.token, is_done);
                 defer if (token_text.len > 0) self.allocator.free(token_text);
-                const finish_reason: ?TokenFinishReason = if (is_done) (if (is_stop) .stop else .length) else null;
+                const finish_reason: ?TokenFinishReason = if (is_done) (if (is_stop or cancelled) .stop else .length) else null;
                 req.completion.deliverToken(self.io, result.token, token_text, is_done, finish_reason);
             }
 
@@ -882,7 +905,7 @@ pub const EngineLoop = struct {
                     // Deliver full text for non-streaming.
                     const full_text = self.tokenizer.decode(req.generated_tokens.items, self.allocator) catch "";
                     defer self.allocator.free(full_text);
-                    req.completion.deliverToken(self.io, 0, full_text, true, if (is_stop) .stop else .length);
+                    req.completion.deliverToken(self.io, 0, full_text, true, if (is_stop or cancelled) .stop else .length);
                 }
                 keep[i] = false;
                 completed += 1;
@@ -925,6 +948,7 @@ pub const EngineLoop = struct {
                 } else {
                     req.phase = .done;
                     logRequestCompletion(self.io, req);
+                    req.markEngineDone();
                 }
             }
             self.active_requests.deinit(self.allocator);
@@ -957,6 +981,7 @@ pub const EngineLoop = struct {
 
         // Log the failed request completion.
         logRequestCompletion(self.io, req);
+        req.markEngineDone();
 
         // If this is the only request, clear the batch.
         if (self.active_requests.items.len == 1) {
@@ -1224,6 +1249,7 @@ pub const EngineLoop = struct {
 
         // Main speculative decoding loop
         while (total_generated < gen_config.max_tokens) {
+            if (req.isCancelled()) break;
             // Try to propose draft tokens from context
             const draft_tokens = drafter.propose(context.items, max_draft_tokens, self.allocator);
 
@@ -2421,6 +2447,9 @@ pub const EngineLoop = struct {
         var topk_hit8 = [_]u32{0} ** topk_depths;
 
         while (!stopped and total_generated < gen_config.max_tokens) {
+            // Client disconnect: truncate at the next round boundary instead
+            // of generating to max_tokens.
+            if (req.isCancelled()) break;
             // Depth for this round (flag value is the upper bound). Never
             // draft past max_tokens: a deeper chain than the remaining budget
             // is pure waste, since emission is capped anyway.
@@ -2553,6 +2582,7 @@ pub const EngineLoop = struct {
                 std.log.warn("EngineLoop: MTP draft failed; finishing with plain decode", .{});
                 hidden.deinit();
                 while (total_generated < gen_config.max_tokens and !stopped) {
+                    if (req.isCancelled()) break;
                     const arr = array_mod.Array.fromData(allocator, u32, &[_]u32{t_next.token}, &[_]i32{ 1, 1 }) catch break;
                     const st = generation_mod.generateStep(self.model, arr, caches, &req.sampler, self.ctx) catch break;
                     t_next = st;
@@ -2971,6 +3001,7 @@ pub const EngineLoop = struct {
             caches,
             self.ctx,
             self.allocator,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("EngineLoop: guided generation failed: {}", .{err});
             req.completion.deliverError(self.io, "Guided generation failed");
@@ -3059,6 +3090,7 @@ pub const EngineLoop = struct {
             &stream_ctx,
             streamCallback,
             start_pos,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
@@ -3092,7 +3124,7 @@ pub const EngineLoop = struct {
         };
 
         const start_pos = if (skip_prefill) req.prompt_tokens.len else null;
-        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream, start_pos) catch |err| {
+        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream, start_pos, &req.cancel_requested) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
             return;
@@ -3183,7 +3215,7 @@ pub const EngineLoop = struct {
                 self.allocator.free(caches);
             }
 
-            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null) catch {
+            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null, null) catch {
                 std.log.warn("[Engine] Warmup {d}: generate failed", .{i});
                 continue;
             };
@@ -3331,6 +3363,7 @@ pub fn generateGuided(
     caches: []KVCacheStrategy,
     ctx: EagerContext,
     allocator: std.mem.Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) ![]u32 {
     var result = std.ArrayList(u32).empty;
     errdefer result.deinit(allocator);
@@ -3371,6 +3404,9 @@ pub fn generateGuided(
     // Autoregressive generation with guided masking
     var step: usize = 1;
     while (step < max_tokens and !decoder.isComplete()) : (step += 1) {
+        if (cancel_flag) |f| {
+            if (f.load(.acquire)) break;
+        }
         const input_token = result.items[result.items.len - 1];
         const input_arr = try array_mod.Array.fromData(
             allocator,

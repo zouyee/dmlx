@@ -490,7 +490,13 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     // On init failure `prepared`'s defer frees the vision payload.
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
-    defer req_state.deinit();
+    // Pushed to the engine queue unconditionally below (no fallible call in
+    // between): wait for the engine's post-generation bookkeeping before
+    // freeing, not just for the final token event.
+    defer {
+        req_state.waitEngineDone(io);
+        req_state.deinit();
+    }
     // Vision ownership has moved into the RequestState.
     prepared.vision = null;
 
@@ -541,6 +547,10 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     const t_wait_end = std.c.mach_absolute_time();
     const wait_ms = @as(f64, @floatFromInt(t_wait_end - t_wait_start)) * 125.0 / 3_000_000.0;
     std.log.info("[OpenAI] Token loop done, all_text.len={d}, wait={d:.1}ms calls={d}", .{ all_text.items.len, wait_ms, wait_call_count });
+
+    // Engine may still be finishing after the final event; wait so the
+    // token_count/error reads below and the deferred deinit are race-free.
+    req_state.waitEngineDone(io);
 
     // Count consumed tokens on both success and generation-failure paths.
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));

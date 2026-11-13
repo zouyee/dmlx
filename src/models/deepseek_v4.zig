@@ -3056,6 +3056,7 @@ pub const DSV4Model = struct {
         callback_ctx: ?*anyopaque,
         callback: ?StreamCallback,
         start_pos_override: ?usize,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) ![]u32 {
         const allocator = self.allocator;
 
@@ -3151,6 +3152,9 @@ pub const DSV4Model = struct {
         const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
         for (0..decode_count) |i| {
             if (current_len >= tokens.len) break;
+            if (cancel_flag) |f| {
+                if (f.load(.acquire)) break;
+            }
 
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();
@@ -3193,6 +3197,7 @@ pub const DSV4Model = struct {
         caches: []kvcache.KVCacheStrategy,
         stream: c.c.mlx_stream,
         start_pos_override: ?usize,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) ![]u32 {
         const allocator = self.allocator;
         std.log.info("dsv4_model: prompt_tokens={any}", .{prompt_tokens});
@@ -3280,6 +3285,9 @@ pub const DSV4Model = struct {
         const decode_count = if (start_pos_override != null) max_new_tokens else max_new_tokens - 1;
         for (0..decode_count) |_| {
             if (current_len >= tokens.len) break;
+            if (cancel_flag) |f| {
+                if (f.load(.acquire)) break;
+            }
 
             var arena = ScopedArrayArena.init(allocator);
             defer arena.deinit();

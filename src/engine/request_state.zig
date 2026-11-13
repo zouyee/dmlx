@@ -128,6 +128,12 @@ pub const RequestState = struct {
     completion: CompletionSignal,
     /// Whether cancellation has been requested (by HTTP fiber on disconnect).
     cancel_requested: std.atomic.Value(bool),
+    /// Set by the engine when it will never touch this RequestState again
+    /// (all tokens delivered AND post-generation bookkeeping done). The HTTP
+    /// handler must observe this before deinit — the final token event alone
+    /// does NOT mean the engine is done (prefix-cache store, completion
+    /// logging, and token_count writes happen after the final delivery).
+    engine_done: std.atomic.Value(bool),
     /// Timestamp when request was pushed to engine queue (HTTP side).
     queued_time_ns: i128,
     /// Start timestamp (nanoseconds) for request latency tracking.
@@ -169,6 +175,7 @@ pub const RequestState = struct {
             .error_msg = null,
             .completion = CompletionSignal.init(allocator),
             .cancel_requested = std.atomic.Value(bool).init(false),
+            .engine_done = std.atomic.Value(bool).init(false),
             .queued_time_ns = 0,
             .start_time_ns = 0,
         };
@@ -205,5 +212,20 @@ pub const RequestState = struct {
     /// Request cancellation (called by HTTP fiber on client disconnect).
     pub fn requestCancel(self: *RequestState) void {
         self.cancel_requested.store(true, .release);
+    }
+
+    /// Called by the engine when it will never touch this RequestState again.
+    pub fn markEngineDone(self: *RequestState) void {
+        self.engine_done.store(true, .release);
+    }
+
+    /// Block the calling (HTTP) fiber until the engine has fully released
+    /// this request. Required before deinit whenever the request was
+    /// submitted: the final token event precedes the engine's post-generation
+    /// bookkeeping, and freeing early races with it.
+    pub fn waitEngineDone(self: *RequestState, io: std.Io) void {
+        while (!self.engine_done.load(.acquire)) {
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
     }
 };

@@ -1290,7 +1290,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     }
 
     std.debug.print("Starting generation...\n", .{});
-    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream, null);
+    const new_tokens = try model.generate(prompt_tokens, cmd.max_tokens, &sampler_config, caches, stream, null, null);
     std.log.info("DEBUG: model.generate returned {d} tokens", .{new_tokens.len});
     defer allocator.free(new_tokens);
 

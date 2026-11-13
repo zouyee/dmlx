@@ -305,7 +305,13 @@ fn runPrompt(
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
-    defer req_state.deinit();
+    // Pushed to the engine queue unconditionally below (no fallible call in
+    // between): wait for the engine's post-generation bookkeeping before
+    // freeing, not just for the final token event.
+    defer {
+        req_state.waitEngineDone(io);
+        req_state.deinit();
+    }
 
     _ = state.active_requests.fetchAdd(1, .monotonic);
     defer _ = state.active_requests.fetchSub(1, .monotonic);
@@ -336,6 +342,10 @@ fn runPrompt(
             }
         } else break;
     }
+
+    // Engine may still be finishing after the final event; wait so the
+    // token_count/error reads below and the deferred deinit are race-free.
+    req_state.waitEngineDone(io);
 
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 

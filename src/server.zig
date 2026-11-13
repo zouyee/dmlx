@@ -252,6 +252,7 @@ fn nativeEngineLoop(server_state: *ServerState) void {
         for (new_requests) |req| {
             if (req.isCancelled()) {
                 req.completion.deliverError(server_state.io, "Request cancelled");
+                req.markEngineDone();
                 continue;
             }
             processNativeRequest(server_state, ne, req);
@@ -264,6 +265,8 @@ fn nativeEngineLoop(server_state: *ServerState) void {
 }
 
 fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.NativeEngine, req: *engine.RequestState) void {
+    // The HTTP handler waits on this before deinit (see request_state.zig).
+    defer req.markEngineDone();
     const engine_start = std.c.mach_absolute_time();
     req.start_time_ns = @intCast(engine_start);
     const queue_wait_ms = @as(f64, @floatFromInt(engine_start - req.queued_time_ns)) / 1_000_000.0;
@@ -323,6 +326,7 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             &stream_ctx,
             cb,
             null,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("[NativeEngine] generate failed: {}", .{err});
             req.completion.deliverError(server_state.io, "Generation failed");
@@ -330,6 +334,11 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
         };
         defer server_state.allocator.free(tokens);
         req.token_count = @intCast(tokens.len);
+        // On mid-stream cancel the generation truncates without a final
+        // event; guarantee one so a draining abort path cannot hang.
+        if (!req.completion.isDone(server_state.io)) {
+            req.completion.deliverDone(server_state.io, .stop);
+        }
     } else {
         const tokens = ne.generate(
             req.prompt_tokens,
@@ -338,6 +347,7 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             null,
             null,
             null,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("[NativeEngine] generate failed: {}", .{err});
             req.completion.deliverError(server_state.io, "Generation failed");

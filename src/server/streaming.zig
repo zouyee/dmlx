@@ -88,7 +88,13 @@ pub fn handleStreamingCompletion(
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     // On init failure `prepared`'s defer frees the vision payload.
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
-    defer req_state.deinit();
+    // The request below is always pushed to the engine queue (no fallible
+    // call in between), so waiting for the engine here cannot hang: the
+    // final token event precedes the engine's post-generation bookkeeping.
+    defer {
+        req_state.waitEngineDone(io);
+        req_state.deinit();
+    }
     // Vision ownership has moved into the RequestState.
     prepared.vision = null;
 
@@ -174,6 +180,10 @@ pub fn handleStreamingCompletion(
         }
     }
 
+    // Engine may still be finishing its post-generation bookkeeping
+    // (token_count write, completion log) after the final event; wait so the
+    // metrics read below and the deferred deinit are race-free.
+    req_state.waitEngineDone(io);
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 }
 
@@ -184,9 +194,15 @@ pub fn handleStreamingCompletion(
 /// the chat (streaming.zig) and Responses (responses.zig) streaming loops.
 pub fn abortStream(io: std.Io, req_state: *engine.RequestState, allocator: std.mem.Allocator) void {
     req_state.requestCancel();
-    while (req_state.completion.waitForToken(io) catch null) |e| {
+    while (!req_state.engine_done.load(.acquire)) {
+        while (req_state.completion.tryGetToken(io)) |e| {
+            if (e.token_text.len > 0) allocator.free(e.token_text);
+        }
+        io.sleep(.fromMilliseconds(1), .awake) catch {};
+    }
+    // Final drain of anything queued between the last poll and engine_done.
+    while (req_state.completion.tryGetToken(io)) |e| {
         if (e.token_text.len > 0) allocator.free(e.token_text);
-        if (e.is_final) break;
     }
 }
 

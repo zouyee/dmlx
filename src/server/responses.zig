@@ -704,7 +704,14 @@ fn handleResponsesStream(
 
     const request_id = state.next_request_id.fetchAdd(1, .monotonic);
     const req_state = try engine.RequestState.init(allocator, request_id, request_config);
-    defer req_state.deinit();
+    // The wait is conditional: fallible SSE writes between here and the push
+    // can return early with the request never submitted, and an unsubmitted
+    // request never gets engine_done set.
+    var req_submitted = false;
+    defer {
+        if (req_submitted) req_state.waitEngineDone(io);
+        req_state.deinit();
+    }
     prepared.vision = null;
 
     try sse_mod.writeSSEHeaders(connection, io);
@@ -726,6 +733,7 @@ fn handleResponsesStream(
 
     var node = engine.QueueNode.init(req_state);
     state.request_queue.push(&node);
+    req_submitted = true;
 
     var all_text = std.ArrayList(u8).empty;
     defer all_text.deinit(allocator);
@@ -761,6 +769,10 @@ fn handleResponsesStream(
             }
         } else break;
     }
+
+    // Engine may still be finishing after the final event; wait so the
+    // token_count/error reads below and the deferred deinit are race-free.
+    req_state.waitEngineDone(io);
 
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 

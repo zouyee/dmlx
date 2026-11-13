@@ -209,7 +209,17 @@ pub const GenerateConfig = struct {
     seed: u64 = 0,
     /// Repetition penalty (1.0 = no penalty, >1.0 reduces repeated tokens).
     repetition_penalty: f32 = 1.0,
+    /// Optional cancellation flag (server: set by the HTTP fiber on client
+    /// disconnect). Polled once per decode step; when set, generation
+    /// truncates early and returns the tokens produced so far.
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
 };
+
+/// Whether cancellation has been requested for this generation run.
+pub fn cancelRequested(config: GenerateConfig) bool {
+    const flag = config.cancel_flag orelse return false;
+    return flag.load(.acquire);
+}
 
 // ============================================================
 // Layer 1: generateStep — single forward pass → sampled token
@@ -369,6 +379,7 @@ pub fn streamGenerate(
         var generated: usize = 1;
 
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -480,6 +491,7 @@ fn streamGenerateCtxImpl(
         var generated: usize = 1;
 
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -589,6 +601,7 @@ fn generateImpl(
         var prev_token = first_result.token;
 
         while (result.items.len < config.max_tokens) {
+            if (cancelRequested(config)) break;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -662,6 +675,7 @@ pub fn streamGenerateSpeculative(
         // Decode loop with speculative decoding
         var generated: usize = 1;
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             // Save KV cache lengths for potential rollback
             const cache_lens = try ctx.allocator.alloc(usize, caches.len);
             defer ctx.allocator.free(cache_lens);
@@ -799,6 +813,7 @@ pub fn streamGenerateEagle(
         // Decode loop with EAGLE speculative decoding
         var generated: usize = 1;
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             // Single-token forward to get hidden state for EAGLE draft
             const last_token = context.items[context.items.len - 1];
             const input_arr = try Array.fromData(
@@ -932,4 +947,110 @@ pub fn isStopToken(token: u32, stop_tokens: []const u32) bool {
         if (token == st) return true;
     }
     return false;
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+const test_vocab = 8;
+
+fn testForward(_: *anyopaque, input: Array, _: ?Array, _: ?[]KVCacheStrategy) anyerror!Array {
+    var data = [_]f32{0} ** test_vocab;
+    data[3] = 1.0; // greedy always picks token 3
+    const in_shape = input.shape();
+    return Array.fromData(std.testing.allocator, f32, &data, &[_]i32{ 1, @intCast(in_shape[1]), test_vocab });
+}
+
+fn testDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
+
+fn testModel() ModelVTable {
+    return .{
+        .forward = &testForward,
+        .deinit = &testDeinit,
+        .config = .{
+            .num_layers = 0,
+            .num_kv_heads = 0,
+            .head_dim = 0,
+            .vocab_size = test_vocab,
+            .hidden_size = 0,
+        },
+        .ptr = @ptrCast(@constCast(&test_model_sentinel)),
+    };
+}
+
+var test_model_sentinel: u8 = 0;
+
+test "cancelRequested: null flag is false, set flag is true" {
+    var config = GenerateConfig{};
+    try std.testing.expect(!cancelRequested(config));
+    var flag = std.atomic.Value(bool).init(true);
+    config.cancel_flag = &flag;
+    try std.testing.expect(cancelRequested(config));
+    flag.store(false, .release);
+    try std.testing.expect(!cancelRequested(config));
+}
+
+test "streamGenerateCtx: pre-set cancel flag truncates after the prefill token" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    var caches = [_]KVCacheStrategy{};
+
+    var flag = std.atomic.Value(bool).init(true);
+    const config = GenerateConfig{
+        .max_tokens = 16,
+        .temperature = 0,
+        .cancel_flag = &flag,
+    };
+
+    const CbCtx = struct {
+        calls: usize = 0,
+        last_is_done: bool = false,
+        fn callback(ptr: *anyopaque, _: u32, is_done: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_is_done = is_done;
+        }
+    };
+    var cb_ctx = CbCtx{};
+
+    try streamGenerateCtx(
+        testModel(),
+        &[_]u32{1},
+        config,
+        &caches,
+        ctx,
+        @ptrCast(&cb_ctx),
+        &CbCtx.callback,
+    );
+
+    // Prefill token is delivered (non-final), then the decode loop sees the
+    // flag and returns without generating further tokens.
+    try std.testing.expectEqual(@as(usize, 1), cb_ctx.calls);
+    try std.testing.expect(!cb_ctx.last_is_done);
+}
+
+test "generate: cancel flag set mid-run truncates the token sequence" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    var caches = [_]KVCacheStrategy{};
+
+    var flag = std.atomic.Value(bool).init(false);
+    const config = GenerateConfig{
+        .max_tokens = 16,
+        .temperature = 0,
+        .cancel_flag = &flag,
+    };
+
+    const model = testModel();
+    // No cancel: full run to max_tokens.
+    const full = try generate(model, &[_]u32{1}, config, &caches, ctx);
+    defer allocator.free(full);
+    try std.testing.expectEqual(@as(usize, 16), full.len);
+
+    // Cancel requested before the call: only the prefill token survives.
+    flag.store(true, .release);
+    const truncated = try generate(model, &[_]u32{1}, config, &caches, ctx);
+    defer allocator.free(truncated);
+    try std.testing.expectEqual(@as(usize, 1), truncated.len);
 }
