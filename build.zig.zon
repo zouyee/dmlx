@@ -5,8 +5,8 @@
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .mlx_z = .{
-            .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.0.3.tar.gz",
-            .hash = "mlx_z-0.1.0--3FlNWAXBgAkJR5o7SVjHxQAFxYXbU9cesj3afCAmXox",
+            .url = "https://github.com/zouyee/mlx-zig/archive/refs/tags/v0.0.4.tar.gz",
+            .hash = "mlx_z-0.1.0--3FlNV0cBgBTDzKsTnyfQ8URhVgBvpu9sFg_-g2M3qiT",
         },
         .zig_regex = .{
             .url = "https://github.com/zig-utils/zig-regex/archive/49fae00540d26fd3e7bdeda70864021c90d3e38f.tar.gz",
