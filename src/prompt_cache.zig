@@ -148,22 +148,25 @@ pub fn loadPromptCache(
         return PromptCacheError.MissingMetadata;
 
     // Validate against model config
+    // Silent under `zig build test`: the build runner replays any captured
+    // stderr as a spurious "failed command" block (see tests.zig convention).
+    const quiet = @import("builtin").is_test;
     if (num_layers != model_config.num_layers) {
-        std.log.warn(
+        if (!quiet) std.log.warn(
             "Prompt cache incompatible: num_layers mismatch (cache={d}, model={d})",
             .{ num_layers, model_config.num_layers },
         );
         return PromptCacheError.NumLayersMismatch;
     }
     if (head_dim != model_config.head_dim) {
-        std.log.warn(
+        if (!quiet) std.log.warn(
             "Prompt cache incompatible: head_dim mismatch (cache={d}, model={d})",
             .{ head_dim, model_config.head_dim },
         );
         return PromptCacheError.HeadDimMismatch;
     }
     if (num_kv_heads != model_config.num_kv_heads) {
-        std.log.warn(
+        if (!quiet) std.log.warn(
             "Prompt cache incompatible: num_kv_heads mismatch (cache={d}, model={d})",
             .{ num_kv_heads, model_config.num_kv_heads },
         );

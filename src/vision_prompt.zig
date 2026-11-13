@@ -88,10 +88,9 @@ pub fn validatePadCount(tokens: []const u32, image_token_id: u32, want_pads: usi
     var n_pads: usize = 0;
     for (tokens) |t| n_pads += @intFromBool(t == image_token_id);
     if (n_pads != want_pads) {
-        // warn under `zig build test` (the runner fails tests on err logs).
-        if (@import("builtin").is_test)
-            std.log.warn("vision prompt: {d} image pads encoded, tower produced {d}", .{ n_pads, want_pads })
-        else
+        // Silent under `zig build test`: the runner fails tests on err logs
+        // and replays any captured stderr as a "failed command".
+        if (!@import("builtin").is_test)
             std.log.err("vision prompt: {d} image pads encoded, tower produced {d}", .{ n_pads, want_pads });
         return error.ImageBlockMismatch;
     }

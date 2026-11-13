@@ -31,6 +31,8 @@ test "P4.2: Expert deduplication reduces redundant loads" {
     // Simulate overlap: some experts are selected by multiple tokens
     const batch_size = 8;
     const topk = 6;
+    _ = batch_size;
+    _ = topk;
 
     // Realistic routing pattern: tokens share some experts (simulating semantic similarity)
     // Token 0: [87, 0, 31, 22, 15, 100]
@@ -76,12 +78,7 @@ test "P4.2: Expert deduplication reduces redundant loads" {
     const total_selections = indices_data.len;
     const unique_count = unique_ids.len;
     const dedup_rate = @as(f64, @floatFromInt(total_selections - unique_count)) / @as(f64, @floatFromInt(total_selections)) * 100.0;
-
-    std.debug.print("\n=== P4.2 Expert Deduplication Verification ===\n", .{});
-    std.debug.print("Batch size: {d} tokens × {d} experts/token = {d} total selections\n", .{ batch_size, topk, total_selections });
-    std.debug.print("Unique experts after deduplication: {d}\n", .{unique_count});
-    std.debug.print("Deduplication rate: {d:.1}% reduction\n", .{dedup_rate});
-    std.debug.print("Unique expert IDs (sorted): {any}\n", .{unique_ids});
+    _ = dedup_rate;
 
     // Verify deduplication effectiveness
     // Expected: 30-50% reduction for realistic prefill scenarios
@@ -144,16 +141,10 @@ test "P4.2: Expert deduplication reduces redundant loads" {
     const loads_with_dedup = 3 * unique_count;
     const load_reduction = @as(f64, @floatFromInt(loads_without_dedup - loads_with_dedup)) / @as(f64, @floatFromInt(loads_without_dedup)) * 100.0;
 
-    std.debug.print("\n=== Load Reduction Analysis ===\n", .{});
-    std.debug.print("Without dedup: {d} expert loads (3 projections × {d} selections)\n", .{ loads_without_dedup, total_selections });
-    std.debug.print("With dedup: {d} expert loads (3 projections × {d} unique)\n", .{ loads_with_dedup, unique_count });
-    std.debug.print("Load reduction: {d:.1}% fewer expert loads\n", .{load_reduction});
-
     // Verify significant load reduction
     try std.testing.expect(loads_with_dedup < loads_without_dedup);
     try std.testing.expect(load_reduction >= 20.0); // At least 20% reduction
 
-    std.debug.print("\n✓ P4.2 verification passed: Experts are deduplicated and loaded only once\n", .{});
 }
 
 test "P4.2: Remap preserves expert identity across tokens" {
@@ -236,8 +227,6 @@ test "P4.2: Remap preserves expert identity across tokens" {
     const remap_60 = remap_data[60];
     try std.testing.expectEqual(remap_60, remap_data[indices_data[8]]);
     try std.testing.expectEqual(remap_60, remap_data[indices_data[11]]);
-
-    std.debug.print("\n✓ P4.2 identity preservation verified: Same expert → same remapped index\n", .{});
 }
 
 test "P4.2: Edge case - all tokens route to same experts" {
@@ -282,15 +271,9 @@ test "P4.2: Edge case - all tokens route to same experts" {
     const total_selections = batch_size * topk;
     const dedup_rate = @as(f64, @floatFromInt(total_selections - topk)) / @as(f64, @floatFromInt(total_selections)) * 100.0;
 
-    std.debug.print("\n=== P4.2 Edge Case: Maximum Deduplication ===\n", .{});
-    std.debug.print("Total selections: {d} ({d} tokens × {d} experts/token)\n", .{ total_selections, batch_size, topk });
-    std.debug.print("Unique experts: {d}\n", .{topk});
-    std.debug.print("Deduplication rate: {d:.1}% (maximum possible)\n", .{dedup_rate});
-
     // Verify maximum deduplication achieved
     try std.testing.expect(dedup_rate > 85.0); // Should be ~87.5% for 8 tokens × 6 experts → 6 unique
 
-    std.debug.print("✓ P4.2 edge case verified: Maximum deduplication achieved\n", .{});
 }
 
 test "P4.2: Edge case - no overlap between tokens" {
@@ -334,11 +317,4 @@ test "P4.2: Edge case - no overlap between tokens" {
     // Expected: batch_size × topk unique experts (no deduplication)
     const expected_unique = batch_size * topk;
     try std.testing.expectEqual(expected_unique, unique_ids.len);
-
-    std.debug.print("\n=== P4.2 Edge Case: No Overlap ===\n", .{});
-    std.debug.print("Total selections: {d}\n", .{indices_data.len});
-    std.debug.print("Unique experts: {d}\n", .{unique_ids.len});
-    std.debug.print("Deduplication rate: 0% (no overlap)\n", .{});
-
-    std.debug.print("✓ P4.2 edge case verified: No deduplication when no overlap\n", .{});
 }

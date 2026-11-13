@@ -327,7 +327,6 @@ test "Property 6: Fused SwiGLU numerical equivalence across random shapes (100 i
     }
 
     // Log minimum similarity observed across all iterations
-    std.debug.print("\n[Property 6 - SwiGLU] {d} iterations completed. Min cosine similarity: {d:.6}\n", .{ num_iterations, min_similarity });
 }
 
 test "Property 6: Fused AdamW numerical equivalence across random shapes (100 iterations)" {
@@ -432,5 +431,4 @@ test "Property 6: Fused AdamW numerical equivalence across random shapes (100 it
     }
 
     // Log minimum similarities observed
-    std.debug.print("\n[Property 6 - AdamW] {d} iterations completed. Min cosine similarity — param: {d:.6}, m: {d:.6}, v: {d:.6}\n", .{ num_iterations, min_sim_param, min_sim_m, min_sim_v });
 }

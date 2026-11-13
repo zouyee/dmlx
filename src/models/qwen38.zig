@@ -98,10 +98,9 @@ pub const VisionError = error{VisionInputNotSupported};
 pub fn rejectVisionTokens(ids: []const u32) VisionError!void {
     for (ids) |t| {
         if (t >= vision_token_lo and t <= vision_token_hi) {
-            // warn under `zig build test` (the runner fails tests on err logs).
-            if (@import("builtin").is_test)
-                std.log.warn("qwen38: vision input not supported (token id {d})", .{t})
-            else
+            // Silent under `zig build test`: the runner fails tests on err
+            // logs and replays any captured stderr as a "failed command".
+            if (!@import("builtin").is_test)
                 std.log.err("qwen38: vision input not supported (token id {d} in vision range [{d}, {d}])", .{ t, vision_token_lo, vision_token_hi });
             return VisionError.VisionInputNotSupported;
         }
@@ -1628,40 +1627,43 @@ pub const Qwen38ServingModel = struct {
     /// Build and warm the compiled GDN/MLP decode closures. Best-effort: a
     /// compile or warm failure disables just that path (eager fallback).
     fn initCompiledSteps(self: *Qwen38ServingModel) void {
+        // Silence the status prints under `zig build test`: the build runner
+        // replays any captured stderr as a spurious "failed command" block.
+        const quiet = @import("builtin").is_test;
         if (qwen38_gdn.compiledStep(self.allocator, true)) |cc| {
             if (self.warmGdnStep(cc)) {
                 self.gdn_step_compiled = cc;
-                std.debug.print("info: compiled GDN decode step active\n", .{});
+                if (!quiet) std.debug.print("info: compiled GDN decode step active\n", .{});
             } else {
-                std.debug.print("warn: compiled GDN step warm failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled GDN step warm failed — eager fallback\n", .{});
                 cc.deinit();
             }
         } else |_| {
-            std.debug.print("warn: compiled GDN step build failed — eager fallback\n", .{});
+            if (!quiet) std.debug.print("warn: compiled GDN step build failed — eager fallback\n", .{});
         }
         if (compiledMlpSwiglu(self.allocator)) |mc| {
             if (self.warmMlpSwiglu(mc)) {
                 self.mlp_swiglu_compiled = mc;
-                std.debug.print("info: compiled MLP swiglu core active\n", .{});
+                if (!quiet) std.debug.print("info: compiled MLP swiglu core active\n", .{});
             } else {
-                std.debug.print("warn: compiled MLP swiglu warm failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled MLP swiglu warm failed — eager fallback\n", .{});
                 mc.deinit();
             }
         } else |_| {
-            std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
+            if (!quiet) std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
         }
         // Fused gate|up variant: only when the layer weights fused at init.
         if (self.layers[0].mlp_gate_up != null) {
             if (compiledMlpSwigluFused(self.allocator)) |mc| {
                 if (self.warmMlpSwigluFused(mc)) {
                     self.mlp_swiglu_fused_compiled = mc;
-                    std.debug.print("info: compiled fused MLP gate_up+swiglu core active\n", .{});
+                    if (!quiet) std.debug.print("info: compiled fused MLP gate_up+swiglu core active\n", .{});
                 } else {
-                    std.debug.print("warn: compiled fused MLP swiglu warm failed — unfused fallback\n", .{});
+                    if (!quiet) std.debug.print("warn: compiled fused MLP swiglu warm failed — unfused fallback\n", .{});
                     mc.deinit();
                 }
             } else |_| {
-                std.debug.print("warn: compiled fused MLP swiglu build failed — unfused fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled fused MLP swiglu build failed — unfused fallback\n", .{});
             }
         }
         // Attention pre-cache segment: only for the exact config the closure
@@ -1673,13 +1675,13 @@ pub const Qwen38ServingModel = struct {
             if (qwen38_attn.compiledPreCache(self.allocator)) |ac| {
                 if (self.warmAttnPreCache(ac)) {
                     self.attn_precache_compiled = ac;
-                    std.debug.print("info: compiled attention pre-cache segment active\n", .{});
+                    if (!quiet) std.debug.print("info: compiled attention pre-cache segment active\n", .{});
                 } else {
-                    std.debug.print("warn: compiled attn pre-cache warm failed — eager fallback\n", .{});
+                    if (!quiet) std.debug.print("warn: compiled attn pre-cache warm failed — eager fallback\n", .{});
                     ac.deinit();
                 }
             } else |_| {
-                std.debug.print("warn: compiled attn pre-cache build failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled attn pre-cache build failed — eager fallback\n", .{});
             }
         }
     }
@@ -1980,9 +1982,7 @@ pub const Qwen38ServingModel = struct {
                 t != cfg.vision_start_token_id and t != cfg.vision_end_token_id and
                 t != cfg.image_token_id)
             {
-                if (@import("builtin").is_test)
-                    std.log.warn("qwen38: vision input not supported (token id {d})", .{t})
-                else
+                if (!@import("builtin").is_test)
                     std.log.err("qwen38: vision input not supported (token id {d} in vision range [{d}, {d}])", .{ t, vision_token_lo, vision_token_hi });
                 return VisionError.VisionInputNotSupported;
             }

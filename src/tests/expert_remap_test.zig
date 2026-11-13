@@ -47,18 +47,11 @@ test "mlx_take remap with 2D indices - exact scenario from logs" {
     // Check results using dataSlice (same method as in streamingForward)
     const result = try remapped_u32.dataSlice(u32);
 
-    std.debug.print("\nTest results:\n", .{});
-    std.debug.print("indices:  {any}\n", .{indices_data});
-    std.debug.print("remapped: {any}\n", .{result[0..6]});
-    std.debug.print("expected: [3, 0, 2, 0, 1, 0]\n", .{});
-
-    // Verify each element
-    std.debug.print("\nPer-element verification:\n", .{});
+    // Verify each element against the remap table
     for (indices_data, 0..) |idx, i| {
         const expected = remap_data[idx];
         const actual = @as(i32, @intCast(result[i]));
-        const match = if (expected == actual) "✓" else "✗";
-        std.debug.print("  [{d}]: indices={d} → remap[{d}]={d}, got {d} {s}\n", .{ i, idx, idx, expected, actual, match });
+        try std.testing.expectEqual(expected, actual);
     }
 
     // Assert expected values
@@ -103,10 +96,6 @@ test "mlx_take remap with 1D indices - control test" {
     try remapped_u32.eval();
 
     const result = try remapped_u32.dataSlice(u32);
-
-    std.debug.print("\n1D Control test results:\n", .{});
-    std.debug.print("indices:  {any}\n", .{indices_data});
-    std.debug.print("remapped: {any}\n", .{result[0..6]});
 
     // Assert expected values
     try std.testing.expectEqual(@as(u32, 3), result[0]);

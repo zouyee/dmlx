@@ -123,12 +123,14 @@ pub const RegistryError = error{
 /// containing the queried name when the architecture is not registered.
 pub fn getLoader(arch_name: []const u8) RegistryError!ModelLoader {
     return model_registry.get(arch_name) orelse {
-        std.log.warn("Unsupported model architecture: \"{s}\". Supported architectures: " ++
-            "LlamaForCausalLM, DeepseekV4ForCausalLM, MistralForCausalLM, " ++
-            "Qwen2ForCausalLM, Qwen3ForCausalLM, GemmaForCausalLM, " ++
-            "Glm4ForCausalLM, PhiForCausalLM, Phi3ForCausalLM, " ++
-            "LlavaForConditionalGeneration, Glm5NextForConditionalGeneration, " ++
-            "Qwen3_5ForConditionalGeneration", .{arch_name});
+        // Silent under `zig build test` (stderr noise trips the build runner).
+        if (!@import("builtin").is_test)
+            std.log.warn("Unsupported model architecture: \"{s}\". Supported architectures: " ++
+                "LlamaForCausalLM, DeepseekV4ForCausalLM, MistralForCausalLM, " ++
+                "Qwen2ForCausalLM, Qwen3ForCausalLM, GemmaForCausalLM, " ++
+                "Glm4ForCausalLM, PhiForCausalLM, Phi3ForCausalLM, " ++
+                "LlavaForConditionalGeneration, Glm5NextForConditionalGeneration, " ++
+                "Qwen3_5ForConditionalGeneration", .{arch_name});
         return RegistryError.UnsupportedArchitecture;
     };
 }

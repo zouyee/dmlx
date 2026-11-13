@@ -742,18 +742,15 @@ test "golden tinyllama e2e — output tokens match python reference (conditional
     });
 
     if (posix_c.access(prompt_path, posix_c.F_OK) != 0) {
-        std.debug.print("SKIP: TinyLlama golden data not found. Run `python tests/generate_golden.py` to generate.\n", .{});
-        return;
+        return error.SkipZigTest; // golden data absent: run tests/generate_golden.py
     }
     if (posix_c.access(output_path, posix_c.F_OK) != 0) {
-        std.debug.print("SKIP: TinyLlama golden output data not found.\n", .{});
-        return;
+        return error.SkipZigTest; // golden output data absent
     }
 
     // Read prompt tokens via POSIX fread
     const prompt_fp = posix_c.fopen(prompt_path, "rb") orelse {
-        std.debug.print("SKIP: Failed to open TinyLlama prompt tokens.\n", .{});
-        return;
+        return error.SkipZigTest; // failed to open prompt tokens
     };
     defer _ = posix_c.fclose(prompt_fp);
 
@@ -772,8 +769,7 @@ test "golden tinyllama e2e — output tokens match python reference (conditional
 
     // Read output tokens via POSIX fread
     const output_fp = posix_c.fopen(output_path, "rb") orelse {
-        std.debug.print("SKIP: Failed to open TinyLlama output tokens.\n", .{});
-        return;
+        return error.SkipZigTest; // failed to open output tokens
     };
     defer _ = posix_c.fclose(output_fp);
 
@@ -806,9 +802,4 @@ test "golden tinyllama e2e — output tokens match python reference (conditional
     for (output_data) |tok| {
         try std.testing.expect(tok >= 0);
     }
-
-    std.debug.print(
-        "TinyLlama e2e golden data validated: {d} prompt tokens, {d} output tokens\n",
-        .{ prompt_data.len, output_data.len },
-    );
 }
