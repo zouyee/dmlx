@@ -546,6 +546,16 @@ pub fn writeResponseAlloc(connection: std.Io.net.Stream, status: u16, content_ty
 
 const unistd_c = @cImport(@cInclude("unistd.h"));
 
+/// Disables SIGPIPE on a connected socket (Darwin/BSD only; Linux uses
+/// MSG_NOSIGNAL in send, and this server targets macOS).
+fn setNoSigPipe(fd: std.posix.fd_t) void {
+    const builtin = @import("builtin");
+    if (comptime !builtin.os.tag.isDarwin()) return;
+    const csock = @cImport(@cInclude("sys/socket.h"));
+    const one: c_int = 1;
+    _ = csock.setsockopt(fd, csock.SOL_SOCKET, csock.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+}
+
 fn writeAllFd(fd: c_int, data: []const u8) !void {
     var remaining = data;
     while (remaining.len > 0) {
@@ -573,6 +583,11 @@ pub fn handleConnection(
     config: ServerConfig,
 ) void {
     const t_conn_enter = std.c.mach_absolute_time();
+    // macOS raises SIGPIPE (default disposition: process termination) when a
+    // write hits a socket whose peer went away — e.g. an SSE stream aborted
+    // mid-flight by the client. SO_NOSIGPIPE turns that into an EPIPE error
+    // from write/send instead, which the write paths already propagate.
+    setNoSigPipe(connection.socket.handle);
     defer {
         const t_conn_exit = std.c.mach_absolute_time();
         const conn_ms = @as(f64, @floatFromInt(t_conn_exit - t_conn_enter)) * 125.0 / 3_000_000.0;

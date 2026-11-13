@@ -99,14 +99,33 @@ pub fn handleStreamingCompletion(
     state.request_queue.push(&node);
 
     // 7. Stream tokens from CompletionSignal to SSE.
-    var token_count: usize = 0;
-    _ = io.async(keepAliveLoop, .{ io, &sse, &token_count });
+    // The keep-alive fiber borrows `sse` and `stop_keepalive` from this
+    // stack frame, so it MUST be cancelled before this function returns —
+    // the defer guarantees that on every exit path (including a write error
+    // from an aborted client connection). Without it the fiber can wake up
+    // after the frame is gone and write through dangling pointers.
+    var stop_keepalive = std.atomic.Value(bool).init(false);
+    var ka_future = io.async(keepAliveLoop, .{ io, &sse, &stop_keepalive });
+    var ka_running = true;
+    defer {
+        if (ka_running) {
+            stop_keepalive.store(true, .release);
+            ka_future.cancel(io);
+        }
+    }
 
     while (true) {
         const event = req_state.completion.waitForToken(io) catch break;
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
-            token_count += 1;
+            if (ka_running) {
+                // First token: prefill is done, keep-alives are no longer
+                // needed. Join the fiber before any further writes so it
+                // can never write concurrently with a token chunk.
+                stop_keepalive.store(true, .release);
+                ka_future.cancel(io);
+                ka_running = false;
+            }
 
             const finish: ?[]const u8 = if (e.is_final)
                 if (e.finish_reason) |fr|
@@ -121,10 +140,21 @@ pub fn handleStreamingCompletion(
                 null;
             const chunk = try formatSSEChunk(allocator, completion_id, created, req.model, e.token_text, finish);
             defer allocator.free(chunk);
-            try sse.sendEvent(chunk);
+            sse.sendEvent(chunk) catch {
+                // Client aborted mid-stream: the engine thread keeps
+                // calling deliverToken into req_state.completion until the
+                // request finishes, so this frame must not unwind (the
+                // req_state defer would free the signal out from under the
+                // engine). Cancel the request and drain the signal instead.
+                abortStream(io, req_state, allocator);
+                return;
+            };
 
             if (e.is_final) {
-                try sse.sendEvent("[DONE]");
+                sse.sendEvent("[DONE]") catch {
+                    abortStream(io, req_state, allocator);
+                    return;
+                };
                 break;
             }
         } else {
@@ -135,12 +165,27 @@ pub fn handleStreamingCompletion(
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 }
 
-/// SSE keep-alive fiber: sends a comment every 5s until the first token
-/// is generated (indicating prefill is complete).
-fn keepAliveLoop(io_arg: std.Io, sse_arg: *SSEWriter, token_count: *usize) void {
-    while (token_count.* == 0) {
+/// Client disconnected mid-stream: request cancellation (so a still-queued
+/// request never starts) and drain the completion signal until the engine
+/// reports the request done. Only after that is it safe for the caller's
+/// req_state.deinit() to run.
+fn abortStream(io: std.Io, req_state: *engine.RequestState, allocator: std.mem.Allocator) void {
+    req_state.requestCancel();
+    while (req_state.completion.waitForToken(io) catch null) |e| {
+        if (e.token_text.len > 0) allocator.free(e.token_text);
+        if (e.is_final) break;
+    }
+}
+
+/// SSE keep-alive fiber: sends a comment every 5s until `stop` is set
+/// (first token generated, or the handler is tearing down). The owner
+/// cancels the fiber before its stack frame exits; `sleep` is the
+/// cancellation point, and write failures (e.g. the client aborted the
+/// connection) terminate the loop.
+fn keepAliveLoop(io_arg: std.Io, sse_arg: *SSEWriter, stop: *std.atomic.Value(bool)) void {
+    while (!stop.load(.acquire)) {
         io_arg.sleep(.fromMilliseconds(5000), .awake) catch break;
-        if (token_count.* > 0) break;
+        if (stop.load(.acquire)) break;
         sse_arg.sendKeepAlive() catch break;
     }
 }
