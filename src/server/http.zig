@@ -546,14 +546,17 @@ pub fn writeResponseAlloc(connection: std.Io.net.Stream, status: u16, content_ty
 
 const unistd_c = @cImport(@cInclude("unistd.h"));
 
-/// Disables SIGPIPE on a connected socket (Darwin/BSD only; Linux uses
-/// MSG_NOSIGNAL in send, and this server targets macOS).
+/// Disables SIGPIPE on a connected socket. Darwin/BSD set SO_NOSIGPIPE;
+/// other targets are a comptime no-op (Linux send uses MSG_NOSIGNAL, and
+/// this server targets macOS) so a future Linux build can't trip on the
+/// Darwin-only constant.
 fn setNoSigPipe(fd: std.posix.fd_t) void {
     const builtin = @import("builtin");
-    if (comptime !builtin.os.tag.isDarwin()) return;
-    const csock = @cImport(@cInclude("sys/socket.h"));
-    const one: c_int = 1;
-    _ = csock.setsockopt(fd, csock.SOL_SOCKET, csock.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+    if (comptime builtin.os.tag.isDarwin()) {
+        const csock = @cImport(@cInclude("sys/socket.h"));
+        const one: c_int = 1;
+        _ = csock.setsockopt(fd, csock.SOL_SOCKET, csock.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+    }
 }
 
 fn writeAllFd(fd: c_int, data: []const u8) !void {

@@ -115,7 +115,14 @@ pub fn handleStreamingCompletion(
     }
 
     while (true) {
-        const event = req_state.completion.waitForToken(io) catch break;
+        const event = req_state.completion.waitForToken(io) catch {
+            // Fiber cancelled mid-stream: the engine may still be
+            // delivering into req_state.completion, so cancel + drain
+            // before this frame unwinds (same contract as the write-error
+            // path below).
+            abortStream(io, req_state, allocator);
+            break;
+        };
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
             if (ka_running) {
@@ -138,7 +145,12 @@ pub fn handleStreamingCompletion(
                     "stop"
             else
                 null;
-            const chunk = try formatSSEChunk(allocator, completion_id, created, req.model, e.token_text, finish);
+            const chunk = formatSSEChunk(allocator, completion_id, created, req.model, e.token_text, finish) catch |err| {
+                // OOM with the engine possibly mid-generation: same
+                // cancel + drain contract before unwinding req_state.
+                abortStream(io, req_state, allocator);
+                return err;
+            };
             defer allocator.free(chunk);
             sse.sendEvent(chunk) catch {
                 // Client aborted mid-stream: the engine thread keeps
@@ -165,11 +177,12 @@ pub fn handleStreamingCompletion(
     metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
 }
 
-/// Client disconnected mid-stream: request cancellation (so a still-queued
-/// request never starts) and drain the completion signal until the engine
-/// reports the request done. Only after that is it safe for the caller's
-/// req_state.deinit() to run.
-fn abortStream(io: std.Io, req_state: *engine.RequestState, allocator: std.mem.Allocator) void {
+/// Client disconnected (or the handler is unwinding) mid-stream: request
+/// cancellation (so a still-queued request never starts) and drain the
+/// completion signal until the engine reports the request done. Only after
+/// that is it safe for the caller's req_state.deinit() to run. Shared by
+/// the chat (streaming.zig) and Responses (responses.zig) streaming loops.
+pub fn abortStream(io: std.Io, req_state: *engine.RequestState, allocator: std.mem.Allocator) void {
     req_state.requestCancel();
     while (req_state.completion.waitForToken(io) catch null) |e| {
         if (e.token_text.len > 0) allocator.free(e.token_text);

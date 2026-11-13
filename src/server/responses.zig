@@ -22,6 +22,7 @@ const state_mod = @import("state.zig");
 const utils_mod = @import("utils.zig");
 const http_mod = @import("http.zig");
 const sse_mod = @import("sse.zig");
+const streaming_mod = @import("streaming.zig");
 const metrics_mod = @import("metrics.zig");
 const openai_mod = @import("openai.zig");
 
@@ -630,6 +631,26 @@ fn sendResponsesEvent(sse: *sse_mod.SSEWriter, allocator: std.mem.Allocator, eve
     try w.interface.flush();
 }
 
+/// Accumulate one token's text and emit the output_text.delta SSE event.
+fn deliverResponsesDelta(
+    sse: *sse_mod.SSEWriter,
+    allocator: std.mem.Allocator,
+    all_text: *std.ArrayList(u8),
+    token_text: []const u8,
+    resp_id: []const u8,
+    msg_id: []const u8,
+) !void {
+    try all_text.appendSlice(allocator, token_text);
+    var escaped_delta = std.ArrayList(u8).empty;
+    defer escaped_delta.deinit(allocator);
+    try jsonEscapeInto(&escaped_delta, allocator, token_text);
+    const delta_payload = try std.fmt.allocPrint(allocator,
+        \\{{"type":"response.output_text.delta","response_id":"{s}","item_id":"{s}","output_index":0,"content_index":0,"delta":"{s}"}}
+    , .{ resp_id, msg_id, escaped_delta.items });
+    defer allocator.free(delta_payload);
+    try sendResponsesEvent(sse, allocator, "response.output_text.delta", delta_payload);
+}
+
 fn handleResponsesStream(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -711,19 +732,22 @@ fn handleResponsesStream(
     var finish_reason: []const u8 = "stop";
 
     while (true) {
-        const event = req_state.completion.waitForToken(io) catch break;
+        // Any failure inside this loop (write error, cancellation, OOM)
+        // while the engine may still be mid-generation must go through
+        // abortStream: cancel + drain the completion signal before this
+        // frame unwinds, or req_state.deinit() frees the signal out from
+        // under the engine's deliverToken calls.
+        const event = req_state.completion.waitForToken(io) catch {
+            streaming_mod.abortStream(io, req_state, allocator);
+            return error.Canceled;
+        };
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
             if (e.token_text.len > 0) {
-                try all_text.appendSlice(allocator, e.token_text);
-                var escaped_delta = std.ArrayList(u8).empty;
-                defer escaped_delta.deinit(allocator);
-                try jsonEscapeInto(&escaped_delta, allocator, e.token_text);
-                const delta_payload = try std.fmt.allocPrint(allocator,
-                    \\{{"type":"response.output_text.delta","response_id":"{s}","item_id":"{s}","output_index":0,"content_index":0,"delta":"{s}"}}
-                , .{ resp_id, msg_id, escaped_delta.items });
-                defer allocator.free(delta_payload);
-                try sendResponsesEvent(&sse, allocator, "response.output_text.delta", delta_payload);
+                deliverResponsesDelta(&sse, allocator, &all_text, e.token_text, resp_id, msg_id) catch |err| {
+                    streaming_mod.abortStream(io, req_state, allocator);
+                    return err;
+                };
             }
             if (e.is_final) {
                 if (e.finish_reason) |fr| {
