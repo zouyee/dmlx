@@ -127,7 +127,8 @@ pub fn enforceMemoryLimit(
     // Final check after all eviction attempts.
     const final_usage = getProcessMemoryBytes();
     if (final_usage > limit) {
-        std.log.warn(
+        // Silent under `zig build test` (stderr noise trips the build runner).
+        if (!@import("builtin").is_test) std.log.warn(
             "memory limiter: process using {d} bytes, limit is {d} bytes — rejecting request",
             .{ final_usage, limit },
         );

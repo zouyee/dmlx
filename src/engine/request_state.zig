@@ -6,6 +6,8 @@
 const std = @import("std");
 const completion_signal = @import("completion_signal.zig");
 const sampling_mod = @import("../sampling.zig");
+const generation_mod = @import("../generation.zig");
+const streaming_mod = @import("../tokenizer/streaming.zig");
 
 pub const CompletionSignal = completion_signal.CompletionSignal;
 pub const TokenEvent = completion_signal.TokenEvent;
@@ -50,6 +52,10 @@ pub const RequestConfig = struct {
     guided_json_schema: ?[]const u8 = null,
     /// Guided decoding: regex pattern constraint (null = unconstrained).
     guided_regex: ?[]const u8 = null,
+    /// Vision payload (Qwen3.8 image prompts): tower features + blocks for
+    /// the vision prefill. Null for text-only requests. Ownership transfers
+    /// to the RequestState.
+    vision: ?generation_mod.VisionData = null,
     /// Sequence index in the shared PagedKVCache (assigned by EngineLoop).
     seq_index: usize = 0,
 };
@@ -86,12 +92,18 @@ pub const RequestState = struct {
     guided_json_schema: ?[]const u8,
     /// Guided decoding: regex pattern constraint (null = unconstrained).
     guided_regex: ?[]const u8,
+    /// Vision payload for the prefill (owned; null for text-only requests).
+    vision: ?generation_mod.VisionData,
 
     // --- Mutable state (written by Engine via signal, read by HTTP after signal) ---
     /// Accumulated generated tokens.
     generated_tokens: std.ArrayList(u32),
     /// Decoded text buffer for stop-string detection.
     text_buffer: std.ArrayList(u8),
+    /// Incremental detokenizer for streaming requests (lazily created by the
+    /// engine on the first streamed token; null for non-streaming requests).
+    /// Concatenating its deltas equals the full-sequence decode byte-exactly.
+    stream_detok: ?streaming_mod.StreamingDetokenizer,
     /// Number of tokens generated so far.
     token_count: usize,
     /// Whether generation is complete.
@@ -116,6 +128,12 @@ pub const RequestState = struct {
     completion: CompletionSignal,
     /// Whether cancellation has been requested (by HTTP fiber on disconnect).
     cancel_requested: std.atomic.Value(bool),
+    /// Set by the engine when it will never touch this RequestState again
+    /// (all tokens delivered AND post-generation bookkeeping done). The HTTP
+    /// handler must observe this before deinit — the final token event alone
+    /// does NOT mean the engine is done (prefix-cache store, completion
+    /// logging, and token_count writes happen after the final delivery).
+    engine_done: std.atomic.Value(bool),
     /// Timestamp when request was pushed to engine queue (HTTP side).
     queued_time_ns: i128,
     /// Start timestamp (nanoseconds) for request latency tracking.
@@ -143,18 +161,21 @@ pub const RequestState = struct {
             .model_name = config.model_name,
             .guided_json_schema = config.guided_json_schema,
             .guided_regex = config.guided_regex,
+            .vision = config.vision,
             .phase = .waiting,
             .seq_index = config.seq_index,
             .sampler = SamplerConfig.init(config.seed),
             .prefill_offset = 0,
             .generated_tokens = std.ArrayList(u32).empty,
             .text_buffer = std.ArrayList(u8).empty,
+            .stream_detok = null,
             .token_count = 0,
             .done = false,
             .finish_reason = null,
             .error_msg = null,
             .completion = CompletionSignal.init(allocator),
             .cancel_requested = std.atomic.Value(bool).init(false),
+            .engine_done = std.atomic.Value(bool).init(false),
             .queued_time_ns = 0,
             .start_time_ns = 0,
         };
@@ -165,8 +186,10 @@ pub const RequestState = struct {
     pub fn deinit(self: *RequestState) void {
         const allocator = self.allocator;
         allocator.free(self.prompt_tokens);
+        if (self.vision) |*vis| vis.deinit(allocator);
         self.generated_tokens.deinit(allocator);
         self.text_buffer.deinit(allocator);
+        if (self.stream_detok) |*detok| detok.deinit();
         self.completion.deinit();
         allocator.destroy(self);
     }
@@ -189,5 +212,20 @@ pub const RequestState = struct {
     /// Request cancellation (called by HTTP fiber on client disconnect).
     pub fn requestCancel(self: *RequestState) void {
         self.cancel_requested.store(true, .release);
+    }
+
+    /// Called by the engine when it will never touch this RequestState again.
+    pub fn markEngineDone(self: *RequestState) void {
+        self.engine_done.store(true, .release);
+    }
+
+    /// Block the calling (HTTP) fiber until the engine has fully released
+    /// this request. Required before deinit whenever the request was
+    /// submitted: the final token event precedes the engine's post-generation
+    /// bookkeeping, and freeing early races with it.
+    pub fn waitEngineDone(self: *RequestState, io: std.Io) void {
+        while (!self.engine_done.load(.acquire)) {
+            io.sleep(.fromMilliseconds(1), .awake) catch {};
+        }
     }
 };

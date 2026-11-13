@@ -22,10 +22,11 @@ Branch `glm53-mlx-support`, HEAD after Task 7 + GDN prefill optimization: see
   streaming + non-streaming; 7-prompt acceptance (short QA / code / long
   instruction) all returned `finish_reason: "stop"`, server survives
   sequential requests (per-layer GDN/attention caches reset on each prefill).
-- Vision input rejected explicitly: token ids 248053–248057
-  (`<|vision_start|>`, `<|vision_end|>`, `<|vision_pad|>`, `<|image_pad|>`,
-  `<|video_pad|>`) raise `error.VisionInputNotSupported` from
-  `Qwen38ServingModel.forwardTokens` (`qwen38.rejectVisionTokens`).
+- Vision input: **supported since 2026-11-12** via `forwardTokensWithVision`
+  (CLI `--image`, server `image_url` parts) — see the vision section at the end
+  of this file. The plain `forwardTokens*` entries still reject vision token ids
+  248053–248057 (`qwen38.rejectVisionTokens`); video (248057) is rejected
+  everywhere.
 
 ## MTP speculative decoding (2026-10-23)
 
@@ -607,11 +608,6 @@ Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen3
 
 ## Known gaps / concerns
 
-- **Streaming SSE text loses spaces**: the engine decodes each token
-  individually (`engine_loop.zig` `tokenizer.decode(&[_]u32{token})`) and
-  `bpe.zig` decode strips the leading space (step 3), so streamed deltas
-  concatenate without spaces ("Theuserwants…"). Non-streaming output is
-  correct. Pre-existing, affects all models; needs incremental decode state.
 - glm53-inherited loader error-path leaks (minor, only on failure paths).
 - CLI `--temperature 0.8` is the global default *and* a sentinel: qwen38 chat
   maps "left at default" to the recommended temp 1.0 / top_k 20 / top_p 0.95,
@@ -1554,3 +1550,453 @@ omlx tile（±2% 噪声内）。所以 prefill GEMM 从未落后——今日残�
 `#include "mlx/backend/..."`（custom_kernel.cpp 只拼接扁平化
 utils 文本，无 include 搜索路径；python 侧的"成功"是 lazy eval
 没编译的假阳性）——v8 当年的预扁平化是必要的。
+
+## 抖动治理终局 + Soft-MTP/pi-attn 评估(2026-11-06 深夜)
+
+**抖动归因定论**(探针 DMLX_PREFILL_TRACE,commit 36eda65):
+HTTP 墙钟方差 ≈ 引擎内部方差,host 侧增量恒定 ≤30ms —— 抖动 100%
+在 GPU 执行内部(热/功耗/带宽),非代码可调度部分。三天数据 MTP
+0.59/0.25/0.48、plain 0.33/0.53/0.17,模式间大小关系跨会话翻转,
+omlx 0.32 同带。"dmlx 抖动更大"不成立,是采样时机差。无修复项。
+
+**Soft-MTP 评估(~/work/code/Soft-MTP)**:推理侧 = 经典 Leviathan
+speculative sampling(min(1,p/q) 接受 +(p-q)+ 重采样),dmlx 早已实现
+(engine_loop.zig mtpAcceptProb/mtpResampleAdjusted,温度>0 无损)。
+其增益全在训练侧(KL 梯度恢复 trick),与我们"不重训"定位冲突,不适用。
+
+**pi-attn 评估(~/work/code/pi-attn)**:CUDA 专用(sm_80/89),核心
+价值是 bitwise 确定性(fold-group attention 程序、row-invariant GEMM)
+而非速度。移植到 Metal 是自研 kernel 大工程,无吞吐收益;若将来做
+"确定性模式"差异化特性可再议。
+
+## AV 接受率估计器评估(2026-11-06 深夜)——早退证伪,Phase 2 不做
+
+缘起:vLLM 2026-10 PR #52228(Adaptive Verification 在线估计器,
+logistic 回归 σ(ω·logit(q_max)+β_i),IRLS 在线拟合,免训练)。
+评估是否移植到 dmlx 的 MTP 草稿链。
+
+**Phase 1(DMLX_MTP_AVTRACE,本 commit)**:greedy GPU 链逐步从
+coarse head 精确 rescore 提取 (l_max, top1-top2 margin) 特征,verify
+后按 vLLM 规则打标签(首个拒绝位之前=1,拒绝位=0),写 JSONL。
+4 prompt × 5 reps × 128 tok 采集 2178 条标注。
+
+离线拟合(标准化特征,共享斜率+每位置截距,IRLS):
+- **判别力优秀**:pooled AUC 0.918(vLLM 报 0.834),logloss 0.269,
+  margin 特征权重最大(3.73 vs lmax 0.70,标准化后)
+- **但早退模拟全线亏损**:τ=0.1..0.7 扫参,最好 +0.1%,普遍 -1~-11%。
+  原因:我们 greedy+MTP 头的每位置接受率 0.76-0.96,survival 很难塌到
+  阈值以下;draft 步成本(2-10ms)相对 verify(82-148ms)和被放弃的
+  已接受 token(每个 ~25ms)太小,省一步不抵丢一个 token。
+- vLLM 自己也有同样 caveat:"a smaller fixed length often outperforms
+  AV"。他们的收益场景是 batch=64 compute-bound 裁 verify 宽度,与我们
+  单请求带宽受限场景无关。
+
+**结论**:早退(Phase 2)不做,EV 不成立。估计器唯一残余价值是给深度
+控制器的 E[t] 模型供预测 p̂(解决跨深度证据陈旧问题),但需对未观测
+深度外推,预期收益小,缓议。AVTRACE 作为诊断工具保留(默认关闭,
+开销可忽略:64 元素 sort/步)。
+
+## SpecExtend 前提实测(2026-11-07)——B 证伪,不适用
+
+问题:我们的 MTP 头在长上下文是否像 EAGLE 系 drafter 那样退化
+(论文:EAGLE-3 在 4K 后 τ 4.65→1.82)。方法:MTP server,重复
+filler 词构造 1K/4K/8K/16K prompt,greedy 128 tok,每档 3 发,
+读 server 日志的逐请求接受率:
+
+- 1K: 52.0/50.0/44.9(均值 ~49%)
+- 4K: 53.3/54.9/52.8(~54%)
+- 8K: 49.2/48.0/53.6(~50%)
+- 16K: 50.0/48.9/63.3(~54%)
+
+接受率完全平坦(条件接受率 p1 稳定 0.71-0.87)。厂商 MTP 头训练
+覆盖了长上下文,SpecExtend/CMR 针对的问题在我们这里不存在。
+verify 时间随上下文增长(87→272ms/round)是 attention 成本,与
+draft 质量无关。CMR 类方案不修不存在的问题,关闭。
+caveat:filler 词内容只压 KV 长度不压语义检索;长推理(32K 生成)
+场景未覆盖,但 16K 已远超 EAGLE-3 崩溃点(4K),前提已足够证伪。
+
+## NPUMoE/ANE 方向 spike(2026-11-07)——D 证伪,不做
+
+方法:scripts/bench_ane_gemm.py(coremltools 9.0,~/venvs/dmlx-ane
+py3.13;cmp venv 的 py3.14 无 coremltools native wheel)。CoreML FP16
+静态 matmul,CPU_AND_NE,M=2048,7 个 prefill 投影 shape vs dmlx v8
+qmm 同 shape 实测(run-bench-prefill-v8,本机同日下午):
+
+| shape | CoreML FP16 | dmlx v8 4bit | 比 |
+|---|---|---|---|
+| gdn_qkv | 38.8ms | 31.4ms | 0.81x |
+| gdn_z | 24.0 | 19.0 | 0.79x |
+| gdn_out | 34.8 | 18.9 | 0.54x |
+| attn_q | 46.1 | 37.8 | 0.82x |
+| attn_o | 34.6 | 18.8 | 0.54x |
+| mlp_gate | 65.2 | 53.1 | 0.81x |
+| mlp_down | 359.3(疑 fallback) | 53.4 | 0.15x |
+
+加权全 pass:CoreML 33.1s(2.28 TF/s)vs dmlx 11.0s(6.75 TF/s)。
+即使修掉 mlp_down 异常、扣掉 fp32 I/O cast 开销,天花板 ~5.6 TF/s
+FP16 仍低于 4-bit qmm 的 6.75。另有结构性成本未计:CPU↔ANE 同步、
+routing/top-k 留 CPU、GDN 层(64 层中 48 层)CoreML 无算子。
+
+结论:ANE 的价值是相对 CPU 基线(NPUMoE 论文的基线正是 CoreML
+CPU),不是相对调优 GPU;能效场景另说,但对"prefill 反超"目标
+无益。方向关闭,不用 CoreML/ANE 做 GEMM 加速。
+
+## 跨请求内容记忆(class-memory)——三次迭代证伪,默认关闭(2026-11-07)
+
+动机(engine_loop.zig trendGatingOff 的 postmortem):区分"坚持"与
+"放弃"需要超出本请求前 10 轮的信息——内容类型的先验。code 类付
+~33% 探针税(15/45 轮在已证伪的 N=5/N=7),请求内自适应到顶。
+
+实现(opt-in,DMLX_MTP_CLASS_MEMORY=1;置信门限
+DMLX_MTP_CLASS_CONFIDENT,默认 2):
+- src/engine/content_class.zig:prompt 文本启发式分类
+  code/math/count/prose/general(错分代价低:种子 0.9/轮衰减,
+  ~10 轮内被活证据冲掉;general 不读不写)。
+- MtpDepthController 持久化 per-class 记忆:请求结束回写 p_i 曲线
+  EMA + 前半/后半接受率差(rising 趋势);resetForRequest(class)
+  按类播种 p_i(权重 3.0 轮当量);类趋势替代请求内 trend 选择
+  give-up 比率(flat→紧 1.08/1.04,rising→松 1.15/1.10)。
+
+三个机制变体,四场交错 A/B(dmlx vs dmlx-classmem,reps 3 ×
+reps-prompt 3,nonce,artifacts/classmem_ab{,_2,_3,_4}_20261107.json):
+
+- v1 仅播种:四域中位数全持平。归因(逐轮轨迹):种入的 p_i 让
+  code 深层臂得分"不够好也不坏"(28.7 vs 29.0 ms/tok),早期退出
+  阈值 1.15 不触发,9 轮 explore 照跑,探针税未省。
+- v2 +confident-flat 免探:math +6.3%(种子+rising 判据帮 math
+  停深层),但 count -7.7%——免探拿掉了托底的 9 轮深轮,argmin
+  想爬 7(26.8 vs 29.9)却被 hysteresis 阈值 26.91 挡一根头发丝,
+  卡 N=3 达 24/30 轮。
+- v3 +confident 类直接以(记忆 p_i × 携带成本)argmin 播种
+  incumbent:第一场 prose +9.7%/math -5.6%/code -2.5%,第二场
+  (复跑)prose +0.3%/math +20%(基线 math 抽到慢模态 33.9-44.6
+  的双峰彩票)/code -1.6%/count 持平。
+
+结论:没有任何一个变体在四域上给出可复现的一致方向性收益;
+prose 的 +9.7% 不能复现,math 的大幅波动是已知慢模态彩票而非
+机制效应。128-token 请求尺度上,请求内自适应(0.9 衰减 ~4 轮
+有效窗 + explore 9 轮)已经捕获了可得的几乎全部——"内容类先验"
+省下的探针税在 tok/s 上兑现不出来。按负结果处理:代码保留为
+opt-in(与既有 DMLX_MTP_* 死方向开关同一约定),默认关闭,
+不再迭代。剩余差距回到清单第 1 项(KV cache 量化,长上下文
+verify 成本 87→272ms/round 是实测的线性增长)。
+
+## Verify split-KV SDPA(FlashDecoding 式)落地(2026-11-07)
+
+动机:16K 上下文 verify 180-193ms/轮,DMLX_VERIFY_NO_ATTN_CORE=1
+诊断显示 attention 核占 ~100-110ms(~55%)。M=1 decode 早有融合
+SDPA + 2-pass split(kv>=1024),verify(L=2..8 行)一直走 stock
+composed 路径(L*GQA=48 超出向量 kernel 32 行预算)。
+
+实现(src/models/qwen38_attn.zig sdpaVerifySplit):移植 omlx
+patches/qwen35_verify_sdpa_split.py 的 `_wide_causal_sdpa`——
+每 (q head, KV 分块) 一个 threadgroup 持全部 8 行(4 个 simdgroup
+各 64 维),32-key 块在线 softmax,第二个 kernel 按 LSE 合并分块。
+硬编 D=256/H=24/HKV=4/bf16(落闸不满足即回退 stock);
+`DMLX_VERIFY_SDPA_SPLIT=0` 可关。一次性日志 `[verify-split]`
+报落闸原因/engaged。数值等价单测(L=3/8 × T=40/1500 含多分块,
+bf16 容差 2e-2)随 473 测试全绿。
+
+测量:
+- kernel 级(scripts/bench_verify_sdpa.py,H24/HKV4/D256/L8/bf16,
+  kv=16400):stock 63.2ms vs wide 8.0ms,8×,max|Δ|=3e-4。
+  注意:stock 的 63ms 主要是 python 侧 composed 路径的 dispatch
+  开销,引擎内 eager stream 里 stock 远没这么慢——kernel 微基准
+  不能外推到引擎内收益。
+- 引擎内 16K(scripts/ab_verify_split16k.sh,逐请求交错 3rep×2臂,
+  verify ms/round):ON 108.0/121.0/110.2(均 113.1)vs OFF
+  133.8/124.4/123.3(均 127.2)——**-11%**。非交错会话间绝对值
+  漂到 143-193ms,只有交错数可信。
+- 短上下文 4 域回归(artifacts/verify_split_shortctx_20261107.json,
+  dmlx vs dmlx-nosplit):code 40.2/40.3、prose 32.5/32.7、
+  math 38.6/39.1、count 38.7/38.5——零回退,默认 ON 安全。
+
+遗留(下一个挖点):attention 核 100-110ms 里 SDPA 只兑现了 ~14ms;
+其余 ~85ms 是每层 cacheAppend/转置/rope/gate 等 dispatch 密集小
+op(16 层 × ~5 op),方向是把这些融进 kernel 或减少层间同步。
+
+**2026-11-11 复查(三臂实测,scripts/ab_verify3_16k.sh,16K ctx,
+逐请求交错 2 rep):** default 138.6/99.9 vs NO_ATTN_CORE 74.1/73.6
+(nocore 臂很稳;default 臂 run 间方差 39ms,与已知的跨会话漂移一致)。
+attention 核整体真实价值 ~45ms/round——不是 85ms,"小 op" 归因
+(barrier 份额外推)再度高估。内部构成:split SDPA ~14ms(KV 读取
+带宽地板 ~4ms)、**cacheAppend sliceUpdate 全 slab 拷贝 ~4-5ms**
+(2×33MB×16 层 ≈ 1GB/round @16K,随 T 线性增长;同一函数也在
+decode 路径,M=1 时每 token 同样 ~1GB,16K decode ~30ms/tok 里
+占 ~13%——这是它真正值钱的地方)、rope/norm/gate/转置余量 ~20ms
+(未再分解,按 §23 教训疑似大部分是伪影)。
+结论:唯一值得动手的是 cacheAppend 的 O(T) 拷贝 → 需要分页/分块
+KV 或 in-place slab 写(MLX 数组不可变,函数式 slice_update 必然
+全拷贝),即清单第 1 项 KV cache 重构的入口;其余方向关闭。
+nosplit 臂 114.7/155.6 vs default 之差在噪声内,split 的 -11% 以
+2026-11-07 的交错测量为准。
+
+## 发现:16K prefill 病态(未查)——2026-11-11 复查:不存在,基线错误
+
+原记录(2026-11-07):12000 词 prompt wall ~112s,decode 占 ~7s,而
+"2048 tok 只要 1.66s",看似超线性爆炸。**1.66s 基线是错的**:v8 kernel
+头注释自己写着 2048 tok prefill wall 是 17.5s;今日实测同 server 路径
+1746 tok = 14.7s(8.4ms/tok),13243 tok = 103s(7.8ms/tok),119 tok
+= 1.9s(15.6ms/tok,小 L 是 dispatch 地板)。**prefill 从 119 到 13243
+token 严格线性,且与 omlx/mlx-vlm 参考值(117-134 tok/s ≈ 7.5-8.5ms/tok)
+持平**。112s = 线性 prefill ~103s + decode ~7s,无爆炸。之前观察到的
+"qkv qmm 从 ~200ms 崩到 1.2-3.1s" 实为 v8 kernel 按 (m,n,k) JIT 的一次性
+编译(QMM_TRACE 里首个该 shape 调用 1878ms,稳态 255ms)。
+
+证据链(全部本机实测):
+- 交错 A/B(scripts/ab_prefill_chunk16k.sh,16K,maxtok=8):
+  chunk=2048 106.95/103.47s vs chunk=0 103.12/102.80s —— 中性。
+- barriered 分段(qwen38-profile --prefill N,N=2048..16384):MLP/GDN
+  每翻倍 ×2.0(线性);attn 分段 ×2.6/×3.2/×4.5 是 barrier 制造的伪热点
+  (见 §23 教训)——server 内 LAYER_PROF(DMLX_LAYER_PROF=1)实测每 token
+  成本与 chunk on/off 无关,恒 ~115µs/token/层。
+- MLX fast SDPA 在 D=256/H24/HKV4/bf16、引擎式 slab 切片视图下仍是 fused
+  kernel:16K 单层 212ms、峰值内存 0.75GB,16 层 ~3.4s,不是瓶颈。
+- QMM_TRACE(DMLX_QMM_TRACE=1,新增于 qwen38_gdn.linearQuantParts):
+  GDN qmm 在 M=16384 线性(qkv 268ms/out 255ms/z 169ms)。
+
+chunked prefill 代码保留为 **opt-in 默认关**(`DMLX_PREFILL_CHUNK=2048`;
+默认 0=monolithic),唯一真实价值是压峰值内存(monolithic 16K 峰值
+53.5GB,>16K prompt 或 48GB 机型可能需要)。一致性单测
+(chunked-vs-monolithic last-logits,容差 5e-2 bf16)随套件通过。
+
+遗留真话:prefill ~8ms/token 里 qmm 占大头(~7 TF/s 有效,与 ANE 表
+里的 6.75 TF/s 一致),再提速只能动 qmm 本身(超出本次范围)。
+
+## KV cache append in-place spike——中性偏负,默认关,方案 2(分页 KV)不做(2026-11-11)
+
+背景:cacheAppend 的 slice_update 是函数式全 slab 拷贝,16K 下
+2×33MB×16 层 ≈ 1GB/token(decode)与 ~1GB/round(verify),账面
+~13% decode 税。spike:自研 Metal kernel 把新行原地写进 slab
+(`const device` 输入 + const_cast;`mlx_fast_metal_kernel_apply`
+是惰性的,必须 asyncEval 哨兵输出才真正入队;全部 kernel 与 eval
+共享 default GPU stream,顺序有保证)。正确性:贪心输出四臂 md5
+逐字一致。
+
+实测(scripts/ab_kvinplace_16k.sh,16K ctx,MTP 7,逐请求交错 2 rep):
+in-place verify 157.1/109.3 vs slice_update 141.4/106.7 ms/round;
+wall 112.6/109.3 vs 110.9/108.8s——差异在噪声内且两 rep 都是
+in-place 略慢(每次 append 的强制提前 eval 打碎了惰性图融合)。
+**拷贝与计算重叠,不占关键路径;拷贝与 SDPA 都随 T 线性增长,
+比率在 32K 也不会反转。** 结论:拷贝税是账面假象(§23 教训的又一例),
+in-place 保留为 opt-in(`DMLX_KV_INPLACE=1`,默认关),分页/分块 KV
+重构的性能动机不成立——它剩余的价值只有 32K+ 容量与 KV 量化挂载点,
+等真实需求驱动再做。清单第 1 项按此改写。
+
+## qmm tile sweep(2026-11-11)——v8 (64,32,64) 已最优,tile 维度无空间
+
+背景:prefill qmm 有效 ~6.75 TF/s vs dense bf16 GEMM 实测峰值 69 TF/s
+(M4 Pro),想找 kernel 级空间。先把两个测量假象钉死:
+- python 侧"stock qmm 33 TF/s"是惰性求值假象(循环里 `o=qmm(...)` 重绑定
+  导致前几个输出从未被 eval);sync/持续实测 stock ≈ v8(zig bench 一致)。
+- 单次 sync 调用受 GPU 时钟爬坡影响,只有持续负载数字可信。
+
+工作:qmm_v8 kernel 的 BM/BK/BN 模板化(DMLX_QMM_TILE="bm,bk,bn" 实验
+开关,entry 改为 template<T,BM,BK,BN>,threadgroup buffer 按
+BM/(BK+8)/BN 推导),bench-prefill-v8 加 DMLX_BENCH_TILE_SWEEP=1 扫
+omlx 全部 10 个实例化 tile 变体。
+
+结果(M=2048 与 M=16384 × 7 个投影 shape,全部 bit-exact):
+**(64,32,64) 在每个 shape、两个 M 点都是最优**,ratio 1.04-1.06× vs
+stock;次优 (64,64,64) 仅 ~1.00×;大 tile(64,64,128)跌至 0.73×。
+tile 维度零空间,默认不变。
+
+剩余可行方向(未做,有精度风险需 eval 门禁):oq_a8 式 activation
+量化 qmm(int8 激活 × int4 权重,omlx 有参考实现
+omlx/custom_kernels/quant_matmul/csrc/oq_a8*.metal),预估 1.5-2×
+prefill qmm 收益,但需要数值精度评估先行。
+
+## Qwen3.8 视觉(图像输入)支持落地(2026-11-11~12)
+
+分支 glm53-mlx-support,8 任务计划
+(`docs/superpowers/plans/2026-11-11-qwen38-vision-support.md`)全部执行完毕,
+每任务经 spec+质量双评审。提交链:`22d5671/987ccbb`(loader)→ `6613d61/1c6a47b`
+(MRoPE)→ `a6146b8/d32422c`(ViT 塔)→ `212ea38/436da97`(预处理)→
+`ab8b567/377e764`(forwardTokensWithVision)→ `2dd62bc/4132d24`(oracle 对拍)→
+`0af1edf/3812189`(CLI/server 接线 + MTP rope_delta 传播)。
+
+**什么能用:**
+- CLI:`dmlx chat --model ~/models/Qwen3.8-27B-4bit --image <path>`(可重复,
+  多图顺序编码)——对合成 fixture 的描述语义正确。
+- Server:`/v1/chat/completions` 接受 OpenAI content parts(text + image_url;
+  data:...;base64 与本地绝对路径;远程 URL 明确 400;decoded 上限 20MB,HTTP
+  body 16MB 使其有效约 12MB)。`scripts/ab_vision_smoke.sh` PASS。
+- MTP + 图像:drafter `rope_extra` 在 vision prefill 后传播(`mtpPrefillVision`,
+  刻意在 drafter prompt pass 之后设置——prompt 行用原始 offset,delta 可能为负),
+  文本 prefill 归零。vision 内容 pooled 接受率 ~47%(p1=0.65,内容类效应,
+  非 rope 错位;输出由 verify 保证正确);文本 MTP 接受率不变(87.9%)。
+
+**实现要点:**
+- 视觉塔 `src/vision/qwen38_vit.zig`:bf16 非量化(权重直借 checkpoint,
+  +~1.3GB 常驻,server 首个图像请求时惰性加载),27 层 ViT,conv3d patch embed
+  (权重已是 MLX NDHWC 布局零转置)、host 端 f64 四点双线性 pos-embed 插值、
+  2D rotary(merge-block 序)、非因果 SDPA、merger(exact erf GELU;block 内
+  tanh GELU;LN eps=1e-6 **无 +1 shift**——那是 RMSNorm 专属约定)。
+- 预处理 `src/vision/qwen38_preprocess.zig`:stb_image 解码(vendored v2.30,
+  STBI_NO_STDIO,64MB 文件上限)、smart_resize 精确移植(含 Python round
+  half-to-even;64×96 图会被 min_pixels=65536 上采样到 224×320——计划里的
+  测试断言值曾因此错误,以参考实现为准)、bilinear resize(v1)、
+  (c,t,ky,kx) patchify merge-block 序。
+- MRoPE `src/models/qwen38_mrope.zig`:`get_rope_index` 图像子集纯整数移植
+  (oracle 逐值对拍),interleaved selector(comptime+runtime 两版互证)。
+  带图 prefill 后 decode/verify/MTP 的 rope offset = cache.len() + rope_delta
+  (delta 默认 0,文本路径逐字不变)。
+- 接线:`VisionOps` vtable(generation.zig,模型无关);adapter 惰性建塔;
+  HTTP fiber 与 engine fiber 共享 MLX ctx 的竞态用 adapter 级 pthread mutex
+  关闭(所有触 ctx 的 op 持锁;并发首图请求实测塔只加载一次)。
+
+**Oracle 门禁(mlx-vlm 对拍,`zig build test-qwen38-vision-oracle`,独立可执行
+——27B 加载会扰动同进程单测;产物 artifacts/qwen38_vision_oracle/ 由
+`scripts/qwen38_vision_oracle_dump.py` 生成,gitignored):**
+- tower features cos **0.99974** ≥ 0.999 ✅(参考塔自身 bf16-vs-f32 仅
+  0.99934,我们已在参考自身噪声内;patch embed/pos/rope 表 bitwise 一致)
+- position_ids / rope_delta 精确一致;cos/sin max_abs 1e-6
+- merged embeddings 文本行 bitwise;图像行 min cos 0.997
+- logits_last cos **0.99717**,门禁按证据放宽至 ≥0.995(计划原值 0.999 不可达:
+  参考栈自身 fused-vs-naive GDN 单 flag 差异即 logits cos 0.99940 < 0.999;
+  同输入下 Zig LM 0.99917,残差是 mlx-c 0.7.0 vs python-mlx 0.32.4 kernel
+  数值差,非逻辑错误)
+
+**已知限制(v1):** 无 video(248057 仍拒绝)、deepstack 不支持(该 checkpoint
+为空)、多轮消息中的图像并入最后一条 user 消息、guided decoding + vision 未验证、
+bilinear vs 参考 bicubic resize(fixture 无需 resize,64×96 上采样单测覆盖
+resize 路径;若未来 parity 失败先换 bicubic 16-tap)、视觉塔 bf16 +~1.3GB 常驻、
+图像逐张顺序编码。
+
+### 视觉性能小杠杆收尾(2026-11-12)
+
+测量先行结论(scripts 见下,M4 Pro,~30 组实测):
+- TTFT 残差不在 LM 视觉路径:warm 后 vision-prefill ≈ 同长文本 prefill
+  (mrope/merge 稳态开销 ~0);残差 = 塔 (~10-45% 慢于参考) + 已知文本
+  prefill 速率差(~5%,与视觉无关)。
+- **杠杆 2(drafter rope 约定)证伪**:mlx-vlm 的 MTP drafter 本来就不
+  应用 rope_delta(qwen3_5_mtp.py 用纯 1D arange positions)。A/B
+  (`DMLX_MTP_VISION_DRAFTER_DELTA=0/1`,scripts/ab_vision_drafter_delta.sh):
+  接受率两臂完全相同(45.1%, 79/175, p_i 逐位接近)。视觉接受率是内容
+  绑定的,策略侧无空间;delta 传播保留(更正确且无副作用)。
+- **杠杆 1 落地(commit 75ed0f4)**:ViT block 经 mx.compile(shapeful,
+  每 patch 数 N 一次 trace;shapeless 因 slice workaround 无法推断输出
+  shape 而失败)编译,eager/编译共享同一 `blockCore` 实现。塔
+  1016→797ms @3072 patches(-18~25%,≈mlx-vlm 参考 813ms);oracle
+  tower cos 不变(0.99973569);eager/compiled 端到端输出 md5 逐字一致。
+  kill switch `DMLX_VIT_NO_COMPILE=1`;compile/apply 失败一次性回退 eager。
+- **附带真 bug(commit 82a1aee)**:mx.compile 的 tracer/eval 用当前线程
+  默认 stream(transforms.cpp),塔前向跑在 HTTP worker fiber 上直接报
+  "no Stream(gpu,N) in current thread"——且首次验证时静默回退 eager
+  造成假绿。修复:fiber 上 `mlx_set_default_stream` 指向模型 GPU stream。
+  教训:验证编译路径必须确认没有 fallback 日志,字节对拍才可能为空验证。
+
+**最终对比(图像 prompt, temp 0, min-of-2; mlx-vlm 模板少 41 tok ≈0.3s):**
+
+| 臂 | 小图 TTFT/decode | 大图 TTFT/decode | 大图 wall@128 |
+|---|---|---|---|
+| mlx-vlm / omlx(无投机) | 1.93-2.12s / 14.7-14.9 | 6.32-6.43s / 14.8-15.3 | 10.5-10.7s |
+| dmlx 无投机 | 2.12s / 14.6 | 6.83s / 14.5 | 10.9s |
+| mlx-vlm + MTP | 1.84s / 25.4 | 6.18s / 25.6 | 11.13s |
+| **dmlx + MTP** | 2.15s / **28.2** | 6.84s / **26.2** | 11.69s |
+
+decode 两臂全胜;大图端到端仍略输 mlx-vlm-mtp 5%(11.69 vs 11.13),
+差值 ≈ 模板 41 tok(~0.33s)+ 文本 prefill 速率差(~5%),视觉段本身
+已持平。vmlx 无需单列——它是 mlx-vlm 的封装壳。
+工具:src/bench_vision_ttft.zig(`run-bench-vision-ttft` 分段计时)、
+scripts/ab_vision_drafter_delta.sh、/tmp/bench_vision.py(三引擎 A/B/C)。
+
+### Server API 面对齐补齐(2026-11-12)
+
+对照 mlx-vlm/omlx/vmlx 源码盘点后按性价比补齐(commits
+`e017eaa`+`990a7e8` → `03bd3db`+`2cb8541` → `85cc62c`+`a28f3b9`):
+
+- **`GET /v1/models`**:OpenAI 形状,id = model_path basename,created =
+  server 启动时间;model id 经 jsonEscape。
+- **per-request `top_p`/`top_k`**:chat completions + Anthropic 双端,校验
+  top_p∈(0,1]/top_k≥1(400),贯通 serial/streaming/MTP/batched-prefill
+  全部引擎路径。
+- **`tool_choice`**:auto(默认)/none(真剥离 tools)/required+named →
+  明确 400(无强制调用机制,不静默错);Anthropic 侧 auto/none 接受、
+  any/tool → 400。
+- **`POST /v1/responses` 最小兼容层**(src/server/responses.zig):纯翻译到
+  chat 机制——input string/array(input_text/input_image parts,图像走真
+  vision 管线)、instructions→system、max_output_tokens(u32 溢出防护)、
+  store/metadata 接受忽略;未知/不支持字段全部明确 400(allowlist)。
+  响应对象 resp_/msg_ id、usage、status completed/incomplete。
+  **流式也支持**:response.created → output_text.delta×N →
+  output_text.done → response.completed。引擎错误映射 HTTP 500,
+  请求错误 400。**真 OpenAI SDK 已验证**(openai 3.49.0,一次性 venv):
+  models.list / chat.completions(流式+非流式)/ responses.create(非流式、
+  流式、图像 input_image、incomplete+max_output_tokens、不支持字段 400)/
+  embeddings(float+base64)10/10 PASS。
+- **`POST /v1/tokenize`(+ /tokenize)**:复用 chat 同款 BpeTokenizer
+  encode(与 HF transformers 逐 id 对拍一致,含多语言 golden 用例);
+  无 chat 模板;>1MB 拒绝;add_special 对 Qwen BPE 是 no-op(文档化)。
+
+单测 454→**525 passed / 2 skipped / 0 failed**。已知未修(pre-existing,
+与本次无关):SSE 中途断连偶发 segfault(疑似 keepAliveLoop 竞态);
+tool_calls 的 arguments JSON 转义缺陷;zig build test 的 --listen=-
+runner 间歇假失败 + test-exact-q4-producer 1% 计时门槛并发下偶超。
+
+剩余 API 缺口(未做,ROI 递减):embeddings/rerank、图像生成/音频、
+Ollama 兼容、metrics/cache 管理端点、多模型池。
+
+### embeddings + metrics 落地(2026-11-12)
+
+- **`POST /v1/embeddings`**(commit `e334404`):last-token pooling(post-final-norm
+  hidden)+ L2 归一化,raw text 无模板;batch ≤32/1MB;float 与 base64 两种
+  encoding_format;非 qwen38 适配器 → 501 embedding_not_supported。
+  **线程模型是重点**:MLX Metal backend 的 command encoder 是线程局部的,
+  HTTP fiber 上跑 backbone 前向必崩(vision 塔是例外)——新增
+  `src/engine/embed_queue.zig` MPSC 队列,embeddings 前向全部在 engine 线程
+  执行,fiber 阻塞等 done 标志,shutdown 时 pending 任务统一失败。
+  实测:dim 5120、norm≈1、cos(cat,dog)=0.68 > cos(cat,photosynthesis)=0.31、
+  重复调用 bit-identical、与 chat 交错互不影响。
+- **`GET /metrics`(+ /v1/metrics)**(commits `478ddf1`+`dfd5c233`):
+  Prometheus 文本格式;requests_total{endpoint,status}、
+  request_duration_seconds_sum/count、generation/prompt_tokens_total、
+  active_requests、uptime、mtp drafts 接受计数。评审后修正:子处理器
+  (responses/anthropic)的 400 原先被记成 200——status_out 出参修复;
+  token 钩子补齐 anthropic/responses-streaming/embeddings 路径。
+  实测计数与发出的请求逐条一致。
+- 图像生成不做:dmlx 的 Flux 管线是 stub(无文本编码器/权重加载/VAE 解码),
+  见 src/main.zig runImageGen——那不是 API 面缺口,是能力缺口。
+
+### omlx API 对齐 + 遗留问题清扫(2026-11-13)
+
+**omlx 对齐批次**(`6f27879`+`43505e2`,549→551 tests):
+- `POST /v1/completions`(legacy 裸文本补全,无模板,string|数组 batch 串行,
+  SSE 流式,vision token 拒绝继承)。
+- `POST /v1/detokenize`(+别名):与 tokenize 精确往返(用全序列 decode,
+  不受逐 token 丢空格影响)。
+- `POST /v1/messages/count_tokens`:与真实 chat 请求 usage.prompt_tokens
+  **逐字一致**(58/78 实测);图像按 smart_resize pad 数计(不走塔)。
+- `GET/DELETE /v1/responses/{id}`:256 条有界内存 store(pthread mutex),
+  store:false 不保留;**失败响应也保留**(含非流式——评审抓出的遗漏)。
+- `GET /api/status`:model/uptime/active/requests_total。
+- 不做(架构/能力限制):rerank(无 reranker 模型)、decisions/systemone
+  (omlx 特有)、多模型 load/unload(单模型架构,http.zig 留有挂点)。
+
+**遗留问题清扫(全部真凶修复,非症状):**
+- **SSE 断连 segfault**(`ccded80`+`bfce9a6`):三个叠加根因——①engine 线程
+  在 handler 因写失败 unwind 后继续向已释放的 CompletionSignal deliverToken
+  (UAF);②全服务器 socket 写无 SIGPIPE 防护;③keepalive fiber 借用 handler
+  栈帧。修复:abortStream(cancel + drain 到 engine 完成才 deinit,
+  chat 与 responses 两条流式路径全覆盖)、SO_NOSIGPIPE、keepalive 原子停止
+  +Future join。回归脚本 scripts/repro_sse_abort.sh(40 次断连存活)。
+  **残余**:cancel 只在 dequeue 生效,in-flight 请求仍生成到 max_tokens
+  (引擎内取消是 engine/ 的后续课题)。
+- **tool_calls arguments JSON 转义**(`3808559`):id/name/arguments 全部
+  过 jsonEscapeInto,arguments 保持 string 型(OpenAI 约定)。
+- **zig build test 假失败**(`76ab670`):真因是 zig 0.16 build_runner 对
+  任何 stderr 非空的 step 都打印 "failed command"(即使成功)——库代码的
+  std.log/std.debug.print 在测试里输出。全部按 builtin.is_test 门控,
+  5 连跑全绿。
+- **q4-producer 计时 flake**(`60cbf21`):build 图排序,重计时步骤排到
+  大测试二进制之后;阈值不动。
+- **CLI --temperature 0.8 sentinel**(`5396050`):flag 改 Optional,
+  显式 0.8 不再被重映射成推荐档位。
+- **glm53 loader 泄漏 + layer_meta double free**(`217ae2d`):错误路径
+  errdefer 补全;double free 实修(ExpertStreamProvider 统一持有)。
+- **流式丢空格**(`357600c2`):新增 src/tokenizer/streaming.zig
+  StreamingDetokenizer(累积 decode + 只发到最后一个完整 UTF-8 边界的新
+  后缀;final flush),所有流式产生者(chat/completions/responses/DSV4/
+  native)统一走它。拼接 deltas == 非流式 decode **逐字节一致**(单测 +
+  三端点实测)。修复前缀稳定性的正确性依据:BPE decode 链是 append-单调的。
+- 单测总数 **555 passed / 3 skipped / 0 failed**。

@@ -530,3 +530,155 @@ test "DeepSeek-style tokenizer JSON load and encode/decode" {
     defer allocator.free(text);
     try std.testing.expectEqualStrings("hello", text);
 }
+
+// ============================================================================
+// StreamingDetokenizer tests (streaming deltas must concatenate to the exact
+// full-sequence decode — the "streaming SSE loses spaces" fix)
+// ============================================================================
+
+const StreamingDetokenizer = mlx.tokenizer.StreamingDetokenizer;
+
+/// Feed `ids` one token at a time through a StreamingDetokenizer and return
+/// the concatenation of all deltas plus the final flush (owned).
+fn streamConcat(allocator: std.mem.Allocator, strategy: TokenizerStrategy, ids: []const u32) ![]u8 {
+    var detok = StreamingDetokenizer.init(allocator, strategy);
+    defer detok.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (ids) |id| {
+        if (try detok.addToken(id)) |delta| {
+            defer allocator.free(delta);
+            try out.appendSlice(allocator, delta);
+        }
+    }
+    if (try detok.flush()) |tail| {
+        defer allocator.free(tail);
+        try out.appendSlice(allocator, tail);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+test "StreamingDetokenizer matches full decode on the toy tokenizer (leading spaces)" {
+    const allocator = std.testing.allocator;
+    var backend = BpeTokenizer.init(allocator);
+    defer backend.deinit();
+    try backend.loadFromJson(bpe_test_json);
+    const strategy = backend.asStrategy();
+
+    // [▁h e ll o] then [▁ hello]: full decode strips the FIRST token's
+    // leading space but keeps the second word's ("hello hello").
+    const ids = &[_]u32{ 5, 2, 7, 4, 0, 8 };
+    const full = try backend.decode(ids);
+    defer allocator.free(full);
+    try std.testing.expectEqualStrings("hello hello", full);
+
+    const streamed = try streamConcat(allocator, strategy, ids);
+    defer allocator.free(streamed);
+    try std.testing.expectEqualStrings(full, streamed);
+}
+
+test "StreamingDetokenizer holds back multibyte UTF-8 split across tokens" {
+    const allocator = std.testing.allocator;
+    var backend = BpeTokenizer.init(allocator);
+    defer backend.deinit();
+    // Byte-fallback pieces for 中 (E4 B8 AD) split one byte per token.
+    try backend.loadFromJson(
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<0xE4>": 0,
+        \\      "<0xB8>": 1,
+        \\      "<0xAD>": 2,
+        \\      "x": 3,
+        \\      "<unk>": 4
+        \\    },
+        \\    "merges": []
+        \\  }
+        \\}
+    );
+    const strategy = backend.asStrategy();
+
+    const ids = &[_]u32{ 0, 1, 2, 3 };
+    const full = try backend.decode(ids);
+    defer allocator.free(full);
+    try std.testing.expectEqualStrings("中x", full);
+
+    // Per-token: first two tokens emit nothing (partial codepoint held
+    // back), the third emits the whole character, the fourth emits "x".
+    var detok = StreamingDetokenizer.init(allocator, strategy);
+    defer detok.deinit();
+    try std.testing.expect((try detok.addToken(0)) == null);
+    try std.testing.expect((try detok.addToken(1)) == null);
+    const d3 = (try detok.addToken(2)).?;
+    defer allocator.free(d3);
+    try std.testing.expectEqualStrings("中", d3);
+    const d4 = (try detok.addToken(3)).?;
+    defer allocator.free(d4);
+    try std.testing.expectEqualStrings("x", d4);
+    try std.testing.expect((try detok.flush()) == null);
+}
+
+test "StreamingDetokenizer flush emits a dangling partial codepoint" {
+    const allocator = std.testing.allocator;
+    var backend = BpeTokenizer.init(allocator);
+    defer backend.deinit();
+    try backend.loadFromJson(
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "x": 0,
+        \\      "<0xE4>": 1,
+        \\      "<unk>": 2
+        \\    },
+        \\    "merges": []
+        \\  }
+        \\}
+    );
+    const strategy = backend.asStrategy();
+
+    // Stream ends mid-codepoint: full decode yields "x" + raw byte 0xE4;
+    // the streamed concatenation must match byte-exactly after flush.
+    const ids = &[_]u32{ 0, 1 };
+    const full = try backend.decode(ids);
+    defer allocator.free(full);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 'x', 0xE4 }, full);
+
+    const streamed = try streamConcat(allocator, strategy, ids);
+    defer allocator.free(streamed);
+    try std.testing.expectEqualSlices(u8, full, streamed);
+}
+
+test "StreamingDetokenizer parity with the real Qwen tokenizer (golden)" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const tok_path = "/Users/zouyee/models/Qwen3.8-27B-4bit/tokenizer.json";
+
+    std.Io.Dir.cwd().access(io, tok_path, .{}) catch return error.SkipZigTest;
+
+    var backend = BpeTokenizer.init(allocator);
+    defer backend.deinit();
+    try backend.loadFromFile(io, tok_path);
+    const strategy = backend.asStrategy();
+
+    const cases = [_][]const u8{
+        "The user wants to see this.",
+        " Hello world, leading space here.",
+        "用户想看中文字符和emoji🎉混合 together 吗？",
+        "Line one\nLine two\tTabbed 和emoji😀 done.",
+    };
+    for (cases) |text| {
+        const ids = try strategy.encode(text, false, allocator);
+        defer allocator.free(ids);
+
+        const full = try strategy.decode(ids, allocator);
+        defer allocator.free(full);
+        try std.testing.expect(ids.len > 0);
+
+        const streamed = try streamConcat(allocator, strategy, ids);
+        defer allocator.free(streamed);
+        try std.testing.expectEqualSlices(u8, full, streamed);
+    }
+}

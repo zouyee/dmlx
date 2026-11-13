@@ -21,6 +21,7 @@ const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const qwen38_attn = @import("qwen38_attn.zig");
+const qwen38_mrope = @import("qwen38_mrope.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
@@ -97,14 +98,114 @@ pub const VisionError = error{VisionInputNotSupported};
 pub fn rejectVisionTokens(ids: []const u32) VisionError!void {
     for (ids) |t| {
         if (t >= vision_token_lo and t <= vision_token_hi) {
-            // warn under `zig build test` (the runner fails tests on err logs).
-            if (@import("builtin").is_test)
-                std.log.warn("qwen38: vision input not supported (token id {d})", .{t})
-            else
+            // Silent under `zig build test`: the runner fails tests on err
+            // logs and replays any captured stderr as a "failed command".
+            if (!@import("builtin").is_test)
                 std.log.err("qwen38: vision input not supported (token id {d} in vision range [{d}, {d}])", .{ t, vision_token_lo, vision_token_hi });
             return VisionError.VisionInputNotSupported;
         }
     }
+}
+
+// ============================================================
+// Vision prefill (forwardTokensWithVision)
+// ============================================================
+
+/// ViT output + grid metadata for one multimodal prompt. `features` holds the
+/// per-image pad rows concatenated in order of appearance; `blocks` is the
+/// merge-divided grid (t, h_merge, w_merge) per image — t*h*w rows each.
+pub const VisionInput = struct {
+    features: Array, // [total_pads, hidden] bf16
+    blocks: []const [3]i32,
+};
+
+/// Replace the rows of `emb_rows` ([L, hidden]) at each run of `image_token`
+/// positions with the next rows of `features` ([total_pads, hidden]). One
+/// image's pads are contiguous in the prompt, so each image is a single
+/// sliceUpdate span. Returns a new array (caller owns it).
+/// PRECONDITION (validated by forwardTokensWithVision): the image-pad count
+/// in `ids` must equal `features.shape()[0]` — spans index `features`
+/// unchecked beyond that.
+pub fn mergeVisionFeatures(
+    ctx: EagerContext,
+    emb_rows: Array,
+    ids: []const u32,
+    features: Array,
+    image_token: u32,
+) !Array {
+    const hidden = emb_rows.shape()[1];
+    var cur = try ops.copy(ctx, emb_rows);
+    errdefer cur.deinit();
+    var cursor: i32 = 0;
+    var i: usize = 0;
+    while (i < ids.len) {
+        if (ids[i] != image_token) {
+            i += 1;
+            continue;
+        }
+        var j = i;
+        while (j < ids.len and ids[j] == image_token) j += 1;
+        const n: i32 = @intCast(j - i);
+        const upd = try ops.slice(ctx, features, &[_]i32{ cursor, 0 }, &[_]i32{ cursor + n, hidden }, &[_]i32{ 1, 1 });
+        defer upd.deinit();
+        const next = try shape_mod.sliceUpdate(ctx, cur, upd, &[_]i32{ @intCast(i), 0 }, &[_]i32{ @intCast(j), hidden }, &[_]i32{ 1, 1 });
+        cur.deinit();
+        cur = next;
+        cursor += n;
+        i = j;
+    }
+    return cur;
+}
+
+/// Host-side MRoPE cos/sin tables for a vision prefill. Frequency slot j
+/// (of rotary_dims/2) reads position channel selector[j] (interleaved
+/// layout); angles are pos * theta^(-2j/rotary_dims), and the [L, half] table
+/// is tiled to [1, 1, L, rotary_dims] in half-split order ([c, c]) for the
+/// rotate-half apply (mirrors compute_mrope_frequencies + the concat tiling
+/// in mlx_vlm's rope_utils).
+pub fn buildMropeCosSin(
+    allocator: std.mem.Allocator,
+    cfg: *const qwen38_loader.Qwen38Config,
+    pos: *const qwen38_mrope.MropeResult,
+    seq_len: usize,
+) !qwen38_attn.MropeApply {
+    const rd: usize = cfg.rotaryDims();
+    const half = rd / 2;
+    const L = seq_len;
+
+    const selector = try allocator.alloc(u2, half);
+    defer allocator.free(selector);
+    qwen38_mrope.interleavedPositionSelectorRuntime(cfg.mrope_section, selector);
+
+    const n = L * rd;
+    const cos_buf = try allocator.alloc(f32, n);
+    defer allocator.free(cos_buf);
+    const sin_buf = try allocator.alloc(f32, n);
+    defer allocator.free(sin_buf);
+    const theta = cfg.rope_theta;
+    for (0..L) |t| {
+        for (0..half) |j| {
+            const jf: f32 = @floatFromInt(j);
+            const inv_freq = std.math.pow(f32, theta, -2.0 * jf / @as(f32, @floatFromInt(rd)));
+            const angle = @as(f32, @floatFromInt(pos.position_ids[selector[j]][t])) * inv_freq;
+            const cv = @cos(angle);
+            const sv = @sin(angle);
+            cos_buf[t * rd + j] = cv;
+            cos_buf[t * rd + j + half] = cv;
+            sin_buf[t * rd + j] = sv;
+            sin_buf[t * rd + j + half] = sv;
+        }
+    }
+
+    const li: i32 = @intCast(L);
+    const ri: i32 = @intCast(rd);
+    const cos_arr = try Array.fromData(allocator, f32, cos_buf, &[_]i32{ 1, 1, li, ri });
+    errdefer cos_arr.deinit();
+    try cos_arr.eval();
+    const sin_arr = try Array.fromData(allocator, f32, sin_buf, &[_]i32{ 1, 1, li, ri });
+    errdefer sin_arr.deinit();
+    try sin_arr.eval();
+    return .{ .cos = cos_arr, .sin = sin_arr };
 }
 
 // ============================================================
@@ -324,7 +425,7 @@ pub fn attnBranch(
     };
     _ = allocator;
 
-    return attn.forward(x, cache);
+    return attn.forward(x, cache, null);
 }
 
 /// SwiGLU MLP branch: down(silu(gate(x)) * up(x)), all quantized.
@@ -1383,6 +1484,22 @@ pub const Qwen38ServingModel = struct {
     /// ropeDynamic → gate sigmoid), one graph shared by all full-attention
     /// layers; KV append + SDPA + o_proj stay eager. Null when unavailable.
     attn_precache_compiled: ?Closure,
+    /// MRoPE rope_delta from the last vision prefill (max_pos+1 − seq_len):
+    /// decode/verify rope offsets are cache.len() + rope_delta. 0 on the
+    /// text path; reset() restores 0 and clears the per-layer copies.
+    rope_delta: i32 = 0,
+
+    /// Propagate the MRoPE delta to every full-attention layer (their rope
+    /// offset is cache.len() + rope_extra). GDN layers carry no rope.
+    fn setRopeDelta(self: *Qwen38ServingModel, delta: i32) void {
+        self.rope_delta = delta;
+        for (self.layers) |*lp| {
+            switch (lp.module) {
+                .attn => |*a| a.rope_extra = delta,
+                .gdn => {},
+            }
+        }
+    }
 
     /// Dequantize embed_tokens (packed U32 + scales + biases) to a resident
     /// bf16 [vocab, hidden] table and eval it once, so decode gathers rows
@@ -1510,40 +1627,43 @@ pub const Qwen38ServingModel = struct {
     /// Build and warm the compiled GDN/MLP decode closures. Best-effort: a
     /// compile or warm failure disables just that path (eager fallback).
     fn initCompiledSteps(self: *Qwen38ServingModel) void {
+        // Silence the status prints under `zig build test`: the build runner
+        // replays any captured stderr as a spurious "failed command" block.
+        const quiet = @import("builtin").is_test;
         if (qwen38_gdn.compiledStep(self.allocator, true)) |cc| {
             if (self.warmGdnStep(cc)) {
                 self.gdn_step_compiled = cc;
-                std.debug.print("info: compiled GDN decode step active\n", .{});
+                if (!quiet) std.debug.print("info: compiled GDN decode step active\n", .{});
             } else {
-                std.debug.print("warn: compiled GDN step warm failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled GDN step warm failed — eager fallback\n", .{});
                 cc.deinit();
             }
         } else |_| {
-            std.debug.print("warn: compiled GDN step build failed — eager fallback\n", .{});
+            if (!quiet) std.debug.print("warn: compiled GDN step build failed — eager fallback\n", .{});
         }
         if (compiledMlpSwiglu(self.allocator)) |mc| {
             if (self.warmMlpSwiglu(mc)) {
                 self.mlp_swiglu_compiled = mc;
-                std.debug.print("info: compiled MLP swiglu core active\n", .{});
+                if (!quiet) std.debug.print("info: compiled MLP swiglu core active\n", .{});
             } else {
-                std.debug.print("warn: compiled MLP swiglu warm failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled MLP swiglu warm failed — eager fallback\n", .{});
                 mc.deinit();
             }
         } else |_| {
-            std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
+            if (!quiet) std.debug.print("warn: compiled MLP swiglu build failed — eager fallback\n", .{});
         }
         // Fused gate|up variant: only when the layer weights fused at init.
         if (self.layers[0].mlp_gate_up != null) {
             if (compiledMlpSwigluFused(self.allocator)) |mc| {
                 if (self.warmMlpSwigluFused(mc)) {
                     self.mlp_swiglu_fused_compiled = mc;
-                    std.debug.print("info: compiled fused MLP gate_up+swiglu core active\n", .{});
+                    if (!quiet) std.debug.print("info: compiled fused MLP gate_up+swiglu core active\n", .{});
                 } else {
-                    std.debug.print("warn: compiled fused MLP swiglu warm failed — unfused fallback\n", .{});
+                    if (!quiet) std.debug.print("warn: compiled fused MLP swiglu warm failed — unfused fallback\n", .{});
                     mc.deinit();
                 }
             } else |_| {
-                std.debug.print("warn: compiled fused MLP swiglu build failed — unfused fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled fused MLP swiglu build failed — unfused fallback\n", .{});
             }
         }
         // Attention pre-cache segment: only for the exact config the closure
@@ -1555,13 +1675,13 @@ pub const Qwen38ServingModel = struct {
             if (qwen38_attn.compiledPreCache(self.allocator)) |ac| {
                 if (self.warmAttnPreCache(ac)) {
                     self.attn_precache_compiled = ac;
-                    std.debug.print("info: compiled attention pre-cache segment active\n", .{});
+                    if (!quiet) std.debug.print("info: compiled attention pre-cache segment active\n", .{});
                 } else {
-                    std.debug.print("warn: compiled attn pre-cache warm failed — eager fallback\n", .{});
+                    if (!quiet) std.debug.print("warn: compiled attn pre-cache warm failed — eager fallback\n", .{});
                     ac.deinit();
                 }
             } else |_| {
-                std.debug.print("warn: compiled attn pre-cache build failed — eager fallback\n", .{});
+                if (!quiet) std.debug.print("warn: compiled attn pre-cache build failed — eager fallback\n", .{});
             }
         }
     }
@@ -1570,7 +1690,7 @@ pub const Qwen38ServingModel = struct {
     /// cache length and returns the segment outputs (owned by the caller).
     /// On failure nothing is consumed — callers fall back to the eager path.
     pub fn applyAttnPreCache(self: *Qwen38ServingModel, ac: Closure, a: *qwen38_attn.Qwen38Attn, cache: *qwen38_attn.Qwen38AttnCache, x: Array) !qwen38_attn.PreCacheOut {
-        const offset_arr = try ops.scalarI32(self.ctx, cache.len());
+        const offset_arr = try ops.scalarI32(self.ctx, cache.len() + a.rope_extra);
         defer offset_arr.deinit();
         const inputs = [_]Array{
             x,            a.q_proj,     a.q_scales.?, a.q_biases.?,
@@ -1756,6 +1876,9 @@ pub const Qwen38ServingModel = struct {
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
         self.caches = new_caches;
+        // Fresh request: the rope delta from any previous vision prefill
+        // dies with the caches.
+        self.setRopeDelta(0);
     }
 
     var cached_sync_every: ?usize = null;
@@ -1834,6 +1957,101 @@ pub const Qwen38ServingModel = struct {
         return res.logits;
     }
 
+    /// Vision prefill: embed `ids`, splice the ViT features in at the
+    /// image-pad positions, run the layer stack with MRoPE cos/sin tables
+    /// (full-attention layers only — GDN has no rope), and stash the
+    /// resulting rope_delta so later decode/verify steps offset rope by
+    /// cache.len() + delta. Returns last-position logits, same contract as
+    /// forwardTokensLast. Always a fresh prefill (resets state).
+    pub fn forwardTokensWithVision(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput) !Array {
+        const res = try self.forwardTokensWithVisionImpl(ids, vision, .none);
+        return res.logits;
+    }
+
+    fn forwardTokensWithVisionImpl(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput, capture: HiddenCapture) !ForwardCoreOut {
+        const allocator = self.allocator;
+        const ctx = self.ctx;
+        const cfg = self.cfg;
+        const hidden: i32 = @intCast(cfg.hidden_size);
+
+        // Vision-range allow-list for this entry point: vision_start /
+        // vision_end / image_pad pass; vision_pad and video_pad stay
+        // rejected everywhere.
+        for (ids) |t| {
+            if (t >= vision_token_lo and t <= vision_token_hi and
+                t != cfg.vision_start_token_id and t != cfg.vision_end_token_id and
+                t != cfg.image_token_id)
+            {
+                if (!@import("builtin").is_test)
+                    std.log.err("qwen38: vision input not supported (token id {d} in vision range [{d}, {d}])", .{ t, vision_token_lo, vision_token_hi });
+                return VisionError.VisionInputNotSupported;
+            }
+        }
+
+        // Pad bookkeeping: the ids must carry exactly the pads the blocks
+        // and the feature rows describe.
+        var n_pads: usize = 0;
+        for (ids) |t| n_pads += @intFromBool(t == cfg.image_token_id);
+        var blocks_pads: usize = 0;
+        for (vision.blocks) |b| {
+            if (b[0] <= 0 or b[1] <= 0 or b[2] <= 0) return error.InvalidGridDims;
+            blocks_pads += @as(usize, @intCast(b[0])) * @as(usize, @intCast(b[1])) * @as(usize, @intCast(b[2]));
+        }
+        if (n_pads != blocks_pads) return error.ImageBlockMismatch;
+
+        if (vision.blocks.len == 0) {
+            // Text-only ids: delegate to the plain path — bitwise-identical,
+            // and rope_delta stays 0.
+            const lg = try self.forwardTokensLast(ids);
+            return .{ .logits = lg, .hidden = null };
+        }
+        // buildMropeCosSin implements only the interleaved frequency layout.
+        if (!cfg.mrope_interleaved) return error.UnsupportedMropeLayout;
+        const fshape = vision.features.shape();
+        if (fshape.len != 2 or fshape[0] != @as(i32, @intCast(n_pads)) or fshape[1] != hidden)
+            return error.ImageBlockMismatch;
+
+        var mres = try qwen38_mrope.computePositionIds(
+            allocator,
+            ids,
+            vision.blocks,
+            cfg.image_token_id,
+            cfg.vision_start_token_id,
+        );
+        defer mres.deinit(allocator);
+
+        if (self.embed_table_bf16 == null) {
+            self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+        }
+        const ids_i32 = try allocator.alloc(i32, ids.len);
+        defer allocator.free(ids_i32);
+        for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+        const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
+        defer id_arr.deinit();
+        const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0); // [L, hidden] bf16
+        defer rows.deinit();
+        const merged = try mergeVisionFeatures(ctx, rows, ids, vision.features, cfg.image_token_id);
+        defer merged.deinit();
+        const emb = try ops.reshape(ctx, merged, &[_]i32{ 1, @intCast(ids.len), hidden });
+        defer emb.deinit();
+
+        var mr = try buildMropeCosSin(allocator, cfg, &mres, ids.len);
+        defer mr.deinit();
+
+        const res = try self.forwardTokensCoreCont(ids, capture, true, false, .{ .emb = emb, .mrope = mr });
+        // Only after the reset inside the prefill: decode/verify offsets
+        // shift by the delta from here on.
+        self.setRopeDelta(mres.rope_delta);
+        return res;
+    }
+
+    /// forwardTokensWithVision with hidden-state capture (oracle bisection):
+    /// identical dataflow; `capture` .all returns the pre-final-norm hidden
+    /// [1, L, hidden] bf16, .last the last position only.
+    pub fn forwardTokensWithVisionCapture(self: *Qwen38ServingModel, ids: []const u32, vision: VisionInput, capture: HiddenCapture) !ForwardCoreOut {
+        return self.forwardTokensWithVisionImpl(ids, vision, capture);
+    }
+
     /// forwardTokens + the pre-final-norm hidden at the last position (the
     /// MTP head's chaining input after a prefill or plain decode step).
     pub fn forwardTokensHidden(self: *Qwen38ServingModel, ids: []const u32) !ForwardHiddenOut {
@@ -1854,8 +2072,29 @@ pub const Qwen38ServingModel = struct {
         return .{ .logits = res.logits, .hidden_all = res.hidden.? };
     }
 
-    const HiddenCapture = enum { none, last, all };
-    const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
+    /// Embedding entry (/v1/embeddings): ALWAYS a fresh prefill — resets all
+    /// GDN/attention state even for a single-token input (the plain core path
+    /// treats L==1 as a cached decode step, which would continue stale state).
+    /// Returns the LAST position's pre-final-norm hidden [1, hidden] bf16
+    /// (owned); the caller applies the final RMSNorm. Logits are
+    /// last-position-only and discarded here.
+    pub fn forwardTokensEmbed(self: *Qwen38ServingModel, ids: []const u32) !Array {
+        try self.reset();
+        const res = try self.forwardTokensCore(ids, .last, true);
+        res.logits.deinit();
+        return res.hidden.?;
+    }
+
+    pub const HiddenCapture = enum { none, last, all };
+    pub const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
+
+    /// Vision prefill extras: merged embeddings (image features already
+    /// spliced at the image-pad rows) and the MRoPE cos/sin tables for the
+    /// full-attention layers. Null = the plain text path, byte-identical.
+    const VisionPrefill = struct {
+        emb: Array, // [1, L, hidden] bf16
+        mrope: qwen38_attn.MropeApply,
+    };
 
     // DMLX_LAYER_PROF=1: barrier after every layer and accumulate per-kind
     // wall time. Diagnostic only — the per-layer sync costs a few percent
@@ -1885,30 +2124,124 @@ pub const Qwen38ServingModel = struct {
         capture: HiddenCapture,
         last_logits_only: bool,
     ) !ForwardCoreOut {
+        return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null);
+    }
+
+    var cached_prefill_chunk: ?usize = null;
+
+    /// Long-prefill chunk size, OPT-IN (default 0 = monolithic). Measured
+    /// neutral on wall (2026-11-11, scripts/ab_prefill_chunk16k.sh: 16K
+    /// prompt, 106.95/103.47s chunked vs 103.12/102.80s monolithic) — the
+    /// earlier "qmm collapses past M≈3K" reading was the per-(m,n,k) Metal
+    /// JIT compile (~1.6s one-off per shape), and prefill is in fact linear
+    /// at ~8 ms/token from 119 to 13243 tokens (at parity with omlx). Keep
+    /// available for peak-memory relief at >16K prompts (monolithic 16K
+    /// peaked at 53.5 GB). DMLX_PREFILL_CHUNK=2048 enables.
+    fn prefillChunkSize() usize {
+        if (cached_prefill_chunk) |v| return v;
+        var v: usize = 0;
+        if (std.c.getenv("DMLX_PREFILL_CHUNK")) |s| {
+            v = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 0;
+        }
+        cached_prefill_chunk = v;
+        return v;
+    }
+
+    /// Chunked prefill: run the prompt in `prefillChunkSize()` pieces with
+    /// layer state carried across chunks (GDN conv/ssm state and attn KV both
+    /// continue; rope offset comes from the cache length). Only the last
+    /// chunk contributes logits; `.all` hidden capture concatenates across
+    /// chunks. Bitwise differences vs a monolithic prefill are possible in
+    /// attention (chunk-boundary softmax splits) — covered by the
+    /// chunked-vs-monolithic consistency test.
+    fn forwardChunkedPrefill(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+    ) anyerror!ForwardCoreOut {
+        const ctx = self.ctx;
+        const chunk = prefillChunkSize();
+        try self.reset();
+        var hidden_all: ?Array = null;
+        errdefer if (hidden_all) |*ha| ha.deinit();
+        var logits: ?Array = null;
+        var pos: usize = 0;
+        while (pos < ids.len) {
+            const end = @min(pos + chunk, ids.len);
+            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null);
+            // Only the last chunk's logits are wanted (they are the
+            // last-position row either way).
+            if (logits) |l| l.deinit();
+            logits = res.logits;
+            if (capture == .all) {
+                if (hidden_all) |*ha| {
+                    const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ ha.*, res.hidden.? }, 1);
+                    ha.deinit();
+                    ha.* = merged;
+                    res.hidden.?.deinit();
+                } else {
+                    hidden_all = res.hidden.?;
+                }
+            }
+            pos = end;
+        }
+        return .{ .logits = logits.?, .hidden = hidden_all };
+    }
+
+    fn forwardTokensCoreCont(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+        continuation: bool,
+        vision: ?VisionPrefill,
+    ) anyerror!ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
         const ctx = self.ctx;
         const hidden: i32 = @intCast(cfg.hidden_size);
 
-        try rejectVisionTokens(ids);
-        if (ids.len > 1) try self.reset();
-
-        const ids_i32 = try allocator.alloc(i32, ids.len);
-        defer allocator.free(ids_i32);
-        for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
-
-        // Gather rows from the resident bf16 table (dequantized once at
-        // init) — never re-dequantize the full vocab table per token.
-        if (self.embed_table_bf16 == null) {
-            self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+        // The vision entry point runs its own allow-list; the plain entry
+        // points keep rejecting every vision-range token.
+        if (vision == null) try rejectVisionTokens(ids);
+        if (ids.len > 1 and !continuation) {
+            const chunk = prefillChunkSize();
+            // Opt-in chunked long prefill (see prefillChunkSize — perf-neutral,
+            // kept for peak-memory relief). Restricted to the serving captures:
+            // the oracle path (capture .none with full logits) stays monolithic.
+            // Vision prefill is always monolithic (one MRoPE table per prompt).
+            if (vision == null and chunk > 0 and ids.len > chunk and
+                (capture == .all or last_logits_only))
+            {
+                return self.forwardChunkedPrefill(ids, capture, last_logits_only);
+            }
+            try self.reset();
         }
-        const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
-        defer id_arr.deinit();
-        const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0);
-        defer rows.deinit();
-        const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) });
-        defer emb.deinit();
-        var h = try ops.copy(ctx, emb); // bf16
+
+        var h: Array = undefined;
+        if (vision) |v| {
+            // Embeddings with the ViT features already merged (host side of
+            // forwardTokensWithVision); bf16 [1, L, hidden].
+            h = try ops.copy(ctx, v.emb);
+        } else {
+            const ids_i32 = try allocator.alloc(i32, ids.len);
+            defer allocator.free(ids_i32);
+            for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+
+            // Gather rows from the resident bf16 table (dequantized once at
+            // init) — never re-dequantize the full vocab table per token.
+            if (self.embed_table_bf16 == null) {
+                self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+            }
+            const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
+            defer id_arr.deinit();
+            const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0);
+            defer rows.deinit();
+            const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(ids.len), @intCast(cfg.hidden_size) });
+            defer emb.deinit();
+            h = try ops.copy(ctx, emb); // bf16
+        }
         defer h.deinit();
 
         // Fused add+rmsNorm restructure: the norm feeding layer i+1's input
@@ -1958,7 +2291,7 @@ pub const Qwen38ServingModel = struct {
                 .attn => |*a| blk: {
                     const cache = &self.caches[layer].attn;
                     const n = normed1.shape()[1];
-                    if (n > 1) break :blk try a.forward(normed1, cache);
+                    if (n > 1) break :blk try a.forward(normed1, cache, if (vision) |v| v.mrope else null);
                     if (self.attn_precache_compiled) |ac| {
                         const step_in = try ops.reshape(ctx, normed1, &[_]i32{ 1, hidden });
                         defer step_in.deinit();
@@ -1970,7 +2303,7 @@ pub const Qwen38ServingModel = struct {
                             break :blk try ops.reshape(ctx, out2d, &[_]i32{ 1, 1, hidden });
                         } else |_| {} // fall through to the eager path
                     }
-                    break :blk try a.forward(normed1, cache);
+                    break :blk try a.forward(normed1, cache, null);
                 },
             };
             defer attn_out.deinit();
@@ -2193,7 +2526,7 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
                 const cache = &self.caches[layer].attn;
                 try attn_old_lens.append(allocator, cache.len());
                 try attn_layers.append(allocator, layer);
-                break :blk try a.forward(normed1, cache);
+                break :blk try a.forward(normed1, cache, null);
             },
         };
         if (prof) {
@@ -2898,5 +3231,393 @@ test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
         const got = try a32.dataSlice(f32);
         const exp = try b32.dataSlice(f32);
         for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+}
+
+test "Qwen38ServingModel: chunked prefill matches monolithic (last logits)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const fa = try allocator.dupe(u32, &[_]u32{1});
+    var cfg = qwen38_loader.Qwen38Config{
+        .allocator = allocator,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .vocab_size = 64,
+        .intermediate_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 32,
+        .partial_rotary_factor = 0.25,
+        .linear_num_key_heads = 2,
+        .linear_num_value_heads = 8,
+        .linear_key_head_dim = 8,
+        .linear_value_head_dim = 8,
+        .full_attn_layers = fa,
+    };
+    defer cfg.deinit();
+
+    const mkModel = struct {
+        fn call(alloc: std.mem.Allocator, c2: EagerContext, c3: *qwen38_loader.Qwen38Config) !Qwen38ServingModel {
+            const hidden: i32 = 64;
+            const vocab: i32 = 64;
+            const inter: i32 = 128;
+            const gdn_qkv: i32 = 96;
+            const gdn_z: i32 = 64;
+            var map = std.StringHashMap(Array).init(alloc);
+            errdefer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    alloc.free(e.key_ptr.*);
+                    e.value_ptr.deinit();
+                }
+                map.deinit();
+            }
+            try putToyQuant(alloc, c2, &map, "language_model.model.embed_tokens", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.norm.weight", &[_]i32{hidden});
+            try putToyQuant(alloc, c2, &map, "language_model.lm_head", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.post_attention_layernorm.weight", &[_]i32{hidden});
+            const la = "language_model.model.layers.0.linear_attn";
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_qkv", gdn_qkv, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_a", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_b", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_z", gdn_z, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".out_proj", hidden, gdn_z);
+            try putToyTensor(alloc, &map, la ++ ".conv1d.weight", &[_]i32{ gdn_qkv, 4, 1 });
+            try putToyTensor(alloc, &map, la ++ ".A_log", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".dt_bias", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".norm.weight", &[_]i32{8});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.down_proj", hidden, inter);
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.post_attention_layernorm.weight", &[_]i32{hidden});
+            const sa = "language_model.model.layers.1.self_attn";
+            try putToyQuant(alloc, c2, &map, sa ++ ".q_proj", 128, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".k_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".v_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".o_proj", hidden, 64);
+            try putToyTensor(alloc, &map, sa ++ ".q_norm.weight", &[_]i32{32});
+            try putToyTensor(alloc, &map, sa ++ ".k_norm.weight", &[_]i32{32});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.down_proj", hidden, inter);
+            var m = try Qwen38ServingModel.init(alloc, c2, c3, map);
+            m.ws = WeightSource.fromMap(&m.weights, c2, &m.ws_backing);
+            return m;
+        }
+    }.call;
+
+    const ids = [_]u32{ 5, 9, 2, 40, 17, 23, 61, 8 };
+
+    // Monolithic reference: chunking disabled.
+    Qwen38ServingModel.cached_prefill_chunk = 0;
+    var ref = try mkModel(allocator, ctx, &cfg);
+    defer {
+        ref.deinit();
+        var it = ref.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        ref.weights.deinit();
+    }
+    const l_mono = try ref.forwardTokensLast(&ids);
+    defer l_mono.deinit();
+
+    // Chunked: 3-token pieces over 8 tokens (uneven tail).
+    Qwen38ServingModel.cached_prefill_chunk = 3;
+    var chunked = try mkModel(allocator, ctx, &cfg);
+    defer {
+        chunked.deinit();
+        var it = chunked.weights.iterator();
+        while (it.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            e.value_ptr.deinit();
+        }
+        chunked.weights.deinit();
+    }
+    const l_chunk = try chunked.forwardTokensLast(&ids);
+    defer l_chunk.deinit();
+    Qwen38ServingModel.cached_prefill_chunk = null;
+
+    const a32 = try ops.astype(ctx, l_mono, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, l_chunk, .float32);
+    defer b32.deinit();
+    const d = try ops.subtract(ctx, a32, b32);
+    defer d.deinit();
+    const ad = try ops.abs(ctx, d);
+    defer ad.deinit();
+    const m = try ops.max(ctx, ad);
+    defer m.deinit();
+    try m.eval();
+    // Chunk boundaries split the attention softmax and the GDN scan; both
+    // sides are bf16 with fp32 accumulation, so allow a few bf16 ulps on
+    // O(1)-magnitude logits.
+    try std.testing.expect(try m.item(f32) <= 5e-2);
+}
+
+test "mergeVisionFeatures: image rows replaced in id order" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // hidden=4, ids with two image spans (2 pads, then 1 pad).
+    const ids = [_]u32{ 1, 60, 60, 2, 60, 3, 4 };
+    var emb_buf: [28]f32 = undefined;
+    for (&emb_buf, 0..) |*v, i| v.* = @floatFromInt(i); // row r = [4r..4r+3]
+    const emb_f32 = try Array.fromData(allocator, f32, &emb_buf, &[_]i32{ 7, 4 });
+    defer emb_f32.deinit();
+    const emb = try ops.astype(ctx, emb_f32, .bfloat16);
+    defer emb.deinit();
+    var feat_buf: [12]f32 = undefined;
+    for (&feat_buf, 0..) |*v, i| v.* = 100.0 + @as(f32, @floatFromInt(i));
+    const feat_f32 = try Array.fromData(allocator, f32, &feat_buf, &[_]i32{ 3, 4 });
+    defer feat_f32.deinit();
+    const feat = try ops.astype(ctx, feat_f32, .bfloat16);
+    defer feat.deinit();
+
+    const merged = try mergeVisionFeatures(ctx, emb, &ids, feat, 60);
+    defer merged.deinit();
+    const got_f32 = try ops.astype(ctx, merged, .float32);
+    defer got_f32.deinit();
+    const got = try got_f32.dataSlice(f32);
+    const expected = [_]f32{
+        0, 1, 2, 3, // text row 0 untouched
+        100, 101, 102, 103, // first span: features row 0
+        104, 105, 106, 107, // first span: features row 1
+        12, 13, 14, 15, // text row 3 untouched
+        108, 109, 110, 111, // second span: features row 2
+        20,  21,  22,  23,
+        24,  25,  26,  27,
+    };
+    try std.testing.expectEqualSlices(f32, &expected, got);
+}
+
+test "Qwen38ServingModel.forwardTokensWithVision: empty vision == text path; image sets rope_delta" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Toy model (same shapes as the chunked-prefill test) with vision token
+    // ids squeezed into the toy vocab: image=60, start=61, end=62.
+    const fa = try allocator.dupe(u32, &[_]u32{1});
+    var cfg = qwen38_loader.Qwen38Config{
+        .allocator = allocator,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .vocab_size = 64,
+        .intermediate_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 32,
+        .partial_rotary_factor = 0.25,
+        .linear_num_key_heads = 2,
+        .linear_num_value_heads = 8,
+        .linear_key_head_dim = 8,
+        .linear_value_head_dim = 8,
+        .full_attn_layers = fa,
+        .image_token_id = 60,
+        .vision_start_token_id = 61,
+        .vision_end_token_id = 62,
+    };
+    defer cfg.deinit();
+
+    const mkModel = struct {
+        fn call(alloc: std.mem.Allocator, c2: EagerContext, c3: *qwen38_loader.Qwen38Config) !Qwen38ServingModel {
+            const hidden: i32 = 64;
+            const vocab: i32 = 64;
+            const inter: i32 = 128;
+            const gdn_qkv: i32 = 96;
+            const gdn_z: i32 = 64;
+            var map = std.StringHashMap(Array).init(alloc);
+            errdefer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    alloc.free(e.key_ptr.*);
+                    e.value_ptr.deinit();
+                }
+                map.deinit();
+            }
+            try putToyQuant(alloc, c2, &map, "language_model.model.embed_tokens", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.norm.weight", &[_]i32{hidden});
+            try putToyQuant(alloc, c2, &map, "language_model.lm_head", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.post_attention_layernorm.weight", &[_]i32{hidden});
+            const la = "language_model.model.layers.0.linear_attn";
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_qkv", gdn_qkv, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_a", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_b", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_z", gdn_z, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".out_proj", hidden, gdn_z);
+            try putToyTensor(alloc, &map, la ++ ".conv1d.weight", &[_]i32{ gdn_qkv, 4, 1 });
+            try putToyTensor(alloc, &map, la ++ ".A_log", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".dt_bias", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".norm.weight", &[_]i32{8});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.down_proj", hidden, inter);
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.post_attention_layernorm.weight", &[_]i32{hidden});
+            const sa = "language_model.model.layers.1.self_attn";
+            try putToyQuant(alloc, c2, &map, sa ++ ".q_proj", 128, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".k_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".v_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".o_proj", hidden, 64);
+            try putToyTensor(alloc, &map, sa ++ ".q_norm.weight", &[_]i32{32});
+            try putToyTensor(alloc, &map, sa ++ ".k_norm.weight", &[_]i32{32});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.down_proj", hidden, inter);
+            var m = try Qwen38ServingModel.init(alloc, c2, c3, map);
+            m.ws = WeightSource.fromMap(&m.weights, c2, &m.ws_backing);
+            return m;
+        }
+    }.call;
+
+    const deinitModel = struct {
+        fn call(m: *Qwen38ServingModel, alloc: std.mem.Allocator) void {
+            m.deinit();
+            var it = m.weights.iterator();
+            while (it.next()) |e| {
+                alloc.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            m.weights.deinit();
+        }
+    }.call;
+
+    const ids_text = [_]u32{ 5, 9, 2, 40 };
+
+    // Reference: plain text prefill.
+    var ref = try mkModel(allocator, ctx, &cfg);
+    defer deinitModel(&ref, allocator);
+    const l_ref = try ref.forwardTokensLast(&ids_text);
+    defer l_ref.deinit();
+
+    // Empty vision input: same ids, no images → identical logits, delta 0.
+    const dummy_feat = try creation_mod.zeros(ctx, &[_]i32{ 1, 64 }, .bfloat16);
+    defer dummy_feat.deinit();
+    var model = try mkModel(allocator, ctx, &cfg);
+    defer deinitModel(&model, allocator);
+    const l_empty = try model.forwardTokensWithVision(&ids_text, .{ .features = dummy_feat, .blocks = &.{} });
+    defer l_empty.deinit();
+    {
+        const a32 = try ops.astype(ctx, l_ref, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_empty, .float32);
+        defer b32.deinit();
+        try std.testing.expectEqualSlices(f32, try a32.dataSlice(f32), try b32.dataSlice(f32));
+        try std.testing.expectEqual(@as(i32, 0), model.rope_delta);
+    }
+
+    // Image case: [5, vs, img x4, ve, 9] with a (1,2,2) block → rope_delta -2.
+    const ids_img = [_]u32{ 5, 61, 60, 60, 60, 60, 62, 9 };
+    const blocks = [_][3]i32{.{ 1, 2, 2 }};
+    var feat_buf: [4 * 64]f32 = undefined;
+    for (&feat_buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 31 + 7, 17) - 8)) * 0.05;
+    }
+    const feat_f32 = try Array.fromData(allocator, f32, &feat_buf, &[_]i32{ 4, 64 });
+    defer feat_f32.deinit();
+    const feat = try ops.astype(ctx, feat_f32, .bfloat16);
+    defer feat.deinit();
+
+    var model_v = try mkModel(allocator, ctx, &cfg);
+    defer deinitModel(&model_v, allocator);
+    const l_img = try model_v.forwardTokensWithVision(&ids_img, .{ .features = feat, .blocks = &blocks });
+    defer l_img.deinit();
+    {
+        const sh = l_img.shape();
+        try std.testing.expectEqual(@as(i32, 1), sh[0]);
+        try std.testing.expectEqual(@as(i32, 1), sh[1]);
+        try std.testing.expectEqual(@as(i32, 64), sh[2]);
+        try std.testing.expectEqual(@as(i32, -2), model_v.rope_delta);
+        // The full-attention layer's decode offset now includes the delta.
+        try std.testing.expectEqual(@as(i32, -2), model_v.layers[1].module.attn.rope_extra);
+        // Logits must be finite.
+        const f32l = try ops.astype(ctx, l_img, .float32);
+        defer f32l.deinit();
+        for (try f32l.dataSlice(f32)) |v| try std.testing.expect(std.math.isFinite(v));
+    }
+
+    // Decode after the vision prefill: deterministic across two identical
+    // models, and the offset must include the delta (cross-checked at the
+    // attention-module level by the rope_extra test in qwen38_attn.zig).
+    var model_v2 = try mkModel(allocator, ctx, &cfg);
+    defer deinitModel(&model_v2, allocator);
+    const l_img2 = try model_v2.forwardTokensWithVision(&ids_img, .{ .features = feat, .blocks = &blocks });
+    defer l_img2.deinit();
+    const d_a = try model_v.forwardTokens(&[_]u32{7});
+    defer d_a.deinit();
+    const d_b = try model_v2.forwardTokens(&[_]u32{7});
+    defer d_b.deinit();
+    {
+        const a32 = try ops.astype(ctx, d_a, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, d_b, .float32);
+        defer b32.deinit();
+        try std.testing.expectEqualSlices(f32, try a32.dataSlice(f32), try b32.dataSlice(f32));
+    }
+
+    // A later plain text prefill resets the delta and matches the reference.
+    const l_after = try model_v.forwardTokensLast(&ids_text);
+    defer l_after.deinit();
+    {
+        try std.testing.expectEqual(@as(i32, 0), model_v.rope_delta);
+        try std.testing.expectEqual(@as(i32, 0), model_v.layers[1].module.attn.rope_extra);
+        const a32 = try ops.astype(ctx, l_ref, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_after, .float32);
+        defer b32.deinit();
+        try std.testing.expectEqualSlices(f32, try a32.dataSlice(f32), try b32.dataSlice(f32));
+    }
+
+    // Pad/block count mismatch is an error, not a trap.
+    var model_bad = try mkModel(allocator, ctx, &cfg);
+    defer deinitModel(&model_bad, allocator);
+    try std.testing.expectError(
+        error.ImageBlockMismatch,
+        model_bad.forwardTokensWithVision(&ids_img, .{ .features = feat, .blocks = &.{} }),
+    );
+
+    // vision_pad / video_pad stay rejected on the vision entry point too
+    // (the check fires before any embedding lookup, so the out-of-toy-vocab
+    // ids are fine here).
+    for ([_]u32{ 248055, 248057 }) |bad_tok| {
+        var model_r = try mkModel(allocator, ctx, &cfg);
+        defer deinitModel(&model_r, allocator);
+        try std.testing.expectError(
+            VisionError.VisionInputNotSupported,
+            model_r.forwardTokensWithVision(&[_]u32{ 5, bad_tok, 9 }, .{ .features = dummy_feat, .blocks = &.{} }),
+        );
+    }
+
+    // Non-interleaved MRoPE layout: vision prefill is rejected loudly (the
+    // cos/sin builder only implements the interleaved layout), while the
+    // text-only delegation is unaffected.
+    const fa2 = try allocator.dupe(u32, &[_]u32{1});
+    var cfg_chunked_layout = cfg;
+    cfg_chunked_layout.full_attn_layers = fa2;
+    cfg_chunked_layout.mrope_interleaved = false;
+    defer cfg_chunked_layout.deinit();
+    var model_ni = try mkModel(allocator, ctx, &cfg_chunked_layout);
+    defer deinitModel(&model_ni, allocator);
+    try std.testing.expectError(
+        error.UnsupportedMropeLayout,
+        model_ni.forwardTokensWithVision(&ids_img, .{ .features = feat, .blocks = &blocks }),
+    );
+    const l_ni = try model_ni.forwardTokensWithVision(&ids_text, .{ .features = dummy_feat, .blocks = &.{} });
+    defer l_ni.deinit();
+    {
+        const a32 = try ops.astype(ctx, l_ref, .float32);
+        defer a32.deinit();
+        const b32 = try ops.astype(ctx, l_ni, .float32);
+        defer b32.deinit();
+        try std.testing.expectEqualSlices(f32, try a32.dataSlice(f32), try b32.dataSlice(f32));
+        try std.testing.expectEqual(@as(i32, 0), model_ni.rope_delta);
     }
 }

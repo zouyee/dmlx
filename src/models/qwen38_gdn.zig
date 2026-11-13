@@ -2505,8 +2505,31 @@ pub fn linearQuantParts(ctx: EagerContext, x: Array, w: Array, scales: ?Array, b
         if (try verify_qmm.maybeQmm(ctx, x, qw)) |y| return y;
         // Long-prefill rows: omlx's affine_q4_qmm_t variant-8 tile (~1.05x at
         // every projection shape, bit-exact; bench_prefill_v8).
-        if (try qmm_v8.maybeApply(ctx, x, w, s, biases)) |y| return y;
-        return quantize_mod.quantizedMatmul(ctx, x, qw, true);
+        const trace = std.c.getenv("DMLX_QMM_TRACE") != null;
+        const t0 = if (trace) nowNs() else 0;
+        var via: []const u8 = "stock";
+        if (try qmm_v8.maybeApply(ctx, x, w, s, biases)) |y| {
+            via = "v8";
+            if (trace) {
+                const yc = try ops.copy(ctx, y);
+                try yc.eval();
+                defer yc.deinit();
+                const xs = x.shape();
+                const xst = x.strides();
+                const wst = w.strides();
+                std.log.info("[QMM_TRACE] {s} x=[{d},{d},{d}] xst=({d},{d},{d}) dt={s} N={d} wst=({d},{d}) {d:.1}ms", .{ via, xs[0], xs[1], xs[2], xst[0], xst[1], xst[2], @tagName(x.dtype()), w.shape()[0], wst[0], wst[1], @as(f64, @floatFromInt(nowNs() - t0)) / 1e6 });
+            }
+            return y;
+        }
+        const y = try quantize_mod.quantizedMatmul(ctx, x, qw, true);
+        if (trace) {
+            const yc = try ops.copy(ctx, y);
+            try yc.eval();
+            defer yc.deinit();
+            const xs = x.shape();
+            std.log.info("[QMM_TRACE] {s} x=[{d},{d},{d}] dt={s} N={d} {d:.1}ms", .{ via, xs[0], xs[1], xs[2], @tagName(x.dtype()), w.shape()[0], @as(f64, @floatFromInt(nowNs() - t0)) / 1e6 });
+        }
+        return y;
     }
     const w_t = try ops.transpose(ctx, w);
     defer w_t.deinit();

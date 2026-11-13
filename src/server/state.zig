@@ -17,6 +17,7 @@ const engine = @import("../engine/root.zig");
 const native_engine_mod = @import("../native_engine.zig");
 const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
+const response_store_mod = @import("response_store.zig");
 const detectArchitecture = utils_mod.detectArchitecture;
 
 const EagerContext = ops.EagerContext;
@@ -56,9 +57,16 @@ pub const ServerState = struct {
     is_native: bool = false,
     /// Model EOS stop tokens (e.g. Qwen3.5 multi-EOS list). Owned.
     stop_tokens: []const u32 = &.{},
+    /// Server start time (unix seconds), reported as `created` by /v1/models.
+    start_time_unix: i64 = 0,
+    /// In-memory Responses API object store (GET/DELETE /v1/responses/{id}).
+    response_store: response_store_mod.ResponseStore,
 
     // Server V2: engine loop and request queue
     request_queue: engine.RequestQueue,
+    /// /v1/embeddings task queue — HTTP fibers push, the engine loop thread
+    /// executes (GPU forwards are thread-affine; see engine/embed_queue.zig).
+    embed_queue: engine.EmbedQueue,
     engine_loop: ?engine.EngineLoop,
     engine_running: std.atomic.Value(bool),
     active_requests: std.atomic.Value(u32),
@@ -67,6 +75,7 @@ pub const ServerState = struct {
     pub fn deinit(self: *ServerState) void {
         self.running = false;
         self.engine_running.store(false, .release);
+        self.response_store.deinit();
         // Save prompt cache to disk on shutdown if configured.
         if (!self.is_native) {
             if (self.prompt_cache_file) |cache_path| {
@@ -128,6 +137,7 @@ fn dummyDeinit(ctx: *anyopaque, allocator: std.mem.Allocator) void {
 }
 
 pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig) !ServerState {
+    const start_time_unix = std.Io.Timestamp.now(io, .real).toSeconds();
     // 1. Read config.json
     const config_path = try std.fs.path.join(allocator, &[_][]const u8{ config.model_path, "config.json" });
     defer allocator.free(config_path);
@@ -221,6 +231,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .tokenizer_strategy = undefined,
             .tokenizer_backend = tokenizer_backend,
             .model_name = model_name,
+            .start_time_unix = start_time_unix,
             .chat_template = chat_template,
             .caches = &[_]kvcache.KVCacheStrategy{},
             .model_pool = null,
@@ -232,8 +243,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .prefix_disk_cache = null,
             .native_engine = ne,
             .is_native = true,
+            .response_store = response_store_mod.ResponseStore.init(allocator),
             .running = true,
             .request_queue = undefined,
+            .embed_queue = undefined,
             .engine_loop = null,
             .engine_running = std.atomic.Value(bool).init(false),
             .active_requests = std.atomic.Value(u32).init(0),
@@ -443,6 +456,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .tokenizer_strategy = undefined,
         .tokenizer_backend = tokenizer_backend,
         .model_name = model_name,
+        .start_time_unix = start_time_unix,
         .chat_template = chat_template,
         .caches = caches,
         .model_pool = model_pool,
@@ -458,8 +472,10 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .dsv4_model = dsv4_model,
         .vtable_serial = is_internal_cache,
         .stop_tokens = stop_tokens,
+        .response_store = response_store_mod.ResponseStore.init(allocator),
         .running = true,
         .request_queue = undefined,
+        .embed_queue = undefined,
         .engine_loop = null,
         .engine_running = std.atomic.Value(bool).init(false),
         .active_requests = std.atomic.Value(u32).init(0),

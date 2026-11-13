@@ -17,6 +17,7 @@ pub const interface = @import("tokenizer/interface.zig");
 pub const greedy = @import("tokenizer/greedy.zig");
 pub const bpe = @import("tokenizer/bpe.zig");
 pub const chat_template = @import("tokenizer/chat_template.zig");
+pub const streaming = @import("tokenizer/streaming.zig");
 
 // Re-exports for convenience
 pub const TokenizerStrategy = interface.TokenizerStrategy;
@@ -25,6 +26,7 @@ pub const BpeTokenizer = bpe.BpeTokenizer;
 pub const ChatTemplate = chat_template.ChatTemplate;
 pub const ChatMessage = chat_template.ChatMessage;
 pub const ChatTemplateType = chat_template.ChatTemplateType;
+pub const StreamingDetokenizer = streaming.StreamingDetokenizer;
 
 // Backward compatibility alias
 pub const Tokenizer = GreedyTokenizer;

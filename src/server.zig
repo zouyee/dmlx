@@ -20,6 +20,11 @@ pub const sse = @import("server/sse.zig");
 pub const openai = @import("server/openai.zig");
 pub const streaming = @import("server/streaming.zig");
 pub const anthropic = @import("server/anthropic.zig");
+pub const responses = @import("server/responses.zig");
+pub const completions = @import("server/completions.zig");
+pub const detokenize = @import("server/detokenize.zig");
+pub const response_store = @import("server/response_store.zig");
+pub const tokenize = @import("server/tokenize.zig");
 pub const utils = @import("server/utils.zig");
 pub const tooling = @import("server/tooling.zig");
 
@@ -44,6 +49,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
 
     // Initialize Server V2 fields.
     server_state.request_queue = engine.RequestQueue.init();
+    server_state.embed_queue = engine.EmbedQueue.init();
     server_state.engine_running = std.atomic.Value(bool).init(true);
     server_state.active_requests = std.atomic.Value(u32).init(0);
     server_state.next_request_id = std.atomic.Value(u64).init(1);
@@ -100,6 +106,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
             .speculative_ngram = server_state.speculative_ngram,
             .speculative_mtp = server_state.speculative_mtp,
             .prefix_cache_max_entries = server_config.prefix_cache_entries,
+            .embed_queue = &server_state.embed_queue,
         };
 
         var engine_loop = try engine.EngineLoop.init(engine_config);
@@ -245,6 +252,7 @@ fn nativeEngineLoop(server_state: *ServerState) void {
         for (new_requests) |req| {
             if (req.isCancelled()) {
                 req.completion.deliverError(server_state.io, "Request cancelled");
+                req.markEngineDone();
                 continue;
             }
             processNativeRequest(server_state, ne, req);
@@ -257,6 +265,8 @@ fn nativeEngineLoop(server_state: *ServerState) void {
 }
 
 fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.NativeEngine, req: *engine.RequestState) void {
+    // The HTTP handler waits on this before deinit (see request_state.zig).
+    defer req.markEngineDone();
     const engine_start = std.c.mach_absolute_time();
     req.start_time_ns = @intCast(engine_start);
     const queue_wait_ms = @as(f64, @floatFromInt(engine_start - req.queued_time_ns)) / 1_000_000.0;
@@ -274,20 +284,35 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             req: *engine.RequestState,
             io: std.Io,
             allocator: std.mem.Allocator,
-            tokenizer: root.tokenizer.TokenizerStrategy,
+            detok: root.tokenizer.StreamingDetokenizer,
         };
         var stream_ctx = StreamCtx{
             .req = req,
             .io = server_state.io,
             .allocator = server_state.allocator,
-            .tokenizer = server_state.tokenizer_strategy,
+            .detok = root.tokenizer.StreamingDetokenizer.init(server_state.allocator, server_state.tokenizer_strategy),
         };
+        defer stream_ctx.detok.deinit();
 
         const cb = struct {
             fn callback(ctx_ptr: *anyopaque, token: u32, is_final: bool) void {
                 const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
-                const token_text = ctx.tokenizer.decode(&[_]u32{token}, ctx.allocator) catch "";
-                defer if (token_text.len > 0) ctx.allocator.free(token_text);
+                // Incremental decode (cumulative decode + diff): concatenated
+                // deltas match the non-streaming full decode byte-exactly.
+                const delta = ctx.detok.addToken(token) catch null;
+                defer if (delta) |d| ctx.allocator.free(d);
+                var tail: ?[]u8 = null;
+                defer if (tail) |t| ctx.allocator.free(t);
+                if (is_final) tail = ctx.detok.flush() catch null;
+                var token_text: []const u8 = delta orelse "";
+                var combined: []u8 = &.{};
+                defer if (combined.len > 0) ctx.allocator.free(combined);
+                if (tail) |t| {
+                    combined = ctx.allocator.alloc(u8, token_text.len + t.len) catch return;
+                    @memcpy(combined[0..token_text.len], token_text);
+                    @memcpy(combined[token_text.len..], t);
+                    token_text = combined;
+                }
                 ctx.req.completion.deliverToken(ctx.io, token, token_text, is_final, if (is_final) .stop else null);
             }
         }.callback;
@@ -301,6 +326,7 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             &stream_ctx,
             cb,
             null,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("[NativeEngine] generate failed: {}", .{err});
             req.completion.deliverError(server_state.io, "Generation failed");
@@ -308,6 +334,11 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
         };
         defer server_state.allocator.free(tokens);
         req.token_count = @intCast(tokens.len);
+        // On mid-stream cancel the generation truncates without a final
+        // event; guarantee one so a draining abort path cannot hang.
+        if (!req.completion.isDone(server_state.io)) {
+            req.completion.deliverDone(server_state.io, .stop);
+        }
     } else {
         const tokens = ne.generate(
             req.prompt_tokens,
@@ -316,6 +347,7 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             null,
             null,
             null,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("[NativeEngine] generate failed: {}", .{err});
             req.completion.deliverError(server_state.io, "Generation failed");
@@ -342,4 +374,16 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
         req.token_count = @intCast(tokens.len);
         req.completion.deliverToken(server_state.io, 0, final_text, true, .stop);
     }
+}
+
+// Pull the server submodule tests into the test build (tests.zig only
+// references this file's decls).
+test {
+    _ = http;
+    _ = openai;
+    _ = anthropic;
+    _ = responses;
+    _ = completions;
+    _ = detokenize;
+    _ = response_store;
 }

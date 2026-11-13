@@ -18,6 +18,8 @@ pub const TokenEvent = completion_signal.TokenEvent;
 
 pub const RequestQueue = request_queue.RequestQueue;
 pub const QueueNode = request_queue.Node;
+pub const EmbedQueue = @import("embed_queue.zig").EmbedQueue;
+pub const EmbedTask = @import("embed_queue.zig").EmbedTask;
 
 pub const EngineLoop = engine_loop.EngineLoop;
 pub const EngineConfig = engine_loop.EngineConfig;

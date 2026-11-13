@@ -11,6 +11,13 @@ const state_mod = @import("state.zig");
 const openai_mod = @import("openai.zig");
 const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
+const responses_mod = @import("responses.zig");
+const completions_mod = @import("completions.zig");
+const detokenize_mod = @import("detokenize.zig");
+const response_store_mod = @import("response_store.zig");
+const tokenize_mod = @import("tokenize.zig");
+const embeddings_mod = @import("embeddings.zig");
+const metrics_mod = @import("metrics.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
 const handleStreamingCompletion = streaming_mod.handleStreamingCompletion;
 const generateChatCompletion = openai_mod.generateChatCompletion;
@@ -107,6 +114,19 @@ fn handleRequest(
     const request = dyn_buf.items();
     std.log.info("[HTTP] Request received: {d} bytes (read={d:.1}ms)", .{ dyn_buf.len(), read_ms });
 
+    // Prometheus metrics: record route/status/duration when the handler
+    // returns. `status_code` defaults to 500 — a handler that throws before
+    // writing a response is counted as a server error. Sub-handlers that
+    // write responses internally (streaming, anthropic, responses) are
+    // recorded as 200 on successful return.
+    const route_idx = metrics_mod.Metrics.routeIndex(request);
+    var status_code: u16 = 500;
+    defer {
+        const t_end = std.c.mach_absolute_time();
+        const dur_ns = @as(u64, @intCast(t_end - t_http_enter)) * 125 / 3;
+        metrics_mod.global.recordRequest(route_idx, status_code, dur_ns);
+    }
+
     const libc = @cImport(@cInclude("unistd.h"));
     const msg = "[HTTP] Request received\n";
     _ = libc.write(2, msg, msg.len);
@@ -118,6 +138,7 @@ fn handleRequest(
             null,
             server_config.memory_config,
         ) catch {
+            status_code = 503;
             try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
             return;
         };
@@ -164,18 +185,31 @@ fn handleRequest(
 
             // Parse request to check for streaming
             const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{}) catch {
+                status_code = 400;
                 try writeJsonResponse(connection, io, 400, "{\"error\":\"invalid_json\"}");
                 return;
             };
             defer parsed.deinit();
 
+            // Reject invalid sampling overrides / unsupported tool_choice
+            // forms up front so both the streaming and non-streaming paths
+            // get a clean 400 instead of a mid-stream error event.
+            if (try openai_mod.validateChatRequest(allocator, parsed.value)) |err_body| {
+                defer allocator.free(err_body);
+                status_code = 400;
+                try writeJsonResponse(connection, io, 400, err_body);
+                return;
+            }
+
             if (parsed.value.stream orelse false) {
+                status_code = 200;
                 try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
             } else {
                 const t0 = std.c.mach_absolute_time();
                 const response = try generateChatCompletion(allocator, io, state, body, server_config);
                 defer allocator.free(response);
                 const t1 = std.c.mach_absolute_time();
+                status_code = 200;
                 try writeJsonResponse(connection, io, 200, response);
                 const t2 = std.c.mach_absolute_time();
                 const gen_ms = @as(f64, @floatFromInt(t1 - t0)) * 125.0 / 3_000_000.0;
@@ -183,29 +217,241 @@ fn handleRequest(
                 std.log.info("[TIMING] generateChatCompletion={d:.1}ms writeResponse={d:.1}ms", .{ gen_ms, write_ms });
             }
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
+    } else if (std.mem.startsWith(u8, request, "GET /v1/models")) {
+        // OpenAI-compatible model listing. Single-model server: the id is
+        // the basename of the configured model directory (what clients
+        // should echo back in the `model` field), `created` is the server
+        // start time. `state.model_name` holds the config.json architecture
+        // name, which is not a useful client-facing id.
+        const models_json = try formatModelsJson(
+            allocator,
+            std.fs.path.basename(server_config.model_path),
+            state.start_time_unix,
+        );
+        defer allocator.free(models_json);
+        status_code = 200;
+        try writeJsonResponse(connection, io, 200, models_json);
     } else if (std.mem.startsWith(u8, request, "GET /health")) {
         const active = state.active_requests.load(.acquire);
+        var escaped_model = std.ArrayList(u8).empty;
+        defer escaped_model.deinit(allocator);
+        try utils_mod.jsonEscapeInto(&escaped_model, allocator, state.model_name);
         const health_json = try std.fmt.allocPrint(
             allocator,
             "{{\"status\":\"ok\",\"model\":\"{s}\",\"active_requests\":{d}}}",
-            .{ state.model_name, active },
+            .{ escaped_model.items, active },
         );
         defer allocator.free(health_json);
+        status_code = 200;
         try writeJsonResponse(connection, io, 200, health_json);
+    } else if (std.mem.startsWith(u8, request, "GET /metrics") or
+        std.mem.startsWith(u8, request, "GET /v1/metrics"))
+    {
+        // Prometheus text exposition format (v0.0.4). Counters live in the
+        // global metrics registry; gauges are computed at render time.
+        const body = try metrics_mod.global.render(
+            allocator,
+            state.active_requests.load(.acquire),
+            state.start_time_unix,
+            std.Io.Timestamp.now(io, .real).toSeconds(),
+        );
+        defer allocator.free(body);
+        status_code = 200;
+        try writeResponseAlloc(connection, 200, "text/plain; version=0.0.4", body);
     } else if (std.mem.startsWith(u8, request, "POST /shutdown")) {
         engine.requestShutdown();
+        status_code = 200;
         try writeJsonResponse(connection, io, 200, "{\"status\":\"shutting_down\"}");
+    } else if (std.mem.startsWith(u8, request, "POST /v1/responses")) {
+        // OpenAI Responses API — minimal compatibility layer (translation
+        // onto the chat-completions machinery; see responses.zig).
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            try responses_mod.handleResponses(allocator, io, state, connection, server_config, body, &status_code);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/tokenize") or
+        std.mem.startsWith(u8, request, "POST /tokenize"))
+    {
+        // Raw-text tokenization for context budgeting (no chat template).
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try tokenize_mod.handleTokenizeRequest(allocator, state.tokenizer_strategy, body);
+            defer allocator.free(result.body);
+            status_code = result.status;
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/embeddings")) {
+        // OpenAI-compatible embeddings from the loaded model's hidden states.
+        // Pooling/extraction: last-token POST-final-norm hidden, L2-normalized
+        // (see embeddings.zig). The forward runs behind the model adapter's
+        // embed op (null → 501 embedding_not_supported), serialized against
+        // chat traffic by the adapter mutex.
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            // The forward runs on the engine-loop thread via the embed task
+            // queue (GPU work is thread-affine); null runner → 501.
+            const runner: ?embeddings_mod.EmbedRunner = if (state.vtable.embed != null)
+                .{ .ctx = state, .run = &embeddings_mod.engineEmbedRunner }
+            else
+                null;
+            const result = blk: {
+                _ = state.active_requests.fetchAdd(1, .monotonic);
+                defer _ = state.active_requests.fetchSub(1, .monotonic);
+                break :blk try embeddings_mod.handleEmbeddingsRequest(
+                    allocator,
+                    state.tokenizer_strategy,
+                    runner,
+                    std.fs.path.basename(server_config.model_path),
+                    body,
+                );
+            };
+            defer allocator.free(result.body);
+            status_code = result.status;
+            // 5120 floats ≈ 60KB JSON per item — heap-allocated response.
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/completions")) {
+        // Legacy OpenAI text completions (raw prompt, no chat template).
+        memory_mod.enforceMemoryLimit(
+            if (state.model_pool) |*pool| pool else null,
+            null,
+            server_config.memory_config,
+        ) catch {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"Memory limit exceeded — server is under memory pressure. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_limit_exceeded\"}}");
+            return;
+        };
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            try completions_mod.handleCompletions(allocator, io, state, connection, server_config, body, &status_code);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/detokenize") or
+        std.mem.startsWith(u8, request, "POST /detokenize"))
+    {
+        // Token-id → text decode (full-sequence decode; see detokenize.zig).
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try detokenize_mod.handleDetokenizeRequest(allocator, state.tokenizer_strategy, body);
+            defer allocator.free(result.body);
+            status_code = result.status;
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "POST /v1/messages/count_tokens")) {
+        // Anthropic-style input token counting. Must precede the
+        // "POST /v1/messages" prefix match below.
+        if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
+            const body = request[header_end + 4 ..];
+            const result = try detokenize_mod.handleCountTokensRequest(allocator, state, body);
+            defer allocator.free(result.body);
+            status_code = result.status;
+            try writeJsonResponseAlloc(connection, result.status, result.body);
+        } else {
+            status_code = 400;
+            try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
+        }
+    } else if (std.mem.startsWith(u8, request, "GET /v1/responses/")) {
+        // Retrieve a stored Responses API object (see response_store.zig).
+        if (response_store_mod.extractResponseId(request, "GET /v1/responses/")) |resp_id| {
+            const stored = try state.response_store.get(allocator, resp_id);
+            if (stored) |obj| {
+                defer allocator.free(obj);
+                status_code = 200;
+                try writeJsonResponseAlloc(connection, 200, obj);
+            } else {
+                status_code = 404;
+                try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+            }
+        } else {
+            status_code = 404;
+            try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+        }
+    } else if (std.mem.startsWith(u8, request, "DELETE /v1/responses/")) {
+        if (response_store_mod.extractResponseId(request, "DELETE /v1/responses/")) |resp_id| {
+            if (state.response_store.remove(resp_id)) {
+                var escaped_id = std.ArrayList(u8).empty;
+                defer escaped_id.deinit(allocator);
+                try utils_mod.jsonEscapeInto(&escaped_id, allocator, resp_id);
+                const body = try std.fmt.allocPrint(allocator,
+                    \\{{"id":"{s}","object":"response.deleted","deleted":true}}
+                , .{escaped_id.items});
+                defer allocator.free(body);
+                status_code = 200;
+                try writeJsonResponse(connection, io, 200, body);
+            } else {
+                status_code = 404;
+                try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+            }
+        } else {
+            status_code = 404;
+            try writeJsonResponse(connection, io, 404, "{\"error\":{\"message\":\"Response not found\",\"type\":\"invalid_request_error\"}}");
+        }
+    } else if (std.mem.startsWith(u8, request, "GET /api/status")) {
+        const now_unix = std.Io.Timestamp.now(io, .real).toSeconds();
+        const uptime: i64 = if (state.start_time_unix > 0 and now_unix > state.start_time_unix)
+            now_unix - state.start_time_unix
+        else
+            0;
+        var escaped_model = std.ArrayList(u8).empty;
+        defer escaped_model.deinit(allocator);
+        try utils_mod.jsonEscapeInto(&escaped_model, allocator, std.fs.path.basename(server_config.model_path));
+        const status_json = try std.fmt.allocPrint(allocator,
+            \\{{"status":"ok","model":"{s}","uptime_seconds":{d},"active_requests":{d},"requests_total":{d}}}
+        , .{
+            escaped_model.items,
+            uptime,
+            state.active_requests.load(.acquire),
+            metrics_mod.global.totalRequests(),
+        });
+        defer allocator.free(status_json);
+        status_code = 200;
+        try writeJsonResponse(connection, io, 200, status_json);
     } else if (std.mem.startsWith(u8, request, "POST /v1/messages")) {
         // Anthropic Messages API compatibility endpoint
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
-            try handleAnthropicMessages(allocator, io, state, connection, server_config, body);
+            try handleAnthropicMessages(allocator, io, state, connection, server_config, body, &status_code);
         } else {
+            status_code = 400;
             try writeJsonResponse(connection, io, 400, "{\"error\":\"bad_request\"}");
         }
     } else {
+        status_code = 404;
         try writeJsonResponse(connection, io, 404, "{\"error\":\"not_found\"}");
     }
 }
@@ -214,12 +460,55 @@ fn handleRequest(
 // HTTP response helpers
 // ------------------------------------------------------------------
 
+/// Build the GET /v1/models response body. The model id is JSON-escaped.
+pub fn formatModelsJson(allocator: std.mem.Allocator, model_id: []const u8, created_unix: i64) ![]u8 {
+    var escaped_id = std.ArrayList(u8).empty;
+    defer escaped_id.deinit(allocator);
+    try utils_mod.jsonEscapeInto(&escaped_id, allocator, model_id);
+    return std.fmt.allocPrint(
+        allocator,
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"}}]}}",
+        .{ escaped_id.items, created_unix },
+    );
+}
+
+test "formatModelsJson shape" {
+    const allocator = std.testing.allocator;
+    const body = try formatModelsJson(allocator, "Qwen3.8-27B-4bit", 1794458459);
+    defer allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const root_obj = parsed.value.object;
+    try std.testing.expectEqualStrings("list", root_obj.get("object").?.string);
+    const data = root_obj.get("data").?.array;
+    try std.testing.expectEqual(@as(usize, 1), data.items.len);
+    const entry = data.items[0].object;
+    try std.testing.expectEqualStrings("Qwen3.8-27B-4bit", entry.get("id").?.string);
+    try std.testing.expectEqualStrings("model", entry.get("object").?.string);
+    try std.testing.expectEqual(@as(i64, 1794458459), entry.get("created").?.integer);
+    try std.testing.expectEqualStrings("dmlx", entry.get("owned_by").?.string);
+}
+
+test "formatModelsJson escapes quotes and backslashes in the id" {
+    const allocator = std.testing.allocator;
+    const body = try formatModelsJson(allocator, "evil\"id\\name", 0);
+    defer allocator.free(body);
+
+    // Must still be valid JSON and round-trip to the raw id.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const data = parsed.value.object.get("data").?.array;
+    try std.testing.expectEqualStrings("evil\"id\\name", data.items[0].object.get("id").?.string);
+}
+
 pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16, body: []const u8) !void {
     _ = io;
     const status_text = switch (status) {
         200 => "OK",
         400 => "Bad Request",
         404 => "Not Found",
+        500 => "Internal Server Error",
         503 => "Service Unavailable",
         else => "Error",
     };
@@ -227,15 +516,56 @@ pub fn writeJsonResponse(connection: std.Io.net.Stream, io: std.Io, status: u16,
     // Build entire HTTP response in a single buffer, then write once.
     var resp_buf: [8192]u8 = undefined;
     const resp = try std.fmt.bufPrint(&resp_buf, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, body.len, body });
-    const unistd_c = @cImport(@cInclude("unistd.h"));
-    var remaining = resp;
+    try writeAllFd(connection.socket.handle, resp);
+    // Flush by sync'ing the fd (no-op on socket but won't hurt)
+    _ = unistd_c.fsync(connection.socket.handle);
+}
+
+/// Heap-allocated variant of writeJsonResponse for bodies that can exceed
+/// the 8KB stack buffer (e.g. /v1/tokenize output for large inputs).
+pub fn writeJsonResponseAlloc(connection: std.Io.net.Stream, status: u16, body: []const u8) !void {
+    try writeResponseAlloc(connection, status, "application/json", body);
+}
+
+/// Heap-allocated response writer with an explicit Content-Type.
+pub fn writeResponseAlloc(connection: std.Io.net.Stream, status: u16, content_type: []const u8, body: []const u8) !void {
+    const status_text = switch (status) {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        else => "Error",
+    };
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const resp = try std.fmt.allocPrint(arena.allocator(), "HTTP/1.1 {d} {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ status, status_text, content_type, body.len, body });
+    try writeAllFd(connection.socket.handle, resp);
+    _ = unistd_c.fsync(connection.socket.handle);
+}
+
+const unistd_c = @cImport(@cInclude("unistd.h"));
+
+/// Disables SIGPIPE on a connected socket. Darwin/BSD set SO_NOSIGPIPE;
+/// other targets are a comptime no-op (Linux send uses MSG_NOSIGNAL, and
+/// this server targets macOS) so a future Linux build can't trip on the
+/// Darwin-only constant.
+fn setNoSigPipe(fd: std.posix.fd_t) void {
+    const builtin = @import("builtin");
+    if (comptime builtin.os.tag.isDarwin()) {
+        const csock = @cImport(@cInclude("sys/socket.h"));
+        const one: c_int = 1;
+        _ = csock.setsockopt(fd, csock.SOL_SOCKET, csock.SO_NOSIGPIPE, &one, @sizeOf(c_int));
+    }
+}
+
+fn writeAllFd(fd: c_int, data: []const u8) !void {
+    var remaining = data;
     while (remaining.len > 0) {
-        const n = unistd_c.write(connection.socket.handle, remaining.ptr, remaining.len);
+        const n = unistd_c.write(fd, remaining.ptr, remaining.len);
         if (n < 0) return error.WriteFailed;
         remaining = remaining[@intCast(n)..];
     }
-    // Flush by sync'ing the fd (no-op on socket but won't hurt)
-    _ = unistd_c.fsync(connection.socket.handle);
 }
 
 pub fn streamWriteAll(stream: std.Io.net.Stream, io: std.Io, data: []const u8) !void {
@@ -256,6 +586,11 @@ pub fn handleConnection(
     config: ServerConfig,
 ) void {
     const t_conn_enter = std.c.mach_absolute_time();
+    // macOS raises SIGPIPE (default disposition: process termination) when a
+    // write hits a socket whose peer went away — e.g. an SSE stream aborted
+    // mid-flight by the client. SO_NOSIGPIPE turns that into an EPIPE error
+    // from write/send instead, which the write paths already propagate.
+    setNoSigPipe(connection.socket.handle);
     defer {
         const t_conn_exit = std.c.mach_absolute_time();
         const conn_ms = @as(f64, @floatFromInt(t_conn_exit - t_conn_enter)) * 125.0 / 3_000_000.0;

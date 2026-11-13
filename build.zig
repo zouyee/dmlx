@@ -474,6 +474,78 @@ pub fn build(b: *std.Build) void {
     );
     run_qwen38_oracle_dump_step.dependOn(&run_qwen38_oracle_dump.step);
 
+    // --- Qwen3.8 VISION oracle parity harness (pure Zig + mlx-c) ---
+    // Reads artifacts/qwen38_vision_oracle/*.npy from
+    // scripts/qwen38_vision_oracle_dump.py and gates tower features,
+    // position_ids, cos/sin, merged embeddings, and last-position logits.
+    // Standalone executable (not a zig test): the 27B load perturbs later
+    // GPU unit tests when they share a process. Exits 0 with SKIP when the
+    // artifacts or the local checkpoint are absent.
+    const qwen38_vision_oracle = b.addExecutable(.{
+        .name = "qwen38-vision-oracle",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/test_qwen38_vision_oracle.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    qwen38_vision_oracle.root_module.addImport("mlx", mlx_z_module);
+    qwen38_vision_oracle.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    qwen38_vision_oracle.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/stb_image_impl.c"),
+        .flags = &.{"-std=c11"},
+        .language = .c,
+    });
+    qwen38_vision_oracle.root_module.linkFramework("Metal", .{});
+    qwen38_vision_oracle.root_module.linkFramework("Foundation", .{});
+    const run_qwen38_vision_oracle = b.addRunArtifact(qwen38_vision_oracle);
+    if (b.args) |args| {
+        run_qwen38_vision_oracle.addArgs(args);
+    }
+    const run_qwen38_vision_oracle_step = b.step(
+        "test-qwen38-vision-oracle",
+        "Run the Qwen3.8 vision oracle parity gates against artifacts/qwen38_vision_oracle",
+    );
+    run_qwen38_vision_oracle_step.dependOn(&run_qwen38_vision_oracle.step);
+
+    // --- Scratch: vision TTFT stage breakdown (preprocess/tower/prefill) ---
+    const bench_vision_ttft = b.addExecutable(.{
+        .name = "bench-vision-ttft",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench_vision_ttft.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    bench_vision_ttft.root_module.addImport("mlx", mlx_z_module);
+    bench_vision_ttft.root_module.addCSourceFile(.{
+        .file = b.path("src/models/moe_metal_wrapper.c"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
+    bench_vision_ttft.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/stb_image_impl.c"),
+        .flags = &.{"-std=c11"},
+        .language = .c,
+    });
+    bench_vision_ttft.root_module.linkFramework("Metal", .{});
+    bench_vision_ttft.root_module.linkFramework("Foundation", .{});
+    const run_bench_vision_ttft = b.addRunArtifact(bench_vision_ttft);
+    if (b.args) |args| {
+        run_bench_vision_ttft.addArgs(args);
+    }
+    const run_bench_vision_ttft_step = b.step(
+        "run-bench-vision-ttft",
+        "Vision TTFT stage breakdown: preprocess / tower / vision prefill vs text prefill",
+    );
+    run_bench_vision_ttft_step.dependOn(&run_bench_vision_ttft.step);
+
     // --- Qwen3.8 decode profiler (TEMPORARY, uncommitted) ---
     // Section-level wall-clock breakdown of the serving decode path.
     const qwen38_profile = b.addExecutable(.{
@@ -967,6 +1039,7 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/mach_compat.c"), .flags = &.{}, .language = .c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_engine.c"), .flags = &.{"-Wno-deprecated-declarations"}, .language = .c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_attention.c"), .flags = &.{}, .language = .c });
+    lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/vision/stb_image_impl.c"), .flags = &.{"-std=c11"}, .language = .c });
     lib_tests.root_module.linkFramework("Metal", .{});
     lib_tests.root_module.linkFramework("Foundation", .{});
     lib_tests.root_module.linkFramework("Accelerate", .{});
@@ -982,6 +1055,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exact_q4_stages_test.step);
     test_step.dependOn(&run_decode_timeline_test.step);
     test_step.dependOn(&run_decode_timeline_disabled_test.step);
+    // test-exact-q4-producer carries a paired GPU timing gate (disabled
+    // overhead must stay within 1% of baseline) that is squeezed when the
+    // 95s library test binary and the other self-tests run concurrently
+    // (standalone: 3/3; under full-suite load: intermittent 1%-gate trips).
+    // Pin it to run after the heavy steps finish instead of weakening the
+    // threshold. The standalone `zig build test-exact-q4-producer` step is
+    // unaffected.
+    run_exact_q4_producer_test.step.dependOn(&run_lib_tests.step);
+    run_exact_q4_producer_test.step.dependOn(&run_native_chunk_planner_tests.step);
+    run_exact_q4_producer_test.step.dependOn(&run_exact_q4_io_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_exact_q4_stages_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_decode_timeline_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_decode_timeline_disabled_test.step);
 
     // --- Example ---
     const example = b.addExecutable(.{
@@ -1060,6 +1146,11 @@ pub fn build(b: *std.Build) void {
         target_step.root_module.addCSourceFile(.{
             .file = b.path("src/metal_infer/dspark_attention.c"),
             .flags = &.{},
+            .language = .c,
+        });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/vision/stb_image_impl.c"),
+            .flags = &.{"-std=c11"},
             .language = .c,
         });
         target_step.root_module.linkFramework("Metal", .{});

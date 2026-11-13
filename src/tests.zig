@@ -31,6 +31,10 @@ pub const scheduler_tests = @import("tests/scheduler_tests.zig");
 pub const native_loader_config_tests = @import("tests/native_loader_config_tests.zig");
 pub const native_engine_transaction_tests = @import("native_engine.zig");
 pub const server_tests = @import("server.zig");
+pub const server_tokenize_tests = @import("server/tokenize.zig");
+pub const server_embeddings_tests = @import("server/embeddings.zig");
+pub const server_metrics_tests = @import("server/metrics.zig");
+pub const embed_queue_tests = @import("engine/embed_queue.zig");
 pub const batch_builder_tests = @import("tests/batch_builder_tests.zig");
 pub const speculative_tests = @import("speculative.zig");
 pub const guided_tests = @import("guided.zig");
@@ -53,6 +57,9 @@ pub const jang_quantizer_tests = @import("jang_quantizer.zig");
 
 pub const vision_preprocess_tests = @import("vision/preprocess.zig");
 pub const vision_vit_tests = @import("vision/vit.zig");
+pub const vision_qwen38_vit_tests = @import("vision/qwen38_vit.zig");
+pub const vision_qwen38_preprocess_tests = @import("vision/qwen38_preprocess.zig");
+pub const vision_prompt_tests = @import("vision_prompt.zig");
 pub const vision_llava_tests = @import("vision/llava.zig");
 
 pub const expert_remap_tests = @import("tests/expert_remap_test.zig");
@@ -65,11 +72,13 @@ pub const expert_stream_tests = @import("models/expert_stream.zig");
 pub const engine_property_tests = @import("tests/engine_property_tests.zig");
 pub const expert_dedup_verification_tests = @import("tests/expert_dedup_verification_test.zig");
 pub const prefix_cache_tests = @import("engine/prefix_cache.zig");
+pub const content_class_tests = @import("engine/content_class.zig");
 pub const glm53_loader_tests = @import("models/glm53_loader.zig");
 pub const glm53_kda_tests = @import("models/glm53_kda.zig");
 pub const glm53_attention_tests = @import("models/glm53_attention.zig");
 pub const glm53_tests = @import("models/glm53.zig");
 pub const qwen38_loader_tests = @import("models/qwen38_loader.zig");
+pub const qwen38_mrope_tests = @import("models/qwen38_mrope.zig");
 pub const qwen38_gdn_tests = @import("models/qwen38_gdn.zig");
 pub const qwen38_attn_tests = @import("models/qwen38_attn.zig");
 pub const qwen38_mtp_tests = @import("models/qwen38_mtp.zig");
@@ -110,6 +119,10 @@ test {
     _ = native_loader_config_tests;
     _ = native_engine_transaction_tests;
     _ = server_tests;
+    _ = server_tokenize_tests;
+    _ = server_embeddings_tests;
+    _ = server_metrics_tests;
+    _ = embed_queue_tests;
     _ = batch_builder_tests;
     _ = speculative_tests;
     _ = guided_tests;
@@ -132,6 +145,9 @@ test {
 
     _ = vision_preprocess_tests;
     _ = vision_vit_tests;
+    _ = vision_qwen38_vit_tests;
+    _ = vision_qwen38_preprocess_tests;
+    _ = vision_prompt_tests;
     _ = vision_llava_tests;
 
     _ = expert_remap_tests;
@@ -144,11 +160,13 @@ test {
     _ = engine_property_tests;
     _ = expert_dedup_verification_tests;
     _ = prefix_cache_tests;
+    _ = content_class_tests;
     _ = glm53_loader_tests;
     _ = glm53_kda_tests;
     _ = glm53_attention_tests;
     _ = glm53_tests;
     _ = qwen38_loader_tests;
+    _ = qwen38_mrope_tests;
     _ = qwen38_gdn_tests;
     _ = qwen38_attn_tests;
     _ = qwen38_mtp_tests;

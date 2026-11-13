@@ -4785,10 +4785,10 @@ template <typename T, const int group_size, const int bits>
 }
 // ---- end /Users/zouyee/work/code/omlx/omlx/custom_kernels/quant_matmul/csrc/affine_quantized.h ----
 
-// ---- dmlx entry: affine_q4_qmm_t variant 8 (bm=64, bk=32, bn=64) ----
+// ---- dmlx entry: affine_q4_qmm_t, tile parameterized (BM, BK, BN) ----
 // threadgroup storage is declared by the caller (Metal only allows
 // threadgroup variables at kernel-function scope).
-template <typename T>
+template <typename T, int BM, int BK, int BN>
 void dmlx_qmm_v8_impl(
     const device uint32_t* w,
     const device T* scales,
@@ -4804,10 +4804,6 @@ void dmlx_qmm_v8_impl(
     uint lid,
     uint simd_gid,
     uint simd_lid) {
-  constexpr int BM = 64;
-  constexpr int BK = 32;
-  constexpr int BN = 64;
-
   qmm_t_impl<T, 64, 4, true, BM, BK, BN>(
       w, scales, biases, x, y, Xs, Ws, K, N, M, K, tid, lid, simd_gid, simd_lid);
 }

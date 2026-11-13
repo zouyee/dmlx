@@ -62,6 +62,16 @@ pub const ModelVTable = struct {
     /// Optional MTP (multi-token prediction) speculative-decoding capability.
     /// Null for models without a drafter head. See MtpOps.
     mtp: ?*const MtpOps = null,
+    /// Optional vision capability (Qwen3.8). Null for text-only models.
+    vision: ?*const VisionOps = null,
+    /// Optional: text embedding from the last-layer hidden state
+    /// (/v1/embeddings). Contract: `ids` are raw-text tokens (no chat
+    /// template); the op runs a FRESH prefill (resets any recurrent/cache
+    /// state), takes the LAST position's POST-final-norm hidden, L2-normalizes
+    /// it, and returns it as an owned [hidden] f32 slice (allocator-owned).
+    /// Null for models without hidden-state access — the server maps that to
+    /// a 501 embedding_not_supported error.
+    embed: ?*const fn (ctx: *anyopaque, allocator: std.mem.Allocator, ids: []const u32) anyerror![]f32 = null,
     deinit: *const fn (ctx: *anyopaque, allocator: std.mem.Allocator) void,
     config: ModelConfig,
     ptr: *anyopaque,
@@ -84,6 +94,59 @@ pub const MtpStepOut = struct {
 pub const MtpGreedyDraftOut = struct {
     tok_gpu: Array,
     hidden: Array,
+    /// DMLX_MTP_AVTRACE only: [2] f32 (l_max, top1-top2 margin) from the
+    /// drafter head's exact rescore, kept on GPU for the batch readback.
+    /// Null on every non-traced step.
+    feat: ?Array = null,
+};
+
+// ============================================================
+// Vision input plumbing (Qwen3.8; tower+preprocess live behind the vtable)
+// ============================================================
+
+/// One image supplied by a caller: a filesystem path (CLI) or encoded image
+/// bytes (server data-URL decode).
+pub const VisionImage = union(enum) {
+    path: []const u8,
+    bytes: []const u8,
+};
+
+/// Tower output for ONE image: merge-divided features plus the prompt
+/// bookkeeping the caller needs to place the image-pad tokens.
+pub const VisionImageOut = struct {
+    features: Array, // [n_pads, hidden] bf16 (owned by the caller)
+    block: [3]i32, // (grid_t, grid_h/merge, grid_w/merge)
+    n_pads: usize,
+};
+
+/// Full per-request vision payload: per-image features concatenated in
+/// prompt order plus one merge-divided block per image. Owned by the
+/// container (CLI scope / RequestState); deinit releases both.
+pub const VisionData = struct {
+    features: Array, // [total_pads, hidden] bf16
+    blocks: [][3]i32,
+
+    pub fn deinit(self: *VisionData, allocator: std.mem.Allocator) void {
+        self.features.deinit();
+        allocator.free(self.blocks);
+    }
+};
+
+/// Vision capability: image preprocessing + tower forward are one op (the
+/// adapter lazily loads the tower weights), the prefill splices features in
+/// at the image-pad positions and runs MRoPE. Null for text-only models.
+pub const VisionOps = struct {
+    /// Token id of the image-pad placeholder (Qwen3.8: 248056 <|image_pad|>).
+    /// Required: set from the model config by the implementing adapter.
+    image_token_id: u32,
+    /// Preprocess one image and run the ViT tower → features + block + pad
+    /// count (owned by the caller).
+    processImage: *const fn (ctx: *anyopaque, image: VisionImage) anyerror!VisionImageOut,
+    /// Vision prefill: ids carry the image-pad tokens; features/blocks are
+    /// the concatenated tower outputs in pad order. Resets backbone state
+    /// and installs the MRoPE rope_delta for subsequent decode steps.
+    /// Returns last-position logits [1, 1, vocab] (owned).
+    prefill: *const fn (ctx: *anyopaque, ids: []const u32, vision: VisionData) anyerror!Array,
 };
 
 /// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).
@@ -99,6 +162,10 @@ pub const MtpOps = struct {
     /// Prefill the prompt (resets backbone + drafter state) → last-position
     /// logits + hidden.
     prefill: *const fn (ctx: *anyopaque, ids: []const u32) anyerror!MtpStepOut,
+    /// Optional vision variant of prefill: backbone MRoPE prefill + drafter
+    /// priming, with the drafter's rope offset shifted by the backbone's
+    /// rope_delta. Null → MTP cannot serve vision prompts.
+    prefillVision: ?*const fn (ctx: *anyopaque, ids: []const u32, vision: VisionData) anyerror!MtpStepOut = null,
     /// One drafter step: (hidden, token) → draft logits + chained hidden.
     draft: *const fn (ctx: *anyopaque, hidden: Array, token: u32) anyerror!MtpStepOut,
     /// Greedy-only GPU-chained drafter step: (hidden, tok_gpu [1] i32) →
@@ -142,7 +209,17 @@ pub const GenerateConfig = struct {
     seed: u64 = 0,
     /// Repetition penalty (1.0 = no penalty, >1.0 reduces repeated tokens).
     repetition_penalty: f32 = 1.0,
+    /// Optional cancellation flag (server: set by the HTTP fiber on client
+    /// disconnect). Polled once per decode step; when set, generation
+    /// truncates early and returns the tokens produced so far.
+    cancel_flag: ?*const std.atomic.Value(bool) = null,
 };
+
+/// Whether cancellation has been requested for this generation run.
+pub fn cancelRequested(config: GenerateConfig) bool {
+    const flag = config.cancel_flag orelse return false;
+    return flag.load(.acquire);
+}
 
 // ============================================================
 // Layer 1: generateStep — single forward pass → sampled token
@@ -222,6 +299,26 @@ pub fn generateStep(
     return results[0];
 }
 
+/// Sample one token from prefill logits [1, L, vocab] or [1, 1, vocab]
+/// (last position). Mirrors the tail of generateBatchStep.
+fn samplePrefillLogits(logits: Array, sampler: *SamplerConfig, ctx: EagerContext) !sampling_mod.SampleResult {
+    var arena = ScopedArrayArena.init(ctx.allocator);
+    defer arena.deinit();
+    const logits_shape = logits.shape();
+    const seq_len: usize = @intCast(logits_shape[1]);
+    const vocab_size: usize = @intCast(logits_shape[2]);
+    const last_logits = try arena.track(try ops.slice(
+        ctx,
+        logits,
+        &[_]i32{ 0, @intCast(seq_len - 1), 0 },
+        &[_]i32{ 1, @intCast(seq_len), @intCast(vocab_size) },
+        &[_]i32{ 1, 1, 1 },
+    ));
+    const squeezed = try arena.track(try shape_mod.squeezeAxes(ctx, last_logits, &[_]i32{ 0, 1 }));
+    const logits_f32 = try arena.track(try ops.astype(ctx, squeezed, .float32));
+    return sampler.sample(logits_f32, ctx.allocator);
+}
+
 // ============================================================
 // Layer 2: streamGenerate — per-token callback streaming
 // ============================================================
@@ -282,6 +379,7 @@ pub fn streamGenerate(
         var generated: usize = 1;
 
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -319,6 +417,34 @@ pub fn streamGenerateCtx(
     ctx_ptr: *anyopaque,
     callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
 ) !void {
+    return streamGenerateCtxImpl(model, prompt_tokens, config, caches, ctx, null, ctx_ptr, callback);
+}
+
+/// Vision variant of streamGenerateCtx: the prefill runs through the
+/// model's VisionOps (MRoPE + feature splice); decode steps are unchanged.
+pub fn streamGenerateCtxVision(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: VisionData,
+    ctx_ptr: *anyopaque,
+    callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
+) !void {
+    return streamGenerateCtxImpl(model, prompt_tokens, config, caches, ctx, vision, ctx_ptr, callback);
+}
+
+fn streamGenerateCtxImpl(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: ?VisionData,
+    ctx_ptr: *anyopaque,
+    callback: *const fn (ctx_ptr: *anyopaque, token: u32, is_done: bool) void,
+) !void {
     var sampler = SamplerConfig{
         .temperature = config.temperature,
         .top_k = config.top_k,
@@ -329,18 +455,24 @@ pub fn streamGenerateCtx(
 
     // Prefill: run the full prompt through the model
     if (prompt_tokens.len > 0) {
-        const prompt_arr = try Array.fromData(
-            ctx.allocator,
-            u32,
-            prompt_tokens,
-            &[_]i32{ 1, @intCast(prompt_tokens.len) },
-        );
-        defer prompt_arr.deinit();
-
         var generated_tokens = std.ArrayList(u32).empty;
         defer generated_tokens.deinit(ctx.allocator);
 
-        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        const first_result = if (vision) |vis| blk: {
+            const vops = model.vision orelse return error.VisionNotSupported;
+            const prefill_logits = try vops.prefill(model.ptr, prompt_tokens, vis);
+            defer prefill_logits.deinit();
+            break :blk try samplePrefillLogits(prefill_logits, &sampler, ctx);
+        } else blk: {
+            const prompt_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                prompt_tokens,
+                &[_]i32{ 1, @intCast(prompt_tokens.len) },
+            );
+            defer prompt_arr.deinit();
+            break :blk try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        };
 
         if (isStopToken(first_result.token, config.stop_tokens)) {
             callback(ctx_ptr, first_result.token, true);
@@ -359,6 +491,7 @@ pub fn streamGenerateCtx(
         var generated: usize = 1;
 
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -401,6 +534,30 @@ pub fn generate(
     caches: []KVCacheStrategy,
     ctx: EagerContext,
 ) ![]u32 {
+    return generateImpl(model, prompt_tokens, config, caches, ctx, null);
+}
+
+/// Vision variant of generate: prefill via the model's VisionOps, then the
+/// plain single-token decode loop.
+pub fn generateWithVision(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: VisionData,
+) ![]u32 {
+    return generateImpl(model, prompt_tokens, config, caches, ctx, vision);
+}
+
+fn generateImpl(
+    model: ModelVTable,
+    prompt_tokens: []const u32,
+    config: GenerateConfig,
+    caches: []KVCacheStrategy,
+    ctx: EagerContext,
+    vision: ?VisionData,
+) ![]u32 {
     var sampler = SamplerConfig{
         .temperature = config.temperature,
         .top_k = config.top_k,
@@ -414,18 +571,24 @@ pub fn generate(
 
     // Prefill: run the full prompt through the model
     if (prompt_tokens.len > 0) {
-        const prompt_arr = try Array.fromData(
-            ctx.allocator,
-            u32,
-            prompt_tokens,
-            &[_]i32{ 1, @intCast(prompt_tokens.len) },
-        );
-        defer prompt_arr.deinit();
-
         var generated_tokens = std.ArrayList(u32).empty;
         defer generated_tokens.deinit(ctx.allocator);
 
-        const first_result = try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        const first_result = if (vision) |vis| blk: {
+            const vops = model.vision orelse return error.VisionNotSupported;
+            const prefill_logits = try vops.prefill(model.ptr, prompt_tokens, vis);
+            defer prefill_logits.deinit();
+            break :blk try samplePrefillLogits(prefill_logits, &sampler, ctx);
+        } else blk: {
+            const prompt_arr = try Array.fromData(
+                ctx.allocator,
+                u32,
+                prompt_tokens,
+                &[_]i32{ 1, @intCast(prompt_tokens.len) },
+            );
+            defer prompt_arr.deinit();
+            break :blk try generateStep(model, prompt_arr, caches, &sampler, ctx);
+        };
         try result.append(ctx.allocator, first_result.token);
         try generated_tokens.append(ctx.allocator, first_result.token);
         sampler.context_tokens = generated_tokens.items;
@@ -438,6 +601,7 @@ pub fn generate(
         var prev_token = first_result.token;
 
         while (result.items.len < config.max_tokens) {
+            if (cancelRequested(config)) break;
             const input_arr = try Array.fromData(
                 ctx.allocator,
                 u32,
@@ -511,6 +675,7 @@ pub fn streamGenerateSpeculative(
         // Decode loop with speculative decoding
         var generated: usize = 1;
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             // Save KV cache lengths for potential rollback
             const cache_lens = try ctx.allocator.alloc(usize, caches.len);
             defer ctx.allocator.free(cache_lens);
@@ -648,6 +813,7 @@ pub fn streamGenerateEagle(
         // Decode loop with EAGLE speculative decoding
         var generated: usize = 1;
         while (generated < config.max_tokens) {
+            if (cancelRequested(config)) return;
             // Single-token forward to get hidden state for EAGLE draft
             const last_token = context.items[context.items.len - 1];
             const input_arr = try Array.fromData(
@@ -781,4 +947,110 @@ pub fn isStopToken(token: u32, stop_tokens: []const u32) bool {
         if (token == st) return true;
     }
     return false;
+}
+
+// ============================================================
+// Tests
+// ============================================================
+
+const test_vocab = 8;
+
+fn testForward(_: *anyopaque, input: Array, _: ?Array, _: ?[]KVCacheStrategy) anyerror!Array {
+    var data = [_]f32{0} ** test_vocab;
+    data[3] = 1.0; // greedy always picks token 3
+    const in_shape = input.shape();
+    return Array.fromData(std.testing.allocator, f32, &data, &[_]i32{ 1, @intCast(in_shape[1]), test_vocab });
+}
+
+fn testDeinit(_: *anyopaque, _: std.mem.Allocator) void {}
+
+fn testModel() ModelVTable {
+    return .{
+        .forward = &testForward,
+        .deinit = &testDeinit,
+        .config = .{
+            .num_layers = 0,
+            .num_kv_heads = 0,
+            .head_dim = 0,
+            .vocab_size = test_vocab,
+            .hidden_size = 0,
+        },
+        .ptr = @ptrCast(@constCast(&test_model_sentinel)),
+    };
+}
+
+var test_model_sentinel: u8 = 0;
+
+test "cancelRequested: null flag is false, set flag is true" {
+    var config = GenerateConfig{};
+    try std.testing.expect(!cancelRequested(config));
+    var flag = std.atomic.Value(bool).init(true);
+    config.cancel_flag = &flag;
+    try std.testing.expect(cancelRequested(config));
+    flag.store(false, .release);
+    try std.testing.expect(!cancelRequested(config));
+}
+
+test "streamGenerateCtx: pre-set cancel flag truncates after the prefill token" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    var caches = [_]KVCacheStrategy{};
+
+    var flag = std.atomic.Value(bool).init(true);
+    const config = GenerateConfig{
+        .max_tokens = 16,
+        .temperature = 0,
+        .cancel_flag = &flag,
+    };
+
+    const CbCtx = struct {
+        calls: usize = 0,
+        last_is_done: bool = false,
+        fn callback(ptr: *anyopaque, _: u32, is_done: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.last_is_done = is_done;
+        }
+    };
+    var cb_ctx = CbCtx{};
+
+    try streamGenerateCtx(
+        testModel(),
+        &[_]u32{1},
+        config,
+        &caches,
+        ctx,
+        @ptrCast(&cb_ctx),
+        &CbCtx.callback,
+    );
+
+    // Prefill token is delivered (non-final), then the decode loop sees the
+    // flag and returns without generating further tokens.
+    try std.testing.expectEqual(@as(usize, 1), cb_ctx.calls);
+    try std.testing.expect(!cb_ctx.last_is_done);
+}
+
+test "generate: cancel flag set mid-run truncates the token sequence" {
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    var caches = [_]KVCacheStrategy{};
+
+    var flag = std.atomic.Value(bool).init(false);
+    const config = GenerateConfig{
+        .max_tokens = 16,
+        .temperature = 0,
+        .cancel_flag = &flag,
+    };
+
+    const model = testModel();
+    // No cancel: full run to max_tokens.
+    const full = try generate(model, &[_]u32{1}, config, &caches, ctx);
+    defer allocator.free(full);
+    try std.testing.expectEqual(@as(usize, 16), full.len);
+
+    // Cancel requested before the call: only the prefill token survives.
+    flag.store(true, .release);
+    const truncated = try generate(model, &[_]u32{1}, config, &caches, ctx);
+    defer allocator.free(truncated);
+    try std.testing.expectEqual(@as(usize, 1), truncated.len);
 }

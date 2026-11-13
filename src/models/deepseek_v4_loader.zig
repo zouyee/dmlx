@@ -112,7 +112,9 @@ fn dequantIfNeeded(
     const scales_key = try std.fmt.allocPrint(allocator, "{s}.scales", .{base_name});
     defer allocator.free(scales_key);
     const scales = weights.get(scales_key) orelse {
-        std.log.warn("dequantIfNeeded: scales not found for {s} (key: {s})", .{ base_name, scales_key });
+        // Silent under `zig build test` (stderr noise trips the build runner).
+        if (!@import("builtin").is_test)
+            std.log.warn("dequantIfNeeded: scales not found for {s} (key: {s})", .{ base_name, scales_key });
         return weight;
     };
 
@@ -2266,8 +2268,9 @@ pub fn buildDSV4Model(
         const hc_attn_fn_name = try std.fmt.allocPrint(allocator, "{s}hc_attn_fn", .{idx_fmt});
         defer allocator.free(hc_attn_fn_name);
         const hc_attn_fn = weights.get(hc_attn_fn_name);
-        if (hc_attn_fn == null and i == 0) std.log.warn("mHC: hc_attn_fn NOT found for layer 0 (key: {s})", .{hc_attn_fn_name});
-        if (hc_attn_fn != null and i == 0) std.log.info("mHC: hc_attn_fn found for layer 0, ndim={d}", .{hc_attn_fn.?.ndim()});
+        const quiet = @import("builtin").is_test;
+        if (hc_attn_fn == null and i == 0 and !quiet) std.log.warn("mHC: hc_attn_fn NOT found for layer 0 (key: {s})", .{hc_attn_fn_name});
+        if (hc_attn_fn != null and i == 0 and !quiet) std.log.info("mHC: hc_attn_fn found for layer 0, ndim={d}", .{hc_attn_fn.?.ndim()});
         if (weights.fetchRemove(hc_attn_fn_name)) |kv| allocator.free(kv.key);
 
         const hc_attn_base_name = try std.fmt.allocPrint(allocator, "{s}hc_attn_base", .{idx_fmt});

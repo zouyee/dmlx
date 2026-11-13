@@ -276,6 +276,29 @@ const safetensors_reader = @import("mlx").safetensors_reader;
 /// prep checkpoint — no 8-bit expert tensors, so the stream path needs no
 /// per-tensor bits). Dense layers get placeholder entries (never queried:
 /// the model only streams on MoE layers).
+/// Free one LayerExpertMeta's owned name strings (MoE layers only; dense
+/// placeholders hold empty literals).
+fn freeLayerExpertMetaEntry(allocator: std.mem.Allocator, m: *const expert_stream.LayerExpertMeta) void {
+    if (m.n_experts == 0) return;
+    allocator.free(m.gate_proj_name);
+    allocator.free(m.up_proj_name);
+    allocator.free(m.down_proj_name);
+    if (m.gate_scales_name) |n| allocator.free(n);
+    if (m.up_scales_name) |n| allocator.free(n);
+    if (m.down_scales_name) |n| allocator.free(n);
+    if (m.gate_biases_name) |n| allocator.free(n);
+    if (m.up_biases_name) |n| allocator.free(n);
+    if (m.down_biases_name) |n| allocator.free(n);
+}
+
+/// Free a slice from buildLayerExpertMeta (entries + slice). NOTE: once an
+/// ExpertStreamProvider takes the meta, its deinit does this — do not call
+/// both.
+pub fn freeLayerExpertMeta(allocator: std.mem.Allocator, meta: []expert_stream.LayerExpertMeta) void {
+    for (meta) |*m| freeLayerExpertMetaEntry(allocator, m);
+    allocator.free(meta);
+}
+
 pub fn buildLayerExpertMeta(
     allocator: std.mem.Allocator,
     cfg: *const Glm53Config,
@@ -283,6 +306,8 @@ pub fn buildLayerExpertMeta(
 ) ![]expert_stream.LayerExpertMeta {
     const meta = try allocator.alloc(expert_stream.LayerExpertMeta, cfg.num_hidden_layers);
     errdefer allocator.free(meta);
+    var built: usize = 0;
+    errdefer for (meta[0..built]) |*m| freeLayerExpertMetaEntry(allocator, m);
 
     for (0..cfg.num_hidden_layers) |i| {
         if (!cfg.isMoE(@intCast(i))) {
@@ -297,48 +322,63 @@ pub fn buildLayerExpertMeta(
                 .expert_scale_row_bytes = 0,
                 .n_experts = 0,
             };
+            built = i + 1;
             continue;
         }
         const prefix = try std.fmt.allocPrint(allocator, "language_model.model.layers.{d}.mlp.switch_mlp", .{i});
+        defer allocator.free(prefix);
 
-        const gate_w = try std.fmt.allocPrint(allocator, "{s}.gate_proj.weight", .{prefix});
-        const up_w = try std.fmt.allocPrint(allocator, "{s}.up_proj.weight", .{prefix});
-        const down_w = try std.fmt.allocPrint(allocator, "{s}.down_proj.weight", .{prefix});
-        const gate_s = try std.fmt.allocPrint(allocator, "{s}.gate_proj.scales", .{prefix});
-        const up_s = try std.fmt.allocPrint(allocator, "{s}.up_proj.scales", .{prefix});
-        const down_s = try std.fmt.allocPrint(allocator, "{s}.down_proj.scales", .{prefix});
-        const gate_b = try std.fmt.allocPrint(allocator, "{s}.gate_proj.biases", .{prefix});
-        const up_b = try std.fmt.allocPrint(allocator, "{s}.up_proj.biases", .{prefix});
-        const down_b = try std.fmt.allocPrint(allocator, "{s}.down_proj.biases", .{prefix});
+        const entry = blk: {
+            const gate_w = try std.fmt.allocPrint(allocator, "{s}.gate_proj.weight", .{prefix});
+            errdefer allocator.free(gate_w);
+            const up_w = try std.fmt.allocPrint(allocator, "{s}.up_proj.weight", .{prefix});
+            errdefer allocator.free(up_w);
+            const down_w = try std.fmt.allocPrint(allocator, "{s}.down_proj.weight", .{prefix});
+            errdefer allocator.free(down_w);
+            const gate_s = try std.fmt.allocPrint(allocator, "{s}.gate_proj.scales", .{prefix});
+            errdefer allocator.free(gate_s);
+            const up_s = try std.fmt.allocPrint(allocator, "{s}.up_proj.scales", .{prefix});
+            errdefer allocator.free(up_s);
+            const down_s = try std.fmt.allocPrint(allocator, "{s}.down_proj.scales", .{prefix});
+            errdefer allocator.free(down_s);
+            const gate_b = try std.fmt.allocPrint(allocator, "{s}.gate_proj.biases", .{prefix});
+            errdefer allocator.free(gate_b);
+            const up_b = try std.fmt.allocPrint(allocator, "{s}.up_proj.biases", .{prefix});
+            errdefer allocator.free(up_b);
+            const down_b = try std.fmt.allocPrint(allocator, "{s}.down_proj.biases", .{prefix});
+            errdefer allocator.free(down_b);
 
-        var row_bytes: usize = 0;
-        var scale_row_bytes: usize = 0;
-        var bias_row_bytes: usize = 0;
-        if (index.entries.get(gate_w)) |info| {
-            row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
-        }
-        if (index.entries.get(gate_s)) |info| {
-            scale_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
-        }
-        if (index.entries.get(gate_b)) |info| {
-            bias_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
-        }
+            var row_bytes: usize = 0;
+            var scale_row_bytes: usize = 0;
+            var bias_row_bytes: usize = 0;
+            if (index.entries.get(gate_w)) |info| {
+                row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+            }
+            if (index.entries.get(gate_s)) |info| {
+                scale_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+            }
+            if (index.entries.get(gate_b)) |info| {
+                bias_row_bytes = @intCast((info.data_offset_end - info.data_offset_start) / @as(u64, @intCast(info.shape[0])));
+            }
 
-        meta[i] = .{
-            .gate_proj_name = gate_w,
-            .up_proj_name = up_w,
-            .down_proj_name = down_w,
-            .gate_scales_name = gate_s,
-            .up_scales_name = up_s,
-            .down_scales_name = down_s,
-            .gate_biases_name = gate_b,
-            .up_biases_name = up_b,
-            .down_biases_name = down_b,
-            .expert_row_bytes = row_bytes,
-            .expert_scale_row_bytes = scale_row_bytes,
-            .expert_bias_row_bytes = bias_row_bytes,
-            .n_experts = cfg.n_routed_experts,
+            break :blk expert_stream.LayerExpertMeta{
+                .gate_proj_name = gate_w,
+                .up_proj_name = up_w,
+                .down_proj_name = down_w,
+                .gate_scales_name = gate_s,
+                .up_scales_name = up_s,
+                .down_scales_name = down_s,
+                .gate_biases_name = gate_b,
+                .up_biases_name = up_b,
+                .down_biases_name = down_b,
+                .expert_row_bytes = row_bytes,
+                .expert_scale_row_bytes = scale_row_bytes,
+                .expert_bias_row_bytes = bias_row_bytes,
+                .n_experts = cfg.n_routed_experts,
+            };
         };
+        meta[i] = entry;
+        built = i + 1;
     }
     return meta;
 }

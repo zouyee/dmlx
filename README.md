@@ -12,7 +12,7 @@
 
 Its two flagship paths are:
 
-- **Qwen3.8-27B-4bit + MTP** — model-specific speculative decoding with GPU-chained drafts, multi-token verification, rollback, and an adaptive draft-depth controller.
+- **Qwen3.8-27B-4bit + MTP** — model-specific speculative decoding with GPU-chained drafts, multi-token verification, rollback, and an adaptive draft-depth controller. Image input is supported end to end (CLI `--image`, server `image_url` content parts, bf16 vision tower with MRoPE, MTP-compatible).
 - **DeepSeek V4 Flash + native expert streaming** — a 284B-parameter MoE checkpoint running within a 48GB unified-memory budget by keeping a bounded expert hot set in RAM and reading cold experts from SSD.
 
 > **Project status:** experimental. The flagship configurations below are benchmarked and exercised regularly. Other registered model architectures are compatibility paths, not equivalent claims of production readiness.
@@ -273,7 +273,14 @@ Approximate memory budget for the tested 48GB machine:
 Currently exposed routes:
 
 - `POST /v1/chat/completions`
-- `POST /v1/messages`
+- `POST /v1/completions` (legacy raw-text completion)
+- `POST /v1/responses` (+ `GET`/`DELETE /v1/responses/{id}`)
+- `POST /v1/messages` (+ `POST /v1/messages/count_tokens`)
+- `POST /v1/tokenize` / `POST /v1/detokenize` (aliases `/tokenize`, `/detokenize`)
+- `POST /v1/embeddings` (last-hidden pooling, Qwen3.8 path)
+- `GET /v1/models`
+- `GET /metrics` (Prometheus text format, also `/v1/metrics`)
+- `GET /api/status`
 - `GET /health`
 - `POST /shutdown`
 
@@ -363,6 +370,11 @@ Custom kernels and techniques include work adapted from:
 - [MTPLX](https://github.com/youssofal/mtplx)
 - [Splash](https://github.com/incoai/splash)
 - [DeepSeek TileKernels](https://github.com/deepseek-ai/TileKernels)
+
+The project icon adapts **Ziggy the Ziguana** from the
+[official Zig artwork repository](https://github.com/ziglang/logo), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Ziggy artwork copyright
+belongs to its original creator; the dmlx MLX-badge composition is an adaptation.
 
 See source headers for per-kernel provenance and licenses. Adapted Apache-2.0 and MIT code retains its required attribution.
 

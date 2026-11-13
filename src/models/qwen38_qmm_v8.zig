@@ -19,17 +19,20 @@ const header_src = @embedFile("qwen38_qmm_v8_steel.metal");
 const body_src =
     \\    const uint3 tid = threadgroup_position_in_grid;
     \\    const uint lid = thread_index_in_threadgroup;
-    \\    threadgroup {[t]s} Xs[64 * 40];
-    \\    threadgroup {[t]s} Ws[64 * 40];
-    \\    dmlx_qmm_v8_impl<{[t]s}>(w, scales, biases, x, y, Xs, Ws, {[k]}, {[n]}, {[m]}, tid, lid, lid / 32, lid % 32);
+    \\    threadgroup {[t]s} Xs[{[bm]} * {[bkp]}];
+    \\    threadgroup {[t]s} Ws[{[bn]} * {[bkp]}];
+    \\    dmlx_qmm_v8_impl<{[t]s}, {[bm]}, {[bk]}, {[bn]}>(w, scales, biases, x, y, Xs, Ws, {[k]}, {[n]}, {[m]}, tid, lid, lid / 32, lid % 32);
     \\
 ;
+
+pub const Tile = struct { bm: i32, bk: i32, bn: i32 };
 
 pub const Key = struct {
     m: i32,
     n: i32,
     k: i32,
     bf16: bool,
+    tile: Tile,
 };
 
 const Entry = struct {
@@ -38,7 +41,7 @@ const Entry = struct {
     broken: bool = false,
 };
 
-var entries: [16]?Entry = .{null} ** 16;
+var entries: [96]?Entry = .{null} ** 96;
 var warned = false;
 
 fn warn(err: anyerror) void {
@@ -60,13 +63,18 @@ fn makeStringVec(allocator: std.mem.Allocator, names: []const []const u8) !c.c.m
 }
 
 fn createKernel(allocator: std.mem.Allocator, key: Key) !c.c.mlx_fast_metal_kernel {
-    const name_z = try std.fmt.allocPrintSentinel(allocator, "qmm_v8_{s}_{d}_{d}_{d}", .{ if (key.bf16) "bf16" else "f16", key.m, key.n, key.k }, 0);
+    const name_z = try std.fmt.allocPrintSentinel(allocator, "qmm_v8_{s}_{d}_{d}_{d}_{d}_{d}_{d}", .{ if (key.bf16) "bf16" else "f16", key.m, key.n, key.k, key.tile.bm, key.tile.bk, key.tile.bn }, 0);
     defer allocator.free(name_z);
     const source_z = try std.fmt.allocPrintSentinel(allocator, body_src, .{
         .t = if (key.bf16) "bfloat16_t" else "float16_t",
         .k = key.k,
         .n = key.n,
         .m = key.m,
+        .bm = key.tile.bm,
+        .bk = key.tile.bk,
+        .bn = key.tile.bn,
+        // BK_padded = BK + 16/sizeof(T); both bf16 and f16 are 2 bytes.
+        .bkp = key.tile.bk + 8,
     }, 0);
     defer allocator.free(source_z);
     const header_z = try allocator.dupeZ(u8, header_src ++ "\n");
@@ -118,6 +126,35 @@ pub fn apply(
     scales: Array,
     biases: Array,
 ) !?Array {
+    return applyTile(ctx, x, w, scales, biases, defaultTile());
+}
+
+var cached_tile: ?Tile = null;
+
+/// Default tile (bm,bk,bn) = (64,32,64); DMLX_QMM_TILE="bm,bk,bn" overrides
+/// for sweeps. Valid combos are omlx's instantiated variant list.
+pub fn defaultTile() Tile {
+    if (cached_tile) |t| return t;
+    var t = Tile{ .bm = 64, .bk = 32, .bn = 64 };
+    if (std.c.getenv("DMLX_QMM_TILE")) |s| {
+        var it = std.mem.splitScalar(u8, std.mem.span(s), ',');
+        const bm = if (it.next()) |v| std.fmt.parseInt(i32, v, 10) catch t.bm else t.bm;
+        const bk = if (it.next()) |v| std.fmt.parseInt(i32, v, 10) catch t.bk else t.bk;
+        const bn = if (it.next()) |v| std.fmt.parseInt(i32, v, 10) catch t.bn else t.bn;
+        t = .{ .bm = bm, .bk = bk, .bn = bn };
+    }
+    cached_tile = t;
+    return t;
+}
+
+pub fn applyTile(
+    ctx: anytype,
+    x: Array,
+    w: Array,
+    scales: Array,
+    biases: Array,
+    tile: Tile,
+) !?Array {
     const nd = x.ndim();
     if (nd < 2) return null;
     const dt = x.dtype();
@@ -135,15 +172,15 @@ pub fn apply(
     if (@mod(k, 64) != 0 or @mod(n, 64) != 0) return null;
     if (scales.shape()[0] != n or scales.shape()[1] != @divTrunc(k, 64)) return null;
     if (biases.shape()[0] != n or biases.shape()[1] != @divTrunc(k, 64)) return null;
-    // v8 tile: bm=64, bk=32, bn=64 — K % 32 and N % 64 required (checked above);
-    // the impl handles a partial M edge at runtime.
-    const key = Key{ .m = m, .n = n, .k = k, .bf16 = bf16 };
+    // Tile (bm,bk,bn): K % 32 and N % 64 required (checked above); the impl
+    // handles partial M/N edges at runtime (min(BM, M - y_row) etc.).
+    const key = Key{ .m = m, .n = n, .k = k, .bf16 = bf16, .tile = tile };
     const kernel = getKernel(ctx.allocator, key) orelse return null;
 
     const cfg = c.c.mlx_fast_metal_kernel_config_new();
     defer c.c.mlx_fast_metal_kernel_config_free(cfg);
-    const tg_n = @divTrunc(n + 63, 64);
-    const tg_m = @divTrunc(m + 63, 64);
+    const tg_n = @divTrunc(n + tile.bn - 1, tile.bn);
+    const tg_m = @divTrunc(m + tile.bm - 1, tile.bm);
     try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, tg_n * 32, tg_m * 2, 2));
     try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 2, 2));
     var out_shape_buf: [8]i32 = undefined;

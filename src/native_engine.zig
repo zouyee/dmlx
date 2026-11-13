@@ -1895,6 +1895,7 @@ pub const NativeEngine = struct {
         caches: anytype,
         stream: anytype,
         start_pos_override: ?usize,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) ![]u32 {
         _ = caches;
         _ = stream;
@@ -2010,6 +2011,9 @@ pub const NativeEngine = struct {
 
         var remaining = decode_count;
         while (remaining > 0) {
+            if (cancel_flag) |f| {
+                if (f.load(.acquire)) break;
+            }
             if (current_len >= tokens.len) break;
 
             // --- Standard single-token decode step (produces anchor logits) ---
@@ -2201,6 +2205,7 @@ pub const NativeEngine = struct {
         callback_ctx: ?*anyopaque,
         callback: ?StreamCallback,
         start_pos_override: ?usize,
+        cancel_flag: ?*const std.atomic.Value(bool),
     ) ![]u32 {
         _ = caches;
         _ = stream;
@@ -2311,6 +2316,9 @@ pub const NativeEngine = struct {
         }
 
         while (remaining > 0) {
+            if (cancel_flag) |f| {
+                if (f.load(.acquire)) break;
+            }
             if (current_len >= tokens.len) break;
 
             var hidden: [MHC_MULT * DIM]f32 = undefined;

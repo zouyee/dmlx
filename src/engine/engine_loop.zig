@@ -29,6 +29,8 @@ const dsv4_loader = @import("../models/deepseek_v4_loader.zig");
 const speculative_mod = @import("../speculative.zig");
 const guided_mod = @import("../guided.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const content_class = @import("content_class.zig");
+const metrics_mod = @import("../server/metrics.zig");
 
 const Array = array_mod.Array;
 const ScopedArrayArena = array_arena_mod.ScopedArrayArena;
@@ -39,10 +41,12 @@ const KVCacheStrategy = kvcache.KVCacheStrategy;
 const LayerConfig = kvcache.LayerConfig;
 const RequestState = request_state.RequestState;
 const RequestQueue = request_queue.RequestQueue;
+const EmbedQueue = @import("embed_queue.zig").EmbedQueue;
 const CompletionSignal = completion_signal.CompletionSignal;
 const TokenEvent = completion_signal.TokenEvent;
 const TokenFinishReason = completion_signal.TokenEvent.FinishReason;
 const sampling_mod = @import("../sampling.zig");
+const streaming_mod = @import("../tokenizer/streaming.zig");
 const qwen38_gdn_prof = @import("../models/qwen38_gdn.zig");
 const verify_qmm_mod = @import("../models/verify_qmm.zig");
 const SamplerConfig = sampling_mod.SamplerConfig;
@@ -81,6 +85,7 @@ const StreamCallbackCtx = struct {
     stop_strings: ?[]const []const u8,
     stop_tokens: []const u32,
     text_buffer: std.ArrayList(u8),
+    detok: streaming_mod.StreamingDetokenizer,
     token_count: usize,
     max_tokens: usize,
     stopped: bool,
@@ -94,6 +99,7 @@ const StreamCallbackCtx = struct {
             .stop_strings = stop_strings,
             .stop_tokens = stop_tokens,
             .text_buffer = std.ArrayList(u8).empty,
+            .detok = streaming_mod.StreamingDetokenizer.init(allocator, tokenizer),
             .token_count = 0,
             .max_tokens = max_tokens,
             .stopped = false,
@@ -102,19 +108,23 @@ const StreamCallbackCtx = struct {
 
     fn deinit(self: *StreamCallbackCtx) void {
         self.text_buffer.deinit(self.allocator);
+        self.detok.deinit();
     }
 
     fn callback(ctx_ptr: *anyopaque, token: u32, is_done: bool) void {
         const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx_ptr));
         if (self.stopped) return;
 
-        // Decode token to text
-        const token_text = self.tokenizer.decode(&[_]u32{token}, self.allocator) catch return;
-        defer self.allocator.free(token_text);
+        // Incremental decode: cumulative full-sequence decode + diff, so
+        // concatenated deltas match the non-streaming decode byte-exactly
+        // (leading spaces on non-initial tokens survive; the leading-space
+        // strip applies once to the first token).
+        const delta = self.detok.addToken(token) catch return;
+        defer if (delta) |d| self.allocator.free(d);
+        self.token_count += 1;
 
         // Accumulate text for stop-string detection
-        self.text_buffer.appendSlice(self.allocator, token_text) catch return;
-        self.token_count += 1;
+        if (delta) |d| self.text_buffer.appendSlice(self.allocator, d) catch return;
 
         // Resolve the real finish verdict: stop token → .stop, otherwise
         // is_done means max_tokens truncation → .length.
@@ -137,9 +147,30 @@ const StreamCallbackCtx = struct {
             finish_reason = .length;
         }
 
+        // Flush any held-back partial UTF-8 on the final token.
+        var tail: ?[]u8 = null;
+        defer if (tail) |t| self.allocator.free(t);
+        if (is_final) {
+            tail = self.detok.flush() catch null;
+        }
+
+        const token_text = joinDeltas(self.allocator, delta, tail) catch return;
+        defer if (token_text.len > 0) self.allocator.free(token_text);
+
         self.signal.deliverToken(self.io, token, token_text, is_final, finish_reason);
     }
 };
+
+/// Concatenate two optional owned delta slices into one owned slice
+/// ("" when both are empty).
+fn joinDeltas(allocator: std.mem.Allocator, a: ?[]const u8, b: ?[]const u8) ![]const u8 {
+    const a_len = if (a) |s| s.len else 0;
+    const b_len = if (b) |s| s.len else 0;
+    const out = try allocator.alloc(u8, a_len + b_len);
+    if (a) |s| @memcpy(out[0..a_len], s);
+    if (b) |s| @memcpy(out[a_len..], s);
+    return out;
+}
 
 /// Derive the wire finish reason from a finished token sequence: a trailing
 /// stop token → .stop; hitting the max_tokens cap → .length.
@@ -179,6 +210,12 @@ fn softmaxProbs(logits: []const f32, temperature: f32, allocator: std.mem.Alloca
 
 /// Speculative-sampling acceptance probability for a draft token:
 /// min(1, p_target / q_draft) with both distributions temperature-shaped.
+fn monotonicNs() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 fn mtpAcceptProb(target_logits: Array, draft_logits: Array, token: u32, temperature: f32, allocator: std.mem.Allocator) !f32 {
     const p_data = try target_logits.dataSlice(f32);
     const q_data = try draft_logits.dataSlice(f32);
@@ -255,6 +292,10 @@ pub const EngineConfig = struct {
     speculative_mtp: ?usize = null,
     /// Prefix cache: max number of prompts to cache KV state for (0 = disabled).
     prefix_cache_max_entries: usize = 16,
+    /// Embedding tasks from /v1/embeddings, drained each loop iteration and
+    /// executed on this (engine) thread — GPU forwards only work here (see
+    /// embed_queue.zig). Null: embed tasks are failed immediately.
+    embed_queue: ?*EmbedQueue = null,
 };
 
 pub const EngineLoop = struct {
@@ -291,6 +332,8 @@ pub const EngineLoop = struct {
     mtp_depth: ?MtpDepthController,
     /// Prefix cache for skipping prefill on repeated prompts.
     prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
+    /// Embedding tasks to execute on the engine thread (null = unsupported).
+    embed_queue: ?*EmbedQueue,
 
     pub fn init(config: EngineConfig) !EngineLoop {
         // Note: batch_caches is lazily initialized via BatchKVCache.merge()
@@ -322,6 +365,7 @@ pub const EngineLoop = struct {
                 prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
             else
                 null,
+            .embed_queue = config.embed_queue,
         };
     }
 
@@ -344,6 +388,7 @@ pub const EngineLoop = struct {
         defer std.log.info("[Engine] Engine loop exiting", .{});
 
         while (self.running.load(.acquire) and !g_shutdown_requested.load(.acquire)) {
+            self.drainEmbedTasks();
             // Drain new requests from the queue.
             const new_requests = self.request_queue.drainAll(self.allocator) catch {
                 threadSleepMs(1);
@@ -357,6 +402,7 @@ pub const EngineLoop = struct {
             for (new_requests) |req| {
                 if (req.isCancelled()) {
                     req.completion.deliverError(self.io, "Request cancelled");
+                    req.markEngineDone();
                     continue;
                 }
                 if (self.dsv4_model != null or self.vtable_serial) {
@@ -395,9 +441,45 @@ pub const EngineLoop = struct {
         while (self.active_requests.items.len > 0 and !g_shutdown_requested.load(.acquire)) {
             self.step();
         }
+        // Fail any embed tasks still pending so their HTTP fibers unblock.
+        self.failEmbedTasks(error.ServerShuttingDown);
+    }
+
+    /// Run one pending batch of embedding tasks on the engine thread. The
+    /// MLX Metal backend registers command encoders per (thread, stream), so
+    /// model forwards only work here — never on HTTP worker threads.
+    fn drainEmbedTasks(self: *EngineLoop) void {
+        const eq = self.embed_queue orelse return;
+        const tasks = eq.drainAll(self.allocator) catch return;
+        defer self.allocator.free(tasks);
+        for (tasks) |task| {
+            if (self.model.embed) |embed_fn| {
+                task.result = embed_fn(self.model.ptr, task.allocator, task.ids) catch |err| blk: {
+                    task.err = err;
+                    break :blk null;
+                };
+            } else {
+                task.err = error.EmbeddingNotSupported;
+            }
+            task.done.store(true, .release);
+        }
+    }
+
+    /// Mark every queued embed task as failed (shutdown path).
+    fn failEmbedTasks(self: *EngineLoop, err: anyerror) void {
+        const eq = self.embed_queue orelse return;
+        const tasks = eq.drainAll(self.allocator) catch return;
+        defer self.allocator.free(tasks);
+        for (tasks) |task| {
+            task.err = err;
+            task.done.store(true, .release);
+        }
     }
 
     fn processRequest(self: *EngineLoop, req: *RequestState) void {
+        // The HTTP handler waits on this before deinit: it must fire on every
+        // exit, including the early error returns below.
+        defer req.markEngineDone();
         // Record start time for request latency tracking.
         const engine_start = std.c.mach_absolute_time();
         req.start_time_ns = @intCast(engine_start);
@@ -457,6 +539,7 @@ pub const EngineLoop = struct {
             .top_p = req.top_p,
             .seed = req.seed,
             .stop_tokens = req.stop_tokens,
+            .cancel_flag = &req.cancel_requested,
         };
 
         if (self.dsv4_model) |model| {
@@ -534,9 +617,19 @@ pub const EngineLoop = struct {
         @memset(success_mask, false);
 
         for (requests, 0..) |req, i| {
+            // Cancelled while waiting for prefill (e.g. SSE disconnect during
+            // a preceding long request): never start it.
+            if (req.isCancelled()) {
+                req.completion.deliverError(self.io, "Request cancelled");
+                req.phase = .done;
+                req.markEngineDone();
+                continue;
+            }
             req_caches[i] = self.createCaches() catch {
                 std.log.err("[Engine] failed to create caches for request {d}", .{req.id});
                 req.completion.deliverError(self.io, "Failed to create KV caches");
+                req.phase = .done;
+                req.markEngineDone();
                 continue;
             };
             success_mask[i] = true;
@@ -556,17 +649,23 @@ pub const EngineLoop = struct {
             ) catch {
                 req.completion.deliverError(self.io, "Failed to create prompt array");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
             defer prompt_arr.deinit();
 
+            const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
             const result = generation_mod.generateStep(self.model, prompt_arr, req_caches[i], &req.sampler, self.ctx) catch {
                 req.completion.deliverError(self.io, "Generation failed during prefill");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
+            if (pf_t0 != 0) {
+                std.log.info("[PREFILL_TRACE] plain req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+            }
 
             // Check stop tokens.
             if (generation_mod.isStopToken(result.token, req.stop_tokens) or req.max_tokens <= 1) {
@@ -574,6 +673,7 @@ pub const EngineLoop = struct {
                 const finish_reason: TokenFinishReason = if (generation_mod.isStopToken(result.token, req.stop_tokens)) .stop else .length;
                 req.completion.deliverToken(self.io, result.token, "", true, finish_reason);
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             }
@@ -582,6 +682,7 @@ pub const EngineLoop = struct {
             req.generated_tokens.append(self.allocator, result.token) catch {
                 req.completion.deliverError(self.io, "Failed to store generated token");
                 req.phase = .done;
+                req.markEngineDone();
                 success_mask[i] = false;
                 continue;
             };
@@ -590,7 +691,7 @@ pub const EngineLoop = struct {
 
             // For streaming, deliver the first token immediately.
             if (req.streaming) {
-                const token_text = self.tokenizer.decode(&[_]u32{result.token}, self.allocator) catch "";
+                const token_text = self.streamTokenText(req, result.token, false);
                 defer if (token_text.len > 0) self.allocator.free(token_text);
                 req.completion.deliverToken(self.io, result.token, token_text, false, null);
             }
@@ -701,6 +802,7 @@ pub const EngineLoop = struct {
             self.active_requests.append(self.allocator, req) catch {
                 req.completion.deliverError(self.io, "Failed to add request to active batch");
                 req.phase = .done;
+                req.markEngineDone();
             };
         }
     }
@@ -772,13 +874,12 @@ pub const EngineLoop = struct {
             const result = results[i];
             req.token_count += 1;
 
-            // Decode token.
-            const token_text = self.tokenizer.decode(&[_]u32{result.token}, self.allocator) catch "";
-            defer if (token_text.len > 0) self.allocator.free(token_text);
-
-            // Check stop tokens.
+            // Check stop tokens. A client disconnect (SSE abort) cancels the
+            // request mid-decode: finish it on this step instead of burning
+            // GPU all the way to max_tokens.
+            const cancelled = req.isCancelled();
             const is_stop = generation_mod.isStopToken(result.token, req.stop_tokens);
-            const is_done = is_stop or req.token_count >= req.max_tokens;
+            const is_done = is_stop or cancelled or req.token_count >= req.max_tokens;
 
             // Store token.
             req.generated_tokens.append(self.allocator, result.token) catch {
@@ -793,7 +894,9 @@ pub const EngineLoop = struct {
 
             // Deliver token.
             if (req.streaming) {
-                const finish_reason: ?TokenFinishReason = if (is_done) (if (is_stop) .stop else .length) else null;
+                const token_text = self.streamTokenText(req, result.token, is_done);
+                defer if (token_text.len > 0) self.allocator.free(token_text);
+                const finish_reason: ?TokenFinishReason = if (is_done) (if (is_stop or cancelled) .stop else .length) else null;
                 req.completion.deliverToken(self.io, result.token, token_text, is_done, finish_reason);
             }
 
@@ -802,7 +905,7 @@ pub const EngineLoop = struct {
                     // Deliver full text for non-streaming.
                     const full_text = self.tokenizer.decode(req.generated_tokens.items, self.allocator) catch "";
                     defer self.allocator.free(full_text);
-                    req.completion.deliverToken(self.io, 0, full_text, true, if (is_stop) .stop else .length);
+                    req.completion.deliverToken(self.io, 0, full_text, true, if (is_stop or cancelled) .stop else .length);
                 }
                 keep[i] = false;
                 completed += 1;
@@ -845,6 +948,7 @@ pub const EngineLoop = struct {
                 } else {
                     req.phase = .done;
                     logRequestCompletion(self.io, req);
+                    req.markEngineDone();
                 }
             }
             self.active_requests.deinit(self.allocator);
@@ -877,6 +981,7 @@ pub const EngineLoop = struct {
 
         // Log the failed request completion.
         logRequestCompletion(self.io, req);
+        req.markEngineDone();
 
         // If this is the only request, clear the batch.
         if (self.active_requests.items.len == 1) {
@@ -929,6 +1034,24 @@ pub const EngineLoop = struct {
         }
     }
 
+    /// Incremental decode of one streamed token for `req`: returns the newly
+    /// decodable text increment (owned; caller frees; empty when the token's
+    /// bytes are held back as a partial UTF-8 sequence). Uses the request's
+    /// StreamingDetokenizer (cumulative decode + diff) so concatenated deltas
+    /// equal the non-streaming full-sequence decode byte-exactly.
+    fn streamTokenText(self: *EngineLoop, req: *RequestState, token: u32, is_final: bool) []const u8 {
+        if (req.stream_detok == null) {
+            req.stream_detok = streaming_mod.StreamingDetokenizer.init(self.allocator, self.tokenizer);
+        }
+        const detok = &req.stream_detok.?;
+        const delta: ?[]u8 = detok.addToken(token) catch null;
+        defer if (delta) |d| self.allocator.free(d);
+        var tail: ?[]u8 = null;
+        defer if (tail) |t| self.allocator.free(t);
+        if (is_final) tail = detok.flush() catch null;
+        return joinDeltas(self.allocator, delta, tail) catch "";
+    }
+
     fn processStreamingRequest(
         self: *EngineLoop,
         req: *RequestState,
@@ -946,7 +1069,22 @@ pub const EngineLoop = struct {
         );
         defer stream_ctx.deinit();
 
-        generation_mod.streamGenerateCtx(
+        if (req.vision) |vis| {
+            generation_mod.streamGenerateCtxVision(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+                vis,
+                @ptrCast(&stream_ctx),
+                &StreamCallbackCtx.callback,
+            ) catch |err| {
+                std.log.err("EngineLoop: streamGenerateCtxVision failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            };
+        } else generation_mod.streamGenerateCtx(
             self.model,
             req.prompt_tokens,
             gen_config,
@@ -982,23 +1120,43 @@ pub const EngineLoop = struct {
             if (self.tryMtpRequest(req, caches, gen_config, n_drafts)) return;
         }
         // If speculative decoding is enabled, use the speculative path.
-        if (self.speculative_ngram) |ngram_n| {
-            self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
-            return;
+        if (req.vision == null) {
+            if (self.speculative_ngram) |ngram_n| {
+                self.processSpeculativeRequest(req, caches, gen_config, ngram_n);
+                return;
+            }
         }
 
-        const tokens = generation_mod.generate(
-            self.model,
-            req.prompt_tokens,
-            gen_config,
-            caches,
-            self.ctx,
-        ) catch |err| {
-            std.log.err("EngineLoop: generate failed: {}", .{err});
-            req.completion.deliverError(self.io, "Generation failed");
-            return;
-        };
+        const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
+        const tokens = if (req.vision) |vis|
+            generation_mod.generateWithVision(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+                vis,
+            ) catch |err| {
+                std.log.err("EngineLoop: generateWithVision failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            }
+        else
+            generation_mod.generate(
+                self.model,
+                req.prompt_tokens,
+                gen_config,
+                caches,
+                self.ctx,
+            ) catch |err| {
+                std.log.err("EngineLoop: generate failed: {}", .{err});
+                req.completion.deliverError(self.io, "Generation failed");
+                return;
+            };
         defer self.allocator.free(tokens);
+        if (pf_t0 != 0) {
+            std.log.info("[PREFILL_TRACE] plain req={d} prompt={d} generate_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+        }
 
         // Decode all tokens to text.
         const text = self.tokenizer.decode(tokens, self.allocator) catch {
@@ -1091,6 +1249,7 @@ pub const EngineLoop = struct {
 
         // Main speculative decoding loop
         while (total_generated < gen_config.max_tokens) {
+            if (req.isCancelled()) break;
             // Try to propose draft tokens from context
             const draft_tokens = drafter.propose(context.items, max_draft_tokens, self.allocator);
 
@@ -1549,6 +1708,69 @@ pub const EngineLoop = struct {
         /// re-explore immediately instead of waiting for the next 1-in-16
         /// probe slot.
         force_explore: u32 = 0,
+        class_mem: [content_class.n_classes]ClassMemory = @splat(.{}),
+        active_class: content_class.ContentClass = .general,
+        /// Per-round acceptance ratios (k/n) of THIS request, for the
+        /// first-half/second-half trend written back at `finishRequest`.
+        round_acc: [64]f32 = @splat(0),
+        round_acc_len: usize = 0,
+
+        /// Cross-request content memory. Acceptance behaviour is a property
+        /// of the content CLASS, not the single request: code stays flat and
+        /// shallow-friendly, math starts bad and turns deep-friendly ~15
+        /// rounds in. The per-request evidence cannot know which regime it
+        /// is in until the explore decision is already behind it (see the
+        /// trend-gate postmortem at `trendGatingOff`), so a prompt
+        /// classifier (content_class.zig) keys a per-class memory that
+        /// (a) seeds p_i at request start, replacing the content-blind
+        /// Laplace prior, and (b) supplies the rising/flat verdict the
+        /// give-up ratios need at round 3, not round 15. A wrong class only
+        /// costs a weak prior: per-request evidence decays the seed away at
+        /// 0.9/round and `.general` requests neither read nor write memory.
+        /// Opt-in via DMLX_MTP_CLASS_MEMORY=1 until the A/B lands.
+        const ClassMemory = struct {
+            /// Requests folded in so far.
+            samples: u32 = 0,
+            /// EMA of the conditional acceptance p_i (1-based position i).
+            p: [max_depth]f32 = @splat(0.5),
+            /// EMA of (second-half acceptance) - (first-half acceptance)
+            /// within a request: positive means the class turns
+            /// deep-friendly as it goes (math), ~0 means flat (code/prose).
+            rising: f32 = 0,
+        };
+        /// Seed strength in rounds-equivalent: weak enough to be overridden
+        /// by ~10 rounds of live evidence, strong enough to inform the
+        /// explore early-exit at rounds 3-9.
+        const class_seed_weight: f32 = 3.0;
+        /// Minimum folded requests before the class verdict drives ratios.
+        const class_confident_default: u32 = 2;
+        fn classConfidentSamples() u32 {
+            const v = std.c.getenv("DMLX_MTP_CLASS_CONFIDENT") orelse
+                return class_confident_default;
+            return std.fmt.parseInt(u32, std.mem.span(v), 10) catch
+                class_confident_default;
+        }
+        /// |rising| above which a class counts as rising (deep-friendly late).
+        const class_rising_epsilon: f32 = 0.05;
+        /// EMA weight of the newest request in the memory update.
+        const class_mem_alpha: f32 = 0.5;
+        /// Requests shorter than this carry no reliable class signal.
+        const class_min_rounds: u64 = 6;
+
+        fn classMemoryOn() bool {
+            return std.c.getenv("DMLX_MTP_CLASS_MEMORY") != null;
+        }
+
+        /// The class memory's verdict on whether acceptance RISES over a
+        /// request, or null when there is no confident opinion (feature off,
+        /// general class, or too few samples). Callers fall back to the
+        /// in-request trend (or the loose default) on null.
+        fn classRising(self: *const MtpDepthController) ?bool {
+            if (!classMemoryOn()) return null;
+            const mem = &self.class_mem[@intFromEnum(self.active_class)];
+            if (mem.samples < classConfidentSamples()) return null;
+            return mem.rising > class_rising_epsilon;
+        }
         /// Per-round evidence decay (see reached/accepted). 0.9 swept best
         /// of {0.75, 0.85, 0.9} on the 4-domain thinking A/B (2026-11-03):
         /// slower decay keeps math/count phase recovery while damping the
@@ -1626,7 +1848,7 @@ pub const EngineLoop = struct {
         /// 4 of them calibrating was eating a third of the request.
         /// Acceptance IS content-dependent, so `p_i` starts fresh (it
         /// re-converges within a few rounds — every round updates p_1..p_k+1).
-        fn resetForRequest(self: *MtpDepthController) void {
+        fn resetForRequest(self: *MtpDepthController, class: content_class.ContentClass) void {
             self.reached = @splat(0);
             self.accepted = @splat(0);
             self.reached_slow = @splat(0);
@@ -1635,6 +1857,77 @@ pub const EngineLoop = struct {
             self.rounds = 0;
             self.force_explore = 0;
             self.last_pick = 0;
+            self.round_acc_len = 0;
+            self.active_class = if (classMemoryOn()) class else .general;
+            // Seed p_i from the class memory: the Laplace prior treats every
+            // prompt as identical, so the explore early-exit judges a code
+            // prompt's deep arm on three unlucky rounds and the math prompt's
+            // deep tail starts from 0.5 optimism. The class prior is what
+            // previous requests of this kind actually measured; the 0.9/round
+            // decay washes it out within ~10 rounds if it is wrong.
+            if (self.active_class != .general) {
+                const mem = &self.class_mem[@intFromEnum(self.active_class)];
+                if (mem.samples > 0) {
+                    for (0..max_depth) |i| {
+                        self.reached[i] = class_seed_weight;
+                        self.accepted[i] = class_seed_weight * mem.p[i];
+                        self.reached_slow[i] = class_seed_weight;
+                        self.accepted_slow[i] = class_seed_weight * mem.p[i];
+                    }
+                }
+                // Confident class: seat the incumbent at the class-optimal
+                // depth directly. Without this a flat class skips explore and
+                // then has to climb from depth 1 through the 10% hysteresis —
+                // count measured the failure: argmin wanted 7 (26.8 vs 29.9
+                // ms/tok) but the hysteresis threshold landed at 26.91 and
+                // the request parked at 3 for 24 of 30 rounds (-7.7%). The
+                // seeded score uses carried cost(n) + class p_i, i.e. exactly
+                // the information the explore rounds would have re-measured.
+                if (mem.samples >= classConfidentSamples()) {
+                    var best: usize = 0;
+                    var best_score: f64 = std.math.floatMax(f64);
+                    for (1..self.max_n + 1) |n| {
+                        const s = self.score(n) orelse continue;
+                        if (s < best_score) {
+                            best_score = s;
+                            best = n;
+                        }
+                    }
+                    self.last_pick = best;
+                }
+            }
+        }
+
+        /// Fold this request's evidence into its class memory. Called once
+        /// at the end of a completed MTP request (not on error paths).
+        fn finishRequest(self: *MtpDepthController) void {
+            if (!classMemoryOn()) return;
+            if (self.active_class == .general) return;
+            if (self.rounds < class_min_rounds) return;
+            const mem = &self.class_mem[@intFromEnum(self.active_class)];
+            const alpha: f32 = if (mem.samples == 0) 1.0 else class_mem_alpha;
+            // p_i: only positions with real evidence this request (a decayed
+            // `reached` below 1 was barely observed and is prior-dominated).
+            for (0..self.max_n) |i| {
+                const r = self.reached[i];
+                if (r < 2.0) continue;
+                const p_req = self.accepted[i] / r;
+                mem.p[i] = alpha * p_req + (1.0 - alpha) * mem.p[i];
+            }
+            // Trend: mean acceptance ratio of the second half of the rounds
+            // minus the first half. Positive = the content turned
+            // deep-friendly as it went (math); ~0 = flat (code/prose).
+            if (self.round_acc_len >= 4) {
+                const half = self.round_acc_len / 2;
+                var first: f32 = 0;
+                var second: f32 = 0;
+                for (self.round_acc[0..half]) |v| first += v;
+                for (self.round_acc[half..self.round_acc_len]) |v| second += v;
+                first /= @floatFromInt(half);
+                second /= @floatFromInt(self.round_acc_len - half);
+                mem.rising = alpha * (second - first) + (1.0 - alpha) * mem.rising;
+            }
+            mem.samples += 1;
         }
 
         /// Is acceptance at position `i` RISING rather than merely low?
@@ -1692,10 +1985,11 @@ pub const EngineLoop = struct {
             if (self.reached[rung - 1] < ladder_confident_floor) return true;
             const rung_score = self.score(rung) orelse return true;
             const inc_score = self.score(self.last_pick) orelse return true;
-            const ratio = if (trendGatingOff() or self.trendRising(rung))
-                ladderGiveUpRatio()
-            else
-                ladderGiveUpFlat();
+            // A confident class verdict beats the in-request trend: it is
+            // available at round 3 instead of round 15 (see classRising).
+            const rising = self.classRising() orelse
+                (trendGatingOff() or self.trendRising(rung));
+            const ratio = if (rising) ladderGiveUpRatio() else ladderGiveUpFlat();
             return rung_score <= inc_score * ratio;
         }
 
@@ -1740,7 +2034,17 @@ pub const EngineLoop = struct {
                 self.force_explore -= 1;
                 return self.max_n;
             }
-            if (self.used[self.max_n - 1] < exploreRounds()) {
+            // Confident-flat classes skip exploration entirely: the class
+            // memory already holds this content's p_i curve (seeded at
+            // reset), and the explore tax is the whole reason the memory
+            // exists — on code it is 9 forced deep rounds plus the probes
+            // they trigger, ~15 of ~45 rounds at depths the class has
+            // already proven worse. Only a FLAT verdict skips: a rising
+            // class (math) still needs the deep sampling, and an unknown
+            // class explores as before. Mid-request phase changes are still
+            // caught by the near-full-acceptance re-explore latch.
+            const class_skip_explore = if (self.classRising()) |rising| !rising else false;
+            if (!class_skip_explore and self.used[self.max_n - 1] < exploreRounds()) {
                 const deep_used = self.used[self.max_n - 1];
                 var keep_exploring = true;
                 // The early exit is what drops a request into the slow fixed
@@ -1763,10 +2067,9 @@ pub const EngineLoop = struct {
                                 if (s < alt) alt = s;
                             }
                         }
-                        const ratio = if (trendGatingOff() or self.trendRising(self.max_n))
-                            exploreGiveUpRatio()
-                        else
-                            exploreGiveUpFlat();
+                        const rising = self.classRising() orelse
+                            (trendGatingOff() or self.trendRising(self.max_n));
+                        const ratio = if (rising) exploreGiveUpRatio() else exploreGiveUpFlat();
                         if (found and deep_score > alt * ratio) keep_exploring = false;
                     }
                 }
@@ -1873,6 +2176,14 @@ pub const EngineLoop = struct {
             self.rounds +|= 1;
             if (n == 0 or n > max_depth) return;
             self.used[n - 1] +|= 1;
+            // Per-round acceptance ratio, for the class-memory trend written
+            // back at finishRequest. Ring is capped; a request longer than
+            // 64 rounds simply measures its trend on the first 64.
+            if (self.round_acc_len < self.round_acc.len) {
+                self.round_acc[self.round_acc_len] =
+                    @as(f32, @floatFromInt(k)) / @as(f32, @floatFromInt(n));
+                self.round_acc_len += 1;
+            }
             // The FIRST round of a request carries one-time per-request work
             // (drafter repriming over the prompt is lazy-evaluated into the
             // first draft phase: measured draft=31.9 ms on request 1 vs
@@ -2037,12 +2348,26 @@ pub const EngineLoop = struct {
         };
 
         // Prefill (resets backbone + drafter) → first token.
-        const pf = mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
+        const pf_t0: i128 = if (std.c.getenv("DMLX_PREFILL_TRACE") != null) monotonicNs() else 0;
+        const pf = if (req.vision) |vis| blk: {
+            const pv = mtp.prefillVision orelse {
+                req.completion.deliverError(self.io, "MTP: vision prompts not supported by this drafter");
+                return;
+            };
+            break :blk pv(self.model.ptr, req.prompt_tokens, vis) catch |err| {
+                std.log.err("EngineLoop: MTP vision prefill failed: {}", .{err});
+                req.completion.deliverError(self.io, "MTP: prefill failed");
+                return;
+            };
+        } else mtp.prefill(self.model.ptr, req.prompt_tokens) catch |err| {
             std.log.err("EngineLoop: MTP prefill failed: {}", .{err});
             req.completion.deliverError(self.io, "MTP: prefill failed");
             return;
         };
         defer pf.logits.deinit();
+        if (pf_t0 != 0) {
+            std.log.info("[PREFILL_TRACE] mtp req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
+        }
         var hidden = pf.hidden; // owned; reassigned per round
 
         var t_next = req.sampler.sample(pf.logits, allocator) catch {
@@ -2091,11 +2416,20 @@ pub const EngineLoop = struct {
 
         // Depth controller persists across requests (cost estimates are
         // hardware properties); only the acceptance evidence is per-request.
+        // With DMLX_MTP_CLASS_MEMORY the prompt is classified once so the
+        // controller can seed p_i and the give-up verdict from the
+        // cross-request memory of this content class.
+        const prompt_class: content_class.ContentClass = blk: {
+            if (std.c.getenv("DMLX_MTP_CLASS_MEMORY") == null) break :blk .general;
+            const prompt_text = self.tokenizer.decode(req.prompt_tokens, allocator) catch
+                break :blk .general;
+            defer allocator.free(prompt_text);
+            break :blk content_class.classify(prompt_text);
+        };
         if (self.mtp_depth == null or self.mtp_depth.?.max_n != @min(n_drafts, MtpDepthController.max_depth)) {
             self.mtp_depth = MtpDepthController.init(n_drafts);
-        } else {
-            self.mtp_depth.?.resetForRequest();
         }
+        self.mtp_depth.?.resetForRequest(prompt_class);
         const depth_ctl = &self.mtp_depth.?;
 
         // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
@@ -2113,6 +2447,9 @@ pub const EngineLoop = struct {
         var topk_hit8 = [_]u32{0} ** topk_depths;
 
         while (!stopped and total_generated < gen_config.max_tokens) {
+            // Client disconnect: truncate at the next round boundary instead
+            // of generating to max_tokens.
+            if (req.isCancelled()) break;
             // Depth for this round (flag value is the upper bound). Never
             // draft past max_tokens: a deeper chain than the remaining budget
             // is pure waste, since emission is capped anyway.
@@ -2123,6 +2460,10 @@ pub const EngineLoop = struct {
             // 1. Draft chain.
             var drafts = std.ArrayList(u32).empty;
             defer drafts.deinit(allocator);
+            // DMLX_MTP_AVTRACE: per-step (l_max, margin) features, aligned
+            // with `drafts` when the coarse head produced them.
+            var draft_feats = std.ArrayList([2]f32).empty;
+            defer draft_feats.deinit(allocator);
             var draft_logits = std.ArrayList(Array).empty;
             defer {
                 for (draft_logits.items) |l| l.deinit();
@@ -2142,6 +2483,11 @@ pub const EngineLoop = struct {
                     for (gpu_toks.items) |t2| t2.deinit();
                     gpu_toks.deinit(allocator);
                 }
+                var gpu_feats = std.ArrayList(Array).empty;
+                defer {
+                    for (gpu_feats.items) |f2| f2.deinit();
+                    gpu_feats.deinit(allocator);
+                }
                 const tok0 = array_mod.Array.fromData(allocator, i32, &[_]i32{@intCast(tok)}, &[_]i32{1}) catch {
                     draft_failed = true;
                     break :blk;
@@ -2157,6 +2503,11 @@ pub const EngineLoop = struct {
                     if (steps > 0) h_cur.deinit(); // previous chained hidden
                     steps += 1;
                     h_cur = g.hidden;
+                    if (g.feat) |f| {
+                        gpu_feats.append(allocator, f) catch {
+                            f.deinit();
+                        };
+                    }
                     gpu_toks.append(allocator, g.tok_gpu) catch {
                         g.tok_gpu.deinit();
                         draft_failed = true;
@@ -2183,6 +2534,19 @@ pub const EngineLoop = struct {
                         draft_failed = true;
                         break :blk;
                     };
+                    if (gpu_feats.items.len == gpu_toks.items.len) {
+                        if (shape_mod.concatenateAxis(self.ctx, gpu_feats.items, 0)) |fall| {
+                            defer fall.deinit();
+                            if (fall.eval()) |_| {
+                                if (fall.dataSlice(f32)) |fv| {
+                                    var fi: usize = 0;
+                                    while (fi + 1 < fv.len) : (fi += 2) {
+                                        draft_feats.append(allocator, .{ fv[fi], fv[fi + 1] }) catch break;
+                                    }
+                                } else |_| {}
+                            } else |_| {}
+                        } else |_| {}
+                    }
                 }
             } else for (0..n_round) |_| {
                 const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
@@ -2218,6 +2582,7 @@ pub const EngineLoop = struct {
                 std.log.warn("EngineLoop: MTP draft failed; finishing with plain decode", .{});
                 hidden.deinit();
                 while (total_generated < gen_config.max_tokens and !stopped) {
+                    if (req.isCancelled()) break;
                     const arr = array_mod.Array.fromData(allocator, u32, &[_]u32{t_next.token}, &[_]i32{ 1, 1 }) catch break;
                     const st = generation_mod.generateStep(self.model, arr, caches, &req.sampler, self.ctx) catch break;
                     t_next = st;
@@ -2357,6 +2722,29 @@ pub const EngineLoop = struct {
                     }
                 }
             }
+            // Acceptance labels for the AVTRACE features: positions before
+            // the first rejection are 1, the rejecting position is 0, and
+            // anything past it is unlabeled (same rule as vLLM AV fitting).
+            if (std.c.getenv("DMLX_MTP_AVTRACE")) |trace_path_z| {
+                if (draft_feats.items.len == drafts.items.len and drafts.items.len > 0) {
+                    const labeled: usize = if (rejected) @min(k + 1, drafts.items.len) else k;
+                    if (labeled > 0) {
+                        var buf: [160]u8 = undefined;
+                        const path = std.mem.span(trace_path_z);
+                        if (std.Io.Dir.cwd().createFile(self.io, path, .{ .truncate = false })) |f| {
+                            defer f.close(self.io);
+                            const size = if (f.stat(self.io)) |st| st.size else |_| 0;
+                            var off: u64 = size;
+                            for (0..labeled) |i| {
+                                const y: u8 = if (i < k) 1 else 0;
+                                const line = std.fmt.bufPrint(&buf, "{{\"pos\":{d},\"lmax\":{d:.4},\"margin\":{d:.4},\"y\":{d}}}\n", .{ i, draft_feats.items[i][0], draft_feats.items[i][1], y }) catch continue;
+                                f.writePositionalAll(self.io, line, off) catch break;
+                                off += line.len;
+                            }
+                        } else |_| {}
+                    }
+                }
+            }
             if (stop_in_drafts) {
                 // An accepted draft is a stop token: emit through it and end.
                 mtp.commit(self.model.ptr, vh, k + 1, vids.items);
@@ -2457,6 +2845,7 @@ pub const EngineLoop = struct {
         hidden.deinit();
 
         if (drafts_proposed > 0) {
+            metrics_mod.global.addMtpDrafts(@intCast(drafts_proposed), @intCast(drafts_accepted));
             const ms = struct {
                 fn f(ns: u64) f64 {
                     return @as(f64, @floatFromInt(ns)) / 1e6;
@@ -2536,6 +2925,14 @@ pub const EngineLoop = struct {
             });
         }
 
+        depth_ctl.finishRequest();
+        if (MtpDepthController.classMemoryOn()) {
+            std.log.info("[Engine] MTP class={s} samples={d}", .{
+                @tagName(depth_ctl.active_class),
+                depth_ctl.class_mem[@intFromEnum(depth_ctl.active_class)].samples,
+            });
+        }
+
         const generated_slice = context.items[req.prompt_tokens.len..];
         const text = self.tokenizer.decode(generated_slice, allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
@@ -2604,6 +3001,7 @@ pub const EngineLoop = struct {
             caches,
             self.ctx,
             self.allocator,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("EngineLoop: guided generation failed: {}", .{err});
             req.completion.deliverError(self.io, "Guided generation failed");
@@ -2656,8 +3054,10 @@ pub const EngineLoop = struct {
                 const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
                 ctx.token_count += 1;
 
-                // Decode token to text
-                const token_text = ctx.engine.tokenizer.decode(&[_]u32{token}, ctx.engine.allocator) catch "";
+                // Decode token to text via the request's incremental
+                // detokenizer (cumulative decode + diff), so concatenated
+                // deltas match the non-streaming decode byte-exactly.
+                const token_text = ctx.engine.streamTokenText(ctx.req, token, is_final);
                 defer if (token_text.len > 0) ctx.engine.allocator.free(token_text);
 
                 // Deliver token immediately via CompletionSignal.
@@ -2690,6 +3090,7 @@ pub const EngineLoop = struct {
             &stream_ctx,
             streamCallback,
             start_pos,
+            &req.cancel_requested,
         ) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
@@ -2723,7 +3124,7 @@ pub const EngineLoop = struct {
         };
 
         const start_pos = if (skip_prefill) req.prompt_tokens.len else null;
-        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream, start_pos) catch |err| {
+        const tokens = model.generate(req.prompt_tokens, req.max_tokens, &sampler, caches, self.stream, start_pos, &req.cancel_requested) catch |err| {
             std.log.err("EngineLoop: DSV4 generate failed: {}", .{err});
             req.completion.deliverError(self.io, "Generation failed");
             return;
@@ -2814,7 +3215,7 @@ pub const EngineLoop = struct {
                 self.allocator.free(caches);
             }
 
-            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null) catch {
+            const tokens = model.generate(prompt, 1, &sampler, caches, self.stream, null, null) catch {
                 std.log.warn("[Engine] Warmup {d}: generate failed", .{i});
                 continue;
             };
@@ -2962,6 +3363,7 @@ pub fn generateGuided(
     caches: []KVCacheStrategy,
     ctx: EagerContext,
     allocator: std.mem.Allocator,
+    cancel_flag: ?*const std.atomic.Value(bool),
 ) ![]u32 {
     var result = std.ArrayList(u32).empty;
     errdefer result.deinit(allocator);
@@ -3002,6 +3404,9 @@ pub fn generateGuided(
     // Autoregressive generation with guided masking
     var step: usize = 1;
     while (step < max_tokens and !decoder.isComplete()) : (step += 1) {
+        if (cancel_flag) |f| {
+            if (f.load(.acquire)) break;
+        }
         const input_token = result.items[result.items.len - 1];
         const input_arr = try array_mod.Array.fromData(
             allocator,

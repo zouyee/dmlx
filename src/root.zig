@@ -52,6 +52,7 @@ pub const tokenizer = @import("tokenizer.zig");
 pub const trainer = @import("trainer.zig");
 pub const generation = @import("generation.zig");
 pub const model_registry = @import("model_registry.zig");
+pub const vision_prompt = @import("vision_prompt.zig");
 pub const prompt_cache = @import("prompt_cache.zig");
 pub const server = @import("server.zig");
 pub const scheduler = @import("scheduler.zig");

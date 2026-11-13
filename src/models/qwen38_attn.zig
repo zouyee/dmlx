@@ -13,6 +13,7 @@ const creation = @import("mlx").creation;
 
 const closure_mod = @import("mlx").closure;
 const compile_mod = @import("mlx").compile;
+const eval_mod = @import("mlx").eval;
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const qmm_v8 = @import("qwen38_qmm_v8.zig");
@@ -206,6 +207,94 @@ pub const Qwen38AttnCache = struct {
     }
 };
 
+test "kvInplaceWrite: bf16 in-place slab append matches expected layout" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    if (kvInplaceDisabled()) {
+        // Force-enable for this test (the feature is opt-in by default).
+        kv_inplace_on = true;
+        kv_inplace_broken = false;
+        if (kvInplaceDisabled()) return error.SkipTest;
+    }
+    // The kernel mutates the slab asynchronously on the GPU stream; reads
+    // must be enqueued on the SAME stream to be ordered after the write
+    // (a CPU-stream ctx would race and read stale data).
+    const stream = c.c.mlx_default_gpu_stream_new();
+    const ctx = EagerContext.initWithStream(allocator, .{ .inner = stream });
+
+    const HKV: i32 = 2;
+    const D: i32 = 4;
+    const CAP: i32 = 8;
+    const slab = try creation.zeros(ctx, &[_]i32{ 1, HKV, CAP, D }, .bfloat16);
+    defer slab.deinit();
+
+    // rows1: [1, 2, 3, 4] with distinct values v = hk*100 + l*10 + d
+    var buf1: [2 * 3 * 4]f32 = undefined;
+    for (0..2) |hk| for (0..3) |l| for (0..4) |d| {
+        buf1[hk * 12 + l * 4 + d] = @floatFromInt(hk * 100 + l * 10 + d);
+    };
+    const r1f = try Array.fromData(allocator, f32, &buf1, &[_]i32{ 1, HKV, 3, D });
+    defer r1f.deinit();
+    const rows1 = try ops.astype(ctx, r1f, .bfloat16);
+    defer rows1.deinit();
+
+    try std.testing.expect(try kvInplaceWrite(ctx, slab, rows1, 2, 3, HKV, D));
+
+    // Interleave a dependent read between two writes to exercise ordering:
+    // read back slab[0, 1, 2..5, :] and check rows1's head-1 content landed.
+    {
+        const seg = try ops.slice(ctx, slab, &[_]i32{ 0, 1, 2, 0 }, &[_]i32{ 1, 2, 5, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer seg.deinit();
+        const segf = try ops.astype(ctx, seg, .float32);
+        defer segf.deinit();
+        try segf.eval();
+        const sv = try segf.dataSlice(f32);
+        // rows1[0, 1, 0..3, :] = [100..103, 110..113, 120..123]
+        try std.testing.expectApproxEqAbs(@as(f32, 100), sv[0], 1e-2);
+        try std.testing.expectApproxEqAbs(@as(f32, 123), sv[11], 1e-2);
+    }
+
+    var buf2: [2 * 2 * 4]f32 = undefined;
+    for (0..2) |hk| for (0..2) |l| for (0..4) |d| {
+        buf2[hk * 8 + l * 4 + d] = @floatFromInt(1000 + hk * 100 + l * 10 + d);
+    };
+    const r2f = try Array.fromData(allocator, f32, &buf2, &[_]i32{ 1, HKV, 2, D });
+    defer r2f.deinit();
+    const rows2 = try ops.astype(ctx, r2f, .bfloat16);
+    defer rows2.deinit();
+
+    try std.testing.expect(try kvInplaceWrite(ctx, slab, rows2, 5, 2, HKV, D));
+
+    // Read back exact regions.
+    const got1 = try ops.slice(ctx, slab, &[_]i32{ 0, 1, 3, 0 }, &[_]i32{ 1, 2, 4, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer got1.deinit();
+    const got32 = try ops.astype(ctx, got1, .float32);
+    defer got32.deinit();
+    try got32.eval();
+    // slab[0, 1, 3, :] == rows1[0, 1, 1, :] == [110, 111, 112, 113]
+    const g1 = try got32.dataSlice(f32);
+    try std.testing.expectApproxEqAbs(@as(f32, 110), g1[0], 1e-2);
+    try std.testing.expectApproxEqAbs(@as(f32, 113), g1[3], 1e-2);
+
+    const got2 = try ops.slice(ctx, slab, &[_]i32{ 0, 0, 5, 0 }, &[_]i32{ 1, 1, 6, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer got2.deinit();
+    const got2f = try ops.astype(ctx, got2, .float32);
+    defer got2f.deinit();
+    try got2f.eval();
+    const g2 = try got2f.dataSlice(f32);
+    try std.testing.expectApproxEqAbs(@as(f32, 1000), g2[0], 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1003), g2[3], 1.0);
+
+    // Untouched region stays zero.
+    const gotz = try ops.slice(ctx, slab, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, 1, 2, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer gotz.deinit();
+    const gotzf = try ops.astype(ctx, gotz, .float32);
+    defer gotzf.deinit();
+    try gotzf.eval();
+    const gz = try gotzf.dataSlice(f32);
+    for (gz) |v| try std.testing.expectEqual(@as(f32, 0), v);
+}
+
 test "Qwen38Attn.step: shapes, cache growth, determinism" {
     c.initErrorHandler();
     const allocator = std.testing.allocator;
@@ -224,7 +313,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     const x = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 16 });
     defer x.deinit();
 
-    const out1 = try attn.forward(x, &cache);
+    const out1 = try attn.forward(x, &cache, null);
     defer out1.deinit();
     try out1.eval();
     const oshape = out1.shape();
@@ -232,7 +321,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     try std.testing.expectEqual(@as(i32, 16), oshape[1]);
     try std.testing.expectEqual(@as(i32, 1), cache.len());
 
-    const out2 = try attn.forward(x, &cache);
+    const out2 = try attn.forward(x, &cache, null);
     defer out2.deinit();
     try out2.eval();
     try std.testing.expectEqual(@as(i32, 2), cache.len());
@@ -242,7 +331,7 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     defer attn2.deinit();
     var cache2 = Qwen38AttnCache{};
     defer cache2.deinit();
-    const out3 = try attn2.forward(x, &cache2);
+    const out3 = try attn2.forward(x, &cache2, null);
     defer out3.deinit();
     const diff = try ops.subtract(ctx, out1, out3);
     defer diff.deinit();
@@ -254,9 +343,129 @@ test "Qwen38Attn.step: shapes, cache growth, determinism" {
     try std.testing.expectEqual(@as(f32, 0.0), try max_diff.item(f32));
 }
 
+// ============================================================
+// In-place KV slab append (OPT-IN, DMLX_KV_INPLACE=1; default OFF)
+//
+// slice_update is functional: every append copies the whole slab
+// (2 x [HKV, cap, D] per layer per token — ~1 GB per token at 16K ctx
+// across 16 layers). This kernel writes only the new L rows into the
+// existing slab buffer instead. MEASURED NEUTRAL-TO-NEGATIVE at 16K MTP
+// (see kvInplaceDisabled): the functional copies overlap compute, so the
+// O(cap) write traffic is not on the critical path. The kernel remains
+// correct (bit-identical outputs) and is kept as the reference pattern
+// for eager in-place mutation: the Metal input arrives as `const device`
+// (const_cast is deliberate), and mlx_fast_metal_kernel_apply is LAZY —
+// the sentinel output must be asyncEval'd for the write to be enqueued.
+// Ordering rests on all custom kernels and MLX evals sharing the default
+// GPU stream (fusedStream()).
+// ============================================================
+
+const kv_inplace_body =
+    \\    const uint3 gid = thread_position_in_grid;
+    \\    const uint offset = params[0];
+    \\    const uint cap = params[1];
+    \\    const uint L = params[2];
+    \\    const uint D = params[3];
+    \\    device bfloat16_t* slab_w = const_cast<device bfloat16_t*>(slab);
+    \\    slab_w[(gid.z * cap + offset + gid.y) * D + gid.x] = rows[(gid.z * L + gid.y) * D + gid.x];
+    \\    if (gid.x == 0 and gid.y == 0 and gid.z == 0) sentinel[0] = 1.0f;
+;
+
+var kv_inplace_kernel: ?c.c.mlx_fast_metal_kernel = null;
+var kv_inplace_broken: bool = false;
+var kv_inplace_on: ?bool = null;
+
+/// OPT-IN (DMLX_KV_INPLACE=1, default OFF). Measured neutral-to-slightly-
+/// negative at 16K MTP (2026-11-11, scripts/ab_kvinplace_16k.sh: verify
+/// 157.1/109.3 vs 141.4/106.7 ms/round, wall 112.6/109.3 vs 110.9/108.8s,
+/// output text bit-identical): the slice_update slab copies overlap compute
+/// and are not on the critical path — bandwidth math does not translate to
+/// wall time here, at any context length (copy and SDPA both scale ~T).
+/// Kept as a reference implementation of eager in-place mutation via
+/// const_cast + sentinel asyncEval; do not extend without new evidence.
+fn kvInplaceDisabled() bool {
+    if (kv_inplace_on == null) {
+        kv_inplace_on = if (std.c.getenv("DMLX_KV_INPLACE")) |v| v[0] == '1' else false;
+    }
+    return !kv_inplace_on.?;
+}
+
+fn getKvInplaceKernel(allocator: std.mem.Allocator) ?c.c.mlx_fast_metal_kernel {
+    if (kv_inplace_broken) return null;
+    if (kv_inplace_kernel) |k| return k;
+    const name_z = allocator.dupeZ(u8, "dmlx_kv_inplace_append") catch return null;
+    defer allocator.free(name_z);
+    const src_z = allocator.dupeZ(u8, kv_inplace_body) catch return null;
+    defer allocator.free(src_z);
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+    const in_vec = qwen38_gdn.makeStringVec(allocator, &.{ "slab", "rows", "params" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in_vec);
+    const out_vec = qwen38_gdn.makeStringVec(allocator, &.{"sentinel"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out_vec);
+    const k = c.c.mlx_fast_metal_kernel_new(name_z.ptr, in_vec, out_vec, src_z.ptr, header_z.ptr, true, false);
+    kv_inplace_kernel = k;
+    return k;
+}
+
+var kv_inplace_logged: bool = false;
+
+/// Write rows [1, HKV, L, D] into slab [1, HKV, cap, D] at [.., off..off+L, :]
+/// without copying the slab. Returns false on any shape/dtype/layout
+/// mismatch (caller falls back to slice_update).
+fn kvInplaceWrite(ctx: EagerContext, slab: Array, rows: Array, off: i32, L: i32, HKV: i32, D: i32) !bool {
+    if (kvInplaceDisabled() or kv_inplace_broken) return false;
+    const dt = dtype_mod.Dtype.bfloat16;
+    if (slab.dtype() != dt or rows.dtype() != dt) return false;
+    const cap: i32 = @intCast(slab.shape()[2]);
+    if (!isContiguous4D(slab, 1, HKV, cap, D)) return false;
+    if (!isContiguous4D(rows, 1, HKV, L, D)) return false;
+    const kernel = getKvInplaceKernel(ctx.allocator) orelse return false;
+
+    const params = try Array.fromData(ctx.allocator, u32, &[_]u32{ @intCast(off), @intCast(cap), @intCast(L), @intCast(D) }, &[_]i32{4});
+    defer params.deinit();
+
+    const cfg = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(D), @intCast(L), @intCast(HKV)));
+    const tg: c_int = @min(D, 128);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]i32{1}, 1, c.c.MLX_FLOAT32));
+
+    const in_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in_vec);
+    for ([_]Array{ slab, rows, params }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in_vec, inp.inner));
+    }
+    var out_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out_vec, kernel, in_vec, cfg, qwen38_gdn.fusedStream())) catch |err| {
+        kv_inplace_broken = true;
+        sdpaDecodeWarn(err);
+        return false;
+    };
+    // mlx_fast_metal_kernel_apply is LAZY: the kernel only runs when the
+    // outputs are evaluated. Submit the sentinel (non-blocking) so the
+    // slab write is enqueued on the GPU stream now — subsequent reads of
+    // the slab on the same stream are ordered after it.
+    if (c.c.mlx_vector_array_size(out_vec) > 0) {
+        var h = c.c.mlx_array_new();
+        try c.check(c.c.mlx_vector_array_get(&h, out_vec, 0));
+        var sentinel = Array.fromHandle(h);
+        defer sentinel.deinit();
+        try eval_mod.asyncEval(ctx.allocator, &[_]Array{sentinel});
+    }
+    if (!kv_inplace_logged) {
+        kv_inplace_logged = true;
+        std.log.info("[kv-inplace] engaged (in-place slab append, no slice_update copy)", .{});
+    }
+    return true;
+}
+
 /// Slab cache write: grow capacity (doubling, 256-token granularity) if
-/// needed, then one slice_update per tensor at [len, len+L). sliceUpdate
-/// returns a new array; swap it in and free the old buffer. On failure
+/// needed, then write the new rows at [len, len+L) — in-place via
+/// kvInplaceWrite when possible (O(L), no copy), else one slice_update
+/// per tensor (functional, copies the whole slab). On failure
 /// the cache stays consistent because `len` only advances at the end.
 fn cacheAppend(ctx: EagerContext, cache: *Qwen38AttnCache, k_t: Array, v_t: Array, L: i32, HKV: i32, D: i32) !void {
     const needed: i32 = cache.len_ + L;
@@ -285,6 +494,27 @@ fn cacheAppend(ctx: EagerContext, cache: *Qwen38AttnCache, k_t: Array, v_t: Arra
             cache.keys = k_grown;
             cache.values = v_grown;
         }
+    }
+    // In-place slab write: O(L) instead of the O(cap) slice_update copy.
+    // Rows that are not contiguous get a cheap same-shape copy first
+    // (rope/transposed views; at most [HKV, L, D]).
+    var k_owned: ?Array = null;
+    defer if (k_owned) |*o| o.deinit();
+    var v_owned: ?Array = null;
+    defer if (v_owned) |*o| o.deinit();
+    const k_c = if (isContiguous4D(k_t, 1, HKV, L, D)) k_t else blk: {
+        k_owned = try ops.copy(ctx, k_t);
+        break :blk k_owned.?;
+    };
+    const v_c = if (isContiguous4D(v_t, 1, HKV, L, D)) v_t else blk: {
+        v_owned = try ops.copy(ctx, v_t);
+        break :blk v_owned.?;
+    };
+    if (try kvInplaceWrite(ctx, cache.keys.?, k_c, cache.len_, L, HKV, D) and
+        try kvInplaceWrite(ctx, cache.values.?, v_c, cache.len_, L, HKV, D))
+    {
+        cache.len_ = needed;
+        return;
     }
     const start = &[_]i32{ 0, 0, cache.len_, 0 };
     const stop = &[_]i32{ 1, HKV, needed, D };
@@ -930,6 +1160,408 @@ fn sdpaDecodeFused(
     return Array.fromHandle(out_handle);
 }
 
+// Verify-width split-KV SDPA (L = 2..8 rows) — port of omlx
+// patches/qwen35_verify_sdpa_split.py `_wide_causal_sdpa` (Apache-2.0, tile
+// design adapted there from Splash paged_attention_tile.h). Hardcoded to the
+// Qwen3.8 dense layout: D=256, H=24, HKV=4, 8 padded rows, bf16.
+//
+// Why: stock scaled_dot_product_attention routes this shape (L*GQA = 48 > the
+// vector kernel's 32-row budget) to the composed unfused path, which at 16K
+// context costs ~100-110 ms of a ~190 ms verify round (measured with
+// DMLX_VERIFY_NO_ATTN_CORE=1, 2026-11-07). Here one threadgroup per (q head,
+// key split) holds all 8 rows: 4 simdgroups own 64 head dims each, partial
+// scores meet in threadgroup memory once per 32-key block, online softmax
+// runs 16 threads per row, and a second launch merges the splits with the
+// log-sum-exp pairs. Causal: row r attends keys <= kv_len - L + r (the same
+// bottom-right alignment stock "causal" gives this shape).
+const sdpa_verify_partial_body =
+    \\    constexpr int D = 256;
+    \\    constexpr int BK = 32;
+    \\    constexpr int SS = 36;   // padded partial-S row stride (floats)
+    \\    constexpr int PS = 40;   // padded P row stride (bf16)
+    \\    uint tid = thread_position_in_threadgroup.x;
+    \\    uint sg = tid / 32;
+    \\    uint lane = tid % 32;
+    \\    int qh = int(threadgroup_position_in_grid.x);
+    \\    int split = int(threadgroup_position_in_grid.y);
+    \\    int h = qh / 6;          // GQA factor 6: kv head = q head / 6
+    \\    int T = int(params[0]);
+    \\    int L = int(params[1]);
+    \\    int chunk = int(params[2]);
+    \\    float scale = as_type<float>(params[4]);
+    \\    int t_begin = split * chunk;
+    \\    int t_end = min(t_begin + chunk, T);
+    \\    const int khs = k_head_stride_in[0];
+    \\    const int kss = k_seq_stride_in[0];
+    \\    const int vhs = v_head_stride_in[0];
+    \\    const int vss = v_seq_stride_in[0];
+    \\
+    \\    threadgroup float Sp[4 * 8 * SS];
+    \\    threadgroup bfloat16_t P[8 * PS];
+    \\    threadgroup float st_m[8];
+    \\    threadgroup float st_l[8];
+    \\    threadgroup float st_a[8];
+    \\
+    \\    const device bfloat16_t* qp = q + qh * 8 * D + int(sg) * 64;
+    \\    simdgroup_matrix<bfloat16_t, 8, 8> qa[8];
+    \\    for (int dk = 0; dk < 8; ++dk)
+    \\        simdgroup_load(qa[dk], qp + dk * 8, D);
+    \\    const device bfloat16_t* kh = k + h * khs + int(sg) * 64;
+    \\    const device bfloat16_t* vh = v + h * vhs + int(sg) * 64;
+    \\
+    \\    simdgroup_matrix<float, 8, 8> o[8];
+    \\    for (int j = 0; j < 8; ++j) o[j] = simdgroup_matrix<float, 8, 8>(0.0f);
+    \\    if (tid < 8) {
+    \\        st_m[tid] = -INFINITY;
+    \\        st_l[tid] = 0.0f;
+    \\    }
+    \\    short qid = short(lane / 4);
+    \\    short fm = (qid & 4) + short((lane / 2) % 4);
+    \\
+    \\    for (int t0 = t_begin; t0 < t_end; t0 += BK) {
+    \\        for (int c = 0; c < 4; ++c) {
+    \\            int ts = min(t0 + c * 8, T - 8);
+    \\            simdgroup_matrix<float, 8, 8> s = simdgroup_matrix<float, 8, 8>(0.0f);
+    \\            for (int dk = 0; dk < 8; ++dk) {
+    \\                simdgroup_matrix<bfloat16_t, 8, 8> kb;
+    \\                simdgroup_load(kb, kh + ts * kss + dk * 8, kss, ulong2(0, 0), true);
+    \\                simdgroup_multiply_accumulate(s, qa[dk], kb, s);
+    \\            }
+    \\            simdgroup_store(s, Sp + int(sg) * 8 * SS + c * 8, SS);
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\        {
+    \\            int r = int(tid) / 16;
+    \\            int cp = (int(tid) % 16) * 2;
+    \\            float sv[2];
+    \\            float rmax = -INFINITY;
+    \\            for (int e = 0; e < 2; ++e) {
+    \\                int col = cp + e;
+    \\                int c = col / 8;
+    \\                int base = t0 + c * 8;
+    \\                int key = min(base, T - 8) + (col - c * 8);
+    \\                bool ok = r < L && key >= base && key < t_end && key <= T - L + r;
+    \\                float val = Sp[r * SS + col] + Sp[8 * SS + r * SS + col]
+    \\                    + Sp[16 * SS + r * SS + col] + Sp[24 * SS + r * SS + col];
+    \\                sv[e] = ok ? val * scale : -INFINITY;
+    \\                rmax = max(rmax, sv[e]);
+    \\            }
+    \\            for (int off = 1; off < 16; off <<= 1)
+    \\                rmax = max(rmax, simd_shuffle_xor(rmax, ushort(off)));
+    \\            float m_old = st_m[r];
+    \\            float m_new = max(m_old, rmax);
+    \\            float rsum = 0.0f;
+    \\            for (int e = 0; e < 2; ++e) {
+    \\                float p = m_new == -INFINITY ? 0.0f : exp(sv[e] - m_new);
+    \\                rsum += p;
+    \\                P[r * PS + cp + e] = bfloat16_t(p);
+    \\            }
+    \\            for (int off = 1; off < 16; off <<= 1)
+    \\                rsum += simd_shuffle_xor(rsum, ushort(off));
+    \\            threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\            if ((tid % 16) == 0) {
+    \\                float alpha = m_new == -INFINITY ? 1.0f : exp(m_old - m_new);
+    \\                st_a[r] = alpha;
+    \\                st_l[r] = st_l[r] * alpha + rsum;
+    \\                st_m[r] = m_new;
+    \\            }
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\        float alpha = st_a[fm];
+    \\        for (int j = 0; j < 8; ++j) {
+    \\            o[j].thread_elements()[0] *= alpha;
+    \\            o[j].thread_elements()[1] *= alpha;
+    \\        }
+    \\        for (int kt = 0; kt < 4; ++kt) {
+    \\            simdgroup_matrix<bfloat16_t, 8, 8> pa;
+    \\            simdgroup_load(pa, P + kt * 8, PS);
+    \\            int ts = min(t0 + kt * 8, T - 8);
+    \\            simdgroup_matrix<bfloat16_t, 8, 8> vb[8];
+    \\            for (int j = 0; j < 8; ++j)
+    \\                simdgroup_load(vb[j], vh + ts * vss + j * 8, vss);
+    \\            for (int j = 0; j < 8; ++j)
+    \\                simdgroup_multiply_accumulate(o[j], pa, vb[j], o[j]);
+    \\        }
+    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\    }
+    \\
+    \\    device float* ob = o_part + ((split * 24 + qh) * 8) * D + int(sg) * 64;
+    \\    for (int j = 0; j < 8; ++j)
+    \\        simdgroup_store(o[j], ob + j * 8, D);
+    \\    if (tid < 8) {
+    \\        ml_part[((split * 24 + qh) * 8 + int(tid)) * 2] = st_m[tid];
+    \\        ml_part[((split * 24 + qh) * 8 + int(tid)) * 2 + 1] = st_l[tid];
+    \\    }
+;
+
+const sdpa_verify_combine_body =
+    \\    constexpr int D = 256;
+    \\    uint d = thread_position_in_threadgroup.x;
+    \\    int r = int(threadgroup_position_in_grid.x);
+    \\    int qh = int(threadgroup_position_in_grid.y);
+    \\    int L = int(params[1]);
+    \\    int n_splits = int(params[3]);
+    \\    float M = -INFINITY;
+    \\    for (int s = 0; s < n_splits; ++s)
+    \\        M = max(M, ml_part[((s * 24 + qh) * 8 + r) * 2]);
+    \\    float total = 0.0f, acc = 0.0f;
+    \\    for (int s = 0; s < n_splits; ++s) {
+    \\        int idx = (s * 24 + qh) * 8 + r;
+    \\        float m = ml_part[idx * 2];
+    \\        if (m == -INFINITY) continue;
+    \\        float w = exp(m - M);
+    \\        total += w * ml_part[idx * 2 + 1];
+    \\        acc += w * o_part[idx * D + d];
+    \\    }
+    \\    out[(qh * L + r) * D + d] = bfloat16_t(acc / total);
+;
+
+const SdpaVerifyEntry = struct {
+    kernel1: c.c.mlx_fast_metal_kernel,
+    kernel2: c.c.mlx_fast_metal_kernel,
+    broken: bool = false,
+};
+
+var sdpa_verify_entry: ?SdpaVerifyEntry = null;
+var sdpa_verify_off: ?bool = null;
+var sdpa_verify_gate_logged: u32 = 0;
+pub var sdpa_verify_applies: u64 = 0;
+
+/// One-shot observability: which gate rejected the split kernel (or that it
+/// engaged). Bit-coded so each reason logs once per process.
+fn sdpaVerifyGateLog(bit: u32, msg: []const u8) void {
+    if (sdpa_verify_gate_logged & bit != 0) return;
+    sdpa_verify_gate_logged |= bit;
+    std.log.info("[verify-split] {s}", .{msg});
+}
+
+/// Escape hatch / A/B toggle: DMLX_VERIFY_SDPA_SPLIT=0 forces stock SDPA.
+fn sdpaVerifySplitDisabled() bool {
+    if (sdpa_verify_off == null) {
+        sdpa_verify_off = if (std.c.getenv("DMLX_VERIFY_SDPA_SPLIT")) |v| v[0] == '0' else false;
+    }
+    return sdpa_verify_off.?;
+}
+
+fn getSdpaVerifyKernels(allocator: std.mem.Allocator) ?*SdpaVerifyEntry {
+    if (sdpa_verify_entry) |*e| return if (e.broken) null else e;
+    const header_z = allocator.dupeZ(u8, "") catch return null;
+    defer allocator.free(header_z);
+
+    const name1_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_partial") catch return null;
+    defer allocator.free(name1_z);
+    const src1_z = allocator.dupeZ(u8, sdpa_verify_partial_body) catch return null;
+    defer allocator.free(src1_z);
+    const in1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "q", "k", "v", "params", "k_head_stride_in", "k_seq_stride_in", "v_head_stride_in", "v_seq_stride_in" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in1_vec);
+    const out1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "o_part", "ml_part" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out1_vec);
+    const k1 = c.c.mlx_fast_metal_kernel_new(name1_z.ptr, in1_vec, out1_vec, src1_z.ptr, header_z.ptr, true, false);
+    // mlx returns null-ish handle on compile failure; validated on first apply.
+
+    const name2_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_combine") catch return null;
+    defer allocator.free(name2_z);
+    const src2_z = allocator.dupeZ(u8, sdpa_verify_combine_body) catch return null;
+    defer allocator.free(src2_z);
+    const in2_vec = qwen38_gdn.makeStringVec(allocator, &.{ "o_part", "ml_part", "params" }) catch return null;
+    defer _ = c.c.mlx_vector_string_free(in2_vec);
+    const out2_vec = qwen38_gdn.makeStringVec(allocator, &.{"out"}) catch return null;
+    defer _ = c.c.mlx_vector_string_free(out2_vec);
+    const k2 = c.c.mlx_fast_metal_kernel_new(name2_z.ptr, in2_vec, out2_vec, src2_z.ptr, header_z.ptr, true, false);
+
+    sdpa_verify_entry = .{ .kernel1 = k1, .kernel2 = k2 };
+    return &sdpa_verify_entry.?;
+}
+
+/// Split-KV causal SDPA for the verify block: q_pad [1, H, 8, D] bf16
+/// (L valid rows), k/v the contiguous slabs [1, HKV, cap, D]. Returns
+/// [1, H, L, D] bf16, or null when the shape is unsupported / kernel broken.
+fn sdpaVerifySplit(
+    ctx: EagerContext,
+    q_t: Array, // [1, H, L, D] bf16 contiguous
+    k: Array,
+    v: Array,
+    scale: f32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    l: i32,
+    kv_len: i32,
+) !?Array {
+    if (sdpaVerifySplitDisabled()) return null;
+    // Hardcoded kernel layout: D=256, GQA=6, H=24, padded to 8 rows.
+    if (d != 256 or h != 24 or hkv != 4 or l < 2 or l > 8) {
+        sdpaVerifyGateLog(1, "shape gate (d/h/hkv/l)");
+        return null;
+    }
+    const dt = dtype_mod.Dtype.bfloat16;
+    if (q_t.dtype() != dt or k.dtype() != dt or v.dtype() != dt) {
+        sdpaVerifyGateLog(2, "dtype gate");
+        return null;
+    }
+    const cap: i32 = @intCast(k.shape()[2]);
+    if (!isContiguous4D(q_t, 1, h, l, d)) {
+        sdpaVerifyGateLog(4, "q not contiguous");
+        return null;
+    }
+    if (!isContiguous4D(k, 1, hkv, cap, d) or !isContiguous4D(v, 1, hkv, cap, d)) {
+        sdpaVerifyGateLog(8, "kv slab not contiguous");
+        return null;
+    }
+    const entry = getSdpaVerifyKernels(ctx.allocator) orelse {
+        sdpaVerifyGateLog(16, "kernel compile failed");
+        return null;
+    };
+    sdpaVerifyGateLog(128, "engaged");
+
+    // Pad rows L..8 with zeros (garbage rows are masked/discarded).
+    var q8 = q_t;
+    var q8_owned = false;
+    var pad: ?Array = null;
+    defer if (pad) |p| p.deinit();
+    if (l < 8) {
+        pad = try array_mod.zeros(ctx.allocator, &[_]i32{ 1, h, 8 - l, d }, dt);
+        var cat_parts = [_]Array{ q_t, pad.? };
+        q8 = try shape_mod.concatenateAxis(ctx, &cat_parts, 2);
+        q8_owned = true;
+    }
+    defer if (q8_owned) q8.deinit();
+
+    // Chunk heuristic from omlx (M3 Ultra tuned): ~16 splits per head,
+    // 32-aligned, clamped [512, 2048]; very long caches use 512-key splits.
+    var chunk: i32 = @min(2048, @max(512, @divTrunc(@divTrunc(kv_len + 15, 16) + 31, 32) * 32));
+    if (kv_len > 32768) chunk = 512;
+    const n_splits: i32 = @divTrunc(kv_len + chunk - 1, chunk);
+
+    const params = try Array.fromData(ctx.allocator, u32, &[_]u32{
+        @intCast(kv_len),
+        @intCast(l),
+        @intCast(chunk),
+        @intCast(n_splits),
+        @bitCast(scale),
+    }, &[_]i32{5});
+    defer params.deinit();
+    const khs = try makeI32Scalar(ctx.allocator, cap * d);
+    defer khs.deinit();
+    const kss = try makeI32Scalar(ctx.allocator, d);
+    defer kss.deinit();
+    const vhs = try makeI32Scalar(ctx.allocator, cap * d);
+    defer vhs.deinit();
+    const vss = try makeI32Scalar(ctx.allocator, d);
+    defer vss.deinit();
+
+    // Pass 1: one 128-thread group per (q head, key split).
+    const cfg1 = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg1);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg1, h * 128, n_splits, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg1, 128, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg1, &[_]i32{ n_splits, h, 8, d }, 4, c.c.MLX_FLOAT32));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg1, &[_]i32{ n_splits, h, 8, 2 }, 4, c.c.MLX_FLOAT32));
+
+    const in1_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in1_vec);
+    for ([_]Array{ q8, k, v, params, khs, kss, vhs, vss }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in1_vec, inp.inner));
+    }
+    var out1_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out1_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out1_vec, entry.kernel1, in1_vec, cfg1, qwen38_gdn.fusedStream())) catch |err| {
+        sdpa_verify_entry.?.broken = true;
+        sdpaDecodeWarn(err);
+        return null;
+    };
+
+    var o_part_h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&o_part_h, out1_vec, 0));
+    var ml_part_h = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&ml_part_h, out1_vec, 1));
+    const o_part = Array.fromHandle(o_part_h);
+    defer o_part.deinit();
+    const ml_part = Array.fromHandle(ml_part_h);
+    defer ml_part.deinit();
+
+    // Pass 2: LSE merge over splits, one 256-thread group per (row, q head).
+    const cfg2 = c.c.mlx_fast_metal_kernel_config_new();
+    defer c.c.mlx_fast_metal_kernel_config_free(cfg2);
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_grid(cfg2, l * 256, h, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_set_thread_group(cfg2, 256, 1, 1));
+    try c.check(c.c.mlx_fast_metal_kernel_config_add_output_arg(cfg2, &[_]i32{ 1, h, l, d }, 4, c.c.MLX_BFLOAT16));
+
+    const in2_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(in2_vec);
+    for ([_]Array{ o_part, ml_part, params }) |inp| {
+        try c.check(c.c.mlx_vector_array_append_value(in2_vec, inp.inner));
+    }
+    var out2_vec = c.c.mlx_vector_array_new();
+    defer _ = c.c.mlx_vector_array_free(out2_vec);
+    c.check(c.c.mlx_fast_metal_kernel_apply(&out2_vec, entry.kernel2, in2_vec, cfg2, qwen38_gdn.fusedStream())) catch |err| {
+        sdpa_verify_entry.?.broken = true;
+        sdpaDecodeWarn(err);
+        return null;
+    };
+
+    var out_handle = c.c.mlx_array_new();
+    try c.check(c.c.mlx_vector_array_get(&out_handle, out2_vec, 0));
+    sdpa_verify_applies += 1;
+    return Array.fromHandle(out_handle);
+}
+
+/// Precomputed MRoPE tables for one vision prefill: cos/sin [1, 1, L, RD]
+/// f32 in rotate-half (half-split) layout — cos[t, j] for j < RD/2 pairs dim
+/// j with dim j + RD/2, and the second half repeats the first. Built on the
+/// host from computePositionIds + the interleaved position selector.
+pub const MropeApply = struct {
+    cos: Array,
+    sin: Array,
+
+    pub fn deinit(self: *MropeApply) void {
+        self.cos.deinit();
+        self.sin.deinit();
+    }
+};
+
+/// Explicit cos/sin rotary on the first RD dims of x [1, H, L, D]; the
+/// remaining dims pass through. Mirrors mlx_vlm's
+/// `_apply_interleaved_rotary_pos_emb_axis1` with half-split pairing
+/// (rotate_half), computed in f32 and cast back to x's dtype.
+fn applyMropeCosSin(ctx: EagerContext, x: Array, mr: MropeApply) !Array {
+    const sh = x.shape();
+    const H = sh[1];
+    const L = sh[2];
+    const D = sh[3];
+    const rd: i32 = mr.cos.shape()[3];
+    const half = @divExact(rd, 2);
+
+    const x_rot = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, H, L, rd }, &[_]i32{ 1, 1, 1, 1 });
+    defer x_rot.deinit();
+    const x_f32 = try ops.astype(ctx, x_rot, .float32);
+    defer x_f32.deinit();
+    // rotate_half: [-x[half:], x[:half]]
+    const x1 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, H, L, half }, &[_]i32{ 1, 1, 1, 1 });
+    defer x1.deinit();
+    const x2 = try ops.slice(ctx, x_f32, &[_]i32{ 0, 0, 0, half }, &[_]i32{ 1, H, L, rd }, &[_]i32{ 1, 1, 1, 1 });
+    defer x2.deinit();
+    const neg2 = try ops.negative(ctx, x2);
+    defer neg2.deinit();
+    const rot = try shape_mod.concatenateAxis(ctx, &[_]Array{ neg2, x1 }, 3);
+    defer rot.deinit();
+    // x * cos + rotate_half(x) * sin; cos/sin [1, 1, L, RD] broadcast over H.
+    const p1 = try ops.multiply(ctx, x_f32, mr.cos);
+    defer p1.deinit();
+    const p2 = try ops.multiply(ctx, rot, mr.sin);
+    defer p2.deinit();
+    const emb = try ops.add(ctx, p1, p2);
+    defer emb.deinit();
+    const emb_x = try ops.astype(ctx, emb, x.dtype());
+    defer emb_x.deinit();
+    if (rd == D) return ops.copy(ctx, emb_x);
+    const x_pass = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0, rd }, &[_]i32{ 1, H, L, D }, &[_]i32{ 1, 1, 1, 1 });
+    defer x_pass.deinit();
+    return shape_mod.concatenateAxis(ctx, &[_]Array{ emb_x, x_pass }, 3);
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -940,6 +1572,10 @@ pub const Qwen38Attn = struct {
     rope_theta: f32,
     rms_norm_eps: f32,
     output_gate: bool = true,
+    /// Extra rope offset added to cache.len() on every rope application —
+    /// the MRoPE rope_delta left over by a vision prefill (0 on the text
+    /// path; set/cleared by Qwen38ServingModel).
+    rope_extra: i32 = 0,
 
     // q_proj packs per-head [q head_dim | gate head_dim]: out = H * 2 * D.
     q_proj: Array,
@@ -1003,7 +1639,10 @@ pub const Qwen38Attn = struct {
 
     /// x: [1, hidden] single token OR [1, L, hidden] prefill.
     /// Returns the same leading shape with hidden last dim. Advances cache.
-    pub fn forward(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache) !Array {
+    /// `mrope` (prefill only) replaces the scalar-offset fast.rope with
+    /// explicit per-position cos/sin tables (vision MRoPE); null keeps the
+    /// text path byte-identical.
+    pub fn forward(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache, mrope: ?MropeApply) !Array {
         const ctx = self.ctx;
         const H: i32 = @intCast(self.num_heads);
         const HKV: i32 = @intCast(self.num_kv_heads);
@@ -1011,7 +1650,7 @@ pub const Qwen38Attn = struct {
         const xshape = x.shape();
         const prefill = xshape.len == 3;
         const L: i32 = if (prefill) xshape[1] else 1;
-        const offset: i32 = cache.len();
+        const offset: i32 = cache.len() + self.rope_extra;
 
         // Decode (L=1): shared pre-cache segment (ropeDynamic — numerically
         // equal to static rope, verified by unit test) + eager remainder.
@@ -1104,9 +1743,15 @@ pub const Qwen38Attn = struct {
         defer v_t.deinit();
 
         const rd: i32 = @intCast(self.rotary_dims);
-        const q_t = try fast_mod.rope(ctx, q_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        const q_t = if (mrope) |mr|
+            try applyMropeCosSin(ctx, q_t0, mr)
+        else
+            try fast_mod.rope(ctx, q_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer q_t.deinit();
-        const k_t = try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
+        const k_t = if (mrope) |mr|
+            try applyMropeCosSin(ctx, k_t0, mr)
+        else
+            try fast_mod.rope(ctx, k_t0, rd, false, self.rope_theta, 1.0, offset, null);
         defer k_t.deinit();
 
         // DIAGNOSTIC ONLY (`DMLX_VERIFY_NO_ATTN_CORE=1`): price the
@@ -1160,16 +1805,20 @@ pub const Qwen38Attn = struct {
         defer v_view.deinit();
 
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn = try fast_mod.scaledDotProductAttention(
-            ctx,
-            q_t,
-            k_view,
-            v_view,
-            scale,
-            "causal",
-            null,
-            null,
-        );
+        // Verify-width split-KV (FlashDecoding-style): one threadgroup per
+        // (q head, key split) holds all rows; stock composed SDPA is the
+        // fallback for shapes the kernel does not cover.
+        const attn = (try sdpaVerifySplit(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, L, kv_len)) orelse
+            try fast_mod.scaledDotProductAttention(
+                ctx,
+                q_t,
+                k_view,
+                v_view,
+                scale,
+                "causal",
+                null,
+                null,
+            );
         defer attn.deinit(); // [1, H, L, D]
 
         // Back to [1, L, H*D].
@@ -1342,7 +1991,7 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     const x = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
     defer x.deinit();
 
-    const out = try attn.forward(x, &cache);
+    const out = try attn.forward(x, &cache, null);
     defer out.deinit();
     try out.eval();
     const oshape = out.shape();
@@ -1358,13 +2007,123 @@ test "Qwen38Attn.prefill: [1,3,hidden] forward, cache growth, decode after prefi
     }
     const xt = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 16 });
     defer xt.deinit();
-    const out_t = try attn.forward(xt, &cache);
+    const out_t = try attn.forward(xt, &cache, null);
     defer out_t.deinit();
     try out_t.eval();
     const tshape = out_t.shape();
     try std.testing.expectEqual(@as(i32, 1), tshape[0]);
     try std.testing.expectEqual(@as(i32, 16), tshape[1]);
     try std.testing.expectEqual(@as(i32, 4), cache.len());
+}
+
+test "Qwen38Attn mrope: explicit cos/sin matches fast.rope on text positions" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Toy module: rotary_dims=2, head_dim=8, theta=1e4 → one freq slot,
+    // inv_freq = theta^0 = 1, so angle = position. cos/sin [1, 1, L, 2] in
+    // half-split layout ([c, c]).
+    var buf: [48]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+
+    var attn_ref = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_ref.deinit();
+    var cache_ref = Qwen38AttnCache{};
+    defer cache_ref.deinit();
+    const x1 = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer x1.deinit();
+    const out_ref = try attn_ref.forward(x1, &cache_ref, null);
+    defer out_ref.deinit();
+
+    var attn_m = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_m.deinit();
+    var cache_m = Qwen38AttnCache{};
+    defer cache_m.deinit();
+    var cos_buf: [6]f32 = undefined;
+    var sin_buf: [6]f32 = undefined;
+    for (0..3) |t| {
+        const p: f32 = @floatFromInt(t);
+        cos_buf[t * 2] = @cos(p);
+        cos_buf[t * 2 + 1] = @cos(p);
+        sin_buf[t * 2] = @sin(p);
+        sin_buf[t * 2 + 1] = @sin(p);
+    }
+    const cos_arr = try Array.fromData(allocator, f32, &cos_buf, &[_]i32{ 1, 1, 3, 2 });
+    defer cos_arr.deinit();
+    const sin_arr = try Array.fromData(allocator, f32, &sin_buf, &[_]i32{ 1, 1, 3, 2 });
+    defer sin_arr.deinit();
+    const x2 = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer x2.deinit();
+    const out_m = try attn_m.forward(x2, &cache_m, .{ .cos = cos_arr, .sin = sin_arr });
+    defer out_m.deinit();
+
+    const a32 = try ops.astype(ctx, out_ref, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, out_m, .float32);
+    defer b32.deinit();
+    const exp = try a32.dataSlice(f32);
+    const got = try b32.dataSlice(f32);
+    for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2);
+}
+
+test "Qwen38Attn rope_extra: decode offset shifts by delta (explicit cos/sin reference)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    var buf: [48]f32 = undefined;
+    for (&buf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+    var tok: [16]f32 = undefined;
+    for (&tok, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11) - 5)) * 0.1;
+    }
+
+    // Model A: prefill 3, then decode with rope_extra = 5 → rope offset 8.
+    var attn_a = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_a.deinit();
+    var cache_a = Qwen38AttnCache{};
+    defer cache_a.deinit();
+    const xa = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer xa.deinit();
+    const pre_a = try attn_a.forward(xa, &cache_a, null);
+    defer pre_a.deinit();
+    attn_a.rope_extra = 5;
+    const xt_a = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 16 });
+    defer xt_a.deinit();
+    const out_a = try attn_a.forward(xt_a, &cache_a, null);
+    defer out_a.deinit();
+
+    // Model B: same prefill, then a 1-row prefill carrying explicit cos/sin
+    // for position 8 — an independent rope implementation as reference.
+    var attn_b = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_b.deinit();
+    var cache_b = Qwen38AttnCache{};
+    defer cache_b.deinit();
+    const xb = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, 3, 16 });
+    defer xb.deinit();
+    const pre_b = try attn_b.forward(xb, &cache_b, null);
+    defer pre_b.deinit();
+    const cos_arr = try Array.fromData(allocator, f32, &[_]f32{ @cos(8.0), @cos(8.0) }, &[_]i32{ 1, 1, 1, 2 });
+    defer cos_arr.deinit();
+    const sin_arr = try Array.fromData(allocator, f32, &[_]f32{ @sin(8.0), @sin(8.0) }, &[_]i32{ 1, 1, 1, 2 });
+    defer sin_arr.deinit();
+    const xt_b = try Array.fromData(allocator, f32, &tok, &[_]i32{ 1, 1, 16 });
+    defer xt_b.deinit();
+    const out_b = try attn_b.forward(xt_b, &cache_b, .{ .cos = cos_arr, .sin = sin_arr });
+    defer out_b.deinit();
+
+    const a32 = try ops.astype(ctx, out_a, .float32);
+    defer a32.deinit();
+    const b32 = try ops.astype(ctx, out_b, .float32);
+    defer b32.deinit();
+    const got = try a32.dataSlice(f32);
+    const exp = try b32.dataSlice(f32);
+    for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 2e-2);
 }
 
 test "Qwen38Attn fused decode SDPA matches stock SDPA" {
@@ -1474,7 +2233,7 @@ test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" 
     for (0..N) |i| {
         const xt = try Array.fromData(allocator, f32, buf[i * HIDDEN ..][0..HIDDEN], &[_]i32{ 1, HIDDEN });
         defer xt.deinit();
-        dec_outs[i] = try attn_d.forward(xt, &cache_d);
+        dec_outs[i] = try attn_d.forward(xt, &cache_d, null);
         try dec_outs[i].eval();
     }
     defer for (&dec_outs) |*o| o.deinit();
@@ -1491,7 +2250,7 @@ test "Qwen38Attn.slab: 260-token decode crosses slab boundary, matches prefill" 
     defer cache_p.deinit();
     const xp = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, N, HIDDEN });
     defer xp.deinit();
-    const out_p = try attn_p.forward(xp, &cache_p);
+    const out_p = try attn_p.forward(xp, &cache_p, null);
     defer out_p.deinit();
     try out_p.eval();
     try std.testing.expectEqual(@as(i32, N), cache_p.len());
@@ -1637,4 +2396,81 @@ test "compiled pre-cache segment matches eager preCacheStep" {
     defer m3.deinit();
     try m3.eval();
     try std.testing.expect(try m3.item(f32) <= 1e-5);
+}
+
+test "sdpaVerifySplit matches stock causal SDPA (bf16, split-KV)" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const H: i32 = 24;
+    const HKV: i32 = 4;
+    const D: i32 = 256;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    // Pseudo-random but deterministic fill (xorshift64 over the indices).
+    const fillBuf = struct {
+        fn call(alloc: std.mem.Allocator, n: usize, seed: u64) ![]f32 {
+            const buf = try alloc.alloc(f32, n);
+            var s = seed;
+            for (0..n) |i| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                buf[i] = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(s >> 33)), 2000) - 1000)) / 1000.0;
+            }
+            return buf;
+        }
+    }.call;
+
+    for ([_]i32{ 3, 8 }) |L| {
+        for ([_]i32{ 40, 1500 }) |T| {
+            const cap = T;
+            // q [1, H, L, D] bf16
+            const qn: usize = @intCast(H * L * D);
+            const qb = try fillBuf(allocator, qn, 11);
+            defer allocator.free(qb);
+            const qf = try Array.fromData(allocator, f32, qb, &[_]i32{ 1, H, L, D });
+            defer qf.deinit();
+            const q = try ops.astype(ctx, qf, .bfloat16);
+            defer q.deinit();
+            // k/v slabs [1, HKV, cap, D] bf16
+            const kn: usize = @intCast(HKV * cap * D);
+            const kb = try fillBuf(allocator, kn, 22);
+            defer allocator.free(kb);
+            const vb = try fillBuf(allocator, kn, 33);
+            defer allocator.free(vb);
+            const kf = try Array.fromData(allocator, f32, kb, &[_]i32{ 1, HKV, cap, D });
+            defer kf.deinit();
+            const vf = try Array.fromData(allocator, f32, vb, &[_]i32{ 1, HKV, cap, D });
+            defer vf.deinit();
+            const k = try ops.astype(ctx, kf, .bfloat16);
+            defer k.deinit();
+            const v = try ops.astype(ctx, vf, .bfloat16);
+            defer v.deinit();
+
+            const split = (try sdpaVerifySplit(ctx, q, k, v, scale, H, HKV, D, L, T)) orelse
+                return error.TestUnexpectedResult; // kernel must apply to this shape
+            defer split.deinit();
+
+            const k_view = try ops.slice(ctx, k, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, T, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer k_view.deinit();
+            const v_view = try ops.slice(ctx, v, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, T, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer v_view.deinit();
+            const stock = try fast_mod.scaledDotProductAttention(ctx, q, k_view, v_view, scale, "causal", null, null);
+            defer stock.deinit();
+
+            const split32 = try ops.astype(ctx, split, .float32);
+            defer split32.deinit();
+            const stock32 = try ops.astype(ctx, stock, .float32);
+            defer stock32.deinit();
+            const diff = try ops.subtract(ctx, split32, stock32);
+            defer diff.deinit();
+            const adiff = try ops.abs(ctx, diff);
+            defer adiff.deinit();
+            const m = try reduce_mod.max(ctx, adiff, false);
+            defer m.deinit();
+            try m.eval();
+            // Both compute in fp32 and round to bf16 on output; tolerance is
+            // a couple of bf16 ulps at O(1) magnitude.
+            try std.testing.expect(try m.item(f32) <= 2e-2);
+        }
+    }
 }
