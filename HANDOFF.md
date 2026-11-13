@@ -1957,3 +1957,46 @@ Ollama 兼容、metrics/cache 管理端点、多模型池。
   实测计数与发出的请求逐条一致。
 - 图像生成不做:dmlx 的 Flux 管线是 stub(无文本编码器/权重加载/VAE 解码),
   见 src/main.zig runImageGen——那不是 API 面缺口,是能力缺口。
+
+### omlx API 对齐 + 遗留问题清扫(2026-11-13)
+
+**omlx 对齐批次**(`6f27879`+`43505e2`,549→551 tests):
+- `POST /v1/completions`(legacy 裸文本补全,无模板,string|数组 batch 串行,
+  SSE 流式,vision token 拒绝继承)。
+- `POST /v1/detokenize`(+别名):与 tokenize 精确往返(用全序列 decode,
+  不受逐 token 丢空格影响)。
+- `POST /v1/messages/count_tokens`:与真实 chat 请求 usage.prompt_tokens
+  **逐字一致**(58/78 实测);图像按 smart_resize pad 数计(不走塔)。
+- `GET/DELETE /v1/responses/{id}`:256 条有界内存 store(pthread mutex),
+  store:false 不保留;**失败响应也保留**(含非流式——评审抓出的遗漏)。
+- `GET /api/status`:model/uptime/active/requests_total。
+- 不做(架构/能力限制):rerank(无 reranker 模型)、decisions/systemone
+  (omlx 特有)、多模型 load/unload(单模型架构,http.zig 留有挂点)。
+
+**遗留问题清扫(全部真凶修复,非症状):**
+- **SSE 断连 segfault**(`ccded80`+`bfce9a6`):三个叠加根因——①engine 线程
+  在 handler 因写失败 unwind 后继续向已释放的 CompletionSignal deliverToken
+  (UAF);②全服务器 socket 写无 SIGPIPE 防护;③keepalive fiber 借用 handler
+  栈帧。修复:abortStream(cancel + drain 到 engine 完成才 deinit,
+  chat 与 responses 两条流式路径全覆盖)、SO_NOSIGPIPE、keepalive 原子停止
+  +Future join。回归脚本 scripts/repro_sse_abort.sh(40 次断连存活)。
+  **残余**:cancel 只在 dequeue 生效,in-flight 请求仍生成到 max_tokens
+  (引擎内取消是 engine/ 的后续课题)。
+- **tool_calls arguments JSON 转义**(`3808559`):id/name/arguments 全部
+  过 jsonEscapeInto,arguments 保持 string 型(OpenAI 约定)。
+- **zig build test 假失败**(`76ab670`):真因是 zig 0.16 build_runner 对
+  任何 stderr 非空的 step 都打印 "failed command"(即使成功)——库代码的
+  std.log/std.debug.print 在测试里输出。全部按 builtin.is_test 门控,
+  5 连跑全绿。
+- **q4-producer 计时 flake**(`60cbf21`):build 图排序,重计时步骤排到
+  大测试二进制之后;阈值不动。
+- **CLI --temperature 0.8 sentinel**(`5396050`):flag 改 Optional,
+  显式 0.8 不再被重映射成推荐档位。
+- **glm53 loader 泄漏 + layer_meta double free**(`217ae2d`):错误路径
+  errdefer 补全;double free 实修(ExpertStreamProvider 统一持有)。
+- **流式丢空格**(`357600c2`):新增 src/tokenizer/streaming.zig
+  StreamingDetokenizer(累积 decode + 只发到最后一个完整 UTF-8 边界的新
+  后缀;final flush),所有流式产生者(chat/completions/responses/DSV4/
+  native)统一走它。拼接 deltas == 非流式 decode **逐字节一致**(单测 +
+  三端点实测)。修复前缀稳定性的正确性依据:BPE decode 链是 append-单调的。
+- 单测总数 **555 passed / 3 skipped / 0 failed**。
