@@ -273,12 +273,14 @@ Approximate memory budget for the tested 48GB machine:
 Currently exposed routes:
 
 - `POST /v1/chat/completions`
-- `POST /v1/responses` (minimal Responses API compatibility layer)
-- `POST /v1/messages`
-- `POST /v1/tokenize` (also `/tokenize`)
+- `POST /v1/completions` (legacy raw-text completion)
+- `POST /v1/responses` (+ `GET`/`DELETE /v1/responses/{id}`)
+- `POST /v1/messages` (+ `POST /v1/messages/count_tokens`)
+- `POST /v1/tokenize` / `POST /v1/detokenize` (aliases `/tokenize`, `/detokenize`)
 - `POST /v1/embeddings` (last-hidden pooling, Qwen3.8 path)
 - `GET /v1/models`
 - `GET /metrics` (Prometheus text format, also `/v1/metrics`)
+- `GET /api/status`
 - `GET /health`
 - `POST /shutdown`
 
