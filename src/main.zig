@@ -27,7 +27,10 @@ const ChatCommand = struct {
     prompt: []const u8,
     system_prompt: []const u8 = "",
     max_tokens: usize = 256,
-    temperature: f32 = 0.8,
+    /// null = flag not given: model-specific recommended profile applies
+    /// (Qwen3.8 chat: 1.0/20/0.95); other paths fall back to 0.8. An explicit
+    /// `--temperature 0.8` is honored as 0.8, not remapped.
+    temperature: ?f32 = null,
     top_k: usize = 50,
     top_p: f32 = 1.0,
     seed: ?u64 = null,
@@ -811,7 +814,7 @@ fn runLlamaChat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     // 6. Generate
     const seed = cmd.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
     var sampler_config = root.sampling.SamplerConfig.init(seed);
-    sampler_config.temperature = cmd.temperature;
+    sampler_config.temperature = cmd.temperature orelse 0.8;
     sampler_config.top_k = cmd.top_k;
     sampler_config.top_p = cmd.top_p;
 
@@ -878,7 +881,7 @@ fn runGlm53Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx:
     const seed = cmd.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
     const gen_config = root.generation.GenerateConfig{
         .max_tokens = cmd.max_tokens,
-        .temperature = cmd.temperature,
+        .temperature = cmd.temperature orelse 0.8,
         .top_k = cmd.top_k,
         .top_p = cmd.top_p,
         .stop_tokens = glm_cfg.eos_token_ids,
@@ -949,11 +952,11 @@ fn runQwen38Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand, ctx
     defer allocator.free(prompt_tokens);
 
     // Qwen3.5 recommended sampling defaults (temp 1.0 / top_k 20 / top_p
-    // 0.95) apply when the user left the CLI flags at their global defaults.
+    // 0.95) apply only when the user left the CLI flags unset.
     const seed = cmd.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
     const gen_config = root.generation.GenerateConfig{
         .max_tokens = cmd.max_tokens,
-        .temperature = if (cmd.temperature == 0.8) 1.0 else cmd.temperature,
+        .temperature = cmd.temperature orelse 1.0,
         .top_k = if (cmd.top_k == 50) 20 else cmd.top_k,
         .top_p = if (cmd.top_p == 1.0) 0.95 else cmd.top_p,
         .stop_tokens = qwen_cfg.eos_token_ids,
@@ -1273,7 +1276,7 @@ fn runDeepSeekV4Chat(allocator: std.mem.Allocator, io: std.Io, cmd: ChatCommand,
     // 7. Generate
     const seed = cmd.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
     var sampler_config = root.sampling.SamplerConfig.init(seed);
-    sampler_config.temperature = cmd.temperature;
+    sampler_config.temperature = cmd.temperature orelse 0.8;
     sampler_config.top_k = cmd.top_k;
     sampler_config.top_p = cmd.top_p;
 
