@@ -1055,6 +1055,19 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exact_q4_stages_test.step);
     test_step.dependOn(&run_decode_timeline_test.step);
     test_step.dependOn(&run_decode_timeline_disabled_test.step);
+    // test-exact-q4-producer carries a paired GPU timing gate (disabled
+    // overhead must stay within 1% of baseline) that is squeezed when the
+    // 95s library test binary and the other self-tests run concurrently
+    // (standalone: 3/3; under full-suite load: intermittent 1%-gate trips).
+    // Pin it to run after the heavy steps finish instead of weakening the
+    // threshold. The standalone `zig build test-exact-q4-producer` step is
+    // unaffected.
+    run_exact_q4_producer_test.step.dependOn(&run_lib_tests.step);
+    run_exact_q4_producer_test.step.dependOn(&run_native_chunk_planner_tests.step);
+    run_exact_q4_producer_test.step.dependOn(&run_exact_q4_io_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_exact_q4_stages_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_decode_timeline_test.step);
+    run_exact_q4_producer_test.step.dependOn(&run_decode_timeline_disabled_test.step);
 
     // --- Example ---
     const example = b.addExecutable(.{
