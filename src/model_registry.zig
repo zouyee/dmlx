@@ -441,7 +441,8 @@ pub const Glm53VTableAdapter = struct {
             sp.deinit();
             allocator.destroy(sp);
         }
-        if (self.layer_meta) |lm| allocator.free(lm);
+        // layer_meta is owned by the stream provider (sp.deinit above frees
+        // the per-layer names and the slice) — do not free it here.
         // PartialTensorReader has no deinit (borrows index + fd_pool).
         allocator.destroy(self.reader);
         self.fd_pool.deinit();
@@ -473,10 +474,12 @@ fn glm53Loader(
     const cfg_ptr = try allocator.create(glm53_loader.Glm53Config);
     errdefer allocator.destroy(cfg_ptr);
     cfg_ptr.* = try glm53_loader.parseGlm53Config(allocator, config_json);
+    errdefer cfg_ptr.deinit();
 
     const idx = try allocator.create(safetensors_reader.TensorIndex);
     errdefer allocator.destroy(idx);
     idx.* = try safetensors_reader.loadOrBuildIndex(allocator, model_path);
+    errdefer idx.deinit();
 
     // Resident backbone: every language_model tensor except the stacked
     // switch_mlp experts (~13.4 GiB; experts stream on demand).
@@ -507,6 +510,7 @@ fn glm53Loader(
     errdefer allocator.destroy(pool);
     pool.* = safetensors_reader.FdPool.init(allocator);
     try pool.openAll(idx);
+    errdefer pool.deinit();
 
     const rd = try allocator.create(safetensors_reader.PartialTensorReader);
     errdefer allocator.destroy(rd);
@@ -515,11 +519,18 @@ fn glm53Loader(
     // Expert streaming (GLM: 4-bit affine gs=64 with biases — biases make the
     // packed-pread path ineligible, so slices come from PartialTensorReader).
     var sp: ?*expert_stream.ExpertStreamProvider = null;
+    errdefer if (sp) |p| {
+        p.deinit();
+        allocator.destroy(p);
+    };
     var layer_meta: ?[]expert_stream.LayerExpertMeta = null;
     if (smelt.enabled and smelt.load_mode == .stream) {
         const meta = try glm53_loader.buildLayerExpertMeta(allocator, cfg_ptr, idx);
-        layer_meta = meta;
+        errdefer glm53_loader.freeLayerExpertMeta(allocator, meta);
+        // sp takes ownership of meta on success (its deinit frees the names
+        // + slice); the errdefer above covers init failure.
         const sp_ptr = try allocator.create(expert_stream.ExpertStreamProvider);
+        errdefer allocator.destroy(sp_ptr);
         sp_ptr.* = try expert_stream.ExpertStreamProvider.initWithStrategy(
             allocator,
             ctx,
@@ -537,6 +548,7 @@ fn glm53Loader(
             smelt.max_parallel,
         );
         sp_ptr.pred_topk = 8; // GLM-5.3 routes top-8 (PRED_WIDTH)
+        layer_meta = meta;
         sp = sp_ptr;
         std.log.info("GLM-5.3 expert streaming enabled (affine gs=64 4-bit, top-8)", .{});
     }
@@ -544,6 +556,7 @@ fn glm53Loader(
     const model_ptr = try allocator.create(glm53.Glm53ServingModel);
     errdefer allocator.destroy(model_ptr);
     model_ptr.* = try glm53.Glm53ServingModel.init(allocator, ctx, cfg_ptr, stream, weights, rd, sp);
+    errdefer model_ptr.deinit();
 
     const adapter = try allocator.create(Glm53VTableAdapter);
     errdefer allocator.destroy(adapter);
@@ -1204,6 +1217,7 @@ fn qwen38Loader(
     const cfg_ptr = try allocator.create(qwen38_loader.Qwen38Config);
     errdefer allocator.destroy(cfg_ptr);
     cfg_ptr.* = try qwen38_loader.parseQwen38Config(allocator, config_json);
+    errdefer cfg_ptr.deinit();
 
     var idx = try safetensors_reader.loadOrBuildIndex(allocator, model_path);
     defer idx.deinit();
@@ -1235,6 +1249,7 @@ fn qwen38Loader(
     const model_ptr = try allocator.create(qwen38.Qwen38ServingModel);
     errdefer allocator.destroy(model_ptr);
     model_ptr.* = try qwen38.Qwen38ServingModel.init(allocator, ctx, cfg_ptr, weights);
+    errdefer model_ptr.deinit();
     // Reseat the WeightSource: init built it against its local `self`; the
     // map/backing pointers must address the heap-placed struct.
     model_ptr.ws = qwen38.WeightSource.fromMap(&model_ptr.weights, ctx, &model_ptr.ws_backing);
