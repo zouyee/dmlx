@@ -588,16 +588,8 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 
                 // Build OpenAI-compatible response with tool_calls
                 const created = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toSeconds()));
-                var tool_calls_json = std.ArrayList(u8).empty;
-                defer tool_calls_json.deinit(allocator);
-                try tool_calls_json.appendSlice(allocator, "[");
-                for (parse_result.calls, 0..) |call, i| {
-                    if (i > 0) try tool_calls_json.appendSlice(allocator, ",");
-                    try tool_calls_json.print(allocator,
-                        \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
-                    , .{ call.id, call.function.name, call.function.arguments });
-                }
-                try tool_calls_json.appendSlice(allocator, "]");
+                const tool_calls_json = try formatToolCallsJson(allocator, parse_result.calls);
+                defer allocator.free(tool_calls_json);
 
                 return try std.fmt.allocPrint(allocator,
                     \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
@@ -605,7 +597,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
                     created,
                     created,
                     req.model,
-                    tool_calls_json.items,
+                    tool_calls_json,
                     prompt_tokens.len,
                     new_tokens_len,
                     prompt_tokens.len + new_tokens_len,
@@ -639,6 +631,34 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
 // ------------------------------------------------------------------
 // SSE streaming completion handler (using Generation API streamGenerate)
 // ------------------------------------------------------------------
+
+/// Serialize parsed tool calls into the OpenAI `tool_calls` array shape.
+/// Per OpenAI convention, `function.arguments` is a JSON *string* containing
+/// the serialized argument object, so the raw argument JSON (and the id/name,
+/// which come from model output) must be escaped before embedding — otherwise
+/// arguments containing quotes/braces produce invalid response JSON.
+pub fn formatToolCallsJson(allocator: std.mem.Allocator, calls: []const tool_calling_mod.ToolCall) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[");
+    for (calls, 0..) |call, i| {
+        if (i > 0) try out.appendSlice(allocator, ",");
+        var escaped_id = std.ArrayList(u8).empty;
+        defer escaped_id.deinit(allocator);
+        try jsonEscapeInto(&escaped_id, allocator, call.id);
+        var escaped_name = std.ArrayList(u8).empty;
+        defer escaped_name.deinit(allocator);
+        try jsonEscapeInto(&escaped_name, allocator, call.function.name);
+        var escaped_args = std.ArrayList(u8).empty;
+        defer escaped_args.deinit(allocator);
+        try jsonEscapeInto(&escaped_args, allocator, call.function.arguments);
+        try out.print(allocator,
+            \\{{"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
+        , .{ escaped_id.items, escaped_name.items, escaped_args.items });
+    }
+    try out.appendSlice(allocator, "]");
+    return out.toOwnedSlice(allocator);
+}
 
 /// Keep-alive threshold in milliseconds (5 seconds).
 const keep_alive_threshold_ms: i64 = 5000;
@@ -740,6 +760,51 @@ test "resolveToolChoice: required and named-function are rejected" {
         var req = parsed.value;
         try std.testing.expectError(error.InvalidToolChoice, resolveToolChoice(&req));
     }
+}
+
+test "formatToolCallsJson escapes arguments with braces, quotes and unicode" {
+    const allocator = std.testing.allocator;
+    const calls = [_]tool_calling_mod.ToolCall{
+        .{
+            .id = "call_1",
+            .type = "function",
+            .function = .{
+                .name = "get_weather",
+                .arguments = "{\"city\": \"Paris\", \"note\": \"say \\\"héllo\\\" ☃\"}",
+            },
+        },
+        .{
+            .id = "call_\"2\"",
+            .type = "function",
+            .function = .{
+                .name = "f\\n",
+                .arguments = "{\"nested\": {\"a\": [1, 2]}}",
+            },
+        },
+    };
+    const json = try formatToolCallsJson(allocator, &calls);
+    defer allocator.free(json);
+
+    // The whole array must be valid JSON...
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+
+    // ...and `arguments` must be a STRING that round-trips to the raw args.
+    const f0 = arr.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("get_weather", f0.get("name").?.string);
+    const args0 = f0.get("arguments").?.string;
+    try std.testing.expectEqualStrings("{\"city\": \"Paris\", \"note\": \"say \\\"héllo\\\" ☃\"}", args0);
+    // The arguments string itself must parse as JSON.
+    const args_parsed = try std.json.parseFromSlice(std.json.Value, allocator, args0, .{});
+    defer args_parsed.deinit();
+    try std.testing.expectEqualStrings("Paris", args_parsed.value.object.get("city").?.string);
+
+    const f1 = arr.items[1].object.get("function").?.object;
+    try std.testing.expectEqualStrings("f\\n", f1.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"nested\": {\"a\": [1, 2]}}", f1.get("arguments").?.string);
+    try std.testing.expectEqualStrings("call_\"2\"", arr.items[1].object.get("id").?.string);
 }
 
 test "validateChatRequest reports unsupported tool_choice forms" {
