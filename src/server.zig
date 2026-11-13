@@ -281,20 +281,35 @@ fn processNativeRequest(server_state: *ServerState, ne: *native_engine_mod.Nativ
             req: *engine.RequestState,
             io: std.Io,
             allocator: std.mem.Allocator,
-            tokenizer: root.tokenizer.TokenizerStrategy,
+            detok: root.tokenizer.StreamingDetokenizer,
         };
         var stream_ctx = StreamCtx{
             .req = req,
             .io = server_state.io,
             .allocator = server_state.allocator,
-            .tokenizer = server_state.tokenizer_strategy,
+            .detok = root.tokenizer.StreamingDetokenizer.init(server_state.allocator, server_state.tokenizer_strategy),
         };
+        defer stream_ctx.detok.deinit();
 
         const cb = struct {
             fn callback(ctx_ptr: *anyopaque, token: u32, is_final: bool) void {
                 const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
-                const token_text = ctx.tokenizer.decode(&[_]u32{token}, ctx.allocator) catch "";
-                defer if (token_text.len > 0) ctx.allocator.free(token_text);
+                // Incremental decode (cumulative decode + diff): concatenated
+                // deltas match the non-streaming full decode byte-exactly.
+                const delta = ctx.detok.addToken(token) catch null;
+                defer if (delta) |d| ctx.allocator.free(d);
+                var tail: ?[]u8 = null;
+                defer if (tail) |t| ctx.allocator.free(t);
+                if (is_final) tail = ctx.detok.flush() catch null;
+                var token_text: []const u8 = delta orelse "";
+                var combined: []u8 = &.{};
+                defer if (combined.len > 0) ctx.allocator.free(combined);
+                if (tail) |t| {
+                    combined = ctx.allocator.alloc(u8, token_text.len + t.len) catch return;
+                    @memcpy(combined[0..token_text.len], token_text);
+                    @memcpy(combined[token_text.len..], t);
+                    token_text = combined;
+                }
                 ctx.req.completion.deliverToken(ctx.io, token, token_text, is_final, if (is_final) .stop else null);
             }
         }.callback;

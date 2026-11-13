@@ -46,6 +46,7 @@ const CompletionSignal = completion_signal.CompletionSignal;
 const TokenEvent = completion_signal.TokenEvent;
 const TokenFinishReason = completion_signal.TokenEvent.FinishReason;
 const sampling_mod = @import("../sampling.zig");
+const streaming_mod = @import("../tokenizer/streaming.zig");
 const qwen38_gdn_prof = @import("../models/qwen38_gdn.zig");
 const verify_qmm_mod = @import("../models/verify_qmm.zig");
 const SamplerConfig = sampling_mod.SamplerConfig;
@@ -84,6 +85,7 @@ const StreamCallbackCtx = struct {
     stop_strings: ?[]const []const u8,
     stop_tokens: []const u32,
     text_buffer: std.ArrayList(u8),
+    detok: streaming_mod.StreamingDetokenizer,
     token_count: usize,
     max_tokens: usize,
     stopped: bool,
@@ -97,6 +99,7 @@ const StreamCallbackCtx = struct {
             .stop_strings = stop_strings,
             .stop_tokens = stop_tokens,
             .text_buffer = std.ArrayList(u8).empty,
+            .detok = streaming_mod.StreamingDetokenizer.init(allocator, tokenizer),
             .token_count = 0,
             .max_tokens = max_tokens,
             .stopped = false,
@@ -105,19 +108,23 @@ const StreamCallbackCtx = struct {
 
     fn deinit(self: *StreamCallbackCtx) void {
         self.text_buffer.deinit(self.allocator);
+        self.detok.deinit();
     }
 
     fn callback(ctx_ptr: *anyopaque, token: u32, is_done: bool) void {
         const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx_ptr));
         if (self.stopped) return;
 
-        // Decode token to text
-        const token_text = self.tokenizer.decode(&[_]u32{token}, self.allocator) catch return;
-        defer self.allocator.free(token_text);
+        // Incremental decode: cumulative full-sequence decode + diff, so
+        // concatenated deltas match the non-streaming decode byte-exactly
+        // (leading spaces on non-initial tokens survive; the leading-space
+        // strip applies once to the first token).
+        const delta = self.detok.addToken(token) catch return;
+        defer if (delta) |d| self.allocator.free(d);
+        self.token_count += 1;
 
         // Accumulate text for stop-string detection
-        self.text_buffer.appendSlice(self.allocator, token_text) catch return;
-        self.token_count += 1;
+        if (delta) |d| self.text_buffer.appendSlice(self.allocator, d) catch return;
 
         // Resolve the real finish verdict: stop token → .stop, otherwise
         // is_done means max_tokens truncation → .length.
@@ -140,9 +147,30 @@ const StreamCallbackCtx = struct {
             finish_reason = .length;
         }
 
+        // Flush any held-back partial UTF-8 on the final token.
+        var tail: ?[]u8 = null;
+        defer if (tail) |t| self.allocator.free(t);
+        if (is_final) {
+            tail = self.detok.flush() catch null;
+        }
+
+        const token_text = joinDeltas(self.allocator, delta, tail) catch return;
+        defer if (token_text.len > 0) self.allocator.free(token_text);
+
         self.signal.deliverToken(self.io, token, token_text, is_final, finish_reason);
     }
 };
+
+/// Concatenate two optional owned delta slices into one owned slice
+/// ("" when both are empty).
+fn joinDeltas(allocator: std.mem.Allocator, a: ?[]const u8, b: ?[]const u8) ![]const u8 {
+    const a_len = if (a) |s| s.len else 0;
+    const b_len = if (b) |s| s.len else 0;
+    const out = try allocator.alloc(u8, a_len + b_len);
+    if (a) |s| @memcpy(out[0..a_len], s);
+    if (b) |s| @memcpy(out[a_len..], s);
+    return out;
+}
 
 /// Derive the wire finish reason from a finished token sequence: a trailing
 /// stop token → .stop; hitting the max_tokens cap → .length.
@@ -644,7 +672,7 @@ pub const EngineLoop = struct {
 
             // For streaming, deliver the first token immediately.
             if (req.streaming) {
-                const token_text = self.tokenizer.decode(&[_]u32{result.token}, self.allocator) catch "";
+                const token_text = self.streamTokenText(req, result.token, false);
                 defer if (token_text.len > 0) self.allocator.free(token_text);
                 req.completion.deliverToken(self.io, result.token, token_text, false, null);
             }
@@ -826,10 +854,6 @@ pub const EngineLoop = struct {
             const result = results[i];
             req.token_count += 1;
 
-            // Decode token.
-            const token_text = self.tokenizer.decode(&[_]u32{result.token}, self.allocator) catch "";
-            defer if (token_text.len > 0) self.allocator.free(token_text);
-
             // Check stop tokens.
             const is_stop = generation_mod.isStopToken(result.token, req.stop_tokens);
             const is_done = is_stop or req.token_count >= req.max_tokens;
@@ -847,6 +871,8 @@ pub const EngineLoop = struct {
 
             // Deliver token.
             if (req.streaming) {
+                const token_text = self.streamTokenText(req, result.token, is_done);
+                defer if (token_text.len > 0) self.allocator.free(token_text);
                 const finish_reason: ?TokenFinishReason = if (is_done) (if (is_stop) .stop else .length) else null;
                 req.completion.deliverToken(self.io, result.token, token_text, is_done, finish_reason);
             }
@@ -981,6 +1007,24 @@ pub const EngineLoop = struct {
         for (new_active.items, 0..) |r, new_idx| {
             r.seq_index = new_idx;
         }
+    }
+
+    /// Incremental decode of one streamed token for `req`: returns the newly
+    /// decodable text increment (owned; caller frees; empty when the token's
+    /// bytes are held back as a partial UTF-8 sequence). Uses the request's
+    /// StreamingDetokenizer (cumulative decode + diff) so concatenated deltas
+    /// equal the non-streaming full-sequence decode byte-exactly.
+    fn streamTokenText(self: *EngineLoop, req: *RequestState, token: u32, is_final: bool) []const u8 {
+        if (req.stream_detok == null) {
+            req.stream_detok = streaming_mod.StreamingDetokenizer.init(self.allocator, self.tokenizer);
+        }
+        const detok = &req.stream_detok.?;
+        const delta: ?[]u8 = detok.addToken(token) catch null;
+        defer if (delta) |d| self.allocator.free(d);
+        var tail: ?[]u8 = null;
+        defer if (tail) |t| self.allocator.free(t);
+        if (is_final) tail = detok.flush() catch null;
+        return joinDeltas(self.allocator, delta, tail) catch "";
     }
 
     fn processStreamingRequest(
@@ -2979,8 +3023,10 @@ pub const EngineLoop = struct {
                 const ctx: *StreamCtx = @ptrCast(@alignCast(ctx_ptr));
                 ctx.token_count += 1;
 
-                // Decode token to text
-                const token_text = ctx.engine.tokenizer.decode(&[_]u32{token}, ctx.engine.allocator) catch "";
+                // Decode token to text via the request's incremental
+                // detokenizer (cumulative decode + diff), so concatenated
+                // deltas match the non-streaming decode byte-exactly.
+                const token_text = ctx.engine.streamTokenText(ctx.req, token, is_final);
                 defer if (token_text.len > 0) ctx.engine.allocator.free(token_text);
 
                 // Deliver token immediately via CompletionSignal.

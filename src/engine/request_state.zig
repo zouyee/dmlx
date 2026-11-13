@@ -7,6 +7,7 @@ const std = @import("std");
 const completion_signal = @import("completion_signal.zig");
 const sampling_mod = @import("../sampling.zig");
 const generation_mod = @import("../generation.zig");
+const streaming_mod = @import("../tokenizer/streaming.zig");
 
 pub const CompletionSignal = completion_signal.CompletionSignal;
 pub const TokenEvent = completion_signal.TokenEvent;
@@ -99,6 +100,10 @@ pub const RequestState = struct {
     generated_tokens: std.ArrayList(u32),
     /// Decoded text buffer for stop-string detection.
     text_buffer: std.ArrayList(u8),
+    /// Incremental detokenizer for streaming requests (lazily created by the
+    /// engine on the first streamed token; null for non-streaming requests).
+    /// Concatenating its deltas equals the full-sequence decode byte-exactly.
+    stream_detok: ?streaming_mod.StreamingDetokenizer,
     /// Number of tokens generated so far.
     token_count: usize,
     /// Whether generation is complete.
@@ -157,6 +162,7 @@ pub const RequestState = struct {
             .prefill_offset = 0,
             .generated_tokens = std.ArrayList(u32).empty,
             .text_buffer = std.ArrayList(u8).empty,
+            .stream_detok = null,
             .token_count = 0,
             .done = false,
             .finish_reason = null,
@@ -176,6 +182,7 @@ pub const RequestState = struct {
         if (self.vision) |*vis| vis.deinit(allocator);
         self.generated_tokens.deinit(allocator);
         self.text_buffer.deinit(allocator);
+        if (self.stream_detok) |*detok| detok.deinit();
         self.completion.deinit();
         allocator.destroy(self);
     }

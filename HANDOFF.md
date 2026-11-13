@@ -608,11 +608,6 @@ Benchmark: `SKIP_PURGE=1 SKIP_BENCHMARK_BUILD=1 bash scripts/run_benchmark_qwen3
 
 ## Known gaps / concerns
 
-- **Streaming SSE text loses spaces**: the engine decodes each token
-  individually (`engine_loop.zig` `tokenizer.decode(&[_]u32{token})`) and
-  `bpe.zig` decode strips the leading space (step 3), so streamed deltas
-  concatenate without spaces ("Theuserwants…"). Non-streaming output is
-  correct. Pre-existing, affects all models; needs incremental decode state.
 - glm53-inherited loader error-path leaks (minor, only on failure paths).
 - CLI `--temperature 0.8` is the global default *and* a sentinel: qwen38 chat
   maps "left at default" to the recommended temp 1.0 / top_k 20 / top_p 0.95,
