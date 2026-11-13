@@ -371,6 +371,11 @@ Custom kernels and techniques include work adapted from:
 - [Splash](https://github.com/incoai/splash)
 - [DeepSeek TileKernels](https://github.com/deepseek-ai/TileKernels)
 
+The project icon adapts **Ziggy the Ziguana** from the
+[official Zig artwork repository](https://github.com/ziglang/logo), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/). Ziggy artwork copyright
+belongs to its original creator; the dmlx MLX-badge composition is an adaptation.
+
 See source headers for per-kernel provenance and licenses. Adapted Apache-2.0 and MIT code retains its required attribution.
 
 ## License
