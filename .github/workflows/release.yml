@@ -1,0 +1,73 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  release:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Cache Zig dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            .zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Install mlx-c
+        run: |
+          brew install --formula mlx-c
+          brew link mlx-c 2>/dev/null || true
+          brew link mlx 2>/dev/null || true
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Bundle self-contained tarball
+        run: bash scripts/make_bundle.sh
+
+      - name: Verify bundle
+        run: |
+          set -euo pipefail
+          BIN=dist/dmlx/bin/dmlx
+          # No absolute Homebrew/Cellar references anywhere in the bundle.
+          for f in "$BIN" dist/dmlx/lib/*.dylib; do
+            if otool -L "$f" | grep -E '/opt/homebrew|/Cellar'; then
+              echo "bundle still references Homebrew paths: $f" >&2
+              exit 1
+            fi
+          done
+          # Codesign must be valid after install_name rewriting.
+          codesign --verify "$BIN" dist/dmlx/lib/*.dylib
+          # Binary must launch from the tarball, loading bundled dylibs.
+          rm -rf /tmp/dmlx-release-check
+          mkdir -p /tmp/dmlx-release-check
+          tar -xzf dist/dmlx-*-macos-arm64.tar.gz -C /tmp/dmlx-release-check
+          /tmp/dmlx-release-check/dmlx/bin/dmlx version
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          assets=(dist/dmlx-*-macos-arm64.tar.gz dist/dmlx-*-macos-arm64.tar.gz.sha256)
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            gh release create "$GITHUB_REF_NAME" "${assets[@]}" \
+              --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            echo "workflow_dispatch run; skipping release upload"
+            echo "artifacts ready under dist/:"
+            ls -lh dist/
+          fi

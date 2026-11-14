@@ -13,7 +13,7 @@
 #   MAX_TTFT_MS       — TTFT threshold for benchmark (default: 500)
 #   MAX_ITL_MS        — ITL threshold for benchmark (default: 150)
 
-.PHONY: all build test clean verify e2e benchmark check
+.PHONY: all build test clean bundle verify e2e benchmark check
 
 # Default target
 all: build
@@ -58,6 +58,13 @@ clean:
 	@echo "🧹 Cleaning build artifacts..."
 	cd "$(PROJECT_DIR)" && rm -rf zig-out .zig-cache
 	@echo "✅ Clean complete"
+
+# ------------------------------------------------------------------
+# Release bundle — self-contained tarball (no brew/zig needed at runtime)
+# ------------------------------------------------------------------
+bundle: build
+	@echo "📦 Creating self-contained release bundle..."
+	bash "$(PROJECT_DIR)/scripts/make_bundle.sh"
 
 # ------------------------------------------------------------------
 # Verification

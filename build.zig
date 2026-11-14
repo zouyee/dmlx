@@ -1093,6 +1093,10 @@ pub fn build(b: *std.Build) void {
     });
     cli.root_module.addImport("mlx", mlx_z_module);
     cli.root_module.addImport("regex", zig_regex.module("regex"));
+    // Leave room for install_name_tool to rewrite the mlx-c dylib reference
+    // and add an @rpath entry when packaging the self-contained bundle
+    // (scripts/make_bundle.sh).
+    cli.headerpad_max_install_names = true;
     b.installArtifact(cli);
 
     const cli_args_tests = b.addTest(.{

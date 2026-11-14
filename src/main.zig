@@ -21,6 +21,9 @@ const EagerContext = root.EagerContext;
 
 const benchmark_mod = @import("benchmark.zig");
 const evaluate_mod = @import("evaluate.zig");
+const catalog = @import("catalog.zig");
+const pull_mod = @import("pull.zig");
+const doctor_mod = @import("doctor.zig");
 
 const ChatCommand = struct {
     model_path: []const u8,
@@ -164,13 +167,16 @@ pub fn main(init: std.process.Init) !void {
     const command = args[1];
 
     if (std.mem.eql(u8, command, "chat")) {
-        const cmd = try parseChatArgs(allocator, args[2..]);
+        var cmd = try parseChatArgs(allocator, args[2..]);
         defer {
             allocator.free(cmd.model_path);
             allocator.free(cmd.prompt);
             for (cmd.images) |img| allocator.free(img);
             allocator.free(cmd.images);
         }
+        const resolved = try catalog.resolveModelArg(allocator, init.io, cmd.model_path);
+        allocator.free(cmd.model_path);
+        cmd.model_path = resolved;
         try runChat(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "convert")) {
         const cmd = try parseConvertArgs(allocator, args[2..]);
@@ -199,7 +205,7 @@ pub fn main(init: std.process.Init) !void {
             if (cmd.dspark_dir) |d| allocator.free(d);
         }
         const server_config = root.server.ServerConfig{
-            .model_path = cmd.model_path,
+            .model_path = try catalog.resolveModelArg(allocator, init.io, cmd.model_path),
             .port = cmd.port,
             .max_tokens = cmd.max_tokens,
             .temperature = cmd.temperature,
@@ -262,6 +268,10 @@ pub fn main(init: std.process.Init) !void {
             allocator.free(cmd.output_path);
         }
         try runImageGen(allocator, init.io, cmd);
+    } else if (std.mem.eql(u8, command, "pull")) {
+        try pull_mod.run(allocator, init.io, args[2..]);
+    } else if (std.mem.eql(u8, command, "doctor")) {
+        std.c._exit(try doctor_mod.run(allocator, init.io));
     } else if (std.mem.eql(u8, command, "version")) {
         std.debug.print("dmlx {s}\n", .{root.version});
     } else {
@@ -357,6 +367,12 @@ fn printUsage() void {
         \\    --width <n>         Image width (default: 512)
         \\    --steps <n>         Denoising steps (default: 20)
         \\    --output <path>     Output image path
+        \\
+        \\  dmlx pull <alias> [--force]
+        \\    Download a registered model from Hugging Face (resumable, sha256-verified)
+        \\
+        \\  dmlx doctor
+        \\    Check hardware, Metal, runtime, and installed models
         \\
         \\  dmlx version
         \\    Show version information
