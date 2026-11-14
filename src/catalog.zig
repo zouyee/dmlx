@@ -135,7 +135,11 @@ pub fn isCompleteInstall(io: std.Io, dir_path: []const u8, entry: *const Entry) 
 /// text. Caller owns the returned slice.
 pub fn resolveModelArg(allocator: std.mem.Allocator, io: std.Io, arg: []const u8) ![]u8 {
     if (std.mem.indexOfScalar(u8, arg, '/') != null) return allocator.dupe(u8, arg);
-    if (dirExists(io, arg)) return allocator.dupe(u8, arg);
+    // Relative bare name: only treat it as a path if a directory by that
+    // name exists in the cwd.
+    if (std.Io.Dir.cwd().access(io, arg, .{})) {
+        return allocator.dupe(u8, arg);
+    } else |_| {}
 
     if (find(arg)) |entry| {
         if (try installedPath(allocator, io, entry)) |p| return p;
