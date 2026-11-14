@@ -295,7 +295,7 @@ fn printUsage() void {
     std.debug.print(
         \\Usage:
         \\  dmlx chat [options]
-        \\    --model <path>      Path to model directory
+        \\    --model <path>      Path to model directory, or a registered alias (see dmlx pull)
         \\    --prompt <text>     Prompt text
         \\    --image <path>      Image for a vision prompt (repeatable; Qwen3.8)
         \\    --max-tokens <n>    Maximum tokens (default: 256)
@@ -306,7 +306,10 @@ fn printUsage() void {
         \\    --max-kv-size <v>   KV cache size: "auto" (default) or integer
         \\
         \\  dmlx serve [options]  (alias: server)
-        \\    --model <path>      Path to model directory
+        \\    --model <path>      Path to model directory, or a registered alias (see dmlx pull)
+        \\    --mlx               Use the MLX-backed engine path
+        \\    --native            Use the native engine (DeepSeek V4; default)
+        \\    --speculative-mtp <n>  MTP speculative decoding, max draft depth (Qwen3.8)
         \\    --port <n>          HTTP port (default: 8080)
         \\    --max-tokens <n>    Maximum tokens per request (default: 256)
         \\    --temperature <t>   Sampling temperature (default: 0.8)
@@ -340,12 +343,6 @@ fn printUsage() void {
         \\    --output <path>     Output path for quantized model
         \\    --bits <n>          Quantization bits: 4 or 8 (default: 4)
         \\    --group-size <n>    Quantization group size (default: 64)
-        \\
-        \\  dmlx convert [options]
-        \\    --from <format>     Source format
-        \\    --to <format>       Target format
-        \\    --input <path>      Input file
-        \\    --output <path>     Output file
         \\
         \\  dmlx evaluate [options]
         \\    --model <path>      Path to model directory

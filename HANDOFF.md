@@ -2000,3 +2000,32 @@ Ollama 兼容、metrics/cache 管理端点、多模型池。
   native)统一走它。拼接 deltas == 非流式 decode **逐字节一致**(单测 +
   三端点实测)。修复前缀稳定性的正确性依据:BPE decode 链是 append-单调的。
 - 单测总数 **555 passed / 3 skipped / 0 failed**。
+
+---
+
+## CLI surface cleanup (2026-11-14, v0.0.8+)
+
+Distribution and model management landed: `make bundle` self-contained
+tarballs (scripts/make_bundle.sh), tag-triggered GitHub Releases
+(.github/workflows/release.yml), Homebrew tap (zouyee/homebrew-tap),
+`dmlx pull` (registry in src/catalog.zig, curl-based resumable downloads,
+LFS sha256 via HF tree API `lfs.oid`), `dmlx doctor`, `--model` alias
+resolution for serve/chat/benchmark/evaluate, build-time version injection
+(git describe via build.zig build_options; root.zig no longer hardcodes).
+
+Deferred decisions:
+
+- **`dmlx convert` is hidden from `--help`** (command still works). Its
+  HF→MLX path shells out to `python3 -m mlx_lm.convert`, which conflicts
+  with the "no Python at runtime" positioning. Decide: (a) keep hidden and
+  document as a developer tool requiring mlx-lm, or (b) reimplement the
+  conversion natively. Recorded here so the flag is not "rediscovered" as
+  a regression.
+- **`dmlx image-gen` is a stub**: parse/validation exist, but the pipeline
+  uses a default FluxConfig and does not load a real checkpoint. Either
+  hide it like convert or finish the loader integration before advertising.
+- `dmlx pull --source modelscope` is parsed but rejects with
+  "not supported"; add when domestic-mirror demand shows up.
+- Non-LFS files in pull are size-matched only (HF gives no digest for
+  them); switch to git blob sha1 (tree API `oid`) if tamper-evidence for
+  tokenizer/config files ever matters.
