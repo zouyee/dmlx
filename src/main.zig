@@ -235,8 +235,11 @@ pub fn main(init: std.process.Init) !void {
         };
         try root.server.start(allocator, init.io, server_config);
     } else if (std.mem.eql(u8, command, "benchmark")) {
-        const cmd = try parseBenchmarkArgs(allocator, args[2..]);
+        var cmd = try parseBenchmarkArgs(allocator, args[2..]);
         defer allocator.free(cmd.model_path);
+        const resolved = try catalog.resolveModelArg(allocator, init.io, cmd.model_path);
+        allocator.free(cmd.model_path);
+        cmd.model_path = resolved;
         try runBenchmark(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "quantize")) {
         const cmd = try parseQuantizeArgs(allocator, args[2..]);
@@ -246,11 +249,14 @@ pub fn main(init: std.process.Init) !void {
         }
         try runQuantize(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "evaluate")) {
-        const cmd = try parseEvaluateArgs(allocator, args[2..]);
+        var cmd = try parseEvaluateArgs(allocator, args[2..]);
         defer {
             allocator.free(cmd.model_path);
             allocator.free(cmd.data_path);
         }
+        const resolved = try catalog.resolveModelArg(allocator, init.io, cmd.model_path);
+        allocator.free(cmd.model_path);
+        cmd.model_path = resolved;
         try runEvaluate(allocator, init.io, cmd);
     } else if (std.mem.eql(u8, command, "jang-convert")) {
         const cmd = try parseJangConvertArgs(allocator, args[2..]);
@@ -272,8 +278,10 @@ pub fn main(init: std.process.Init) !void {
         try pull_mod.run(allocator, init.io, args[2..]);
     } else if (std.mem.eql(u8, command, "doctor")) {
         std.c._exit(try doctor_mod.run(allocator, init.io));
-    } else if (std.mem.eql(u8, command, "version")) {
+    } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         std.debug.print("dmlx {s}\n", .{root.version});
+    } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
+        printUsage();
     } else {
         std.log.err("Unknown command: {s}", .{command});
         printUsage();

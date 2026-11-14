@@ -98,4 +98,4 @@ pub const float64 = dtype.float64;
 pub const bfloat16 = dtype.bfloat16;
 pub const complex64 = dtype.complex64;
 
-pub const version = "0.4.0";
+pub const version = @import("build_options").version;

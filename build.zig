@@ -24,6 +24,24 @@ pub fn build(b: *std.Build) void {
     else
         "-DDMLX_DECODE_TIMELINE_PROBE=0";
 
+    // Version embedded into the binary: -Dversion override, else
+    // `git describe` (v0.0.8, v0.0.8-3-gabcdef, ...), else a dev fallback.
+    const version_string = b.option(
+        []const u8,
+        "version",
+        "Version string embedded into the dmlx binary",
+    ) orelse blk: {
+        var code: u8 = 0;
+        const out = b.runAllowFail(
+            &.{ "git", "describe", "--tags", "--always", "--dirty" },
+            &code,
+            .ignore,
+        ) catch break :blk "0.4.0-dev";
+        break :blk std.mem.trim(u8, out, " \n\r\t");
+    };
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", version_string);
+
     const zig_regex = b.dependency("zig_regex", .{
         .target = target,
         .optimize = optimize,
@@ -1017,6 +1035,7 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     lib.root_module.addImport("mlx", mlx_z_module);
+    lib.root_module.addImport("build_options", build_options.createModule());
     lib.root_module.addImport("regex", zig_regex.module("regex"));
     b.installArtifact(lib);
 
@@ -1029,6 +1048,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     lib_tests.root_module.addImport("mlx", mlx_z_module);
+    lib_tests.root_module.addImport("build_options", build_options.createModule());
     lib_tests.root_module.addImport("regex", zig_regex.module("regex"));
     // Metal MoE C wrapper — needed for test compilation
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/models/moe_metal_wrapper.c"), .flags = &.{"-fobjc-arc"}, .language = .objective_c });
@@ -1079,6 +1099,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     example.root_module.addImport("mlx", mlx_z_module);
+    example.root_module.addImport("build_options", build_options.createModule());
     example.root_module.addImport("regex", zig_regex.module("regex"));
     b.installArtifact(example);
 
@@ -1093,6 +1114,7 @@ pub fn build(b: *std.Build) void {
     });
     cli.root_module.addImport("mlx", mlx_z_module);
     cli.root_module.addImport("regex", zig_regex.module("regex"));
+    cli.root_module.addImport("build_options", build_options.createModule());
     // Leave room for install_name_tool to rewrite the mlx-c dylib reference
     // and add an @rpath entry when packaging the self-contained bundle
     // (scripts/make_bundle.sh).
