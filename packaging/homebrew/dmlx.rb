@@ -12,7 +12,7 @@ class Dmlx < Formula
   desc "Zig inference runtime for Apple Silicon with speculative decoding"
   homepage "https://github.com/zouyee/dmlx"
   url "https://github.com/zouyee/dmlx/releases/download/v0.0.8/dmlx-v0.0.8-macos-arm64.tar.gz"
-  sha256 "REPLACE_WITH_SHA256_FROM_RELEASE"
+  sha256 "e9d7fc20b7a59adf0f1e17b3444ac8e3d57f7eabc1cbd38dc4b498521e52e693"
   license "MIT"
 
   depends_on arch: :arm64
