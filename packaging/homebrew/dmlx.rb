@@ -19,7 +19,10 @@ class Dmlx < Formula
   depends_on :macos
 
   def install
-    libexec.install "bin/dmlx"
+    # Homebrew strips the tarball's top-level dmlx/ directory, so the build
+    # cwd already contains bin/ and lib/. Install both trees verbatim so
+    # @executable_path/../lib keeps resolving inside libexec.
+    libexec.install "bin"
     libexec.install "lib"
     # Wrapper keeps the real binary path stable so @executable_path/../lib
     # resolves to the bundled dylibs inside libexec.
