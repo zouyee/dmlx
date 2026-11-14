@@ -1,0 +1,68 @@
+# dmlx
+
+> dmlx is a Zig inference runtime for Apple Silicon. It serves local language
+> models over an OpenAI-compatible HTTP API, with two flagship paths:
+> Qwen3.8-27B-4bit with MTP speculative decoding, and DeepSeek V4 Flash (284B
+> MoE) running under a 48GB unified-memory budget via SSD expert streaming.
+
+Use this file when helping a user install, run, or integrate dmlx. Prefer the
+release install and the `dmlx` CLI; do not build from source unless the user
+is developing dmlx itself.
+
+## Install and run (agent quick path)
+
+```bash
+# 1. Install (macOS arm64 only; no sudo, no dependencies)
+curl -fsSL https://raw.githubusercontent.com/zouyee/dmlx/main/scripts/install.sh | bash
+
+# 2. Check the machine
+dmlx doctor
+
+# 3. Download models (resumable, sha256-verified; lands in ~/.cache/dmlx/models)
+dmlx pull qwen3.8-27b-4bit        # target model
+dmlx pull qwen3.8-27b-mtp-4bit    # MTP drafter for speculative decode
+
+# 4. Serve (OpenAI-compatible API on 127.0.0.1:8080)
+dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
+```
+
+Verify with:
+
+```bash
+curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"default","messages":[{"role":"user","content":"hello"}],"max_tokens":32,"stream":false}'
+```
+
+## DeepSeek V4 Flash (284B MoE on 48GB)
+
+Requires the native path with packed experts and a bounded expert cache:
+
+```bash
+python3 scripts/repack_experts.py <model-dir>          # one-time expert packing
+NATIVE_SMELT_N=20 dmlx serve --model <model-dir> \
+  --expert-packed-dir <model-dir>/packed_experts --native --port 8080
+```
+
+Do NOT use full expert preload on a 48GB machine (would need ~147GB). Run at
+most one DeepSeek server instance.
+
+## Key facts
+
+- Platform: macOS on Apple Silicon only. The serving process has no Python
+  runtime dependency.
+- API surface: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
+  `/v1/messages` (Anthropic-style), `/v1/embeddings`, `/v1/models`,
+  `/tokenize`, `/health`, `/metrics`.
+- MTP benchmark measurements must use non-streaming requests.
+- Registered model aliases: `qwen3.8-27b-4bit`, `qwen3.8-27b-mtp-4bit`,
+  `deepseek-v4-flash-4bit`. Aliases work anywhere `--model` takes a path.
+- `DMLX_MODEL_HOME` overrides the model cache directory.
+
+## Links
+
+- [README](https://github.com/zouyee/dmlx/blob/main/README.md): paths, benchmarks, API boundaries
+- [Releases](https://github.com/zouyee/dmlx/releases): prebuilt macOS arm64 tarballs
+- [Benchmark report](https://github.com/zouyee/dmlx/blob/main/docs/en/analysis/performance-benchmark.md): measured numbers and protocol
+- [Contributing](https://github.com/zouyee/dmlx/blob/main/CONTRIBUTING.md): development workflow

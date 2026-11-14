@@ -64,6 +64,28 @@ The MLX-backed path still depends on `mlx-c`; “Zig-controlled” does not mean
 
 ## Quick start
 
+### One-command install (macOS, Apple Silicon)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zouyee/dmlx/main/scripts/install.sh | bash
+```
+
+This downloads the latest [release](https://github.com/zouyee/dmlx/releases),
+verifies the sha256, installs into `~/.local/share/dmlx`, and links the CLI to
+`~/.local/bin/dmlx`. The tarball bundles `libmlxc`, `libmlx`, and
+`mlx.metallib` — nothing else to install, no Zig required.
+
+### What runs on your Mac
+
+Measured on an Apple M4 Pro with 48GB unified memory; see
+[Benchmarks](#benchmarks) for protocols and raw artifacts.
+
+| Model | Memory needed | Measured speed | Notes |
+|---|---:|---:|---|
+| Qwen3.8-27B-4bit + MTP drafter | fits in 48GB | **43.2 tok/s** decode (non-thinking), 0.28s TTFT | speculative decoding, flagship path |
+| DeepSeek V4 Flash 4bit (284B MoE) | ~20.3GiB RSS + SSD for cold experts | **1.24 tok/s** effective completion | 284B model under a 48GB budget via expert streaming |
+| Llama / Mistral / Qwen2/3 / Gemma / GLM / Phi registry models | model-dependent | compatibility paths | see [Choose a path](#choose-a-path) |
+
 ### Models the easy way
 
 `dmlx pull` downloads a registered model from Hugging Face with resumable
