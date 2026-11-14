@@ -1747,6 +1747,12 @@ fn parseConvertArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !C
         }
     }
 
+    if (cmd.input_path.len == 0 or cmd.output_path.len == 0 or
+        cmd.from_format.len == 0 or cmd.to_format.len == 0)
+    {
+        std.log.err("usage: dmlx convert --from <format> --to <format> --input <path> --output <path>", .{});
+        return error.MissingRequiredArgument;
+    }
     return cmd;
 }
 
@@ -1860,6 +1866,10 @@ fn parseLoraTrainArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) 
         }
     }
 
+    if (cmd.model_path.len == 0 or cmd.data_path.len == 0 or cmd.output_path.len == 0) {
+        std.log.err("usage: dmlx lora-train --model <path> --data <dataset.jsonl> --output <adapter-path>", .{});
+        return error.MissingRequiredArgument;
+    }
     return cmd;
 }
 
