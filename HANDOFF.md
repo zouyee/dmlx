@@ -2075,3 +2075,32 @@ Notes / follow-ups:
 - Snapshot path verified on Debug build; ReleaseFast not separately
   re-measured. `DMLX_QWEN38_PREFIX_SNAP=0` off-path not benchmarked.
 - Streaming speculative decode (MTP under SSE) remains deferred.
+
+---
+
+## Streaming MTP (2026-11-16, `d9ce888`)
+
+Streaming requests bypassed MTP: `--speculative-mtp` only applied to the
+non-streaming path, so SSE clients (agent harnesses) got plain decode.
+
+What landed:
+
+- Dispatch (`engine_loop.zig`): streaming requests route through
+  `tryMtpRequest` when the model has MTP (vision requires drafter
+  `prefillVision`, else plain streaming fallback).
+- `MtpStreamer` sink inside `processMtpRequest`: every emitted token (first
+  token, accepted drafts, next-sample, plain-decode fallback) is delivered
+  through the existing `StreamCallbackCtx`, so stop-token text suppression,
+  incremental detok, stop-string detection, and finish reasons are
+  identical to `processStreamingRequest`. Tokens commit k+1 per round, so
+  each is held as pending until the next arrives; the last carries
+  is_done, with `deliverDone` fallback on early cancel. Stop-string
+  matches now also early-exit the round loop.
+- Verified: streamed deltas concatenate byte-identically to non-streaming
+  (temp=0), finish_reason=stop, depth controller + acceptance stats active
+  on the streaming request; TTFT additionally benefits from prefix
+  snapshots (repeat prompt streams ~instantly).
+
+Note: `zig fmt` mangled nothing, but watch an earlier edit mishap — a
+duplicated `processGuidedRequest` docstring was removed in the same
+commit.
