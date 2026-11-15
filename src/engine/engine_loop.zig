@@ -165,6 +165,37 @@ const StreamCallbackCtx = struct {
     }
 };
 
+/// Token sink that lets the MTP speculative loop drive the same streaming
+/// delivery semantics as the plain streaming path. Emitted tokens pass
+/// through StreamCallbackCtx (stop-token text suppression, incremental
+/// detokenization, stop-string detection, finish reasons) unchanged.
+///
+/// MTP commits tokens in batches of k+1 per round, but the wire protocol
+/// needs is_done only on the very last token; so each emitted token is held
+/// as `pending` until the next one arrives or generation ends.
+const MtpStreamer = struct {
+    ctx: *StreamCallbackCtx,
+    pending: ?u32 = null,
+
+    fn emit(self: *MtpStreamer, token: u32) void {
+        if (self.pending) |p| StreamCallbackCtx.callback(self.ctx, p, false);
+        self.pending = token;
+    }
+
+    /// True once the sink detected a stop string mid-stream; the generation
+    /// loop should stop emitting (further deliveries are suppressed anyway).
+    fn stopped(self: *const MtpStreamer) bool {
+        return self.ctx.stopped;
+    }
+
+    fn finish(self: *MtpStreamer) void {
+        if (self.pending) |p| {
+            self.pending = null;
+            StreamCallbackCtx.callback(self.ctx, p, true);
+        }
+    }
+};
+
 /// Concatenate two optional owned delta slices into one owned slice
 /// ("" when both are empty).
 fn joinDeltas(allocator: std.mem.Allocator, a: ?[]const u8, b: ?[]const u8) ![]const u8 {
@@ -566,7 +597,20 @@ pub const EngineLoop = struct {
             if (!req.streaming and (req.guided_json_schema != null or req.guided_regex != null)) {
                 self.processGuidedRequest(req, caches, gen_config);
             } else if (req.streaming) {
-                self.processStreamingRequest(req, caches, gen_config);
+                // Streaming requests can also use MTP speculative decoding:
+                // processMtpRequest delivers each emitted token through the
+                // same StreamCallbackCtx semantics as the plain streaming
+                // path. Vision prompts need a drafter with vision prefill;
+                // otherwise fall back to plain streaming decode.
+                var handled = false;
+                if (self.speculative_mtp) |n_drafts| {
+                    if (self.model.mtp) |mtp_ops| {
+                        if (req.vision == null or mtp_ops.prefillVision != null) {
+                            handled = self.tryMtpRequest(req, caches, gen_config, n_drafts);
+                        }
+                    }
+                }
+                if (!handled) self.processStreamingRequest(req, caches, gen_config);
             } else {
                 self.processNonStreamingRequest(req, caches, gen_config);
             }
@@ -2351,6 +2395,17 @@ pub const EngineLoop = struct {
         req.sampler.top_p = gen_config.top_p;
         const greedy = req.sampler.temperature <= 0.0;
 
+        // Streaming delivery: when the request is streaming, each emitted
+        // token goes through a StreamCallbackCtx (same semantics as
+        // processStreamingRequest); the final non-streaming delivery at the
+        // bottom of this function is skipped.
+        var stream_cb: ?StreamCallbackCtx = if (req.streaming)
+            StreamCallbackCtx.init(allocator, self.io, &req.completion, self.tokenizer, req.stop_strings, req.stop_tokens, req.max_tokens)
+        else
+            null;
+        defer if (stream_cb) |*sc| sc.deinit();
+        var streamer: ?MtpStreamer = if (stream_cb) |*sc| MtpStreamer{ .ctx = sc } else null;
+
         var context = std.ArrayList(u32).empty;
         defer context.deinit(allocator);
         context.appendSlice(allocator, req.prompt_tokens) catch {
@@ -2387,6 +2442,7 @@ pub const EngineLoop = struct {
             return;
         };
         context.append(allocator, t_next.token) catch return;
+        if (streamer) |*st| st.emit(t_next.token);
         var total_generated: usize = 1;
         var drafts_proposed: usize = 0;
         var drafts_accepted: usize = 0;
@@ -2461,6 +2517,14 @@ pub const EngineLoop = struct {
             // Client disconnect: truncate at the next round boundary instead
             // of generating to max_tokens.
             if (req.isCancelled()) break;
+            // A stop string matched in the streamed text: stop generating.
+            if (streamer) |*s2| {
+                if (s2.stopped()) {
+                    stopped = true;
+                    finish = .stop;
+                    break;
+                }
+            }
             // Depth for this round (flag value is the upper bound). Never
             // draft past max_tokens: a deeper chain than the remaining budget
             // is pure waste, since emission is capped anyway.
@@ -2598,6 +2662,7 @@ pub const EngineLoop = struct {
                     const st = generation_mod.generateStep(self.model, arr, caches, &req.sampler, self.ctx) catch break;
                     t_next = st;
                     context.append(allocator, t_next.token) catch break;
+                    if (streamer) |*s2| s2.emit(t_next.token);
                     total_generated += 1;
                     if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
                         stopped = true;
@@ -2762,6 +2827,7 @@ pub const EngineLoop = struct {
                 for (drafts.items[0..k]) |d| {
                     if (total_generated >= gen_config.max_tokens) break;
                     context.append(allocator, d) catch break;
+                    if (streamer) |*s2| s2.emit(d);
                     total_generated += 1;
                     drafts_accepted += 1;
                 }
@@ -2827,12 +2893,14 @@ pub const EngineLoop = struct {
             for (drafts.items[0..k]) |d| {
                 if (total_generated >= gen_config.max_tokens) break;
                 context.append(allocator, d) catch break;
+                if (streamer) |*s2| s2.emit(d);
                 total_generated += 1;
                 drafts_accepted += 1;
             }
             if (total_generated >= gen_config.max_tokens) break;
             t_next = next_sample;
             context.append(allocator, t_next.token) catch break;
+            if (streamer) |*s2| s2.emit(t_next.token);
             total_generated += 1;
             hidden.deinit();
             hidden = hidden_next_opt.?;
@@ -2944,6 +3012,17 @@ pub const EngineLoop = struct {
             });
         }
 
+        req.token_count = total_generated;
+        if (streamer) |*s2| {
+            // Streaming: the held-back pending token carries is_done so the
+            // wire sees exactly one final event; guarantee a done even when
+            // generation ended with nothing pending (e.g. early cancel).
+            s2.finish();
+            if (!req.completion.isDone(self.io)) {
+                req.completion.deliverDone(self.io, .stop);
+            }
+            return;
+        }
         const generated_slice = context.items[req.prompt_tokens.len..];
         const text = self.tokenizer.decode(stripTrailingStopToken(generated_slice, gen_config), allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
