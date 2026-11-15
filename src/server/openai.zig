@@ -50,6 +50,13 @@ pub const ChatCompletionRequest = struct {
         /// String content, or an array of content parts
         /// ({"type":"text","text":...} / {"type":"image_url","image_url":{"url":...}}).
         content: std.json.Value,
+        /// Historical assistant tool calls (OpenAI shape), re-rendered into
+        /// the model's native call format when building the prompt.
+        tool_calls: ?std.json.Value = null,
+        /// Present on role=tool messages; accepted for schema compatibility.
+        tool_call_id: ?[]const u8 = null,
+        /// Present on some clients' tool messages; accepted and unused.
+        name: ?[]const u8 = null,
     };
 
     pub const ResponseFormat = struct {
@@ -148,6 +155,8 @@ fn extractMessageContent(
 ) ![]const u8 {
     switch (content) {
         .string => |s| return allocator.dupe(u8, s),
+        // Null content is legal on assistant messages that carry tool_calls.
+        .null => return allocator.dupe(u8, ""),
         .array => |parts| {
             var text = std.ArrayList(u8).empty;
             errdefer text.deinit(allocator);
@@ -361,6 +370,11 @@ pub fn countPromptTokens(
 
 /// Apply the chat template to the extracted message texts (optionally with
 /// the vision blocks prepended to one user message) and tokenize.
+///
+/// For Qwen-family models, history is rendered in the native chat-template
+/// tool format: role=tool messages become user turns wrapping their content
+/// in <tool_response>, and assistant tool_calls are re-rendered as native
+/// <tool_call><function=...> blocks.
 fn tokenizeMessages(
     allocator: std.mem.Allocator,
     state: *ServerState,
@@ -369,22 +383,73 @@ fn tokenizeMessages(
     extra_system: ?[]const u8,
     vision: ?VisionInsert,
 ) ![]u32 {
+    const family = tool_calling_mod.detectFamily(state.model_name);
     var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
     defer messages.deinit(allocator);
     var merged: ?[]u8 = null;
     defer if (merged) |m| allocator.free(m);
+    var owned = std.ArrayList([]const u8).empty;
+    defer {
+        for (owned.items) |s| allocator.free(s);
+        owned.deinit(allocator);
+    }
+    var parsed_args = std.ArrayList(std.json.Parsed(std.json.Value)).empty;
+    defer {
+        for (parsed_args.items) |*p| p.deinit();
+        parsed_args.deinit(allocator);
+    }
     if (extra_system) |sys| {
         try messages.append(allocator, .{ .role = "system", .content = sys });
     }
     for (texts, 0..) |t, i| {
         var content = t;
+        var role = req_messages[i].role;
         if (vision) |v| {
             if (i == v.user_idx) {
                 merged = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ v.blocks_text, t });
                 content = merged.?;
             }
         }
-        try messages.append(allocator, .{ .role = req_messages[i].role, .content = content });
+        if (family == .qwen) {
+            if (std.mem.eql(u8, role, "tool")) {
+                const wrapped = try std.fmt.allocPrint(allocator, "<tool_response>\n{s}\n</tool_response>", .{content});
+                try owned.append(allocator, wrapped);
+                content = wrapped;
+                role = "user";
+            } else if (std.mem.eql(u8, role, "assistant")) {
+                if (req_messages[i].tool_calls) |tc| {
+                    if (tc == .array and tc.array.items.len > 0) {
+                        var buf = std.ArrayList(u8).empty;
+                        try buf.appendSlice(allocator, content);
+                        for (tc.array.items) |call| {
+                            if (call != .object) continue;
+                            const fn_v = call.object.get("function") orelse continue;
+                            if (fn_v != .object) continue;
+                            const name_v = fn_v.object.get("name") orelse continue;
+                            if (name_v != .string) continue;
+                            var args_val: ?std.json.Value = null;
+                            if (fn_v.object.get("arguments")) |a| {
+                                switch (a) {
+                                    .string => |s| {
+                                        const p = try std.json.parseFromSlice(std.json.Value, allocator, s, .{});
+                                        try parsed_args.append(allocator, p);
+                                        args_val = parsed_args.items[parsed_args.items.len - 1].value;
+                                    },
+                                    .object => args_val = a,
+                                    else => {},
+                                }
+                            }
+                            try buf.appendSlice(allocator, "\n");
+                            try tool_calling_mod.appendQwenNativeCall(&buf, allocator, name_v.string, args_val);
+                        }
+                        const owned_content = try buf.toOwnedSlice(allocator);
+                        try owned.append(allocator, owned_content);
+                        content = owned_content;
+                    }
+                }
+            }
+        }
+        try messages.append(allocator, .{ .role = role, .content = content });
     }
     const prompt_text = try state.chat_template.apply(messages.items, true);
     defer allocator.free(prompt_text);

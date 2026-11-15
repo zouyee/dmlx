@@ -546,6 +546,36 @@ fn buildGenericToolPrompt(allocator: std.mem.Allocator, tools: []const ToolDefin
     return try buildLlamaToolPrompt(allocator, tools);
 }
 
+/// Render a tool call in the native Qwen chat-template form:
+///   <tool_call>\n<function=name>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call>
+/// `arguments` is the parsed arguments object; string values render
+/// verbatim, everything else as JSON (matching the jinja template).
+pub fn appendQwenNativeCall(out: *std.ArrayList(u8), allocator: std.mem.Allocator, name: []const u8, arguments: ?std.json.Value) !void {
+    try out.appendSlice(allocator, "<tool_call>\n<function=");
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, ">\n");
+    if (arguments) |args| {
+        if (args == .object) {
+            var it = args.object.iterator();
+            while (it.next()) |entry| {
+                try out.appendSlice(allocator, "<parameter=");
+                try out.appendSlice(allocator, entry.key_ptr.*);
+                try out.appendSlice(allocator, ">\n");
+                switch (entry.value_ptr.*) {
+                    .string => |s| try out.appendSlice(allocator, s),
+                    else => |v| {
+                        const j = try std.json.Stringify.valueAlloc(allocator, v, .{});
+                        defer allocator.free(j);
+                        try out.appendSlice(allocator, j);
+                    },
+                }
+                try out.appendSlice(allocator, "\n</parameter>\n");
+            }
+        }
+    }
+    try out.appendSlice(allocator, "</function>\n</tool_call>");
+}
+
 // ============================================================
 // Unit Tests
 // ============================================================
