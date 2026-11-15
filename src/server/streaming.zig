@@ -9,6 +9,7 @@ const config_mod = @import("config.zig");
 const utils_mod = @import("utils.zig");
 const state_mod = @import("state.zig");
 const openai_mod = @import("openai.zig");
+const tool_calling_mod = @import("../tool_calling.zig");
 const metrics_mod = @import("metrics.zig");
 const sse_mod = @import("sse.zig");
 const ChatCompletionRequest = openai_mod.ChatCompletionRequest;
@@ -26,8 +27,9 @@ pub fn handleStreamingCompletion(
     state: *ServerState,
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
-    req: ChatCompletionRequest,
+    req_param: ChatCompletionRequest,
 ) !void {
+    var req = req_param;
     // 1. Send SSE response headers
     try writeSSEHeaders(connection, io);
 
@@ -46,8 +48,15 @@ pub fn handleStreamingCompletion(
     try sse.sendEvent(role_chunk);
 
     // 3-5. Build the prompt (text + optional image content parts, chat
-    // template, tokenize). Shared with the non-streaming handler.
-    var prepared = openai_mod.preparePrompt(allocator, state, req, null) catch |err| {
+    // template, tokenize). Shared with the non-streaming handler. Tool
+    // definitions inject a leading system prompt, same as non-streaming.
+    // Mirrors the non-streaming handler: applies tool_choice "none"
+    // stripping; validation already happened at HTTP dispatch.
+    openai_mod.resolveToolChoice(&req) catch unreachable;
+    var tool_system: ?[]u8 = null;
+    defer if (tool_system) |ts| allocator.free(ts);
+    tool_system = try openai_mod.buildToolSystem(allocator, req);
+    var prepared = openai_mod.preparePrompt(allocator, state, req, tool_system) catch |err| {
         const msg: []const u8 = switch (err) {
             error.VisionNotSupported => "vision input is not supported by the loaded model",
             error.ImageTooLarge => "decoded image exceeds the 20MB limit",
@@ -120,6 +129,16 @@ pub fn handleStreamingCompletion(
         }
     }
 
+    // Tool-enabled requests buffer the whole generation instead of streaming
+    // tokens: a tool call is only recognizable once the model's JSON output is
+    // complete, and OpenAI clients expect it as delta.tool_calls, never as
+    // content chunks. Non-tool output is flushed as a single content chunk.
+    // Keep-alives stay active until the buffered flush since no token chunks
+    // go out meanwhile.
+    const buffer_for_tools = tool_system != null;
+    var buffered = std.ArrayList(u8).empty;
+    defer buffered.deinit(allocator);
+
     while (true) {
         const event = req_state.completion.waitForToken(io) catch {
             // Fiber cancelled mid-stream: the engine may still be
@@ -131,6 +150,48 @@ pub fn handleStreamingCompletion(
         };
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
+            if (buffer_for_tools) {
+                try buffered.appendSlice(allocator, e.token_text);
+                if (!e.is_final) continue;
+                if (ka_running) {
+                    stop_keepalive.store(true, .release);
+                    ka_future.cancel(io);
+                    ka_running = false;
+                }
+                const finish: []const u8 = if (e.finish_reason) |fr|
+                    switch (fr) {
+                        .stop => "stop",
+                        .length => "length",
+                        .error_ => "stop",
+                    }
+                else
+                    "stop";
+                var sent = false;
+                const family = tool_calling_mod.detectFamily(req.model);
+                if (tool_calling_mod.parse(allocator, buffered.items, family) catch null) |pr| {
+                    defer pr.deinit();
+                    if (pr.calls.len > 0) {
+                        const calls_json = try openai_mod.formatToolCallsDeltaJson(allocator, pr.calls);
+                        defer allocator.free(calls_json);
+                        const chunk = try std.fmt.allocPrint(allocator,
+                            \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"tool_calls":{s}}},"finish_reason":"tool_calls"}}]}}
+                        , .{ completion_id, created, req.model, calls_json });
+                        defer allocator.free(chunk);
+                        try sse.sendEvent(chunk);
+                        sent = true;
+                    }
+                }
+                if (!sent) {
+                    const chunk = try formatSSEChunk(allocator, completion_id, created, req.model, buffered.items, finish);
+                    defer allocator.free(chunk);
+                    try sse.sendEvent(chunk);
+                }
+                sse.sendEvent("[DONE]") catch {
+                    abortStream(io, req_state, allocator);
+                    return;
+                };
+                break;
+            }
             if (ka_running) {
                 // First token: prefill is done, keep-alives are no longer
                 // needed. Join the fiber before any further writes so it

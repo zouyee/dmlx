@@ -391,6 +391,40 @@ fn tokenizeMessages(
     return state.tokenizer_strategy.encode(prompt_text, false, allocator);
 }
 
+// ------------------------------------------------------------------
+// Tool-calling prompt injection (shared by streaming + non-streaming)
+// ------------------------------------------------------------------
+
+/// Build the tool-calling system prompt for a request, or null when the
+/// request carries no usable tool definitions. Caller owns the string.
+pub fn buildToolSystem(allocator: std.mem.Allocator, req: ChatCompletionRequest) !?[]u8 {
+    const tools = req.tools orelse return null;
+    const family = tool_calling_mod.detectFamily(req.model);
+    var tool_defs = std.ArrayList(tool_calling_mod.ToolDefinition).empty;
+    defer {
+        for (tool_defs.items) |*td| {
+            allocator.free(td.name);
+            if (td.description) |d| allocator.free(d);
+            if (td.parameters) |p| allocator.free(p);
+        }
+        tool_defs.deinit(allocator);
+    }
+    for (tools) |tool| {
+        const fn_info = tool.function orelse continue;
+        const params_json = if (fn_info.parameters) |params| blk: {
+            const out = try std.json.Stringify.valueAlloc(allocator, params, .{});
+            break :blk out;
+        } else null;
+        try tool_defs.append(allocator, .{
+            .name = try allocator.dupe(u8, fn_info.name),
+            .description = if (fn_info.description) |d| try allocator.dupe(u8, d) else null,
+            .parameters = params_json,
+        });
+    }
+    if (tool_defs.items.len == 0) return null;
+    return try tool_calling_mod.buildToolSystemPrompt(allocator, tool_defs.items, family);
+}
+
 pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *ServerState, request_json: []const u8, server_config: ServerConfig) ![]u8 {
     const t_entry = std.c.mach_absolute_time();
     // 1. Parse request
@@ -417,33 +451,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     // tokenize. Tool definitions inject a leading system prompt.
     var tool_system: ?[]u8 = null;
     defer if (tool_system) |ts| allocator.free(ts);
-    if (req.tools) |tools| {
-        const family = tool_calling_mod.detectFamily(req.model);
-        var tool_defs = std.ArrayList(tool_calling_mod.ToolDefinition).empty;
-        defer {
-            for (tool_defs.items) |*td| {
-                allocator.free(td.name);
-                if (td.description) |d| allocator.free(d);
-                if (td.parameters) |p| allocator.free(p);
-            }
-            tool_defs.deinit(allocator);
-        }
-        for (tools) |tool| {
-            const fn_info = tool.function orelse continue;
-            const params_json = if (fn_info.parameters) |params| blk: {
-                const out = try std.json.Stringify.valueAlloc(allocator, params, .{});
-                break :blk out;
-            } else null;
-            try tool_defs.append(allocator, .{
-                .name = try allocator.dupe(u8, fn_info.name),
-                .description = if (fn_info.description) |d| try allocator.dupe(u8, d) else null,
-                .parameters = params_json,
-            });
-        }
-        if (tool_defs.items.len > 0) {
-            tool_system = try tool_calling_mod.buildToolSystemPrompt(allocator, tool_defs.items, family);
-        }
-    }
+    tool_system = try buildToolSystem(allocator, req);
 
     var prepared = preparePrompt(allocator, state, req, tool_system) catch |err| {
         const msg: []const u8 = switch (err) {
@@ -670,6 +678,32 @@ pub fn formatToolCallsJson(allocator: std.mem.Allocator, calls: []const tool_cal
     return out.toOwnedSlice(allocator);
 }
 
+/// Delta-shaped `tool_calls` for streaming chunks: same serialization as
+/// formatToolCallsJson plus the per-call "index" field OpenAI clients expect
+/// inside streaming deltas.
+pub fn formatToolCallsDeltaJson(allocator: std.mem.Allocator, calls: []const tool_calling_mod.ToolCall) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.appendSlice(allocator, "[");
+    for (calls, 0..) |call, i| {
+        if (i > 0) try out.appendSlice(allocator, ",");
+        var escaped_id = std.ArrayList(u8).empty;
+        defer escaped_id.deinit(allocator);
+        try jsonEscapeInto(&escaped_id, allocator, call.id);
+        var escaped_name = std.ArrayList(u8).empty;
+        defer escaped_name.deinit(allocator);
+        try jsonEscapeInto(&escaped_name, allocator, call.function.name);
+        var escaped_args = std.ArrayList(u8).empty;
+        defer escaped_args.deinit(allocator);
+        try jsonEscapeInto(&escaped_args, allocator, call.function.arguments);
+        try out.print(allocator,
+            \\{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}
+        , .{ i, escaped_id.items, escaped_name.items, escaped_args.items });
+    }
+    try out.appendSlice(allocator, "]");
+    return out.toOwnedSlice(allocator);
+}
+
 /// Keep-alive threshold in milliseconds (5 seconds).
 const keep_alive_threshold_ms: i64 = 5000;
 
@@ -815,6 +849,40 @@ test "formatToolCallsJson escapes arguments with braces, quotes and unicode" {
     try std.testing.expectEqualStrings("f\\n", f1.get("name").?.string);
     try std.testing.expectEqualStrings("{\"nested\": {\"a\": [1, 2]}}", f1.get("arguments").?.string);
     try std.testing.expectEqualStrings("call_\"2\"", arr.items[1].object.get("id").?.string);
+}
+
+test "formatToolCallsDeltaJson adds per-call index and escapes arguments" {
+    const allocator = std.testing.allocator;
+    const calls = [_]tool_calling_mod.ToolCall{
+        .{
+            .id = "call_1",
+            .type = "function",
+            .function = .{
+                .name = "get_weather",
+                .arguments = "{\"city\": \"Paris\"}",
+            },
+        },
+        .{
+            .id = "call_2",
+            .type = "function",
+            .function = .{
+                .name = "get_time",
+                .arguments = "{\"tz\": \"UTC\"}",
+            },
+        },
+    };
+    const json = try formatToolCallsDeltaJson(allocator, &calls);
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array;
+    try std.testing.expectEqual(@as(usize, 2), arr.items.len);
+    try std.testing.expectEqual(@as(i64, 0), arr.items[0].object.get("index").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), arr.items[1].object.get("index").?.integer);
+    const f0 = arr.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings("get_weather", f0.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"city\": \"Paris\"}", f0.get("arguments").?.string);
 }
 
 test "validateChatRequest reports unsupported tool_choice forms" {
