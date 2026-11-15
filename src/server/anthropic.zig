@@ -12,6 +12,8 @@ const jsonEscapeInto = utils_mod.jsonEscapeInto;
 const http_mod = @import("http.zig");
 const writeJsonResponse = http_mod.writeJsonResponse;
 const metrics_mod = @import("metrics.zig");
+const sse_mod = @import("sse.zig");
+const tool_calling_mod = @import("../tool_calling.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;
@@ -29,9 +31,7 @@ const AnthropicRequest = struct {
     system: ?[]const u8 = null,
     /// Anthropic tool_choice: {"type":"auto"|"any"|"none"|"tool"}. Mapped to
     /// the OpenAI policy: auto→auto, none→none, any→required, tool→named.
-    /// Since this endpoint does not implement tool execution at all, "auto"
-    /// and "none" are accepted (both behave as none); "any"/"tool" would
-    /// require forced-call machinery we don't have and are rejected.
+    /// "any"/"tool" would force a call; rejected.
     tool_choice: ?AnthropicToolChoice = null,
 
     pub const AnthropicMessage = struct {
@@ -45,35 +45,254 @@ const AnthropicRequest = struct {
     };
 };
 
-/// Anthropic tool_choice support policy, mirroring the OpenAI one in
-/// openai.zig: "auto"/"none" are accepted (this endpoint executes no tools,
-/// so both behave as none); "any"/"tool" would force a call and are
-/// rejected with the message returned here.
+/// Anthropic tool_choice support policy: "auto" enables tools, "none" strips
+/// them; "any"/"tool" would force a call and are rejected with the message
+/// returned here.
 pub fn unsupportedToolChoiceMsg(tc: AnthropicRequest.AnthropicToolChoice) ?[]const u8 {
     if (std.mem.eql(u8, tc.type, "auto") or std.mem.eql(u8, tc.type, "none")) return null;
     return "tool_choice 'any'/'tool' (forced calls) are not supported by this server (use 'auto' or 'none')";
 }
 
-/// Format an Anthropic Messages API response.
+// ------------------------------------------------------------------
+// Response blocks
+// ------------------------------------------------------------------
+
+const ToolUseBlock = struct {
+    id: []const u8,
+    name: []const u8,
+    /// Serialized JSON object string for the `input` field.
+    input_json: []const u8,
+};
+
+const ResponseBlock = union(enum) {
+    text: []const u8,
+    tool_use: ToolUseBlock,
+};
+
+fn writeEscaped(w: anytype, allocator: std.mem.Allocator, text: []const u8) !void {
+    var escaped = std.ArrayList(u8).empty;
+    defer escaped.deinit(allocator);
+    try jsonEscapeInto(&escaped, allocator, text);
+    try w.appendSlice(allocator, escaped.items);
+}
+
+/// Serialize one content block into `out` (`{"type":"text",...}` or
+/// `{"type":"tool_use",...}`).
+fn appendContentBlockJson(out: *std.ArrayList(u8), allocator: std.mem.Allocator, block: ResponseBlock) !void {
+    switch (block) {
+        .text => |t| {
+            try out.appendSlice(allocator, "{\"type\":\"text\",\"text\":\"");
+            try writeEscaped(out, allocator, t);
+            try out.appendSlice(allocator, "\"}");
+        },
+        .tool_use => |tu| {
+            try out.appendSlice(allocator, "{\"type\":\"tool_use\",\"id\":\"");
+            try writeEscaped(out, allocator, tu.id);
+            try out.appendSlice(allocator, "\",\"name\":\"");
+            try writeEscaped(out, allocator, tu.name);
+            try out.appendSlice(allocator, "\",\"input\":");
+            try out.appendSlice(allocator, if (tu.input_json.len > 0) tu.input_json else "{}");
+            try out.appendSlice(allocator, "}");
+        },
+    }
+}
+
+/// Build the non-streaming Messages API response body.
 fn formatAnthropicResponse(
     allocator: std.mem.Allocator,
     model: []const u8,
-    text: []const u8,
+    blocks: []const ResponseBlock,
     input_tokens: usize,
     output_tokens: usize,
     stop_reason: []const u8,
 ) ![]u8 {
-    var escaped = std.ArrayList(u8).empty;
-    defer escaped.deinit(allocator);
-    try jsonEscapeInto(&escaped, allocator, text);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(allocator);
+    try content.appendSlice(allocator, "[");
+    for (blocks, 0..) |b, i| {
+        if (i > 0) try content.appendSlice(allocator, ",");
+        try appendContentBlockJson(&content, allocator, b);
+    }
+    try content.appendSlice(allocator, "]");
+
+    var escaped_model = std.ArrayList(u8).empty;
+    defer escaped_model.deinit(allocator);
+    try jsonEscapeInto(&escaped_model, allocator, model);
 
     return try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_1","type":"message","role":"assistant","content":[{{"type":"text","text":"{s}"}}],"model":"{s}","stop_reason":"{s}","usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
-    , .{ escaped.items, model, stop_reason, input_tokens, output_tokens });
+        \\{{"id":"msg_1","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+    , .{ content.items, escaped_model.items, stop_reason, input_tokens, output_tokens });
 }
 
 // ------------------------------------------------------------------
-// OpenAI request parsing & response generation (using Generation API)
+// Request translation (flexible content blocks, tools, system arrays)
+// ------------------------------------------------------------------
+
+const TranslateError = error{ InvalidRequest, OutOfMemory };
+
+/// Render a historical assistant tool call in the same textual format the
+/// injected tool system prompt asks the model to produce, so the prompt and
+/// the conversation history stay consistent per model family.
+fn appendHistoricalCall(out: *std.ArrayList(u8), allocator: std.mem.Allocator, family: tool_calling_mod.ModelFamily, name: []const u8, input_json: []const u8) !void {
+    const open_tag: []const u8 = switch (family) {
+        .qwen => "<tool_call>\n",
+        else => "<|python_tag|>",
+    };
+    const close_tag: []const u8 = switch (family) {
+        .qwen => "\n</tool_call>",
+        else => "",
+    };
+    try out.appendSlice(allocator, open_tag);
+    try out.appendSlice(allocator, "{\"name\": \"");
+    try out.appendSlice(allocator, name);
+    try out.appendSlice(allocator, "\", \"arguments\": ");
+    try out.appendSlice(allocator, if (input_json.len > 0) input_json else "{}");
+    try out.appendSlice(allocator, "}");
+    try out.appendSlice(allocator, close_tag);
+}
+
+/// Flatten an Anthropic `content` value (string or block array) into plain
+/// text for the chat template. tool_use/tool_result blocks are rendered as
+/// text in the family's call format / "Tool 'name' result:" convention.
+fn flattenContent(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content: std.json.Value, family: tool_calling_mod.ModelFamily) TranslateError!void {
+    switch (content) {
+        .string => |s| try out.appendSlice(allocator, s),
+        .array => |blocks| {
+            for (blocks.items) |b| {
+                const obj = switch (b) {
+                    .object => |o| o,
+                    else => continue,
+                };
+                const btype = if (obj.get("type")) |t| switch (t) {
+                    .string => |s| s,
+                    else => continue,
+                } else continue;
+                if (std.mem.eql(u8, btype, "text")) {
+                    if (obj.get("text")) |t| {
+                        switch (t) {
+                            .string => |s| try out.appendSlice(allocator, s),
+                            else => {},
+                        }
+                    }
+                } else if (std.mem.eql(u8, btype, "tool_use")) {
+                    const name = if (obj.get("name")) |n| (if (n == .string) n.string else "?") else "?";
+                    var input_json: []const u8 = "{}";
+                    if (obj.get("input")) |inp| {
+                        input_json = try std.json.Stringify.valueAlloc(allocator, inp, .{});
+                    }
+                    try appendHistoricalCall(out, allocator, family, name, input_json);
+                    try out.appendSlice(allocator, "\n");
+                } else if (std.mem.eql(u8, btype, "tool_result")) {
+                    try out.appendSlice(allocator, "Tool result: ");
+                    if (obj.get("content")) |rc| {
+                        switch (rc) {
+                            .string => |s| try out.appendSlice(allocator, s),
+                            .array => |parts| {
+                                for (parts.items) |p| {
+                                    if (p != .object) continue;
+                                    const pt = p.object.get("type") orelse continue;
+                                    if (pt != .string or !std.mem.eql(u8, pt.string, "text")) continue;
+                                    const txt = p.object.get("text") orelse continue;
+                                    if (txt == .string) try out.appendSlice(allocator, txt.string);
+                                }
+                            },
+                            else => {},
+                        }
+                    }
+                    try out.appendSlice(allocator, "\n");
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+// ------------------------------------------------------------------
+// SSE (simulated streaming from the completed generation)
+// ------------------------------------------------------------------
+
+fn sendSSE(sse: *sse_mod.SSEWriter, allocator: std.mem.Allocator, event: []const u8, data: []const u8) !void {
+    _ = allocator;
+    try sse.sendNamedEvent(event, data);
+}
+
+fn streamBlocks(
+    allocator: std.mem.Allocator,
+    sse: *sse_mod.SSEWriter,
+    model: []const u8,
+    blocks: []const ResponseBlock,
+    stop_reason: []const u8,
+    input_tokens: usize,
+    output_tokens: usize,
+) !void {
+    var model_esc = std.ArrayList(u8).empty;
+    defer model_esc.deinit(allocator);
+    try jsonEscapeInto(&model_esc, allocator, model);
+
+    const msg_start = try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_start","message":{{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"usage":{{"input_tokens":{d},"output_tokens":0}}}}}}
+    , .{ model_esc.items, input_tokens });
+    defer allocator.free(msg_start);
+    try sendSSE(sse, allocator, "message_start", msg_start);
+
+    for (blocks, 0..) |b, i| {
+        switch (b) {
+            .text => |t| {
+                const start = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                , .{i});
+                defer allocator.free(start);
+                try sendSSE(sse, allocator, "content_block_start", start);
+
+                var esc = std.ArrayList(u8).empty;
+                defer esc.deinit(allocator);
+                try jsonEscapeInto(&esc, allocator, t);
+                const delta = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"text_delta","text":"{s}"}}}}
+                , .{ i, esc.items });
+                defer allocator.free(delta);
+                try sendSSE(sse, allocator, "content_block_delta", delta);
+            },
+            .tool_use => |tu| {
+                var id_esc = std.ArrayList(u8).empty;
+                defer id_esc.deinit(allocator);
+                try jsonEscapeInto(&id_esc, allocator, tu.id);
+                var name_esc = std.ArrayList(u8).empty;
+                defer name_esc.deinit(allocator);
+                try jsonEscapeInto(&name_esc, allocator, tu.name);
+                const start = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":"{s}","input":{{}}}}}}
+                , .{ i, id_esc.items, name_esc.items });
+                defer allocator.free(start);
+                try sendSSE(sse, allocator, "content_block_start", start);
+
+                var args_esc = std.ArrayList(u8).empty;
+                defer args_esc.deinit(allocator);
+                try jsonEscapeInto(&args_esc, allocator, tu.input_json);
+                const delta = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
+                , .{ i, args_esc.items });
+                defer allocator.free(delta);
+                try sendSSE(sse, allocator, "content_block_delta", delta);
+            },
+        }
+        const stop = try std.fmt.allocPrint(allocator,
+            \\{{"type":"content_block_stop","index":{d}}}
+        , .{i});
+        defer allocator.free(stop);
+        try sendSSE(sse, allocator, "content_block_stop", stop);
+    }
+
+    const msg_delta = try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}"}},"usage":{{"output_tokens":{d}}}}}
+    , .{ stop_reason, output_tokens });
+    defer allocator.free(msg_delta);
+    try sendSSE(sse, allocator, "message_delta", msg_delta);
+    try sendSSE(sse, allocator, "message_stop", "{\"type\":\"message_stop\"}");
+}
+
+// ------------------------------------------------------------------
+// Request handler
 // ------------------------------------------------------------------
 
 pub fn handleAnthropicMessages(
@@ -85,48 +304,163 @@ pub fn handleAnthropicMessages(
     body: []const u8,
     status_out: *u16,
 ) !void {
-    const parsed = std.json.parseFromSlice(AnthropicRequest, allocator, body, .{}) catch {
+    // Request-scoped scratch space for composed message text and the tool
+    // system prompt; everything built here dies when the handler returns.
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const arena = arena_inst.allocator();
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         status_out.* = 400;
         try writeJsonResponse(connection, io, 400, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid_json\"}}");
         return;
     };
     defer parsed.deinit();
-    const req = parsed.value;
+    if (parsed.value != .object) {
+        status_out.* = 400;
+        try writeJsonResponse(connection, io, 400, "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"invalid_json\"}}");
+        return;
+    }
+    const root_obj = parsed.value.object;
+
+    const reject = struct {
+        fn send(conn: std.Io.net.Stream, io2: std.Io, status: *u16, a: std.mem.Allocator, msg: []const u8) !void {
+            const err_body = try std.fmt.allocPrint(a,
+                \\{{"type":"error","error":{{"type":"invalid_request_error","message":"{s}"}}}}
+            , .{msg});
+            defer a.free(err_body);
+            status.* = 400;
+            try writeJsonResponse(conn, io2, 400, err_body);
+        }
+    }.send;
+
+    const model: []const u8 = if (root_obj.get("model")) |m| switch (m) {
+        .string => |s| s,
+        else => "default",
+    } else "default";
+
+    var max_tokens: u32 = 1024;
+    if (root_obj.get("max_tokens")) |mt| {
+        switch (mt) {
+            .integer => |v| max_tokens = @intCast(@max(1, v)),
+            else => {},
+        }
+    }
+    const temperature: ?f32 = if (root_obj.get("temperature")) |t| switch (t) {
+        .float => |f| @floatCast(f),
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    } else null;
+    const top_p: ?f32 = if (root_obj.get("top_p")) |t| switch (t) {
+        .float => |f| @floatCast(f),
+        .integer => |v| @floatFromInt(v),
+        else => null,
+    } else null;
+    const top_k: ?u32 = if (root_obj.get("top_k")) |t| switch (t) {
+        .integer => |v| @intCast(v),
+        else => null,
+    } else null;
+    const want_stream = if (root_obj.get("stream")) |s| switch (s) {
+        .bool => |b| b,
+        else => false,
+    } else false;
 
     // Validate sampling overrides and tool_choice support before doing work.
     {
-        var reject: ?[]const u8 = null;
-        if (req.top_p) |p| {
-            if (!(p > 0.0 and p <= 1.0)) reject = "top_p must be in the range (0, 1]";
+        var msg: ?[]const u8 = null;
+        if (top_p) |p| {
+            if (!(p > 0.0 and p <= 1.0)) msg = "top_p must be in the range (0, 1]";
         }
-        if (req.top_k) |k| {
-            if (k == 0) reject = "top_k must be >= 1";
+        if (top_k) |k| {
+            if (k == 0) msg = "top_k must be >= 1";
         }
-        if (req.tool_choice) |tc| {
-            reject = unsupportedToolChoiceMsg(tc) orelse reject;
+        if (root_obj.get("tool_choice")) |tcv| {
+            if (tcv == .object) {
+                if (tcv.object.get("type")) |tv| {
+                    if (tv == .string) {
+                        msg = unsupportedToolChoiceMsg(.{ .type = tv.string }) orelse msg;
+                    }
+                }
+            }
         }
-        if (reject) |msg| {
-            const err_body = try std.fmt.allocPrint(allocator,
-                \\{{"type":"error","error":{{"type":"invalid_request_error","message":"{s}"}}}}
-            , .{msg});
-            defer allocator.free(err_body);
-            status_out.* = 400;
-            try writeJsonResponse(connection, io, 400, err_body);
+        if (msg) |m| {
+            try reject(connection, io, status_out, allocator, m);
             return;
         }
     }
+    const tools_none = blk: {
+        if (root_obj.get("tool_choice")) |tcv| {
+            if (tcv == .object) {
+                if (tcv.object.get("type")) |tv| {
+                    if (tv == .string and std.mem.eql(u8, tv.string, "none")) break :blk true;
+                }
+            }
+        }
+        break :blk false;
+    };
 
-    // Map Anthropic messages to internal format
+    const family = tool_calling_mod.detectFamily(model);
+
+    // Map Anthropic messages to internal format. Content may be a string or
+    // an array of text/tool_use/tool_result blocks.
     var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
     defer messages.deinit(allocator);
 
-    // Add system message if provided
-    if (req.system) |sys| {
-        try messages.append(allocator, .{ .role = "system", .content = sys });
+    if (root_obj.get("system")) |sys| {
+        var sys_buf = std.ArrayList(u8).empty;
+        try flattenContent(&sys_buf, arena, sys, family);
+        if (sys_buf.items.len > 0) {
+            try messages.append(allocator, .{ .role = "system", .content = sys_buf.items });
+        }
     }
 
-    for (req.messages) |msg| {
-        try messages.append(allocator, .{ .role = msg.role, .content = msg.content });
+    if (root_obj.get("messages")) |msgs| {
+        if (msgs == .array) {
+            for (msgs.array.items) |mv| {
+                if (mv != .object) continue;
+                const role = if (mv.object.get("role")) |r| switch (r) {
+                    .string => |s| s,
+                    else => "user",
+                } else "user";
+                var buf = std.ArrayList(u8).empty;
+                if (mv.object.get("content")) |cv| {
+                    try flattenContent(&buf, arena, cv, family);
+                }
+                try messages.append(allocator, .{ .role = role, .content = buf.items });
+            }
+        }
+    }
+
+    // Tools: Anthropic shape {name, description, input_schema}. Injected as a
+    // system prompt, same mechanism as the OpenAI endpoint.
+    if (!tools_none) {
+        if (root_obj.get("tools")) |tv| {
+            if (tv == .array and tv.array.items.len > 0) {
+                var tool_defs = std.ArrayList(tool_calling_mod.ToolDefinition).empty;
+                for (tv.array.items) |t| {
+                    if (t != .object) continue;
+                    const name_v = t.object.get("name") orelse continue;
+                    if (name_v != .string) continue;
+                    const desc: ?[]const u8 = if (t.object.get("description")) |d| switch (d) {
+                        .string => |s| s,
+                        else => null,
+                    } else null;
+                    const schema: ?[]const u8 = if (t.object.get("input_schema")) |sc|
+                        try std.json.Stringify.valueAlloc(arena, sc, .{})
+                    else
+                        null;
+                    try tool_defs.append(arena, .{
+                        .name = try arena.dupe(u8, name_v.string),
+                        .description = if (desc) |d| try arena.dupe(u8, d) else null,
+                        .parameters = schema,
+                    });
+                }
+                if (tool_defs.items.len > 0) {
+                    const sys_prompt = try tool_calling_mod.buildToolSystemPrompt(arena, tool_defs.items, family);
+                    try messages.insert(allocator, 0, .{ .role = "system", .content = sys_prompt });
+                }
+            }
+        }
     }
 
     // Apply chat template
@@ -138,21 +472,20 @@ pub fn handleAnthropicMessages(
     defer allocator.free(prompt_tokens);
 
     // Generate
-    const max_tokens = @min(req.max_tokens, @as(u32, @intCast(server_config.max_tokens)));
-    const temperature = req.temperature orelse server_config.temperature;
+    const capped_max = @min(max_tokens, @as(u32, @intCast(server_config.max_tokens)));
     const seed = @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
 
     // Submit to engine queue.
     const request_config = engine.RequestConfig{
         .prompt_tokens = prompt_tokens,
-        .max_tokens = max_tokens,
-        .temperature = temperature,
-        .top_k = if (req.top_k) |k| @as(usize, k) else server_config.top_k,
-        .top_p = req.top_p orelse server_config.top_p,
+        .max_tokens = capped_max,
+        .temperature = temperature orelse server_config.temperature,
+        .top_k = if (top_k) |k| @as(usize, k) else server_config.top_k,
+        .top_p = top_p orelse server_config.top_p,
         .seed = seed,
         .stop_tokens = state.stop_tokens,
         .streaming = false,
-        .model_name = req.model,
+        .model_name = model,
         .api_format = .anthropic,
     };
 
@@ -204,18 +537,48 @@ pub fn handleAnthropicMessages(
     // token_count reads below and the deferred deinit are race-free.
     req_state.waitEngineDone(io);
 
-    // Format Anthropic response
+    // Tool-call detection on the completed output.
+    var blocks = std.ArrayList(ResponseBlock).empty;
+    defer blocks.deinit(allocator);
+    if (try tool_calling_mod.parse(allocator, all_text.items, family)) |pr| {
+        defer pr.deinit();
+        if (pr.calls.len > 0) {
+            for (pr.calls) |call| {
+                // pr owns these strings and is deinit'd at scope end — copy
+                // into the request arena so the blocks outlive the parse result.
+                try blocks.append(allocator, .{ .tool_use = .{
+                    .id = try arena.dupe(u8, call.id),
+                    .name = try arena.dupe(u8, call.function.name),
+                    .input_json = try arena.dupe(u8, call.function.arguments),
+                } });
+            }
+            stop_reason = "tool_use";
+        }
+    }
+    if (blocks.items.len == 0) {
+        try blocks.append(allocator, .{ .text = all_text.items });
+    }
+
+    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
+
+    if (want_stream) {
+        status_out.* = 200;
+        try sse_mod.writeSSEHeaders(connection, io);
+        var sse = sse_mod.SSEWriter{ .connection = connection, .io = io };
+        try streamBlocks(allocator, &sse, model, blocks.items, stop_reason, prompt_tokens.len, req_state.token_count);
+        return;
+    }
+
     const response = try formatAnthropicResponse(
         allocator,
-        req.model,
-        all_text.items,
+        model,
+        blocks.items,
         prompt_tokens.len,
         req_state.token_count,
         stop_reason,
     );
     defer allocator.free(response);
 
-    metrics_mod.global.addTokenCounts(@intCast(prompt_tokens.len), @intCast(req_state.token_count));
     status_out.* = 200;
     try writeJsonResponse(connection, io, 200, response);
 }
@@ -246,4 +609,46 @@ test "AnthropicRequest parses top_p/top_k/tool_choice" {
     try std.testing.expectEqualStrings("tool", tc.type);
     try std.testing.expectEqualStrings("f", tc.name.?);
     try std.testing.expect(unsupportedToolChoiceMsg(tc) != null);
+}
+
+test "formatAnthropicResponse emits tool_use blocks with object input" {
+    const allocator = std.testing.allocator;
+    const blocks = [_]ResponseBlock{
+        .{ .text = "Let me check." },
+        .{ .tool_use = .{ .id = "toolu_1", .name = "get_weather", .input_json = "{\"city\":\"Paris\"}" } },
+    };
+    const json = try formatAnthropicResponse(allocator, "m", &blocks, 10, 5, "tool_use");
+    defer allocator.free(json);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("tool_use", obj.get("stop_reason").?.string);
+    const content = obj.get("content").?.array;
+    try std.testing.expectEqual(@as(usize, 2), content.items.len);
+    try std.testing.expectEqualStrings("text", content.items[0].object.get("type").?.string);
+    const tu = content.items[1].object;
+    try std.testing.expectEqualStrings("tool_use", tu.get("type").?.string);
+    try std.testing.expectEqualStrings("get_weather", tu.get("name").?.string);
+    // input must be an embedded JSON object, not an escaped string
+    try std.testing.expect(tu.get("input").? == .object);
+    try std.testing.expectEqualStrings("Paris", tu.get("input").?.object.get("city").?.string);
+}
+
+test "flattenContent renders block arrays and tool history" {
+    const allocator = std.testing.allocator;
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const body =
+        \\[{"type":"text","text":"weather?"},{"type":"tool_use","id":"t1","name":"get_weather","input":{"city":"Paris"}},{"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"sunny"}]}]
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(arena_inst.allocator());
+    try flattenContent(&out, arena_inst.allocator(), parsed.value, .qwen);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "weather?") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\": \"get_weather\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "Tool result: sunny") != null);
 }

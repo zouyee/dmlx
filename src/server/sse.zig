@@ -35,6 +35,17 @@ pub const SSEWriter = struct {
         try w.interface.flush();
     }
 
+    /// Write an SSE event with a named `event:` line:
+    ///   event: <name>\ndata: <payload>\n\n
+    pub fn sendNamedEvent(self: *SSEWriter, event: []const u8, data: []const u8) !void {
+        var w = self.connection.writer(self.io, &self.buf);
+        try w.interface.writeAll("event: ");
+        try w.interface.writeAll(event);
+        try w.interface.writeAll("\n");
+        try writeSSEEvent(&w.interface, data);
+        try w.interface.flush();
+    }
+
     pub fn sendKeepAlive(self: *SSEWriter) !void {
         var w = self.connection.writer(self.io, &self.buf);
         try writeSSEKeepAlive(&w.interface);
