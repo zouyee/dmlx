@@ -62,8 +62,6 @@ def decide(body, tokens):
         return "local", "no cloud key configured (local-only mode)"
     if tokens > LOCAL_MAX_TOK:
         return "cloud", f"prompt ~{tokens} tok > local ceiling {LOCAL_MAX_TOK} (prefill ~110 tok/s)"
-    if body.get("tools") and body.get("stream"):
-        return "cloud", "stream+tools: local streaming path does not inject tool definitions yet"
     return "local", f"prompt ~{tokens} tok fits local budget"
 
 
