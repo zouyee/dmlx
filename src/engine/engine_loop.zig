@@ -115,11 +115,15 @@ const StreamCallbackCtx = struct {
         const self: *StreamCallbackCtx = @ptrCast(@alignCast(ctx_ptr));
         if (self.stopped) return;
 
+        // Stop tokens are control tokens: their text (e.g. "<|im_end|>") must
+        // not leak into the output.
+        const is_stop = generation_mod.isStopToken(token, self.stop_tokens);
+
         // Incremental decode: cumulative full-sequence decode + diff, so
         // concatenated deltas match the non-streaming decode byte-exactly
         // (leading spaces on non-initial tokens survive; the leading-space
         // strip applies once to the first token).
-        const delta = self.detok.addToken(token) catch return;
+        const delta: ?[]u8 = if (is_stop) null else self.detok.addToken(token) catch return;
         defer if (delta) |d| self.allocator.free(d);
         self.token_count += 1;
 
@@ -130,7 +134,7 @@ const StreamCallbackCtx = struct {
         // is_done means max_tokens truncation → .length.
         var finish_reason: ?TokenFinishReason = null;
         if (is_done) {
-            finish_reason = if (generation_mod.isStopToken(token, self.stop_tokens)) .stop else .length;
+            finish_reason = if (is_stop) .stop else .length;
         }
         if (self.stop_strings) |stop_strings| {
             for (stop_strings) |stop_str| {
@@ -178,6 +182,13 @@ fn finishReasonForTokens(tokens: []const u32, gen_config: GenerateConfig) TokenF
     if (tokens.len > 0 and generation_mod.isStopToken(tokens[tokens.len - 1], gen_config.stop_tokens)) return .stop;
     if (tokens.len >= gen_config.max_tokens) return .length;
     return .stop;
+}
+
+/// Token view excluding a trailing stop token: stop tokens are control tokens
+/// whose text (e.g. "<|im_end|>") must not leak into the decoded output.
+fn stripTrailingStopToken(tokens: []const u32, gen_config: GenerateConfig) []const u32 {
+    if (tokens.len > 0 and generation_mod.isStopToken(tokens[tokens.len - 1], gen_config.stop_tokens)) return tokens[0 .. tokens.len - 1];
+    return tokens;
 }
 
 /// Three-way finish verdict for streaming callbacks that see only the final
@@ -1159,7 +1170,7 @@ pub const EngineLoop = struct {
         }
 
         // Decode all tokens to text.
-        const text = self.tokenizer.decode(tokens, self.allocator) catch {
+        const text = self.tokenizer.decode(stripTrailingStopToken(tokens, gen_config), self.allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
             return;
         };
@@ -1237,7 +1248,7 @@ pub const EngineLoop = struct {
 
         // Check if first token is a stop token
         if (generation_mod.isStopToken(first_result.token, gen_config.stop_tokens)) {
-            const text = self.tokenizer.decode(context.items[req.prompt_tokens.len..], self.allocator) catch {
+            const text = self.tokenizer.decode(stripTrailingStopToken(context.items[req.prompt_tokens.len..], gen_config), self.allocator) catch {
                 req.completion.deliverError(self.io, "Failed to decode tokens");
                 return;
             };
@@ -1325,7 +1336,7 @@ pub const EngineLoop = struct {
 
         // Decode generated tokens to text
         const generated_slice = context.items[req.prompt_tokens.len..];
-        const text = self.tokenizer.decode(generated_slice, self.allocator) catch {
+        const text = self.tokenizer.decode(stripTrailingStopToken(generated_slice, gen_config), self.allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
             return;
         };
@@ -2934,7 +2945,7 @@ pub const EngineLoop = struct {
         }
 
         const generated_slice = context.items[req.prompt_tokens.len..];
-        const text = self.tokenizer.decode(generated_slice, allocator) catch {
+        const text = self.tokenizer.decode(stripTrailingStopToken(generated_slice, gen_config), allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
             return;
         };
@@ -3010,7 +3021,7 @@ pub const EngineLoop = struct {
         defer self.allocator.free(tokens);
 
         // Decode tokens to text
-        const text = self.tokenizer.decode(tokens, self.allocator) catch {
+        const text = self.tokenizer.decode(stripTrailingStopToken(tokens, gen_config), self.allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode guided tokens");
             return;
         };
@@ -3131,7 +3142,7 @@ pub const EngineLoop = struct {
         };
         defer self.allocator.free(tokens);
 
-        const text = self.tokenizer.decode(tokens, self.allocator) catch {
+        const text = self.tokenizer.decode(stripTrailingStopToken(tokens, gen_config), self.allocator) catch {
             req.completion.deliverError(self.io, "Failed to decode tokens");
             return;
         };
