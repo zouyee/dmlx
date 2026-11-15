@@ -132,23 +132,48 @@ const TranslateError = error{ InvalidRequest, OutOfMemory };
 
 /// Render a historical assistant tool call in the same textual format the
 /// injected tool system prompt asks the model to produce, so the prompt and
-/// the conversation history stay consistent per model family.
-fn appendHistoricalCall(out: *std.ArrayList(u8), allocator: std.mem.Allocator, family: tool_calling_mod.ModelFamily, name: []const u8, input_json: []const u8) !void {
-    const open_tag: []const u8 = switch (family) {
-        .qwen => "<tool_call>\n",
-        else => "<|python_tag|>",
-    };
-    const close_tag: []const u8 = switch (family) {
-        .qwen => "\n</tool_call>",
-        else => "",
-    };
-    try out.appendSlice(allocator, open_tag);
+/// the conversation history stay consistent per model family. For Qwen this
+/// is the native chat-template form:
+///   <tool_call>\n<function=name>\n<parameter=k>\nv\n</parameter>\n</function>\n</tool_call>
+fn appendHistoricalCall(out: *std.ArrayList(u8), allocator: std.mem.Allocator, family: tool_calling_mod.ModelFamily, name: []const u8, input: ?std.json.Value) !void {
+    if (family == .qwen) {
+        try out.appendSlice(allocator, "<tool_call>\n<function=");
+        try out.appendSlice(allocator, name);
+        try out.appendSlice(allocator, ">\n");
+        if (input) |inp| {
+            if (inp == .object) {
+                var it = inp.object.iterator();
+                while (it.next()) |entry| {
+                    try out.appendSlice(allocator, "<parameter=");
+                    try out.appendSlice(allocator, entry.key_ptr.*);
+                    try out.appendSlice(allocator, ">\n");
+                    switch (entry.value_ptr.*) {
+                        .string => |s| try out.appendSlice(allocator, s),
+                        else => |v| {
+                            const j = try std.json.Stringify.valueAlloc(allocator, v, .{});
+                            defer allocator.free(j);
+                            try out.appendSlice(allocator, j);
+                        },
+                    }
+                    try out.appendSlice(allocator, "\n</parameter>\n");
+                }
+            }
+        }
+        try out.appendSlice(allocator, "</function>\n</tool_call>");
+        return;
+    }
+    try out.appendSlice(allocator, "<|python_tag|>");
     try out.appendSlice(allocator, "{\"name\": \"");
     try out.appendSlice(allocator, name);
     try out.appendSlice(allocator, "\", \"arguments\": ");
-    try out.appendSlice(allocator, if (input_json.len > 0) input_json else "{}");
+    if (input) |inp| {
+        const j = try std.json.Stringify.valueAlloc(allocator, inp, .{});
+        defer allocator.free(j);
+        try out.appendSlice(allocator, if (j.len > 0) j else "{}");
+    } else {
+        try out.appendSlice(allocator, "{}");
+    }
     try out.appendSlice(allocator, "}");
-    try out.appendSlice(allocator, close_tag);
 }
 
 /// Flatten an Anthropic `content` value (string or block array) into plain
@@ -176,14 +201,15 @@ fn flattenContent(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content
                     }
                 } else if (std.mem.eql(u8, btype, "tool_use")) {
                     const name = if (obj.get("name")) |n| (if (n == .string) n.string else "?") else "?";
-                    var input_json: []const u8 = "{}";
-                    if (obj.get("input")) |inp| {
-                        input_json = try std.json.Stringify.valueAlloc(allocator, inp, .{});
-                    }
-                    try appendHistoricalCall(out, allocator, family, name, input_json);
+                    try appendHistoricalCall(out, allocator, family, name, obj.get("input"));
                     try out.appendSlice(allocator, "\n");
                 } else if (std.mem.eql(u8, btype, "tool_result")) {
-                    try out.appendSlice(allocator, "Tool result: ");
+                    // Qwen chat template wraps tool output in <tool_response>.
+                    if (family == .qwen) {
+                        try out.appendSlice(allocator, "<tool_response>\n");
+                    } else {
+                        try out.appendSlice(allocator, "Tool result: ");
+                    }
                     if (obj.get("content")) |rc| {
                         switch (rc) {
                             .string => |s| try out.appendSlice(allocator, s),
@@ -198,6 +224,9 @@ fn flattenContent(out: *std.ArrayList(u8), allocator: std.mem.Allocator, content
                             },
                             else => {},
                         }
+                    }
+                    if (family == .qwen) {
+                        try out.appendSlice(allocator, "\n</tool_response>");
                     }
                     try out.appendSlice(allocator, "\n");
                 }
@@ -648,7 +677,6 @@ test "flattenContent renders block arrays and tool history" {
     defer out.deinit(arena_inst.allocator());
     try flattenContent(&out, arena_inst.allocator(), parsed.value, .qwen);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "weather?") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "<tool_call>") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "\"name\": \"get_weather\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out.items, "Tool result: sunny") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "<tool_response>\nsunny\n</tool_response>") != null);
 }

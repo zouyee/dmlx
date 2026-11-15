@@ -152,8 +152,12 @@ fn parseQwenFormat(allocator: std.mem.Allocator, text: []const u8) !?ParseResult
 
         const content = std.mem.trim(u8, text[content_start..close_idx], " \t\n\r");
         if (content.len > 0) {
-            if (try parseToolCallObject(allocator, content, call_idx)) |call| {
-                try calls.append(allocator, call);
+            const call = if (std.mem.startsWith(u8, content, "<function="))
+                try parseQwenFunctionBlock(allocator, content, call_idx)
+            else
+                try parseToolCallObject(allocator, content, call_idx);
+            if (call) |c| {
+                try calls.append(allocator, c);
                 call_idx += 1;
             }
         }
@@ -168,6 +172,74 @@ fn parseQwenFormat(allocator: std.mem.Allocator, text: []const u8) !?ParseResult
     return ParseResult{
         .calls = try calls.toOwnedSlice(allocator),
         .allocator = allocator,
+    };
+}
+
+// ============================================================
+// Qwen native format (Qwen3.5/3.8 chat template):
+//   <function=NAME>\n<parameter=key>\nvalue\n</parameter>\n...</function>
+// ============================================================
+
+/// Parse the inner content of a <tool_call> block in native function form.
+/// Reconstructs arguments as a JSON object: parameter values that parse as
+/// JSON are embedded raw, everything else becomes a JSON string (mirroring
+/// the template, which renders strings verbatim and non-strings as JSON).
+fn parseQwenFunctionBlock(allocator: std.mem.Allocator, content: []const u8, idx: usize) !?ToolCall {
+    const name_start = "<function=".len;
+    const name_end = std.mem.indexOf(u8, content[name_start..], ">") orelse return null;
+    const name = std.mem.trim(u8, content[name_start .. name_start + name_end], " \t\n\r");
+    if (name.len == 0) return null;
+    const fn_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(fn_name);
+
+    var args = std.ArrayList(u8).empty;
+    defer args.deinit(allocator);
+    try args.append(allocator, '{');
+    var first = true;
+    var pos: usize = name_start + name_end + 1;
+    while (std.mem.indexOfPos(u8, content, pos, "<parameter=")) |p_start| {
+        const key_start = p_start + "<parameter=".len;
+        const key_end = std.mem.indexOfPos(u8, content, key_start, ">") orelse break;
+        const key = content[key_start..key_end];
+        const val_close = std.mem.indexOfPos(u8, content, key_end, "</parameter>") orelse break;
+        var value = content[key_end + 1 .. val_close];
+        // Template wraps values as "<parameter=k>\n value \n</parameter>".
+        if (value.len > 0 and value[0] == '\n') value = value[1..];
+        if (value.len > 0 and value[value.len - 1] == '\n') value = value[0 .. value.len - 1];
+        if (!first) try args.append(allocator, ',');
+        first = false;
+        try appendJsonString(&args, allocator, key);
+        try args.append(allocator, ':');
+        // Embed as raw JSON when the value is valid JSON, else quote it.
+        const trimmed = std.mem.trim(u8, value, " \t\n\r");
+        const is_json = blk: {
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch break :blk false;
+            parsed.deinit();
+            break :blk true;
+        };
+        if (is_json) {
+            try args.appendSlice(allocator, trimmed);
+        } else {
+            try appendJsonString(&args, allocator, value);
+        }
+        pos = val_close + "</parameter>".len;
+    }
+    try args.append(allocator, '}');
+
+    const id = try std.fmt.allocPrint(allocator, "call_{d}", .{idx});
+    errdefer allocator.free(id);
+    const type_str = try allocator.dupe(u8, "function");
+    errdefer allocator.free(type_str);
+    const args_owned = try args.toOwnedSlice(allocator);
+    errdefer allocator.free(args_owned);
+
+    return ToolCall{
+        .id = id,
+        .type = type_str,
+        .function = .{
+            .name = fn_name,
+            .arguments = args_owned,
+        },
     };
 }
 
@@ -391,35 +463,78 @@ fn buildLlamaToolPrompt(allocator: std.mem.Allocator, tools: []const ToolDefinit
 }
 
 fn buildQwenToolPrompt(allocator: std.mem.Allocator, tools: []const ToolDefinition) ![]u8 {
+    // Native Qwen3.5/3.8 chat-template tool format (chat_template.jinja):
+    // a "# Tools" section with one JSON object per tool inside <tools>, and
+    // calls rendered as <tool_call>\n<function=name>\n<parameter=k>\nvalue
+    // \n</parameter>\n</function>\n</tool_call>. Matching the training-time
+    // format is what keeps tool calling reliable on long agent prompts.
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
+    try buf.appendSlice(allocator, "# Tools\n\nYou have access to the following functions:\n\n<tools>");
+    for (tools) |tool| {
+        try buf.appendSlice(allocator, "\n{\"name\": ");
+        try appendJsonString(&buf, allocator, tool.name);
+        if (tool.description) |desc| {
+            try buf.appendSlice(allocator, ", \"description\": ");
+            try appendJsonString(&buf, allocator, desc);
+        }
+        try buf.appendSlice(allocator, ", \"parameters\": ");
+        try buf.appendSlice(allocator, if (tool.parameters) |p| p else "{}");
+        try buf.appendSlice(allocator, "}");
+    }
     try buf.appendSlice(allocator,
-        \\You are a helpful assistant with tool calling capabilities.
-        \\When you need to use a tool, wrap the tool call in <tool_call> tags:
-        \\  <tool_call>
-        \\  {"name": "<tool_name>", "arguments": {<args>}}
-        \\  </tool_call>
-        \\Available tools:
         \\
+        \\</tools>
+        \\
+        \\If you choose to call a function ONLY reply in the following format with NO suffix:
+        \\
+        \\<tool_call>
+        \\<function=example_function_name>
+        \\<parameter=example_parameter_1>
+        \\value_1
+        \\</parameter>
+        \\<parameter=example_parameter_2>
+        \\This is the value for the second parameter
+        \\that can span
+        \\multiple lines
+        \\</parameter>
+        \\</function>
+        \\</tool_call>
+        \\
+        \\<IMPORTANT>
+        \\Reminder:
+        \\- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+        \\- Required parameters MUST be specified
+        \\- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+        \\- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+        \\</IMPORTANT>
     );
 
-    for (tools) |tool| {
-        try buf.appendSlice(allocator, "- ");
-        try buf.appendSlice(allocator, tool.name);
-        if (tool.description) |desc| {
-            try buf.appendSlice(allocator, ": ");
-            try buf.appendSlice(allocator, desc);
-        }
-        try buf.appendSlice(allocator, "\n");
-        if (tool.parameters) |params| {
-            try buf.appendSlice(allocator, "  Parameters: ");
-            try buf.appendSlice(allocator, params);
-            try buf.appendSlice(allocator, "\n");
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Append a JSON-quoted string literal (with escapes) to `buf`.
+fn appendJsonString(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u8) !void {
+    try buf.append(allocator, '"');
+    for (s) |ch| {
+        switch (ch) {
+            '"' => try buf.appendSlice(allocator, "\\\""),
+            '\\' => try buf.appendSlice(allocator, "\\\\"),
+            '\n' => try buf.appendSlice(allocator, "\\n"),
+            '\r' => try buf.appendSlice(allocator, "\\r"),
+            '\t' => try buf.appendSlice(allocator, "\\t"),
+            else => {
+                if (ch < 0x20) {
+                    const hex = "0123456789abcdef";
+                    try buf.appendSlice(allocator, &.{ '\\', 'u', '0', '0', hex[ch >> 4], hex[ch & 0xf] });
+                } else {
+                    try buf.append(allocator, ch);
+                }
+            },
         }
     }
-
-    return try buf.toOwnedSlice(allocator);
+    try buf.append(allocator, '"');
 }
 
 fn buildDeepSeekToolPrompt(allocator: std.mem.Allocator, tools: []const ToolDefinition) ![]u8 {
@@ -462,6 +577,38 @@ test "parse Qwen format" {
 
     try std.testing.expectEqual(@as(usize, 1), result.?.calls.len);
     try std.testing.expectEqualStrings("calculator", result.?.calls[0].function.name);
+}
+
+test "parse Qwen native function format" {
+    const allocator = std.testing.allocator;
+    const text =
+        \\<tool_call>
+        \\<function=Write>
+        \\<parameter=file_path>
+        \\/tmp/hello.py
+        \\</parameter>
+        \\<parameter=count>
+        \\5
+        \\</parameter>
+        \\<parameter=opts>
+        \\{"recursive": true}
+        \\</parameter>
+        \\</function>
+        \\</tool_call>
+    ;
+
+    const result = try parse(allocator, text, .qwen);
+    try std.testing.expect(result != null);
+    defer if (result) |*r| r.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.?.calls.len);
+    const call = result.?.calls[0];
+    try std.testing.expectEqualStrings("Write", call.function.name);
+    const args = try std.json.parseFromSlice(std.json.Value, allocator, call.function.arguments, .{});
+    defer args.deinit();
+    try std.testing.expectEqualStrings("/tmp/hello.py", args.value.object.get("file_path").?.string);
+    try std.testing.expectEqual(@as(i64, 5), args.value.object.get("count").?.integer);
+    try std.testing.expectEqual(true, args.value.object.get("opts").?.object.get("recursive").?.bool);
 }
 
 test "parse generic JSON format" {
