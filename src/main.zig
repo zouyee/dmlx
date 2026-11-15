@@ -24,6 +24,7 @@ const evaluate_mod = @import("evaluate.zig");
 const catalog = @import("catalog.zig");
 const pull_mod = @import("pull.zig");
 const doctor_mod = @import("doctor.zig");
+const connect_mod = @import("connect.zig");
 
 const ChatCommand = struct {
     model_path: []const u8,
@@ -278,6 +279,8 @@ pub fn main(init: std.process.Init) !void {
         try pull_mod.run(allocator, init.io, args[2..]);
     } else if (std.mem.eql(u8, command, "doctor")) {
         std.c._exit(try doctor_mod.run(allocator, init.io));
+    } else if (std.mem.eql(u8, command, "connect")) {
+        std.c._exit(try connect_mod.run(allocator, init.io, args[2..]));
     } else if (std.mem.eql(u8, command, "version") or std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
         std.debug.print("dmlx {s}\n", .{root.version});
     } else if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h") or std.mem.eql(u8, command, "help")) {
@@ -378,6 +381,9 @@ fn printUsage() void {
         \\
         \\  dmlx doctor
         \\    Check hardware, Metal, runtime, and installed models
+        \\
+        \\  dmlx connect [claude-code|codex|aider|cline] [--apply] [--port <n>]
+        \\    Show or write the config that points an agent harness at dmlx serve
         \\
         \\  dmlx version
         \\    Show version information
