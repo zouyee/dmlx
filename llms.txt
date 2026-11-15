@@ -73,7 +73,8 @@ most one DeepSeek server instance.
 - API surface: `/v1/chat/completions`, `/v1/completions`, `/v1/responses`,
   `/v1/messages` (Anthropic-style), `/v1/embeddings`, `/v1/models`,
   `/tokenize`, `/health`, `/metrics`.
-- MTP benchmark measurements must use non-streaming requests.
+- MTP applies to streaming and non-streaming alike; benchmark measurements
+  should still use non-streaming requests (SSE delivery adds overhead).
 - Registered model aliases: `qwen3.8-27b-4bit`, `qwen3.8-27b-mtp-4bit`,
   `deepseek-v4-flash-4bit`. Aliases work anywhere `--model` takes a path.
 - `DMLX_MODEL_HOME` overrides the model cache directory.
