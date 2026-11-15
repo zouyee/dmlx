@@ -2029,3 +2029,49 @@ Deferred decisions:
 - Non-LFS files in pull are size-matched only (HF gives no digest for
   them); switch to git blob sha1 (tree API `oid`) if tamper-evidence for
   tokenizer/config files ever matters.
+
+---
+
+## Qwen3.8 prefix snapshot reuse (2026-11-16, `fc9cb82`)
+
+The Qwen3.8 serving model (`vtable_serial` path) bypassed the generic
+prefix cache entirely, so every non-continuation prefill rebuilt full
+KV+GDN state. Agent harness workloads (one growing `messages` array per
+session) paid full prompt prefill on every turn.
+
+What landed:
+
+- `Qwen38AttnCache.deepClone` / `Qwen38GdnCache.deepClone` (ops.copy +
+  eval of the KV / conv / ssm slabs).
+- `Qwen38ServingModel` keeps an LRU list of `PrefixSnapshot{prompt_tokens,
+  caches, logits, hidden_all?}` entries, capped by `DMLX_QWEN38_PREFIX_SNAP`
+  (default 4, 0 disables). After a full prefill the state is snapshotted;
+  the next prefill finds the longest exact token-prefix match and only
+  prefills the suffix (`forwardTokensCoreCont(..., continuation=true)`).
+  Full-prefix hits replay stored logits with zero compute. `capture=.all`
+  snapshots additionally retain `hidden_all` so MTP drafter priming still
+  works; prefix+suffix hidden rows are concatenated on restore.
+- Exclusions: vision requests, and any path that is not
+  `last_logits_only` non-continuation prefill.
+
+Measured (Debug build, ~2.2k-token multi-turn agent conversation):
+
+- Repeat of the same 2k request: 16.58s → 0.02s (full-prefix hit).
+- Simulated agent turns (`messages` appended): turn1 20.79s → turn2
+  0.47s (~44x) → turn3 0.52s, with correct conversational continuity.
+- Unrelated short session correctly falls back to full prefill.
+
+Notes / follow-ups:
+
+- Snapshot store does a synchronous deep copy + eval; turn 1 costs ~2-4s
+  extra at 2.2k tokens. Could move to asyncEval or copy only the valid
+  `len_` rows instead of full slabs.
+- Memory: ~0.9GB per snapshot at 20k tokens of attn KV; default cap of 4
+  bounds it, tune down on tighter budgets.
+- Text-level prompt extension (string concatenation) does NOT hit — token
+  boundaries shift. Agent `messages` appends hit because `empty_think`
+  makes turn N's generation prompt token-identical to turn N+1's
+  assistant opening.
+- Snapshot path verified on Debug build; ReleaseFast not separately
+  re-measured. `DMLX_QWEN38_PREFIX_SNAP=0` off-path not benchmarked.
+- Streaming speculative decode (MTP under SSE) remains deferred.

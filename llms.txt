@@ -77,6 +77,10 @@ most one DeepSeek server instance.
 - Registered model aliases: `qwen3.8-27b-4bit`, `qwen3.8-27b-mtp-4bit`,
   `deepseek-v4-flash-4bit`. Aliases work anywhere `--model` takes a path.
 - `DMLX_MODEL_HOME` overrides the model cache directory.
+- `DMLX_QWEN38_PREFIX_SNAP` (default 4, 0 disables) caps how many
+  longest-prefix KV snapshots the Qwen3.8 serving model keeps. Multi-turn
+  agent workloads reuse the longest matching prompt prefix instead of
+  re-prefilling from scratch (~44x faster on turn 2 in measurements).
 
 ## Links
 
