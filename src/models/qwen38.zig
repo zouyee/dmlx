@@ -1488,6 +1488,10 @@ pub const Qwen38ServingModel = struct {
     /// decode/verify rope offsets are cache.len() + rope_delta. 0 on the
     /// text path; reset() restores 0 and clears the per-layer copies.
     rope_delta: i32 = 0,
+    /// Longest-prefix KV snapshots (agent-loop prefill reuse). See
+    /// PrefixSnapshot.
+    prefix_snaps: std.ArrayList(PrefixSnapshot) = .empty,
+    snap_access: u64 = 0,
 
     /// Propagate the MRoPE delta to every full-attention layer (their rope
     /// offset is cache.len() + rope_extra). GDN layers carry no rope.
@@ -1852,6 +1856,7 @@ pub const Qwen38ServingModel = struct {
     }
 
     pub fn deinit(self: *Qwen38ServingModel) void {
+        self.deinitPrefixSnapshots();
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
         // Shallow: frees only module-owned derived arrays (GDN conv1d_t /
@@ -1922,6 +1927,154 @@ pub const Qwen38ServingModel = struct {
             }
         }
         try eval_mod.asyncEval(self.allocator, states.items);
+    }
+
+    // --------------------------------------------------------------
+    // Longest-prefix KV snapshots (agent-loop prefill reuse)
+    //
+    // An agent harness resends the same growing prompt every turn (fixed
+    // system+tools header, append-only messages). A full re-prefill at
+    // ~125 tok/s costs minutes at 20k tokens; restoring the post-prefill
+    // state of the longest cached prefix and prefilling only the suffix
+    // makes turn N cost only its incremental tokens.
+    // --------------------------------------------------------------
+
+    pub const PrefixSnapshot = struct {
+        prompt_tokens: []u32,
+        caches: []Qwen38LayerCache, // deep copies, owned
+        logits: Array, // [1, 1, vocab] last-position, owned
+        /// [1, L, hidden] pre-final-norm rows for the whole prompt, retained
+        /// only when the storing prefill captured .all (MTP drafter priming).
+        hidden_all: ?Array,
+        last_access: u64,
+
+        fn deinit(self: *PrefixSnapshot, allocator: std.mem.Allocator) void {
+            allocator.free(self.prompt_tokens);
+            for (self.caches) |*lc| lc.deinit();
+            allocator.free(self.caches);
+            self.logits.deinit();
+            if (self.hidden_all) |*h| h.deinit();
+        }
+    };
+
+    var cached_snap_max: ?usize = null;
+
+    /// Max retained snapshots; DMLX_QWEN38_PREFIX_SNAP=0 disables. Default
+    /// 4: an agent session reuses one growing prefix, and each snapshot
+    /// holds full attention KV (~1 GB at 20k tokens).
+    fn prefixSnapMax() usize {
+        if (cached_snap_max) |v| return v;
+        var v: usize = 4;
+        if (std.c.getenv("DMLX_QWEN38_PREFIX_SNAP")) |s| {
+            v = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 4;
+        }
+        cached_snap_max = v;
+        return v;
+    }
+
+    /// Deep-copy every layer cache (post-prefill state).
+    fn snapshotState(self: *Qwen38ServingModel) ![]Qwen38LayerCache {
+        const out = try self.allocator.alloc(Qwen38LayerCache, self.caches.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |*lc| lc.deinit();
+            self.allocator.free(out);
+        }
+        for (self.caches, 0..) |*lc, i| {
+            out[i] = switch (lc.*) {
+                .gdn => |*gc| .{ .gdn = try gc.deepClone(self.ctx) },
+                .attn => |*ac| .{ .attn = try ac.deepClone(self.ctx) },
+            };
+            made += 1;
+        }
+        return out;
+    }
+
+    /// Replace the live caches with deep copies of `snap`'s (the snapshot
+    /// stays immutable and reusable). RoPE delta returns to the text value.
+    fn restoreSnapshot(self: *Qwen38ServingModel, snap: *const PrefixSnapshot) !void {
+        const fresh = try self.allocator.alloc(Qwen38LayerCache, snap.caches.len);
+        var made: usize = 0;
+        errdefer {
+            for (fresh[0..made]) |*lc| lc.deinit();
+            self.allocator.free(fresh);
+        }
+        for (snap.caches, 0..) |*lc, i| {
+            fresh[i] = switch (lc.*) {
+                .gdn => |*gc| .{ .gdn = try gc.deepClone(self.ctx) },
+                .attn => |*ac| .{ .attn = try ac.deepClone(self.ctx) },
+            };
+            made += 1;
+        }
+        for (self.caches) |*lc| lc.deinit();
+        self.allocator.free(self.caches);
+        self.caches = fresh;
+        self.setRopeDelta(0);
+    }
+
+    /// Index of the longest snapshot that is a prefix of `ids` (full
+    /// equality counts), or null.
+    fn findPrefixSnapshot(self: *Qwen38ServingModel, ids: []const u32) ?usize {
+        var best: ?usize = null;
+        var best_len: usize = 0;
+        for (self.prefix_snaps.items, 0..) |*s, i| {
+            const plen = s.prompt_tokens.len;
+            if (plen == 0 or plen > ids.len or plen <= best_len) continue;
+            if (std.mem.eql(u32, s.prompt_tokens, ids[0..plen])) {
+                best = i;
+                best_len = plen;
+            }
+        }
+        return best;
+    }
+
+    fn storeSnapshot(self: *Qwen38ServingModel, ids: []const u32, logits: Array, hidden_all: ?Array) !void {
+        const max = prefixSnapMax();
+        if (max == 0) return;
+        for (self.prefix_snaps.items, 0..) |*s, i| {
+            if (std.mem.eql(u32, s.prompt_tokens, ids)) {
+                s.deinit(self.allocator);
+                _ = self.prefix_snaps.orderedRemove(i);
+                break;
+            }
+        }
+        if (self.prefix_snaps.items.len >= max) {
+            var oldest: usize = 0;
+            for (self.prefix_snaps.items, 0..) |*s, i| {
+                if (s.last_access < self.prefix_snaps.items[oldest].last_access) oldest = i;
+            }
+            self.prefix_snaps.items[oldest].deinit(self.allocator);
+            _ = self.prefix_snaps.orderedRemove(oldest);
+        }
+        const toks = try self.allocator.dupe(u32, ids);
+        errdefer self.allocator.free(toks);
+        const caches_snap = try self.snapshotState();
+        errdefer {
+            for (caches_snap) |*lc| lc.deinit();
+            self.allocator.free(caches_snap);
+        }
+        const lg = try ops.copy(self.ctx, logits);
+        errdefer lg.deinit();
+        try lg.eval();
+        var ha: ?Array = null;
+        errdefer if (ha) |*h| h.deinit();
+        if (hidden_all) |src| {
+            ha = try ops.copy(self.ctx, src);
+            try ha.?.eval();
+        }
+        self.snap_access += 1;
+        try self.prefix_snaps.append(self.allocator, .{
+            .prompt_tokens = toks,
+            .caches = caches_snap,
+            .logits = lg,
+            .hidden_all = ha,
+            .last_access = self.snap_access,
+        });
+    }
+
+    pub fn deinitPrefixSnapshots(self: *Qwen38ServingModel) void {
+        for (self.prefix_snaps.items) |*s| s.deinit(self.allocator);
+        self.prefix_snaps.deinit(self.allocator);
     }
 
     /// ids: [L] u32 token ids → logits [1, L, vocab] f32. L>1 = prefill
@@ -2216,6 +2369,47 @@ pub const Qwen38ServingModel = struct {
             {
                 return self.forwardChunkedPrefill(ids, capture, last_logits_only);
             }
+            // Longest-prefix snapshot restore (text path). Capture .all is
+            // the MTP drafter-priming path: it additionally needs per-position
+            // hidden rows, so it can only use snapshots that stored them.
+            if (vision == null and last_logits_only and prefixSnapMax() > 0) {
+                if (self.findPrefixSnapshot(ids)) |idx| {
+                    const usable = capture != .all or self.prefix_snaps.items[idx].hidden_all != null;
+                    if (usable) {
+                        const snap = &self.prefix_snaps.items[idx];
+                        const plen = snap.prompt_tokens.len;
+                        try self.restoreSnapshot(snap);
+                        self.snap_access += 1;
+                        self.prefix_snaps.items[idx].last_access = self.snap_access;
+                        if (plen == ids.len) {
+                            std.log.info("[qwen38] prefix snapshot full hit ({d} tokens), skipping prefill", .{plen});
+                            const lg = try ops.copy(ctx, snap.logits);
+                            errdefer lg.deinit();
+                            try lg.eval();
+                            var hh: ?Array = null;
+                            if (capture == .all) {
+                                hh = try ops.copy(ctx, snap.hidden_all.?);
+                                try hh.?.eval();
+                            }
+                            return .{ .logits = lg, .hidden = hh };
+                        }
+                        std.log.info("[qwen38] prefix snapshot hit: {d}/{d} tokens cached, prefilling suffix", .{ plen, ids.len });
+                        const res = try self.forwardTokensCoreCont(ids[plen..], capture, last_logits_only, true, null);
+                        var out = res;
+                        if (capture == .all) {
+                            // Reassemble full-prompt hidden rows: stored
+                            // prefix rows + fresh suffix rows.
+                            const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ snap.hidden_all.?, res.hidden.? }, 1);
+                            try merged.eval();
+                            res.hidden.?.deinit();
+                            out.hidden = merged;
+                        }
+                        self.storeSnapshot(ids, out.logits, out.hidden) catch |err|
+                            std.log.warn("[qwen38] prefix snapshot store failed: {}", .{err});
+                        return out;
+                    }
+                }
+            }
             try self.reset();
         }
 
@@ -2408,6 +2602,13 @@ pub const Qwen38ServingModel = struct {
         try self.asyncEvalCacheStates();
         try logits.eval();
         if (ids.len > 1) qwen38_gdn.gdnPrefillProfReport(); // DMLX_GDN_PREFILL_PROF
+        // Snapshot the post-prefill state for longest-prefix reuse (same
+        // gating as the restore path above; suffix-prefill recursion passes
+        // continuation=true and stores at its own level).
+        if (ids.len > 1 and !continuation and vision == null and last_logits_only) {
+            self.storeSnapshot(ids, logits, if (capture == .all) hidden_cap else null) catch |err|
+                std.log.warn("[qwen38] prefix snapshot store failed: {}", .{err});
+        }
         return .{ .logits = logits, .hidden = hidden_cap };
     }
 };

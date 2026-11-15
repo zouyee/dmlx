@@ -201,6 +201,23 @@ pub const Qwen38AttnCache = struct {
         return self.len_;
     }
 
+    /// Independent copy of the KV slabs (same capacity, same len) for
+    /// prefix-snapshot restore: slab appends use in-place writes, so a
+    /// shallow share would let the next request mutate the snapshot.
+    pub fn deepClone(self: *const Qwen38AttnCache, ctx: EagerContext) !Qwen38AttnCache {
+        var out = Qwen38AttnCache{ .len_ = self.len_ };
+        errdefer out.deinit();
+        if (self.keys) |k| {
+            out.keys = try ops.copy(ctx, k);
+            try out.keys.?.eval();
+        }
+        if (self.values) |v| {
+            out.values = try ops.copy(ctx, v);
+            try out.values.?.eval();
+        }
+        return out;
+    }
+
     fn capacity(self: *const Qwen38AttnCache) i32 {
         const k = self.keys orelse return 0;
         return @intCast(k.shape()[2]);

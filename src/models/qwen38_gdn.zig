@@ -2370,6 +2370,18 @@ pub const Qwen38GdnCache = struct {
         self.conv_state.deinit();
         self.ssm_state.deinit();
     }
+
+    /// Independent copy of the recurrent state for prefix-snapshot restore.
+    pub fn deepClone(self: *const Qwen38GdnCache, ctx: EagerContext) !Qwen38GdnCache {
+        var out = Qwen38GdnCache{
+            .conv_state = try ops.copy(ctx, self.conv_state),
+            .ssm_state = try ops.copy(ctx, self.ssm_state),
+        };
+        errdefer out.deinit();
+        try out.conv_state.eval();
+        try out.ssm_state.eval();
+        return out;
+    }
 };
 
 /// Per-layer constants derived once from the loaded weights: the transposed
