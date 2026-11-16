@@ -15,6 +15,7 @@ const Array = array_mod.Array;
 const EagerContext = ops.EagerContext;
 
 extern fn stbi_load_from_memory(buffer: [*c]const u8, len: c_int, x: *c_int, y: *c_int, channels_in_file: *c_int, desired_channels: c_int) [*c]u8;
+extern fn dmlx_imageio_decode_rgb(bytes: [*c]const u8, len: usize, out_w: *c_int, out_h: *c_int) ?[*]u8;
 extern fn stbi_image_free(data: ?*anyopaque) void;
 
 // preprocessor_config.json (Qwen3.8-27B-4bit): size.shortest_edge/longest_edge,
@@ -167,11 +168,20 @@ pub fn preprocessImageBytes(allocator: std.mem.Allocator, ctx: EagerContext, byt
     var ch: c_int = 0;
     const len: c_int = std.math.cast(c_int, bytes.len) orelse return error.ImageTooLarge;
     const data = stbi_load_from_memory(bytes.ptr, len, &x, &y, &ch, 3);
-    if (data == null) return error.ImageDecodeFailed;
-    defer stbi_image_free(data);
+    if (data != null) {
+        defer stbi_image_free(data);
+        const w: usize = @intCast(x);
+        const h: usize = @intCast(y);
+        return preprocessRgb(allocator, ctx, data[0 .. w * h * 3], h, w);
+    }
+    // stb_image has no WebP/HEIC support; fall back to macOS ImageIO, which
+    // covers every format a browser client can send (dsh re-encodes uploads
+    // to WebP).
+    const rgb = dmlx_imageio_decode_rgb(bytes.ptr, bytes.len, &x, &y) orelse return error.ImageDecodeFailed;
+    defer std.c.free(rgb);
     const w: usize = @intCast(x);
     const h: usize = @intCast(y);
-    return preprocessRgb(allocator, ctx, data[0 .. w * h * 3], h, w);
+    return preprocessRgb(allocator, ctx, rgb[0 .. w * h * 3], h, w);
 }
 
 pub fn preprocessImageFile(allocator: std.mem.Allocator, ctx: EagerContext, path: []const u8) !PreprocessOut {

@@ -519,8 +519,15 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
         .language = .c,
     });
+    qwen38_vision_oracle.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/imageio_decode.m"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
     qwen38_vision_oracle.root_module.linkFramework("Metal", .{});
     qwen38_vision_oracle.root_module.linkFramework("Foundation", .{});
+    qwen38_vision_oracle.root_module.linkFramework("ImageIO", .{});
+    qwen38_vision_oracle.root_module.linkFramework("CoreGraphics", .{});
     const run_qwen38_vision_oracle = b.addRunArtifact(qwen38_vision_oracle);
     if (b.args) |args| {
         run_qwen38_vision_oracle.addArgs(args);
@@ -552,8 +559,15 @@ pub fn build(b: *std.Build) void {
         .flags = &.{"-std=c11"},
         .language = .c,
     });
+    bench_vision_ttft.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/imageio_decode.m"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
     bench_vision_ttft.root_module.linkFramework("Metal", .{});
     bench_vision_ttft.root_module.linkFramework("Foundation", .{});
+    bench_vision_ttft.root_module.linkFramework("ImageIO", .{});
+    bench_vision_ttft.root_module.linkFramework("CoreGraphics", .{});
     const run_bench_vision_ttft = b.addRunArtifact(bench_vision_ttft);
     if (b.args) |args| {
         run_bench_vision_ttft.addArgs(args);
@@ -1060,8 +1074,15 @@ pub fn build(b: *std.Build) void {
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_engine.c"), .flags = &.{"-Wno-deprecated-declarations"}, .language = .c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/metal_infer/dspark_attention.c"), .flags = &.{}, .language = .c });
     lib_tests.root_module.addCSourceFile(.{ .file = b.path("src/vision/stb_image_impl.c"), .flags = &.{"-std=c11"}, .language = .c });
+    lib_tests.root_module.addCSourceFile(.{
+        .file = b.path("src/vision/imageio_decode.m"),
+        .flags = &.{"-fobjc-arc"},
+        .language = .objective_c,
+    });
     lib_tests.root_module.linkFramework("Metal", .{});
     lib_tests.root_module.linkFramework("Foundation", .{});
+    lib_tests.root_module.linkFramework("ImageIO", .{});
+    lib_tests.root_module.linkFramework("CoreGraphics", .{});
     lib_tests.root_module.linkFramework("Accelerate", .{});
     const run_lib_tests = b.addRunArtifact(lib_tests);
     if (b.args) |args| {
@@ -1179,8 +1200,15 @@ pub fn build(b: *std.Build) void {
             .flags = &.{"-std=c11"},
             .language = .c,
         });
+        target_step.root_module.addCSourceFile(.{
+            .file = b.path("src/vision/imageio_decode.m"),
+            .flags = &.{"-fobjc-arc"},
+            .language = .objective_c,
+        });
         target_step.root_module.linkFramework("Metal", .{});
         target_step.root_module.linkFramework("Foundation", .{});
+        target_step.root_module.linkFramework("ImageIO", .{});
+        target_step.root_module.linkFramework("CoreGraphics", .{});
         target_step.root_module.linkFramework("Accelerate", .{});
     }
 }

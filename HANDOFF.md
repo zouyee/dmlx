@@ -2240,3 +2240,16 @@ growing prefix); layer-count/kind mismatches (different model) are rejected
 with a warning. Complements `DMLX_PROMPT_DUMP` + `scripts/prompt_warmup.sh`
 (body capture + replay warmup) which predates it and stays as the fallback
 when persistence is off.
+
+## WebP image input via ImageIO fallback (2026-11-16 晚)
+
+dsh web re-encodes uploaded images to WebP, and stb_image has no WebP
+support, so every dsh image turn failed in `preparePrompt` — surfaced
+upstream as pi-ai's generic "prompt preparation failed". Added
+`src/vision/imageio_decode.m` (ImageIO/CoreGraphics decode to RGB888 via a
+32bpp draw + compact) as a fallback in
+`qwen38_preprocess.preprocessImageBytes` when `stbi_load_from_memory`
+returns null; build.zig links it (plus ImageIO/CoreGraphics frameworks)
+into the CLI, lib, tests, and the vision harnesses. Verified end to end
+with the failing dsh attachment (webp, 1342x824): correct description in
+11.9 s including vision tower load.
