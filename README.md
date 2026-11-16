@@ -176,7 +176,7 @@ export DMLX_QWEN38_MTP_DIR=~/models/Qwen3.8-27B-MTP-4bit
 
 `--speculative-mtp 7` sets the adaptive controller’s ceiling; it does not force every round to draft seven tokens.
 
-MTP performance measurements must use non-streaming requests. The current streaming route does not exercise the same speculative path.
+MTP applies to streaming and non-streaming alike; benchmark measurements should still use non-streaming requests (SSE delivery adds overhead).
 
 ### Serve DeepSeek V4 Flash in native mode
 
@@ -217,6 +217,39 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 ```
 
 The server exposes OpenAI-style Chat Completions and an Anthropic-style Messages endpoint. It does not claim full compatibility with every endpoint or response field from either hosted API.
+
+### Connect an agent harness
+
+`dmlx connect` prints the exact config per harness, and `--apply` writes it where supported:
+
+```bash
+dmlx connect                     # list harnesses, detect installed CLIs
+dmlx connect claude-code --apply # merge ANTHROPIC_* env into ~/.claude/settings.json
+dmlx connect codex --apply       # append [model_providers.dmlx] to ~/.codex/config.toml
+dmlx connect aider               # print OPENAI_API_BASE exports
+dmlx connect cline               # print Cline provider fields
+```
+
+For **DeepSeek Harness** (`dsh`), register dmlx as a custom provider in the profile's `cordis.patch.yml` (e.g. `~/.dsh/profiles/headless/cordis.patch.yml`):
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      dmlx:
+        api: openai-completions
+        baseURL: http://127.0.0.1:8080/v1
+        apiKeyEnv: DMLX_LOCAL_KEY   # pi-ai requires a credential reference; dmlx ignores the value
+        models:
+          - id: qwen3.8-27b-4bit
+            contextWindow: 262144
+- id: agent-default-model
+  config:
+    provider: dmlx
+    model: qwen3.8-27b-4bit
+```
+
+Then run with any placeholder credential, e.g. `DMLX_LOCAL_KEY=local dsh headless "hello"`. Codex must use `wire_api = "chat"` (`/v1/responses` is not implemented).
 
 ---
 
