@@ -110,6 +110,16 @@ most one DeepSeek server instance.
   longest-prefix KV snapshots the Qwen3.8 serving model keeps. Multi-turn
   agent workloads reuse the longest matching prompt prefix instead of
   re-prefilling from scratch (~44x faster on turn 2 in measurements).
+- `DMLX_QWEN38_SNAP_DIR` (unset by default) additionally persists the newest
+  snapshot to `<dir>/snap_latest.safetensors` on every store and reloads it
+  lazily after a restart, so the cold full prefill of a large static system
+  prompt happens once ever, not once per process (measured: 2908-token
+  snapshot = 378MB, ~114ms to write; a restarted server's turn-2 request
+  served in 2.5s instead of a 22.6s cold prefill). Point it at a per-model
+  directory, e.g. `DMLX_QWEN38_SNAP_DIR=~/.cache/dmlx/snaps/qwen3.8-27b`.
+- `DMLX_PROMPT_DUMP=<path>` makes the server keep the largest chat request
+  body on disk; `scripts/prompt_warmup.sh` replays it (max_tokens=1) to
+  pre-build snapshots after a restart when SNAP_DIR persistence is off.
 
 ## Links
 

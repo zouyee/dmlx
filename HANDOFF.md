@@ -2226,3 +2226,17 @@ Two fixes from the dsh multi-turn latency investigation:
 - Build gotcha: an *empty* `MLX_C_PREFIX` in the environment resolves to a
   relative `lib` path and fails the build with `unable to open library
   directory 'lib'`; unset it or pass `-Dmlx_prefix=/opt/homebrew`.
+
+## Disk-persisted prefix snapshots (2026-11-16 晚)
+
+`DMLX_QWEN38_SNAP_DIR=<dir>`: every in-memory snapshot store also writes
+`<dir>/snap_latest.safetensors` (layer caches `l{i}.conv/ssm|k/v`, `logits`,
+`hidden_all` when captured, `tokens` + a `kinds` layout string in metadata);
+the first snapshot lookup after a restart lazily reloads it into
+`prefix_snaps`. Measured: 2908-token snapshot = 378 MB, persist 114 ms;
+a restarted server answers a turn-2 request in 2.5 s vs a 22.6 s cold
+prefill. Only the latest store is kept on disk (agent sessions reuse one
+growing prefix); layer-count/kind mismatches (different model) are rejected
+with a warning. Complements `DMLX_PROMPT_DUMP` + `scripts/prompt_warmup.sh`
+(body capture + replay warmup) which predates it and stays as the fallback
+when persistence is off.

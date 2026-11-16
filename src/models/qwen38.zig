@@ -8,6 +8,7 @@
 //! kdaAttnBranch / denseFfnBranch.
 const std = @import("std");
 const c = @import("mlx").c;
+const mkdir_c = @cImport(@cInclude("sys/stat.h"));
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
@@ -1959,6 +1960,184 @@ pub const Qwen38ServingModel = struct {
 
     var cached_snap_max: ?usize = null;
 
+    /// Directory for disk-persisted snapshots (DMLX_QWEN38_SNAP_DIR). When
+    /// set, every stored snapshot is also written to
+    /// `<dir>/snap_latest.safetensors` and reloaded lazily on the first
+    /// lookup after a restart — the cold full prefill of a large static
+    /// system prompt then happens once ever instead of once per process.
+    var cached_snap_dir: ?(?[]const u8) = null;
+    fn prefixSnapDir() ?[]const u8 {
+        if (cached_snap_dir) |v| return v;
+        var v: ?[]const u8 = null;
+        if (std.c.getenv("DMLX_QWEN38_SNAP_DIR")) |s| {
+            const d = std.mem.span(s);
+            if (d.len > 0) v = d;
+        }
+        cached_snap_dir = v;
+        return v;
+    }
+
+    fn snapFilePath(self: *Qwen38ServingModel, dir: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/snap_latest.safetensors", .{dir});
+    }
+
+    /// FNV-1a over the token ids, used only as a cheap sanity tag in metadata.
+    fn tokensHash(ids: []const u32) u64 {
+        var h: u64 = 14695981039346656037;
+        for (ids) |t| {
+            h ^= t;
+            h *%= 1099511628211;
+        }
+        return h;
+    }
+
+    /// Persist the just-stored snapshot (top of prefix_snaps) to disk.
+    /// Arrays are already materialized (deepClone/copy eval them), so the
+    /// safetensors writer can read them directly.
+    fn persistLatestSnapshot(self: *Qwen38ServingModel) void {
+        const dir = prefixSnapDir() orelse return;
+        const snap = &self.prefix_snaps.items[self.prefix_snaps.items.len - 1];
+        const t0 = std.c.mach_absolute_time();
+        self.persistLatestSnapshotImpl(dir, snap) catch |err| {
+            std.log.warn("[qwen38] snapshot persist failed: {}", .{err});
+            return;
+        };
+        const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) * 125.0 / 3_000_000.0;
+        std.log.info("[qwen38] snapshot persisted ({d} tokens, {d:.0} ms)", .{ snap.prompt_tokens.len, ms });
+    }
+
+    fn persistLatestSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8, snap: *const PrefixSnapshot) !void {
+        const mlx_io = @import("mlx").io;
+        const dir_z = try self.allocator.dupeZ(u8, dir);
+        defer self.allocator.free(dir_z);
+        _ = mkdir_c.mkdir(dir_z.ptr, 0o755);
+        const path = try self.snapFilePath(dir);
+        defer self.allocator.free(path);
+
+        var weights = std.StringHashMap(Array).init(self.allocator);
+        defer weights.deinit();
+        var kinds = std.ArrayList(u8).empty;
+        defer kinds.deinit(self.allocator);
+        for (snap.caches, 0..) |*lc, i| {
+            switch (lc.*) {
+                .gdn => |*gc| {
+                    try kinds.append(self.allocator, 'g');
+                    try weights.put(try std.fmt.allocPrint(self.allocator, "l{d}.conv", .{i}), gc.conv_state);
+                    try weights.put(try std.fmt.allocPrint(self.allocator, "l{d}.ssm", .{i}), gc.ssm_state);
+                },
+                .attn => |*ac| {
+                    try kinds.append(self.allocator, 'a');
+                    const k = ac.keys orelse return error.SnapshotAttnEmpty;
+                    const v = ac.values orelse return error.SnapshotAttnNoValues;
+                    try weights.put(try std.fmt.allocPrint(self.allocator, "l{d}.k", .{i}), k);
+                    try weights.put(try std.fmt.allocPrint(self.allocator, "l{d}.v", .{i}), v);
+                },
+            }
+        }
+        defer {
+            var it = weights.keyIterator();
+            while (it.next()) |k| self.allocator.free(k.*);
+        }
+        try weights.put(try self.allocator.dupe(u8, "logits"), snap.logits);
+        if (snap.hidden_all) |h| try weights.put(try self.allocator.dupe(u8, "hidden_all"), h);
+        const toks_i32 = try self.allocator.alloc(i32, snap.prompt_tokens.len);
+        defer self.allocator.free(toks_i32);
+        for (snap.prompt_tokens, 0..) |t, i| toks_i32[i] = @intCast(t);
+        const toks_arr = try Array.fromData(self.allocator, i32, toks_i32, &[_]i32{@intCast(toks_i32.len)});
+        defer toks_arr.deinit();
+        try toks_arr.eval();
+        try weights.put(try self.allocator.dupe(u8, "tokens"), toks_arr);
+
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        try metadata.put("kinds", kinds.items);
+        const hash_str = try std.fmt.allocPrint(self.allocator, "{x}", .{tokensHash(snap.prompt_tokens)});
+        defer self.allocator.free(hash_str);
+        try metadata.put("tokens_hash", hash_str);
+        try mlx_io.saveSafetensors(self.allocator, path, weights, metadata);
+    }
+
+    /// Load the persisted snapshot (if any) into prefix_snaps. Runs at most
+    /// once per process, lazily on the first lookup.
+    fn maybeLoadPersistedSnapshot(self: *Qwen38ServingModel) void {
+        if (persisted_snap_loaded) return;
+        persisted_snap_loaded = true;
+        const dir = prefixSnapDir() orelse return;
+        self.loadPersistedSnapshotImpl(dir) catch |err| {
+            std.log.warn("[qwen38] persisted snapshot load failed: {}", .{err});
+        };
+    }
+
+    /// Move `name` out of a loaded weight map (caller adopts the Array and
+    /// frees the map-owned key).
+    fn takeAdopted(map: *std.StringHashMap(Array), name: []const u8) !Array {
+        const kv = map.fetchRemove(name) orelse return error.SnapshotMissingTensor;
+        map.allocator.free(kv.key);
+        return kv.value;
+    }
+
+    fn loadPersistedSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8) !void {
+        const mlx_io = @import("mlx").io;
+        const path = try self.snapFilePath(dir);
+        defer self.allocator.free(path);
+        var res = mlx_io.loadSafetensors(self.allocator, path) catch return;
+        // Weight arrays are adopted into the snapshot below via takeAdopted;
+        // whatever remains in the map at scope exit is freed by res.deinit
+        // together with keys and metadata.
+        defer res.deinit(self.allocator);
+
+        const kinds = res.metadata.get("kinds") orelse return error.SnapshotNoKinds;
+        if (kinds.len != self.caches.len) return error.SnapshotLayerMismatch;
+
+        var toks_arr = try takeAdopted(&res.weights, "tokens");
+        try toks_arr.eval();
+        const toks_slice = try toks_arr.dataSlice(i32);
+        const toks = try self.allocator.alloc(u32, toks_slice.len);
+        errdefer self.allocator.free(toks);
+        for (toks_slice, 0..) |t, i| toks[i] = @intCast(t);
+        toks_arr.deinit();
+
+        const caches = try self.allocator.alloc(Qwen38LayerCache, kinds.len);
+        var made: usize = 0;
+        errdefer {
+            for (caches[0..made]) |*lc| lc.deinit();
+            self.allocator.free(caches);
+        }
+        for (kinds, 0..) |kind, i| {
+            var name_buf: [32]u8 = undefined;
+            switch (kind) {
+                'g' => {
+                    const conv = try takeAdopted(&res.weights, std.fmt.bufPrint(&name_buf, "l{d}.conv", .{i}) catch unreachable);
+                    const ssm = try takeAdopted(&res.weights, std.fmt.bufPrint(&name_buf, "l{d}.ssm", .{i}) catch unreachable);
+                    caches[i] = .{ .gdn = .{ .conv_state = conv, .ssm_state = ssm } };
+                },
+                'a' => {
+                    const k = try takeAdopted(&res.weights, std.fmt.bufPrint(&name_buf, "l{d}.k", .{i}) catch unreachable);
+                    const v = try takeAdopted(&res.weights, std.fmt.bufPrint(&name_buf, "l{d}.v", .{i}) catch unreachable);
+                    caches[i] = .{ .attn = .{ .keys = k, .values = v, .len_ = @intCast(k.shape()[2]) } };
+                },
+                else => return error.SnapshotBadKind,
+            }
+            made += 1;
+        }
+        var logits = try takeAdopted(&res.weights, "logits");
+        errdefer logits.deinit();
+        var hidden: ?Array = takeAdopted(&res.weights, "hidden_all") catch null;
+        errdefer if (hidden) |*h| h.deinit();
+
+        self.snap_access += 1;
+        try self.prefix_snaps.append(self.allocator, .{
+            .prompt_tokens = toks,
+            .caches = caches,
+            .logits = logits,
+            .hidden_all = hidden,
+            .last_access = self.snap_access,
+        });
+        std.log.info("[qwen38] persisted snapshot loaded ({d} tokens)", .{toks.len});
+    }
+
+    var persisted_snap_loaded: bool = false;
+
     /// Max retained snapshots; DMLX_QWEN38_PREFIX_SNAP=0 disables. Default
     /// 4: an agent session reuses one growing prefix, and each snapshot
     /// holds full attention KV (~1 GB at 20k tokens).
@@ -2015,6 +2194,7 @@ pub const Qwen38ServingModel = struct {
     /// Index of the longest snapshot that is a prefix of `ids` (full
     /// equality counts), or null.
     fn findPrefixSnapshot(self: *Qwen38ServingModel, ids: []const u32) ?usize {
+        self.maybeLoadPersistedSnapshot();
         var best: ?usize = null;
         var best_len: usize = 0;
         for (self.prefix_snaps.items, 0..) |*s, i| {
@@ -2070,6 +2250,7 @@ pub const Qwen38ServingModel = struct {
             .hidden_all = ha,
             .last_access = self.snap_access,
         });
+        self.persistLatestSnapshot();
     }
 
     pub fn deinitPrefixSnapshots(self: *Qwen38ServingModel) void {

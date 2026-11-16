@@ -204,6 +204,21 @@ fn handleRequest(
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
 
+            // DMLX_PROMPT_DUMP=<path>: keep the largest chat request body on
+            // disk. Replaying it after a restart rebuilds the KV prefix
+            // snapshot before the first real turn, so agent harnesses with a
+            // large static system prompt skip the cold full prefill.
+            if (std.c.getenv("DMLX_PROMPT_DUMP")) |p| {
+                const path = std.mem.span(p);
+                const prev: u64 = if (std.Io.Dir.cwd().statFile(io, path, .{}) catch null) |st| st.size else 0;
+                if (body.len > prev) {
+                    if (std.Io.Dir.cwd().createFile(io, path, .{}) catch null) |f| {
+                        defer f.close(io);
+                        f.writeStreamingAll(io, body) catch {};
+                    }
+                }
+            }
+
             // Parse request to check for streaming
             const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{ .ignore_unknown_fields = true }) catch {
                 status_code = 400;
