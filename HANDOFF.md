@@ -2104,3 +2104,22 @@ What landed:
 Note: `zig fmt` mangled nothing, but watch an earlier edit mishap — a
 duplicated `processGuidedRequest` docstring was removed in the same
 commit.
+
+---
+
+## Snapshot store cost trimmed; router hardening (2026-11-16, `13f8e58`)
+
+- `Qwen38AttnCache.deepClone` copied the whole KV slab (capacity). After a
+  cache grew large, snapshotting a short prompt copied multiples of the
+  live data — the earlier 2-4s turn-1 store overhead. Now slices slabs to
+  the first `len` rows before copying (restored caches regrow via the
+  existing doubling append). A/B at ~6.3k prompt tokens: 54.17s with
+  store vs 54.68s with `DMLX_QWEN38_PREFIX_SNAP=0` — store cost is within
+  noise. The off-path was also validated live.
+- `scripts/router.py`: `_proxy` now catches BrokenPipeError/
+  ConnectionResetError (client disconnect mid-stream) instead of dying
+  with a traceback; URLError still propagates so the cloud→local
+  fallback works.
+- Remaining follow-up from the prefill sprint: snapshot memory at very
+  long prompts (>8k) not yet stress-measured; ReleaseFast rebuild of the
+  snapshot path not separately benchmarked (Debug numbers throughout).
