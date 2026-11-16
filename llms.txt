@@ -1,9 +1,12 @@
 # dmlx
 
-> dmlx is a Zig inference runtime for Apple Silicon. It serves local language
-> models over an OpenAI-compatible HTTP API, with two flagship paths:
-> Qwen3.8-27B-4bit with MTP speculative decoding, and DeepSeek V4 Flash (284B
-> MoE) running under a 48GB unified-memory budget via SSD expert streaming.
+> dmlx — agent-grade local inference on Apple Silicon. A Zig inference
+> runtime serving local language models over OpenAI- and Anthropic-compatible
+> HTTP APIs, with two flagship paths: Qwen3.8-27B-4bit with MTP speculative
+> decoding, and DeepSeek V4 Flash (284B MoE) running under a 48GB
+> unified-memory budget via SSD expert streaming. Built to sit behind agent
+> harnesses (Claude Code, Codex, aider, Cline) with prefix-snapshot reuse for
+> multi-turn workloads.
 
 Use this file when helping a user install, run, or integrate dmlx. Prefer the
 release install and the `dmlx` CLI; do not build from source unless the user

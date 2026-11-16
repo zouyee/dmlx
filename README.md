@@ -1,6 +1,8 @@
 # dmlx
 
-**A Zig inference runtime for Apple Silicon, built for model-specific speculative decoding and memory-bounded local execution.**
+**Agent-grade local inference on Apple Silicon.**
+
+A Zig inference runtime for Apple Silicon, built for model-specific speculative decoding and memory-bounded local execution.
 
 [![CI](https://github.com/zouyee/dmlx/actions/workflows/ci.yml/badge.svg)](https://github.com/zouyee/dmlx/actions/workflows/ci.yml)
 [![macOS](https://img.shields.io/badge/platform-macOS-black?logo=apple)](https://support.apple.com/macos)
@@ -43,6 +45,16 @@ The DeepSeek V4 native path does not try to preload every routed expert. It comb
 
 On a 48GB Mac, the safe default is `NATIVE_SMELT_N=20`. Full expert preload would require roughly 147GB and is intentionally unsupported on this hardware class.
 
+### Agent-ready serving
+
+The server is built to sit behind an agent harness, not just a chat UI:
+
+- OpenAI Chat Completions **and** Anthropic Messages APIs (tools + streaming)
+- `dmlx connect` prints or writes the harness config (Claude Code, Codex, aider, Cline)
+- longest-prefix KV snapshots: multi-turn agent sessions re-use the shared prompt prefix instead of re-prefilling from scratch (~44x faster turn-2 measured)
+- streaming speculative decoding: SSE clients get the same MTP speedup as batch requests
+- long context validated end-to-end at 42k tokens (256k positions declared by the model config)
+
 ### An inspectable local runtime
 
 The service, scheduler, model adapters, cache management, and performance-critical dispatch logic live in Zig. Python is used for conversion, oracle checks, and benchmark tooling, but the serving process does not require a Python runtime.
@@ -55,7 +67,7 @@ The MLX-backed path still depends on `mlx-c`; “Zig-controlled” does not mean
 
 | Path | Execution | Best for | Status |
 |---|---|---|---|
-| Qwen3.8-27B-4bit + MTP | Zig runtime + `mlx-c` + custom Metal kernels | Fast local decode and speculative-decoding research | **Flagship / benchmarked** |
+| Qwen3.8-27B-4bit + MTP | Zig runtime + `mlx-c` + custom Metal kernels | Agent-harness serving, fast local decode, speculative-decoding research | **Flagship / benchmarked** |
 | DeepSeek V4 Flash | Native engine + packed SSD-streamed experts | Running a 284B MoE model under a 48GB memory budget | **Flagship / benchmarked** |
 | Llama-like, Mistral, Qwen2/3, Gemma, GLM-4, Phi/Phi-3, LLaVA, GLM-5 Next | MLX-backed registry adapters | Compatibility and development | **Implemented / model-dependent** |
 | n-gram speculation, PLD, EAGLE, DSpark and alternate Metal paths | Mixed | Kernel and decoding experiments | **Experimental** |
