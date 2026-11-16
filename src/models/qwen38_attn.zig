@@ -201,21 +201,35 @@ pub const Qwen38AttnCache = struct {
         return self.len_;
     }
 
-    /// Independent copy of the KV slabs (same capacity, same len) for
-    /// prefix-snapshot restore: slab appends use in-place writes, so a
-    /// shallow share would let the next request mutate the snapshot.
+    /// Independent copy of the KV slabs for prefix-snapshot restore: slab
+    /// appends use in-place writes, so a shallow share would let the next
+    /// request mutate the snapshot. Only the valid [0, len) rows are copied
+    /// (capacity beyond len is unreachable garbage); a restored cache has
+    /// capacity == len and regrows on the next append, which the doubling
+    /// growth path already handles.
     pub fn deepClone(self: *const Qwen38AttnCache, ctx: EagerContext) !Qwen38AttnCache {
         var out = Qwen38AttnCache{ .len_ = self.len_ };
         errdefer out.deinit();
         if (self.keys) |k| {
-            out.keys = try ops.copy(ctx, k);
+            out.keys = try cloneValidRows(ctx, k, self.len_);
             try out.keys.?.eval();
         }
         if (self.values) |v| {
-            out.values = try ops.copy(ctx, v);
+            out.values = try cloneValidRows(ctx, v, self.len_);
             try out.values.?.eval();
         }
         return out;
+    }
+
+    /// Contiguous copy of a [1, HKV, cap, D] slab trimmed to the first
+    /// `len` rows along axis 2 (whole copy when len >= cap).
+    fn cloneValidRows(ctx: EagerContext, a: Array, valid: i32) !Array {
+        const cap: i32 = @intCast(a.shape()[2]);
+        if (valid <= 0 or valid >= cap) return ops.copy(ctx, a);
+        const shape = a.shape();
+        const trimmed = try ops.slice(ctx, a, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ shape[0], shape[1], valid, shape[3] }, &[_]i32{ 1, 1, 1, 1 });
+        defer trimmed.deinit();
+        return ops.copy(ctx, trimmed);
     }
 
     fn capacity(self: *const Qwen38AttnCache) i32 {
@@ -310,6 +324,43 @@ test "kvInplaceWrite: bf16 in-place slab append matches expected layout" {
     try gotzf.eval();
     const gz = try gotzf.dataSlice(f32);
     for (gz) |v| try std.testing.expectEqual(@as(f32, 0), v);
+}
+
+test "Qwen38AttnCache.deepClone: trims slab to valid rows" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const HKV: i32 = 2;
+    const D: i32 = 4;
+    // Slab with capacity 8 but only 3 valid rows.
+    var buf: [2 * 8 * 4]f32 = undefined;
+    for (&buf, 0..) |*v, i| v.* = @floatFromInt(i);
+    const kf = try Array.fromData(allocator, f32, &buf, &[_]i32{ 1, HKV, 8, D });
+    defer kf.deinit();
+    const keys = try ops.astype(ctx, kf, .bfloat16);
+
+    var cache = Qwen38AttnCache{ .keys = keys, .len_ = 3 };
+    defer cache.deinit();
+
+    var clone = try cache.deepClone(ctx);
+    defer clone.deinit();
+    try std.testing.expectEqual(@as(i32, 3), clone.len_);
+    // Capacity trimmed to the valid rows.
+    try std.testing.expectEqual(@as(i32, 3), clone.keys.?.shape()[2]);
+
+    // Content of the valid rows matches.
+    const cf = try ops.astype(ctx, clone.keys.?, .float32);
+    defer cf.deinit();
+    try cf.eval();
+    const cv = try cf.dataSlice(f32);
+    try std.testing.expectEqual(@as(usize, 2 * 3 * 4), cv.len);
+    for (cv, 0..) |v, i| {
+        // Compacted [1, 2, 3, 4] layout: head hk keeps its first 3 rows,
+        // which lived at hk*64 + l*4 + d in the source slab.
+        const src = (i / 12) * 32 + (i % 12);
+        try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(src)), v, 1e-2);
+    }
 }
 
 test "Qwen38Attn.step: shapes, cache growth, determinism" {

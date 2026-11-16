@@ -80,6 +80,16 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def _proxy(self, target_base, body, extra_headers, t0, route, reason, tokens):
+        try:
+            self._proxy_inner(target_base, body, extra_headers, t0, route, reason, tokens)
+        except (BrokenPipeError, ConnectionResetError):
+            # Client disconnected mid-stream (or upstream died); nothing to
+            # deliver to, and a traceback must not kill the handler thread.
+            # URLError is deliberately NOT caught here so do_POST's
+            # cloud→local fallback keeps working.
+            print(f"route={route} client disconnected after {time.time() - t0:.1f}s", flush=True)
+
+    def _proxy_inner(self, target_base, body, extra_headers, t0, route, reason, tokens):
         headers = {"Content-Type": "application/json"}
         headers.update(extra_headers)
         streaming = b'"stream":true' in body.replace(b" ", b"") or b'"stream": true' in body
