@@ -2150,3 +2150,21 @@ build (Debug numbers were used throughout the sprint):
   distinct large prompts evicts earlier snapshots, so a "repeat" of an
   older prompt re-pays full prefill (an apparent non-hit is LRU
   eviction, not a bug).
+
+---
+
+## 42k-token end-to-end context test (2026-11-16)
+
+First long-context validation beyond 13.5k (ReleaseFast, snapshots on):
+
+- 42,373-token cold prefill: 397s @ 107 tok/s (some degradation from the
+  123 tok/s seen at 10k; quadratic attn layers start to matter), answer
+  correct.
+- Turn-2 prefix hit: 13.2s (~30x vs cold).
+- Memory (footprint): idle 25GB -> +11GB with one 42k snapshot resident
+  (content theory ~3.3GB: KV 2.7GB + hidden_all 0.4GB + GDN ~0.2GB; the
+  extra is MLX pool retention). 48GB machines should use
+  DMLX_QWEN38_PREFIX_SNAP=2 (or 1) when expecting 40k+ prompts.
+- The model config declares 262,144 positions; nothing in the vtable_serial
+  path caps length (the 8192 clamp in server.zig applies only to the
+  legacy MLX engine's KV config).
