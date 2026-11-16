@@ -2123,3 +2123,30 @@ commit.
 - Remaining follow-up from the prefill sprint: snapshot memory at very
   long prompts (>8k) not yet stress-measured; ReleaseFast rebuild of the
   snapshot path not separately benchmarked (Debug numbers throughout).
+
+---
+
+## ReleaseFast re-measure + large-prompt snapshot memory (2026-11-16)
+
+Follow-up closure of the prefill sprint's deferred items, on a ReleaseFast
+build (Debug numbers were used throughout the sprint):
+
+- Prefill throughput: 123 tok/s at ~10k prompt tokens (ReleaseFast), in
+  line with the earlier 120-131 tok/s band. 9,923-token cold prefill
+  80.4s; turn-2 prefix hit (9,923/9,946 cached) 8.7s (~9x).
+- Streaming parity re-verified on ReleaseFast (deltas == non-streaming
+  bytes, finish reasons correct).
+- Memory, measured with `footprint` (ps RSS is useless here: weights are
+  mmap'd and GPU buffers are IOAccelerator): model+drafter idle is 23GB;
+  with 4 snapshots resident (~50.5k total tokens) footprint reaches 36GB.
+  Snapshot content theory: attn KV 64KB/token (16 attn layers x 4 KV
+  heads x 256 dim x bf16 x K+V) + GDN conv/ssm state ~0.1-0.3GB per
+  snapshot + hidden_all for capture=.all (138MB at 13.5k) -> ~1-1.2GB per
+  large-prompt snapshot. The 13GB measured delta exceeds the ~5GB
+  content estimate; the remainder is MLX pool retention/fragmentation.
+  Practical guidance: default cap 4 is fine at 48GB with Qwen3.8 alone;
+  set DMLX_QWEN38_PREFIX_SNAP=2 when sharing the machine.
+- Expected-behavior caveat observed: with the cap at 4, a burst of
+  distinct large prompts evicts earlier snapshots, so a "repeat" of an
+  older prompt re-pays full prefill (an apparent non-hit is LRU
+  eviction, not a bug).
