@@ -49,6 +49,7 @@ const sampling_mod = @import("../sampling.zig");
 const streaming_mod = @import("../tokenizer/streaming.zig");
 const qwen38_gdn_prof = @import("../models/qwen38_gdn.zig");
 const verify_qmm_mod = @import("../models/verify_qmm.zig");
+const eval_mod = @import("mlx").eval;
 const SamplerConfig = sampling_mod.SamplerConfig;
 
 /// Platform-native sleep that does NOT enter the std.Io event loop.
@@ -2431,6 +2432,12 @@ pub const EngineLoop = struct {
             return;
         };
         defer pf.logits.deinit();
+        // Repay the prefill's lazy-eval debt before decode starts: without a
+        // sync here the first MTP round absorbs everything still queued
+        // (measured: round 1 spikes to ~3s at 15.6k context while steady
+        // rounds are ~132ms, which also distorts the depth controller's
+        // early cost estimates).
+        c.synchronize(self.stream) catch {};
         if (pf_t0 != 0) {
             std.log.info("[PREFILL_TRACE] mtp req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
         }
@@ -2746,6 +2753,36 @@ pub const EngineLoop = struct {
             var k: usize = 0; // accepted drafts
             var rejected = false;
             var stop_in_drafts = false;
+            // temp>0 acceptance: pre-pull ALL verify rows (0..drafts.len
+            // inclusive — the last row is the bonus/resample row) and the
+            // draft logits with ONE asyncEval. The per-row reads below are
+            // then sync-free; before this, every row stalled the pipeline,
+            // which is why low-acceptance rounds cost ~2x steady rounds at
+            // long context.
+            var verify_rows = std.ArrayList(Array).empty;
+            defer {
+                for (verify_rows.items) |*vr| vr.deinit();
+                verify_rows.deinit(allocator);
+            }
+            if (!greedy) blk: {
+                for (0..drafts.items.len + 1) |i| {
+                    const row = mtp.verifyLogits(self.model.ptr, vh, i) catch break :blk;
+                    verify_rows.append(allocator, row) catch {
+                        row.deinit();
+                        break :blk;
+                    };
+                }
+                if (verify_rows.items.len == drafts.items.len + 1) {
+                    var joint = std.ArrayList(Array).empty;
+                    defer joint.deinit(allocator);
+                    if (joint.appendSlice(allocator, verify_rows.items)) |_| {
+                        if (joint.appendSlice(allocator, draft_logits.items)) |_| {
+                            eval_mod.asyncEval(allocator, joint.items) catch {};
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
+            const rows_ready = verify_rows.items.len == drafts.items.len + 1;
             for (0..drafts.items.len) |i| {
                 if (greedy and greedy_tokens.len > i) {
                     // Batched-argmax path: no per-row logits pull.
@@ -2760,11 +2797,14 @@ pub const EngineLoop = struct {
                     }
                     continue;
                 }
-                const v_i = mtp.verifyLogits(self.model.ptr, vh, i) catch {
-                    rejected = true;
-                    break;
-                };
-                defer v_i.deinit();
+                const v_i = if (rows_ready)
+                    verify_rows.items[i]
+                else
+                    mtp.verifyLogits(self.model.ptr, vh, i) catch {
+                        rejected = true;
+                        break;
+                    };
+                defer if (!rows_ready) v_i.deinit();
                 if (greedy) {
                     const target = req.sampler.sample(v_i, allocator) catch {
                         rejected = true;
@@ -2841,7 +2881,13 @@ pub const EngineLoop = struct {
             const next_sample = if (greedy and greedy_tokens.len > next_pos)
                 // Batched argmax already holds this row's greedy token.
                 sampling_mod.SampleResult{ .token = @intCast(greedy_tokens[next_pos]), .logprob = 0.0 }
-            else blk: {
+            else if (rows_ready) blk: {
+                // Row was pre-pulled and joint-evaled above — sync-free.
+                break :blk if (!rejected)
+                    req.sampler.sample(verify_rows.items[next_pos], allocator) catch break
+                else
+                    mtpResampleAdjusted(verify_rows.items[next_pos], draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
+            } else blk: {
                 const v_next = mtp.verifyLogits(self.model.ptr, vh, next_pos) catch break;
                 defer v_next.deinit();
                 break :blk if (greedy or !rejected)

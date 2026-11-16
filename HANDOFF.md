@@ -2190,3 +2190,39 @@ Verified: one-shot answer and a bash/write tool-calling task through
 `dsh headless` against Qwen3.8-27B-4bit. Note pi-ai requires an
 apiKeyEnv credential reference even for keyless local routes
 (DMLX_LOCAL_KEY=local works).
+
+## Token-prefix-stable serving: HTTP token cache + MTP verify batching (2026-11-16)
+
+Two fixes from the dsh multi-turn latency investigation:
+
+- **Root cause of "every turn pays full prefill"**: the KV prefix snapshot
+  (`fc9cb82`) matched on exact token prefixes, but re-tokenizing the
+  rendered chat prompt each turn is not prefix-stable — BPE merges across
+  the old boundary, so the last token or two of the shared text differ and
+  the longest-prefix match fails outright (observed: `hit=false` with a
+  2908-token snapshot vs a 2915-token exact-text-prefix follow-up).
+  Fix: `tokenizeWithPrefixReuse` in `src/server/openai.zig` caches the last
+  4 rendered prompt strings + their token arrays (spinlock-guarded, LRU);
+  a new request reuses the cached tokens for its string-prefix and encodes
+  only the new suffix. The suffix decodes to the same text (valid
+  tokenization, possibly split differently at the seam) and the prefix is
+  byte-identical, so the KV snapshot now hits on every agent-loop turn.
+  Measured on a ~2.9k-token 3-turn conversation: turn 2 prefill 23.5s ->
+  2.4s, turn 3 -> 1.7s (only ~34 suffix tokens prefilled per turn).
+- **MTP verify batched logits fetch** (`src/engine/engine_loop.zig`):
+  non-greedy rejection rounds previously pulled verify rows one at a time
+  (one sync each); all N+1 rows (accepted + bonus/resample) are now
+  gathered up front and submitted with a single `asyncEval` alongside the
+  draft logits. Also added a defensive `synchronize` after MTP prefill.
+  Steady-state long-context MTP decode holds ~130-180 ms/round at 15.6k
+  context (~60 tok/s at 100% acceptance, temp=0).
+- Note: the per-request first MTP round still shows a one-off ~3s spike at
+  long context (temp>0 path); MEMROUND shows it is not an allocation event
+  (memory flat across rounds), root cause still open.
+- dsh image input fixed on the client side: the pi-ai model declaration
+  needs `input: [text, image]` (default is text-only) — added to all three
+  dsh profile patches. dmlx's Qwen3.8 ViT path already accepted
+  `image_url` parts.
+- Build gotcha: an *empty* `MLX_C_PREFIX` in the environment resolves to a
+  relative `lib` path and fails the build with `unable to open library
+  directory 'lib'`; unset it or pass `-Dmlx_prefix=/opt/homebrew`.

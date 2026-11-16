@@ -457,7 +457,118 @@ fn tokenizeMessages(
     }
     const prompt_text = try state.chat_template.apply(messages.items, true);
     defer allocator.free(prompt_text);
-    return state.tokenizer_strategy.encode(prompt_text, false, allocator);
+    return tokenizeWithPrefixReuse(allocator, state, prompt_text);
+}
+
+// ------------------------------------------------------------------
+// Prompt token prefix cache
+// ------------------------------------------------------------------
+// Agent harnesses resend the full conversation every turn, so the
+// rendered chat prompt shares a long string prefix with the previous
+// request. Re-encoding the whole string is NOT token-prefix stable (BPE
+// can merge across the old boundary), which defeats the model-side KV
+// prefix snapshot's exact token match. Cache rendered prompt → tokens
+// and re-encode only the new string suffix; the cached prefix tokens are
+// then byte-identical across turns. The suffix is still a valid
+// tokenization of its text (decodes to the same string), it may just
+// split differently at the seam.
+const TokenPrefixEntry = struct {
+    prompt: []u8,
+    tokens: []u32,
+    last_access: u64,
+};
+const token_prefix_cap = 4;
+var token_prefix_cache: [token_prefix_cap]?TokenPrefixEntry = .{ null, null, null, null };
+var token_prefix_access: u64 = 0;
+var token_prefix_lock = std.atomic.Value(u32).init(0);
+
+fn tpLock() void {
+    while (token_prefix_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) std.atomic.spinLoopHint();
+}
+fn tpUnlock() void {
+    token_prefix_lock.store(0, .release);
+}
+
+fn tokenizeWithPrefixReuse(allocator: std.mem.Allocator, state: *ServerState, prompt_text: []const u8) ![]u32 {
+    // Lookup: longest cached prompt that is a prefix of this one.
+    var hit: ?usize = null;
+    var hit_len: usize = 0;
+    tpLock();
+    for (&token_prefix_cache, 0..) |*e, i| {
+        if (e.*) |ent| {
+            if (ent.prompt.len <= prompt_text.len and ent.prompt.len > hit_len and
+                std.mem.eql(u8, ent.prompt, prompt_text[0..ent.prompt.len]))
+            {
+                hit = i;
+                hit_len = ent.prompt.len;
+            }
+        }
+    }
+    var prefix_tokens: ?[]u32 = null;
+    if (hit) |i| {
+        token_prefix_access += 1;
+        token_prefix_cache[i].?.last_access = token_prefix_access;
+        prefix_tokens = allocator.dupe(u32, token_prefix_cache[i].?.tokens) catch null;
+    }
+    tpUnlock();
+
+    var tokens: []u32 = undefined;
+    if (prefix_tokens) |pt| {
+        defer allocator.free(pt);
+        if (hit_len == prompt_text.len) {
+            tokens = try allocator.dupe(u32, pt);
+        } else {
+            const suffix = try state.tokenizer_strategy.encode(prompt_text[hit_len..], false, allocator);
+            defer allocator.free(suffix);
+            tokens = try allocator.alloc(u32, pt.len + suffix.len);
+            @memcpy(tokens[0..pt.len], pt);
+            @memcpy(tokens[pt.len..], suffix);
+        }
+        std.log.info("[openai] token prefix cache hit: {d}/{d} tokens reused", .{ pt.len, tokens.len });
+    } else {
+        tokens = try state.tokenizer_strategy.encode(prompt_text, false, allocator);
+    }
+    errdefer allocator.free(tokens);
+
+    // Store: replace the identical prompt, else evict the oldest.
+    tpLock();
+    defer tpUnlock();
+    token_prefix_access += 1;
+    var slot: usize = 0;
+    var found = false;
+    for (&token_prefix_cache, 0..) |*e, i| {
+        if (e.*) |ent| {
+            if (std.mem.eql(u8, ent.prompt, prompt_text)) {
+                slot = i;
+                found = true;
+                break;
+            }
+        }
+    }
+    if (!found) {
+        var oldest: u64 = std.math.maxInt(u64);
+        for (&token_prefix_cache, 0..) |*e, i| {
+            if (e.* == null) {
+                slot = i;
+                oldest = 0;
+                break;
+            }
+            if (e.*.?.last_access < oldest) {
+                oldest = e.*.?.last_access;
+                slot = i;
+            }
+        }
+    }
+    if (token_prefix_cache[slot]) |*ent| {
+        allocator.free(ent.prompt);
+        allocator.free(ent.tokens);
+    }
+    token_prefix_cache[slot] = .{
+        .prompt = try allocator.dupe(u8, prompt_text),
+        .tokens = try allocator.dupe(u32, tokens),
+        .last_access = token_prefix_access,
+    };
+    return tokens;
 }
 
 // ------------------------------------------------------------------
