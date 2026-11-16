@@ -12,6 +12,7 @@ const Harness = enum {
     codex,
     aider,
     cline,
+    dsh,
 
     fn name(self: Harness) []const u8 {
         return switch (self) {
@@ -19,6 +20,7 @@ const Harness = enum {
             .codex => "codex",
             .aider => "aider",
             .cline => "cline",
+            .dsh => "dsh",
         };
     }
 
@@ -28,6 +30,7 @@ const Harness = enum {
             .codex => "codex",
             .aider => "aider",
             .cline => "code",
+            .dsh => "dsh",
         };
     }
 
@@ -82,14 +85,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) !
     std.debug.print(
         \\
         \\Run 'dmlx connect <harness>' for the config snippet, add --apply to
-        \\write it where supported (claude-code, codex).
+        \\write it where supported (claude-code, codex, dsh).
         \\
     , .{});
     return 0;
 }
 
 fn usage() u8 {
-    std.debug.print("usage: dmlx connect [claude-code|codex|aider|cline] [--apply] [--port <n>]\n", .{});
+    std.debug.print("usage: dmlx connect [claude-code|codex|aider|cline|dsh] [--apply] [--port <n>]\n", .{});
     return 1;
 }
 
@@ -189,9 +192,93 @@ fn connectOne(allocator: std.mem.Allocator, io: std.Io, h: Harness, port: u16, a
                 \\
             , .{port});
         },
+        .dsh => {
+            std.debug.print(
+                \\
+                \\== dsh (DeepSeek Harness) ==
+                \\dmlx is wired in as a hand-declared pi-ai provider via profile
+                \\patches under ~/.dsh/profiles/<profile>/cordis.patch.yml.
+                \\  Run with --apply to (re)write the web/headless/dsh-tui
+                \\  patches (existing files are backed up first), then start
+                \\  dsh with the credential placeholder:
+                \\    DMLX_LOCAL_KEY=local dsh web        # browser UI
+                \\    DMLX_LOCAL_KEY=local dsh headless "task"
+                \\  The declared model accepts image input and is sized to the
+                \\  context range dmlx has been validated at (40960 tokens).
+                \\
+            , .{});
+            if (apply) {
+                try applyDsh(allocator, io, home, port);
+            } else {
+                std.debug.print("  (or run with --apply to write the profile patches)\n", .{});
+            }
+        },
     }
     std.debug.print(ModelNote, .{port});
     return 0;
+}
+
+/// Write the dsh profile patch (dmlx provider + default model) for the
+/// web/headless/dsh-tui profiles, backing up any existing patch file.
+fn applyDsh(allocator: std.mem.Allocator, io: std.Io, home: []const u8, port: u16) !void {
+    const profiles = [_][]const u8{ "web", "headless", "dsh-tui" };
+    for (profiles) |profile| {
+        const dir = try std.fmt.allocPrint(allocator, "{s}/.dsh/profiles/{s}", .{ home, profile });
+        defer allocator.free(dir);
+        std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        const path = try std.fmt.allocPrint(allocator, "{s}/cordis.patch.yml", .{dir});
+        defer allocator.free(path);
+        if (std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1 << 20))) |text| {
+            const backup = try std.fmt.allocPrint(allocator, "{s}.bak-dmlx", .{path});
+            defer allocator.free(backup);
+            try writeFileAll(io, backup, text);
+            allocator.free(text);
+            std.debug.print("  backup: {s}\n", .{backup});
+        } else |_| {}
+
+        const web_tools =
+            \\- id: tool-bash
+            \\  disabled: false
+            \\- id: tool-fs
+            \\  disabled: false
+            \\- id: tool-fs-search
+            \\  disabled: false
+            \\- id: ui-settings-general
+            \\  name: "@deepseek-ai/dsh-client-ui-settings-general"
+            \\  config:
+            \\    welcomeNoticeVersion: 2026-09-28.1
+            \\
+        ;
+        const patch = try std.fmt.allocPrint(allocator,
+            \\# dmlx local inference route (written by `dmlx connect dsh --apply`).
+            \\# Serve the model with: dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port {d}
+            \\# pi-ai requires a credential reference; dmlx ignores the value,
+            \\# so launch dsh with DMLX_LOCAL_KEY=local.
+            \\- id: llm-pi-ai
+            \\  config:
+            \\    providers:
+            \\      dmlx:
+            \\        displayName: dmlx (local Qwen3.8-27B)
+            \\        api: openai-completions
+            \\        baseURL: http://127.0.0.1:{d}/v1
+            \\        apiKeyEnv: DMLX_LOCAL_KEY
+            \\        models:
+            \\          - id: qwen3.8-27b-4bit
+            \\            name: Qwen3.8 27B 4bit (local)
+            \\            contextWindow: 40960
+            \\            maxTokens: 16384
+            \\            input: [text, image]
+            \\- id: agent-default-model
+            \\  config:
+            \\    provider: dmlx
+            \\    model: qwen3.8-27b-4bit
+            \\{s}
+        , .{ port, port, if (std.mem.eql(u8, profile, "web")) web_tools else "" });
+        defer allocator.free(patch);
+        try writeFileAll(io, path, patch);
+        std.debug.print("  wrote: {s}\n", .{path});
+    }
+    std.debug.print("  done. Launch with: DMLX_LOCAL_KEY=local dsh web\n", .{});
 }
 
 /// Merge ANTHROPIC_* env entries into ~/.claude/settings.json, backing up

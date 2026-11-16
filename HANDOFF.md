@@ -2253,3 +2253,32 @@ returns null; build.zig links it (plus ImageIO/CoreGraphics frameworks)
 into the CLI, lib, tests, and the vision harnesses. Verified end to end
 with the failing dsh attachment (webp, 1342x824): correct description in
 11.9 s including vision tower load.
+
+## Agent-harness UX: default-on persistence + startup warmup + connect dsh (2026-11-16 晚)
+
+Bundle of changes making `dmlx serve` restart-transparent for harness
+users with zero environment variables:
+
+- **Snapshot persistence defaults on for the server**: `server.start()`
+  sets `DMLX_QWEN38_SNAP_DIR=~/.cache/dmlx/snaps` via putenv when unset
+  (kept out of the model so library tests keep env-only behavior — an
+  on-by-default read in the model made every test emit an MLX
+  safetensors-open error log). Persist skips snapshots < 2048 tokens so
+  small probes never displace the valuable big-prompt entry.
+- **Prompt dump defaults on** (`~/.cache/dmlx/last_chat.json`) and is now
+  keyed on prompt *tokens* (sidecar `<path>.tokens`), not body bytes — a
+  base64 image request is byte-huge but token-cheap and previously evicted
+  the 13k-token system prompt. Dump moved from the HTTP read path to
+  after `preparePrompt` (both streaming and non-streaming), which is where
+  the token count exists.
+- **Startup warmup**: `warmupFromPromptDump` fiber replays the dump 3s
+  after launch as a one-token non-streaming completion (self-POST via
+  std.Io.net), so the snapshot exists before the first real turn. With the
+  disk snapshot warm this costs ~1s; cold it pays the prefill in the
+  background. Verified: restart -> turn-2-style request in 1.4s.
+- **`dmlx connect dsh [--apply]`**: prints the recipe; `--apply` writes
+  `~/.dsh/profiles/{web,headless,dsh-tui}/cordis.patch.yml` (backup first)
+  with the pi-ai provider (`input: [text, image]`, `maxTokens: 16384`,
+  `contextWindow: 40960`), the default model, and — for the web profile —
+  the tool enables + welcome-notice dismissal. Launch dsh with
+  `DMLX_LOCAL_KEY=local` (pi-ai requires a credential reference).

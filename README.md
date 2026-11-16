@@ -226,30 +226,44 @@ The server exposes OpenAI-style Chat Completions and an Anthropic-style Messages
 dmlx connect                     # list harnesses, detect installed CLIs
 dmlx connect claude-code --apply # merge ANTHROPIC_* env into ~/.claude/settings.json
 dmlx connect codex --apply       # append [model_providers.dmlx] to ~/.codex/config.toml
+dmlx connect dsh --apply         # write dsh profile patches (web/headless/dsh-tui)
 dmlx connect aider               # print OPENAI_API_BASE exports
 dmlx connect cline               # print Cline provider fields
 ```
 
-For **DeepSeek Harness** (`dsh`), register dmlx as a custom provider in the profile's `cordis.patch.yml` (e.g. `~/.dsh/profiles/headless/cordis.patch.yml`):
+For **DeepSeek Harness** (`dsh`), `dmlx connect dsh --apply` writes
+`~/.dsh/profiles/<profile>/cordis.patch.yml` for the web, headless and
+dsh-tui profiles: dmlx as a pi-ai provider, the local model as default
+(with image input enabled and a 40960-token context window), and the
+mutating tools enabled for the web profile. Then:
 
-```yaml
-- id: llm-pi-ai
-  config:
-    providers:
-      dmlx:
-        api: openai-completions
-        baseURL: http://127.0.0.1:8080/v1
-        apiKeyEnv: DMLX_LOCAL_KEY   # pi-ai requires a credential reference; dmlx ignores the value
-        models:
-          - id: qwen3.8-27b-4bit
-            contextWindow: 262144
-- id: agent-default-model
-  config:
-    provider: dmlx
-    model: qwen3.8-27b-4bit
+```bash
+DMLX_LOCAL_KEY=local dsh web   # or: dsh headless "task"
 ```
 
-Then run with any placeholder credential, e.g. `DMLX_LOCAL_KEY=local dsh headless "hello"`. Codex must use `wire_api = "chat"` (`/v1/responses` is not implemented).
+`DMLX_LOCAL_KEY` is only a credential placeholder — dmlx ignores the value.
+The served model's vision tower handles image input directly (PNG/JPEG via
+stb_image, WebP/HEIC via a macOS ImageIO fallback). Codex must use
+`wire_api = "chat"` (`/v1/responses` is not implemented).
+
+### Zero-wait restarts (agent workloads)
+
+`dmlx serve` is restart-friendly by default:
+
+- **Disk-persisted prefix snapshots** — the largest prefix snapshot is
+  written to `~/.cache/dmlx/snaps/` (override with
+  `DMLX_QWEN38_SNAP_DIR`, empty disables) and reloaded after a restart, so
+  a harness's big static system prompt is prefilled once ever, not once
+  per process.
+- **Startup warmup replay** — the highest-token chat request body seen so
+  far is kept at `~/.cache/dmlx/last_chat.json` (override with
+  `DMLX_PROMPT_DUMP`, empty disables) and replayed with `max_tokens=1`
+  three seconds after launch, pre-building snapshots before the first real
+  turn arrives.
+- **Token-prefix-stable prompts** — the server reuses cached token ids for
+  the shared string prefix of consecutive requests, which is what makes
+  the KV snapshot's exact-prefix match hit every turn (BPE re-tokenization
+  of the full prompt is not prefix-stable).
 
 ---
 

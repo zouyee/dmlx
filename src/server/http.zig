@@ -204,21 +204,6 @@ fn handleRequest(
         if (std.mem.find(u8, request, "\r\n\r\n")) |header_end| {
             const body = request[header_end + 4 ..];
 
-            // DMLX_PROMPT_DUMP=<path>: keep the largest chat request body on
-            // disk. Replaying it after a restart rebuilds the KV prefix
-            // snapshot before the first real turn, so agent harnesses with a
-            // large static system prompt skip the cold full prefill.
-            if (std.c.getenv("DMLX_PROMPT_DUMP")) |p| {
-                const path = std.mem.span(p);
-                const prev: u64 = if (std.Io.Dir.cwd().statFile(io, path, .{}) catch null) |st| st.size else 0;
-                if (body.len > prev) {
-                    if (std.Io.Dir.cwd().createFile(io, path, .{}) catch null) |f| {
-                        defer f.close(io);
-                        f.writeStreamingAll(io, body) catch {};
-                    }
-                }
-            }
-
             // Parse request to check for streaming
             const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{ .ignore_unknown_fields = true }) catch {
                 status_code = 400;
@@ -239,7 +224,7 @@ fn handleRequest(
 
             if (parsed.value.stream orelse false) {
                 status_code = 200;
-                try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value);
+                try handleStreamingCompletion(allocator, io, state, connection, server_config, parsed.value, body);
             } else {
                 const t0 = std.c.mach_absolute_time();
                 const response = try generateChatCompletion(allocator, io, state, body, server_config);
@@ -581,6 +566,51 @@ pub fn writeResponseAlloc(connection: std.Io.net.Stream, status: u16, content_ty
 }
 
 const unistd_c = @cImport(@cInclude("unistd.h"));
+
+/// Where the highest-token chat request body is kept for warmup replay
+/// (DMLX_PROMPT_DUMP overrides; empty string disables). Thread-safe: the
+/// result is cached after first use.
+var cached_dump_path: ?(?[]const u8) = null;
+var default_dump_path_buf: [4096]u8 = undefined;
+pub fn promptDumpPath() ?[]const u8 {
+    if (cached_dump_path) |v| return v;
+    var v: ?[]const u8 = null;
+    if (std.c.getenv("DMLX_PROMPT_DUMP")) |s| {
+        const d = std.mem.span(s);
+        if (d.len > 0) v = d;
+    } else if (std.c.getenv("HOME")) |h| {
+        v = std.fmt.bufPrint(&default_dump_path_buf, "{s}/.cache/dmlx/last_chat.json", .{std.mem.span(h)}) catch null;
+    }
+    cached_dump_path = v;
+    return v;
+}
+
+/// Keep the chat request body with the most prompt tokens on disk; the
+/// startup warmup replays it to rebuild the KV prefix snapshot before the
+/// first real turn. Keyed on token count, not bytes: a small request with a
+/// base64 image is byte-huge but token-cheap and must not displace the big
+/// system prompt.
+pub fn maybeDumpPromptBody(io: std.Io, body: []const u8, n_tokens: usize) void {
+    const path = promptDumpPath() orelse return;
+    const sidecar = std.fmt.allocPrint(std.heap.page_allocator, "{s}.tokens", .{path}) catch return;
+    defer std.heap.page_allocator.free(sidecar);
+    var prev: usize = 0;
+    if (std.Io.Dir.cwd().readFileAlloc(io, sidecar, std.heap.page_allocator, .limited(64))) |t| {
+        prev = std.fmt.parseInt(usize, std.mem.trim(u8, t, " \n"), 10) catch 0;
+    } else |_| {}
+    if (n_tokens <= prev) return;
+    if (std.fs.path.dirname(path)) |d| std.Io.Dir.cwd().createDirPath(io, d) catch {};
+    if (std.Io.Dir.cwd().createFile(io, path, .{}) catch null) |f| {
+        defer f.close(io);
+        f.writeStreamingAll(io, body) catch return;
+    }
+    const count = std.fmt.allocPrint(std.heap.page_allocator, "{d}", .{n_tokens}) catch return;
+    defer std.heap.page_allocator.free(count);
+    if (std.Io.Dir.cwd().createFile(io, sidecar, .{}) catch null) |f| {
+        defer f.close(io);
+        f.writeStreamingAll(io, count) catch {};
+    }
+}
 
 /// Disables SIGPIPE on a connected socket. Darwin/BSD set SO_NOSIGPIPE;
 /// other targets are a comptime no-op (Linux send uses MSG_NOSIGNAL, and

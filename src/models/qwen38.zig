@@ -1965,6 +1965,12 @@ pub const Qwen38ServingModel = struct {
     /// `<dir>/snap_latest.safetensors` and reloaded lazily on the first
     /// lookup after a restart — the cold full prefill of a large static
     /// system prompt then happens once ever instead of once per process.
+    /// Directory for disk-persisted snapshots (DMLX_QWEN38_SNAP_DIR; the
+    /// server sets a ~/.cache/dmlx/snaps default at startup, an empty value
+    /// disables persistence). Every stored snapshot is written to
+    /// `<dir>/snap_latest.safetensors` and reloaded lazily on the first
+    /// lookup after a restart — the cold full prefill of a large static
+    /// system prompt then happens once ever instead of once per process.
     var cached_snap_dir: ?(?[]const u8) = null;
     fn prefixSnapDir() ?[]const u8 {
         if (cached_snap_dir) |v| return v;
@@ -1997,6 +2003,9 @@ pub const Qwen38ServingModel = struct {
     fn persistLatestSnapshot(self: *Qwen38ServingModel) void {
         const dir = prefixSnapDir() orelse return;
         const snap = &self.prefix_snaps.items[self.prefix_snaps.items.len - 1];
+        // Only prompts big enough to make a re-prefill hurt are worth disk;
+        // this also keeps small probes from overwriting the valuable entry.
+        if (snap.prompt_tokens.len < 2048) return;
         const t0 = std.c.mach_absolute_time();
         self.persistLatestSnapshotImpl(dir, snap) catch |err| {
             std.log.warn("[qwen38] snapshot persist failed: {}", .{err});
@@ -2008,9 +2017,7 @@ pub const Qwen38ServingModel = struct {
 
     fn persistLatestSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8, snap: *const PrefixSnapshot) !void {
         const mlx_io = @import("mlx").io;
-        const dir_z = try self.allocator.dupeZ(u8, dir);
-        defer self.allocator.free(dir_z);
-        _ = mkdir_c.mkdir(dir_z.ptr, 0o755);
+        makePathPosix(self.allocator, dir);
         const path = try self.snapFilePath(dir);
         defer self.allocator.free(path);
 
@@ -2066,6 +2073,19 @@ pub const Qwen38ServingModel = struct {
         self.loadPersistedSnapshotImpl(dir) catch |err| {
             std.log.warn("[qwen38] persisted snapshot load failed: {}", .{err});
         };
+    }
+
+    /// mkdir -p via one mkdir per component (POSIX; absolute or relative).
+    fn makePathPosix(allocator: std.mem.Allocator, path: []const u8) void {
+        var i: usize = 0;
+        while (i <= path.len) : (i += 1) {
+            if (i != path.len and path[i] != '/') continue;
+            if (i == 0) continue;
+            const part = path[0..i];
+            const part_z = allocator.dupeZ(u8, part) catch return;
+            defer allocator.free(part_z);
+            _ = mkdir_c.mkdir(part_z.ptr, 0o755);
+        }
     }
 
     /// Move `name` out of a loaded weight map (caller adopts the Array and

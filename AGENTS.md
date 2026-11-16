@@ -13,7 +13,7 @@ dmlx pull qwen3.8-27b-4bit && dmlx pull qwen3.8-27b-mtp-4bit
 dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
 ```
 
-To drive dmlx from an agent harness (Claude Code, Codex, aider, Cline), use
+To drive dmlx from an agent harness (Claude Code, Codex, aider, Cline, dsh), use
 `dmlx connect <harness>` (add `--apply` to write the config where supported).
 
 See [llms.txt](llms.txt) for the full run/integrate reference, including the

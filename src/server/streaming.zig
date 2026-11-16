@@ -28,6 +28,7 @@ pub fn handleStreamingCompletion(
     connection: std.Io.net.Stream,
     server_config: ServerConfig,
     req_param: ChatCompletionRequest,
+    raw_body: []const u8,
 ) !void {
     var req = req_param;
     // 1. Send SSE response headers
@@ -74,6 +75,7 @@ pub fn handleStreamingCompletion(
     };
     defer prepared.deinit(allocator);
     const prompt_tokens = prepared.tokens;
+    @import("http.zig").maybeDumpPromptBody(io, raw_body, prompt_tokens.len);
 
     // 6. Setup generation config and submit to engine queue.
     const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;

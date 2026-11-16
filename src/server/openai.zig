@@ -647,6 +647,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     };
     defer prepared.deinit(allocator);
     const prompt_tokens = prepared.tokens;
+    @import("http.zig").maybeDumpPromptBody(io, request_json, prompt_tokens.len);
 
     // 6. Submit request to engine queue and wait for completion.
     const max_tokens = if (req.max_tokens orelse req.max_completion_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;

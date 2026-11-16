@@ -10,6 +10,8 @@ const scheduler_mod = @import("scheduler.zig");
 const kvcache = @import("kvcache.zig");
 const engine = @import("engine/root.zig");
 const native_engine_mod = @import("native_engine.zig");
+const unistd_c = @cImport(@cInclude("unistd.h"));
+const setenv_c = @cImport(@cInclude("stdlib.h"));
 
 const EagerContext = ops.EagerContext;
 
@@ -39,6 +41,19 @@ pub const ServerState = state.ServerState;
 // ------------------------------------------------------------------
 
 pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConfig) !void {
+    // Agent-harness friendly default: persist Qwen3.8 prefix snapshots across
+    // restarts unless the user configured (or explicitly emptied) the path.
+    // Set here rather than in the model so tests keep the env-only behavior.
+    if (std.c.getenv("DMLX_QWEN38_SNAP_DIR") == null) {
+        if (std.c.getenv("HOME")) |h| {
+            // putenv retains the pointer: intentionally leaked for the
+            // process lifetime.
+            if (std.fmt.allocPrint(allocator, "DMLX_QWEN38_SNAP_DIR={s}/.cache/dmlx/snaps", .{std.mem.span(h)})) |s| {
+                const env = allocator.dupeZ(u8, s) catch null;
+                if (env) |e| _ = setenv_c.putenv(e.ptr);
+            } else |_| {}
+        }
+    }
     var server_state = try state.loadModel(allocator, io, server_config);
     // NOTE: server is long-running; deinit happens on process exit.
     // defer server_state.deinit();
@@ -60,6 +75,11 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
 
     // Start the accept loop in an async fiber.
     _ = io.async(acceptLoop, .{ allocator, io, &server_state, server_config });
+
+    // Warmup: replay the largest previously-seen chat request so the KV
+    // prefix snapshot exists before the first real turn (agent harnesses
+    // resend a large static system prompt every session).
+    _ = io.async(warmupFromPromptDump, .{ allocator, io, server_config.port });
 
     if (server_state.is_native) {
         // ------------------------------------------------------------------
@@ -193,6 +213,46 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
 
 fn engineLoopRun(loop: *engine.EngineLoop) void {
     loop.run();
+}
+
+/// Replay the largest stored chat request body (http.promptDumpPath()) as a
+/// one-token non-streaming completion, right after startup. With a disk
+/// snapshot present this is a ~1s full-prefix hit; without one it pays the
+/// cold prefill once in the background instead of in the user's first turn.
+fn warmupFromPromptDump(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
+    io.sleep(.fromSeconds(3), .awake) catch return;
+    const path = http.promptDumpPath() orelse return;
+    const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch return;
+    defer allocator.free(raw);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const obj_alloc = parsed.arena.allocator();
+    parsed.value.object.put(obj_alloc, "max_tokens", .{ .integer = 1 }) catch return;
+    parsed.value.object.put(obj_alloc, "stream", .{ .bool = false }) catch return;
+    const body = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch return;
+    defer allocator.free(body);
+
+    const request = std.fmt.allocPrint(allocator, "POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.len, body }) catch return;
+    defer allocator.free(request);
+
+    const addr = std.Io.net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+    const conn = addr.connect(io, .{ .mode = .stream }) catch return;
+    defer conn.close(io);
+    var rest: []const u8 = request;
+    while (rest.len > 0) {
+        const n = unistd_c.write(conn.socket.handle, rest.ptr, rest.len);
+        if (n < 0) return;
+        rest = rest[@intCast(n)..];
+    }
+    // Drain briefly; the response itself is irrelevant.
+    var sink: [4096]u8 = undefined;
+    while (true) {
+        const n = unistd_c.read(conn.socket.handle, &sink, sink.len);
+        if (n <= 0) break;
+    }
+    std.log.info("[warmup] replayed stored prompt ({d} bytes) for prefix snapshot", .{body.len});
 }
 
 fn installSignalHandlers() void {
