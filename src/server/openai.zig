@@ -28,6 +28,10 @@ pub const ChatCompletionRequest = struct {
     /// Per-request top-k override (must be >= 1).
     top_k: ?u32 = null,
     max_tokens: ?u32 = null,
+    /// Newer OpenAI clients (and gateways like pi-ai) send
+    /// `max_completion_tokens` instead of `max_tokens`; honored as a
+    /// fallback when `max_tokens` is absent.
+    max_completion_tokens: ?u32 = null,
     /// Optional seed for deterministic sampling.
     seed: ?u64 = null,
     /// Optional stop strings — generation stops when any of these are produced.
@@ -493,7 +497,7 @@ pub fn buildToolSystem(allocator: std.mem.Allocator, req: ChatCompletionRequest)
 pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *ServerState, request_json: []const u8, server_config: ServerConfig) ![]u8 {
     const t_entry = std.c.mach_absolute_time();
     // 1. Parse request
-    const parsed = try std.json.parseFromSlice(ChatCompletionRequest, allocator, request_json, .{});
+    const parsed = try std.json.parseFromSlice(ChatCompletionRequest, allocator, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     var req = parsed.value;
 
@@ -534,7 +538,7 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     const prompt_tokens = prepared.tokens;
 
     // 6. Submit request to engine queue and wait for completion.
-    const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
+    const max_tokens = if (req.max_tokens orelse req.max_completion_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
     const temperature = req.temperature orelse server_config.temperature;
     const seed = req.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
 

@@ -27,6 +27,28 @@ const DynamicBuffer = dynamic_buffer_mod.DynamicBuffer;
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;
 
+/// Case-insensitive lookup of a header value inside a raw header block
+/// (everything before the blank line). Returns the trimmed value, or null
+/// when the header is absent.
+fn findHeaderValue(headers: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, headers, "\r\n");
+    _ = it.next(); // request line
+    while (it.next()) |line| {
+        if (line.len <= name.len + 1) continue;
+        if (!std.ascii.eqlIgnoreCase(line[0..name.len], name)) continue;
+        if (line[name.len] != ':') continue;
+        return std.mem.trim(u8, line[name.len + 1 ..], " \t");
+    }
+    return null;
+}
+
+test "findHeaderValue: case-insensitive, trims whitespace" {
+    const h = "POST /v1/chat HTTP/1.1\r\nHost: x\r\ncontent-length: 43124 \r\nContent-Type: application/json\r\n";
+    try std.testing.expectEqualStrings("43124", findHeaderValue(h, "Content-Length").?);
+    try std.testing.expectEqualStrings("application/json", findHeaderValue(h, "content-type").?);
+    try std.testing.expect(findHeaderValue(h, "transfer-encoding") == null);
+}
+
 fn handleRequest(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -93,11 +115,10 @@ fn handleRequest(
 
         // Check if we have the full headers
         if (std.mem.find(u8, dyn_buf.items(), "\r\n\r\n")) |header_end| {
-            const cl_prefix = "Content-Length: ";
-            if (std.mem.find(u8, dyn_buf.items()[0..header_end], cl_prefix)) |cl_start| {
-                const cl_value_start = cl_start + cl_prefix.len;
-                const cl_end = std.mem.find(u8, dyn_buf.items()[cl_value_start..], "\r\n") orelse continue;
-                const cl_str = dyn_buf.items()[cl_value_start .. cl_value_start + cl_end];
+            // HTTP header names are case-insensitive; Node/undici sends
+            // lowercase "content-length" while curl/Python send the
+            // capitalized form. Match both.
+            if (findHeaderValue(dyn_buf.items()[0..header_end], "content-length")) |cl_str| {
                 const content_length = std.fmt.parseInt(usize, cl_str, 10) catch continue;
                 const body_start = header_end + 4;
                 expected_total = body_start + content_length;
@@ -184,7 +205,7 @@ fn handleRequest(
             const body = request[header_end + 4 ..];
 
             // Parse request to check for streaming
-            const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{}) catch {
+            const parsed = std.json.parseFromSlice(ChatCompletionRequest, allocator, body, .{ .ignore_unknown_fields = true }) catch {
                 status_code = 400;
                 try writeJsonResponse(connection, io, 400, "{\"error\":\"invalid_json\"}");
                 return;
