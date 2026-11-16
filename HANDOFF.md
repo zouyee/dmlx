@@ -2168,3 +2168,25 @@ First long-context validation beyond 13.5k (ReleaseFast, snapshots on):
 - The model config declares 262,144 positions; nothing in the vtable_serial
   path caps length (the 8192 clamp in server.zig applies only to the
   legacy MLX engine's KV config).
+
+---
+
+## DeepSeek Harness (dsh) integration (2026-11-16, `d039d51`)
+
+dsh 0.2.2 drives dmlx through its pi-ai multi-provider adapter as a
+hand-declared OpenAI-compatible gateway (profile patch under
+~/.dsh/profiles/*/cordis.patch.yml; recipe now in llms.txt). Two
+Node/undici-induced server bugs fixed on the way:
+
+- Case-sensitive `Content-Length` matching made the request reader treat
+  undici requests as bodiless (lowercase header names) -> truncated JSON
+  -> invalid_json 400. Now case-insensitive per-line lookup.
+- Strict chat JSON parsing rejected pi-ai's extra fields
+  (stream_options/store) and it only sends max_completion_tokens; parser
+  is now ignore_unknown_fields and honors max_completion_tokens as the
+  max_tokens fallback.
+
+Verified: one-shot answer and a bash/write tool-calling task through
+`dsh headless` against Qwen3.8-27B-4bit. Note pi-ai requires an
+apiKeyEnv credential reference even for keyless local routes
+(DMLX_LOCAL_KEY=local works).

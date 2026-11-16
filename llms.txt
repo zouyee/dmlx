@@ -29,7 +29,7 @@ dmlx pull qwen3.8-27b-mtp-4bit    # MTP drafter for speculative decode
 dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
 ```
 
-## Connect an agent harness (Claude Code, Codex, aider, Cline)
+## Connect an agent harness (Claude Code, Codex, aider, Cline, DeepSeek Harness)
 
 The server speaks both the OpenAI Chat Completions API and the Anthropic
 Messages API (tools + streaming included). `dmlx connect` prints the exact
@@ -42,6 +42,26 @@ dmlx connect claude-code --apply   # merges ANTHROPIC_* env into ~/.claude/setti
 dmlx connect codex --apply         # appends [model_providers.dmlx] to ~/.codex/config.toml
 dmlx connect aider             # prints OPENAI_API_BASE exports
 dmlx connect cline             # prints Cline provider fields
+```
+
+DeepSeek Harness (`dsh`) has no `dmlx connect` recipe yet; add this to the
+profile's `cordis.patch.yml` and export any value for `DMLX_LOCAL_KEY`:
+
+```yaml
+- id: llm-pi-ai
+  config:
+    providers:
+      dmlx:
+        api: openai-completions
+        baseURL: http://127.0.0.1:8080/v1
+        apiKeyEnv: DMLX_LOCAL_KEY
+        models:
+          - id: qwen3.8-27b-4bit
+            contextWindow: 262144
+- id: agent-default-model
+  config:
+    provider: dmlx
+    model: qwen3.8-27b-4bit
 ```
 
 Notes: Codex must use `wire_api = "chat"` (/v1/responses is not implemented).
