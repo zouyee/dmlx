@@ -59,7 +59,9 @@ const ChatCommand = struct {
 const ServerCommand = struct {
     model_path: []const u8,
     port: u16 = 8080,
-    max_tokens: usize = 256,
+    // Per-request generation ceiling (also the clamp for client max_tokens).
+    // Agent harnesses request 16k; 256 silently truncated every long answer.
+    max_tokens: usize = 16384,
     temperature: f32 = 0.8,
     top_k: usize = 50,
     top_p: f32 = 1.0,
@@ -314,7 +316,7 @@ fn printUsage() void {
         \\    --native            Use the native engine (DeepSeek V4; default)
         \\    --speculative-mtp <n>  MTP speculative decoding, max draft depth (Qwen3.8)
         \\    --port <n>          HTTP port (default: 8080)
-        \\    --max-tokens <n>    Maximum tokens per request (default: 256)
+        \\    --max-tokens <n>    Maximum tokens per request (default: 16384)
         \\    --temperature <t>   Sampling temperature (default: 0.8)
         \\    --top-k <k>         Top-k sampling (default: 50)
         \\    --top-p <p>         Top-p sampling (default: 1.0)

@@ -26,7 +26,10 @@ pub const KvQuant = enum {
 pub const ServerConfig = struct {
     model_path: []const u8,
     port: u16 = 8080,
-    max_tokens: usize = 256,
+    /// Per-request ceiling on generated tokens; OpenAI max_tokens /
+    /// max_completion_tokens are clamped to this. Agent harnesses ask for
+    /// 16k, so the default must not truncate them.
+    max_tokens: usize = 16384,
     temperature: f32 = 0.8,
     top_k: usize = 50,
     top_p: f32 = 1.0,

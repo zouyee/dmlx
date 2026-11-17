@@ -2315,3 +2315,14 @@ image KV reusable across turns:
 
 Debug aid: `DMLX_SNAP_DEBUG=1` logs the first-mismatch token index when a
 stored snapshot fails to prefix-match.
+
+## serve: default max_tokens 256 -> 16384 (2026-11-17)
+
+Every OpenAI request is clamped to the server's per-request ceiling
+(`openai.zig` `@min(mt, server_config.max_tokens)`), and the ceiling
+defaulted to 256 — dsh asked for 16384 and got silently truncated at 256
+tokens, surfaced in the harness as "已达到输出 token 上限回答被截断"
+(finish_reason=length). Raised the default in both `ServerConfig` and the
+`serve` CLI command (help text updated); `--max-tokens` still overrides.
+Verified: 1200-token request now completes with finish_reason=stop at 692
+tokens. CLI `dmlx chat` default (256) is unchanged.
