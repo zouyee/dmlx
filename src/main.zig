@@ -66,6 +66,8 @@ const ServerCommand = struct {
     top_k: usize = 50,
     top_p: f32 = 1.0,
     max_kv_size: memory.MaxKvSize = .auto,
+    /// System-wide memory guard threshold (fraction of RAM used); 0 disables.
+    system_mem_guard_pct: f32 = 0.92,
     // -- Production server config parameters (wired from ServerConfig) --
     kv_bits: u8 = 4,
     kv_strategy: root.server.KvStrategy = .paged_quantized,
@@ -215,6 +217,7 @@ pub fn main(init: std.process.Init) !void {
             .top_k = cmd.top_k,
             .top_p = cmd.top_p,
             .max_kv_size = cmd.max_kv_size,
+            .system_mem_guard_pct = cmd.system_mem_guard_pct,
             .kv_bits = cmd.kv_bits,
             .kv_strategy = cmd.kv_strategy,
             .kv_quant = cmd.kv_quant,
@@ -321,6 +324,7 @@ fn printUsage() void {
         \\    --top-k <k>         Top-k sampling (default: 50)
         \\    --top-p <p>         Top-p sampling (default: 1.0)
         \\    --max-kv-size <v>   KV cache size: "auto" (default) or integer
+        \\    --system-mem-guard <f>  Shed load when system RAM used ≥ this fraction (default: 0.92, 0 disables)
         \\    --kv-bits <n>       KV cache quantization: 4, 8, or 16 (default: 4)
         \\    --kv-strategy <s>   KV cache strategy: standard|paged|quantized|paged_quantized (default: paged_quantized)
         \\    --kv-quant <q>      KV quantization algorithm: simple|turbo (default: simple)
@@ -424,6 +428,9 @@ fn parseServerArgs(allocator: std.mem.Allocator, args: []const [:0]const u8) !Se
             cmd.top_p = try std.fmt.parseFloat(f32, value);
         } else if (std.mem.eql(u8, flag, "--max-kv-size")) {
             cmd.max_kv_size = memory.parseMaxKvSize(value) catch return error.InvalidArgument;
+        } else if (std.mem.eql(u8, flag, "--system-mem-guard")) {
+            cmd.system_mem_guard_pct = try std.fmt.parseFloat(f32, value);
+            if (cmd.system_mem_guard_pct < 0 or cmd.system_mem_guard_pct > 1.0) return error.InvalidArgument;
         } else if (std.mem.eql(u8, flag, "--kv-bits")) {
             cmd.kv_bits = try std.fmt.parseInt(u8, value, 10);
         } else if (std.mem.eql(u8, flag, "--kv-strategy")) {

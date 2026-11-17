@@ -11,7 +11,7 @@ const state_mod = @import("state.zig");
 const openai_mod = @import("openai.zig");
 const streaming_mod = @import("streaming.zig");
 const anthropic_mod = @import("anthropic.zig");
-const responses_mod = @import("responses.zig");
+const responses_mod = @import("responses/mod.zig");
 const completions_mod = @import("completions.zig");
 const detokenize_mod = @import("detokenize.zig");
 const response_store_mod = @import("response_store.zig");
@@ -153,6 +153,13 @@ fn handleRequest(
     _ = libc.write(2, msg, msg.len);
 
     if (std.mem.startsWith(u8, request, "POST /v1/chat/completions")) {
+        // Shed load early when the whole machine is under memory pressure —
+        // better a 503 than a macOS OOM reboot (see memory.samplePressureLevel).
+        if (state.systemPressureLevel() != .ok) {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"System memory pressure high — server is shedding load. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_pressure\"}}");
+            return;
+        }
         // Enforce memory limit before processing the request.
         memory_mod.enforceMemoryLimit(
             if (state.model_pool) |*pool| pool else null,
@@ -251,6 +258,7 @@ fn handleRequest(
             allocator,
             std.fs.path.basename(server_config.model_path),
             state.start_time_unix,
+            state.max_model_len,
         );
         defer allocator.free(models_json);
         status_code = 200;
@@ -289,6 +297,11 @@ fn handleRequest(
     } else if (std.mem.startsWith(u8, request, "POST /v1/responses")) {
         // OpenAI Responses API — minimal compatibility layer (translation
         // onto the chat-completions machinery; see responses.zig).
+        if (state.systemPressureLevel() != .ok) {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"System memory pressure high — server is shedding load. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_pressure\"}}");
+            return;
+        }
         memory_mod.enforceMemoryLimit(
             if (state.model_pool) |*pool| pool else null,
             null,
@@ -325,6 +338,11 @@ fn handleRequest(
         // (see embeddings.zig). The forward runs behind the model adapter's
         // embed op (null → 501 embedding_not_supported), serialized against
         // chat traffic by the adapter mutex.
+        if (state.systemPressureLevel() != .ok) {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"System memory pressure high — server is shedding load. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_pressure\"}}");
+            return;
+        }
         memory_mod.enforceMemoryLimit(
             if (state.model_pool) |*pool| pool else null,
             null,
@@ -363,6 +381,11 @@ fn handleRequest(
         }
     } else if (std.mem.startsWith(u8, request, "POST /v1/completions")) {
         // Legacy OpenAI text completions (raw prompt, no chat template).
+        if (state.systemPressureLevel() != .ok) {
+            status_code = 503;
+            try writeJsonResponse(connection, io, 503, "{\"error\":{\"message\":\"System memory pressure high — server is shedding load. Please retry later.\",\"type\":\"server_error\",\"code\":\"memory_pressure\"}}");
+            return;
+        }
         memory_mod.enforceMemoryLimit(
             if (state.model_pool) |*pool| pool else null,
             null,
@@ -482,20 +505,25 @@ fn handleRequest(
 // ------------------------------------------------------------------
 
 /// Build the GET /v1/models response body. The model id is JSON-escaped.
-pub fn formatModelsJson(allocator: std.mem.Allocator, model_id: []const u8, created_unix: i64) ![]u8 {
+pub fn formatModelsJson(allocator: std.mem.Allocator, model_id: []const u8, created_unix: i64, max_model_len: usize) ![]u8 {
     var escaped_id = std.ArrayList(u8).empty;
     defer escaped_id.deinit(allocator);
     try utils_mod.jsonEscapeInto(&escaped_id, allocator, model_id);
+    const len_part = if (max_model_len > 0)
+        try std.fmt.allocPrint(allocator, ",\"max_model_len\":{d}", .{max_model_len})
+    else
+        try allocator.dupe(u8, "");
+    defer allocator.free(len_part);
     return std.fmt.allocPrint(
         allocator,
-        "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"}}]}}",
-        .{ escaped_id.items, created_unix },
+        "{{\"object\":\"list\",\"data\":[{{\"id\":\"{s}\",\"object\":\"model\",\"created\":{d},\"owned_by\":\"dmlx\"{s}}}]}}",
+        .{ escaped_id.items, created_unix, len_part },
     );
 }
 
 test "formatModelsJson shape" {
     const allocator = std.testing.allocator;
-    const body = try formatModelsJson(allocator, "Qwen3.8-27B-4bit", 1794458459);
+    const body = try formatModelsJson(allocator, "Qwen3.8-27B-4bit", 1794458459, 262144);
     defer allocator.free(body);
 
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -513,7 +541,7 @@ test "formatModelsJson shape" {
 
 test "formatModelsJson escapes quotes and backslashes in the id" {
     const allocator = std.testing.allocator;
-    const body = try formatModelsJson(allocator, "evil\"id\\name", 0);
+    const body = try formatModelsJson(allocator, "evil\"id\\name", 0, 0);
     defer allocator.free(body);
 
     // Must still be valid JSON and round-trip to the raw id.

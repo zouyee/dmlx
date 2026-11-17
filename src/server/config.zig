@@ -34,6 +34,9 @@ pub const ServerConfig = struct {
     top_k: usize = 50,
     top_p: f32 = 1.0,
     memory_config: memory_mod.MemoryConfig = .{},
+    /// System-wide memory guard: warn when (total - reclaimable)/total ≥ this
+    /// fraction; critical at min(pct + 0.03, 0.99). 0 disables the guard.
+    system_mem_guard_pct: f32 = 0.92,
     max_kv_size: memory_mod.MaxKvSize = .auto,
     kv_bits: u8 = 4,
     kv_strategy: KvStrategy = .paged_quantized,

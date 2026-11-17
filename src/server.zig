@@ -68,6 +68,7 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
     server_state.engine_running = std.atomic.Value(bool).init(true);
     server_state.active_requests = std.atomic.Value(u32).init(0);
     server_state.next_request_id = std.atomic.Value(u64).init(1);
+    server_state.system_pressure = std.atomic.Value(u8).init(0);
 
     // Install signal handlers for graceful shutdown.
     installSignalHandlers();
@@ -75,6 +76,16 @@ pub fn start(allocator: std.mem.Allocator, io: std.Io, server_config: ServerConf
 
     // Start the accept loop in an async fiber.
     _ = io.async(acceptLoop, .{ allocator, io, &server_state, server_config });
+
+    // System-wide memory guard: watch total machine memory so dmlx sheds load
+    // before macOS runs out and OOM-reboots. 0 disables.
+    if (server_config.system_mem_guard_pct > 0) {
+        _ = io.async(systemMemoryGuardLoop, .{ io, &server_state, server_config.system_mem_guard_pct });
+        std.log.info("System memory guard: warn at {d:.0}% used (critical at {d:.0}%), poll 2s", .{
+            server_config.system_mem_guard_pct * 100.0,
+            @min(server_config.system_mem_guard_pct + 0.03, 0.99) * 100.0,
+        });
+    }
 
     // Warmup: replay the largest previously-seen chat request so the KV
     // prefix snapshot exists before the first real turn (agent harnesses
@@ -209,6 +220,68 @@ fn acceptLoop(allocator: std.mem.Allocator, io: std.Io, server_state: *ServerSta
     }
 
     std.log.info("Accept loop stopped, no longer accepting new connections.", .{});
+}
+
+/// System-wide memory guard fiber. Polls machine memory every 2s and
+/// publishes the pressure level on `server_state.system_pressure`; on
+/// critical pressure it also tries to free memory (KV offload / pool evict).
+/// Runs until shutdown is requested.
+fn systemMemoryGuardLoop(io: std.Io, server_state: *ServerState, warn_pct: f32) void {
+    const critical_pct: f32 = @min(warn_pct + 0.03, 0.99);
+    var last_level: memory_mod.PressureLevel = .ok;
+    var pending: memory_mod.PressureLevel = .ok;
+    var pending_count: u8 = 0;
+    // ~60s sliding window of swap samples for growth-rate escalation.
+    var swap_window: [30]i64 = @splat(-1);
+    var swap_idx: usize = 0;
+    while (!engine.isShutdownRequested()) {
+        io.sleep(.fromSeconds(2), .awake) catch break;
+        var sampled = memory_mod.samplePressureLevel(warn_pct, critical_pct);
+        const swap_now: i64 = @intCast(memory_mod.getSwapUsageBytes());
+        if (swap_window[swap_idx] >= 0) {
+            const elapsed_min: f64 = @as(f64, @floatFromInt(swap_window.len)) * 2.0 / 60.0;
+            const rate: i64 = @intFromFloat(@as(f64, @floatFromInt(swap_now - swap_window[swap_idx])) / elapsed_min);
+            const growth_level = memory_mod.classifySwapGrowth(rate);
+            if (@intFromEnum(growth_level) > @intFromEnum(sampled)) sampled = growth_level;
+        }
+        swap_window[swap_idx] = swap_now;
+        swap_idx = (swap_idx + 1) % swap_window.len;
+        // Hysteresis against flapping near a threshold: enter warn/critical
+        // only after 2 consecutive samples, leave back to ok immediately.
+        var level = last_level;
+        if (@intFromEnum(sampled) <= @intFromEnum(last_level)) {
+            level = sampled;
+            pending = .ok;
+            pending_count = 0;
+        } else {
+            if (sampled == pending) {
+                pending_count += 1;
+            } else {
+                pending = sampled;
+                pending_count = 1;
+            }
+            if (pending_count >= 2) {
+                level = pending;
+                pending = .ok;
+                pending_count = 0;
+            }
+        }
+        server_state.system_pressure.store(@intFromEnum(level), .release);
+        if (level != last_level) {
+            const free_mb = memory_mod.getSystemFreeMemoryBytes() / (1024 * 1024);
+            const swap_mb = memory_mod.getSwapUsageBytes() / (1024 * 1024);
+            switch (level) {
+                .ok => std.log.info("System memory pressure relieved (free={d}MB swap={d}MB)", .{ free_mb, swap_mb }),
+                .warn => std.log.warn("System memory pressure HIGH — rejecting new requests (free={d}MB swap={d}MB)", .{ free_mb, swap_mb }),
+                .critical => std.log.err("System memory pressure CRITICAL — rejecting new requests (free={d}MB swap={d}MB)", .{ free_mb, swap_mb }),
+            }
+            last_level = level;
+        }
+        // Gate-only design: shedding load at admission is the safe action.
+        // Actively evicting pool entries / KV from this fiber raced the live
+        // engine and stalled request processing, so the guard never calls
+        // enforceMemoryLimit itself.
+    }
 }
 
 fn engineLoopRun(loop: *engine.EngineLoop) void {

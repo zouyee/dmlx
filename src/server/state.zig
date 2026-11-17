@@ -30,6 +30,20 @@ const Array = @import("mlx").array.Array;
 // Model state (loaded via ModelRegistry at startup)
 // ------------------------------------------------------------------
 
+/// Extract max_position_embeddings from config.json text (first occurrence;
+/// top-level for most models, nested under text_config for qwen3_5). 0 when
+/// absent.
+fn parseMaxPositionEmbeddings(config_content: []const u8) usize {
+    const key = "\"max_position_embeddings\":";
+    const idx = std.mem.indexOf(u8, config_content, key) orelse return 0;
+    var rest = config_content[idx + key.len ..];
+    rest = std.mem.trimStart(u8, rest, " \t");
+    var end: usize = 0;
+    while (end < rest.len and rest[end] >= '0' and rest[end] <= '9') end += 1;
+    if (end == 0) return 0;
+    return std.fmt.parseInt(usize, rest[0..end], 10) catch 0;
+}
+
 pub const ServerState = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -59,6 +73,10 @@ pub const ServerState = struct {
     stop_tokens: []const u32 = &.{},
     /// Server start time (unix seconds), reported as `created` by /v1/models.
     start_time_unix: i64 = 0,
+    /// Advertised context window (config.json max_position_embeddings); 0 =
+    /// unknown. /v1/models reports it as max_model_len so clients can show
+    /// context-usage percentages.
+    max_model_len: usize = 0,
     /// In-memory Responses API object store (GET/DELETE /v1/responses/{id}).
     response_store: response_store_mod.ResponseStore,
 
@@ -71,6 +89,14 @@ pub const ServerState = struct {
     engine_running: std.atomic.Value(bool),
     active_requests: std.atomic.Value(u32),
     next_request_id: std.atomic.Value(u64),
+    /// System-wide memory pressure, published by the monitor fiber
+    /// (memory.PressureLevel ordinal). Read by the HTTP admission gate.
+    system_pressure: std.atomic.Value(u8),
+
+    /// Current system-wide memory pressure level (set by the guard fiber).
+    pub fn systemPressureLevel(self: *const ServerState) memory_mod.PressureLevel {
+        return @enumFromInt(self.system_pressure.load(.acquire));
+    }
 
     pub fn deinit(self: *ServerState) void {
         self.running = false;
@@ -232,6 +258,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .tokenizer_backend = tokenizer_backend,
             .model_name = model_name,
             .start_time_unix = start_time_unix,
+            .max_model_len = parseMaxPositionEmbeddings(config_content),
             .chat_template = chat_template,
             .caches = &[_]kvcache.KVCacheStrategy{},
             .model_pool = null,
@@ -251,6 +278,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
             .engine_running = std.atomic.Value(bool).init(false),
             .active_requests = std.atomic.Value(u32).init(0),
             .next_request_id = std.atomic.Value(u64).init(0),
+            .system_pressure = std.atomic.Value(u8).init(0),
         };
         server_state.tokenizer_strategy = server_state.tokenizer_backend.asStrategy();
         std.log.info("Native mode: engine ready (vocab={d}, layers={d})", .{ ne.config.vocab_size, ne.config.num_hidden_layers });
@@ -457,6 +485,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .tokenizer_backend = tokenizer_backend,
         .model_name = model_name,
         .start_time_unix = start_time_unix,
+        .max_model_len = parseMaxPositionEmbeddings(config_content),
         .chat_template = chat_template,
         .caches = caches,
         .model_pool = model_pool,
@@ -480,6 +509,7 @@ pub fn loadModel(allocator: std.mem.Allocator, io: std.Io, config: ServerConfig)
         .engine_running = std.atomic.Value(bool).init(false),
         .active_requests = std.atomic.Value(u32).init(0),
         .next_request_id = std.atomic.Value(u64).init(0),
+        .system_pressure = std.atomic.Value(u8).init(0),
     };
     server_state.tokenizer_strategy = server_state.tokenizer_backend.asStrategy();
     return server_state;
