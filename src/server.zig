@@ -292,11 +292,48 @@ fn engineLoopRun(loop: *engine.EngineLoop) void {
 /// one-token non-streaming completion, right after startup. With a disk
 /// snapshot present this is a ~1s full-prefix hit; without one it pays the
 /// cold prefill once in the background instead of in the user's first turn.
+///
+/// Size-capped: replaying a huge prompt (16k+) is a monolithic-prefill
+/// memory bomb — measured peak ~53.5 GB at 16K, which on a 48 GB machine
+/// wedges the Metal allocator and every queued request behind it (the
+/// "server hangs after restart" bug). DMLX_WARMUP_MAX_TOKENS overrides the
+/// cap; 0 disables the warmup replay entirely.
+fn warmupMaxTokens() usize {
+    const cached = struct {
+        var v: ?usize = null;
+    };
+    if (cached.v) |v| return v;
+    var v: usize = 8192;
+    if (std.c.getenv("DMLX_WARMUP_MAX_TOKENS")) |s| {
+        v = std.fmt.parseInt(usize, std.mem.span(s), 10) catch 8192;
+    }
+    cached.v = v;
+    return v;
+}
+
 fn warmupFromPromptDump(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
+    const max_tokens_cap = warmupMaxTokens();
+    if (max_tokens_cap == 0) return;
     io.sleep(.fromSeconds(3), .awake) catch return;
     const path = http.promptDumpPath() orelse return;
     const raw = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(16 * 1024 * 1024)) catch return;
     defer allocator.free(raw);
+
+    // Skip oversized replays: token count comes from the .tokens sidecar
+    // (written by maybeDumpPromptBody); fall back to a conservative
+    // bytes/4 estimate when the sidecar is missing.
+    var prompt_tokens: usize = raw.len / 4;
+    if (std.fmt.allocPrint(allocator, "{s}.tokens", .{path})) |sidecar| {
+        defer allocator.free(sidecar);
+        if (std.Io.Dir.cwd().readFileAlloc(io, sidecar, allocator, .limited(64))) |t| {
+            defer allocator.free(t);
+            prompt_tokens = std.fmt.parseInt(usize, std.mem.trim(u8, t, " \n"), 10) catch prompt_tokens;
+        } else |_| {}
+    } else |_| {}
+    if (prompt_tokens > max_tokens_cap) {
+        std.log.info("[warmup] skipping replay: {d} tokens exceeds cap {d} (DMLX_WARMUP_MAX_TOKENS)", .{ prompt_tokens, max_tokens_cap });
+        return;
+    }
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return;
     defer parsed.deinit();
