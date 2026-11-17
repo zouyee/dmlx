@@ -102,3 +102,28 @@ pub fn formatSSEChunk(
         finish_part,
     });
 }
+
+/// Same as formatSSEChunk but carries the text in delta.reasoning_content
+/// (DeepSeek/OpenRouter convention) instead of delta.content — used to
+/// stream the model's think block on a separate channel so clients render
+/// it as collapsible reasoning instead of mixing it into the answer.
+pub fn formatSSEChunkReasoning(
+    allocator: std.mem.Allocator,
+    completion_id: u64,
+    created: u64,
+    model_name: []const u8,
+    token_text: []const u8,
+) ![]u8 {
+    var escaped_buf = std.ArrayList(u8).empty;
+    defer escaped_buf.deinit(allocator);
+    try jsonEscapeInto(&escaped_buf, allocator, token_text);
+
+    return try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[{{"index":0,"delta":{{"reasoning_content":"{s}"}},"finish_reason":null}}]}}
+    , .{
+        completion_id,
+        created,
+        model_name,
+        escaped_buf.items,
+    });
+}

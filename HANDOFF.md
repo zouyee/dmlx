@@ -2358,3 +2358,23 @@ already-buffered prose stranded in `buffered` (never flushed). Flushes now
 back off to a UTF-8 codepoint boundary and the transition moves the
 decided prose into the holdback. Verified: CJK poem with tools attached
 streams intact; tool-call and no-tool paths unchanged.
+
+## reasoning_content split: thinking on its own SSE channel (2026-11-17 午)
+
+Agent harnesses showed the model's think block inline with the answer
+("思维链与输出混在一起"). Root cause: with thinking enabled the Qwen
+ChatML generation prompt opens "<think>\n" and everything the model
+produces — reasoning AND answer — went out as delta.content. (The
+DMLX_CHAT_EMPTY_THINK empty-block suppression did not reliably stop this
+27B from reasoning, and when it did fire it just made the reasoning
+appear untagged.) The server now splits at the first "</think>": text
+before streams as delta.reasoning_content (DeepSeek/OpenRouter
+convention, rendered collapsible by harnesses), text after is the content
+path (tool-call buffering/marker watch unchanged, applied post-think;
+reasoning chunks bypass the tool buffer). Splitting handles tags split
+across tokens and never cuts multi-byte UTF-8. Non-streaming responses
+split into message.reasoning_content + message.content, and tool
+detection runs on the post-think content only. Serve now runs WITHOUT
+DMLX_CHAT_EMPTY_THINK so the think block is well-formed. Verified:
+reasoning/answer split cleanly in streaming + non-streaming; forced tool
+call still returns a single delta.tool_calls chunk.

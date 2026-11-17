@@ -17,6 +17,7 @@ const SSEWriter = sse_mod.SSEWriter;
 const writeSSEHeaders = sse_mod.writeSSEHeaders;
 const writeSSEEvent = sse_mod.writeSSEEvent;
 const formatSSEChunk = sse_mod.formatSSEChunk;
+const formatSSEChunkReasoning = sse_mod.formatSSEChunkReasoning;
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;
@@ -153,6 +154,18 @@ pub fn handleStreamingCompletion(
     var holdback = std.ArrayList(u8).empty;
     defer holdback.deinit(allocator);
 
+    // Thinking split (qwen ChatML with thinking enabled): the generation
+    // prompt opens "<think>\n", so output before the first "</think>" is
+    // reasoning. Deliver it as delta.reasoning_content (DeepSeek/OpenRouter
+    // convention) and keep only the post-think text on the content/tool
+    // path, so agent harnesses render collapsible thinking instead of the
+    // reasoning mixing into the answer.
+    const think_close = "</think>";
+    const split_think = !state.chat_template.empty_think and tool_family == .qwen;
+    var in_reasoning = split_think;
+    var think_tail = std.ArrayList(u8).empty;
+    defer think_tail.deinit(allocator);
+
     while (true) {
         const event = req_state.completion.waitForToken(io) catch {
             // Fiber cancelled mid-stream: the engine may still be
@@ -164,6 +177,65 @@ pub fn handleStreamingCompletion(
         };
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
+            var text: []const u8 = e.token_text;
+            if (in_reasoning) {
+                try think_tail.appendSlice(allocator, text);
+                if (std.mem.indexOf(u8, think_tail.items, think_close)) |p| {
+                    if (p > 0) {
+                        if (ka_running) {
+                            stop_keepalive.store(true, .release);
+                            ka_future.cancel(io);
+                            ka_running = false;
+                        }
+                        sendReasoningChunk(&sse, allocator, completion_id, created, req.model, think_tail.items[0..p]) catch {
+                            abortStream(io, req_state, allocator);
+                            return;
+                        };
+                    }
+                    in_reasoning = false;
+                    var rest = think_tail.items[p + think_close.len ..];
+                    if (std.mem.startsWith(u8, rest, "\n\n")) rest = rest[2..];
+                    think_tail.clearRetainingCapacity();
+                    text = rest;
+                } else {
+                    // Hold back up to think_close.len-1 bytes (a "</think>"
+                    // opening may be split across tokens).
+                    const keep = think_close.len - 1;
+                    if (think_tail.items.len > keep) {
+                        var flush_len = think_tail.items.len - keep;
+                        // UTF-8 boundary back-off (continuation bytes 10xxxxxx).
+                        while (flush_len > 0 and (think_tail.items[flush_len] & 0xC0) == 0x80) flush_len -= 1;
+                        if (flush_len > 0) {
+                            if (ka_running) {
+                                stop_keepalive.store(true, .release);
+                                ka_future.cancel(io);
+                                ka_running = false;
+                            }
+                            sendReasoningChunk(&sse, allocator, completion_id, created, req.model, think_tail.items[0..flush_len]) catch {
+                                abortStream(io, req_state, allocator);
+                                return;
+                            };
+                            const r = think_tail.items.len - flush_len;
+                            std.mem.copyForwards(u8, think_tail.items[0..r], think_tail.items[flush_len..]);
+                            think_tail.shrinkRetainingCapacity(r);
+                        }
+                    }
+                    if (!e.is_final) continue;
+                    if (think_tail.items.len > 0) {
+                        if (ka_running) {
+                            stop_keepalive.store(true, .release);
+                            ka_future.cancel(io);
+                            ka_running = false;
+                        }
+                        sendReasoningChunk(&sse, allocator, completion_id, created, req.model, think_tail.items) catch {
+                            abortStream(io, req_state, allocator);
+                            return;
+                        };
+                        think_tail.clearRetainingCapacity();
+                    }
+                    text = "";
+                }
+            }
             if (buffer_for_tools) {
                 const finish_str: ?[]const u8 = if (e.is_final)
                     if (e.finish_reason) |fr|
@@ -179,9 +251,9 @@ pub fn handleStreamingCompletion(
 
                 if (tool_marker) |marker| {
                     if (tool_mode == .streaming) {
-                        try holdback.appendSlice(allocator, e.token_text);
+                        try holdback.appendSlice(allocator, text);
                     } else {
-                        try buffered.appendSlice(allocator, e.token_text);
+                        try buffered.appendSlice(allocator, text);
                     }
                     while (true) {
                         switch (tool_mode) {
@@ -270,7 +342,7 @@ pub fn handleStreamingCompletion(
                     // .deciding (degenerate empty output) or .buffering:
                     // the whole reply is in buffered — parse as before.
                 } else {
-                    try buffered.appendSlice(allocator, e.token_text);
+                    try buffered.appendSlice(allocator, text);
                     if (!e.is_final) continue;
                     if (ka_running) {
                         stop_keepalive.store(true, .release);
@@ -325,7 +397,7 @@ pub fn handleStreamingCompletion(
                     "stop"
             else
                 null;
-            const chunk = formatSSEChunk(allocator, completion_id, created, req.model, e.token_text, finish) catch |err| {
+            const chunk = formatSSEChunk(allocator, completion_id, created, req.model, text, finish) catch |err| {
                 // OOM with the engine possibly mid-generation: same
                 // cancel + drain contract before unwinding req_state.
                 abortStream(io, req_state, allocator);
@@ -377,6 +449,20 @@ fn sendContentChunk(
     finish: ?[]const u8,
 ) !void {
     const chunk = try formatSSEChunk(allocator, completion_id, created, model, text, finish);
+    defer allocator.free(chunk);
+    try sse.sendEvent(chunk);
+}
+
+/// Format + send one SSE reasoning chunk (frees its own buffer).
+fn sendReasoningChunk(
+    sse: *sse_mod.SSEWriter,
+    allocator: std.mem.Allocator,
+    completion_id: u64,
+    created: u64,
+    model: []const u8,
+    text: []const u8,
+) !void {
+    const chunk = try formatSSEChunkReasoning(allocator, completion_id, created, model, text);
     defer allocator.free(chunk);
     try sse.sendEvent(chunk);
 }

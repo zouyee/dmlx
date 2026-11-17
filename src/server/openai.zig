@@ -827,11 +827,34 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     const final_text = all_text.items;
     const new_tokens_len = req_state.token_count;
 
+    // Thinking split (qwen ChatML with thinking enabled): text before the
+    // first "</think>" is reasoning — return it as message.reasoning_content
+    // (DeepSeek/OpenRouter convention) so clients render collapsible
+    // thinking instead of mixing it into the answer. Tool detection runs on
+    // the post-think content only.
+    var content_text = final_text;
+    var reasoning_json: ?[]u8 = null;
+    defer if (reasoning_json) |r| allocator.free(r);
+    if (!state.chat_template.empty_think and tool_calling_mod.detectFamily(req.model) == .qwen) {
+        if (std.mem.indexOf(u8, final_text, "</think>")) |p| {
+            const reasoning = final_text[0..p];
+            var rest = final_text[p + "</think>".len ..];
+            if (std.mem.startsWith(u8, rest, "\n\n")) rest = rest[2..];
+            content_text = rest;
+            if (reasoning.len > 0) {
+                var esc_r = std.ArrayList(u8).empty;
+                defer esc_r.deinit(allocator);
+                try jsonEscapeInto(&esc_r, allocator, reasoning);
+                reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":\"{s}\"", .{esc_r.items});
+            }
+        }
+    }
+
     // 8. Tool calling loop (single round)
     if (req.tools) |tools| {
         _ = tools;
         const family = tool_calling_mod.detectFamily(req.model);
-        if (try tool_calling_mod.parse(allocator, final_text, family)) |parse_result| {
+        if (try tool_calling_mod.parse(allocator, content_text, family)) |parse_result| {
             defer parse_result.deinit();
 
             if (parse_result.calls.len > 0) {
@@ -883,15 +906,16 @@ pub fn generateChatCompletion(allocator: std.mem.Allocator, io: std.Io, state: *
     // JSON-escape the output text
     var escaped = std.ArrayList(u8).empty;
     defer escaped.deinit(allocator);
-    try jsonEscapeInto(&escaped, allocator, final_text);
+    try jsonEscapeInto(&escaped, allocator, content_text);
 
     return try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         created,
         created,
         req.model,
         escaped.items,
+        reasoning_json orelse "",
         finish_reason,
         prompt_tokens.len,
         new_tokens_len,
