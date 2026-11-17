@@ -271,10 +271,12 @@ pub fn preparePrompt(
         for (texts[0..n_texts]) |t| allocator.free(t);
         allocator.free(texts);
     }
-    var last_user_idx: ?usize = null;
+    const img_counts = try allocator.alloc(usize, req.messages.len);
+    defer allocator.free(img_counts);
     for (req.messages, 0..) |msg, i| {
-        if (std.mem.eql(u8, msg.role, "user")) last_user_idx = i;
+        const before = images.items.len;
         texts[i] = try extractMessageContent(allocator, msg.content, &images, &decoded);
+        img_counts[i] = images.items.len - before;
         n_texts += 1;
     }
 
@@ -284,25 +286,79 @@ pub fn preparePrompt(
     }
 
     const vops = state.vtable.vision orelse return error.VisionNotSupported;
-    const user_idx = last_user_idx orelse return error.InvalidContent;
     var proc = try vision_prompt.processImages(allocator, state.ctx, vops, state.vtable.ptr, images.items);
     defer allocator.free(proc.blocks_text);
     errdefer proc.data.deinit(allocator);
 
-    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, .{
-        .user_idx = user_idx,
-        .blocks_text = proc.blocks_text,
-    });
+    // Keep each image in its OWN user message: prepending every block to the
+    // last user message (the old behavior) relocates the image on every turn,
+    // so an earlier turn's prompt is never a token prefix of the next one and
+    // the model-side prefix snapshot can never hit.
+    const inserts = try buildVisionInserts(allocator, req.messages.len, img_counts, proc.data.blocks);
+    defer freeVisionInserts(allocator, inserts);
+
+    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, inserts);
     errdefer allocator.free(tokens);
     try vision_prompt.validatePadCount(tokens, vops.image_token_id, proc.n_pads);
     return .{ .tokens = tokens, .vision = proc.data };
 }
 
-const VisionInsert = struct {
-    user_idx: usize,
-    blocks_text: []const u8,
-};
+/// One "<|vision_start|><|image_pad|>*n<|vision_end|>" literal block.
+fn appendImageBlock(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, n_pads: usize) !void {
+    try buf.appendSlice(allocator, "<|vision_start|>");
+    for (0..n_pads) |_| try buf.appendSlice(allocator, "<|image_pad|>");
+    try buf.appendSlice(allocator, "<|vision_end|>");
+}
 
+/// Per-image pad count from its merge-divided grid (t * h_merge * w_merge).
+fn gridPads(g: [3]i32) usize {
+    return @as(usize, @intCast(g[0])) * @as(usize, @intCast(g[1])) * @as(usize, @intCast(g[2]));
+}
+
+/// Build the per-message vision block text: inserts[i] holds the blocks of
+/// the images that appeared in message i (empty slice when none), in
+/// in-message order. grids are the tower blocks for ALL images in the
+/// request, in appearance order.
+fn buildVisionInserts(
+    allocator: std.mem.Allocator,
+    n_messages: usize,
+    img_counts: []const usize,
+    grids: []const [3]i32,
+) ![]const []const u8 {
+    const inserts = try allocator.alloc([]const u8, n_messages);
+    var built: usize = 0;
+    errdefer {
+        for (inserts[0..built]) |s| allocator.free(s);
+        allocator.free(inserts);
+    }
+    var img_idx: usize = 0;
+    for (0..n_messages) |i| {
+        if (img_counts[i] == 0) {
+            inserts[i] = "";
+            built += 1;
+            continue;
+        }
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        for (0..img_counts[i]) |_| {
+            try appendImageBlock(&buf, allocator, gridPads(grids[img_idx]));
+            img_idx += 1;
+        }
+        inserts[i] = try buf.toOwnedSlice(allocator);
+        built += 1;
+    }
+    return inserts;
+}
+
+fn freeVisionInserts(allocator: std.mem.Allocator, inserts: []const []const u8) void {
+    for (inserts) |s| {
+        if (s.len > 0) allocator.free(s);
+    }
+    allocator.free(inserts);
+}
+
+/// Per-message literal vision block text: inserts[i] is prepended to
+/// message i's text (empty slice = no images in that message).
 /// Token count for a chat request WITHOUT running generation: same chat
 /// template + tokenizer as preparePrompt, so the result equals the chat
 /// path's usage.prompt_tokens for the same messages.
@@ -334,10 +390,12 @@ pub fn countPromptTokens(
         for (texts[0..n_texts]) |t| allocator.free(t);
         allocator.free(texts);
     }
-    var last_user_idx: ?usize = null;
+    const img_counts = try allocator.alloc(usize, req.messages.len);
+    defer allocator.free(img_counts);
     for (req.messages, 0..) |msg, i| {
-        if (std.mem.eql(u8, msg.role, "user")) last_user_idx = i;
+        const before = images.items.len;
         texts[i] = try extractMessageContent(allocator, msg.content, &images, &decoded);
+        img_counts[i] = images.items.len - before;
         n_texts += 1;
     }
 
@@ -350,30 +408,44 @@ pub fn countPromptTokens(
     // Preprocess-only pad counting (no tower forward — token count needs
     // just the grid, and the tower would waste a GPU forward per image).
     _ = state.vtable.vision orelse return error.VisionNotSupported;
-    const user_idx = last_user_idx orelse return error.InvalidContent;
-    var blocks_text = std.ArrayList(u8).empty;
-    defer blocks_text.deinit(allocator);
-    for (images.items) |img| {
-        var pp = switch (img) {
-            .path => |p| try qwen38_preprocess.preprocessImageFile(allocator, state.ctx, p),
-            .bytes => |b| try qwen38_preprocess.preprocessImageBytes(allocator, state.ctx, b),
-        };
-        defer pp.deinit();
-        try blocks_text.appendSlice(allocator, "<|vision_start|>");
-        for (0..pp.n_image_pad) |_| try blocks_text.appendSlice(allocator, "<|image_pad|>");
-        try blocks_text.appendSlice(allocator, "<|vision_end|>");
+    const inserts = try allocator.alloc([]const u8, req.messages.len);
+    var n_inserts: usize = 0;
+    defer {
+        for (inserts[0..n_inserts]) |s| {
+            if (s.len > 0) allocator.free(s);
+        }
+        allocator.free(inserts);
+    }
+    var img_idx: usize = 0;
+    for (0..req.messages.len) |i| {
+        if (img_counts[i] == 0) {
+            inserts[i] = "";
+            n_inserts += 1;
+            continue;
+        }
+        var buf = std.ArrayList(u8).empty;
+        errdefer buf.deinit(allocator);
+        for (0..img_counts[i]) |_| {
+            var pp = switch (images.items[img_idx]) {
+                .path => |p| try qwen38_preprocess.preprocessImageFile(allocator, state.ctx, p),
+                .bytes => |b| try qwen38_preprocess.preprocessImageBytes(allocator, state.ctx, b),
+            };
+            defer pp.deinit();
+            try appendImageBlock(&buf, allocator, pp.n_image_pad);
+            img_idx += 1;
+        }
+        inserts[i] = try buf.toOwnedSlice(allocator);
+        n_inserts += 1;
     }
 
-    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, .{
-        .user_idx = user_idx,
-        .blocks_text = blocks_text.items,
-    });
+    const tokens = try tokenizeMessages(allocator, state, req.messages, texts, extra_system, inserts);
     defer allocator.free(tokens);
     return tokens.len;
 }
 
 /// Apply the chat template to the extracted message texts (optionally with
-/// the vision blocks prepended to one user message) and tokenize.
+/// the per-message vision blocks prepended to their own message's text) and
+/// tokenize.
 ///
 /// For Qwen-family models, history is rendered in the native chat-template
 /// tool format: role=tool messages become user turns wrapping their content
@@ -385,7 +457,7 @@ fn tokenizeMessages(
     req_messages: []const ChatCompletionRequest.Message,
     texts: []const []const u8,
     extra_system: ?[]const u8,
-    vision: ?VisionInsert,
+    vision: ?[]const []const u8,
 ) ![]u32 {
     const family = tool_calling_mod.detectFamily(state.model_name);
     var messages = std.ArrayList(root.tokenizer.ChatMessage).empty;
@@ -409,8 +481,8 @@ fn tokenizeMessages(
         var content = t;
         var role = req_messages[i].role;
         if (vision) |v| {
-            if (i == v.user_idx) {
-                merged = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ v.blocks_text, t });
+            if (v[i].len > 0) {
+                merged = try std.fmt.allocPrint(allocator, "{s}\n{s}", .{ v[i], t });
                 content = merged.?;
             }
         }

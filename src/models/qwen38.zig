@@ -1947,6 +1947,10 @@ pub const Qwen38ServingModel = struct {
         /// [1, L, hidden] pre-final-norm rows for the whole prompt, retained
         /// only when the storing prefill captured .all (MTP drafter priming).
         hidden_all: ?Array,
+        /// MRoPE rope_delta in effect at store time (non-zero only for
+        /// snapshots stored by a vision prefill). Restored together with the
+        /// caches so decode/verify rope offsets stay consistent.
+        rope_delta: i32,
         last_access: u64,
 
         fn deinit(self: *PrefixSnapshot, allocator: std.mem.Allocator) void {
@@ -2061,6 +2065,9 @@ pub const Qwen38ServingModel = struct {
         const hash_str = try std.fmt.allocPrint(self.allocator, "{x}", .{tokensHash(snap.prompt_tokens)});
         defer self.allocator.free(hash_str);
         try metadata.put("tokens_hash", hash_str);
+        const delta_str = try std.fmt.allocPrint(self.allocator, "{d}", .{snap.rope_delta});
+        defer self.allocator.free(delta_str);
+        try metadata.put("rope_delta", delta_str);
         try mlx_io.saveSafetensors(self.allocator, path, weights, metadata);
     }
 
@@ -2144,6 +2151,12 @@ pub const Qwen38ServingModel = struct {
         errdefer logits.deinit();
         var hidden: ?Array = takeAdopted(&res.weights, "hidden_all") catch null;
         errdefer if (hidden) |*h| h.deinit();
+        // Older snapshot files predate the field; their entries are
+        // text-prefill snapshots, whose rope delta is 0.
+        var rope_delta: i32 = 0;
+        if (res.metadata.get("rope_delta")) |s| {
+            rope_delta = std.fmt.parseInt(i32, s, 10) catch 0;
+        }
 
         self.snap_access += 1;
         try self.prefix_snaps.append(self.allocator, .{
@@ -2151,6 +2164,7 @@ pub const Qwen38ServingModel = struct {
             .caches = caches,
             .logits = logits,
             .hidden_all = hidden,
+            .rope_delta = rope_delta,
             .last_access = self.snap_access,
         });
         std.log.info("[qwen38] persisted snapshot loaded ({d} tokens)", .{toks.len});
@@ -2190,7 +2204,8 @@ pub const Qwen38ServingModel = struct {
     }
 
     /// Replace the live caches with deep copies of `snap`'s (the snapshot
-    /// stays immutable and reusable). RoPE delta returns to the text value.
+    /// stays immutable and reusable). The MRoPE rope delta returns to the
+    /// value the snapshot was stored with (0 for text prefills).
     fn restoreSnapshot(self: *Qwen38ServingModel, snap: *const PrefixSnapshot) !void {
         const fresh = try self.allocator.alloc(Qwen38LayerCache, snap.caches.len);
         var made: usize = 0;
@@ -2208,7 +2223,7 @@ pub const Qwen38ServingModel = struct {
         for (self.caches) |*lc| lc.deinit();
         self.allocator.free(self.caches);
         self.caches = fresh;
-        self.setRopeDelta(0);
+        self.setRopeDelta(snap.rope_delta);
     }
 
     /// Index of the longest snapshot that is a prefix of `ids` (full
@@ -2223,6 +2238,10 @@ pub const Qwen38ServingModel = struct {
             if (std.mem.eql(u32, s.prompt_tokens, ids[0..plen])) {
                 best = i;
                 best_len = plen;
+            } else if (std.c.getenv("DMLX_SNAP_DEBUG") != null) {
+                var mismatch: usize = 0;
+                while (mismatch < plen and s.prompt_tokens[mismatch] == ids[mismatch]) mismatch += 1;
+                std.log.info("[qwen38] snap[{d}] len={d} mismatches at token {d} (snap={d} req={d})", .{ i, plen, mismatch, s.prompt_tokens[mismatch], ids[mismatch] });
             }
         }
         return best;
@@ -2268,6 +2287,7 @@ pub const Qwen38ServingModel = struct {
             .caches = caches_snap,
             .logits = lg,
             .hidden_all = ha,
+            .rope_delta = self.rope_delta,
             .last_access = self.snap_access,
         });
         self.persistLatestSnapshot();
@@ -2374,6 +2394,70 @@ pub const Qwen38ServingModel = struct {
         );
         defer mres.deinit(allocator);
 
+        // Longest-prefix snapshot restore for vision prompts. A text-path
+        // snapshot never contains vision tokens (that path rejects them), so
+        // a token-wise prefix match implies the restored KV is exactly what
+        // a monolithic vision prefill would have produced for the prefix —
+        // including any image pads, whose snapshots are only ever stored by
+        // this entry point. The boundary must not split an image's pad run
+        // (grid positions belong to one block); otherwise fall back to the
+        // monolithic prefill below.
+        if (prefixSnapMax() > 0) {
+            if (self.findPrefixSnapshot(ids)) |idx| {
+                const usable = capture != .all or self.prefix_snaps.items[idx].hidden_all != null;
+                if (usable) {
+                    const snap = &self.prefix_snaps.items[idx];
+                    const plen = snap.prompt_tokens.len;
+                    var prefix_pads: usize = 0;
+                    for (snap.prompt_tokens) |t| prefix_pads += @intFromBool(t == cfg.image_token_id);
+                    var acc_pads: usize = 0;
+                    var boundary_ok = acc_pads == prefix_pads;
+                    for (vision.blocks) |b| {
+                        if (acc_pads == prefix_pads) break;
+                        const n = @as(usize, @intCast(b[0])) * @as(usize, @intCast(b[1])) * @as(usize, @intCast(b[2]));
+                        if (acc_pads + n > prefix_pads) {
+                            boundary_ok = false;
+                            break;
+                        }
+                        acc_pads += n;
+                        boundary_ok = acc_pads == prefix_pads;
+                    }
+                    if (boundary_ok) {
+                        try self.restoreSnapshot(snap);
+                        self.snap_access += 1;
+                        self.prefix_snaps.items[idx].last_access = self.snap_access;
+                        if (plen == ids.len) {
+                            std.log.info("[qwen38] vision prefix snapshot full hit ({d} tokens), skipping prefill", .{plen});
+                            const lg = try ops.copy(ctx, snap.logits);
+                            errdefer lg.deinit();
+                            try lg.eval();
+                            var hh: ?Array = null;
+                            if (capture == .all) {
+                                hh = try ops.copy(ctx, snap.hidden_all.?);
+                                try hh.?.eval();
+                            }
+                            return .{ .logits = lg, .hidden = hh };
+                        }
+                        std.log.info("[qwen38] vision prefix snapshot hit: {d}/{d} tokens cached, prefilling suffix", .{ plen, ids.len });
+                        const res = try self.forwardVisionSuffix(ids, vision, capture, &mres, plen, prefix_pads);
+                        var out = res;
+                        if (capture == .all) {
+                            // Reassemble full-prompt hidden rows: stored
+                            // prefix rows + fresh suffix rows.
+                            const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ snap.hidden_all.?, res.hidden.? }, 1);
+                            try merged.eval();
+                            res.hidden.?.deinit();
+                            out.hidden = merged;
+                        }
+                        self.setRopeDelta(mres.rope_delta);
+                        self.storeSnapshot(ids, out.logits, out.hidden) catch |err|
+                            std.log.warn("[qwen38] prefix snapshot store failed: {}", .{err});
+                        return out;
+                    }
+                }
+            }
+        }
+
         if (self.embed_table_bf16 == null) {
             self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
         }
@@ -2396,7 +2480,65 @@ pub const Qwen38ServingModel = struct {
         // Only after the reset inside the prefill: decode/verify offsets
         // shift by the delta from here on.
         self.setRopeDelta(mres.rope_delta);
+        // Retain the post-prefill state so the next agent-loop turn restores
+        // the longest prefix instead of re-prefilling the whole multimodal
+        // prompt (the image KV lives in the snapshot like any text KV).
+        self.storeSnapshot(ids, res.logits, if (capture == .all) res.hidden else null) catch |err|
+            std.log.warn("[qwen38] prefix snapshot store failed: {}", .{err});
         return res;
+    }
+
+    /// Suffix continuation of a vision prefill after a prefix snapshot
+    /// restore: embed only ids[plen..], splice the feature rows of the
+    /// images whose pads start at or after the boundary (whole pad runs —
+    /// checked by the caller), and run the layer stack with MRoPE tables
+    /// built from the suffix slice of the full-prompt position ids. The
+    /// restored caches already hold the prefix, so positions stay absolute.
+    fn forwardVisionSuffix(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        vision: VisionInput,
+        capture: HiddenCapture,
+        mres: *const qwen38_mrope.MropeResult,
+        plen: usize,
+        prefix_pads: usize,
+    ) !ForwardCoreOut {
+        const allocator = self.allocator;
+        const ctx = self.ctx;
+        const cfg = self.cfg;
+        const hidden: i32 = @intCast(cfg.hidden_size);
+        const suffix = ids[plen..];
+
+        if (self.embed_table_bf16 == null) {
+            self.embed_table_bf16 = try buildResidentEmbedTable(ctx, self.ws, hidden);
+        }
+        const ids_i32 = try allocator.alloc(i32, suffix.len);
+        defer allocator.free(ids_i32);
+        for (suffix, 0..) |t, i| ids_i32[i] = @intCast(t);
+        const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(ids_i32.len)});
+        defer id_arr.deinit();
+        const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0); // [L', hidden] bf16
+        defer rows.deinit();
+        const feats_suffix = try ops.slice(ctx, vision.features, &[_]i32{ @intCast(prefix_pads), 0 }, &[_]i32{ vision.features.shape()[0], hidden }, &[_]i32{ 1, 1 });
+        defer feats_suffix.deinit();
+        const merged = try mergeVisionFeatures(ctx, rows, suffix, feats_suffix, cfg.image_token_id);
+        defer merged.deinit();
+        const emb = try ops.reshape(ctx, merged, &[_]i32{ 1, @intCast(suffix.len), hidden });
+        defer emb.deinit();
+
+        var channels: [3][]i32 = undefined;
+        var nch: usize = 0;
+        errdefer for (channels[0..nch]) |ch| allocator.free(ch);
+        for (&channels, 0..) |*ch, ci| {
+            ch.* = try allocator.dupe(i32, mres.position_ids[ci][plen..]);
+            nch += 1;
+        }
+        var mres_suffix = qwen38_mrope.MropeResult{ .position_ids = channels, .rope_delta = mres.rope_delta };
+        defer mres_suffix.deinit(allocator);
+        var mr = try buildMropeCosSin(allocator, cfg, &mres_suffix, suffix.len);
+        defer mr.deinit();
+
+        return self.forwardTokensCoreCont(suffix, capture, true, true, .{ .emb = emb, .mrope = mr });
     }
 
     /// forwardTokensWithVision with hidden-state capture (oracle bisection):

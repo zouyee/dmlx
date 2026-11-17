@@ -2282,3 +2282,36 @@ users with zero environment variables:
   `contextWindow: 40960`), the default model, and — for the web profile —
   the tool enables + welcome-notice dismissal. Launch dsh with
   `DMLX_LOCAL_KEY=local` (pi-ai requires a credential reference).
+
+## Vision prefix snapshots: restore + suffix continuation, images kept in their own message (2026-11-17)
+
+Multi-turn image requests used to re-run the full monolithic vision prefill
+every turn (a 16k-token dsh image turn cost ~156 s). Two changes make the
+image KV reusable across turns:
+
+- **Prefix snapshots now work for vision prompts**
+  (`Qwen38ServingModel.forwardTokensWithVisionImpl`): longest-prefix token
+  match restores the post-prefill state; a full match returns the stored
+  logits directly (identical repeat: 93 s -> 1.35 s), a partial match runs
+  the new `forwardVisionSuffix` — embeds only the suffix tokens, splices the
+  feature rows of images whose pads start at/after the boundary, and builds
+  MRoPE cos/sin from the suffix slice of the full-prompt position ids
+  (attn MRoPE tables use absolute positions, so restored-cache offsets are
+  consistent). A boundary that would split an image pad run falls back to
+  the monolithic prefill. The monolithic vision path now also stores a
+  snapshot (prerequisite for any later hit). `PrefixSnapshot` carries the
+  vision prefill's MRoPE `rope_delta` (persisted in the safetensors
+  metadata, default 0 for older files) and `restoreSnapshot` re-applies it.
+  Verified live: turn 2 -> `hit: 101/145, prefilling suffix` (2.8 s), turn
+  3 -> `hit: 145/187` (4.6 s), correct image-grounded answers throughout.
+- **Images stay in their own message** (`openai.zig` preparePrompt /
+  countPromptTokens): vision blocks were previously collected from all
+  messages and prepended to the LAST user message, so adding any turn moved
+  the image block and broke token-prefix matching (snapshot could never
+  hit). Blocks are now inserted into the message the image_url part came
+  from (`buildVisionInserts`), which is both more faithful to the chat
+  template and what makes multi-turn prefix reuse possible. Single-message
+  requests render identically to before.
+
+Debug aid: `DMLX_SNAP_DEBUG=1` logs the first-mismatch token index when a
+stored snapshot fails to prefix-match.
