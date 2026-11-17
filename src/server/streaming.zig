@@ -131,15 +131,27 @@ pub fn handleStreamingCompletion(
         }
     }
 
-    // Tool-enabled requests buffer the whole generation instead of streaming
-    // tokens: a tool call is only recognizable once the model's JSON output is
-    // complete, and OpenAI clients expect it as delta.tool_calls, never as
-    // content chunks. Non-tool output is flushed as a single content chunk.
-    // Keep-alives stay active until the buffered flush since no token chunks
-    // go out meanwhile.
+    // Tool-enabled requests: normal text streams live; output is buffered
+    // only while it can still turn into a tool call (the family's open
+    // marker, possibly split across tokens). Previously the whole
+    // generation was buffered whenever tools were present, so agent
+    // harnesses (always tool-enabled) looked frozen until the reply
+    // finished. Families without a reliable open marker keep the old
+    // full-buffer behavior.
+    const tool_family = tool_calling_mod.detectFamily(req.model);
+    const tool_marker: ?[]const u8 = if (tool_system != null) switch (tool_family) {
+        .qwen => "<tool_call>",
+        .llama => "<|python_tag|>",
+        .deepseek => "<|tool|>",
+        .unknown => null,
+    } else null;
     const buffer_for_tools = tool_system != null;
+    const ToolMode = enum { deciding, streaming, buffering };
+    var tool_mode: ToolMode = .deciding;
     var buffered = std.ArrayList(u8).empty;
     defer buffered.deinit(allocator);
+    var holdback = std.ArrayList(u8).empty;
+    defer holdback.deinit(allocator);
 
     while (true) {
         const event = req_state.completion.waitForToken(io) catch {
@@ -153,24 +165,110 @@ pub fn handleStreamingCompletion(
         if (event) |e| {
             defer if (e.token_text.len > 0) allocator.free(e.token_text);
             if (buffer_for_tools) {
-                try buffered.appendSlice(allocator, e.token_text);
-                if (!e.is_final) continue;
-                if (ka_running) {
-                    stop_keepalive.store(true, .release);
-                    ka_future.cancel(io);
-                    ka_running = false;
-                }
-                const finish: []const u8 = if (e.finish_reason) |fr|
-                    switch (fr) {
-                        .stop => "stop",
-                        .length => "length",
-                        .error_ => "stop",
-                    }
+                const finish_str: ?[]const u8 = if (e.is_final)
+                    if (e.finish_reason) |fr|
+                        switch (fr) {
+                            .stop => "stop",
+                            .length => "length",
+                            .error_ => "stop",
+                        }
+                    else
+                        "stop"
                 else
-                    "stop";
+                    null;
+
+                if (tool_marker) |marker| {
+                    if (tool_mode == .streaming) {
+                        try holdback.appendSlice(allocator, e.token_text);
+                    } else {
+                        try buffered.appendSlice(allocator, e.token_text);
+                    }
+                    while (true) {
+                        switch (tool_mode) {
+                            .deciding => {
+                                const trimmed = std.mem.trimStart(u8, buffered.items, " \t\n\r");
+                                const n = @min(trimmed.len, marker.len);
+                                if (std.mem.eql(u8, trimmed[0..n], marker[0..n])) {
+                                    if (trimmed.len >= marker.len) tool_mode = .buffering;
+                                    break; // still consistent with a tool call
+                                }
+                                tool_mode = .streaming; // plain text: go live
+                            },
+                            .streaming => {
+                                const keep = marker.len - 1;
+                                if (std.mem.indexOf(u8, holdback.items, marker)) |p| {
+                                    // A tool call begins mid-reply: flush the
+                                    // prose before it, buffer from the marker.
+                                    if (p > 0) {
+                                        if (ka_running) {
+                                            stop_keepalive.store(true, .release);
+                                            ka_future.cancel(io);
+                                            ka_running = false;
+                                        }
+                                        sendContentChunk(&sse, allocator, completion_id, created, req.model, holdback.items[0..p], null) catch {
+                                            abortStream(io, req_state, allocator);
+                                            return;
+                                        };
+                                    }
+                                    try buffered.appendSlice(allocator, holdback.items[p..]);
+                                    holdback.clearRetainingCapacity();
+                                    tool_mode = .buffering;
+                                } else if (holdback.items.len > keep) {
+                                    if (ka_running) {
+                                        stop_keepalive.store(true, .release);
+                                        ka_future.cancel(io);
+                                        ka_running = false;
+                                    }
+                                    const flush_len = holdback.items.len - keep;
+                                    sendContentChunk(&sse, allocator, completion_id, created, req.model, holdback.items[0..flush_len], null) catch {
+                                        abortStream(io, req_state, allocator);
+                                        return;
+                                    };
+                                    std.mem.copyForwards(u8, holdback.items[0..keep], holdback.items[flush_len..]);
+                                    holdback.shrinkRetainingCapacity(keep);
+                                }
+                                break;
+                            },
+                            .buffering => break,
+                        }
+                    }
+                    if (!e.is_final) continue;
+                    if (ka_running) {
+                        stop_keepalive.store(true, .release);
+                        ka_future.cancel(io);
+                        ka_running = false;
+                    }
+                    if (tool_mode == .streaming) {
+                        if (holdback.items.len > 0) {
+                            sendContentChunk(&sse, allocator, completion_id, created, req.model, holdback.items, null) catch {
+                                abortStream(io, req_state, allocator);
+                                return;
+                            };
+                        }
+                        sendContentChunk(&sse, allocator, completion_id, created, req.model, "", finish_str orelse "stop") catch {
+                            abortStream(io, req_state, allocator);
+                            return;
+                        };
+                        sse.sendEvent("[DONE]") catch {
+                            abortStream(io, req_state, allocator);
+                            return;
+                        };
+                        break;
+                    }
+                    // .deciding (degenerate empty output) or .buffering:
+                    // the whole reply is in buffered — parse as before.
+                } else {
+                    try buffered.appendSlice(allocator, e.token_text);
+                    if (!e.is_final) continue;
+                    if (ka_running) {
+                        stop_keepalive.store(true, .release);
+                        ka_future.cancel(io);
+                        ka_running = false;
+                    }
+                }
+                const finish: []const u8 = finish_str orelse "stop";
                 var sent = false;
-                const family = tool_calling_mod.detectFamily(req.model);
-                if (tool_calling_mod.parse(allocator, buffered.items, family) catch null) |pr| {
+                if (tool_calling_mod.parse(allocator, buffered.items, tool_family) catch null) |pr| {
                     defer pr.deinit();
                     if (pr.calls.len > 0) {
                         const calls_json = try openai_mod.formatToolCallsDeltaJson(allocator, pr.calls);
@@ -184,9 +282,10 @@ pub fn handleStreamingCompletion(
                     }
                 }
                 if (!sent) {
-                    const chunk = try formatSSEChunk(allocator, completion_id, created, req.model, buffered.items, finish);
-                    defer allocator.free(chunk);
-                    try sse.sendEvent(chunk);
+                    sendContentChunk(&sse, allocator, completion_id, created, req.model, buffered.items, finish) catch {
+                        abortStream(io, req_state, allocator);
+                        return;
+                    };
                 }
                 sse.sendEvent("[DONE]") catch {
                     abortStream(io, req_state, allocator);
@@ -255,6 +354,21 @@ pub fn handleStreamingCompletion(
 /// completion signal until the engine reports the request done. Only after
 /// that is it safe for the caller's req_state.deinit() to run. Shared by
 /// the chat (streaming.zig) and Responses (responses.zig) streaming loops.
+/// Format + send one SSE content chunk (frees its own buffer).
+fn sendContentChunk(
+    sse: *sse_mod.SSEWriter,
+    allocator: std.mem.Allocator,
+    completion_id: u64,
+    created: u64,
+    model: []const u8,
+    text: []const u8,
+    finish: ?[]const u8,
+) !void {
+    const chunk = try formatSSEChunk(allocator, completion_id, created, model, text, finish);
+    defer allocator.free(chunk);
+    try sse.sendEvent(chunk);
+}
+
 pub fn abortStream(io: std.Io, req_state: *engine.RequestState, allocator: std.mem.Allocator) void {
     req_state.requestCancel();
     while (!req_state.engine_done.load(.acquire)) {

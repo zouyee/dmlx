@@ -2326,3 +2326,26 @@ tokens, surfaced in the harness as "已达到输出 token 上限回答被截断"
 `serve` CLI command (help text updated); `--max-tokens` still overrides.
 Verified: 1200-token request now completes with finish_reason=stop at 692
 tokens. CLI `dmlx chat` default (256) is unchanged.
+
+## streaming: live tokens for tool-enabled requests (2026-11-17)
+
+Root cause of "choppy" agent-harness output: any request carrying `tools`
+took the `buffer_for_tools` branch and flushed the ENTIRE generation as one
+SSE chunk (a tool call is only recognizable once complete), so dsh — always
+tool-enabled — showed nothing until the reply finished (3 chunks for a
+466-token reply). `handleStreamingCompletion` now streams content live and
+only buffers while the output can still become a tool call: `.deciding`
+holds the first few bytes while they match the family open marker (qwen
+`<tool_call>`, llama `<|python_tag|>`, deepseek `<|tool|>`), `.streaming`
+flushes everything but a rolling marker.len-1 tail (a marker beginning
+mid-reply is caught, prose before it streams as content), `.buffering`
+accumulates a detected call for end-of-reply parsing into
+delta.tool_calls. Families without a reliable marker keep the old
+full-buffer behavior. Verified: dsh-style 18k-tool-prompt reply now
+arrives as 465 chunks (p90 gap 134 ms) at 17.7 tok/s; a forced tool call
+still returns a single delta.tool_calls chunk with finish_reason
+"tool_calls".
+
+Also: at 18k context, `--speculative-mtp 3` beat 7 (18.2 vs 15.3 tok/s —
+verify cost scales with draft depth at long KV), so the server now runs
+with cap 3.
