@@ -2349,3 +2349,12 @@ still returns a single delta.tool_calls chunk with finish_reason
 Also: at 18k context, `--speculative-mtp 3` beat 7 (18.2 vs 15.3 tok/s —
 verify cost scales with draft depth at long KV), so the server now runs
 with cap 3.
+
+Follow-up fix to the hybrid tool streaming: the rolling holdback split
+flushes at arbitrary byte offsets, which cut multi-byte UTF-8 characters
+across chunks (CJK output arrived as U+FFFD replacement garbage whenever
+tools were attached), and the deciding->streaming transition left the
+already-buffered prose stranded in `buffered` (never flushed). Flushes now
+back off to a UTF-8 codepoint boundary and the transition moves the
+decided prose into the holdback. Verified: CJK poem with tools attached
+streams intact; tool-call and no-tool paths unchanged.

@@ -193,6 +193,10 @@ pub fn handleStreamingCompletion(
                                     break; // still consistent with a tool call
                                 }
                                 tool_mode = .streaming; // plain text: go live
+                                // Move the decided prose into the holdback
+                                // so it flows through the same flush path.
+                                try holdback.appendSlice(allocator, buffered.items);
+                                buffered.clearRetainingCapacity();
                             },
                             .streaming => {
                                 const keep = marker.len - 1;
@@ -219,13 +223,21 @@ pub fn handleStreamingCompletion(
                                         ka_future.cancel(io);
                                         ka_running = false;
                                     }
-                                    const flush_len = holdback.items.len - keep;
-                                    sendContentChunk(&sse, allocator, completion_id, created, req.model, holdback.items[0..flush_len], null) catch {
-                                        abortStream(io, req_state, allocator);
-                                        return;
-                                    };
-                                    std.mem.copyForwards(u8, holdback.items[0..keep], holdback.items[flush_len..]);
-                                    holdback.shrinkRetainingCapacity(keep);
+                                    var flush_len = holdback.items.len - keep;
+                                    // Never split a multi-byte UTF-8 sequence
+                                    // across chunks: back off to the start of
+                                    // the straddling character (continuation
+                                    // bytes are 10xxxxxx).
+                                    while (flush_len > 0 and (holdback.items[flush_len] & 0xC0) == 0x80) flush_len -= 1;
+                                    if (flush_len > 0) {
+                                        sendContentChunk(&sse, allocator, completion_id, created, req.model, holdback.items[0..flush_len], null) catch {
+                                            abortStream(io, req_state, allocator);
+                                            return;
+                                        };
+                                        const rest = holdback.items.len - flush_len;
+                                        std.mem.copyForwards(u8, holdback.items[0..rest], holdback.items[flush_len..]);
+                                        holdback.shrinkRetainingCapacity(rest);
+                                    }
                                 }
                                 break;
                             },
