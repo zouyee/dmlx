@@ -2378,3 +2378,27 @@ detection runs on the post-think content only. Serve now runs WITHOUT
 DMLX_CHAT_EMPTY_THINK so the think block is well-formed. Verified:
 reasoning/answer split cleanly in streaming + non-streaming; forced tool
 call still returns a single delta.tool_calls chunk.
+
+## MTP catch-up: replay-free commit + prenorm chain by default (2026-11-17 午后)
+
+Head-to-head vs omlx (same M4 Pro, Qwen3.8-27B-4bit, MTP): our decode was
+19.5 tok/s vs their 28.6. `scripts/mtp_round_decompose.py` showed the gap
+was NOT draft speed or verify cost — it was conditional acceptance:
+omlx's depth profile is flat (d1-d4 = 72-100%) while ours collapsed with
+depth (p1..p4 = 0.64/0.34/0.11/0.11 on prose). Two pre-existing A/B
+toggles fixed exactly that and are now DEFAULTS:
+
+- **Replay-free commit** (`DMLX_MTP_REPLAY=1` restores the old path): the
+  commit no longer replays accepted drafts through the drafter with the
+  target's verify hidden rows; the drafter keeps its own chain states
+  (bare truncation). The replay was misaligning the drafter cache —
+  removing it took p1/p2 from 0.64/0.34 to 0.97/1.00 on code.
+- **Pre-norm chaining** (`DMLX_MTP_NO_CHAIN_PRENORM=1` restores): each
+  draft step chains on the pre-final-norm hidden, same distribution as
+  draft 1's input, lifting deep-draft acceptance (p3/p4 ~0.11 -> 0.7-0.9).
+
+Measured after the flip (temp 0.6, short prompts): code 19.5 -> **29.1
+tok/s** (omlx: 28.65), prose 19.6 -> 26.1, math 28.2, count 31.1. dsh
+replay (21.8k ctx): snapshot hit intact, reasoning split intact, 17.1
+tok/s decode (long-KV verify cost is the remaining long-context gap).
+Draft chain cost (26ms/round vs omlx's ~5.6ms) is the next lever.

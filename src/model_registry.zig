@@ -1070,20 +1070,17 @@ pub const Qwen38VTableAdapter = struct {
         const m = self.mtp.?;
         const ctx = self.model.ctx;
         const lm = self.mtpLmHead();
-        // Replay-free commit (omlx `_chain_next_drafts` semantics):
-        // `DMLX_MTP_REPLAY_FREE=1` keeps the drafter's OWN chain states for
-        // the accepted drafts (computed during drafting) instead of replaying
-        // them with the target's verify hidden rows. The chain already wrote
-        // one KV entry per step (t_next at old_len+1, draft i at old_len+1+i),
-        // so the commit is a bare truncation to old_len + accepted.
-        //
-        // Why this exists (2026-11-02): on empty-think prose our conditional
-        // acceptance collapses with depth (p1..p4 = 0.64/0.34/0.11/0.11)
-        // while omlx — same drafter weights, replay-free — holds
-        // 0.74/0.68/0.33/0.50. Draft 1 never touches chained head outputs,
-        // so its -0.09 gap can only come from the committed context, i.e.
-        // this replay. A/B toggle, not a default flip.
-        if (std.c.getenv("DMLX_MTP_REPLAY_FREE") != null) {
+        // Replay-free commit (omlx `_chain_next_drafts` semantics) is the
+        // DEFAULT (2026-11-17): keeping the drafter's OWN chain states for
+        // the accepted drafts instead of replaying them with the target's
+        // verify hidden rows. Measured: conditional acceptance p1/p2 went
+        // 0.64/0.34 -> 0.97/1.00 on code (tok/s 19.5 -> 28.2), with no
+        // regression on prose — the replay was actively misaligning the
+        // drafter cache. The chain already wrote one KV entry per step
+        // (t_next at old_len+1, draft i at old_len+1+i), so the commit is a
+        // bare truncation to old_len + accepted.
+        // `DMLX_MTP_REPLAY=1` restores the old replay path for A/B.
+        if (std.c.getenv("DMLX_MTP_REPLAY") == null) {
             m.cache.len_ = self.mtp_round_old_len.? + @as(i32, @intCast(accepted));
             if (self.chainDumpEnabled())
                 std.debug.print("MTP-CHAIN commit replay-free accepted={d} len={d}\n", .{ accepted, m.cache.len_ });

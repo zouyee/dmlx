@@ -1148,11 +1148,12 @@ pub const Qwen38Mtp = struct {
         // target's verify decides acceptance) and saves ~0.9 ms of the
         // 3.10 ms/step the full 4-bit head costs. See buildCoarseHead.
         if (self.coarseHead(allocator, lm_head)) |coarse| {
-            // `DMLX_MTP_CHAIN_PRENORM=1`: chain the next step on the PRE-final
-            // -norm output so every draft step sees the same kind of hidden as
-            // draft 1 (which gets the backbone's pre-norm row). See
-            // forwardBodyIdsPair — this is the p_i-cliff experiment.
-            const chain_prenorm = std.c.getenv("DMLX_MTP_CHAIN_PRENORM") != null;
+            // Chain the next step on the PRE-final-norm output so every
+            // draft step sees the same kind of hidden as draft 1 (which gets
+            // the backbone's pre-norm row). DEFAULT on (2026-11-17): p3/p4
+            // conditional acceptance rose from ~0.11 to 0.7-0.9 in A/B.
+            // `DMLX_MTP_NO_CHAIN_PRENORM=1` chains on the normed body again.
+            const chain_prenorm = std.c.getenv("DMLX_MTP_NO_CHAIN_PRENORM") == null;
             var body: Array = undefined;
             var chain: Array = undefined;
             if (chain_prenorm) {
