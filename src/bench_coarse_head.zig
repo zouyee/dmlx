@@ -54,6 +54,30 @@ pub fn main() !void {
     defer pending.deinit(allocator);
     defer for (pending.items) |y| y.deinit();
 
+    // (a0) coarse qmm sweep over bit widths — the 2-bit stock kernel sits
+    // well below the memory-bandwidth ceiling; a wider head with a faster
+    // kernel could win on wall time despite the extra bytes.
+    std.debug.print("coarse qmm sweep (vocab={d}, hidden={d}):\n", .{ vocab, hidden });
+    inline for (.{ 2, 3, 4 }) |bits| {
+        const coarse_b = try quantize_mod.quantize(ctx, w, .{ .group_size = 128, .bits = bits });
+        defer coarse_b.deinit(allocator);
+        for (0..3) |_| {
+            const y = try quantize_mod.quantizedMatmul(ctx, x, coarse_b, true);
+            defer y.deinit();
+            try y.eval();
+        }
+        const tb = std.c.mach_absolute_time();
+        for (0..reps) |_| {
+            try pending.append(allocator, try quantize_mod.quantizedMatmul(ctx, x, coarse_b, true));
+        }
+        try eval_mod.asyncEval(allocator, pending.items);
+        try pending.items[pending.items.len - 1].eval();
+        const b_ms = elapsedMs(tb) / reps;
+        pending.clearRetainingCapacity();
+        const bytes = @as(f64, @floatFromInt(@as(u64, @intCast(vocab)) * @as(u64, @intCast(hidden)))) * (@as(f64, bits) / 8.0);
+        std.debug.print("  {d}-bit: {d:.3} ms  ({d:.0} GB/s)\n", .{ bits, b_ms, bytes / b_ms / 1e6 });
+    }
+
     // (a) coarse qmm alone
     for (0..3) |_| {
         const y = try quantize_mod.quantizedMatmul(ctx, x, coarse, true);
