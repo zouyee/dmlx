@@ -19,6 +19,8 @@ const std = @import("std");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
+const fast_mod = @import("mlx").fast;
+const activations = @import("mlx").activations;
 const reduce_mod = @import("mlx").reduce;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const glm53 = @import("glm53.zig");
@@ -387,6 +389,159 @@ pub fn convFinish(ctx: EagerContext, w: *const ConvWeights, x: Array, dynamic: A
 }
 
 // ---------------------------------------------------------------------------
+// Decoder layer forward (Task 4)
+// ---------------------------------------------------------------------------
+
+/// RMSNorm over the last dim: f32 compute, bf16 out (matches nn.RMSNorm on a
+/// bf16 input). `w` may be any float dtype (cast internally).
+pub fn rmsNormLastDim(ctx: EagerContext, x: Array, w: Array, eps: f32) !Array {
+    const x_f32 = try ops.astype(ctx, x, .float32);
+    defer x_f32.deinit();
+    const w_f32 = try ops.astype(ctx, w, .float32);
+    defer w_f32.deinit();
+    const n = try fast_mod.rmsNorm(ctx, x_f32, w_f32, eps);
+    defer n.deinit();
+    return ops.astype(ctx, n, .bfloat16);
+}
+
+/// DFlashAttention: block queries attend over [context KV ‖ block KV],
+/// non-causal (no mask), GQA via head-count mismatch, per-head q/k RMSNorm,
+/// NeoX RoPE (traditional=false). No cache — the caller passes a fully
+/// realized context; the K/V ring (Task 7) reuses these projections.
+///   x:     [B, L, H]  block tokens (conv-prepared)
+///   x_ctx: [B, S, H]  projected context rows
+///   q_off: absolute position of the first block token (RoPE)
+///   k_off: absolute position of the first context token (RoPE)
+pub fn attentionForward(
+    ctx: EagerContext,
+    w: *const LayerWeights,
+    cfg: *const DFlash2Config,
+    x: Array,
+    x_ctx: Array,
+    q_off: i32,
+    k_off: i32,
+) !Array {
+    const B = x.shape()[0];
+    const L = x.shape()[1];
+    const S = x_ctx.shape()[1];
+    const nh: i32 = @intCast(cfg.num_attention_heads);
+    const nkv: i32 = @intCast(cfg.num_key_value_heads);
+    const hd: i32 = @intCast(cfg.head_dim);
+
+    // Queries from the block.
+    const q = try w.q_proj.apply(ctx, x);
+    defer q.deinit();
+    const q4 = try ops.reshape(ctx, q, &[_]i32{ B, L, nh, hd });
+    defer q4.deinit();
+    const qn = try rmsNormLastDim(ctx, q4, w.q_norm, cfg.rms_norm_eps);
+    defer qn.deinit();
+    const qt = try ops.transposeAxes(ctx, qn, &[_]i32{ 0, 2, 1, 3 });
+    defer qt.deinit();
+    const qr = try fast_mod.rope(ctx, qt, hd, false, cfg.rope_theta, 1.0, q_off, null);
+    defer qr.deinit();
+
+    // Context K/V.
+    const ck = try w.k_proj.apply(ctx, x_ctx);
+    defer ck.deinit();
+    const ck4 = try ops.reshape(ctx, ck, &[_]i32{ B, S, nkv, hd });
+    defer ck4.deinit();
+    const ckn = try rmsNormLastDim(ctx, ck4, w.k_norm, cfg.rms_norm_eps);
+    defer ckn.deinit();
+    const ckt = try ops.transposeAxes(ctx, ckn, &[_]i32{ 0, 2, 1, 3 });
+    defer ckt.deinit();
+    const ckr = try fast_mod.rope(ctx, ckt, hd, false, cfg.rope_theta, 1.0, k_off, null);
+    defer ckr.deinit();
+    const cv = try w.v_proj.apply(ctx, x_ctx);
+    defer cv.deinit();
+    const cv4 = try ops.reshape(ctx, cv, &[_]i32{ B, S, nkv, hd });
+    defer cv4.deinit();
+    const cvt = try ops.transposeAxes(ctx, cv4, &[_]i32{ 0, 2, 1, 3 });
+    defer cvt.deinit();
+
+    // Block (proposal) K/V.
+    const pk = try w.k_proj.apply(ctx, x);
+    defer pk.deinit();
+    const pk4 = try ops.reshape(ctx, pk, &[_]i32{ B, L, nkv, hd });
+    defer pk4.deinit();
+    const pkn = try rmsNormLastDim(ctx, pk4, w.k_norm, cfg.rms_norm_eps);
+    defer pkn.deinit();
+    const pkt = try ops.transposeAxes(ctx, pkn, &[_]i32{ 0, 2, 1, 3 });
+    defer pkt.deinit();
+    const pkr = try fast_mod.rope(ctx, pkt, hd, false, cfg.rope_theta, 1.0, q_off, null);
+    defer pkr.deinit();
+    const pv = try w.v_proj.apply(ctx, x);
+    defer pv.deinit();
+    const pv4 = try ops.reshape(ctx, pv, &[_]i32{ B, L, nkv, hd });
+    defer pv4.deinit();
+    const pvt = try ops.transposeAxes(ctx, pv4, &[_]i32{ 0, 2, 1, 3 });
+    defer pvt.deinit();
+
+    const keys = try shape_mod.concatenateAxis(ctx, &[_]Array{ ckr, pkr }, 2);
+    defer keys.deinit();
+    const values = try shape_mod.concatenateAxis(ctx, &[_]Array{ cvt, pvt }, 2);
+    defer values.deinit();
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const o = try fast_mod.scaledDotProductAttention(ctx, qr, keys, values, scale, "", null, null);
+    defer o.deinit();
+    const ot = try ops.transposeAxes(ctx, o, &[_]i32{ 0, 2, 1, 3 });
+    defer ot.deinit();
+    const of = try ops.reshape(ctx, ot, &[_]i32{ B, L, nh * hd });
+    defer of.deinit();
+    return w.o_proj.apply(ctx, of);
+}
+
+fn swigluMlp(ctx: EagerContext, w: *const LayerWeights, x: Array) !Array {
+    const gate = try w.gate_proj.apply(ctx, x);
+    defer gate.deinit();
+    const up = try w.up_proj.apply(ctx, x);
+    defer up.deinit();
+    const act = try activations.silu(ctx, gate);
+    defer act.deinit();
+    const h = try ops.multiply(ctx, act, up);
+    defer h.deinit();
+    return w.down_proj.apply(ctx, h);
+}
+
+/// DFlash2DecoderLayer._forward: norm → conv_prepare → attention →
+/// conv_finish → residual, then the same shape around the SwiGLU MLP.
+pub fn layerForward(
+    ctx: EagerContext,
+    w: *const LayerWeights,
+    cfg: *const DFlash2Config,
+    x: Array, // [B, L, H] block hidden
+    x_ctx: Array, // [B, S, H] projected context
+    q_off: i32,
+    k_off: i32,
+) !Array {
+    const KS: i32 = @intCast(cfg.conv_kernel_size);
+    const GS: i32 = @intCast(cfg.conv_group_size);
+
+    const xn = try rmsNormLastDim(ctx, x, w.input_layernorm_f32, cfg.rms_norm_eps);
+    defer xn.deinit();
+    const prep = try convPrepare(ctx, &w.attention_conv, xn, KS, GS);
+    defer prep.prepared.deinit();
+    defer prep.dynamic.deinit();
+    const attn = try attentionForward(ctx, w, cfg, prep.prepared, x_ctx, q_off, k_off);
+    defer attn.deinit();
+    const fin = try convFinish(ctx, &w.attention_conv, attn, prep.dynamic, KS, GS);
+    defer fin.deinit();
+    const h1 = try ops.add(ctx, x, fin);
+    defer h1.deinit();
+
+    const xn2 = try rmsNormLastDim(ctx, h1, w.post_attention_layernorm_f32, cfg.rms_norm_eps);
+    defer xn2.deinit();
+    const prep2 = try convPrepare(ctx, &w.mlp_conv, xn2, KS, GS);
+    defer prep2.prepared.deinit();
+    defer prep2.dynamic.deinit();
+    const mlp = try swigluMlp(ctx, w, prep2.prepared);
+    defer mlp.deinit();
+    const fin2 = try convFinish(ctx, &w.mlp_conv, mlp, prep2.dynamic, KS, GS);
+    defer fin2.deinit();
+    return ops.add(ctx, h1, fin2);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -574,6 +729,74 @@ test "DFlash2 conv: prepare/finish match golden trace (layer 0 attention)" {
     defer exp_fin.deinit();
     const scale_f = try maxAbs(ctx, exp_fin);
     try std.testing.expect(try maxAbsDiff(ctx, fin, exp_fin) <= 1e-2 * scale_f + 1e-3);
+}
+
+test "DFlash2 layer 0: full forward matches golden trace" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const cfg = try testCfgFromMeta(meta);
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    defer m.deinit();
+
+    const x = try loadTraceTensor(allocator, "block_embed");
+    defer x.deinit();
+    const x_ctx = try loadTraceTensor(allocator, "ctx_projected");
+    defer x_ctx.deinit();
+    const S: i32 = x_ctx.shape()[1];
+
+    // Intermediate parity: attention sublayer output.
+    const l0 = &m.layers[0];
+    const xn = try rmsNormLastDim(ctx, x, l0.input_layernorm_f32, cfg.rms_norm_eps);
+    defer xn.deinit();
+    const prep = try convPrepare(ctx, &l0.attention_conv, xn, @intCast(cfg.conv_kernel_size), @intCast(cfg.conv_group_size));
+    defer prep.prepared.deinit();
+    defer prep.dynamic.deinit();
+    const attn = try attentionForward(ctx, l0, &cfg, prep.prepared, x_ctx, S, 0);
+    defer attn.deinit();
+    const exp_attn = try loadTraceTensor(allocator, "l0.attn.out");
+    defer exp_attn.deinit();
+    const sa = try maxAbs(ctx, exp_attn);
+    try std.testing.expect(try maxAbsDiff(ctx, attn, exp_attn) <= 1e-2 * sa + 1e-3);
+
+    // Full layer output.
+    const out = try layerForward(ctx, l0, &cfg, x, x_ctx, S, 0);
+    defer out.deinit();
+    const exp_out = try loadTraceTensor(allocator, "l0.out");
+    defer exp_out.deinit();
+    const so = try maxAbs(ctx, exp_out);
+    try std.testing.expect(try maxAbsDiff(ctx, out, exp_out) <= 1e-2 * so + 1e-3);
+}
+
+fn testCfgFromMeta(meta: std.json.Parsed(std.json.Value)) !DFlash2Config {
+    _ = meta;
+    return .{
+        .hidden_size = 256,
+        .intermediate_size = 512,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 2,
+        .head_dim = 64,
+        .vocab_size = 1000,
+        .block_size = 8,
+        .mask_token_id = 999,
+        .target_layer_ids = .{ 1, 3, 5, 7, 9 },
+        .num_target_layers = 12,
+        .sliding_window = 64,
+        .conv_kernel_size = 2,
+        .conv_group_size = 16,
+        .selector_rank = 32,
+        .selector_top_k = 8,
+    };
 }
 
 fn cfgValue(meta: std.json.Parsed(std.json.Value), key: []const u8) i64 {
