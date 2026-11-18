@@ -1420,6 +1420,12 @@ pub const EngineLoop = struct {
             return false;
         };
         if (!ok) return false;
+        // Greedy-only drafters (DFlash2) cannot serve sampled requests:
+        // route them to plain decoding instead of failing mid-round.
+        if (ops_mtp.greedy_only and gen_config.temperature > 0) {
+            std.log.info("EngineLoop: drafter is greedy-only; sampled request uses normal decoding", .{});
+            return false;
+        }
         self.processMtpRequest(req, caches, gen_config, ops_mtp, n_drafts);
         return true;
     }

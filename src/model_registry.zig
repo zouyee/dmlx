@@ -891,6 +891,7 @@ pub const Qwen38VTableAdapter = struct {
     /// still verify a shorter prefix per round.
     fn dflash2Enable(self: *Qwen38VTableAdapter, dir: []const u8) anyerror!bool {
         self.mtp_ops.num_drafts = 7;
+        self.mtp_ops.greedy_only = true;
         if (self.dflash2 != null) return true;
         std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
         const m = try self.allocator.create(qwen38_dflash2.DFlash2);

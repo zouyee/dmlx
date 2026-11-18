@@ -193,6 +193,10 @@ pub const MtpOps = struct {
     /// GPU flush as the verify (predraft). Conditional on all drafts being
     /// accepted; commit/rollback adopt or discard it.
     predraft: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) anyerror!void = null,
+    /// Drafter supports greedy verification only (e.g. DFlash2): the engine
+    /// must not route temp>0 requests here — sampled speculative decoding
+    /// needs per-position draft logits this drafter does not produce.
+    greedy_only: bool = false,
     commit: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted: usize, tokens: []const u32) void,
     /// Discard the whole verify pass (backbone + drafter caches restored).
     rollback: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void,
