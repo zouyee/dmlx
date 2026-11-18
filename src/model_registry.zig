@@ -35,6 +35,7 @@ const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
 const qwen38_dflash2 = @import("models/qwen38_dflash2.zig");
+const lora_merge = @import("models/lora_merge.zig");
 const qwen38_vit = @import("vision/qwen38_vit.zig");
 const qwen38_preprocess = @import("vision/qwen38_preprocess.zig");
 const pthread = @cImport(@cInclude("pthread.h"));
@@ -1630,6 +1631,16 @@ fn qwen38Loader(
         }
     }
     std.log.info("Qwen3.8 weights resident: {d} tensors", .{weights.count()});
+
+    // Optional LoRA adapter merged into the resident quantized weights at
+    // load time (e.g. harness-hub/Qwen3.8-27B-pi-adapted).
+    if (std.c.getenv("DMLX_LORA_ADAPTER")) |d| {
+        const n = lora_merge.applyLoraAdapter(allocator, ctx, &weights, std.mem.span(d)) catch |err| blk: {
+            std.log.warn("lora: merge of {s} failed ({}), serving base weights", .{ std.mem.span(d), err });
+            break :blk 0;
+        };
+        _ = n;
+    }
 
     const model_ptr = try allocator.create(qwen38.Qwen38ServingModel);
     errdefer allocator.destroy(model_ptr);
