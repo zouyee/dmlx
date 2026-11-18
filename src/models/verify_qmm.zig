@@ -59,9 +59,9 @@
 // For intermediate projections the deviation is absorbed by the following
 // norms. For `lm_head` it lands at ~0.07 absolute on logits of magnitude
 // ~20, which is the same order as the top-2 gap that flips a greedy argmax —
-// so lm_head routing is OFF by default and must be enabled explicitly
-// (`DMLX_VERIFY_QMM_LM_HEAD=1`) and validated with the self-consistency
-// probe. `DMLX_NO_VERIFY_QMM=1` disables the whole module.
+// lm_head routing is ON by default (validated against the backbone's greedy
+// variant set); `DMLX_NO_VERIFY_QMM_LM_HEAD=1` restores stock lm_head.
+// `DMLX_NO_VERIFY_QMM=1` disables the whole module.
 const std = @import("std");
 const c = @import("mlx").c;
 const array_mod = @import("mlx").array;

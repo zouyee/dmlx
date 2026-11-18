@@ -2422,13 +2422,13 @@ order: KV ring (draft rounds became context-length independent),
 4-bit drafter weights (draft 30→25 ms, acceptance unchanged), drafter
 context prefix cache (TTFT 12.5 s → 0.15 s).
 
-Verify decomposition (2026-11-18): ~93 ms/round = 68 ms HOST building
-48 GDN layers' verify graphs + 19 ms GPU. The next real lever is a
-compiled GDN verify closure (one graph, weights as inputs, per the MTP
-compiled-step precedent) — potentially verify -> ~30 ms. Predraft
-machinery is implemented (tentative ring feed, adopt/discard) but
-opt-in (DMLX_DF2_PREDRAFT=1): conditioned on all-accepted, adoption is
-too rare at ~40% draft acceptance to pay for the build; a
+Verify decomposition (2026-11-18, corrected same day): ~93 ms/round,
+GPU-bound — DMLX_VERIFY_LAYER_SUBMIT=0 splits it as 5 ms host build /
+94 ms eval, so the 68 ms "host build" is the per-layer submit overlap,
+not host cost. Compiled GDN verify would NOT help (see follow-ups).
+Predraft machinery is implemented (tentative ring feed, adopt/discard)
+but opt-in (DMLX_DF2_PREDRAFT=1): conditioned on all-accepted, adoption
+is too rare at ~40% draft acceptance to pay for the build; a
 depth-controller-predicted acceptance target could make it profitable.
 
 PRE-EXISTING BUG FOUND (main branch, not dflash2): bare temp-0 decode
@@ -2438,22 +2438,32 @@ prompt, no snapshots). Parity checks must compare against the
 trajectory SET, not a single baseline.
 
 Remaining gaps / follow-ups:
-- Compiled GDN verify (host-bound 68 ms) is the big one; then verify
-  kernel work.
-- Sampled drafting (temp > 0) not wired; vision prefill unsupported.
+- Compiled GDN verify: REJECTED (GPU-bound, see below).
+- Sampled drafting (temp > 0): DONE (2026-11-18, 7bedda0). DFlash2 keeps
+  the [P,V] f32 block logits and serves them via MtpOps.draft; the
+  engine's rejection sampler handles acceptance. temp=0.8 code: 17.8 vs
+  13.2 tok/s plain (+35%); acceptance 24-36% at temp 0.8. Vision prefill
+  still unsupported.
 - pi-adapted LoRA: DONE (2026-11-18). `DMLX_LORA_ADAPTER` merges the
   adapter at load (src/models/lora_merge.zig); model-card parity items
   verified — thinking off via DMLX_CHAT_EMPTY_THINK=1, openai-completions,
   structured tool_calls, pi harness e2e (fix-failing-test loop green in
   58 s). Not done: Terminal-Bench score reproduction (needs the harbor
   harness; the card itself notes low-bit bases drift).
-- Sampled (temp>0) requests bypass DFlash2 via MtpOps.greedy_only.
-  KNOWN LATENT BUG: the engine's draft-failure plain-decode fallback
-  segfaults after a mid-round draft error (reproduced twice). The gate
-  prevents the realistic trigger; the fallback itself needs a fix for
-  OOM-class robustness.
-- Verify decomposition correction: DMLX_VERIFY_LAYER_SUBMIT=0 shows
-  build 5 ms / eval 94 ms — verify is GPU-bound (~90 ms/round), the
-  68 ms "host build" was the per-layer submit overlap. Compiled-verify
-  would NOT help; remaining gap is GPU kernel efficiency (1.6x the
-  4-bit bandwidth floor).
+- KNOWN LATENT BUG: the engine's draft-failure plain-decode fallback
+  segfaults after a mid-round draft error (reproduced twice). With
+  sampled drafting wired, the realistic greedy_only trigger is gone, but
+  the fallback itself needs a fix for OOM-class robustness.
+- Verify kernel ceiling RE-VERIFIED (2026-11-18): custom verify_qmm
+  kernels vs stock (DMLX_NO_VERIFY_QMM=1), same warm code prompt,
+  256 tok greedy: 25.0 vs 22.1 tok/s (+13% end-to-end from the kernels).
+  The "1.6x the bandwidth floor" gap was mis-estimated against the
+  273 GB/s peak: two independent kernel morphologies (sg8, mma) converge
+  at 157-198 GB/s on these shapes (verdict 2026-11-06), so the verify
+  qmm is at the DRAM streaming ceiling for weight streaming at M <= 8.
+  lm_head routing is ON by default (DMLX_NO_VERIFY_QMM_LM_HEAD=1
+  disables). Remaining compressible GPU is only the GDN recurrence +
+  small-op launches (~10-15 ms/round); a fused GDN verify megakernel
+  would buy at most +3-5% end-to-end at high exactness risk. Verify
+  kernel work is DONE for this hardware; further decode gains must come
+  from acceptance (drafter quality/depth), not verify.
