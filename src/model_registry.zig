@@ -643,6 +643,11 @@ pub const Qwen38VTableAdapter = struct {
     df2_block: [7]u32 = undefined,
     df2_block_len: usize = 0,
     df2_block_idx: usize = 0,
+    /// Sampled path: retained block logits [P, V] f32 (lazy). Row i is the
+    /// drafter's distribution q_i for draft position i — the engine's
+    /// speculative sampler needs it for min(1, p/q) acceptance and the
+    /// (p-q)+ rejection resample. Greedy rounds leave this null.
+    df2_block_logits: ?Array = null,
     /// Drafter-context cache mirroring the backbone prefix snapshots:
     /// projected (post-fc) windowed context rows + the prompt tokens they
     /// cover. Lets a snapshot-restored prefill skip both the backbone
@@ -891,7 +896,6 @@ pub const Qwen38VTableAdapter = struct {
     /// still verify a shorter prefix per round.
     fn dflash2Enable(self: *Qwen38VTableAdapter, dir: []const u8) anyerror!bool {
         self.mtp_ops.num_drafts = 7;
-        self.mtp_ops.greedy_only = true;
         if (self.dflash2 != null) return true;
         std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
         const m = try self.allocator.create(qwen38_dflash2.DFlash2);
@@ -921,8 +925,7 @@ pub const Qwen38VTableAdapter = struct {
     /// (projected at observe time) seed the drafter context. Returns the
     /// same last-logits/last-hidden contract as mtpPrefill.
     fn dflash2Prefill(self: *Qwen38VTableAdapter, ids: []const u32) anyerror!generation.MtpStepOut {
-        self.df2_block_len = 0;
-        self.df2_block_idx = 0;
+        self.dflash2ClearBlock();
         self.dflash2ClearPending();
         self.df2_ctx.?.reset();
         const ctx = self.model.ctx;
@@ -1143,6 +1146,77 @@ pub const Qwen38VTableAdapter = struct {
         self.df2_pending_rows = 0;
     }
 
+    fn dflash2ClearBlock(self: *Qwen38VTableAdapter) void {
+        if (self.df2_block_logits) |l| l.deinit();
+        self.df2_block_logits = null;
+        self.df2_block_len = 0;
+        self.df2_block_idx = 0;
+    }
+
+    /// Sampled-path block computation: same forward as dflash2ComputeBlock
+    /// but keeps the [P, V] f32 logits instead of argmaxing them away. No
+    /// sync here — the engine joint-asyncEvals the draft rows with the
+    /// verify rows during acceptance.
+    fn dflash2ComputeBlockLogits(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!void {
+        const m = self.dflash2.?;
+        const ctx = self.model.ctx;
+        const P: i32 = @intCast(m.cfg.block_size - 1);
+        const H: i32 = @intCast(m.cfg.hidden_size);
+        const mask_ids = try self.allocator.alloc(i32, @intCast(P));
+        defer self.allocator.free(mask_ids);
+        for (mask_ids) |*t| t.* = @intCast(m.cfg.mask_token_id);
+        const mask_arr = try Array.fromData(self.allocator, i32, mask_ids, &[_]i32{P});
+        defer mask_arr.deinit();
+        const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
+        defer block_ids.deinit();
+        var ring = &self.df2_ctx.?;
+        if (ring.fed == 0) return error.DFlash2EmptyContext;
+        const mask = try ring.draftMask();
+        defer mask.deinit();
+        const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
+        defer hidden_full.deinit();
+        const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+        defer draft_hidden.deinit();
+        const lm = self.mtpLmHead();
+        const logits = try lm.apply(ctx, draft_hidden); // [1, P, V]
+        defer logits.deinit();
+        const f32l = try ops.astype(ctx, logits, .float32);
+        defer f32l.deinit();
+        const vocab: i32 = f32l.shape()[2];
+        const flat = try ops.reshape(ctx, f32l, &[_]i32{ P, vocab });
+        errdefer flat.deinit();
+        self.df2_block_logits = flat;
+        self.df2_block_len = @intCast(P);
+        self.df2_block_idx = 0;
+    }
+
+    /// Sampled (temp>0) draft step: hands out block-logits row by row. The
+    /// block is block-parallel — q_i is conditioned on the anchor + ring
+    /// context, not on the previously sampled drafts — which is exactly the
+    /// q the engine's rejection sampler needs (a position-independent
+    /// proposal keeps the adjusted-resample identity exact).
+    fn dflash2Draft(self: *Qwen38VTableAdapter, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
+        if (self.df2_block_idx >= self.df2_block_len) {
+            self.dflash2ClearBlock();
+            const tok_gpu = try Array.fromData(self.allocator, i32, &[_]i32{@intCast(token)}, &[_]i32{1});
+            defer tok_gpu.deinit();
+            try self.dflash2ComputeBlockLogits(tok_gpu);
+        }
+        const ctx = self.model.ctx;
+        const bl = self.df2_block_logits.?;
+        const i: i32 = @intCast(self.df2_block_idx);
+        const vocab: i32 = bl.shape()[1];
+        const row = try ops.slice(ctx, bl, &[_]i32{ i, 0 }, &[_]i32{ i + 1, vocab }, &[_]i32{ 1, 1 });
+        defer row.deinit();
+        const flat = try ops.reshape(ctx, row, &[_]i32{vocab});
+        defer flat.deinit();
+        const logits = try ops.copy(ctx, flat);
+        self.df2_block_idx += 1;
+        // Hidden passes through (drafter conditions on the ring, not a chain).
+        const h = try ops.copy(ctx, hidden);
+        return .{ .logits = logits, .hidden = h };
+    }
+
     fn dflash2DraftGreedy(self: *Qwen38VTableAdapter, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
         if (self.df2_block_idx >= self.df2_block_len) {
             if (self.df2_pending_tokens) |pt| {
@@ -1183,8 +1257,7 @@ pub const Qwen38VTableAdapter = struct {
                 // the argmax stash can go (engine already read it).
                 if (self.df2_pending_argmax) |a| a.deinit();
                 self.df2_pending_argmax = null;
-                self.df2_block_len = 0;
-                self.df2_block_idx = 0;
+                self.dflash2ClearBlock();
                 return;
             }
             self.df2_ctx.?.discardTentative();
@@ -1196,8 +1269,7 @@ pub const Qwen38VTableAdapter = struct {
             defer rows.deinit();
             self.df2_ctx.?.observe(rows) catch return;
         }
-        self.df2_block_len = 0;
-        self.df2_block_idx = 0;
+        self.dflash2ClearBlock();
     }
 
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
@@ -1311,10 +1383,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
-        if (self.dflash2 != null) {
-            std.log.warn("DFlash2: sampled (temp>0) drafting is not wired; greedy only", .{});
-            return error.DFlash2GreedyOnly;
-        }
+        if (self.dflash2 != null) return self.dflash2Draft(hidden, token);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
@@ -1524,8 +1593,7 @@ pub const Qwen38VTableAdapter = struct {
             // any tentative predraft state.
             if (self.df2_ctx.?.tentative_start >= 0) self.df2_ctx.?.discardTentative();
             self.dflash2ClearPending();
-            self.df2_block_len = 0;
-            self.df2_block_idx = 0;
+            self.dflash2ClearBlock();
             return;
         }
         const m = self.mtp.?;
@@ -1551,6 +1619,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         if (self.df2_cache_ids.len > 0) allocator.free(self.df2_cache_ids);
         if (self.df2_cache_rows) |r| r.deinit();
+        if (self.df2_block_logits) |l| l.deinit();
         if (self.df2_ctx) |*cx| cx.deinit();
         if (self.dflash2) |m| {
             m.deinit();
