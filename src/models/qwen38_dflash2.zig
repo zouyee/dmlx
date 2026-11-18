@@ -694,73 +694,272 @@ pub fn selectGreedy(
 // Draft context store (Task 7)
 // ---------------------------------------------------------------------------
 
-/// Committed-token context for the drafter: PROJECTED tap rows ([., H])
-/// appended as the backbone commits tokens. Projection (fc + hidden_norm)
-/// happens once per token at observe time; the draft forward reuses the
-/// projected rows directly. Rows are only ever appended (accepted tokens) —
-/// never rolled back — and truncated eagerly to the sliding window so the
-/// store stays at ~window * H * 2 bytes (21 MB at 2047 x 5120 bf16).
+/// Committed-token context for the drafter as a per-layer K/V ring
+/// (omlx `_RowContext` semantics): RoPE-pre-applied keys and raw values for
+/// every committed token, written once at observe time. Validity comes from
+/// an absolute-position array (-1 = empty); attention keeps the newest
+/// `sliding_window - 1` positions via the draft mask. Rows are only ever
+/// appended (accepted tokens) — never rolled back.
 pub const DFlash2Context = struct {
     allocator: std.mem.Allocator,
     ctx: EagerContext,
     cfg: *const DFlash2Config,
     model: *const DFlash2,
-    rows: ?Array = null, // [1, T, H] bf16, projected
-    len: i64 = 0,
+    capacity: i32, // ring_slots + block_size
+    ring_slots: i64,
+    fed: i64 = 0, // absolute position of the next row to write
+    keys: [5]Array, // per layer [nkv, capacity, hd] bf16, RoPE applied
+    values: [5]Array, // per layer [nkv, capacity, hd] bf16
+    pos: []i64, // [capacity] absolute position per slot, -1 empty
 
-    pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, model: *const DFlash2) DFlash2Context {
-        return .{ .allocator = allocator, .ctx = ctx, .cfg = &model.cfg, .model = model };
+    pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, model: *const DFlash2) !DFlash2Context {
+        const cfg = &model.cfg;
+        const ring_slots: i64 = @as(i64, @intCast(cfg.sliding_window)) - 1;
+        const capacity: i32 = @intCast(ring_slots + @as(i64, @intCast(cfg.block_size)));
+        const nkv: i32 = @intCast(cfg.num_key_value_heads);
+        const hd: i32 = @intCast(cfg.head_dim);
+        var keys: [5]Array = undefined;
+        var values: [5]Array = undefined;
+        var n_init: usize = 0;
+        errdefer for (keys[0..n_init], values[0..n_init]) |k, v| {
+            k.deinit();
+            v.deinit();
+        };
+        for (0..cfg.num_hidden_layers) |l| {
+            keys[l] = try Array.zeros(allocator, &[_]i32{ nkv, capacity, hd }, .bfloat16);
+            values[l] = try Array.zeros(allocator, &[_]i32{ nkv, capacity, hd }, .bfloat16);
+            n_init += 1;
+        }
+        const pos = try allocator.alloc(i64, @intCast(capacity));
+        @memset(pos, -1);
+        return .{
+            .allocator = allocator,
+            .ctx = ctx,
+            .cfg = cfg,
+            .model = model,
+            .capacity = capacity,
+            .ring_slots = ring_slots,
+            .keys = keys,
+            .values = values,
+            .pos = pos,
+        };
     }
 
     pub fn reset(self: *DFlash2Context) void {
-        if (self.rows) |r| r.deinit();
-        self.rows = null;
-        self.len = 0;
-    }
-
-    fn keepMax(self: *const DFlash2Context) i64 {
-        return @as(i64, @intCast(self.cfg.sliding_window)) - 1;
+        // Zeroing 42 MB of rings is pointless; invalidating pos empties them.
+        @memset(self.pos, -1);
+        self.fed = 0;
     }
 
     /// Append tap rows for newly committed tokens. tap_hidden: [1, k, 5*H]
-    /// (raw backbone taps — projected here, once).
+    /// raw backbone taps. Projects to context space, then per layer computes
+    /// K/V and writes the ring slots; K gets RoPE at the absolute offset.
     pub fn observe(self: *DFlash2Context, tap_hidden: Array) !void {
-        const k = tap_hidden.shape()[1];
+        const k: i32 = tap_hidden.shape()[1];
         if (k == 0) return;
-        const proj = try projectContext(self.ctx, self.model, tap_hidden);
+        const ctx = self.ctx;
+        const cfg = self.cfg;
+        const proj = try projectContext(ctx, self.model, tap_hidden); // [1,k,H]
         defer proj.deinit();
-        if (self.rows) |old| {
-            const merged = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ old, proj }, 1);
-            old.deinit();
-            self.rows = merged;
-        } else {
-            self.rows = try ops.copy(self.ctx, proj);
+        const nkv: i32 = @intCast(cfg.num_key_value_heads);
+        const hd: i32 = @intCast(cfg.head_dim);
+        const base_off: i32 = @intCast(self.fed);
+        for (self.model.layers, 0..) |*lw, l| {
+            const kc = try lw.k_proj.apply(ctx, proj);
+            defer kc.deinit();
+            const k4 = try ops.reshape(ctx, kc, &[_]i32{ 1, k, nkv, hd });
+            defer k4.deinit();
+            const kn = try rmsNormLastDim(ctx, k4, lw.k_norm, cfg.rms_norm_eps);
+            defer kn.deinit();
+            const kt = try ops.transposeAxes(ctx, kn, &[_]i32{ 0, 2, 1, 3 }); // [1,nkv,k,hd]
+            defer kt.deinit();
+            const kr = try fast_mod.rope(ctx, kt, hd, false, cfg.rope_theta, 1.0, base_off, null);
+            defer kr.deinit();
+            const kr3 = try ops.reshape(ctx, kr, &[_]i32{ nkv, k, hd });
+            defer kr3.deinit();
+            const vc = try lw.v_proj.apply(ctx, proj);
+            defer vc.deinit();
+            const v4 = try ops.reshape(ctx, vc, &[_]i32{ 1, k, nkv, hd });
+            defer v4.deinit();
+            const vt = try ops.transposeAxes(ctx, v4, &[_]i32{ 0, 2, 1, 3 });
+            defer vt.deinit();
+            const vt3 = try ops.reshape(ctx, vt, &[_]i32{ nkv, k, hd });
+            defer vt3.deinit();
+            try self.writeSlots(l, kr3, vt3, k);
         }
-        self.len += k;
-        // Eager truncation keeps the store bounded.
-        const keep = self.keepMax();
-        if (self.len > keep) {
-            const start: i32 = @intCast(self.len - keep);
-            const total: i32 = @intCast(self.len);
-            const tail = try ops.slice(self.ctx, self.rows.?, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(self.cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-            self.rows.?.deinit();
-            self.rows = tail;
-            self.len = keep;
+        self.fed += k;
+    }
+
+    /// Write k rows of one layer's K/V into ring slots (fed + j) % capacity.
+    fn writeSlots(self: *DFlash2Context, layer: usize, k3: Array, v3: Array, k: i32) !void {
+        const nkv: i32 = @intCast(self.cfg.num_key_value_heads);
+        const hd: i32 = @intCast(self.cfg.head_dim);
+        var j: i32 = 0;
+        while (j < k) {
+            const slot: i32 = @intCast(@mod(self.fed + j, self.capacity));
+            const run: i32 = @min(k - j, self.capacity - slot);
+            const ks = try ops.slice(self.ctx, k3, &[_]i32{ 0, j, 0 }, &[_]i32{ nkv, j + run, hd }, &[_]i32{ 1, 1, 1 });
+            defer ks.deinit();
+            const vs = try ops.slice(self.ctx, v3, &[_]i32{ 0, j, 0 }, &[_]i32{ nkv, j + run, hd }, &[_]i32{ 1, 1, 1 });
+            defer vs.deinit();
+            const new_k = try shape_mod.sliceUpdate(self.ctx, self.keys[layer], ks, &[_]i32{ 0, slot, 0 }, &[_]i32{ nkv, slot + run, hd }, &[_]i32{ 1, 1, 1 });
+            self.keys[layer].deinit();
+            self.keys[layer] = new_k;
+            const new_v = try shape_mod.sliceUpdate(self.ctx, self.values[layer], vs, &[_]i32{ 0, slot, 0 }, &[_]i32{ nkv, slot + run, hd }, &[_]i32{ 1, 1, 1 });
+            self.values[layer].deinit();
+            self.values[layer] = new_v;
+            for (0..@intCast(run)) |t| self.pos[@intCast(slot + @as(i32, @intCast(t)))] = self.fed + j + @as(i64, @intCast(t));
+            j += run;
         }
     }
 
-    /// Windowed projected context for the next draft round. Returns a fresh
-    /// array the caller owns; null when empty.
-    pub fn windowed(self: *DFlash2Context) !?Array {
-        const all = self.rows orelse return null;
-        const out = try ops.copy(self.ctx, all);
-        return out;
+    /// Boolean SDPA mask [1, 1, 1, capacity + block]: ring slot visible iff
+    /// occupied and inside the newest ring_slots positions; the block's own
+    /// slots are always visible (non-causal block).
+    pub fn draftMask(self: *DFlash2Context) !Array {
+        const blk: i32 = @intCast(self.cfg.block_size);
+        const n: usize = @intCast(self.capacity + blk);
+        const data = try self.allocator.alloc(bool, n);
+        defer self.allocator.free(data);
+        const lo = self.fed - self.ring_slots;
+        for (0..@intCast(self.capacity)) |i| {
+            data[i] = self.pos[i] >= 0 and self.pos[i] >= lo;
+        }
+        for (0..@intCast(blk)) |i| data[@as(usize, @intCast(self.capacity)) + i] = true;
+        const arr = try Array.fromData(self.allocator, bool, data, &[_]i32{ 1, 1, 1, @intCast(n) });
+        return arr;
     }
 
     pub fn deinit(self: *DFlash2Context) void {
-        self.reset();
+        for (0..self.cfg.num_hidden_layers) |l| {
+            self.keys[l].deinit();
+            self.values[l].deinit();
+        }
+        self.allocator.free(self.pos);
     }
 };
+
+/// Ring variant of the block forward: attention reads context K/V from the
+/// ring (masked) instead of a freshly projected dense context. Block Q/K/V
+/// rope at offset `fed` (position after the newest context row).
+pub fn blockHiddenRing(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    ring: *DFlash2Context,
+    embed_table: Array,
+    block_ids: Array,
+    mask: Array,
+) !Array {
+    const blk: i32 = block_ids.shape()[0];
+    const q_off: i32 = @intCast(ring.fed);
+    const emb = try shape_mod.takeAxis(ctx, embed_table, block_ids, 0);
+    defer emb.deinit();
+    var h = try ops.reshape(ctx, emb, &[_]i32{ 1, blk, @intCast(m.cfg.hidden_size) });
+    defer h.deinit();
+    for (m.layers, 0..) |*l, li| {
+        const next = try layerForwardRing(ctx, l, &m.cfg, h, ring, li, q_off, mask);
+        h.deinit();
+        h = next;
+    }
+    return rmsNormLastDim(ctx, h, m.norm_f32, m.cfg.rms_norm_eps);
+}
+
+fn layerForwardRing(
+    ctx: EagerContext,
+    w: *const LayerWeights,
+    cfg: *const DFlash2Config,
+    x: Array, // [1, L, H]
+    ring: *DFlash2Context,
+    layer_idx: usize,
+    q_off: i32,
+    mask: Array,
+) !Array {
+    const KS: i32 = @intCast(cfg.conv_kernel_size);
+    const GS: i32 = @intCast(cfg.conv_group_size);
+    const xn = try rmsNormLastDim(ctx, x, w.input_layernorm_f32, cfg.rms_norm_eps);
+    defer xn.deinit();
+    const prep = try convPrepare(ctx, &w.attention_conv, xn, KS, GS);
+    defer prep.prepared.deinit();
+    defer prep.dynamic.deinit();
+    const attn = try attentionForwardRing(ctx, w, cfg, prep.prepared, ring, layer_idx, q_off, mask);
+    defer attn.deinit();
+    const fin = try convFinish(ctx, &w.attention_conv, attn, prep.dynamic, KS, GS);
+    defer fin.deinit();
+    const h1 = try ops.add(ctx, x, fin);
+    defer h1.deinit();
+    const xn2 = try rmsNormLastDim(ctx, h1, w.post_attention_layernorm_f32, cfg.rms_norm_eps);
+    defer xn2.deinit();
+    const prep2 = try convPrepare(ctx, &w.mlp_conv, xn2, KS, GS);
+    defer prep2.prepared.deinit();
+    defer prep2.dynamic.deinit();
+    const mlp = try swigluMlp(ctx, w, prep2.prepared);
+    defer mlp.deinit();
+    const fin2 = try convFinish(ctx, &w.mlp_conv, mlp, prep2.dynamic, KS, GS);
+    defer fin2.deinit();
+    return ops.add(ctx, h1, fin2);
+}
+
+fn attentionForwardRing(
+    ctx: EagerContext,
+    w: *const LayerWeights,
+    cfg: *const DFlash2Config,
+    x: Array, // [1, L, H] conv-prepared block
+    ring: *DFlash2Context,
+    layer_idx: usize,
+    q_off: i32,
+    mask: Array,
+) !Array {
+    const L = x.shape()[1];
+    const nh: i32 = @intCast(cfg.num_attention_heads);
+    const nkv: i32 = @intCast(cfg.num_key_value_heads);
+    const hd: i32 = @intCast(cfg.head_dim);
+
+    const q = try w.q_proj.apply(ctx, x);
+    defer q.deinit();
+    const q4 = try ops.reshape(ctx, q, &[_]i32{ 1, L, nh, hd });
+    defer q4.deinit();
+    const qn = try rmsNormLastDim(ctx, q4, w.q_norm, cfg.rms_norm_eps);
+    defer qn.deinit();
+    const qt = try ops.transposeAxes(ctx, qn, &[_]i32{ 0, 2, 1, 3 });
+    defer qt.deinit();
+    const qr = try fast_mod.rope(ctx, qt, hd, false, cfg.rope_theta, 1.0, q_off, null);
+    defer qr.deinit();
+
+    const pk = try w.k_proj.apply(ctx, x);
+    defer pk.deinit();
+    const pk4 = try ops.reshape(ctx, pk, &[_]i32{ 1, L, nkv, hd });
+    defer pk4.deinit();
+    const pkn = try rmsNormLastDim(ctx, pk4, w.k_norm, cfg.rms_norm_eps);
+    defer pkn.deinit();
+    const pkt = try ops.transposeAxes(ctx, pkn, &[_]i32{ 0, 2, 1, 3 });
+    defer pkt.deinit();
+    const pkr = try fast_mod.rope(ctx, pkt, hd, false, cfg.rope_theta, 1.0, q_off, null);
+    defer pkr.deinit();
+    const pv = try w.v_proj.apply(ctx, x);
+    defer pv.deinit();
+    const pv4 = try ops.reshape(ctx, pv, &[_]i32{ 1, L, nkv, hd });
+    defer pv4.deinit();
+    const pvt = try ops.transposeAxes(ctx, pv4, &[_]i32{ 0, 2, 1, 3 });
+    defer pvt.deinit();
+
+    const rk = try ops.reshape(ctx, ring.keys[layer_idx], &[_]i32{ 1, nkv, ring.capacity, hd });
+    defer rk.deinit();
+    const rv = try ops.reshape(ctx, ring.values[layer_idx], &[_]i32{ 1, nkv, ring.capacity, hd });
+    defer rv.deinit();
+    const keys = try shape_mod.concatenateAxis(ctx, &[_]Array{ rk, pkr }, 2);
+    defer keys.deinit();
+    const values = try shape_mod.concatenateAxis(ctx, &[_]Array{ rv, pvt }, 2);
+    defer values.deinit();
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const o = try fast_mod.scaledDotProductAttention(ctx, qr, keys, values, scale, "", mask, null);
+    defer o.deinit();
+    const ot = try ops.transposeAxes(ctx, o, &[_]i32{ 0, 2, 1, 3 });
+    defer ot.deinit();
+    const of = try ops.reshape(ctx, ot, &[_]i32{ 1, L, nh * hd });
+    defer of.deinit();
+    return w.o_proj.apply(ctx, of);
+}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1121,7 +1320,7 @@ test "DFlash2 full block draft + greedy selector match golden trace" {
     // The strict end-to-end criterion: identical greedy token sequence.
 }
 
-test "DFlash2Context: observe, window truncation, split-vs-oneshot determinism" {
+test "DFlash2Context ring: observe + masked draft matches dense golden path" {
     const c_mod = @import("mlx").c;
     c_mod.initErrorHandler();
     const allocator = std.testing.allocator;
@@ -1149,51 +1348,34 @@ test "DFlash2Context: observe, window truncation, split-vs-oneshot determinism" 
     const block_ids_i32 = try ops.astype(ctx, block_ids, .int32);
     defer block_ids_i32.deinit();
 
-    // One-shot: observe all 13 rows at once.
-    var c1 = DFlash2Context.init(allocator, ctx, &m);
-    defer c1.deinit();
-    try c1.observe(ctx_hidden);
-    try std.testing.expectEqual(@as(i64, 13), c1.len);
+    var ring = try DFlash2Context.init(allocator, ctx, &m);
+    defer ring.deinit();
+    try ring.observe(ctx_hidden);
+    try std.testing.expectEqual(@as(i64, 13), ring.fed);
+    try std.testing.expectEqual(@as(i64, 12), ring.pos[12]);
+    try std.testing.expectEqual(@as(i64, -1), ring.pos[13]);
 
-    // Split: 5 + 8 rows.
-    var c2 = DFlash2Context.init(allocator, ctx, &m);
-    defer c2.deinit();
-    const part1 = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 5, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-    defer part1.deinit();
-    const part2 = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 5, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-    defer part2.deinit();
-    try c2.observe(part1);
-    try c2.observe(part2);
-    try std.testing.expectEqual(@as(i64, 13), c2.len);
+    const mask = try ring.draftMask();
+    defer mask.deinit();
+    const h_ring = try blockHiddenRing(ctx, &m, &ring, embed_w, block_ids_i32, mask);
+    defer h_ring.deinit();
 
-    // Determinism: identical draft hidden from both stores.
-    const w1 = (try c1.windowed()).?;
-    defer w1.deinit();
-    const w2 = (try c2.windowed()).?;
-    defer w2.deinit();
-    const h1 = try blockHiddenProjected(ctx, &m, embed_w, block_ids_i32, w1);
-    defer h1.deinit();
-    const h2 = try blockHiddenProjected(ctx, &m, embed_w, block_ids_i32, w2);
-    defer h2.deinit();
-    try std.testing.expect(try maxAbsDiff(ctx, h1, h2) == 0.0);
+    const h_dense = try blockHidden(ctx, &m, embed_w, block_ids_i32, ctx_hidden);
+    defer h_dense.deinit();
+    const d = try maxAbsDiff(ctx, h_ring, h_dense);
+    const sc = try maxAbs(ctx, h_dense);
+    try std.testing.expect(d <= 0.05 * sc);
 
-    // Truncation: window keeps the newest sliding_window-1 rows.
-    var m_big = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
-    defer m_big.deinit();
-    m_big.cfg.sliding_window = 6; // keep 5
-    var c3 = DFlash2Context.init(allocator, ctx, &m_big);
-    defer c3.deinit();
-    try c3.observe(ctx_hidden);
-    try std.testing.expectEqual(@as(i64, 5), c3.len);
-    const w3 = (try c3.windowed()).?;
-    defer w3.deinit();
-    try std.testing.expectEqual(@as(i32, 5), w3.shape()[1]);
-    // Windowed rows are the projection of the newest 5 raw rows.
-    const tail_raw = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 8, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-    defer tail_raw.deinit();
-    const tail_proj = try projectContext(ctx, &m_big, tail_raw);
-    defer tail_proj.deinit();
-    try std.testing.expect(try maxAbsDiff(ctx, w3, tail_proj) == 0.0);
+    // Sliding-window validity: mark the ring as if 3000 rows were fed — only
+    // the newest ring_slots (63) positions may be visible in the mask.
+    ring.fed = 3000;
+    const mask2 = try ring.draftMask();
+    defer mask2.deinit();
+    try mask2.eval();
+    const md = try mask2.dataSlice(bool);
+    // positions 0..12 are older than 3000-63 → all ring slots masked out
+    for (0..@intCast(ring.capacity)) |i| try std.testing.expect(!md[i]);
+    for (0..@intCast(cfg.block_size)) |i| try std.testing.expect(md[@as(usize, @intCast(ring.capacity)) + i]);
 }
 
 fn testCfgFromMeta(meta: std.json.Parsed(std.json.Value)) !DFlash2Config {

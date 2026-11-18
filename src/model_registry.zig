@@ -887,7 +887,12 @@ pub const Qwen38VTableAdapter = struct {
             return false;
         };
         self.dflash2 = m;
-        self.df2_ctx = qwen38_dflash2.DFlash2Context.init(self.allocator, self.model.ctx, m);
+        self.df2_ctx = qwen38_dflash2.DFlash2Context.init(self.allocator, self.model.ctx, m) catch |err| {
+            std.log.warn("Qwen3.8 DFlash2 context init failed ({})", .{err});
+            m.deinit();
+            self.allocator.destroy(m);
+            return false;
+        };
         self.df2_block_len = 0;
         self.df2_block_idx = 0;
         return true;
@@ -942,9 +947,11 @@ pub const Qwen38VTableAdapter = struct {
         const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
         defer block_ids.deinit();
 
-        const w = (try self.df2_ctx.?.windowed()) orelse return error.DFlash2EmptyContext;
-        defer w.deinit();
-        const hidden_full = try qwen38_dflash2.blockHiddenProjected(ctx, m, self.model.embed_table_bf16.?, block_ids, w);
+        var ring = &self.df2_ctx.?;
+        if (ring.fed == 0) return error.DFlash2EmptyContext;
+        const mask = try ring.draftMask();
+        defer mask.deinit();
+        const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
         defer hidden_full.deinit();
         const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
         defer draft_hidden.deinit();
