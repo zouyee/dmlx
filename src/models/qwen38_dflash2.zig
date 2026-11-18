@@ -22,6 +22,7 @@ const shape_mod = @import("mlx").shape;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
 const sort_mod = @import("mlx").sort;
+const quantize_mod = @import("mlx").quantize;
 const reduce_mod = @import("mlx").reduce;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const glm53 = @import("glm53.zig");
@@ -183,17 +184,21 @@ pub const DFlash2 = struct {
         return w_f32;
     }
 
-    fn loadLinear(ws: WeightSource, prefix: []const u8) !MtpLinear {
+    fn loadLinear(ctx: EagerContext, ws: WeightSource, prefix: []const u8, quant_bits: u8) !MtpLinear {
         var nbuf: [256]u8 = undefined;
         const w = try ws.tensor(try std.fmt.bufPrint(&nbuf, "{s}.weight", .{prefix}));
-        return .{ .w = w };
+        if (quant_bits == 0) return .{ .w = w };
+        defer w.deinit();
+        const qw = try quantize_mod.quantize(ctx, w, .{ .bits = quant_bits, .group_size = 64, .mode = .affine });
+        qw.config.validate() catch unreachable;
+        return .{ .w = qw.data, .scales = qw.scales, .biases = qw.biases };
     }
 
-    fn loadConv(ws: WeightSource, prefix: []const u8) !ConvWeights {
+    fn loadConv(ctx: EagerContext, ws: WeightSource, prefix: []const u8, quant_bits: u8) !ConvWeights {
         var nbuf: [256]u8 = undefined;
         const base = try ws.tensor(try std.fmt.bufPrint(&nbuf, "{s}.base_kernel", .{prefix}));
         errdefer base.deinit();
-        const proj = try loadLinear(ws, try std.fmt.bufPrint(&nbuf, "{s}.kernel_projection", .{prefix}));
+        const proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&nbuf, "{s}.kernel_projection", .{prefix}), quant_bits);
         return .{ .base_kernel = base, .kernel_projection = proj };
     }
 
@@ -205,8 +210,9 @@ pub const DFlash2 = struct {
         ctx: EagerContext,
         ws: WeightSource,
         cfg: DFlash2Config,
+        quant_bits: u8,
     ) !DFlash2 {
-        const fc = try loadLinear(ws, "fc");
+        const fc = try loadLinear(ctx, ws, "fc", quant_bits);
         errdefer deinitLinear(&fc);
         const hn = try loadNormF32(ctx, ws, "hidden_norm.weight");
         errdefer hn.deinit();
@@ -229,22 +235,22 @@ pub const DFlash2 = struct {
             l.* = .{
                 .input_layernorm_f32 = try loadNormF32(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.input_layernorm.weight", .{p})),
                 .post_attention_layernorm_f32 = try loadNormF32(ctx, ws, try std.fmt.bufPrint(&n2, "{s}.post_attention_layernorm.weight", .{p})),
-                .q_proj = try loadLinear(ws, try std.fmt.bufPrint(&n1, "{s}.q_proj", .{sa})),
-                .k_proj = try loadLinear(ws, try std.fmt.bufPrint(&n2, "{s}.k_proj", .{sa})),
-                .v_proj = try loadLinear(ws, try std.fmt.bufPrint(&n1, "{s}.v_proj", .{sa})),
-                .o_proj = try loadLinear(ws, try std.fmt.bufPrint(&n2, "{s}.o_proj", .{sa})),
+                .q_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.q_proj", .{sa}), quant_bits),
+                .k_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n2, "{s}.k_proj", .{sa}), quant_bits),
+                .v_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.v_proj", .{sa}), quant_bits),
+                .o_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n2, "{s}.o_proj", .{sa}), quant_bits),
                 .q_norm = try ws.tensor(try std.fmt.bufPrint(&n1, "{s}.q_norm.weight", .{sa})),
                 .k_norm = try ws.tensor(try std.fmt.bufPrint(&n2, "{s}.k_norm.weight", .{sa})),
-                .attention_conv = try loadConv(ws, try std.fmt.bufPrint(&n1, "{s}.attention_conv", .{p})),
-                .mlp_conv = try loadConv(ws, try std.fmt.bufPrint(&n2, "{s}.mlp_conv", .{p})),
-                .gate_proj = try loadLinear(ws, try std.fmt.bufPrint(&n1, "{s}.mlp.gate_proj", .{p})),
-                .up_proj = try loadLinear(ws, try std.fmt.bufPrint(&n2, "{s}.mlp.up_proj", .{p})),
-                .down_proj = try loadLinear(ws, try std.fmt.bufPrint(&n1, "{s}.mlp.down_proj", .{p})),
+                .attention_conv = try loadConv(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.attention_conv", .{p}), quant_bits),
+                .mlp_conv = try loadConv(ctx, ws, try std.fmt.bufPrint(&n2, "{s}.mlp_conv", .{p}), quant_bits),
+                .gate_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.mlp.gate_proj", .{p}), quant_bits),
+                .up_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n2, "{s}.mlp.up_proj", .{p}), quant_bits),
+                .down_proj = try loadLinear(ctx, ws, try std.fmt.bufPrint(&n1, "{s}.mlp.down_proj", .{p}), quant_bits),
             };
             n_loaded += 1;
         }
 
-        const hp = try loadLinear(ws, "candidate_selector.hidden_projection");
+        const hp = try loadLinear(ctx, ws, "candidate_selector.hidden_projection", quant_bits);
         errdefer deinitLinear(&hp);
         const pcb = try ws.tensor("candidate_selector.predecessor_codebook");
         errdefer pcb.deinit();
@@ -266,7 +272,7 @@ pub const DFlash2 = struct {
     }
 
     /// Load from a checkpoint directory (config.json + safetensors).
-    pub fn load(allocator: std.mem.Allocator, ctx: EagerContext, model_dir: []const u8) !DFlash2 {
+    pub fn load(allocator: std.mem.Allocator, ctx: EagerContext, model_dir: []const u8, quant_bits: u8) !DFlash2 {
         const cfg_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
         defer allocator.free(cfg_path);
         const posix = @cImport({
@@ -286,7 +292,7 @@ pub const DFlash2 = struct {
 
         var index = try safetensors_reader.loadOrBuildIndex(allocator, model_dir);
         defer index.deinit();
-        return loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+        return loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, quant_bits);
     }
 
     pub fn deinit(self: *DFlash2) void {
@@ -1041,7 +1047,7 @@ test "DFlash2.loadFromSource: golden weights load with expected shapes" {
 
     var index = try safetensors_reader.buildIndexFromDirectory(allocator, test_golden_dir);
     defer index.deinit();
-    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
     defer m.deinit();
 
     const H: i32 = @intCast(cfg.hidden_size);
@@ -1190,7 +1196,7 @@ test "DFlash2 layer 0: full forward matches golden trace" {
     var index = safetensors_reader.TensorIndex.init(allocator);
     defer index.deinit();
     try index.addShard(test_golden_dir ++ "/model.safetensors");
-    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
     defer m.deinit();
 
     const x = try loadTraceTensor(allocator, "block_embed");
@@ -1236,7 +1242,7 @@ test "DFlash2 full block draft + greedy selector match golden trace" {
     var index = safetensors_reader.TensorIndex.init(allocator);
     defer index.deinit();
     try index.addShard(test_golden_dir ++ "/model.safetensors");
-    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
     defer m.deinit();
 
     // Borrowed tables live in the same golden shard.
@@ -1334,7 +1340,7 @@ test "DFlash2Context ring: observe + masked draft matches dense golden path" {
     var index = safetensors_reader.TensorIndex.init(allocator);
     defer index.deinit();
     try index.addShard(test_golden_dir ++ "/model.safetensors");
-    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
     defer m.deinit();
     const embed_w = try index.loadTensor("embed_tokens.weight");
     defer embed_w.deinit();

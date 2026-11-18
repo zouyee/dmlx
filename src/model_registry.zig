@@ -881,7 +881,11 @@ pub const Qwen38VTableAdapter = struct {
         std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
         const m = try self.allocator.create(qwen38_dflash2.DFlash2);
         errdefer self.allocator.destroy(m);
-        m.* = qwen38_dflash2.DFlash2.load(self.allocator, self.model.ctx, dir) catch |err| {
+        const quant_bits: u8 = if (std.c.getenv("DMLX_DF2_DRAFTER_BITS")) |b|
+            if (std.mem.eql(u8, std.mem.span(b), "0")) 0 else 4
+        else
+            4;
+        m.* = qwen38_dflash2.DFlash2.load(self.allocator, self.model.ctx, dir, quant_bits) catch |err| {
             std.log.warn("Qwen3.8 DFlash2 drafter load failed at {s} ({})", .{ dir, err });
             self.allocator.destroy(m);
             return false;
@@ -933,7 +937,20 @@ pub const Qwen38VTableAdapter = struct {
 
     /// Compute the round's draft block: one parallel forward over
     /// [anchor, mask x 7], then the greedy candidate selector chain.
+    fn df2Now() i128 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+
     fn dflash2ComputeBlock(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!void {
+        const prof = std.c.getenv("DMLX_DF2_PROF") != null;
+        var t0: i128 = 0;
+        if (prof) t0 = df2Now();
+        defer if (prof) {
+            const ms = @as(f64, @floatFromInt(df2Now() - t0)) / 1e6;
+            std.debug.print("DF2 block total {d:.1}ms\n", .{ms});
+        };
         const m = self.dflash2.?;
         const ctx = self.model.ctx;
         const P: i32 = @intCast(m.cfg.block_size - 1);
@@ -953,6 +970,12 @@ pub const Qwen38VTableAdapter = struct {
         defer mask.deinit();
         const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
         defer hidden_full.deinit();
+        var t1: i128 = 0;
+        if (prof) {
+            hidden_full.eval() catch {};
+            t1 = df2Now();
+            std.debug.print("DF2 block fwd {d:.1}ms\n", .{@as(f64, @floatFromInt(t1 - t0)) / 1e6});
+        }
         const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
         defer draft_hidden.deinit();
         const lm = self.mtpLmHead();
@@ -961,8 +984,15 @@ pub const Qwen38VTableAdapter = struct {
 
         try tok_gpu.eval();
         const anchor_slice = try tok_gpu.dataSlice(i32);
+        var t2: i128 = 0;
+        if (prof) {
+            logits.eval() catch {};
+            t2 = df2Now();
+            std.debug.print("DF2 block lm_head {d:.1}ms\n", .{@as(f64, @floatFromInt(t2 - t1)) / 1e6});
+        }
         var tokens: [7]u32 = undefined;
         try qwen38_dflash2.selectGreedy(ctx, m, draft_hidden, logits, @intCast(anchor_slice[0]), &tokens);
+        if (prof) std.debug.print("DF2 block select {d:.1}ms\n", .{@as(f64, @floatFromInt(df2Now() - t2)) / 1e6});
         self.df2_block = tokens;
         self.df2_block_len = tokens.len;
         self.df2_block_idx = 0;
