@@ -18,6 +18,8 @@
 const std = @import("std");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
+const reduce_mod = @import("mlx").reduce;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const glm53 = @import("glm53.zig");
 const qwen38_mtp = @import("qwen38_mtp.zig");
@@ -286,6 +288,105 @@ pub const DFlash2 = struct {
 };
 
 // ---------------------------------------------------------------------------
+// Two-tap grouped dynamic causal conv (Task 3)
+// ---------------------------------------------------------------------------
+
+/// out[b,t,g,j] = sum_o (base[o, g*gs+j] + dyn[b,t,o,g]) * x[b,t-o,g*gs+j]
+/// zero-padded for t < o. Mirrors mlx-vlm `_grouped_dynamic_convolve`.
+fn groupedDynamicConvolve(
+    ctx: EagerContext,
+    x: Array, // [B, L, H]
+    dyn: Array, // [B, L, KS, G]
+    base: Array, // [KS, H]
+    group_size: i32,
+) !Array {
+    const xs = x.shape();
+    const B = xs[0];
+    const L = xs[1];
+    const H = xs[2];
+    const KS: i32 = @intCast(base.shape()[0]);
+    const G: i32 = @divExact(H, group_size);
+
+    const blocks = try ops.reshape(ctx, x, &[_]i32{ B, L, G, group_size });
+    defer blocks.deinit();
+    var out = try Array.zeros(ctx.allocator, &[_]i32{ B, L, G, group_size }, x.dtype());
+    defer out.deinit();
+
+    var o: i32 = 0;
+    while (o < KS) : (o += 1) {
+        var values = blocks;
+        var pad: ?Array = null;
+        var tail: ?Array = null;
+        var cat_values: ?Array = null;
+        defer if (pad) |*v| v.deinit();
+        defer if (tail) |*v| v.deinit();
+        defer if (cat_values) |*v| v.deinit();
+        if (o > 0) {
+            pad = try Array.zeros(ctx.allocator, &[_]i32{ B, o, G, group_size }, x.dtype());
+            tail = try ops.slice(ctx, blocks, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ B, L - o, G, group_size }, &[_]i32{ 1, 1, 1, 1 });
+            cat_values = try shape_mod.concatenateAxis(ctx, &[_]Array{ pad.?, tail.? }, 1);
+            values = cat_values.?;
+        }
+        const base_row = try ops.slice(ctx, base, &[_]i32{ o, 0 }, &[_]i32{ o + 1, H }, &[_]i32{ 1, 1 });
+        defer base_row.deinit();
+        const k = try ops.reshape(ctx, base_row, &[_]i32{ 1, 1, G, group_size });
+        defer k.deinit();
+        const d_row = try ops.slice(ctx, dyn, &[_]i32{ 0, 0, o, 0 }, &[_]i32{ B, L, o + 1, G }, &[_]i32{ 1, 1, 1, 1 });
+        defer d_row.deinit();
+        const d = try ops.reshape(ctx, d_row, &[_]i32{ B, L, G, 1 });
+        defer d.deinit();
+        const kernel = try ops.add(ctx, k, d); // [B, L, G, gs]
+        defer kernel.deinit();
+        const term = try ops.multiply(ctx, kernel, values);
+        defer term.deinit();
+        const next = try ops.add(ctx, out, term);
+        out.deinit();
+        out = next;
+    }
+    return ops.reshape(ctx, out, &[_]i32{ B, L, H });
+}
+
+pub const ConvOut = struct { prepared: Array, dynamic: Array };
+
+/// prepare: convolve with kernel set 0 and hand the set-1 dynamic kernel to
+/// the later finish call (reference: GroupedDynamicCausalConv.prepare).
+pub fn convPrepare(ctx: EagerContext, w: *const ConvWeights, x: Array, kernel_size: i32, group_size: i32) !ConvOut {
+    const xs = x.shape();
+    const B = xs[0];
+    const L = xs[1];
+    const H = xs[2];
+    const G: i32 = @divExact(H, group_size);
+    const dyn_full = try w.kernel_projection.apply(ctx, x); // [B, L, 2*KS*G]
+    defer dyn_full.deinit();
+    const dyn5 = try ops.reshape(ctx, dyn_full, &[_]i32{ B, L, 2, kernel_size, G });
+    defer dyn5.deinit();
+    const d0 = try ops.slice(ctx, dyn5, &[_]i32{ 0, 0, 0, 0, 0 }, &[_]i32{ B, L, 1, kernel_size, G }, &[_]i32{ 1, 1, 1, 1, 1 });
+    defer d0.deinit();
+    const d0r = try ops.reshape(ctx, d0, &[_]i32{ B, L, kernel_size, G });
+    defer d0r.deinit();
+    const d1 = try ops.slice(ctx, dyn5, &[_]i32{ 0, 0, 1, 0, 0 }, &[_]i32{ B, L, 2, kernel_size, G }, &[_]i32{ 1, 1, 1, 1, 1 });
+    defer d1.deinit();
+    const dynamic = try ops.reshape(ctx, d1, &[_]i32{ B, L, kernel_size, G });
+    errdefer dynamic.deinit();
+    const base0 = try ops.slice(ctx, w.base_kernel, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, kernel_size, H }, &[_]i32{ 1, 1, 1 });
+    defer base0.deinit();
+    const base0r = try ops.reshape(ctx, base0, &[_]i32{ kernel_size, H });
+    defer base0r.deinit();
+    const prepared = try groupedDynamicConvolve(ctx, x, d0r, base0r, group_size);
+    return .{ .prepared = prepared, .dynamic = dynamic };
+}
+
+/// finish: convolve the sublayer output with kernel set 1 + saved dynamics.
+pub fn convFinish(ctx: EagerContext, w: *const ConvWeights, x: Array, dynamic: Array, kernel_size: i32, group_size: i32) !Array {
+    const H = x.shape()[2];
+    const base1 = try ops.slice(ctx, w.base_kernel, &[_]i32{ 1, 0, 0 }, &[_]i32{ 2, kernel_size, H }, &[_]i32{ 1, 1, 1 });
+    defer base1.deinit();
+    const base1r = try ops.reshape(ctx, base1, &[_]i32{ kernel_size, H });
+    defer base1r.deinit();
+    return groupedDynamicConvolve(ctx, x, dynamic, base1r, group_size);
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -385,6 +486,94 @@ test "DFlash2.loadFromSource: golden weights load with expected shapes" {
     try expectShape(&[_]i32{ @as(i32, @intCast(cfg.selector_rank)), H }, m.selector_hidden_projection.w);
     try expectShape(&[_]i32{ @as(i32, @intCast(cfg.vocab_size)), @as(i32, @intCast(cfg.selector_rank)) }, m.predecessor_codebook);
     try expectShape(&[_]i32{ @as(i32, @intCast(cfg.vocab_size)), @as(i32, @intCast(cfg.selector_rank)) }, m.successor_codebook);
+}
+
+fn loadTraceTensor(allocator: std.mem.Allocator, name: []const u8) !Array {
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/trace.safetensors");
+    return index.loadTensor(name);
+}
+
+/// Max abs difference between two same-shaped arrays, computed in f32.
+fn maxAbsDiff(ctx: EagerContext, a: Array, b: Array) !f32 {
+    const af = try ops.astype(ctx, a, .float32);
+    defer af.deinit();
+    const bf = try ops.astype(ctx, b, .float32);
+    defer bf.deinit();
+    const diff = try ops.subtract(ctx, af, bf);
+    defer diff.deinit();
+    const ad = try ops.abs(ctx, diff);
+    defer ad.deinit();
+    const m = try reduce_mod.max(ctx, ad, false);
+    defer m.deinit();
+    try m.eval();
+    return m.item(f32);
+}
+
+fn maxAbs(ctx: EagerContext, a: Array) !f32 {
+    const af = try ops.astype(ctx, a, .float32);
+    defer af.deinit();
+    const ad = try ops.abs(ctx, af);
+    defer ad.deinit();
+    const m = try reduce_mod.max(ctx, ad, false);
+    defer m.deinit();
+    try m.eval();
+    return m.item(f32);
+}
+
+test "DFlash2 conv: prepare/finish match golden trace (layer 0 attention)" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const KS: i32 = @intCast(cfgValue(meta, "conv_kernel_size"));
+    const GS: i32 = @intCast(cfgValue(meta, "conv_group_size"));
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+
+    const base = try index.loadTensor("layers.0.attention_conv.base_kernel");
+    defer base.deinit();
+    const kp = try index.loadTensor("layers.0.attention_conv.kernel_projection.weight");
+    defer kp.deinit();
+    const conv: ConvWeights = .{ .base_kernel = base, .kernel_projection = .{ .w = kp } };
+
+    const x = try loadTraceTensor(allocator, "l0.attn.normed");
+    defer x.deinit();
+    const out = try convPrepare(ctx, &conv, x, KS, GS);
+    defer out.prepared.deinit();
+    defer out.dynamic.deinit();
+
+    const exp_prepared = try loadTraceTensor(allocator, "l0.attn.conv_prepared");
+    defer exp_prepared.deinit();
+    const exp_dynamic = try loadTraceTensor(allocator, "l0.attn.conv_dynamic");
+    defer exp_dynamic.deinit();
+
+    // bf16 golden: allow a couple of ULPs of wiggle room.
+    const scale_p = try maxAbs(ctx, exp_prepared);
+    try std.testing.expect(try maxAbsDiff(ctx, out.prepared, exp_prepared) <= 1e-2 * scale_p + 1e-3);
+    const scale_d = try maxAbs(ctx, exp_dynamic);
+    try std.testing.expect(try maxAbsDiff(ctx, out.dynamic, exp_dynamic) <= 1e-2 * scale_d + 1e-3);
+
+    // finish: conv(attn_out, dynamic) must equal post_attn - block_embed.
+    const attn_out = try loadTraceTensor(allocator, "l0.attn.out");
+    defer attn_out.deinit();
+    const fin = try convFinish(ctx, &conv, attn_out, exp_dynamic, KS, GS);
+    defer fin.deinit();
+    const post_attn = try loadTraceTensor(allocator, "l0.post_attn");
+    defer post_attn.deinit();
+    const block_embed = try loadTraceTensor(allocator, "block_embed");
+    defer block_embed.deinit();
+    const exp_fin = try ops.subtract(ctx, post_attn, block_embed);
+    defer exp_fin.deinit();
+    const scale_f = try maxAbs(ctx, exp_fin);
+    try std.testing.expect(try maxAbsDiff(ctx, fin, exp_fin) <= 1e-2 * scale_f + 1e-3);
 }
 
 fn cfgValue(meta: std.json.Parsed(std.json.Value), key: []const u8) i64 {
