@@ -48,6 +48,14 @@ pub const ChatCompletionRequest = struct {
     /// {"type":"function","function":{"name":...}}. v1 supports only "auto"
     /// and "none" — see resolveToolChoice.
     tool_choice: ?std.json.Value = null,
+    /// stream_options.include_usage: when true, the stream ends with a
+    /// usage chunk (empty choices) before [DONE], per the OpenAI streaming
+    /// contract. Agent harnesses (pi-ai/dsh) read it for token accounting.
+    stream_options: ?StreamOptions = null,
+
+    pub const StreamOptions = struct {
+        include_usage: ?bool = null,
+    };
 
     pub const Message = struct {
         role: []const u8,

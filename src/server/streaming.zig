@@ -79,7 +79,10 @@ pub fn handleStreamingCompletion(
     @import("http.zig").maybeDumpPromptBody(io, raw_body, prompt_tokens.len);
 
     // 6. Setup generation config and submit to engine queue.
-    const max_tokens = if (req.max_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
+    const max_tokens = if (req.max_tokens orelse req.max_completion_tokens) |mt| @min(mt, @as(u32, @intCast(server_config.max_tokens))) else server_config.max_tokens;
+    // OpenAI stream_options.include_usage: end the stream with a usage chunk
+    // (empty choices) before [DONE]. Harnesses read it for token accounting.
+    const include_usage = req.stream_options != null and (req.stream_options.?.include_usage orelse false);
     const temperature = req.temperature orelse server_config.temperature;
     const seed = req.seed orelse @as(u64, @intCast(std.Io.Timestamp.now(state.io, .real).toMilliseconds()));
 
@@ -333,6 +336,10 @@ pub fn handleStreamingCompletion(
                             abortStream(io, req_state, allocator);
                             return;
                         };
+                        if (include_usage) sendUsageChunk(&sse, allocator, completion_id, created, req.model, prompt_tokens.len, req_state.token_count) catch {
+                            abortStream(io, req_state, allocator);
+                            return;
+                        };
                         sse.sendEvent("[DONE]") catch {
                             abortStream(io, req_state, allocator);
                             return;
@@ -371,6 +378,10 @@ pub fn handleStreamingCompletion(
                         return;
                     };
                 }
+                if (include_usage) sendUsageChunk(&sse, allocator, completion_id, created, req.model, prompt_tokens.len, req_state.token_count) catch {
+                    abortStream(io, req_state, allocator);
+                    return;
+                };
                 sse.sendEvent("[DONE]") catch {
                     abortStream(io, req_state, allocator);
                     return;
@@ -415,6 +426,10 @@ pub fn handleStreamingCompletion(
             };
 
             if (e.is_final) {
+                if (include_usage) sendUsageChunk(&sse, allocator, completion_id, created, req.model, prompt_tokens.len, req_state.token_count) catch {
+                    abortStream(io, req_state, allocator);
+                    return;
+                };
                 sse.sendEvent("[DONE]") catch {
                     abortStream(io, req_state, allocator);
                     return;
@@ -463,6 +478,24 @@ fn sendReasoningChunk(
     text: []const u8,
 ) !void {
     const chunk = try formatSSEChunkReasoning(allocator, completion_id, created, model, text);
+    defer allocator.free(chunk);
+    try sse.sendEvent(chunk);
+}
+
+/// Format + send the terminal OpenAI usage chunk (empty choices) emitted
+/// when the client asked for stream_options.include_usage.
+fn sendUsageChunk(
+    sse: *sse_mod.SSEWriter,
+    allocator: std.mem.Allocator,
+    completion_id: u64,
+    created: u64,
+    model: []const u8,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","choices":[],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+    , .{ completion_id, created, model, prompt_tokens, completion_tokens, prompt_tokens + completion_tokens });
     defer allocator.free(chunk);
     try sse.sendEvent(chunk);
 }

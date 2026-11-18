@@ -64,7 +64,9 @@ profile's `cordis.patch.yml` and export any value for `DMLX_LOCAL_KEY`:
     model: qwen3.8-27b-4bit
 ```
 
-Notes: Codex must use `wire_api = "chat"` (/v1/responses is not implemented).
+Notes: Codex uses `wire_api = "responses"` (newer Codex releases removed
+the "chat" wire API); /v1/responses supports function tools and ignores
+reasoning/encrypted-content fields.
 `DMLX_CHAT_EMPTY_THINK=1` keeps reasoning traces out of agent-facing output.
 
 Verify with:

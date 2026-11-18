@@ -20,7 +20,7 @@ const http_mod = @import("http.zig");
 const sse_mod = @import("sse.zig");
 const metrics_mod = @import("metrics.zig");
 const openai_mod = @import("openai.zig");
-const responses_mod = @import("responses.zig");
+const responses_mod = @import("responses/mod.zig");
 
 const ServerConfig = config_mod.ServerConfig;
 const ServerState = state_mod.ServerState;

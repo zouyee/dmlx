@@ -151,15 +151,15 @@ fn connectOne(allocator: std.mem.Allocator, io: std.Io, h: Harness, port: u16, a
             std.debug.print(
                 \\
                 \\== codex ==
-                \\Codex config (~/.codex/config.toml) — dmlx speaks wire_api "chat":
+                \\Codex config (~/.codex/config.toml) — dmlx speaks wire_api "responses":
                 \\  [model_providers.dmlx]
                 \\  name = "dmlx (local)"
                 \\  base_url = "http://127.0.0.1:{d}/v1"
-                \\  wire_api = "chat"
+                \\  wire_api = "responses"
                 \\
                 \\Then run: codex --profile dmlx  (or set model_provider/model)
-                \\Note: /v1/responses is not implemented yet, so wire_api must
-                \\stay "chat".
+                \\Note: /v1/responses supports function tools; reasoning /
+                \\encrypted-content fields are accepted but ignored.
                 \\
             , .{port});
             if (apply) {
@@ -329,7 +329,7 @@ fn applyCodex(allocator: std.mem.Allocator, io: std.Io, path: []const u8, port: 
         \\[model_providers.dmlx]
         \\name = "dmlx (local)"
         \\base_url = "http://127.0.0.1:{d}/v1"
-        \\wire_api = "chat"
+        \\wire_api = "responses"
         \\
     , .{port});
     defer allocator.free(block);
