@@ -2402,3 +2402,31 @@ tok/s** (omlx: 28.65), prose 19.6 -> 26.1, math 28.2, count 31.1. dsh
 replay (21.8k ctx): snapshot hit intact, reasoning split intact, 17.1
 tok/s decode (long-KV verify cost is the remaining long-context gap).
 Draft chain cost (26ms/round vs omlx's ~5.6ms) is the next lever.
+
+
+## DFlash2 block drafter (2026-11-18, dflash2 branch)
+
+z-lab/Qwen3.8-27B-DFlash2 is wired into the MtpOps channel as an
+alternative to the sequential MTP head: `DMLX_QWEN38_DFLASH2_DIR` +
+`--speculative-mtp 7`, greedy only. Implementation: `src/models/
+qwen38_dflash2.zig` (loader / two-tap dynamic conv / 5-layer non-causal
+block forward / greedy candidate selector / per-layer KV ring), hidden
+taps at backbone layers 5/19/33/47/61 in `qwen38.zig`, adapter in
+`model_registry.zig`. Golden parity against the mlx-vlm reference is
+token-exact (`scripts/gen_dflash2_golden.py` → `src/models/testdata/
+dflash2/`); e2e greedy output is bit-identical to the MTP path.
+
+Perf on M4 Pro 48 GB (realistic_h2h, temp 0): 33.6 code / 26.3
+multi-turn / 35.6 prose tok/s, repeat TTFT ~0.15 s. Key levers in
+order: KV ring (draft rounds became context-length independent),
+4-bit drafter weights (draft 30→25 ms, acceptance unchanged), drafter
+context prefix cache (TTFT 12.5 s → 0.15 s).
+
+Remaining gaps / follow-ups:
+- Verify round is ~93 ms (73% of round time). Predraft/overlap and
+  verify kernel work are the next levers for multi-turn/prose.
+- Sampled drafting (temp > 0) not wired; vision prefill unsupported.
+- pi-adapted LoRA (harness-hub/Qwen3.8-27B-pi-adapted, r=32) would
+  need load-time merge into the 4-bit backbone (dequantize → merge →
+  requantize) behind a --lora-adapter flag; DFlash2 stays compatible
+  (verify keeps it lossless, acceptance may dip).

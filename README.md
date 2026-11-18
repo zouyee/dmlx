@@ -176,6 +176,16 @@ export DMLX_QWEN38_MTP_DIR=~/models/Qwen3.8-27B-MTP-4bit
 
 `--speculative-mtp 7` sets the adaptive controller’s ceiling; it does not force every round to draft seven tokens.
 
+**DFlash2 block drafter (experimental).** Instead of the sequential MTP head you can use the block-parallel [z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2) drafter (7 tokens per draft round, conditioned on backbone layers 5/19/33/47/61). Point `DMLX_QWEN38_DFLASH2_DIR` at the checkpoint before serving with `--speculative-mtp`:
+
+```bash
+huggingface-cli download z-lab/Qwen3.8-27B-DFlash2
+DMLX_QWEN38_DFLASH2_DIR=~/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/<rev> \
+  ./dmlx/bin/dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
+```
+
+Greedy (temperature 0) only for now; sampled drafting and vision prompts fall back or error. The drafter weights are quantized to 4-bit at load by default (`DMLX_DF2_DRAFTER_BITS=0` keeps bf16). Measured on an M4 Pro 48 GB (temp 0, 256-token generations): 33.6 tok/s code, 26.3 multi-turn, 35.6 prose, with repeat-prompt TTFT ~0.15 s via the drafter-context prefix cache.
+
 MTP applies to streaming and non-streaming alike; benchmark measurements should still use non-streaming requests (SSE delivery adds overhead).
 
 ### Serve DeepSeek V4 Flash in native mode
