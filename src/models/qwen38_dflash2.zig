@@ -759,9 +759,10 @@ pub fn selectGreedyGpu(
         defer scores.deinit();
         const am = try reduce_mod.argmaxAxis(ctx, scores, 1, false); // [1] i32
         defer am.deinit();
-        const sel = try shape_mod.takeAlongAxis(ctx, cand_pos, am, 1); // [1,1] i32
+        // Flat gather: token id = candidates[pos][argmax], all on device.
+        const sel = try shape_mod.take(ctx, cand_flat, am); // [1] i32
         defer sel.deinit();
-        const sel_flat = try ops.reshape(ctx, sel, &[_]i32{1});
+        const sel_flat = try ops.copy(ctx, sel);
         prev.deinit();
         prev = sel_flat;
         picked[n_pick] = try ops.copy(ctx, sel_flat);
