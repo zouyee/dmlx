@@ -55,7 +55,7 @@ CONFIG = dict(
 
 OUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-    "tests", "golden", "dflash2",
+    "src", "models", "testdata", "dflash2",
 )
 
 
