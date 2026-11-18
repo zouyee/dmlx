@@ -188,6 +188,11 @@ pub const MtpOps = struct {
     /// is truncated to the round start (+ t_next) and accepted drafts are
     /// REPLAYED with the TARGET's verify hidden states (mlx-vlm
     /// accept_verified_tokens semantics), not kept from the draft chain.
+    /// Optional: build the NEXT round's draft graph right after verify,
+    /// before the acceptance sync — the block forward then rides the same
+    /// GPU flush as the verify (predraft). Conditional on all drafts being
+    /// accepted; commit/rollback adopt or discard it.
+    predraft: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) anyerror!void = null,
     commit: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted: usize, tokens: []const u32) void,
     /// Discard the whole verify pass (backbone + drafter caches restored).
     rollback: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void,

@@ -696,6 +696,80 @@ pub fn selectGreedy(
     }
 }
 
+/// GPU-resident greedy selector: same chained top-k/codebook scoring as
+/// selectGreedy, but every index stays on device — the whole 7-position
+/// chain is one lazy graph, synced once by the caller. `anchor_gpu`: [1]
+/// i32 (device). Returns [P] i32 selected token ids (unevaluated).
+pub fn selectGreedyGpu(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    hidden: Array, // [1, P, H]
+    logits: Array, // [1, P, V]
+    anchor_gpu: Array, // [1] i32
+) !Array {
+    const P: i32 = logits.shape()[1];
+    const V: i32 = logits.shape()[2];
+    const K: i32 = @intCast(m.cfg.selector_top_k);
+    const R: i32 = @intCast(m.cfg.selector_rank);
+
+    const order = try sort_mod.argsortAxis(ctx, logits, -1);
+    defer order.deinit();
+    const candidates = try ops.slice(ctx, order, &[_]i32{ 0, 0, V - K }, &[_]i32{ 1, P, V }, &[_]i32{ 1, 1, 1 });
+    defer candidates.deinit();
+    const cand_i32 = try ops.astype(ctx, candidates, .int32);
+    defer cand_i32.deinit();
+    const unary = try shape_mod.takeAlongAxis(ctx, logits, cand_i32, -1);
+    defer unary.deinit();
+    const hp = try m.selector_hidden_projection.apply(ctx, hidden);
+    defer hp.deinit();
+
+    var prev = try ops.copy(ctx, anchor_gpu); // [1] i32
+    defer prev.deinit();
+    var picked: [8]Array = undefined;
+    var n_pick: usize = 0;
+    defer for (picked[0..n_pick]) |pk| pk.deinit();
+
+    var pos: i32 = 0;
+    while (pos < P) : (pos += 1) {
+        const pcb_row = try shape_mod.takeAxis(ctx, m.predecessor_codebook, prev, 0); // [1,R]
+        defer pcb_row.deinit();
+        const pcb3 = try ops.reshape(ctx, pcb_row, &[_]i32{ 1, 1, R });
+        defer pcb3.deinit();
+        const proj_pos = try ops.slice(ctx, hp, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, R }, &[_]i32{ 1, 1, 1 });
+        defer proj_pos.deinit();
+        const cand_pos = try ops.slice(ctx, cand_i32, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, K }, &[_]i32{ 1, 1, 1 });
+        defer cand_pos.deinit();
+        const cand_flat = try ops.reshape(ctx, cand_pos, &[_]i32{K});
+        defer cand_flat.deinit();
+        const scb_rows = try shape_mod.takeAxis(ctx, m.successor_codebook, cand_flat, 0); // [K,R]
+        defer scb_rows.deinit();
+        const scb3 = try ops.reshape(ctx, scb_rows, &[_]i32{ 1, K, R });
+        defer scb3.deinit();
+        const prod = try ops.multiply(ctx, pcb3, proj_pos);
+        defer prod.deinit();
+        const prod2 = try ops.multiply(ctx, prod, scb3);
+        defer prod2.deinit();
+        const edges = try reduce_mod.sumAxis(ctx, prod2, 2, false); // [1,K]
+        defer edges.deinit();
+        const unary_pos = try ops.slice(ctx, unary, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, K }, &[_]i32{ 1, 1, 1 });
+        defer unary_pos.deinit();
+        const unary_flat = try ops.reshape(ctx, unary_pos, &[_]i32{ 1, K });
+        defer unary_flat.deinit();
+        const scores = try ops.add(ctx, unary_flat, edges);
+        defer scores.deinit();
+        const am = try reduce_mod.argmaxAxis(ctx, scores, 1, false); // [1] i32
+        defer am.deinit();
+        const sel = try shape_mod.takeAlongAxis(ctx, cand_pos, am, 1); // [1,1] i32
+        defer sel.deinit();
+        const sel_flat = try ops.reshape(ctx, sel, &[_]i32{1});
+        prev.deinit();
+        prev = sel_flat;
+        picked[n_pick] = try ops.copy(ctx, sel_flat);
+        n_pick += 1;
+    }
+    return shape_mod.concatenateAxis(ctx, picked[0..n_pick], 0);
+}
+
 // ---------------------------------------------------------------------------
 // Draft context store (Task 7)
 // ---------------------------------------------------------------------------
@@ -720,6 +794,11 @@ pub const DFlash2Context = struct {
     /// Projected rows currently in the ring ([1, <=ring_slots, H]), kept so
     /// the adapter can cache the drafter context for prefix-snapshot hits.
     rows_shadow: ?Array = null,
+    /// In-flight tentative (predraft) feed bookkeeping — see
+    /// observeTentative.
+    tentative_start: i64 = -1,
+    tentative_len: i32 = 0,
+    tentative_proj: ?Array = null,
 
     pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, model: *const DFlash2) !DFlash2Context {
         const cfg = &model.cfg;
@@ -760,6 +839,10 @@ pub const DFlash2Context = struct {
         self.fed = 0;
         if (self.rows_shadow) |r| r.deinit();
         self.rows_shadow = null;
+        if (self.tentative_proj) |tp| tp.deinit();
+        self.tentative_proj = null;
+        self.tentative_start = -1;
+        self.tentative_len = 0;
     }
 
     /// Borrowed view of the projected rows currently in the ring (or null).
@@ -787,6 +870,74 @@ pub const DFlash2Context = struct {
     /// paths seed the newest window rows of a longer prefix, so the write
     /// position (and resulting fed) is not the running count.
     pub fn seedFromProjectedAt(self: *DFlash2Context, proj: Array, fed_start: i64) !void {
+        try self.feedRings(proj, fed_start, true);
+    }
+
+    /// Predraft feed: write k rows at fed..fed+k-1 WITHOUT advancing fed and
+    /// without touching the row shadow. adopt/discard settle the round.
+    pub fn observeTentative(self: *DFlash2Context, proj: Array) !void {
+        std.debug.assert(self.tentative_start < 0);
+        self.tentative_proj = try ops.copy(self.ctx, proj);
+        self.tentative_start = self.fed;
+        self.tentative_len = proj.shape()[1];
+        try self.feedRings(proj, self.fed, false);
+        // feedRings advanced fed; the tentative feed must not — commit's
+        // adopt/discard settles the final value.
+        self.fed = self.tentative_start;
+    }
+
+    /// While the predraft block forward runs, the ring must LOOK fully
+    /// committed: block RoPE offsets and the mask window start after the
+    /// tentative rows.
+    pub fn advanceFedForTentativeDraft(self: *DFlash2Context) void {
+        std.debug.assert(self.tentative_start >= 0);
+        self.fed = self.tentative_start + self.tentative_len;
+    }
+
+    /// All drafted tokens accepted: the tentative rows become committed.
+    pub fn adoptTentative(self: *DFlash2Context) !void {
+        std.debug.assert(self.tentative_start >= 0);
+        self.fed = self.tentative_start + self.tentative_len;
+        // The shadow gains the rows now that they are committed.
+        const proj = self.tentative_proj.?;
+        if (self.rows_shadow) |old| {
+            const merged = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ old, proj }, 1);
+            old.deinit();
+            self.rows_shadow = merged;
+        } else {
+            self.rows_shadow = try ops.copy(self.ctx, proj);
+        }
+        const sh_len: i64 = self.rows_shadow.?.shape()[1];
+        if (sh_len > self.ring_slots) {
+            const start: i32 = @intCast(sh_len - self.ring_slots);
+            const total: i32 = @intCast(sh_len);
+            const tail = try ops.slice(self.ctx, self.rows_shadow.?, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(self.cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+            self.rows_shadow.?.deinit();
+            self.rows_shadow = tail;
+        }
+        self.clearTentative();
+    }
+
+    /// A draft was rejected: invalidate the tentative slots (the commit's
+    /// own observe re-writes the accepted prefix of them anyway).
+    pub fn discardTentative(self: *DFlash2Context) void {
+        std.debug.assert(self.tentative_start >= 0);
+        self.fed = self.tentative_start;
+        var j: i64 = 0;
+        while (j < self.tentative_len) : (j += 1) {
+            self.pos[@intCast(@mod(self.tentative_start + j, self.capacity))] = -1;
+        }
+        self.clearTentative();
+    }
+
+    fn clearTentative(self: *DFlash2Context) void {
+        if (self.tentative_proj) |tp| tp.deinit();
+        self.tentative_proj = null;
+        self.tentative_start = -1;
+        self.tentative_len = 0;
+    }
+
+    fn feedRings(self: *DFlash2Context, proj: Array, fed_start: i64, update_shadow: bool) !void {
         self.fed = fed_start;
         const k: i32 = proj.shape()[1];
         if (k == 0) return;
@@ -820,6 +971,7 @@ pub const DFlash2Context = struct {
         }
         self.fed += k;
         // Maintain the projected-row shadow (windowed to ring_slots).
+        if (!update_shadow) return;
         if (self.rows_shadow) |old| {
             const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ old, proj }, 1);
             old.deinit();

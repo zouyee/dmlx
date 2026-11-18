@@ -648,6 +648,12 @@ pub const Qwen38VTableAdapter = struct {
     /// recompute AND the drafter-context rebuild.
     df2_cache_ids: []u32 = &.{},
     df2_cache_rows: ?Array = null, // [1, <=window, H] projected
+    /// Predraft stash: next round's block tokens ([7] i32 GPU, built before
+    /// the acceptance sync) + the round's verify argmax ([L] i32 GPU) +
+    /// how many verify rows the tentative ring feed used.
+    df2_pending_tokens: ?Array = null,
+    df2_pending_argmax: ?Array = null,
+    df2_pending_rows: usize = 0,
     /// `DMLX_MTP_CHAIN_DUMP=1`: per-step drafter KV length trace (plan
     /// 2026-10-29-catch-omlx-mtp Task 1). Read once per process; the RoPE
     /// offset of every head forward equals cache.len() before its append,
@@ -664,6 +670,7 @@ pub const Qwen38VTableAdapter = struct {
         .verify = &mtpVerify,
         .verifyLogits = &mtpVerifyLogits,
         .verifyArgmax = &mtpVerifyArgmax,
+        .predraft = &mtpPredraft,
         .verifyHidden = &mtpVerifyHidden,
         .commit = &mtpCommit,
         .rollback = &mtpRollback,
@@ -914,6 +921,7 @@ pub const Qwen38VTableAdapter = struct {
     fn dflash2Prefill(self: *Qwen38VTableAdapter, ids: []const u32) anyerror!generation.MtpStepOut {
         self.df2_block_len = 0;
         self.df2_block_idx = 0;
+        self.dflash2ClearPending();
         self.df2_ctx.?.reset();
         const ctx = self.model.ctx;
         const m = self.dflash2.?;
@@ -1046,25 +1054,107 @@ pub const Qwen38VTableAdapter = struct {
         const logits = try lm.apply(ctx, draft_hidden);
         defer logits.deinit();
 
-        try tok_gpu.eval();
-        const anchor_slice = try tok_gpu.dataSlice(i32);
         var t2: i128 = 0;
         if (prof) {
             logits.eval() catch {};
             t2 = df2Now();
             std.debug.print("DF2 block lm_head {d:.1}ms\n", .{@as(f64, @floatFromInt(t2 - t1)) / 1e6});
         }
-        var tokens: [7]u32 = undefined;
-        try qwen38_dflash2.selectGreedy(ctx, m, draft_hidden, logits, @intCast(anchor_slice[0]), &tokens);
+        const tokens_gpu = try qwen38_dflash2.selectGreedyGpu(ctx, m, draft_hidden, logits, tok_gpu);
+        defer tokens_gpu.deinit();
         if (prof) std.debug.print("DF2 block select {d:.1}ms\n", .{@as(f64, @floatFromInt(df2Now() - t2)) / 1e6});
+        try tokens_gpu.eval();
+        const tslice = try tokens_gpu.dataSlice(i32);
+        var tokens: [7]u32 = undefined;
+        for (tslice[0..7], 0..) |t, i| tokens[i] = @intCast(t);
         self.df2_block = tokens;
         self.df2_block_len = tokens.len;
         self.df2_block_idx = 0;
     }
 
+    /// GPU-only block computation for the predraft path: identical to the
+    /// above but returns the [7] i32 token array WITHOUT syncing.
+    fn dflash2ComputeBlockLazy(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!Array {
+        const m = self.dflash2.?;
+        const ctx = self.model.ctx;
+        const P: i32 = @intCast(m.cfg.block_size - 1);
+        const H: i32 = @intCast(m.cfg.hidden_size);
+        const mask_ids = try self.allocator.alloc(i32, @intCast(P));
+        defer self.allocator.free(mask_ids);
+        for (mask_ids) |*t| t.* = @intCast(m.cfg.mask_token_id);
+        const mask_arr = try Array.fromData(self.allocator, i32, mask_ids, &[_]i32{P});
+        defer mask_arr.deinit();
+        const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
+        defer block_ids.deinit();
+        var ring = &self.df2_ctx.?;
+        const mask = try ring.draftMask();
+        defer mask.deinit();
+        const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
+        defer hidden_full.deinit();
+        const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+        defer draft_hidden.deinit();
+        const lm = self.mtpLmHead();
+        const logits = try lm.apply(ctx, draft_hidden);
+        defer logits.deinit();
+        return qwen38_dflash2.selectGreedyGpu(ctx, m, draft_hidden, logits, tok_gpu);
+    }
+
+    /// Predraft: condition on ALL drafts being accepted, ingest the verify
+    /// rows into the ring tentatively, and build the next block's token
+    /// graph — all lazy, so it rides the acceptance sync's GPU flush.
+    fn dflash2Predraft(self: *Qwen38VTableAdapter, v: *qwen38.Qwen38VerifyOut) anyerror!void {
+        const th = v.tap_hidden orelse return;
+        if (self.df2_pending_tokens != null) return; // already stashed
+        const ctx = self.model.ctx;
+        const L: usize = @intCast(th.shape()[1]);
+        // Verify argmax once; mtpVerifyArgmax serves the engine from this.
+        const f32l = try ops.astype(ctx, v.logits, .float32);
+        defer f32l.deinit();
+        const Li: i32 = v.logits.shape()[1];
+        const vocab: i32 = v.logits.shape()[2];
+        const flat = try ops.reshape(ctx, f32l, &[_]i32{ Li, vocab });
+        defer flat.deinit();
+        const am = try reduce_mod.argmaxAxis(ctx, flat, -1, false); // [L] i32
+        errdefer am.deinit();
+        // Tentative ring feed of all verify rows.
+        const proj = try qwen38_dflash2.projectContext(ctx, self.dflash2.?, th);
+        defer proj.deinit();
+        try self.df2_ctx.?.observeTentative(proj);
+        errdefer self.df2_ctx.?.discardTentative();
+        // Anchor for the assumed-all-accepted block: bonus token (last row).
+        const anchor = try ops.slice(ctx, am, &[_]i32{Li - 1}, &[_]i32{Li}, &[_]i32{1});
+        defer anchor.deinit();
+        // The block's positions/RoPE and the mask window follow the
+        // tentative rows, so the ring must present the post-commit fed.
+        self.df2_ctx.?.advanceFedForTentativeDraft();
+        const tokens = try self.dflash2ComputeBlockLazy(anchor);
+        self.df2_pending_tokens = tokens;
+        self.df2_pending_argmax = am;
+        self.df2_pending_rows = L;
+    }
+
+    fn dflash2ClearPending(self: *Qwen38VTableAdapter) void {
+        if (self.df2_pending_tokens) |t| t.deinit();
+        self.df2_pending_tokens = null;
+        if (self.df2_pending_argmax) |a| a.deinit();
+        self.df2_pending_argmax = null;
+        self.df2_pending_rows = 0;
+    }
+
     fn dflash2DraftGreedy(self: *Qwen38VTableAdapter, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
         if (self.df2_block_idx >= self.df2_block_len) {
-            try self.dflash2ComputeBlock(tok_gpu);
+            if (self.df2_pending_tokens) |pt| {
+                // Adopted predraft: one sync here (the values were already
+                // flushed by the acceptance argmax read).
+                try pt.eval();
+                const ts = try pt.dataSlice(i32);
+                for (ts[0..7], 0..) |t, i| self.df2_block[i] = @intCast(t);
+                self.df2_block_len = 7;
+                self.df2_block_idx = 0;
+                self.dflash2ClearPending();
+            } else {
+                try self.dflash2ComputeBlock(tok_gpu);
+            }
         }
         const tok = self.df2_block[self.df2_block_idx];
         self.df2_block_idx += 1;
@@ -1079,6 +1169,25 @@ pub const Qwen38VTableAdapter = struct {
     fn dflash2Commit(self: *Qwen38VTableAdapter, v: *qwen38.Qwen38VerifyOut, accepted: usize) void {
         qwen38.commitVerify(self.model, v, accepted);
         const ctx = self.model.ctx;
+        // Predraft settle: adopt only when every verify row was accepted
+        // (the tentative feed covered exactly `pending_rows` rows).
+        if (self.df2_ctx.?.tentative_start >= 0) {
+            if (self.df2_pending_tokens != null and accepted == self.df2_pending_rows) {
+                self.df2_ctx.?.adoptTentative() catch {
+                    self.df2_ctx.?.discardTentative();
+                    self.dflash2ClearPending();
+                };
+                // adopted: keep df2_pending_tokens for the draft calls;
+                // the argmax stash can go (engine already read it).
+                if (self.df2_pending_argmax) |a| a.deinit();
+                self.df2_pending_argmax = null;
+                self.df2_block_len = 0;
+                self.df2_block_idx = 0;
+                return;
+            }
+            self.df2_ctx.?.discardTentative();
+            self.dflash2ClearPending();
+        }
         if (v.tap_hidden) |th| {
             const width: i32 = th.shape()[2];
             const rows = ops.slice(ctx, th, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @intCast(accepted), width }, &[_]i32{ 1, 1, 1 }) catch return;
@@ -1290,6 +1399,7 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         const ctx = self.model.ctx;
+        if (self.df2_pending_argmax) |am| return ops.copy(ctx, am);
         const L: i32 = v.logits.shape()[1];
         const vocab: i32 = v.logits.shape()[2];
         const f32l = try ops.astype(ctx, v.logits, .float32);
@@ -1297,6 +1407,15 @@ pub const Qwen38VTableAdapter = struct {
         const flat = try ops.reshape(ctx, f32l, &[_]i32{ L, vocab });
         defer flat.deinit();
         return reduce_mod.argmaxAxis(ctx, flat, -1, false); // [L] i32
+    }
+
+    fn mtpPredraft(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) anyerror!void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 == null) return;
+        const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        return self.dflash2Predraft(v);
     }
 
     fn mtpCommit(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted: usize, tokens: []const u32) void {
@@ -1399,7 +1518,10 @@ pub const Qwen38VTableAdapter = struct {
         qwen38.rollbackVerify(self.model, v);
         if (self.dflash2 != null) {
             // Context rows are only appended on commit, so a rollback needs
-            // no drafter-side undo — just drop the round's draft block.
+            // no drafter-side undo — just drop the round's draft block and
+            // any tentative predraft state.
+            if (self.df2_ctx.?.tentative_start >= 0) self.df2_ctx.?.discardTentative();
+            self.dflash2ClearPending();
             self.df2_block_len = 0;
             self.df2_block_idx = 0;
             return;
@@ -1414,6 +1536,10 @@ pub const Qwen38VTableAdapter = struct {
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        if (self.dflash2 != null and self.df2_ctx != null and self.df2_ctx.?.tentative_start >= 0) {
+            self.df2_ctx.?.discardTentative();
+        }
+        self.dflash2ClearPending();
         v.deinit(self.allocator);
         self.allocator.destroy(v);
         self.mtp_round_old_len = null; // never leave stale round state

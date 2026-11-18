@@ -3224,7 +3224,11 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32, tap: ?*Qwe
     const logits = try self.lm_head.?.apply(ctx, hidden_final);
     errdefer logits.deinit();
     if (prof) _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &prof_t1);
-    try logits.eval();
+    // Lazy by default: the accept step (batched argmax) syncs once for the
+    // whole round, and a predraft graph built in between rides the same
+    // flush (see the DFlash2 predraft path). DMLX_MTP_DEBUG keeps the
+    // split timing meaningful by syncing here.
+    if (prof or std.c.getenv("DMLX_VERIFY_SYNC") != null) try logits.eval();
     if (prof) {
         var t2: std.c.timespec = undefined;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t2);

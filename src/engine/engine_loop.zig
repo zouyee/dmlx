@@ -2697,6 +2697,15 @@ pub const EngineLoop = struct {
             // per-step states — it must be freed on EVERY exit from this
             // round (normal, stop, max_tokens, and all error paths).
             defer mtp.freeVerify(self.model.ptr, vh);
+            // Predraft (DFlash2): build the next block's draft graph now so
+            // it flushes together with the acceptance argmax read below.
+            // Predraft is OPT-IN (DMLX_DF2_PREDRAFT=1): conditioned on
+            // all-drafts-accepted, its adoption rate is too low at ~40%
+            // draft acceptance to pay for the extra graph build (measured
+            // 2026-11-18: -1 tok/s on code/prose when enabled by default).
+            if (std.c.getenv("DMLX_DF2_PREDRAFT") != null) if (mtp.predraft) |pd| pd(self.model.ptr, vh) catch |err| {
+                std.log.warn("EngineLoop: predraft failed ({}), continuing", .{err});
+            };
             prof_lap(prof_now, &prof_last, &prof_verify_ns);
             if (mem_probe_on and prof_rounds <= 6) _ = c.c.mlx_get_active_memory(&phase_mem[1]);
 
