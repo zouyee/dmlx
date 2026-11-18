@@ -780,6 +780,14 @@ pub const DFlash2Context = struct {
     /// Feed already-projected context rows ([1, k, H]) into the rings
     /// (prefix-snapshot restore path — the projection was cached).
     pub fn seedFromProjected(self: *DFlash2Context, proj: Array) !void {
+        return self.seedFromProjectedAt(proj, self.fed);
+    }
+
+    /// seedFromProjected with an explicit absolute start position: restore
+    /// paths seed the newest window rows of a longer prefix, so the write
+    /// position (and resulting fed) is not the running count.
+    pub fn seedFromProjectedAt(self: *DFlash2Context, proj: Array, fed_start: i64) !void {
+        self.fed = fed_start;
         const k: i32 = proj.shape()[1];
         if (k == 0) return;
         const ctx = self.ctx;

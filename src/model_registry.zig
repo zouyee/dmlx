@@ -916,6 +916,7 @@ pub const Qwen38VTableAdapter = struct {
         self.df2_block_idx = 0;
         self.df2_ctx.?.reset();
         const ctx = self.model.ctx;
+        const m = self.dflash2.?;
 
         // How much of the drafter context can the adapter cache supply for
         // a snapshot-restored prefix? Rows are per-token projected context.
@@ -926,17 +927,21 @@ pub const Qwen38VTableAdapter = struct {
             while (cache_plen < max_rows and self.df2_cache_ids[cache_plen] == ids[cache_plen]) cache_plen += 1;
         }
         const snap_plen = self.model.peekPrefixSnapshotLen(ids);
-        // Full snapshot hit without a matching drafter cache: force a full
-        // tapped prefill (suppress the restore), else the drafter context
-        // would be empty for the whole request.
-        const suppress = snap_plen >= ids.len and cache_plen < ids.len;
-        // Partial hit the cache cannot cover: same story.
-        const suppress2 = snap_plen > cache_plen and snap_plen < ids.len;
-        if (suppress or suppress2) self.model.suppress_snapshot_restore = true;
+        // The ring only ever needs the newest ring_slots rows, so the cache
+        // "covers" a prefix as long as it holds those rows: full coverage
+        // for prefixes <= window, tail coverage for longer ones.
+        const window: usize = @intCast(m.cfg.sliding_window - 1);
+        const cache_rows_len: usize = if (self.df2_cache_rows) |cr| @intCast(cr.shape()[1]) else 0;
+        const covered = @min(cache_plen, cache_rows_len); // rows the cache can supply for this prompt
+        const need: usize = @min(snap_plen, window);
+        // Suppress the restore only when the cache cannot supply the rows
+        // the ring would need for the restored prefix.
+        const suppress = snap_plen > 0 and covered < need;
+        if (suppress) self.model.suppress_snapshot_restore = true;
         defer self.model.suppress_snapshot_restore = false;
         // On a suppressed (full tapped) prefill the tap covers every row —
         // seeding the cached prefix too would duplicate it in the ring.
-        const usable_prefix = if (suppress or suppress2) 0 else @min(snap_plen, cache_plen);
+        const usable_prefix = if (suppress) 0 else snap_plen;
 
         var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
         errdefer tap.deinit();
@@ -947,11 +952,14 @@ pub const Qwen38VTableAdapter = struct {
         // Seed the drafter context: cached projected rows for the restored
         // prefix + freshly tapped rows for the freshly computed part.
         if (usable_prefix > 0) {
+            // Seed the NEWEST min(usable_prefix, window) rows of the prefix,
+            // at their absolute positions (RoPE offsets depend on them).
             const cr = self.df2_cache_rows.?;
             const width: i32 = cr.shape()[2];
-            const rows = try ops.slice(ctx, cr, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @intCast(usable_prefix), width }, &[_]i32{ 1, 1, 1 });
+            const take: usize = @min(usable_prefix, window);
+            const rows = try ops.slice(ctx, cr, &[_]i32{ 0, @intCast(cache_rows_len - take), 0 }, &[_]i32{ 1, @intCast(cache_rows_len), width }, &[_]i32{ 1, 1, 1 });
             defer rows.deinit();
-            try self.df2_ctx.?.seedFromProjected(rows);
+            try self.df2_ctx.?.seedFromProjectedAt(rows, @intCast(usable_prefix - take));
         }
         if (try tap.finish(ctx)) |rows| {
             defer rows.deinit();
