@@ -1493,6 +1493,10 @@ pub const Qwen38ServingModel = struct {
     /// Longest-prefix KV snapshots (agent-loop prefill reuse). See
     /// PrefixSnapshot.
     prefix_snaps: std.ArrayList(PrefixSnapshot) = .empty,
+    /// Token count of the snapshot currently on disk (this process): the
+    /// single slot only ever grows, so a valuable large entry survives
+    /// later small prompts.
+    last_persisted_tokens: usize = 0,
     snap_access: u64 = 0,
     /// Set by the DFlash2 adapter to force a full tapped prefill when its
     /// drafter-context cache cannot cover a snapshot-restored prefix.
@@ -1980,17 +1984,35 @@ pub const Qwen38ServingModel = struct {
     /// lookup after a restart — the cold full prefill of a large static
     /// system prompt then happens once ever instead of once per process.
     var cached_snap_dir: ?(?[]const u8) = null;
-    fn prefixSnapDir() ?[]const u8 {
+    var default_snap_dir_buf: [256]u8 = undefined;
+
+    /// Per-model disk-cache directory. Env override wins (single shared
+    /// slot, previous behavior); otherwise default ON at
+    /// ~/.dmlx/qwen38_snaps/<arch tag> so agent workloads survive restarts
+    /// (the ~11k stable system prompt repays a full prefill otherwise).
+    /// DMLX_NO_SNAP_PERSIST=1 disables both persist and load.
+    /// The default path lives in a process-lifetime static buffer: the
+    /// test harness's leak check counts heap allocations, and this cache
+    /// is intentionally never freed.
+    fn snapDir(self: *Qwen38ServingModel) ?[]const u8 {
+        if (std.c.getenv("DMLX_NO_SNAP_PERSIST") != null) return null;
         if (cached_snap_dir) |v| return v;
         var v: ?[]const u8 = null;
         if (std.c.getenv("DMLX_QWEN38_SNAP_DIR")) |s| {
             const d = std.mem.span(s);
             if (d.len > 0) v = d;
+        } else if (std.c.getenv("HOME")) |h| {
+            const cfg = self.cfg;
+            const written = std.fmt.bufPrint(
+                &default_snap_dir_buf,
+                "{s}/.dmlx/qwen38_snaps/h{d}_l{d}_v{d}",
+                .{ h, cfg.hidden_size, cfg.num_hidden_layers, cfg.vocab_size },
+            ) catch null;
+            if (written) |w| v = w;
         }
         cached_snap_dir = v;
         return v;
     }
-
     fn snapFilePath(self: *Qwen38ServingModel, dir: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "{s}/snap_latest.safetensors", .{dir});
     }
@@ -2009,17 +2031,23 @@ pub const Qwen38ServingModel = struct {
     /// Arrays are already materialized (deepClone/copy eval them), so the
     /// safetensors writer can read them directly.
     fn persistLatestSnapshot(self: *Qwen38ServingModel) void {
-        const dir = prefixSnapDir() orelse return;
+        const dir = self.snapDir() orelse return;
         const snap = &self.prefix_snaps.items[self.prefix_snaps.items.len - 1];
         // Only prompts big enough to make a re-prefill hurt are worth disk;
         // this also keeps small probes from overwriting the valuable entry.
         if (snap.prompt_tokens.len < 2048) return;
+        // Single on-disk slot: persist MONOTONICALLY (largest wins). The
+        // latest store is not necessarily the most valuable one — a burst
+        // of smaller prompts after a big agent-session snapshot would
+        // otherwise clobber it (measured: 10.7k snapshot replaced by 2.7k).
+        if (snap.prompt_tokens.len <= self.last_persisted_tokens) return;
         const t0 = std.c.mach_absolute_time();
         self.persistLatestSnapshotImpl(dir, snap) catch |err| {
             std.log.warn("[qwen38] snapshot persist failed: {}", .{err});
             return;
         };
         const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) * 125.0 / 3_000_000.0;
+        self.last_persisted_tokens = snap.prompt_tokens.len;
         std.log.info("[qwen38] snapshot persisted ({d} tokens, {d:.0} ms)", .{ snap.prompt_tokens.len, ms });
     }
 
@@ -2080,10 +2108,16 @@ pub const Qwen38ServingModel = struct {
     fn maybeLoadPersistedSnapshot(self: *Qwen38ServingModel) void {
         if (persisted_snap_loaded) return;
         persisted_snap_loaded = true;
-        const dir = prefixSnapDir() orelse return;
+        const dir = self.snapDir() orelse return;
         self.loadPersistedSnapshotImpl(dir) catch |err| {
             std.log.warn("[qwen38] persisted snapshot load failed: {}", .{err});
         };
+    }
+
+    fn fileExists(path: []const u8) bool {
+        const z = std.heap.page_allocator.dupeZ(u8, path) catch return false;
+        defer std.heap.page_allocator.free(z);
+        return std.c.access(z.ptr, 0) == 0;
     }
 
     /// mkdir -p via one mkdir per component (POSIX; absolute or relative).
@@ -2111,6 +2145,10 @@ pub const Qwen38ServingModel = struct {
         const mlx_io = @import("mlx").io;
         const path = try self.snapFilePath(dir);
         defer self.allocator.free(path);
+        // Missing cache file is the NORMAL first-run path — check before
+        // loadSafetensors, whose failure logs at error level (and the test
+        // harness fails on unexpected error logs).
+        if (!fileExists(path)) return;
         var res = mlx_io.loadSafetensors(self.allocator, path) catch return;
         // Weight arrays are adopted into the snapshot below via takeAdopted;
         // whatever remains in the map at scope exit is freed by res.deinit
@@ -2171,10 +2209,17 @@ pub const Qwen38ServingModel = struct {
             .rope_delta = rope_delta,
             .last_access = self.snap_access,
         });
+        self.last_persisted_tokens = toks.len;
         std.log.info("[qwen38] persisted snapshot loaded ({d} tokens)", .{toks.len});
     }
 
     var persisted_snap_loaded: bool = false;
+
+    /// Adapter-facing accessor for the disk-cache directory (DFlash2 context
+    /// rows persist alongside the backbone snapshot).
+    pub fn snapshotDir(self: *Qwen38ServingModel) ?[]const u8 {
+        return self.snapDir();
+    }
 
     /// Max retained snapshots; DMLX_QWEN38_PREFIX_SNAP=0 disables. Default
     /// 4: an agent session reuses one growing prefix, and each snapshot
@@ -2248,6 +2293,16 @@ pub const Qwen38ServingModel = struct {
                 std.log.info("[qwen38] snap[{d}] len={d} mismatches at token {d} (snap={d} req={d})", .{ i, plen, mismatch, s.prompt_tokens[mismatch], ids[mismatch] });
             }
         }
+        // Refresh the hit's recency HERE (not only in the restore path): a
+        // persisted large snapshot loaded at startup must survive the small
+        // snapshots stored by unrelated requests until its own prompt shows
+        // up — otherwise the LRU evicts it first and the disk cache never
+        // gets a chance to pay off (measured: loaded 10.7k entry evicted by
+        // three small stores before its request arrived).
+        if (best) |i| {
+            self.snap_access += 1;
+            self.prefix_snaps.items[i].last_access = self.snap_access;
+        }
         return best;
     }
 
@@ -2262,12 +2317,22 @@ pub const Qwen38ServingModel = struct {
             }
         }
         if (self.prefix_snaps.items.len >= max) {
-            var oldest: usize = 0;
+            // Evict oldest-by-access, but never the largest entry: it is the
+            // one disk persistence backs, and losing it to small unrelated
+            // prompts turns every restart back into a full prefill. If every
+            // non-largest slot is somehow unavailable, fall back to plain LRU.
+            var oldest: ?usize = null;
+            var largest: usize = 0;
             for (self.prefix_snaps.items, 0..) |*s, i| {
-                if (s.last_access < self.prefix_snaps.items[oldest].last_access) oldest = i;
+                if (s.prompt_tokens.len > self.prefix_snaps.items[largest].prompt_tokens.len) largest = i;
             }
-            self.prefix_snaps.items[oldest].deinit(self.allocator);
-            _ = self.prefix_snaps.orderedRemove(oldest);
+            for (self.prefix_snaps.items, 0..) |*s, i| {
+                if (i == largest and self.prefix_snaps.items.len > 1) continue;
+                if (oldest == null or s.last_access < self.prefix_snaps.items[oldest.?].last_access) oldest = i;
+            }
+            const victim = oldest orelse largest;
+            self.prefix_snaps.items[victim].deinit(self.allocator);
+            _ = self.prefix_snaps.orderedRemove(victim);
         }
         const toks = try self.allocator.dupe(u32, ids);
         errdefer self.allocator.free(toks);
@@ -2742,11 +2807,48 @@ pub const Qwen38ServingModel = struct {
     ) anyerror!ForwardCoreOut {
         const ctx = self.ctx;
         const chunk = prefillChunkSize();
-        try self.reset();
-        var hidden_all: ?Array = null;
+        // Snapshot restore FIRST (before reset/chunking): a full-prefix hit
+        // skips everything; a partial hit restores state and continues
+        // chunking the suffix. Placing this after the chunked dispatch in
+        // CoreCont used to leave full-prompt snapshots unused — every chunk
+        // only ever saw its own 2048-token prefix snapshot.
+        var pos: usize = 0;
+        var prefix_hidden: ?Array = null;
+        var restored = false;
+        if (last_logits_only and prefixSnapMax() > 0 and !self.suppress_snapshot_restore) {
+            if (self.findPrefixSnapshot(ids)) |idx| {
+                const usable = capture != .all or self.prefix_snaps.items[idx].hidden_all != null;
+                if (usable) {
+                    const snap = &self.prefix_snaps.items[idx];
+                    const plen = snap.prompt_tokens.len;
+                    try self.restoreSnapshot(snap);
+                    self.snap_access += 1;
+                    self.prefix_snaps.items[idx].last_access = self.snap_access;
+                    restored = true;
+                    if (plen == ids.len) {
+                        std.log.info("[qwen38] prefix snapshot full hit ({d} tokens), skipping prefill", .{plen});
+                        const lg = try ops.copy(ctx, snap.logits);
+                        errdefer lg.deinit();
+                        try lg.eval();
+                        var hh: ?Array = null;
+                        if (capture == .all) {
+                            hh = try ops.copy(ctx, snap.hidden_all.?);
+                            try hh.?.eval();
+                        }
+                        return .{ .logits = lg, .hidden = hh };
+                    }
+                    std.log.info("[qwen38] prefix snapshot hit: {d}/{d} tokens cached, prefilling suffix", .{ plen, ids.len });
+                    pos = plen;
+                    if (capture == .all) {
+                        prefix_hidden = try ops.copy(ctx, snap.hidden_all.?);
+                    }
+                }
+            }
+        }
+        if (!restored) try self.reset();
+        var hidden_all: ?Array = prefix_hidden;
         errdefer if (hidden_all) |*ha| ha.deinit();
         var logits: ?Array = null;
-        var pos: usize = 0;
         while (pos < ids.len) {
             const end = @min(pos + chunk, ids.len);
             const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null, tap);
@@ -2765,6 +2867,14 @@ pub const Qwen38ServingModel = struct {
                 }
             }
             pos = end;
+        }
+        // The per-chunk CoreCont calls store only the FIRST chunk's snapshot
+        // (!continuation gate) — without this the full-prompt snapshot never
+        // exists and a repeat of a chunked long prompt reuses just one chunk
+        // (measured: 8.5k prompt re-prefilled 6.5k tokens every repeat).
+        if (ids.len > 1 and prefixSnapMax() > 0) {
+            self.storeSnapshot(ids, logits.?, if (capture == .all) hidden_all else null) catch |err|
+                std.log.warn("[qwen38] prefix snapshot store failed: {}", .{err});
         }
         return .{ .logits = logits.?, .hidden = hidden_all };
     }

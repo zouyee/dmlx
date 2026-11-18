@@ -35,6 +35,7 @@ const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
 const qwen38_dflash2 = @import("models/qwen38_dflash2.zig");
+const mkdir_c = @cImport(@cInclude("sys/stat.h"));
 const lora_merge = @import("models/lora_merge.zig");
 const qwen38_vit = @import("vision/qwen38_vit.zig");
 const qwen38_preprocess = @import("vision/qwen38_preprocess.zig");
@@ -657,6 +658,9 @@ pub const Qwen38VTableAdapter = struct {
     /// Predraft stash: next round's block tokens ([7] i32 GPU, built before
     /// the acceptance sync) + the round's verify argmax ([L] i32 GPU) +
     /// how many verify rows the tentative ring feed used.
+    /// Monotonic guard for df2_latest persistence (same rationale as the
+    /// backbone snapshot's single-slot largest-wins rule).
+    df2_last_persisted: usize = 0,
     df2_pending_tokens: ?Array = null,
     df2_pending_argmax: ?Array = null,
     df2_pending_rows: usize = 0,
@@ -918,6 +922,13 @@ pub const Qwen38VTableAdapter = struct {
         };
         self.df2_block_len = 0;
         self.df2_block_idx = 0;
+        if (self.model.snapshotDir()) |snap_dir| {
+            self.loadDf2Cache(snap_dir) catch |err| {
+                if (err != error.Df2NoRows and err != error.Df2NoTokens) {
+                    std.log.warn("Qwen3.8 DFlash2: persisted context load failed: {}", .{err});
+                }
+            };
+        }
         return true;
     }
 
@@ -1010,6 +1021,73 @@ pub const Qwen38VTableAdapter = struct {
         if (self.df2_ctx.?.rowsShadow()) |sh| {
             self.df2_cache_rows = try ops.copy(ctx, sh);
         }
+        // Persist alongside the backbone snapshot: on a fresh process the
+        // restored snapshot is only usable when the drafter context rows
+        // covering its prefix are also present (else dflash2Prefill
+        // suppresses the restore and repays the full prefill).
+        if (self.df2_cache_rows != null and ids.len >= 2048 and ids.len > self.df2_last_persisted) {
+            if (self.model.snapshotDir()) |dir| {
+                self.persistDf2Cache(dir, ids) catch |err| {
+                    std.log.warn("DFlash2 context persist failed: {}", .{err});
+                };
+                self.df2_last_persisted = ids.len;
+            }
+        }
+    }
+
+    fn persistDf2Cache(self: *Qwen38VTableAdapter, dir: []const u8, ids: []const u32) !void {
+        const mlx_io = @import("mlx").io;
+        var buf: [1024]u8 = undefined;
+        // mkdir -p
+        var i: usize = 0;
+        while (i <= dir.len) : (i += 1) {
+            if (i != dir.len and dir[i] != '/') continue;
+            if (i == 0) continue;
+            const part_z = self.allocator.dupeZ(u8, dir[0..i]) catch return;
+            defer self.allocator.free(part_z);
+            _ = mkdir_c.mkdir(part_z.ptr, 0o755);
+        }
+        const path = try std.fmt.bufPrint(&buf, "{s}/df2_latest.safetensors", .{dir});
+        var weights = std.StringHashMap(Array).init(self.allocator);
+        defer weights.deinit();
+        try weights.put("rows", self.df2_cache_rows.?);
+        const toks_i32 = try self.allocator.alloc(i32, ids.len);
+        defer self.allocator.free(toks_i32);
+        for (ids, 0..) |t, j| toks_i32[j] = @intCast(t);
+        const toks_arr = try Array.fromData(self.allocator, i32, toks_i32, &[_]i32{@intCast(toks_i32.len)});
+        defer toks_arr.deinit();
+        try toks_arr.eval();
+        try weights.put("tokens", toks_arr);
+        var metadata = std.StringHashMap([]const u8).init(self.allocator);
+        defer metadata.deinit();
+        try mlx_io.saveSafetensors(self.allocator, path, weights, metadata);
+    }
+
+    fn loadDf2Cache(self: *Qwen38VTableAdapter, dir: []const u8) !void {
+        const mlx_io = @import("mlx").io;
+        var buf: [1024]u8 = undefined;
+        const path = try std.fmt.bufPrint(&buf, "{s}/df2_latest.safetensors", .{dir});
+        var res = mlx_io.loadSafetensors(self.allocator, path) catch return;
+        defer res.deinit(self.allocator);
+        var rows_it = res.weights.fetchRemove("rows") orelse return error.Df2NoRows;
+        defer self.allocator.free(rows_it.key);
+        const toks_it = res.weights.fetchRemove("tokens") orelse {
+            rows_it.value.deinit();
+            return error.Df2NoTokens;
+        };
+        defer self.allocator.free(toks_it.key);
+        var toks = toks_it.value;
+        defer toks.deinit();
+        try toks.eval();
+        const slice = toks.dataSlice(i32) catch return error.Df2BadTokens;
+        if (slice.len == 0) return error.Df2Empty;
+        if (self.df2_cache_ids.len > 0) self.allocator.free(self.df2_cache_ids);
+        self.df2_cache_ids = try self.allocator.alloc(u32, slice.len);
+        for (slice, 0..) |t, j| self.df2_cache_ids[j] = @intCast(t);
+        if (self.df2_cache_rows) |r| r.deinit();
+        self.df2_cache_rows = rows_it.value;
+        self.df2_last_persisted = slice.len;
+        std.log.info("Qwen3.8 DFlash2: loaded persisted drafter context ({d} tokens)", .{slice.len});
     }
 
     /// Compute the round's draft block: one parallel forward over
