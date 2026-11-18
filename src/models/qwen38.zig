@@ -2602,10 +2602,27 @@ pub const Qwen38ServingModel = struct {
         }
 
         fn maybeCapture(self: *HiddenTap, ctx: EagerContext, layer: usize, h: Array) !void {
-            if (self.n >= self.ids.len) return;
-            if (self.ids[self.n] != layer) return; // ids must be increasing
-            self.rows[self.n] = try ops.copy(ctx, h);
-            self.n += 1;
+            // Locate the slot by layer number (ids are unique and
+            // increasing). Chunked prefill calls the core once per chunk and
+            // the layer sequence repeats each chunk, so slot 0 can fire
+            // again after slot ids.len-1 — locate by value, not by n.
+            var slot: usize = self.ids.len;
+            for (self.ids, 0..) |id, i| {
+                if (id == layer) {
+                    slot = i;
+                    break;
+                }
+            }
+            if (slot == self.ids.len) return;
+            if (self.rows[slot]) |prev| {
+                // Concatenate the per-chunk [1, chunk, hidden] rows in
+                // prompt order.
+                defer prev.deinit();
+                self.rows[slot] = try shape_mod.concatenateAxis(ctx, &[_]Array{ prev, h }, 1);
+            } else {
+                self.rows[slot] = try ops.copy(ctx, h);
+            }
+            if (slot >= self.n) self.n = slot + 1;
         }
 
         pub fn finish(self: *HiddenTap, ctx: EagerContext) !?Array {
@@ -2721,6 +2738,7 @@ pub const Qwen38ServingModel = struct {
         ids: []const u32,
         capture: HiddenCapture,
         last_logits_only: bool,
+        tap: ?*HiddenTap,
     ) anyerror!ForwardCoreOut {
         const ctx = self.ctx;
         const chunk = prefillChunkSize();
@@ -2731,7 +2749,7 @@ pub const Qwen38ServingModel = struct {
         var pos: usize = 0;
         while (pos < ids.len) {
             const end = @min(pos + chunk, ids.len);
-            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null, null);
+            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null, tap);
             // Only the last chunk's logits are wanted (they are the
             // last-position row either way).
             if (logits) |l| l.deinit();
@@ -2777,7 +2795,7 @@ pub const Qwen38ServingModel = struct {
             if (vision == null and chunk > 0 and ids.len > chunk and
                 (capture == .all or last_logits_only))
             {
-                return self.forwardChunkedPrefill(ids, capture, last_logits_only);
+                return self.forwardChunkedPrefill(ids, capture, last_logits_only, tap);
             }
             // Longest-prefix snapshot restore (text path). Capture .all is
             // the MTP drafter-priming path: it additionally needs per-position

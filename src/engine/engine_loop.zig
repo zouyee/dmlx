@@ -2448,6 +2448,10 @@ pub const EngineLoop = struct {
             std.log.info("[PREFILL_TRACE] mtp req={d} prompt={d} prefill_ms={d:.1}", .{ req.id, req.prompt_tokens.len, @as(f64, @floatFromInt(monotonicNs() - pf_t0)) / 1e6 });
         }
         var hidden = pf.hidden; // owned; reassigned per round
+        // Set when the draft-failure fallback frees `hidden` early (it owns
+        // the same Array as h_cur on first-step failure); guards the final
+        // `hidden.deinit()` after the round loop.
+        var hidden_freed = false;
 
         var t_next = req.sampler.sample(pf.logits, allocator) catch {
             pf.hidden.deinit();
@@ -2558,6 +2562,10 @@ pub const EngineLoop = struct {
                 draft_logits.deinit(allocator);
             }
             var h_cur = hidden;
+            // h_cur ALIASES hidden until the first successful draft step
+            // replaces it — the failure paths below must free it exactly once.
+            var h_cur_own = false;
+            var draft_err: ?anyerror = null;
             var tok = t_next.token;
             var draft_failed = false;
             const gpu_chain = greedy and mtp.draftGreedy != null and !topk_probe;
@@ -2584,13 +2592,15 @@ pub const EngineLoop = struct {
                 var cur = tok0; // borrowed (tok0, then the last gpu_toks item)
                 var steps: usize = 0;
                 for (0..n_round) |_| {
-                    const g = mtp.draftGreedy.?(self.model.ptr, h_cur, cur) catch {
+                    const g = mtp.draftGreedy.?(self.model.ptr, h_cur, cur) catch |e| {
+                        draft_err = e;
                         draft_failed = true;
                         break :blk;
                     };
                     if (steps > 0) h_cur.deinit(); // previous chained hidden
                     steps += 1;
                     h_cur = g.hidden;
+                    h_cur_own = true;
                     if (g.feat) |f| {
                         gpu_feats.append(allocator, f) catch {
                             f.deinit();
@@ -2637,12 +2647,14 @@ pub const EngineLoop = struct {
                     }
                 }
             } else for (0..n_round) |_| {
-                const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch {
+                const d_out = mtp.draft(self.model.ptr, h_cur, tok) catch |e| {
+                    draft_err = e;
                     draft_failed = true;
                     break;
                 };
                 if (drafts.items.len > 0) h_cur.deinit(); // previous chained hidden
                 h_cur = d_out.hidden;
+                h_cur_own = true;
                 const d = draft_sampler.sample(d_out.logits, allocator) catch {
                     d_out.logits.deinit();
                     draft_failed = true;
@@ -2667,8 +2679,11 @@ pub const EngineLoop = struct {
                 // decode steps. Backbone state was untouched by the aborted
                 // round (drafts only touch the drafter cache, which the next
                 // prefill resets), so plain continuation is exact.
-                std.log.warn("EngineLoop: MTP draft failed; finishing with plain decode", .{});
-                hidden.deinit();
+                std.log.warn("EngineLoop: MTP draft failed ({?}); finishing with plain decode", .{draft_err});
+                // h_cur still aliases hidden when no draft step succeeded —
+                // it was just freed above; only free a distinct chain array.
+                if (h_cur_own) hidden.deinit();
+                hidden_freed = true;
                 while (total_generated < gen_config.max_tokens and !stopped) {
                     if (req.isCancelled()) break;
                     const arr = array_mod.Array.fromData(allocator, u32, &[_]u32{t_next.token}, &[_]i32{ 1, 1 }) catch break;
@@ -2982,7 +2997,9 @@ pub const EngineLoop = struct {
                 }
             }
         }
-        hidden.deinit();
+        // The draft-failure fallback already freed `hidden` (it breaks out
+        // of the loop below); every other exit path still owns it.
+        if (!hidden_freed) hidden.deinit();
 
         if (drafts_proposed > 0) {
             metrics_mod.global.addMtpDrafts(@intCast(drafts_proposed), @intCast(drafts_accepted));
