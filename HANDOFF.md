@@ -2422,9 +2422,24 @@ order: KV ring (draft rounds became context-length independent),
 4-bit drafter weights (draft 30→25 ms, acceptance unchanged), drafter
 context prefix cache (TTFT 12.5 s → 0.15 s).
 
+Verify decomposition (2026-11-18): ~93 ms/round = 68 ms HOST building
+48 GDN layers' verify graphs + 19 ms GPU. The next real lever is a
+compiled GDN verify closure (one graph, weights as inputs, per the MTP
+compiled-step precedent) — potentially verify -> ~30 ms. Predraft
+machinery is implemented (tentative ring feed, adopt/discard) but
+opt-in (DMLX_DF2_PREDRAFT=1): conditioned on all-accepted, adoption is
+too rare at ~40% draft acceptance to pay for the build; a
+depth-controller-predicted acceptance target could make it profitable.
+
+PRE-EXISTING BUG FOUND (main branch, not dflash2): bare temp-0 decode
+is nondeterministic across requests on one server — outputs alternate
+between two exact trajectories sharing a ~778-char prefix (fibonacci
+prompt, no snapshots). Parity checks must compare against the
+trajectory SET, not a single baseline.
+
 Remaining gaps / follow-ups:
-- Verify round is ~93 ms (73% of round time). Predraft/overlap and
-  verify kernel work are the next levers for multi-turn/prose.
+- Compiled GDN verify (host-bound 68 ms) is the big one; then verify
+  kernel work.
 - Sampled drafting (temp > 0) not wired; vision prefill unsupported.
 - pi-adapted LoRA (harness-hub/Qwen3.8-27B-pi-adapted, r=32) would
   need load-time merge into the 4-bit backbone (dequantize → merge →
