@@ -663,6 +663,66 @@ pub fn selectGreedy(
 }
 
 // ---------------------------------------------------------------------------
+// Draft context store (Task 7)
+// ---------------------------------------------------------------------------
+
+/// Committed-token context for the drafter: raw tap rows ([., 5*H] each)
+/// appended as the backbone commits tokens. The draft forward truncates to
+/// the newest `sliding_window - 1` rows (reference: keep_ctx in
+/// DFlashAttention). Row i of the store conditions on backbone token i, so
+/// rows are only ever appended (accepted tokens) — never rolled back.
+pub const DFlash2Context = struct {
+    allocator: std.mem.Allocator,
+    ctx: EagerContext,
+    cfg: *const DFlash2Config,
+    rows: ?Array = null, // [1, T, 5*H] bf16
+    len: i64 = 0,
+
+    pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, cfg: *const DFlash2Config) DFlash2Context {
+        return .{ .allocator = allocator, .ctx = ctx, .cfg = cfg };
+    }
+
+    pub fn reset(self: *DFlash2Context) void {
+        if (self.rows) |r| r.deinit();
+        self.rows = null;
+        self.len = 0;
+    }
+
+    /// Append tap rows for newly committed tokens. tap_hidden: [1, k, 5*H].
+    pub fn observe(self: *DFlash2Context, tap_hidden: Array) !void {
+        const k = tap_hidden.shape()[1];
+        if (k == 0) return;
+        if (self.rows) |old| {
+            const merged = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ old, tap_hidden }, 1);
+            old.deinit();
+            self.rows = merged;
+        } else {
+            self.rows = try ops.copy(self.ctx, tap_hidden);
+        }
+        self.len += k;
+    }
+
+    /// Windowed context view for the next draft round (newest rows first
+    /// dropped). Returns a fresh array the caller owns; null when empty.
+    pub fn windowed(self: *DFlash2Context) !?Array {
+        const all = self.rows orelse return null;
+        const keep: i64 = @as(i64, @intCast(self.cfg.sliding_window)) - 1;
+        if (self.len <= keep) {
+            const out = try ops.copy(self.ctx, all);
+            return out;
+        }
+        const start: i32 = @intCast(self.len - keep);
+        const total: i32 = @intCast(self.len);
+        const out = try ops.slice(self.ctx, all, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(5 * self.cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+        return out;
+    }
+
+    pub fn deinit(self: *DFlash2Context) void {
+        self.reset();
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1019,6 +1079,76 @@ test "DFlash2 full block draft + greedy selector match golden trace" {
         try std.testing.expectEqual(@as(u32, @intCast(exp)), got);
     }
     // The strict end-to-end criterion: identical greedy token sequence.
+}
+
+test "DFlash2Context: observe, window truncation, split-vs-oneshot determinism" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const cfg = try testCfgFromMeta(meta);
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    defer m.deinit();
+    const embed_w = try index.loadTensor("embed_tokens.weight");
+    defer embed_w.deinit();
+
+    const ctx_hidden = try loadTraceTensor(allocator, "ctx_hidden");
+    defer ctx_hidden.deinit(); // [1, 13, 5H]
+    const block_ids_t = try loadTraceTensor(allocator, "block_ids");
+    defer block_ids_t.deinit();
+    const block_ids = try ops.reshape(ctx, block_ids_t, &[_]i32{@intCast(cfg.block_size)});
+    defer block_ids.deinit();
+    const block_ids_i32 = try ops.astype(ctx, block_ids, .int32);
+    defer block_ids_i32.deinit();
+
+    // One-shot: observe all 13 rows at once.
+    var c1 = DFlash2Context.init(allocator, ctx, &cfg);
+    defer c1.deinit();
+    try c1.observe(ctx_hidden);
+    try std.testing.expectEqual(@as(i64, 13), c1.len);
+
+    // Split: 5 + 8 rows.
+    var c2 = DFlash2Context.init(allocator, ctx, &cfg);
+    defer c2.deinit();
+    const part1 = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 5, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+    defer part1.deinit();
+    const part2 = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 5, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+    defer part2.deinit();
+    try c2.observe(part1);
+    try c2.observe(part2);
+    try std.testing.expectEqual(@as(i64, 13), c2.len);
+
+    // Determinism: identical draft hidden from both stores.
+    const w1 = (try c1.windowed()).?;
+    defer w1.deinit();
+    const w2 = (try c2.windowed()).?;
+    defer w2.deinit();
+    const h1 = try blockHidden(ctx, &m, embed_w, block_ids_i32, w1);
+    defer h1.deinit();
+    const h2 = try blockHidden(ctx, &m, embed_w, block_ids_i32, w2);
+    defer h2.deinit();
+    try std.testing.expect(try maxAbsDiff(ctx, h1, h2) == 0.0);
+
+    // Truncation: window keeps the newest sliding_window-1 rows.
+    var cfg_big = cfg;
+    cfg_big.sliding_window = 6; // keep 5
+    var c3 = DFlash2Context.init(allocator, ctx, &cfg_big);
+    defer c3.deinit();
+    try c3.observe(ctx_hidden);
+    const w3 = (try c3.windowed()).?;
+    defer w3.deinit();
+    try std.testing.expectEqual(@as(i32, 5), w3.shape()[1]);
+    const tail = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 8, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+    defer tail.deinit();
+    try std.testing.expect(try maxAbsDiff(ctx, w3, tail) == 0.0);
 }
 
 fn testCfgFromMeta(meta: std.json.Parsed(std.json.Value)) !DFlash2Config {
