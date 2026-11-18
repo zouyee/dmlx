@@ -17,6 +17,7 @@ const activations = @import("mlx").activations;
 const quantize_mod = @import("mlx").quantize;
 const creation_mod = @import("mlx").creation;
 const eval_mod = @import("mlx").eval;
+const reduce_mod = @import("mlx").reduce;
 const glm53 = @import("glm53.zig");
 const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
@@ -2476,7 +2477,7 @@ pub const Qwen38ServingModel = struct {
         var mr = try buildMropeCosSin(allocator, cfg, &mres, ids.len);
         defer mr.deinit();
 
-        const res = try self.forwardTokensCoreCont(ids, capture, true, false, .{ .emb = emb, .mrope = mr });
+        const res = try self.forwardTokensCoreCont(ids, capture, true, false, .{ .emb = emb, .mrope = mr }, null);
         // Only after the reset inside the prefill: decode/verify offsets
         // shift by the delta from here on.
         self.setRopeDelta(mres.rope_delta);
@@ -2538,7 +2539,7 @@ pub const Qwen38ServingModel = struct {
         var mr = try buildMropeCosSin(allocator, cfg, &mres_suffix, suffix.len);
         defer mr.deinit();
 
-        return self.forwardTokensCoreCont(suffix, capture, true, true, .{ .emb = emb, .mrope = mr });
+        return self.forwardTokensCoreCont(suffix, capture, true, true, .{ .emb = emb, .mrope = mr }, null);
     }
 
     /// forwardTokensWithVision with hidden-state capture (oracle bisection):
@@ -2582,6 +2583,48 @@ pub const Qwen38ServingModel = struct {
     }
 
     pub const HiddenCapture = enum { none, last, all };
+
+    /// DFlash2 conditioning taps: copies of the post-layer hidden state at
+    /// the given layer ids (increasing, <= 5 entries). `finish` concatenates
+    /// along the feature axis -> [1, L, n*hidden] bf16, the layout the
+    /// DFlash2 drafter's fc consumes.
+    pub const HiddenTap = struct {
+        ids: []const usize,
+        rows: [5]?Array = .{ null, null, null, null, null },
+        n: usize = 0,
+
+        pub fn init(ids: []const usize) HiddenTap {
+            std.debug.assert(ids.len <= 5);
+            return .{ .ids = ids };
+        }
+
+        fn maybeCapture(self: *HiddenTap, ctx: EagerContext, layer: usize, h: Array) !void {
+            if (self.n >= self.ids.len) return;
+            if (self.ids[self.n] != layer) return; // ids must be increasing
+            self.rows[self.n] = try ops.copy(ctx, h);
+            self.n += 1;
+        }
+
+        pub fn finish(self: *HiddenTap, ctx: EagerContext) !?Array {
+            if (self.n == 0) return null;
+            var parts: [5]Array = undefined;
+            for (self.rows[0..self.n], 0..) |r, i| parts[i] = r.?;
+            const cat = try shape_mod.concatenateAxis(ctx, parts[0..self.n], 2);
+            self.deinit();
+            return cat;
+        }
+
+        pub fn deinit(self: *HiddenTap) void {
+            for (&self.rows) |*r| {
+                if (r.*) |x| x.deinit();
+                r.* = null;
+            }
+            self.n = 0;
+        }
+    };
+
+    /// DFlash2 checkpoint conditioning layers (z-lab/Qwen3.8-27B-DFlash2).
+    pub const dflash2_tap_layer_ids = [5]usize{ 5, 19, 33, 47, 61 };
     pub const ForwardCoreOut = struct { logits: Array, hidden: ?Array };
 
     /// Vision prefill extras: merged embeddings (image features already
@@ -2620,7 +2663,7 @@ pub const Qwen38ServingModel = struct {
         capture: HiddenCapture,
         last_logits_only: bool,
     ) !ForwardCoreOut {
-        return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null);
+        return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null, null);
     }
 
     var cached_prefill_chunk: ?usize = null;
@@ -2665,7 +2708,7 @@ pub const Qwen38ServingModel = struct {
         var pos: usize = 0;
         while (pos < ids.len) {
             const end = @min(pos + chunk, ids.len);
-            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null);
+            const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null, null);
             // Only the last chunk's logits are wanted (they are the
             // last-position row either way).
             if (logits) |l| l.deinit();
@@ -2692,6 +2735,7 @@ pub const Qwen38ServingModel = struct {
         last_logits_only: bool,
         continuation: bool,
         vision: ?VisionPrefill,
+        tap: ?*HiddenTap,
     ) anyerror!ForwardCoreOut {
         const allocator = self.allocator;
         const cfg = self.cfg;
@@ -2715,7 +2759,10 @@ pub const Qwen38ServingModel = struct {
             // Longest-prefix snapshot restore (text path). Capture .all is
             // the MTP drafter-priming path: it additionally needs per-position
             // hidden rows, so it can only use snapshots that stored them.
-            if (vision == null and last_logits_only and prefixSnapMax() > 0) {
+            // Tap capture (DFlash2) bypasses snapshots: stored snapshots
+            // have no tap rows, and a suffix-only prefill would leave the
+            // drafter context incomplete.
+            if (vision == null and last_logits_only and prefixSnapMax() > 0 and tap == null) {
                 if (self.findPrefixSnapshot(ids)) |idx| {
                     const usable = capture != .all or self.prefix_snaps.items[idx].hidden_all != null;
                     if (usable) {
@@ -2737,7 +2784,7 @@ pub const Qwen38ServingModel = struct {
                             return .{ .logits = lg, .hidden = hh };
                         }
                         std.log.info("[qwen38] prefix snapshot hit: {d}/{d} tokens cached, prefilling suffix", .{ plen, ids.len });
-                        const res = try self.forwardTokensCoreCont(ids[plen..], capture, last_logits_only, true, null);
+                        const res = try self.forwardTokensCoreCont(ids[plen..], capture, last_logits_only, true, null, tap);
                         var out = res;
                         if (capture == .all) {
                             // Reassemble full-prompt hidden rows: stored
@@ -2891,6 +2938,7 @@ pub const Qwen38ServingModel = struct {
                     .attn => layer_prof_attn_ns += dt,
                 }
             }
+            if (tap) |t| try t.maybeCapture(ctx, layer, h);
         }
         if (lp_on) {
             const ms = struct {
@@ -2970,10 +3018,13 @@ pub const Qwen38VerifyOut = struct {
     gdn_layers: []usize,
     attn_old_lens: []i32,
     attn_layers: []usize,
+    /// DFlash2 tap rows [1, L, 5*hidden] bf16 when a HiddenTap was passed.
+    tap_hidden: ?Array = null,
 
     pub fn deinit(self: *Qwen38VerifyOut, allocator: std.mem.Allocator) void {
         self.logits.deinit();
         self.hidden_pre_norm_all.deinit();
+        if (self.tap_hidden) |t| t.deinit();
         for (self.gdn) |*r| r.deinit(allocator);
         allocator.free(self.gdn);
         allocator.free(self.gdn_layers);
@@ -2988,7 +3039,7 @@ pub const Qwen38VerifyOut = struct {
 /// (per-position states retained, caches untouched); attention layers append
 /// normally (rollback truncates len_). Returns per-position logits and the
 /// pre-final-norm hidden states needed by the MTP head.
-pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38VerifyOut {
+pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32, tap: ?*Qwen38ServingModel.HiddenTap) !Qwen38VerifyOut {
     const allocator = self.allocator;
     const cfg = self.cfg;
     const ctx = self.ctx;
@@ -3126,6 +3177,7 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
             h.deinit();
             h = next;
         }
+        if (tap) |t| try t.maybeCapture(ctx, layer, h);
         // Partial-graph flush every 8 layers (omlx `_FLUSH_LAYERS`): submits
         // the prefix so the GPU starts while the host builds the rest.
         // MEASURED NEUTRAL here (2026-11-02, opt-in via DMLX_VERIFY_FLUSH=1):
@@ -3168,9 +3220,15 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32) !Qwen38Ver
         }
     }
 
+    var tap_hidden: ?Array = null;
+    if (tap) |t| {
+        errdefer t.deinit();
+        tap_hidden = try t.finish(ctx);
+    }
     return .{
         .logits = logits,
         .hidden_pre_norm_all = hidden_pre_norm_all,
+        .tap_hidden = tap_hidden,
         .gdn = try gdn_results.toOwnedSlice(allocator),
         .gdn_layers = try gdn_layers.toOwnedSlice(allocator),
         .attn_old_lens = try attn_old_lens.toOwnedSlice(allocator),
@@ -3674,8 +3732,48 @@ test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
     const l_ref = try ref.forwardTokens(&[_]u32{ 1, 2, 3, 4, 5 });
     defer l_ref.deinit();
 
-    var v = try forwardVerifyImpl(&model, &[_]u32{ 4, 5 });
+    var v = try forwardVerifyImpl(&model, &[_]u32{ 4, 5 }, null);
     defer v.deinit(allocator);
+
+    // HiddenTap: with ids {0,1} on this 2-layer toy model the tap must
+    // produce [1, L, 2*hidden], and the layer-1 half must equal
+    // hidden_pre_norm_all exactly (same tensor, same op path).
+    {
+        var model_t = try mkModel(allocator, ctx, &cfg);
+        defer {
+            model_t.deinit();
+            var it = model_t.weights.iterator();
+            while (it.next()) |e| {
+                allocator.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            model_t.weights.deinit();
+        }
+        const lt = try model_t.forwardTokens(&[_]u32{ 1, 2, 3 });
+        lt.deinit();
+        const tap_ids = [2]usize{ 0, 1 };
+        var tap = Qwen38ServingModel.HiddenTap.init(&tap_ids);
+        var vt = try forwardVerifyImpl(&model_t, &[_]u32{ 4, 5 }, &tap);
+        defer vt.deinit(allocator);
+        const th = vt.tap_hidden.?;
+        const ts = th.shape();
+        try std.testing.expectEqual(@as(i32, 2), ts[1]);
+        try std.testing.expectEqual(@as(i32, 128), ts[2]);
+        const l1_half = try ops.slice(ctx, th, &[_]i32{ 0, 0, 64 }, &[_]i32{ 1, 2, 128 }, &[_]i32{ 1, 1, 1 });
+        defer l1_half.deinit();
+        const a_f32 = try ops.astype(ctx, l1_half, .float32);
+        defer a_f32.deinit();
+        const b_f32 = try ops.astype(ctx, vt.hidden_pre_norm_all, .float32);
+        defer b_f32.deinit();
+        const ad = try ops.subtract(ctx, a_f32, b_f32);
+        defer ad.deinit();
+        const aad = try ops.abs(ctx, ad);
+        defer aad.deinit();
+        const mx = try reduce_mod.max(ctx, aad, false);
+        defer mx.deinit();
+        try mx.eval();
+        try std.testing.expect(try mx.item(f32) == 0.0);
+    }
     const vshape = v.logits.shape();
     try std.testing.expectEqual(@as(i32, 2), vshape[1]);
     try std.testing.expectEqual(@as(i32, 64), vshape[2]);
@@ -3760,7 +3858,7 @@ test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
     lr0.deinit();
     const lr_ref0 = try ref_r.forwardTokens(&[_]u32{ 1, 2, 3 });
     lr_ref0.deinit();
-    var v2 = try forwardVerifyImpl(&model_r, &[_]u32{ 4, 5 });
+    var v2 = try forwardVerifyImpl(&model_r, &[_]u32{ 4, 5 }, null);
     defer v2.deinit(allocator);
     rollbackVerify(&model_r, &v2);
     const l_r = try model_r.forwardTokens(&[_]u32{4});

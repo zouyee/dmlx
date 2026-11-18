@@ -1006,7 +1006,7 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
         errdefer self.allocator.destroy(box);
-        box.* = try qwen38.forwardVerifyImpl(self.model, ids);
+        box.* = try qwen38.forwardVerifyImpl(self.model, ids, null);
         return box;
     }
 
