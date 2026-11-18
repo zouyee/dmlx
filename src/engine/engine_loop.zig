@@ -19,6 +19,7 @@ const array_mod = @import("mlx").array;
 const array_arena_mod = @import("mlx").array_arena;
 const shape_mod = @import("mlx").shape;
 const generation_mod = @import("../generation.zig");
+const accept_gpu = @import("accept_gpu.zig");
 const kvcache = @import("../kvcache.zig");
 const request_state = @import("request_state.zig");
 const request_queue = @import("request_queue.zig");
@@ -2783,18 +2784,69 @@ pub const EngineLoop = struct {
             var k: usize = 0; // accepted drafts
             var rejected = false;
             var stop_in_drafts = false;
+            // GPU acceptance verdict (temp>0 fast path): one kernel launch
+            // computes every position's min(1, p/q) and the first rejection,
+            // replacing the L per-row CPU softmaxes + round-trips. On any
+            // setup failure `gpu_k` stays null and the CPU loop below runs
+            // unchanged.
+            var gpu_k: ?usize = null;
+            if (!greedy and accept_gpu.enabled() and draft_logits.items.len == drafts.items.len and drafts.items.len > 0) blk: {
+                const l = drafts.items.len;
+                var target_rows = std.ArrayList(Array).empty;
+                defer {
+                    for (target_rows.items) |*tr| tr.deinit();
+                    target_rows.deinit(allocator);
+                }
+                for (0..l + 1) |i| {
+                    const row = mtp.verifyLogits(self.model.ptr, vh, i) catch break :blk;
+                    target_rows.append(allocator, row) catch {
+                        row.deinit();
+                        break :blk;
+                    };
+                }
+                if (target_rows.items.len != l + 1) break :blk;
+                const uniforms = allocator.alloc(f32, l) catch break :blk;
+                defer allocator.free(uniforms);
+                for (uniforms) |*u| u.* = req.sampler.prng.random().float(f32);
+                const res = accept_gpu.compute(
+                    allocator,
+                    self.ctx,
+                    target_rows.items,
+                    draft_logits.items,
+                    drafts.items,
+                    uniforms,
+                    req.sampler.temperature,
+                ) catch break :blk;
+                if (res.used) gpu_k = res.k;
+                if (std.c.getenv("DMLX_ACCEPT_DEBUG") != null) {
+                    for (0..@min(l, 2)) |i| {
+                        const cpu_a = mtpAcceptProb(target_rows.items[i], draft_logits.items[i], drafts.items[i], req.sampler.temperature, allocator) catch continue;
+                        const ti = drafts.items[i];
+                        const tr = target_rows.items[i].dataSlice(f32) catch continue;
+                        const qr = draft_logits.items[i].dataSlice(f32) catch continue;
+                        var tmax: f32 = -1e30;
+                        for (tr) |x| tmax = @max(tmax, x);
+                        const qmax = qmax: {
+                            var qm: f32 = -1e30;
+                            for (qr) |x| qm = @max(qm, x);
+                            break :qmax qm;
+                        };
+                        std.log.warn("accept dbg pos={d} tok={d} cpu_a={d:.4} gpu_k={?d} t_tok={d:.3} q_tok={d:.3} t_max={d:.3} q_max={d:.3}", .{ i, ti, cpu_a, gpu_k, tr[ti], qr[ti], tmax, qmax });
+                    }
+                }
+            }
             // temp>0 acceptance: pre-pull ALL verify rows (0..drafts.len
             // inclusive — the last row is the bonus/resample row) and the
             // draft logits with ONE asyncEval. The per-row reads below are
             // then sync-free; before this, every row stalled the pipeline,
             // which is why low-acceptance rounds cost ~2x steady rounds at
-            // long context.
+            // long context. Skipped entirely when the GPU verdict landed.
             var verify_rows = std.ArrayList(Array).empty;
             defer {
                 for (verify_rows.items) |*vr| vr.deinit();
                 verify_rows.deinit(allocator);
             }
-            if (!greedy) blk: {
+            if (!greedy and gpu_k == null) blk: {
                 for (0..drafts.items.len + 1) |i| {
                     const row = mtp.verifyLogits(self.model.ptr, vh, i) catch break :blk;
                     verify_rows.append(allocator, row) catch {
@@ -2813,7 +2865,20 @@ pub const EngineLoop = struct {
                 }
             }
             const rows_ready = verify_rows.items.len == drafts.items.len + 1;
+            if (gpu_k) |gk| {
+                // GPU verdict: acceptance decided in one kernel launch; only
+                // the stop-token scan runs on the host.
+                k = gk;
+                rejected = k < drafts.items.len;
+                for (drafts.items[0..k]) |d| {
+                    if (generation_mod.isStopToken(d, gen_config.stop_tokens)) {
+                        stop_in_drafts = true;
+                        break;
+                    }
+                }
+            }
             for (0..drafts.items.len) |i| {
+                if (gpu_k != null) break;
                 if (greedy and greedy_tokens.len > i) {
                     // Batched-argmax path: no per-row logits pull.
                     if (@as(u32, @intCast(greedy_tokens[i])) != drafts.items[i]) {
