@@ -9,6 +9,7 @@
 const std = @import("std");
 const c = @import("mlx").c;
 const ops = @import("mlx").ops;
+const shape_mod = @import("mlx").shape;
 const reduce_mod = @import("mlx").reduce;
 const fast_mod = @import("mlx").fast;
 const kvcache = @import("kvcache.zig");
@@ -33,6 +34,7 @@ const glm53 = @import("models/glm53.zig");
 const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
+const qwen38_dflash2 = @import("models/qwen38_dflash2.zig");
 const qwen38_vit = @import("vision/qwen38_vit.zig");
 const qwen38_preprocess = @import("vision/qwen38_preprocess.zig");
 const pthread = @cImport(@cInclude("pthread.h"));
@@ -630,6 +632,16 @@ pub const Qwen38VTableAdapter = struct {
     /// Drafter KV length before the current round's draft chain; null when
     /// no round is active (set on the round's first draft call).
     mtp_round_old_len: ?i32 = null,
+    /// DFlash2 block-parallel drafter (loaded when DMLX_QWEN38_DFLASH2_DIR is
+    /// set at enable time). Shares the MTP verify/commit plumbing; the ops
+    /// below branch on `dflash2 != null`.
+    dflash2: ?*qwen38_dflash2.DFlash2 = null,
+    df2_ctx: ?qwen38_dflash2.DFlash2Context = null,
+    /// Current round's drafted block: computed lazily on the first draft
+    /// call of a round, handed out one token per call.
+    df2_block: [7]u32 = undefined,
+    df2_block_len: usize = 0,
+    df2_block_idx: usize = 0,
     /// `DMLX_MTP_CHAIN_DUMP=1`: per-step drafter KV length trace (plan
     /// 2026-10-29-catch-omlx-mtp Task 1). Read once per process; the RoPE
     /// offset of every head forward equals cache.len() before its append,
@@ -807,6 +819,9 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (std.c.getenv("DMLX_QWEN38_DFLASH2_DIR")) |d| {
+            return self.dflash2Enable(std.mem.span(d));
+        }
         self.mtp_ops.num_drafts = num_drafts;
         if (self.mtp != null) return true;
         const dir = blk: {
@@ -857,10 +872,127 @@ pub const Qwen38VTableAdapter = struct {
         return ops.astype(ctx, nf, .bfloat16);
     }
 
+    /// DFlash2 enable: load the block drafter and force num_drafts to the
+    /// checkpoint's block_size - 1 (7). The engine's depth controller may
+    /// still verify a shorter prefix per round.
+    fn dflash2Enable(self: *Qwen38VTableAdapter, dir: []const u8) anyerror!bool {
+        self.mtp_ops.num_drafts = 7;
+        if (self.dflash2 != null) return true;
+        std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
+        const m = try self.allocator.create(qwen38_dflash2.DFlash2);
+        errdefer self.allocator.destroy(m);
+        m.* = qwen38_dflash2.DFlash2.load(self.allocator, self.model.ctx, dir) catch |err| {
+            std.log.warn("Qwen3.8 DFlash2 drafter load failed at {s} ({})", .{ dir, err });
+            self.allocator.destroy(m);
+            return false;
+        };
+        self.dflash2 = m;
+        self.df2_ctx = qwen38_dflash2.DFlash2Context.init(self.allocator, self.model.ctx, m);
+        self.df2_block_len = 0;
+        self.df2_block_idx = 0;
+        return true;
+    }
+
+    /// DFlash2 prefill: backbone prefill with hidden taps; the tap rows
+    /// (projected at observe time) seed the drafter context. Returns the
+    /// same last-logits/last-hidden contract as mtpPrefill.
+    fn dflash2Prefill(self: *Qwen38VTableAdapter, ids: []const u32) anyerror!generation.MtpStepOut {
+        self.df2_block_len = 0;
+        self.df2_block_idx = 0;
+        self.df2_ctx.?.reset();
+        var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
+        errdefer tap.deinit();
+        const res = try self.model.forwardTokensCoreTap(ids, .all, true, &tap);
+        defer res.logits.deinit();
+        defer res.hidden.?.deinit();
+        if (try tap.finish(self.model.ctx)) |rows| {
+            defer rows.deinit();
+            try self.df2_ctx.?.observe(rows);
+        }
+        const ctx = self.model.ctx;
+        const lshape = res.logits.shape();
+        const vocab: i32 = lshape[2];
+        const flat = try ops.reshape(ctx, res.logits, &[_]i32{vocab});
+        defer flat.deinit();
+        const logits = try ops.astype(ctx, flat, .float32);
+        errdefer logits.deinit();
+        const hidden_dim: i32 = res.hidden.?.shape()[2];
+        const L: i32 = res.hidden.?.shape()[1];
+        const hrow = try ops.slice(ctx, res.hidden.?, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden_dim }, &[_]i32{ 1, 1, 1 });
+        defer hrow.deinit();
+        const hflat = try ops.reshape(ctx, hrow, &[_]i32{ 1, hidden_dim });
+        defer hflat.deinit();
+        const hidden = try ops.copy(ctx, hflat);
+        return .{ .logits = logits, .hidden = hidden };
+    }
+
+    /// Compute the round's draft block: one parallel forward over
+    /// [anchor, mask x 7], then the greedy candidate selector chain.
+    fn dflash2ComputeBlock(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!void {
+        const m = self.dflash2.?;
+        const ctx = self.model.ctx;
+        const P: i32 = @intCast(m.cfg.block_size - 1);
+        const H: i32 = @intCast(m.cfg.hidden_size);
+
+        const mask_ids = try self.allocator.alloc(i32, @intCast(P));
+        defer self.allocator.free(mask_ids);
+        for (mask_ids) |*t| t.* = @intCast(m.cfg.mask_token_id);
+        const mask_arr = try Array.fromData(self.allocator, i32, mask_ids, &[_]i32{P});
+        defer mask_arr.deinit();
+        const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
+        defer block_ids.deinit();
+
+        const w = (try self.df2_ctx.?.windowed()) orelse return error.DFlash2EmptyContext;
+        defer w.deinit();
+        const hidden_full = try qwen38_dflash2.blockHiddenProjected(ctx, m, self.model.embed_table_bf16.?, block_ids, w);
+        defer hidden_full.deinit();
+        const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+        defer draft_hidden.deinit();
+        const lm = self.mtpLmHead();
+        const logits = try lm.apply(ctx, draft_hidden);
+        defer logits.deinit();
+
+        try tok_gpu.eval();
+        const anchor_slice = try tok_gpu.dataSlice(i32);
+        var tokens: [7]u32 = undefined;
+        try qwen38_dflash2.selectGreedy(ctx, m, draft_hidden, logits, @intCast(anchor_slice[0]), &tokens);
+        self.df2_block = tokens;
+        self.df2_block_len = tokens.len;
+        self.df2_block_idx = 0;
+    }
+
+    fn dflash2DraftGreedy(self: *Qwen38VTableAdapter, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
+        if (self.df2_block_idx >= self.df2_block_len) {
+            try self.dflash2ComputeBlock(tok_gpu);
+        }
+        const tok = self.df2_block[self.df2_block_idx];
+        self.df2_block_idx += 1;
+        const t = try Array.fromData(self.allocator, i32, &[_]i32{@intCast(tok)}, &[_]i32{1});
+        errdefer t.deinit();
+        // Hidden is passed through: the drafter conditions on the tap
+        // context, not on a chained hidden, so the engine's h_cur is unused.
+        const h = try ops.copy(self.model.ctx, hidden);
+        return .{ .tok_gpu = t, .hidden = h };
+    }
+
+    fn dflash2Commit(self: *Qwen38VTableAdapter, v: *qwen38.Qwen38VerifyOut, accepted: usize) void {
+        qwen38.commitVerify(self.model, v, accepted);
+        const ctx = self.model.ctx;
+        if (v.tap_hidden) |th| {
+            const width: i32 = th.shape()[2];
+            const rows = ops.slice(ctx, th, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @intCast(accepted), width }, &[_]i32{ 1, 1, 1 }) catch return;
+            defer rows.deinit();
+            self.df2_ctx.?.observe(rows) catch return;
+        }
+        self.df2_block_len = 0;
+        self.df2_block_idx = 0;
+    }
+
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 != null) return self.dflash2Prefill(ids);
         const m = self.mtp.?;
         // Backbone: normal prefill path (reset + fused recurrence — NO
         // per-position state retention; verify-mode would pin L x 3.1 MB x 48
@@ -967,6 +1099,10 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 != null) {
+            std.log.warn("DFlash2: sampled (temp>0) drafting is not wired; greedy only", .{});
+            return error.DFlash2GreedyOnly;
+        }
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
@@ -988,6 +1124,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 != null) return self.dflash2DraftGreedy(hidden, tok_gpu);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
             self.mtp_round_old_len = m.cache.len();
@@ -1006,6 +1143,12 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
         errdefer self.allocator.destroy(box);
+        if (self.dflash2 != null) {
+            var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
+            errdefer tap.deinit();
+            box.* = try qwen38.forwardVerifyImpl(self.model, ids, &tap);
+            return box;
+        }
         box.* = try qwen38.forwardVerifyImpl(self.model, ids, null);
         return box;
     }
@@ -1060,6 +1203,10 @@ pub const Qwen38VTableAdapter = struct {
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        if (self.dflash2 != null) {
+            self.dflash2Commit(v, accepted);
+            return;
+        }
         qwen38.commitVerify(self.model, v, accepted);
         // Drafter cache, mlx-vlm accept_verified_tokens semantics: drop every
         // drafted chain entry except t_next (whose input was already the
@@ -1149,6 +1296,13 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         qwen38.rollbackVerify(self.model, v);
+        if (self.dflash2 != null) {
+            // Context rows are only appended on commit, so a rollback needs
+            // no drafter-side undo — just drop the round's draft block.
+            self.df2_block_len = 0;
+            self.df2_block_idx = 0;
+            return;
+        }
         const m = self.mtp.?;
         m.cache.len_ = self.mtp_round_old_len.?;
         self.mtp_round_old_len = null;
@@ -1166,6 +1320,11 @@ pub const Qwen38VTableAdapter = struct {
 
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        if (self.df2_ctx) |*cx| cx.deinit();
+        if (self.dflash2) |m| {
+            m.deinit();
+            allocator.destroy(m);
+        }
         if (self.mtp) |m| {
             m.deinit();
             allocator.destroy(m);

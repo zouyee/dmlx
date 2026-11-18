@@ -266,11 +266,22 @@ pub const DFlash2 = struct {
     }
 
     /// Load from a checkpoint directory (config.json + safetensors).
-    pub fn load(allocator: std.mem.Allocator, io: std.Io, ctx: EagerContext, model_dir: []const u8) !DFlash2 {
+    pub fn load(allocator: std.mem.Allocator, ctx: EagerContext, model_dir: []const u8) !DFlash2 {
         const cfg_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
         defer allocator.free(cfg_path);
-        const cfg_raw = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, allocator, .limited(64 * 1024));
-        defer allocator.free(cfg_raw);
+        const posix = @cImport({
+            @cInclude("fcntl.h");
+            @cInclude("unistd.h");
+        });
+        const cfg_path_z = try allocator.dupeZ(u8, cfg_path);
+        defer allocator.free(cfg_path_z);
+        const fd = posix.open(cfg_path_z.ptr, posix.O_RDONLY);
+        if (fd < 0) return error.FileNotFound;
+        defer _ = posix.close(fd);
+        var buf: [64 * 1024]u8 = undefined;
+        const n = posix.read(fd, &buf, buf.len);
+        if (n < 0) return error.ReadFailed;
+        const cfg_raw = buf[0..@intCast(n)];
         const cfg = try DFlash2Config.parse(allocator, cfg_raw);
 
         var index = try safetensors_reader.loadOrBuildIndex(allocator, model_dir);
@@ -556,14 +567,23 @@ pub fn layerForward(
 ///               five tapped layers, one row per committed context token
 ///   embed_table: borrowed backbone embedding [vocab, H]
 /// Returns [1, block, H]; the caller drops row 0 (anchor) before the head.
-pub fn blockHidden(
+/// Project raw tap rows ([1, S, 5*H]) into drafter context space
+/// ([1, S, H]): fc + hidden_norm. Done once per committed token.
+pub fn projectContext(ctx: EagerContext, m: *const DFlash2, ctx_hidden: Array) !Array {
+    const proj = try m.fc.apply(ctx, ctx_hidden);
+    defer proj.deinit();
+    return rmsNormLastDim(ctx, proj, m.hidden_norm_f32, m.cfg.rms_norm_eps);
+}
+
+/// Block forward with an already-projected context (see projectContext).
+pub fn blockHiddenProjected(
     ctx: EagerContext,
     m: *const DFlash2,
     embed_table: Array,
     block_ids: Array,
-    ctx_hidden: Array,
+    x_ctx: Array,
 ) !Array {
-    const S: i32 = ctx_hidden.shape()[1];
+    const S: i32 = x_ctx.shape()[1];
     const blk: i32 = block_ids.shape()[0];
 
     const emb = try shape_mod.takeAxis(ctx, embed_table, block_ids, 0);
@@ -571,17 +591,25 @@ pub fn blockHidden(
     var h = try ops.reshape(ctx, emb, &[_]i32{ 1, blk, @intCast(m.cfg.hidden_size) });
     defer h.deinit();
 
-    const proj = try m.fc.apply(ctx, ctx_hidden);
-    defer proj.deinit();
-    const x_ctx = try rmsNormLastDim(ctx, proj, m.hidden_norm_f32, m.cfg.rms_norm_eps);
-    defer x_ctx.deinit();
-
     for (m.layers) |*l| {
         const next = try layerForward(ctx, l, &m.cfg, h, x_ctx, S, 0);
         h.deinit();
         h = next;
     }
     return rmsNormLastDim(ctx, h, m.norm_f32, m.cfg.rms_norm_eps);
+}
+
+/// Convenience wrapper: raw tap rows in, block hidden out.
+pub fn blockHidden(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    embed_table: Array,
+    block_ids: Array,
+    ctx_hidden: Array,
+) !Array {
+    const x_ctx = try projectContext(ctx, m, ctx_hidden);
+    defer x_ctx.deinit();
+    return blockHiddenProjected(ctx, m, embed_table, block_ids, x_ctx);
 }
 
 /// Greedy DFlash2 candidate selection. hidden [1, P, H], logits [1, P, V]
@@ -666,20 +694,22 @@ pub fn selectGreedy(
 // Draft context store (Task 7)
 // ---------------------------------------------------------------------------
 
-/// Committed-token context for the drafter: raw tap rows ([., 5*H] each)
-/// appended as the backbone commits tokens. The draft forward truncates to
-/// the newest `sliding_window - 1` rows (reference: keep_ctx in
-/// DFlashAttention). Row i of the store conditions on backbone token i, so
-/// rows are only ever appended (accepted tokens) — never rolled back.
+/// Committed-token context for the drafter: PROJECTED tap rows ([., H])
+/// appended as the backbone commits tokens. Projection (fc + hidden_norm)
+/// happens once per token at observe time; the draft forward reuses the
+/// projected rows directly. Rows are only ever appended (accepted tokens) —
+/// never rolled back — and truncated eagerly to the sliding window so the
+/// store stays at ~window * H * 2 bytes (21 MB at 2047 x 5120 bf16).
 pub const DFlash2Context = struct {
     allocator: std.mem.Allocator,
     ctx: EagerContext,
     cfg: *const DFlash2Config,
-    rows: ?Array = null, // [1, T, 5*H] bf16
+    model: *const DFlash2,
+    rows: ?Array = null, // [1, T, H] bf16, projected
     len: i64 = 0,
 
-    pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, cfg: *const DFlash2Config) DFlash2Context {
-        return .{ .allocator = allocator, .ctx = ctx, .cfg = cfg };
+    pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, model: *const DFlash2) DFlash2Context {
+        return .{ .allocator = allocator, .ctx = ctx, .cfg = &model.cfg, .model = model };
     }
 
     pub fn reset(self: *DFlash2Context) void {
@@ -688,32 +718,42 @@ pub const DFlash2Context = struct {
         self.len = 0;
     }
 
-    /// Append tap rows for newly committed tokens. tap_hidden: [1, k, 5*H].
+    fn keepMax(self: *const DFlash2Context) i64 {
+        return @as(i64, @intCast(self.cfg.sliding_window)) - 1;
+    }
+
+    /// Append tap rows for newly committed tokens. tap_hidden: [1, k, 5*H]
+    /// (raw backbone taps — projected here, once).
     pub fn observe(self: *DFlash2Context, tap_hidden: Array) !void {
         const k = tap_hidden.shape()[1];
         if (k == 0) return;
+        const proj = try projectContext(self.ctx, self.model, tap_hidden);
+        defer proj.deinit();
         if (self.rows) |old| {
-            const merged = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ old, tap_hidden }, 1);
+            const merged = try shape_mod.concatenateAxis(self.ctx, &[_]Array{ old, proj }, 1);
             old.deinit();
             self.rows = merged;
         } else {
-            self.rows = try ops.copy(self.ctx, tap_hidden);
+            self.rows = try ops.copy(self.ctx, proj);
         }
         self.len += k;
+        // Eager truncation keeps the store bounded.
+        const keep = self.keepMax();
+        if (self.len > keep) {
+            const start: i32 = @intCast(self.len - keep);
+            const total: i32 = @intCast(self.len);
+            const tail = try ops.slice(self.ctx, self.rows.?, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(self.cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+            self.rows.?.deinit();
+            self.rows = tail;
+            self.len = keep;
+        }
     }
 
-    /// Windowed context view for the next draft round (newest rows first
-    /// dropped). Returns a fresh array the caller owns; null when empty.
+    /// Windowed projected context for the next draft round. Returns a fresh
+    /// array the caller owns; null when empty.
     pub fn windowed(self: *DFlash2Context) !?Array {
         const all = self.rows orelse return null;
-        const keep: i64 = @as(i64, @intCast(self.cfg.sliding_window)) - 1;
-        if (self.len <= keep) {
-            const out = try ops.copy(self.ctx, all);
-            return out;
-        }
-        const start: i32 = @intCast(self.len - keep);
-        const total: i32 = @intCast(self.len);
-        const out = try ops.slice(self.ctx, all, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(5 * self.cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+        const out = try ops.copy(self.ctx, all);
         return out;
     }
 
@@ -1110,13 +1150,13 @@ test "DFlash2Context: observe, window truncation, split-vs-oneshot determinism" 
     defer block_ids_i32.deinit();
 
     // One-shot: observe all 13 rows at once.
-    var c1 = DFlash2Context.init(allocator, ctx, &cfg);
+    var c1 = DFlash2Context.init(allocator, ctx, &m);
     defer c1.deinit();
     try c1.observe(ctx_hidden);
     try std.testing.expectEqual(@as(i64, 13), c1.len);
 
     // Split: 5 + 8 rows.
-    var c2 = DFlash2Context.init(allocator, ctx, &cfg);
+    var c2 = DFlash2Context.init(allocator, ctx, &m);
     defer c2.deinit();
     const part1 = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 5, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
     defer part1.deinit();
@@ -1131,24 +1171,29 @@ test "DFlash2Context: observe, window truncation, split-vs-oneshot determinism" 
     defer w1.deinit();
     const w2 = (try c2.windowed()).?;
     defer w2.deinit();
-    const h1 = try blockHidden(ctx, &m, embed_w, block_ids_i32, w1);
+    const h1 = try blockHiddenProjected(ctx, &m, embed_w, block_ids_i32, w1);
     defer h1.deinit();
-    const h2 = try blockHidden(ctx, &m, embed_w, block_ids_i32, w2);
+    const h2 = try blockHiddenProjected(ctx, &m, embed_w, block_ids_i32, w2);
     defer h2.deinit();
     try std.testing.expect(try maxAbsDiff(ctx, h1, h2) == 0.0);
 
     // Truncation: window keeps the newest sliding_window-1 rows.
-    var cfg_big = cfg;
-    cfg_big.sliding_window = 6; // keep 5
-    var c3 = DFlash2Context.init(allocator, ctx, &cfg_big);
+    var m_big = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    defer m_big.deinit();
+    m_big.cfg.sliding_window = 6; // keep 5
+    var c3 = DFlash2Context.init(allocator, ctx, &m_big);
     defer c3.deinit();
     try c3.observe(ctx_hidden);
+    try std.testing.expectEqual(@as(i64, 5), c3.len);
     const w3 = (try c3.windowed()).?;
     defer w3.deinit();
     try std.testing.expectEqual(@as(i32, 5), w3.shape()[1]);
-    const tail = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 8, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
-    defer tail.deinit();
-    try std.testing.expect(try maxAbsDiff(ctx, w3, tail) == 0.0);
+    // Windowed rows are the projection of the newest 5 raw rows.
+    const tail_raw = try ops.slice(ctx, ctx_hidden, &[_]i32{ 0, 8, 0 }, &[_]i32{ 1, 13, @intCast(5 * cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+    defer tail_raw.deinit();
+    const tail_proj = try projectContext(ctx, &m_big, tail_raw);
+    defer tail_proj.deinit();
+    try std.testing.expect(try maxAbsDiff(ctx, w3, tail_proj) == 0.0);
 }
 
 fn testCfgFromMeta(meta: std.json.Parsed(std.json.Value)) !DFlash2Config {

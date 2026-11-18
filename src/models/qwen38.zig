@@ -2666,6 +2666,18 @@ pub const Qwen38ServingModel = struct {
         return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null, null);
     }
 
+    /// forwardTokensCore + DFlash2 hidden taps (drafter conditioning rows).
+    /// The caller finishes the tap (concat) and owns the result.
+    pub fn forwardTokensCoreTap(
+        self: *Qwen38ServingModel,
+        ids: []const u32,
+        capture: HiddenCapture,
+        last_logits_only: bool,
+        tap: ?*HiddenTap,
+    ) !ForwardCoreOut {
+        return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null, tap);
+    }
+
     var cached_prefill_chunk: ?usize = null;
 
     /// Long-prefill chunk size, OPT-IN (default 0 = monolithic). Measured
