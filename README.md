@@ -206,6 +206,8 @@ DMLX_LORA_ADAPTER=~/.cache/huggingface/hub/models--harness-hub--Qwen3.8-27B-pi-a
 
 Each targeted linear is dequantized, merged as `W + (alpha/r)·B·A` in f32, and requantized — no runtime cost, but not bit-identical to a bf16 merge. Compatible with both MTP and DFlash2 speculative decoding.
 
+Model-card parity for pi-adapted: serve with `DMLX_CHAT_EMPTY_THINK=1` (thinking off, as trained) and drive it over `/v1/chat/completions` (pi: `"api": "openai-completions"` in `~/.pi/agent/models.json`). Tool calls parse into structured `tool_calls` (qwen3_xml format). Verified end-to-end: the pi coding agent ran a fix-the-failing-test loop (pytest → diagnose → edit → green) against this server. Note the adapter was trained on bf16 weights; merging into a 4-bit backbone preserves behavior in our checks but Terminal-Bench scores were not reproduced. temp>0 requests bypass DFlash2 (greedy-only drafter) automatically.
+
 MTP applies to streaming and non-streaming alike; benchmark measurements should still use non-streaming requests (SSE delivery adds overhead).
 
 ### Serve DeepSeek V4 Flash in native mode
@@ -273,8 +275,10 @@ DMLX_LOCAL_KEY=local dsh web   # or: dsh headless "task"
 
 `DMLX_LOCAL_KEY` is only a credential placeholder — dmlx ignores the value.
 The served model's vision tower handles image input directly (PNG/JPEG via
-stb_image, WebP/HEIC via a macOS ImageIO fallback). Codex must use
-`wire_api = "chat"` (`/v1/responses` is not implemented).
+stb_image, WebP/HEIC via a macOS ImageIO fallback). Codex uses
+`wire_api = "responses"` (newer Codex releases removed the "chat"
+wire API); /v1/responses supports function tools and ignores
+reasoning/encrypted-content fields.
 
 ### Zero-wait restarts (agent workloads)
 

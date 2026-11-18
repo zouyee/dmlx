@@ -2441,7 +2441,19 @@ Remaining gaps / follow-ups:
 - Compiled GDN verify (host-bound 68 ms) is the big one; then verify
   kernel work.
 - Sampled drafting (temp > 0) not wired; vision prefill unsupported.
-- pi-adapted LoRA (harness-hub/Qwen3.8-27B-pi-adapted, r=32) would
-  need load-time merge into the 4-bit backbone (dequantize → merge →
-  requantize) behind a --lora-adapter flag; DFlash2 stays compatible
-  (verify keeps it lossless, acceptance may dip).
+- pi-adapted LoRA: DONE (2026-11-18). `DMLX_LORA_ADAPTER` merges the
+  adapter at load (src/models/lora_merge.zig); model-card parity items
+  verified — thinking off via DMLX_CHAT_EMPTY_THINK=1, openai-completions,
+  structured tool_calls, pi harness e2e (fix-failing-test loop green in
+  58 s). Not done: Terminal-Bench score reproduction (needs the harbor
+  harness; the card itself notes low-bit bases drift).
+- Sampled (temp>0) requests bypass DFlash2 via MtpOps.greedy_only.
+  KNOWN LATENT BUG: the engine's draft-failure plain-decode fallback
+  segfaults after a mid-round draft error (reproduced twice). The gate
+  prevents the realistic trigger; the fallback itself needs a fix for
+  OOM-class robustness.
+- Verify decomposition correction: DMLX_VERIFY_LAYER_SUBMIT=0 shows
+  build 5 ms / eval 94 ms — verify is GPU-bound (~90 ms/round), the
+  68 ms "host build" was the per-layer submit overlap. Compiled-verify
+  would NOT help; remaining gap is GPU kernel efficiency (1.6x the
+  4-bit bandwidth floor).
