@@ -184,7 +184,27 @@ DMLX_QWEN38_DFLASH2_DIR=~/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFla
   ./dmlx/bin/dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
 ```
 
-Greedy (temperature 0) only for now; sampled drafting and vision prompts fall back or error. The drafter weights are quantized to 4-bit at load by default (`DMLX_DF2_DRAFTER_BITS=0` keeps bf16). Measured on an M4 Pro 48 GB (temp 0, 256-token generations): 33.6 tok/s code, 26.3 multi-turn, 35.6 prose, with repeat-prompt TTFT ~0.15 s via the drafter-context prefix cache.
+Greedy (temperature 0) only for now; sampled drafting and vision prompts fall back or error. The drafter weights are quantized to 4-bit at load by default (`DMLX_DF2_DRAFTER_BITS=0` keeps bf16).
+
+Measured on an M4 Pro 48 GB (temp 0, 256-token generations, `scripts/realistic_h2h.py`):
+
+| scenario | decode tok/s | repeat-prompt TTFT |
+|---|---|---|
+| code generation | 33.6 | 0.15 s |
+| multi-turn | 26.3 | 0.15 s |
+| prose summary | 35.8 | 0.28 s |
+
+How it works: the backbone exposes hidden-state taps at layers 5/19/33/47/61; the drafter conditions on those (projected once per committed token into a per-layer K/V ring), drafts 7 tokens in ONE parallel pass through 5 non-causal layers with two-tap dynamic convolutions, and a rank-256/top-16 candidate selector picks the block greedily. The standard draft→verify→commit path keeps outputs lossless (greedy output is bit-identical to the MTP path). Repeat prompts restore both the backbone KV snapshot and the drafter context, so the second turn skips prefill entirely. `DMLX_DF2_PREDRAFT=1` additionally builds the next block during verify (off by default — see HANDOFF.md for the measurements).
+
+**LoRA adapters (experimental).** PEFT adapters can be merged into the quantized backbone at load time — verified with [harness-hub/Qwen3.8-27B-pi-adapted](https://huggingface.co/harness-hub/Qwen3.8-27B-pi-adapted) (r=32, 256 modules):
+
+```bash
+huggingface-cli download harness-hub/Qwen3.8-27B-pi-adapted
+DMLX_LORA_ADAPTER=~/.cache/huggingface/hub/models--harness-hub--Qwen3.8-27B-pi-adapted/snapshots/<rev> \
+  ./dmlx/bin/dmlx serve --model qwen3.8-27b-4bit --speculative-mtp 7 --port 8080
+```
+
+Each targeted linear is dequantized, merged as `W + (alpha/r)·B·A` in f32, and requantized — no runtime cost, but not bit-identical to a bf16 merge. Compatible with both MTP and DFlash2 speculative decoding.
 
 MTP applies to streaming and non-streaming alike; benchmark measurements should still use non-streaming requests (SSE delivery adds overhead).
 
