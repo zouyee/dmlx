@@ -1185,6 +1185,11 @@ pub const Qwen38VTableAdapter = struct {
         const vocab: i32 = f32l.shape()[2];
         const flat = try ops.reshape(ctx, f32l, &[_]i32{ P, vocab });
         errdefer flat.deinit();
+        // Materialize ONCE: the sampled draft path draws each position's
+        // token from its row on the host, and without this eval every row
+        // pull re-syncs the whole GPU queue (measured 115-200 ms/round at
+        // 2k context; the greedy path pays one sync per BLOCK instead).
+        try flat.eval();
         self.df2_block_logits = flat;
         self.df2_block_len = @intCast(P);
         self.df2_block_idx = 0;
