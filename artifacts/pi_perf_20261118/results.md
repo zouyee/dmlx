@@ -23,8 +23,13 @@ comparable cold; first-touch walls were ~20/40/107s ≈ same ~110 tok/s
 prefill as everyone else).
 
 Takeaways:
-- Prefill throughput is ~105-130 tok/s on ALL engines for this hybrid GDN
-  model — hardware-bound parity, no engine differentiates.
+- Prefill throughput is ~110 tok/s on ALL engines TODAY, but that is
+  swap-depressed: the 2026-11-11 clean-machine chunk A/B measured 16,384
+  tokens in 103-107 s = 153-159 tok/s, so the real ceiling band is
+  ~140-160 tok/s (compute-bound: 27B x 2 x L FLOPs at M4 Pro's effective
+  ~4 TFLOPS for dequant GEMM, not weight-bandwidth). Correct reading:
+  all engines sit at the SAME compute ceiling; today's ~110 applies
+  equally to everyone and does not change the ranking.
 - dmlx >= TensorFold > mlx_lm >> omlx on decode. omlx's ~5 tok/s (VLM
   legacy path, no drafter engaged for this model) is 2.5-3x slower than the
   field — consistent across thinking on/off and prompt sizes.
