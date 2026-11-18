@@ -21,6 +21,7 @@ const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
+const sort_mod = @import("mlx").sort;
 const reduce_mod = @import("mlx").reduce;
 const safetensors_reader = @import("mlx").safetensors_reader;
 const glm53 = @import("glm53.zig");
@@ -392,16 +393,20 @@ pub fn convFinish(ctx: EagerContext, w: *const ConvWeights, x: Array, dynamic: A
 // Decoder layer forward (Task 4)
 // ---------------------------------------------------------------------------
 
-/// RMSNorm over the last dim: f32 compute, bf16 out (matches nn.RMSNorm on a
-/// bf16 input). `w` may be any float dtype (cast internally).
+/// RMSNorm over the last dim. Matches nn.RMSNorm exactly: the input dtype
+/// drives the compute (bf16 in → bf16 fast.rms_norm, which is what the
+/// mlx-vlm reference runs), so the weight is cast to x's dtype rather than
+/// upcasting everything to f32 (the f32 path is more accurate but rounds
+/// differently, which breaks golden parity).
 pub fn rmsNormLastDim(ctx: EagerContext, x: Array, w: Array, eps: f32) !Array {
-    const x_f32 = try ops.astype(ctx, x, .float32);
-    defer x_f32.deinit();
+    if (x.dtype() == .bfloat16) {
+        const w_b = try ops.astype(ctx, w, .bfloat16);
+        defer w_b.deinit();
+        return fast_mod.rmsNorm(ctx, x, w_b, eps);
+    }
     const w_f32 = try ops.astype(ctx, w, .float32);
     defer w_f32.deinit();
-    const n = try fast_mod.rmsNorm(ctx, x_f32, w_f32, eps);
-    defer n.deinit();
-    return ops.astype(ctx, n, .bfloat16);
+    return fast_mod.rmsNorm(ctx, x, w_f32, eps);
 }
 
 /// DFlashAttention: block queries attend over [context KV ‖ block KV],
@@ -542,6 +547,122 @@ pub fn layerForward(
 }
 
 // ---------------------------------------------------------------------------
+// Full block draft forward + greedy candidate selector (Task 5)
+// ---------------------------------------------------------------------------
+
+/// Post-final-norm block hidden for one draft round (single request, B=1).
+///   block_ids:  [block] i32 — [anchor, mask × (block-1)]
+///   ctx_hidden: [1, S, 5*H] — backbone hidden states concatenated from the
+///               five tapped layers, one row per committed context token
+///   embed_table: borrowed backbone embedding [vocab, H]
+/// Returns [1, block, H]; the caller drops row 0 (anchor) before the head.
+pub fn blockHidden(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    embed_table: Array,
+    block_ids: Array,
+    ctx_hidden: Array,
+) !Array {
+    const S: i32 = ctx_hidden.shape()[1];
+    const blk: i32 = block_ids.shape()[0];
+
+    const emb = try shape_mod.takeAxis(ctx, embed_table, block_ids, 0);
+    defer emb.deinit();
+    var h = try ops.reshape(ctx, emb, &[_]i32{ 1, blk, @intCast(m.cfg.hidden_size) });
+    defer h.deinit();
+
+    const proj = try m.fc.apply(ctx, ctx_hidden);
+    defer proj.deinit();
+    const x_ctx = try rmsNormLastDim(ctx, proj, m.hidden_norm_f32, m.cfg.rms_norm_eps);
+    defer x_ctx.deinit();
+
+    for (m.layers) |*l| {
+        const next = try layerForward(ctx, l, &m.cfg, h, x_ctx, S, 0);
+        h.deinit();
+        h = next;
+    }
+    return rmsNormLastDim(ctx, h, m.norm_f32, m.cfg.rms_norm_eps);
+}
+
+/// Greedy DFlash2 candidate selection. hidden [1, P, H], logits [1, P, V]
+/// with P = block_size - 1. Writes P token ids into out_tokens.
+/// Chain semantics: the selected token at position p becomes the predecessor
+/// for position p+1; position 0's predecessor is the anchor.
+pub fn selectGreedy(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    hidden: Array,
+    logits: Array,
+    anchor: u32,
+    out_tokens: []u32,
+) !void {
+    const P: i32 = logits.shape()[1];
+    const V: i32 = logits.shape()[2];
+    const K: i32 = @intCast(m.cfg.selector_top_k);
+    const R: i32 = @intCast(m.cfg.selector_rank);
+
+    const order = try sort_mod.argsortAxis(ctx, logits, -1); // ascending
+    defer order.deinit();
+    const candidates = try ops.slice(ctx, order, &[_]i32{ 0, 0, V - K }, &[_]i32{ 1, P, V }, &[_]i32{ 1, 1, 1 });
+    defer candidates.deinit();
+    const cand_i32 = try ops.astype(ctx, candidates, .int32);
+    defer cand_i32.deinit();
+    const unary = try shape_mod.takeAlongAxis(ctx, logits, cand_i32, -1); // [1,P,K]
+    defer unary.deinit();
+    const hp = try m.selector_hidden_projection.apply(ctx, hidden); // [1,P,R]
+    defer hp.deinit();
+
+    var prev = try Array.fromData(ctx.allocator, i32, &[_]i32{@intCast(anchor)}, &[_]i32{1});
+    defer prev.deinit();
+
+    var pos: i32 = 0;
+    while (pos < P) : (pos += 1) {
+        const pcb_row = try shape_mod.takeAxis(ctx, m.predecessor_codebook, prev, 0); // [1,R]
+        defer pcb_row.deinit();
+        const pcb3 = try ops.reshape(ctx, pcb_row, &[_]i32{ 1, 1, R });
+        defer pcb3.deinit();
+        const proj_pos = try ops.slice(ctx, hp, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, R }, &[_]i32{ 1, 1, 1 });
+        defer proj_pos.deinit();
+        const cand_pos = try ops.slice(ctx, cand_i32, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, K }, &[_]i32{ 1, 1, 1 });
+        defer cand_pos.deinit();
+        const cand_flat = try ops.reshape(ctx, cand_pos, &[_]i32{K});
+        defer cand_flat.deinit();
+        const scb_rows = try shape_mod.takeAxis(ctx, m.successor_codebook, cand_flat, 0); // [K,R]
+        defer scb_rows.deinit();
+        const scb3 = try ops.reshape(ctx, scb_rows, &[_]i32{ 1, K, R });
+        defer scb3.deinit();
+        const prod = try ops.multiply(ctx, pcb3, proj_pos); // [1,1,R]
+        defer prod.deinit();
+        const prod2 = try ops.multiply(ctx, prod, scb3); // [1,K,R]
+        defer prod2.deinit();
+        const edges = try reduce_mod.sumAxis(ctx, prod2, 2, false); // [1,K]
+        defer edges.deinit();
+        const unary_pos = try ops.slice(ctx, unary, &[_]i32{ 0, pos, 0 }, &[_]i32{ 1, pos + 1, K }, &[_]i32{ 1, 1, 1 });
+        defer unary_pos.deinit();
+        const unary_flat = try ops.reshape(ctx, unary_pos, &[_]i32{ 1, K });
+        defer unary_flat.deinit();
+        const scores = try ops.add(ctx, unary_flat, edges);
+        defer scores.deinit();
+        const am1 = try reduce_mod.argmaxAxis(ctx, scores, 1, false); // [1]
+        defer am1.deinit();
+        const am = try ops.reshape(ctx, am1, &[_]i32{});
+        defer am.deinit();
+        try am.eval();
+        const am_idx = try am.item(i32);
+        const sel1 = try ops.slice(ctx, cand_flat, &[_]i32{am_idx}, &[_]i32{am_idx + 1}, &[_]i32{1});
+        defer sel1.deinit();
+        const sel = try ops.reshape(ctx, sel1, &[_]i32{});
+        defer sel.deinit();
+        try sel.eval();
+        const tok = try sel.item(i32);
+        out_tokens[@intCast(pos)] = @intCast(tok);
+        const next = try Array.fromData(ctx.allocator, i32, &[_]i32{tok}, &[_]i32{1});
+        prev.deinit();
+        prev = next;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -666,6 +787,31 @@ fn maxAbsDiff(ctx: EagerContext, a: Array, b: Array) !f32 {
     return m.item(f32);
 }
 
+/// max over elements of |a-b| / (|b| + floor) — relative parity for bf16
+/// traces where absolute error scales with element magnitude.
+fn relMaxDiff(ctx: EagerContext, a: Array, b: Array, floor: f32) !f32 {
+    const af = try ops.astype(ctx, a, .float32);
+    defer af.deinit();
+    const bf = try ops.astype(ctx, b, .float32);
+    defer bf.deinit();
+    const diff = try ops.subtract(ctx, af, bf);
+    defer diff.deinit();
+    const ad = try ops.abs(ctx, diff);
+    defer ad.deinit();
+    const ab = try ops.abs(ctx, bf);
+    defer ab.deinit();
+    const f = try ops.scalarF32(ctx, floor);
+    defer f.deinit();
+    const denom = try ops.add(ctx, ab, f);
+    defer denom.deinit();
+    const rel = try ops.divide(ctx, ad, denom);
+    defer rel.deinit();
+    const m = try reduce_mod.max(ctx, rel, false);
+    defer m.deinit();
+    try m.eval();
+    return m.item(f32);
+}
+
 fn maxAbs(ctx: EagerContext, a: Array) !f32 {
     const af = try ops.astype(ctx, a, .float32);
     defer af.deinit();
@@ -775,6 +921,104 @@ test "DFlash2 layer 0: full forward matches golden trace" {
     defer exp_out.deinit();
     const so = try maxAbs(ctx, exp_out);
     try std.testing.expect(try maxAbsDiff(ctx, out, exp_out) <= 1e-2 * so + 1e-3);
+}
+
+test "DFlash2 full block draft + greedy selector match golden trace" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const cfg = try testCfgFromMeta(meta);
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg);
+    defer m.deinit();
+
+    // Borrowed tables live in the same golden shard.
+    const embed_w = try index.loadTensor("embed_tokens.weight");
+    defer embed_w.deinit();
+    const lm_w = try index.loadTensor("lm_head.weight");
+    defer lm_w.deinit();
+    const lm_head: MtpLinear = .{ .w = lm_w };
+
+    const ctx_hidden = try loadTraceTensor(allocator, "ctx_hidden");
+    defer ctx_hidden.deinit();
+    const block_ids_t = try loadTraceTensor(allocator, "block_ids");
+    defer block_ids_t.deinit();
+    const block_ids = try ops.reshape(ctx, block_ids_t, &[_]i32{@intCast(cfg.block_size)});
+    defer block_ids.deinit();
+    const block_ids_i32 = try ops.astype(ctx, block_ids, .int32);
+    defer block_ids_i32.deinit();
+
+    const hidden_full = try blockHidden(ctx, &m, embed_w, block_ids_i32, ctx_hidden);
+    defer hidden_full.deinit();
+    const exp_hidden = try loadTraceTensor(allocator, "final_hidden");
+    defer exp_hidden.deinit();
+    // Layer-level parity: intermediate tensors are small-magnitude sums
+    // with cancellation, so per-element relative error is misleading; check
+    // abs error against the tensor scale (a few bf16 ULPs of the max).
+    {
+        const emb2 = try shape_mod.takeAxis(ctx, embed_w, block_ids_i32, 0);
+        defer emb2.deinit();
+        var h2 = try ops.reshape(ctx, emb2, &[_]i32{ 1, @intCast(cfg.block_size), @intCast(cfg.hidden_size) });
+        defer h2.deinit();
+        const proj2 = try m.fc.apply(ctx, ctx_hidden);
+        defer proj2.deinit();
+        const x_ctx2 = try rmsNormLastDim(ctx, proj2, m.hidden_norm_f32, m.cfg.rms_norm_eps);
+        defer x_ctx2.deinit();
+        for (m.layers, 0..) |*l, li| {
+            const next = try layerForward(ctx, l, &m.cfg, h2, x_ctx2, ctx_hidden.shape()[1], 0);
+            h2.deinit();
+            h2 = next;
+            var nbuf: [64]u8 = undefined;
+            const exp_l = try loadTraceTensor(allocator, try std.fmt.bufPrint(&nbuf, "l{d}.out", .{li}));
+            defer exp_l.deinit();
+            const dl = try maxAbsDiff(ctx, h2, exp_l);
+            const sl2 = try maxAbs(ctx, exp_l);
+            try std.testing.expect(dl <= 0.05 * sl2);
+        }
+        const df = try maxAbsDiff(ctx, hidden_full, exp_hidden);
+        const sf = try maxAbs(ctx, exp_hidden);
+        try std.testing.expect(df <= 0.05 * sf);
+    }
+
+    // Drop the anchor row, then logits.
+    const P: i32 = @intCast(cfg.block_size - 1);
+    const H: i32 = @intCast(cfg.hidden_size);
+    const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+    defer draft_hidden.deinit();
+    const logits = try lm_head.apply(ctx, draft_hidden);
+    defer logits.deinit();
+    const exp_logits = try loadTraceTensor(allocator, "logits");
+    defer exp_logits.deinit();
+    const dl2 = try maxAbsDiff(ctx, logits, exp_logits);
+    const sl3 = try maxAbs(ctx, exp_logits);
+    try std.testing.expect(dl2 <= 0.05 * sl3);
+
+    var tokens: [7]u32 = undefined;
+    try selectGreedy(ctx, &m, draft_hidden, logits, 42, &tokens);
+    const exp_sel = try loadTraceTensor(allocator, "selected_tokens");
+    defer exp_sel.deinit();
+    try exp_sel.eval();
+    var exp_tokens: [7]i32 = undefined;
+    for (0..7) |i| {
+        const t1 = try ops.slice(ctx, exp_sel, &[_]i32{ 0, @intCast(i) }, &[_]i32{ 1, @intCast(i + 1) }, &[_]i32{ 1, 1 });
+        defer t1.deinit();
+        const t = try ops.reshape(ctx, t1, &[_]i32{});
+        defer t.deinit();
+        try t.eval();
+        exp_tokens[i] = try t.item(i32);
+    }
+    for (tokens, exp_tokens) |got, exp| {
+        try std.testing.expectEqual(@as(u32, @intCast(exp)), got);
+    }
+    // The strict end-to-end criterion: identical greedy token sequence.
 }
 
 fn testCfgFromMeta(meta: std.json.Parsed(std.json.Value)) !DFlash2Config {
