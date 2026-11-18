@@ -642,6 +642,12 @@ pub const Qwen38VTableAdapter = struct {
     df2_block: [7]u32 = undefined,
     df2_block_len: usize = 0,
     df2_block_idx: usize = 0,
+    /// Drafter-context cache mirroring the backbone prefix snapshots:
+    /// projected (post-fc) windowed context rows + the prompt tokens they
+    /// cover. Lets a snapshot-restored prefill skip both the backbone
+    /// recompute AND the drafter-context rebuild.
+    df2_cache_ids: []u32 = &.{},
+    df2_cache_rows: ?Array = null, // [1, <=window, H] projected
     /// `DMLX_MTP_CHAIN_DUMP=1`: per-step drafter KV length trace (plan
     /// 2026-10-29-catch-omlx-mtp Task 1). Read once per process; the RoPE
     /// offset of every head forward equals cache.len() before its append,
@@ -909,16 +915,52 @@ pub const Qwen38VTableAdapter = struct {
         self.df2_block_len = 0;
         self.df2_block_idx = 0;
         self.df2_ctx.?.reset();
+        const ctx = self.model.ctx;
+
+        // How much of the drafter context can the adapter cache supply for
+        // a snapshot-restored prefix? Rows are per-token projected context.
+        var cache_plen: usize = 0;
+        if (self.df2_cache_rows) |cr| {
+            const n_rows: usize = @intCast(cr.shape()[1]);
+            const max_rows = @min(n_rows, @min(ids.len, self.df2_cache_ids.len));
+            while (cache_plen < max_rows and self.df2_cache_ids[cache_plen] == ids[cache_plen]) cache_plen += 1;
+        }
+        const snap_plen = self.model.peekPrefixSnapshotLen(ids);
+        // Full snapshot hit without a matching drafter cache: force a full
+        // tapped prefill (suppress the restore), else the drafter context
+        // would be empty for the whole request.
+        const suppress = snap_plen >= ids.len and cache_plen < ids.len;
+        // Partial hit the cache cannot cover: same story.
+        const suppress2 = snap_plen > cache_plen and snap_plen < ids.len;
+        if (suppress or suppress2) self.model.suppress_snapshot_restore = true;
+        defer self.model.suppress_snapshot_restore = false;
+        // On a suppressed (full tapped) prefill the tap covers every row —
+        // seeding the cached prefix too would duplicate it in the ring.
+        const usable_prefix = if (suppress or suppress2) 0 else @min(snap_plen, cache_plen);
+
         var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
         errdefer tap.deinit();
         const res = try self.model.forwardTokensCoreTap(ids, .all, true, &tap);
         defer res.logits.deinit();
         defer res.hidden.?.deinit();
-        if (try tap.finish(self.model.ctx)) |rows| {
+
+        // Seed the drafter context: cached projected rows for the restored
+        // prefix + freshly tapped rows for the freshly computed part.
+        if (usable_prefix > 0) {
+            const cr = self.df2_cache_rows.?;
+            const width: i32 = cr.shape()[2];
+            const rows = try ops.slice(ctx, cr, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @intCast(usable_prefix), width }, &[_]i32{ 1, 1, 1 });
+            defer rows.deinit();
+            try self.df2_ctx.?.seedFromProjected(rows);
+        }
+        if (try tap.finish(ctx)) |rows| {
             defer rows.deinit();
             try self.df2_ctx.?.observe(rows);
         }
-        const ctx = self.model.ctx;
+        // Refresh the adapter cache to cover THIS prompt (rows come from
+        // the context's projected-row shadow).
+        self.updateDflash2Cache(ids) catch |err|
+            std.log.warn("DFlash2 context cache update failed: {}", .{err});
         const lshape = res.logits.shape();
         const vocab: i32 = lshape[2];
         const flat = try ops.reshape(ctx, res.logits, &[_]i32{vocab});
@@ -933,6 +975,20 @@ pub const Qwen38VTableAdapter = struct {
         defer hflat.deinit();
         const hidden = try ops.copy(ctx, hflat);
         return .{ .logits = logits, .hidden = hidden };
+    }
+
+    /// Refresh the drafter-context cache after a prefill. The projected
+    /// rows live in df2_ctx.rows_shadow (maintained by observe/seed), so
+    /// this just snapshots the shadow + ids.
+    fn updateDflash2Cache(self: *Qwen38VTableAdapter, ids: []const u32) !void {
+        const ctx = self.model.ctx;
+        if (self.df2_cache_ids.len > 0) self.allocator.free(self.df2_cache_ids);
+        self.df2_cache_ids = try self.allocator.dupe(u32, ids);
+        if (self.df2_cache_rows) |r| r.deinit();
+        self.df2_cache_rows = null;
+        if (self.df2_ctx.?.rowsShadow()) |sh| {
+            self.df2_cache_rows = try ops.copy(ctx, sh);
+        }
     }
 
     /// Compute the round's draft block: one parallel forward over
@@ -1357,6 +1413,8 @@ pub const Qwen38VTableAdapter = struct {
 
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        if (self.df2_cache_ids.len > 0) allocator.free(self.df2_cache_ids);
+        if (self.df2_cache_rows) |r| r.deinit();
         if (self.df2_ctx) |*cx| cx.deinit();
         if (self.dflash2) |m| {
             m.deinit();

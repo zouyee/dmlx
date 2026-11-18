@@ -1494,6 +1494,9 @@ pub const Qwen38ServingModel = struct {
     /// PrefixSnapshot.
     prefix_snaps: std.ArrayList(PrefixSnapshot) = .empty,
     snap_access: u64 = 0,
+    /// Set by the DFlash2 adapter to force a full tapped prefill when its
+    /// drafter-context cache cannot cover a snapshot-restored prefix.
+    suppress_snapshot_restore: bool = false,
 
     /// Propagate the MRoPE delta to every full-attention layer (their rope
     /// offset is cache.len() + rope_extra). GDN layers carry no rope.
@@ -2666,6 +2669,14 @@ pub const Qwen38ServingModel = struct {
         return self.forwardTokensCoreCont(ids, capture, last_logits_only, false, null, null);
     }
 
+    /// Length of the longest snapshot prefix match for `ids` (0 = none).
+    /// Peek-only: does not restore anything.
+    pub fn peekPrefixSnapshotLen(self: *Qwen38ServingModel, ids: []const u32) usize {
+        if (prefixSnapMax() == 0) return 0;
+        const idx = self.findPrefixSnapshot(ids) orelse return 0;
+        return self.prefix_snaps.items[idx].prompt_tokens.len;
+    }
+
     /// forwardTokensCore + DFlash2 hidden taps (drafter conditioning rows).
     /// The caller finishes the tap (concat) and owns the result.
     pub fn forwardTokensCoreTap(
@@ -2771,10 +2782,10 @@ pub const Qwen38ServingModel = struct {
             // Longest-prefix snapshot restore (text path). Capture .all is
             // the MTP drafter-priming path: it additionally needs per-position
             // hidden rows, so it can only use snapshots that stored them.
-            // Tap capture (DFlash2) bypasses snapshots: stored snapshots
-            // have no tap rows, and a suffix-only prefill would leave the
-            // drafter context incomplete.
-            if (vision == null and last_logits_only and prefixSnapMax() > 0 and tap == null) {
+            // Snapshot restore can be suppressed per-call (DFlash2 prefill
+            // does this when the drafter context cache cannot cover the
+            // restored prefix and a full tapped prefill is required).
+            if (vision == null and last_logits_only and prefixSnapMax() > 0 and !self.suppress_snapshot_restore) {
                 if (self.findPrefixSnapshot(ids)) |idx| {
                     const usable = capture != .all or self.prefix_snaps.items[idx].hidden_all != null;
                     if (usable) {

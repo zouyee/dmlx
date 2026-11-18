@@ -717,6 +717,9 @@ pub const DFlash2Context = struct {
     keys: [5]Array, // per layer [nkv, capacity, hd] bf16, RoPE applied
     values: [5]Array, // per layer [nkv, capacity, hd] bf16
     pos: []i64, // [capacity] absolute position per slot, -1 empty
+    /// Projected rows currently in the ring ([1, <=ring_slots, H]), kept so
+    /// the adapter can cache the drafter context for prefix-snapshot hits.
+    rows_shadow: ?Array = null,
 
     pub fn init(allocator: std.mem.Allocator, ctx: EagerContext, model: *const DFlash2) !DFlash2Context {
         const cfg = &model.cfg;
@@ -755,18 +758,32 @@ pub const DFlash2Context = struct {
         // Zeroing 42 MB of rings is pointless; invalidating pos empties them.
         @memset(self.pos, -1);
         self.fed = 0;
+        if (self.rows_shadow) |r| r.deinit();
+        self.rows_shadow = null;
+    }
+
+    /// Borrowed view of the projected rows currently in the ring (or null).
+    pub fn rowsShadow(self: *DFlash2Context) ?Array {
+        return self.rows_shadow;
     }
 
     /// Append tap rows for newly committed tokens. tap_hidden: [1, k, 5*H]
     /// raw backbone taps. Projects to context space, then per layer computes
     /// K/V and writes the ring slots; K gets RoPE at the absolute offset.
     pub fn observe(self: *DFlash2Context, tap_hidden: Array) !void {
-        const k: i32 = tap_hidden.shape()[1];
+        if (tap_hidden.shape()[1] == 0) return;
+        const proj = try projectContext(self.ctx, self.model, tap_hidden); // [1,k,H]
+        defer proj.deinit();
+        return self.seedFromProjected(proj);
+    }
+
+    /// Feed already-projected context rows ([1, k, H]) into the rings
+    /// (prefix-snapshot restore path — the projection was cached).
+    pub fn seedFromProjected(self: *DFlash2Context, proj: Array) !void {
+        const k: i32 = proj.shape()[1];
         if (k == 0) return;
         const ctx = self.ctx;
         const cfg = self.cfg;
-        const proj = try projectContext(ctx, self.model, tap_hidden); // [1,k,H]
-        defer proj.deinit();
         const nkv: i32 = @intCast(cfg.num_key_value_heads);
         const hd: i32 = @intCast(cfg.head_dim);
         const base_off: i32 = @intCast(self.fed);
@@ -794,6 +811,22 @@ pub const DFlash2Context = struct {
             try self.writeSlots(l, kr3, vt3, k);
         }
         self.fed += k;
+        // Maintain the projected-row shadow (windowed to ring_slots).
+        if (self.rows_shadow) |old| {
+            const merged = try shape_mod.concatenateAxis(ctx, &[_]Array{ old, proj }, 1);
+            old.deinit();
+            self.rows_shadow = merged;
+        } else {
+            self.rows_shadow = try ops.copy(ctx, proj);
+        }
+        const sh_len: i64 = self.rows_shadow.?.shape()[1];
+        if (sh_len > self.ring_slots) {
+            const start: i32 = @intCast(sh_len - self.ring_slots);
+            const total: i32 = @intCast(sh_len);
+            const tail = try ops.slice(ctx, self.rows_shadow.?, &[_]i32{ 0, start, 0 }, &[_]i32{ 1, total, @intCast(cfg.hidden_size) }, &[_]i32{ 1, 1, 1 });
+            self.rows_shadow.?.deinit();
+            self.rows_shadow = tail;
+        }
     }
 
     /// Write k rows of one layer's K/V into ring slots (fed + j) % capacity.
@@ -841,6 +874,7 @@ pub const DFlash2Context = struct {
             self.keys[l].deinit();
             self.values[l].deinit();
         }
+        if (self.rows_shadow) |r| r.deinit();
         self.allocator.free(self.pos);
     }
 };
