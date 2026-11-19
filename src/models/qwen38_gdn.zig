@@ -4526,6 +4526,97 @@ pub const Qwen38GDN = struct {
         allocator.free(res.ssm_states);
         res.ssm_states = &.{};
     }
+
+    /// Tree-verify result: per-node outputs in flat node order plus a copy of
+    /// the input rows. Per-node conv/ssm states are deliberately NOT retained
+    /// (N × ~3.1 MB per layer); the commit side replays the accepted path from
+    /// the root state + `x_copy` rows (deltaRuleEager).
+    pub const TreeVerifyResult = struct {
+        out: Array, // [1, N, hidden] flat node order
+        x_copy: Array, // [1, N, hidden] input copy for commit replay
+
+        pub fn deinit(self: *TreeVerifyResult) void {
+            self.out.deinit();
+            self.x_copy.deinit();
+        }
+    };
+
+    /// Tree-shaped verify pass: runs the per-step eager recurrence along every
+    /// root-to-node path of a draft tree. `x` holds the N node tokens in flat
+    /// order; `parents[i]` is the flat index of node i's parent (-1 branches
+    /// from the cache's current state). Requires parents[i] < i whenever
+    /// parents[i] >= 0 (topological flat order, which DraftTree's construction
+    /// already guarantees). The cache is NOT modified. Each node's post-state
+    /// is freed as soon as its last child has been processed, so peak state
+    /// memory is bounded by the tree's width, not N.
+    pub fn prefillVerifyTree(
+        self: *Qwen38GDN,
+        allocator: std.mem.Allocator,
+        x: Array, // [1, N, hidden]
+        parents: []const i32,
+        cache: *Qwen38GdnCache,
+    ) !TreeVerifyResult {
+        const ctx = self.ctx;
+        const N: usize = @intCast(x.shape()[1]);
+        const hidden: i32 = x.shape()[2];
+        if (parents.len != N) return error.TreeVerifyParentsLen;
+
+        // Post-state of each processed node (null once freed).
+        var states = try allocator.alloc(?Qwen38GdnCache, N);
+        defer allocator.free(states);
+        for (states) |*s| s.* = null;
+        defer for (states) |*s| {
+            if (s.*) |*st| st.deinit();
+        };
+
+        // Last flat index that still needs node i's post-state.
+        var last_use = try allocator.alloc(usize, N);
+        defer allocator.free(last_use);
+        for (last_use, 0..) |*lu, i| lu.* = i;
+        for (parents, 0..) |p, i| {
+            if (p >= 0) {
+                const pi: usize = @intCast(p);
+                if (pi >= i) return error.TreeVerifyParentOrder;
+                last_use[pi] = @max(last_use[pi], i);
+            }
+        }
+
+        var outs = try allocator.alloc(Array, N);
+        defer allocator.free(outs);
+        var made: usize = 0;
+        errdefer for (outs[0..made]) |o| o.deinit();
+
+        for (0..N) |i| {
+            var scratch = if (parents[i] >= 0)
+                try states[@intCast(parents[i])].?.deepClone(ctx)
+            else
+                try cache.deepClone(ctx);
+            errdefer scratch.deinit();
+            const row = try ops.slice(ctx, x, &[_]i32{ 0, @intCast(i), 0 }, &[_]i32{ 1, @intCast(i + 1), hidden }, &[_]i32{ 1, 1, 1 });
+            defer row.deinit();
+            const flat = try ops.reshape(ctx, row, &[_]i32{ 1, hidden });
+            defer flat.deinit();
+            outs[i] = try self.forward(flat, &scratch);
+            made += 1;
+            states[i] = scratch;
+            // Free every state whose last consumer has been processed.
+            for (states[0 .. i + 1], 0..) |*s, j| {
+                if (s.* != null and last_use[j] <= i) {
+                    s.*.?.deinit();
+                    s.* = null;
+                }
+            }
+        }
+
+        const cat = try shape_mod.concatenateAxis(ctx, outs, 0); // [N, hidden]
+        defer cat.deinit();
+        for (outs) |o| o.deinit();
+        made = 0; // outs freed; the errdefer above must not touch them again
+        const out = try ops.reshape(ctx, cat, &[_]i32{ 1, @intCast(N), hidden });
+        errdefer out.deinit();
+        const x_copy = try ops.copy(ctx, x);
+        return .{ .out = out, .x_copy = x_copy };
+    }
 };
 
 const TestDims = struct {
@@ -5162,6 +5253,99 @@ test "Qwen38GDN.prefillVerify: matches prefill + per-position states + commit" {
     // Commit emptied the lists; res2.deinit (defer) frees only `out`.
     try std.testing.expectEqual(@as(usize, 0), res2.conv_states.len);
     try std.testing.expectEqual(@as(usize, 0), res2.ssm_states.len);
+}
+
+test "Qwen38GDN.prefillVerifyTree: per-step tree matches per-path chain verify" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const dims = TestDims{};
+    const hidden: i32 = @intCast(dims.hidden);
+    const N: i32 = 3;
+    const n: usize = @intCast(N * hidden);
+
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    testFill(buf);
+    const x = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, N, hidden });
+    defer x.deinit();
+
+    // Tree: root(0) -> {a(1), b(2)}.
+    const parents = [_]i32{ -1, 0, 0 };
+
+    var g = try makeTestModule(allocator, ctx, dims);
+    defer g.deinit();
+    var cache = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+    defer cache.deinit();
+
+    // Dirty the cache so "unmodified" is a non-trivial assertion.
+    {
+        const x0 = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, hidden }, &[_]i32{ 1, 1, 1 });
+        defer x0.deinit();
+        const x0f = try ops.reshape(ctx, x0, &[_]i32{ 1, hidden });
+        defer x0f.deinit();
+        const o0 = try g.forward(x0f, &cache);
+        defer o0.deinit();
+        try o0.eval();
+        try cache.conv_state.eval();
+        try cache.ssm_state.eval();
+    }
+    const conv_before = try cache.conv_state.dataSlice(f32);
+    const ssm_before = try cache.ssm_state.dataSlice(f32);
+
+    var res = try g.prefillVerifyTree(allocator, x, &parents, &cache);
+    defer res.deinit();
+    try res.out.eval();
+    try res.x_copy.eval();
+
+    // Cache untouched by the tree verify.
+    try std.testing.expectEqualSlices(f32, conv_before, try cache.conv_state.dataSlice(f32));
+    try std.testing.expectEqualSlices(f32, ssm_before, try cache.ssm_state.dataSlice(f32));
+    // x_copy is a verbatim copy of the input.
+    try std.testing.expectEqualSlices(f32, buf, try res.x_copy.dataSlice(f32));
+
+    const tree_out = try res.out.dataSlice(f32);
+    const h: usize = @intCast(hidden);
+
+    // Reference: for each node, an independent chain prefillVerify over its
+    // root-to-node path, starting from an identically dirtied cache. The
+    // tree output row for that node must equal the chain's last row.
+    const paths = [_][2]i32{ .{ 0, 0 }, .{ 0, 1 }, .{ 0, 2 } };
+    for (paths, 0..) |path, node| {
+        var g_ref = try makeTestModule(allocator, ctx, dims);
+        defer g_ref.deinit();
+        var cache_ref = try Qwen38GdnCache.init(allocator, dims.conv_kernel, (2 * dims.key_heads + dims.value_heads) * dims.head_dim, dims.value_heads, dims.head_dim);
+        defer cache_ref.deinit();
+        {
+            const x0 = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, hidden }, &[_]i32{ 1, 1, 1 });
+            defer x0.deinit();
+            const x0f = try ops.reshape(ctx, x0, &[_]i32{ 1, hidden });
+            defer x0f.deinit();
+            const o0 = try g_ref.forward(x0f, &cache_ref);
+            defer o0.deinit();
+            try o0.eval();
+        }
+        var x_path: Array = undefined;
+        if (path[0] == path[1]) {
+            x_path = try ops.slice(ctx, x, &[_]i32{ 0, path[0], 0 }, &[_]i32{ 1, path[0] + 1, hidden }, &[_]i32{ 1, 1, 1 });
+        } else {
+            const r0 = try ops.slice(ctx, x, &[_]i32{ 0, path[0], 0 }, &[_]i32{ 1, path[0] + 1, hidden }, &[_]i32{ 1, 1, 1 });
+            defer r0.deinit();
+            const r1 = try ops.slice(ctx, x, &[_]i32{ 0, path[1], 0 }, &[_]i32{ 1, path[1] + 1, hidden }, &[_]i32{ 1, 1, 1 });
+            defer r1.deinit();
+            x_path = try shape_mod.concatenateAxis(ctx, &[_]Array{ r0, r1 }, 1);
+        }
+        defer x_path.deinit();
+        var res_ref = try g_ref.prefillVerify(allocator, x_path, &cache_ref);
+        defer res_ref.deinit(allocator);
+        try res_ref.out.eval();
+        const ref_out = try res_ref.out.dataSlice(f32);
+        const L: usize = @intCast(x_path.shape()[1]);
+        const exp_row = ref_out[(L - 1) * h .. L * h];
+        const got_row = tree_out[node * h .. (node + 1) * h];
+        for (exp_row, got_row) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
 }
 
 test "Qwen38GDN.prefillVerify fused: s_all commit matches prefix prefill" {
