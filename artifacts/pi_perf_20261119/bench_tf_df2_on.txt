@@ -1,0 +1,3 @@
+tf-df2-on                short          prompt~   65tok ttft=  1.09s decode=   9.2 tok/s n=97 wall=  11.5s
+tf-df2-on                mid-2k         prompt~ 2133tok ttft= 23.54s decode=   8.1 tok/s n=87 wall=  34.1s
+tf-df2-on                long-8k        prompt~ 8493tok ttft= 72.63s decode=   6.5 tok/s n=91 wall=  86.6s
