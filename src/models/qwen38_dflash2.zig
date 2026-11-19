@@ -18,6 +18,7 @@
 const std = @import("std");
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
+const eval_mod = @import("mlx").eval;
 const shape_mod = @import("mlx").shape;
 const fast_mod = @import("mlx").fast;
 const activations = @import("mlx").activations;
@@ -772,6 +773,236 @@ pub fn selectGreedyGpu(
 }
 
 // ---------------------------------------------------------------------------
+// Host-side tree candidate selector (stage A / U1)
+// ---------------------------------------------------------------------------
+
+/// Flat topological-order draft tree produced by selectTree. `tokens`
+/// excludes the anchor; `parents[i]` is -1 for anchor children, otherwise an
+/// index into `tokens` (always < i). `positions[i] = anchor_pos + depth[i]`
+/// is the absolute RoPE position of the node.
+pub const DraftTree = struct {
+    tokens: []u32, // [N] flat node order (topological), without anchor
+    parents: []i32, // [N]: -1 = child of the anchor, else a tokens index
+    positions: []i32, // [N]: absolute rope position = anchor_pos + depth
+    depth: []u8, // [N]: 1-based depth (<= block_size - 1)
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *DraftTree) void {
+        self.allocator.free(self.tokens);
+        self.allocator.free(self.parents);
+        self.allocator.free(self.positions);
+        self.allocator.free(self.depth);
+    }
+};
+
+/// Edge-score weight for tree node ranking: the greedy chain scores
+/// unary + edge (selectGreedy); the tree discounts the codebook edge term.
+const tree_edge_weight: f32 = 0.6;
+
+/// Best-first tree selector. The GPU front half is identical to
+/// selectGreedy (top-k candidates, unary logits, hidden projection) plus a
+/// gather of the codebook rows for every candidate; all of it is read back
+/// to the host with a single asyncEval. Tree expansion then runs on the
+/// host. The greedy chain (unary + edge argmax, exactly selectGreedy's
+/// scoring) is seeded first so the chain is always a sub-path of the tree;
+/// the remaining budget is spent best-first: the highest-scoring unexpanded
+/// frontier node expands its top min(children, K) children, where
+/// score(child) = score(parent) + unary + tree_edge_weight * edge and
+/// edge = sum_r pcb[parent_tok][r] * hp[row][r] * scb[cand_tok][r]
+/// (depth-1 children use the anchor's pcb row). At most max_nodes nodes,
+/// depth <= P = block_size - 1.
+pub fn selectTree(
+    ctx: EagerContext,
+    m: *const DFlash2,
+    hidden: Array, // [1, P, H]
+    logits: Array, // [1, P, V]
+    anchor: u32,
+    anchor_pos: i64, // ring.fed
+    max_nodes: usize, // <= 15
+    children: usize, // <= 4
+) !DraftTree {
+    const P: usize = @intCast(logits.shape()[1]);
+    const V: i32 = logits.shape()[2];
+    const K: usize = m.cfg.selector_top_k;
+    const R: usize = m.cfg.selector_rank;
+    std.debug.assert(K <= 64);
+    const Pi: i32 = @intCast(P);
+    const Ki: i32 = @intCast(K);
+    const allocator = ctx.allocator;
+
+    const order = try sort_mod.argsortAxis(ctx, logits, -1); // ascending
+    defer order.deinit();
+    const candidates = try ops.slice(ctx, order, &[_]i32{ 0, 0, V - Ki }, &[_]i32{ 1, Pi, V }, &[_]i32{ 1, 1, 1 });
+    defer candidates.deinit();
+    const cand_i32 = try ops.astype(ctx, candidates, .int32);
+    defer cand_i32.deinit();
+    const cand_flat = try ops.reshape(ctx, cand_i32, &[_]i32{@intCast(P * K)});
+    defer cand_flat.deinit();
+    const unary = try shape_mod.takeAlongAxis(ctx, logits, cand_i32, -1); // [1,P,K]
+    defer unary.deinit();
+    const unary_f = try ops.astype(ctx, unary, .float32);
+    defer unary_f.deinit();
+    const hp = try m.selector_hidden_projection.apply(ctx, hidden); // [1,P,R]
+    defer hp.deinit();
+    const hp_f = try ops.astype(ctx, hp, .float32);
+    defer hp_f.deinit();
+    const scb_rows = try shape_mod.takeAxis(ctx, m.successor_codebook, cand_flat, 0); // [P*K,R]
+    defer scb_rows.deinit();
+    const scb_f = try ops.astype(ctx, scb_rows, .float32);
+    defer scb_f.deinit();
+    const pcb_rows = try shape_mod.takeAxis(ctx, m.predecessor_codebook, cand_flat, 0); // [P*K,R]
+    defer pcb_rows.deinit();
+    const pcb_f = try ops.astype(ctx, pcb_rows, .float32);
+    defer pcb_f.deinit();
+    const anchor_arr = try Array.fromData(allocator, i32, &[_]i32{@intCast(anchor)}, &[_]i32{1});
+    defer anchor_arr.deinit();
+    const pcb_anchor = try shape_mod.takeAxis(ctx, m.predecessor_codebook, anchor_arr, 0); // [1,R]
+    defer pcb_anchor.deinit();
+    const pcb_anchor_f = try ops.astype(ctx, pcb_anchor, .float32);
+    defer pcb_anchor_f.deinit();
+
+    try eval_mod.asyncEval(allocator, &[_]Array{ cand_flat, unary_f, hp_f, scb_f, pcb_f, pcb_anchor_f });
+    const cand_h = try cand_flat.dataSlice(i32); // [P*K]
+    const unary_h = try unary_f.dataSlice(f32); // [P*K]
+    const hp_h = try hp_f.dataSlice(f32); // [P*R]
+    const scb_h = try scb_f.dataSlice(f32); // [P*K*R]
+    const pcb_h = try pcb_f.dataSlice(f32); // [P*K*R]
+    const pcb_anchor_h = try pcb_anchor_f.dataSlice(f32); // [R]
+
+    // Host build. Internal node 0 is the anchor; output arrays exclude it.
+    var itokens = std.ArrayList(u32).empty;
+    defer itokens.deinit(allocator);
+    var iparents = std.ArrayList(i32).empty;
+    defer iparents.deinit(allocator);
+    var idepth = std.ArrayList(u8).empty;
+    defer idepth.deinit(allocator);
+    var iscore = std.ArrayList(f32).empty;
+    defer iscore.deinit(allocator);
+    var ipcb = std.ArrayList(usize).empty; // f32 offset into pcb_h; maxInt = anchor row
+    defer ipcb.deinit(allocator);
+    var expanded = std.ArrayList(bool).empty;
+    defer expanded.deinit(allocator);
+
+    try itokens.append(allocator, anchor);
+    try iparents.append(allocator, -1);
+    try idepth.append(allocator, 0);
+    try iscore.append(allocator, 0);
+    try ipcb.append(allocator, std.math.maxInt(usize));
+    try expanded.append(allocator, false);
+
+    const nodePcb = struct {
+        fn f(off: usize, anchor_row: []const f32, rows: []const f32, r: usize) []const f32 {
+            return if (off == std.math.maxInt(usize)) anchor_row else rows[off..][0..r];
+        }
+    }.f;
+    const edgeScore = struct {
+        fn f(pcb_row: []const f32, hp_row: []const f32, scb_row: []const f32) f32 {
+            var e: f32 = 0;
+            for (pcb_row, hp_row, scb_row) |a, b, c2| e += a * b * c2;
+            return e;
+        }
+    }.f;
+
+    // Phase 1: seed the greedy chain so it is always a sub-path of the tree.
+    // Chain scoring is selectGreedy's (unary + edge, weight 1.0); the stored
+    // node score for frontier ranking discounts the edge term.
+    var cur: usize = 0;
+    for (0..P) |d| {
+        if (itokens.items.len - 1 >= max_nodes) break;
+        const pcb_u = nodePcb(ipcb.items[cur], pcb_anchor_h, pcb_h, R);
+        const hp_row = hp_h[d * R ..][0..R];
+        var bk: usize = 0;
+        var bscore: f32 = 0;
+        var bedge: f32 = 0;
+        for (0..K) |k| {
+            const e = edgeScore(pcb_u, hp_row, scb_h[(d * K + k) * R ..][0..R]);
+            const s = unary_h[d * K + k] + e;
+            if (k == 0 or s > bscore) {
+                bk = k;
+                bscore = s;
+                bedge = e;
+            }
+        }
+        try itokens.append(allocator, @intCast(cand_h[d * K + bk]));
+        try iparents.append(allocator, @intCast(cur));
+        try idepth.append(allocator, @intCast(d + 1));
+        try iscore.append(allocator, iscore.items[cur] + unary_h[d * K + bk] + tree_edge_weight * bedge);
+        try ipcb.append(allocator, (d * K + bk) * R);
+        try expanded.append(allocator, false);
+        cur = itokens.items.len - 1;
+    }
+
+    // Phase 2: spend the remaining budget best-first on the frontier.
+    while (itokens.items.len - 1 < max_nodes) {
+        // Frontier: highest-score unexpanded node that can still deepen.
+        var best: ?usize = null;
+        for (iscore.items, 0..) |s, i| {
+            if (expanded.items[i] or idepth.items[i] >= P) continue;
+            if (best == null or s > iscore.items[best.?]) best = i;
+        }
+        const u = best orelse break;
+        expanded.items[u] = true;
+        const d: usize = idepth.items[u];
+        const pcb_u = nodePcb(ipcb.items[u], pcb_anchor_h, pcb_h, R);
+        const hp_row = hp_h[d * R ..][0..R];
+
+        var cscore: [64]f32 = undefined;
+        for (0..K) |k| {
+            cscore[k] = unary_h[d * K + k] + tree_edge_weight * edgeScore(pcb_u, hp_row, scb_h[(d * K + k) * R ..][0..R]);
+        }
+        const budget = max_nodes - (itokens.items.len - 1);
+        const take = @min(@min(children, K), budget);
+        var used = [_]bool{false} ** 64;
+        var added: usize = 0;
+        while (added < take) {
+            var bk: ?usize = null;
+            for (0..K) |k| {
+                if (used[k]) continue;
+                if (bk == null or cscore[k] > cscore[bk.?]) bk = k;
+            }
+            const kk = bk orelse break;
+            used[kk] = true;
+            const ctok: u32 = @intCast(cand_h[d * K + kk]);
+            // Skip candidates already added as a child of this node (the
+            // seeded chain child may coincide with a top-scoring one).
+            var dup = false;
+            for (itokens.items, 0..) |t, i| {
+                if (i != 0 and iparents.items[i] == @as(i32, @intCast(u)) and t == ctok) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            try itokens.append(allocator, ctok);
+            try iparents.append(allocator, @intCast(u));
+            try idepth.append(allocator, @intCast(d + 1));
+            try iscore.append(allocator, iscore.items[u] + cscore[kk]);
+            try ipcb.append(allocator, (d * K + kk) * R);
+            try expanded.append(allocator, false);
+            added += 1;
+        }
+    }
+
+    const n = itokens.items.len - 1;
+    const tokens = try allocator.alloc(u32, n);
+    errdefer allocator.free(tokens);
+    const parents = try allocator.alloc(i32, n);
+    errdefer allocator.free(parents);
+    const positions = try allocator.alloc(i32, n);
+    errdefer allocator.free(positions);
+    const depths = try allocator.alloc(u8, n);
+    errdefer allocator.free(depths);
+    for (0..n) |i| {
+        tokens[i] = itokens.items[i + 1];
+        const p = iparents.items[i + 1];
+        parents[i] = if (p == 0) -1 else p - 1;
+        depths[i] = idepth.items[i + 1];
+        positions[i] = @intCast(anchor_pos + @as(i64, depths[i]));
+    }
+    return .{ .tokens = tokens, .parents = parents, .positions = positions, .depth = depths, .allocator = allocator };
+}
+
+// ---------------------------------------------------------------------------
 // Draft context store (Task 7)
 // ---------------------------------------------------------------------------
 
@@ -1519,6 +1750,222 @@ test "DFlash2 full block draft + greedy selector match golden trace" {
         try std.testing.expectEqual(@as(u32, @intCast(exp)), got);
     }
     // The strict end-to-end criterion: identical greedy token sequence.
+}
+
+test "DFlash2 selectTree: greedy chain is a lossless sub-path, parents closed, bounded" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const cfg = try testCfgFromMeta(meta);
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
+    defer m.deinit();
+    const embed_w = try index.loadTensor("embed_tokens.weight");
+    defer embed_w.deinit();
+    const lm_w = try index.loadTensor("lm_head.weight");
+    defer lm_w.deinit();
+    const lm_head: MtpLinear = .{ .w = lm_w };
+
+    const ctx_hidden = try loadTraceTensor(allocator, "ctx_hidden");
+    defer ctx_hidden.deinit();
+    const block_ids_t = try loadTraceTensor(allocator, "block_ids");
+    defer block_ids_t.deinit();
+    const block_ids = try ops.reshape(ctx, block_ids_t, &[_]i32{@intCast(cfg.block_size)});
+    defer block_ids.deinit();
+    const block_ids_i32 = try ops.astype(ctx, block_ids, .int32);
+    defer block_ids_i32.deinit();
+
+    const hidden_full = try blockHidden(ctx, &m, embed_w, block_ids_i32, ctx_hidden);
+    defer hidden_full.deinit();
+    const P: i32 = @intCast(cfg.block_size - 1);
+    const H: i32 = @intCast(cfg.hidden_size);
+    const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+    defer draft_hidden.deinit();
+    const logits = try lm_head.apply(ctx, draft_hidden);
+    defer logits.deinit();
+
+    const anchor: u32 = 42;
+    const anchor_pos: i64 = 13; // ring.fed after observing the 13 ctx rows
+    var chain: [7]u32 = undefined;
+    try selectGreedy(ctx, &m, draft_hidden, logits, anchor, &chain);
+    var tree = try selectTree(ctx, &m, draft_hidden, logits, anchor, anchor_pos, 15, 4);
+    defer tree.deinit();
+
+    // (c) node budget.
+    try std.testing.expect(tree.tokens.len <= 15);
+    try std.testing.expect(tree.tokens.len > 0);
+
+    // (b) parents closed: every parent index < its own index; depth and
+    // position consistent along the parents chain.
+    for (tree.parents, 0..) |p, i| {
+        try std.testing.expect(p >= -1 and p < @as(i32, @intCast(i)));
+        if (p == -1) {
+            try std.testing.expectEqual(@as(u8, 1), tree.depth[i]);
+        } else {
+            try std.testing.expectEqual(tree.depth[@intCast(p)] + 1, tree.depth[i]);
+        }
+        try std.testing.expect(tree.depth[i] <= cfg.block_size - 1);
+        try std.testing.expectEqual(anchor_pos + @as(i64, tree.depth[i]), @as(i64, tree.positions[i]));
+    }
+
+    // (a) losslessness: the greedy chain is a root-to-node path in the tree.
+    var cur: i32 = -1;
+    for (chain, 1..) |tok, d| {
+        var found: ?usize = null;
+        for (tree.tokens, 0..) |t, i| {
+            if (tree.parents[i] == cur and tree.depth[i] == d and t == tok) {
+                found = i;
+                break;
+            }
+        }
+        try std.testing.expect(found != null);
+        cur = @intCast(found.?);
+    }
+}
+
+test "DFlash2 selectTree: offline E[t] simulation vs greedy chain" {
+    const c_mod = @import("mlx").c;
+    c_mod.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const cfg_raw = @embedFile("testdata/dflash2/meta.json");
+    var meta = try std.json.parseFromSlice(std.json.Value, allocator, cfg_raw, .{});
+    defer meta.deinit();
+    const cfg = try testCfgFromMeta(meta);
+
+    var index = safetensors_reader.TensorIndex.init(allocator);
+    defer index.deinit();
+    try index.addShard(test_golden_dir ++ "/model.safetensors");
+    var m = try DFlash2.loadFromSource(allocator, ctx, WeightSource.fromIndex(&index), cfg, 0);
+    defer m.deinit();
+    const embed_w = try index.loadTensor("embed_tokens.weight");
+    defer embed_w.deinit();
+    const lm_w = try index.loadTensor("lm_head.weight");
+    defer lm_w.deinit();
+    const lm_head: MtpLinear = .{ .w = lm_w };
+
+    const ctx_hidden = try loadTraceTensor(allocator, "ctx_hidden");
+    defer ctx_hidden.deinit();
+    const block_ids_t = try loadTraceTensor(allocator, "block_ids");
+    defer block_ids_t.deinit();
+    const block_ids = try ops.reshape(ctx, block_ids_t, &[_]i32{@intCast(cfg.block_size)});
+    defer block_ids.deinit();
+    const block_ids_i32 = try ops.astype(ctx, block_ids, .int32);
+    defer block_ids_i32.deinit();
+
+    const hidden_full = try blockHidden(ctx, &m, embed_w, block_ids_i32, ctx_hidden);
+    defer hidden_full.deinit();
+    const P: usize = cfg.block_size - 1;
+    const Pi: i32 = @intCast(P);
+    const H: i32 = @intCast(cfg.hidden_size);
+    const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, Pi + 1, H }, &[_]i32{ 1, 1, 1 });
+    defer draft_hidden.deinit();
+    const logits = try lm_head.apply(ctx, draft_hidden);
+    defer logits.deinit();
+
+    var chain: [7]u32 = undefined;
+    try selectGreedy(ctx, &m, draft_hidden, logits, 42, &chain);
+    var tree = try selectTree(ctx, &m, draft_hidden, logits, 42, 13, 15, 4);
+    defer tree.deinit();
+
+    // Host copy of the block logits: the offline target proxy. The golden
+    // fixture has no separate backbone, so the target continuation at depth p
+    // is drawn from softmax(logits[0][p]) (or its argmax) — the drafter's own
+    // distribution is the only offline signal available.
+    const V: usize = @intCast(logits.shape()[2]);
+    const logits_f = try ops.astype(ctx, logits, .float32);
+    defer logits_f.deinit();
+    try logits_f.eval();
+    const lg = try logits_f.dataSlice(f32); // [P*V]
+
+    const treeAccepted = struct {
+        fn f(tokens: []const u32, parents: []const i32, depth: []const u8, target: []const u32) usize {
+            var best: usize = 0;
+            var mlen: [64]usize = undefined;
+            for (tokens, 0..) |t, i| {
+                const d: usize = depth[i];
+                const parent_ok = parents[i] == -1 or mlen[@intCast(parents[i])] == d - 1;
+                mlen[i] = if (parent_ok and t == target[d - 1]) d else 0;
+                best = @max(best, mlen[i]);
+            }
+            return best;
+        }
+    }.f;
+    const chainAccepted = struct {
+        fn f(chain_tokens: []const u32, target: []const u32) usize {
+            for (chain_tokens, 0..) |t, i| {
+                if (t != target[i]) return i;
+            }
+            return chain_tokens.len;
+        }
+    }.f;
+
+    // Deterministic argmax target.
+    var target_am: [7]u32 = undefined;
+    for (0..P) |p| {
+        var bi: usize = 0;
+        for (1..V) |v| {
+            if (lg[p * V + v] > lg[p * V + bi]) bi = v;
+        }
+        target_am[p] = @intCast(bi);
+    }
+    const det_chain = chainAccepted(&chain, &target_am);
+    const det_tree = treeAccepted(tree.tokens, tree.parents, tree.depth, &target_am);
+    // Silent by default: the build runner replays captured stderr as a
+    // spurious "failed command" block. DFLASH2_SIM_PRINT=1 prints numbers.
+    const verbose = std.c.getenv("DFLASH2_SIM_PRINT") != null;
+    if (verbose) std.debug.print("dflash2 E[t] sim (argmax target): chain={d} tree={d}\n", .{ det_chain, det_tree });
+    try std.testing.expect(det_tree >= det_chain);
+
+    // Sampled target: target[p] ~ softmax(logits[0][p] / temp).
+    const trials = 20000;
+    var rng = std.Random.DefaultPrng.init(20261119);
+    const temps = [_]f32{ 1.0, 0.1 };
+    for (temps) |temp| {
+        var cum = try allocator.alloc(f64, P * V);
+        defer allocator.free(cum);
+        for (0..P) |p| {
+            var mx: f32 = lg[p * V];
+            for (1..V) |v| mx = @max(mx, lg[p * V + v]);
+            var acc: f64 = 0;
+            for (0..V) |v| {
+                acc += @exp(@as(f64, lg[p * V + v] - mx) / temp);
+                cum[p * V + v] = acc;
+            }
+            for (0..V) |v| cum[p * V + v] /= acc;
+        }
+        var sum_chain: usize = 0;
+        var sum_tree: usize = 0;
+        var target: [7]u32 = undefined;
+        for (0..trials) |_| {
+            for (0..P) |p| {
+                const u = rng.random().float(f64);
+                const row = cum[p * V ..][0..V];
+                var lo: usize = 0;
+                var hi: usize = V - 1;
+                while (lo < hi) {
+                    const mid = (lo + hi) / 2;
+                    if (u <= row[mid]) hi = mid else lo = mid + 1;
+                }
+                target[p] = @intCast(lo);
+            }
+            sum_chain += chainAccepted(&chain, &target);
+            sum_tree += treeAccepted(tree.tokens, tree.parents, tree.depth, &target);
+        }
+        const et_chain = @as(f64, @floatFromInt(sum_chain)) / trials;
+        const et_tree = @as(f64, @floatFromInt(sum_tree)) / trials;
+        if (verbose) std.debug.print("dflash2 E[t] sim (sampled target, temp={d:.1}, {d} trials): chain={d:.3} tree={d:.3} delta={d:.3}\n", .{ temp, trials, et_chain, et_tree, et_tree - et_chain });
+        try std.testing.expect(et_tree >= et_chain);
+    }
 }
 
 test "DFlash2Context ring: observe + masked draft matches dense golden path" {
