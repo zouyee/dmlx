@@ -1710,6 +1710,43 @@ pub fn buildRowCosSin(
     return .{ .cos = cos_arr, .sin = sin_arr };
 }
 
+/// DFlash2 tree-verify commit: compact the verify region [old_len, len_) of
+/// the KV slabs down to the accepted path's rows. `path_rows` are row
+/// indices within the verify region (0-based from old_len), gathered in path
+/// order into [old_len, old_len + k); len_ becomes old_len + k. An empty
+/// path is a plain rollback (len_ = old_len).
+pub fn compactAttnCache(ctx: EagerContext, cache: *Qwen38AttnCache, old_len: i32, path_rows: []const usize) !void {
+    const k = path_rows.len;
+    if (k == 0) {
+        cache.len_ = old_len;
+        return;
+    }
+    const idx_buf = try ctx.allocator.alloc(i32, k);
+    defer ctx.allocator.free(idx_buf);
+    for (path_rows, 0..) |r, i| idx_buf[i] = old_len + @as(i32, @intCast(r));
+    const idx = try Array.fromData(ctx.allocator, i32, idx_buf, &[_]i32{@intCast(k)});
+    defer idx.deinit();
+    const HKV = cache.keys.?.shape()[1];
+    const D = cache.keys.?.shape()[3];
+    // Gather first, then overwrite: the taken rows are independent lazy
+    // nodes, so the slice_update back into the slab is not self-aliasing.
+    const k_taken = try shape_mod.takeAxis(ctx, cache.keys.?, idx, 2);
+    defer k_taken.deinit();
+    const v_taken = try shape_mod.takeAxis(ctx, cache.values.?, idx, 2);
+    defer v_taken.deinit();
+    const new_len = old_len + @as(i32, @intCast(k));
+    const start = &[_]i32{ 0, 0, old_len, 0 };
+    const stop = &[_]i32{ 1, HKV, new_len, D };
+    const ones = &[_]i32{ 1, 1, 1, 1 };
+    const k_new = try shape_mod.sliceUpdate(ctx, cache.keys.?, k_taken, start, stop, ones);
+    cache.keys.?.deinit();
+    cache.keys = k_new;
+    const v_new = try shape_mod.sliceUpdate(ctx, cache.values.?, v_taken, start, stop, ones);
+    cache.values.?.deinit();
+    cache.values = v_new;
+    cache.len_ = new_len;
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,

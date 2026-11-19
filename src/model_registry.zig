@@ -900,6 +900,8 @@ pub const Qwen38VTableAdapter = struct {
     /// still verify a shorter prefix per round.
     fn dflash2Enable(self: *Qwen38VTableAdapter, dir: []const u8) anyerror!bool {
         self.mtp_ops.num_drafts = 7;
+        self.mtp_ops.verifyTree = &mtpVerifyTree;
+        self.mtp_ops.commitTree = &mtpCommitTree;
         if (self.dflash2 != null) return true;
         std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
         const m = try self.allocator.create(qwen38_dflash2.DFlash2);
@@ -1515,6 +1517,60 @@ pub const Qwen38VTableAdapter = struct {
         }
         box.* = try qwen38.forwardVerifyImpl(self.model, ids, null);
         return box;
+    }
+
+    /// DFlash2 tree verify (U4): wrap the flat tree slices into a DraftTree
+    /// (depth derived from parents; topological order guaranteed by
+    /// selectTree) and run the backbone tree verify with the hidden tap.
+    fn mtpVerifyTree(ctx_ptr: *anyopaque, tokens: []const u32, parents: []const i32, positions: []const i32, anchor: u32) anyerror!generation.MtpVerifyHandle {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 == null) return error.TreeVerifyUnavailable;
+        const n = tokens.len;
+        if (parents.len != n or positions.len != n) return error.TreeShapeMismatch;
+        const box = try self.allocator.create(qwen38.Qwen38TreeVerifyOut);
+        errdefer self.allocator.destroy(box);
+        const tree = blk: {
+            const toks = try self.allocator.dupe(u32, tokens);
+            errdefer self.allocator.free(toks);
+            const pars = try self.allocator.dupe(i32, parents);
+            errdefer self.allocator.free(pars);
+            const poss = try self.allocator.dupe(i32, positions);
+            errdefer self.allocator.free(poss);
+            const deps = try self.allocator.alloc(u8, n);
+            errdefer self.allocator.free(deps);
+            for (0..n) |i| {
+                const p = parents[i];
+                if (p >= 0 and @as(usize, @intCast(p)) >= i) return error.TreeParentOrder;
+                deps[i] = if (p < 0) 1 else deps[@intCast(p)] + 1;
+            }
+            break :blk qwen38_dflash2.DraftTree{
+                .tokens = toks,
+                .parents = pars,
+                .positions = poss,
+                .depth = deps,
+                .allocator = self.allocator,
+            };
+        };
+        // On error forwardVerifyTree deinits the tree itself.
+        var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
+        errdefer tap.deinit();
+        box.* = try qwen38.forwardVerifyTree(self.model, tree, anchor, &tap);
+        return box;
+    }
+
+    /// Commit the accepted path (verify-row indices) and free the handle.
+    /// Drafter-side context bookkeeping is the engine's job (U5); a full
+    /// rollback is model-level `rollbackVerifyTree`, not yet exposed here.
+    fn mtpCommitTree(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted_path: []const usize) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        const v: *qwen38.Qwen38TreeVerifyOut = @ptrCast(@alignCast(handle));
+        qwen38.commitVerifyTree(self.model, v, accepted_path);
+        v.deinit(self.allocator);
+        self.allocator.destroy(v);
     }
 
     fn mtpVerifyLogits(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {

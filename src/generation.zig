@@ -181,6 +181,16 @@ pub const MtpOps = struct {
     /// per-row sampler round-trips (each pulls the full vocab to CPU).
     /// Null → the engine falls back to per-row sampling.
     verifyArgmax: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) anyerror!Array = null,
+    /// DFlash2 tree verify (U4): verify a flat topological-order draft tree
+    /// (`parents[i]` = -1 for anchor children, else a tokens index;
+    /// `positions[i]` the node's absolute rope position; `anchor` is the
+    /// committed token the tree branches from). The handle's logits rows are
+    /// [anchor, tokens...] in flat order. Null → tree verify unavailable;
+    /// the engine falls back to chain rounds.
+    verifyTree: ?*const fn (ctx: *anyopaque, tokens: []const u32, parents: []const i32, positions: []const i32, anchor: u32) anyerror!MtpVerifyHandle = null,
+    /// Commit an accepted root-to-leaf path of a tree verify (verify-row
+    /// indices, 0 = anchor) and free the handle.
+    commitTree: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted_path: []const usize) void = null,
     /// Pre-final-norm hidden row i of the verify handle → [1, hidden] (owned).
     verifyHidden: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
     /// Commit `accepted` ∈ 1..L verify positions (backbone + drafter caches).

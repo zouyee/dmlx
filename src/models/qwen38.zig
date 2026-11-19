@@ -23,6 +23,7 @@ const glm53_attn = @import("glm53_attention.zig");
 const qwen38_loader = @import("qwen38_loader.zig");
 const qwen38_gdn = @import("qwen38_gdn.zig");
 const qwen38_attn = @import("qwen38_attn.zig");
+const qwen38_dflash2 = @import("qwen38_dflash2.zig");
 const qwen38_mrope = @import("qwen38_mrope.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const closure_mod = @import("mlx").closure;
@@ -3391,6 +3392,265 @@ pub fn forwardVerifyImpl(self: *Qwen38ServingModel, ids: []const u32, tap: ?*Qwe
     };
 }
 
+/// Tree-verify output (DFlash2 U4). Same field contract as Qwen38VerifyOut
+/// so commit/rollback mirror the chain path; `gdn[i]` holds the tree result
+/// (out + x_copy) for GDN layer `gdn_layers[i]`, and `tree` is the draft
+/// tree the pass ran (ownership moved in from the caller). Verify row 0 is
+/// the anchor token; row i+1 is tree node i.
+pub const Qwen38TreeVerifyOut = struct {
+    logits: Array, // [1, 1+N, vocab], lm_head dtype (bf16)
+    /// Pre-final-norm hidden states for all 1+N rows [1, 1+N, hidden] bf16.
+    hidden_pre_norm_all: Array,
+    gdn: []qwen38_gdn.Qwen38GDN.TreeVerifyResult,
+    gdn_layers: []usize,
+    attn_old_lens: []i32,
+    attn_layers: []usize,
+    tree: qwen38_dflash2.DraftTree,
+    /// DFlash2 tap rows [1, 1+N, 5*hidden] bf16 when a HiddenTap was passed.
+    tap_hidden: ?Array = null,
+
+    pub fn deinit(self: *Qwen38TreeVerifyOut, allocator: std.mem.Allocator) void {
+        self.logits.deinit();
+        self.hidden_pre_norm_all.deinit();
+        if (self.tap_hidden) |t| t.deinit();
+        for (self.gdn) |*r| r.deinit();
+        allocator.free(self.gdn);
+        allocator.free(self.gdn_layers);
+        allocator.free(self.attn_old_lens);
+        allocator.free(self.attn_layers);
+        self.tree.deinit();
+    }
+};
+
+/// Tree-shaped verify pass (DFlash2 U4): identical dataflow to
+/// forwardVerifyImpl, but the verify sequence is [anchor] ++ tree.tokens
+/// with tree-structured visibility. Attention layers run forwardTree (bool
+/// ancestor mask + per-row rope positions from the tree); GDN layers run
+/// prefillVerifyTree (per-path eager recurrence, cache untouched). Attention
+/// KV for ALL nodes is appended; commitVerifyTree compacts the accepted
+/// path. Takes ownership of `tree` (returned inside the result).
+pub fn forwardVerifyTree(self: *Qwen38ServingModel, tree: qwen38_dflash2.DraftTree, anchor_token: u32, tap: ?*Qwen38ServingModel.HiddenTap) !Qwen38TreeVerifyOut {
+    const allocator = self.allocator;
+    const cfg = self.cfg;
+    const ctx = self.ctx;
+
+    var tree_owned = tree;
+    errdefer tree_owned.deinit();
+
+    const N = tree.tokens.len;
+    if (N == 0) return error.TreeVerifyEmpty;
+    const L = N + 1;
+
+    // Verify-row parents/positions: row 0 is the anchor (parent -1, branches
+    // from the committed context); node i sits at row i+1 with its parent
+    // shifted by one (anchor children point at row 0).
+    const parents_full = try allocator.alloc(i32, L);
+    defer allocator.free(parents_full);
+    parents_full[0] = -1;
+    for (tree.parents, 0..) |p, i| parents_full[i + 1] = if (p < 0) 0 else p + 1;
+    const positions_full = try allocator.alloc(i32, L);
+    defer allocator.free(positions_full);
+    // positions[i] = anchor_pos + depth[i] by DraftTree construction.
+    positions_full[0] = tree.positions[0] - @as(i32, tree.depth[0]);
+    for (tree.positions, 0..) |p, i| positions_full[i + 1] = p;
+    const pos_arr = try Array.fromData(allocator, i32, positions_full, &[_]i32{@intCast(L)});
+    defer pos_arr.deinit();
+
+    const ids = try allocator.alloc(u32, L);
+    defer allocator.free(ids);
+    ids[0] = anchor_token;
+    @memcpy(ids[1..], tree.tokens);
+    try rejectVisionTokens(ids);
+
+    // Same verify-qmm arming contract as forwardVerifyImpl (eager MLP while
+    // armed; see there).
+    verify_qmm.arm();
+    defer verify_qmm.disarm();
+    const routed = verify_qmm.isArmed();
+
+    const ids_i32 = try allocator.alloc(i32, L);
+    defer allocator.free(ids_i32);
+    for (ids, 0..) |t, i| ids_i32[i] = @intCast(t);
+
+    if (self.embed_table_bf16 == null) {
+        self.embed_table_bf16 = try Qwen38ServingModel.buildResidentEmbedTable(ctx, self.ws, @intCast(cfg.hidden_size));
+    }
+    const id_arr = try Array.fromData(allocator, i32, ids_i32, &[_]i32{@intCast(L)});
+    defer id_arr.deinit();
+    const rows = try shape_mod.takeAxis(ctx, self.embed_table_bf16.?, id_arr, 0);
+    defer rows.deinit();
+    const emb = try ops.reshape(ctx, rows, &[_]i32{ 1, @intCast(L), @intCast(cfg.hidden_size) });
+    defer emb.deinit();
+    var h = try ops.copy(ctx, emb); // bf16
+    errdefer h.deinit();
+
+    var gdn_results = std.ArrayList(qwen38_gdn.Qwen38GDN.TreeVerifyResult).empty;
+    errdefer {
+        for (gdn_results.items) |*r| r.deinit();
+        gdn_results.deinit(allocator);
+    }
+    var gdn_layers = std.ArrayList(usize).empty;
+    errdefer gdn_layers.deinit(allocator);
+    var attn_old_lens = std.ArrayList(i32).empty;
+    errdefer attn_old_lens.deinit(allocator);
+    var attn_layers = std.ArrayList(usize).empty;
+    errdefer attn_layers.deinit(allocator);
+
+    var normed1_carry: ?Array = null;
+    defer if (normed1_carry) |*nc| nc.deinit();
+
+    for (self.layers, 0..) |*lp, layer| {
+        const normed1 = if (normed1_carry) |nc| blk: {
+            normed1_carry = null;
+            break :blk nc;
+        } else try rmsNormOnly(ctx, h, lp.ln1_f32, cfg.rms_norm_eps);
+        defer normed1.deinit();
+        const attn_out = switch (lp.module) {
+            .gdn => |*g| blk: {
+                const cache = &self.caches[layer].gdn;
+                var res = try g.prefillVerifyTree(allocator, normed1, parents_full, cache);
+                errdefer res.deinit();
+                try gdn_results.append(allocator, res);
+                try gdn_layers.append(allocator, layer);
+                break :blk res.out; // owned by gdn_results now — no defer
+            },
+            .attn => |*a| blk: {
+                const cache = &self.caches[layer].attn;
+                try attn_old_lens.append(allocator, cache.len());
+                try attn_layers.append(allocator, layer);
+                const mask = try qwen38_attn.buildTreeMask(allocator, parents_full, cache.len());
+                defer mask.deinit();
+                break :blk try a.forwardTree(normed1, cache, .{ .mask = mask, .positions = pos_arr });
+            },
+        };
+        defer if (lp.module != .gdn) attn_out.deinit();
+        // h += attn_out, then rmsNorm(h, ln2) for the MLP branch.
+        const r1 = try addRmsNorm(ctx, h, attn_out, lp.ln2_f32, cfg.rms_norm_eps);
+        h.deinit();
+        h = r1.h;
+        const normed2 = r1.normed;
+        defer normed2.deinit();
+        const mlp_out = blk: {
+            if (!routed) {
+                if (self.mlp_swiglu_fused_compiled) |mc| {
+                    if (lp.mlp_gate_up != null) {
+                        if (applyMlpSwigluFused(allocator, mc, lp, normed2)) |mo| {
+                            break :blk mo;
+                        } else |_| {}
+                    }
+                }
+                if (self.mlp_swiglu_compiled) |mc| {
+                    if (applyMlpSwiglu(allocator, mc, lp, normed2)) |mo| {
+                        break :blk mo;
+                    } else |_| {}
+                }
+            }
+            break :blk try mlpForwardPersistent(ctx, lp, normed2);
+        };
+        defer mlp_out.deinit();
+        if (layer + 1 < self.layers.len) {
+            const r2 = try addRmsNorm(ctx, h, mlp_out, self.layers[layer + 1].ln1_f32, cfg.rms_norm_eps);
+            h.deinit();
+            h = r2.h;
+            normed1_carry = r2.normed;
+        } else {
+            const next = try ops.add(ctx, h, mlp_out);
+            h.deinit();
+            h = next;
+        }
+        if (tap) |t| try t.maybeCapture(ctx, layer, h);
+    }
+
+    // Capture pre-final-norm hidden for all rows (MTP chaining input).
+    const hidden_pre_norm_all = h; // [1, 1+N, hidden] bf16 — ownership moves out
+    errdefer hidden_pre_norm_all.deinit();
+
+    const h_f32 = try ops.astype(ctx, h, .float32);
+    defer h_f32.deinit();
+    const hidden_final_f32 = try fast_mod.rmsNorm(ctx, h_f32, self.final_norm_f32.?, cfg.rms_norm_eps);
+    defer hidden_final_f32.deinit();
+    const hidden_final = try ops.astype(ctx, hidden_final_f32, .bfloat16);
+    defer hidden_final.deinit();
+    const logits = try self.lm_head.?.apply(ctx, hidden_final);
+    errdefer logits.deinit();
+    // Lazy by default, same contract as forwardVerifyImpl.
+    if (std.c.getenv("DMLX_VERIFY_SYNC") != null) try logits.eval();
+
+    var tap_hidden: ?Array = null;
+    if (tap) |t| {
+        errdefer t.deinit();
+        tap_hidden = try t.finish(ctx);
+    }
+    return .{
+        .logits = logits,
+        .hidden_pre_norm_all = hidden_pre_norm_all,
+        .tap_hidden = tap_hidden,
+        .gdn = try gdn_results.toOwnedSlice(allocator),
+        .gdn_layers = try gdn_layers.toOwnedSlice(allocator),
+        .attn_old_lens = try attn_old_lens.toOwnedSlice(allocator),
+        .attn_layers = try attn_layers.toOwnedSlice(allocator),
+        .tree = tree_owned,
+    };
+}
+
+/// Commit an accepted root-to-node path of a tree verify. `accepted_path`
+/// are verify-row indices (0 = anchor) in root-to-leaf order.
+/// Attention: the verify region [old, old+1+N) of each KV slab is compacted
+/// to the path rows (compactAttnCache), len_ = old + k. GDN: the path's
+/// input rows (TreeVerifyResult.x_copy) are replayed through the layer's
+/// decode step from the cache's untouched root state, leaving conv/ssm at
+/// the path's terminal node — bit-identical to a chain commit of the same
+/// path.
+pub fn commitVerifyTree(self: *Qwen38ServingModel, v: *Qwen38TreeVerifyOut, accepted_path: []const usize) void {
+    const ctx = self.ctx;
+    const n_rows = v.tree.tokens.len + 1;
+    for (accepted_path) |row| {
+        if (row >= n_rows) {
+            std.log.err("commitVerifyTree: path row {d} out of range ({d} rows); commit aborted", .{ row, n_rows });
+            return;
+        }
+    }
+    for (v.attn_layers, v.attn_old_lens) |layer, old| {
+        qwen38_attn.compactAttnCache(ctx, &self.caches[layer].attn, old, accepted_path) catch |err| {
+            std.log.err("commitVerifyTree: attn compact failed ({})", .{err});
+        };
+    }
+    for (v.gdn, v.gdn_layers) |*r, layer| {
+        const g = &self.layers[layer].module.gdn;
+        const cache = &self.caches[layer].gdn;
+        const hidden: i32 = r.x_copy.shape()[2];
+        for (accepted_path) |row| {
+            const ri: i32 = @intCast(row);
+            const r5 = ops.slice(ctx, r.x_copy, &[_]i32{ 0, ri, 0 }, &[_]i32{ 1, ri + 1, hidden }, &[_]i32{ 1, 1, 1 }) catch |err| {
+                std.log.err("commitVerifyTree: GDN replay slice failed ({})", .{err});
+                break;
+            };
+            defer r5.deinit();
+            const flat = ops.reshape(ctx, r5, &[_]i32{ 1, hidden }) catch |err| {
+                std.log.err("commitVerifyTree: GDN replay reshape failed ({})", .{err});
+                break;
+            };
+            defer flat.deinit();
+            const out = g.forward(flat, cache) catch |err| {
+                std.log.err("commitVerifyTree: GDN replay step failed ({})", .{err});
+                break;
+            };
+            defer out.deinit();
+        }
+        // Bound the lazy graph: materialize the terminal states now.
+        cache.conv_state.eval() catch {};
+        cache.ssm_state.eval() catch {};
+    }
+}
+
+/// Discard a tree verify pass: attention lengths truncated back, GDN caches
+/// untouched (prefillVerifyTree never modified them).
+pub fn rollbackVerifyTree(self: *Qwen38ServingModel, v: *Qwen38TreeVerifyOut) void {
+    for (v.attn_layers, v.attn_old_lens) |layer, old| {
+        self.caches[layer].attn.len_ = old;
+    }
+}
+
 /// Commit `accepted` ∈ 1..L verify positions: GDN caches take the retained
 /// post-step-(accepted-1) states; attention caches keep old+accepted rows.
 /// Frees the GDN per-position lists inside `v` (v.deinit still required for
@@ -4028,6 +4288,218 @@ test "Qwen38ServingModel.forwardVerify: continuation, commit, rollback" {
         const got = try a32.dataSlice(f32);
         const exp = try b32.dataSlice(f32);
         for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+}
+
+test "Qwen38ServingModel.forwardVerifyTree: chain-degenerate, branch isolation, commit" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const fa = try allocator.dupe(u32, &[_]u32{1});
+    var cfg = qwen38_loader.Qwen38Config{
+        .allocator = allocator,
+        .hidden_size = 64,
+        .num_hidden_layers = 2,
+        .vocab_size = 64,
+        .intermediate_size = 128,
+        .num_attention_heads = 2,
+        .num_key_value_heads = 1,
+        .head_dim = 32,
+        .partial_rotary_factor = 0.25,
+        .linear_num_key_heads = 2,
+        .linear_num_value_heads = 8,
+        .linear_key_head_dim = 8,
+        .linear_value_head_dim = 8,
+        .full_attn_layers = fa,
+    };
+    defer cfg.deinit();
+
+    const mkModel = struct {
+        fn call(alloc: std.mem.Allocator, c2: EagerContext, c3: *qwen38_loader.Qwen38Config) !Qwen38ServingModel {
+            const hidden: i32 = 64;
+            const vocab: i32 = 64;
+            const inter: i32 = 128;
+            const gdn_qkv: i32 = 96;
+            const gdn_z: i32 = 64;
+            var map = std.StringHashMap(Array).init(alloc);
+            errdefer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    alloc.free(e.key_ptr.*);
+                    e.value_ptr.deinit();
+                }
+                map.deinit();
+            }
+            try putToyQuant(alloc, c2, &map, "language_model.model.embed_tokens", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.norm.weight", &[_]i32{hidden});
+            try putToyQuant(alloc, c2, &map, "language_model.lm_head", vocab, hidden);
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.0.post_attention_layernorm.weight", &[_]i32{hidden});
+            const la = "language_model.model.layers.0.linear_attn";
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_qkv", gdn_qkv, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_a", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_b", 8, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".in_proj_z", gdn_z, hidden);
+            try putToyQuant(alloc, c2, &map, la ++ ".out_proj", hidden, gdn_z);
+            try putToyTensor(alloc, &map, la ++ ".conv1d.weight", &[_]i32{ gdn_qkv, 4, 1 });
+            try putToyTensor(alloc, &map, la ++ ".A_log", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".dt_bias", &[_]i32{8});
+            try putToyTensor(alloc, &map, la ++ ".norm.weight", &[_]i32{8});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.0.mlp.down_proj", hidden, inter);
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.input_layernorm.weight", &[_]i32{hidden});
+            try putToyTensor(alloc, &map, "language_model.model.layers.1.post_attention_layernorm.weight", &[_]i32{hidden});
+            const sa = "language_model.model.layers.1.self_attn";
+            try putToyQuant(alloc, c2, &map, sa ++ ".q_proj", 128, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".k_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".v_proj", 32, hidden);
+            try putToyQuant(alloc, c2, &map, sa ++ ".o_proj", hidden, 64);
+            try putToyTensor(alloc, &map, sa ++ ".q_norm.weight", &[_]i32{32});
+            try putToyTensor(alloc, &map, sa ++ ".k_norm.weight", &[_]i32{32});
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.gate_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.up_proj", inter, hidden);
+            try putToyQuant(alloc, c2, &map, "language_model.model.layers.1.mlp.down_proj", hidden, inter);
+            var m = try Qwen38ServingModel.init(alloc, c2, c3, map);
+            m.ws = WeightSource.fromMap(&m.weights, c2, &m.ws_backing);
+            return m;
+        }
+    }.call;
+
+    const freeModel = struct {
+        fn call(alloc: std.mem.Allocator, m: *Qwen38ServingModel) void {
+            m.deinit();
+            var it = m.weights.iterator();
+            while (it.next()) |e| {
+                alloc.free(e.key_ptr.*);
+                e.value_ptr.deinit();
+            }
+            m.weights.deinit();
+        }
+    }.call;
+
+    const mkTree = struct {
+        fn call(alloc: std.mem.Allocator, tokens: []const u32, parents: []const i32, positions: []const i32, depth: []const u8) !qwen38_dflash2.DraftTree {
+            return .{
+                .tokens = try alloc.dupe(u32, tokens),
+                .parents = try alloc.dupe(i32, parents),
+                .positions = try alloc.dupe(i32, positions),
+                .depth = try alloc.dupe(u8, depth),
+                .allocator = alloc,
+            };
+        }
+    }.call;
+
+    // ---- Gate A3.1: a chain-parents "tree" matches the chain verify ----
+    {
+        var m_tree = try mkModel(allocator, ctx, &cfg);
+        defer freeModel(allocator, &m_tree);
+        var m_chain = try mkModel(allocator, ctx, &cfg);
+        defer freeModel(allocator, &m_chain);
+        (try m_tree.forwardTokens(&[_]u32{ 1, 2, 3 })).deinit();
+        (try m_chain.forwardTokens(&[_]u32{ 1, 2, 3 })).deinit();
+
+        const tree = try mkTree(allocator, &[_]u32{ 5, 6, 7 }, &[_]i32{ -1, 0, 1 }, &[_]i32{ 4, 5, 6 }, &[_]u8{ 1, 2, 3 });
+        var vt = try forwardVerifyTree(&m_tree, tree, 4, null);
+        defer vt.deinit(allocator);
+        var vc = try forwardVerifyImpl(&m_chain, &[_]u32{ 4, 5, 6, 7 }, null);
+        defer vc.deinit(allocator);
+
+        try std.testing.expectEqual(@as(i32, 4), vt.logits.shape()[1]);
+        const got_f32 = try ops.astype(ctx, vt.logits, .float32);
+        defer got_f32.deinit();
+        const exp_f32 = try ops.astype(ctx, vc.logits, .float32);
+        defer exp_f32.deinit();
+        const got = try got_f32.dataSlice(f32);
+        const exp = try exp_f32.dataSlice(f32);
+        try std.testing.expectEqual(exp.len, got.len);
+        for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+
+        const gh = try ops.astype(ctx, vt.hidden_pre_norm_all, .float32);
+        defer gh.deinit();
+        const eh = try ops.astype(ctx, vc.hidden_pre_norm_all, .float32);
+        defer eh.deinit();
+        const ghs = try gh.dataSlice(f32);
+        const ehs = try eh.dataSlice(f32);
+        try std.testing.expectEqual(ehs.len, ghs.len);
+        for (ehs, ghs) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+
+        // Rollback restores both models: decode 4 matches a fresh 3-prefill.
+        rollbackVerifyTree(&m_tree, &vt);
+        rollbackVerify(&m_chain, &vc);
+        const lt = try m_tree.forwardTokens(&[_]u32{4});
+        defer lt.deinit();
+        const lc = try m_chain.forwardTokens(&[_]u32{4});
+        defer lc.deinit();
+        const ltf = try ops.astype(ctx, lt, .float32);
+        defer ltf.deinit();
+        const lcf = try ops.astype(ctx, lc, .float32);
+        defer lcf.deinit();
+        const lg = try ltf.dataSlice(f32);
+        const le = try lcf.dataSlice(f32);
+        for (le, lg) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    }
+
+    // ---- Gate A3.2: branch isolation + tree commit == chain commit ----
+    {
+        var mt = try mkModel(allocator, ctx, &cfg);
+        defer freeModel(allocator, &mt);
+        var mc = try mkModel(allocator, ctx, &cfg);
+        defer freeModel(allocator, &mc);
+        var ma = try mkModel(allocator, ctx, &cfg);
+        defer freeModel(allocator, &ma);
+        (try mt.forwardTokens(&[_]u32{ 1, 2, 3 })).deinit();
+        (try mc.forwardTokens(&[_]u32{ 1, 2, 3 })).deinit();
+        (try ma.forwardTokens(&[_]u32{ 1, 2, 3 })).deinit();
+
+        // Tree: anchor 4, root 5 with two children a=6 (row 2) and b=7 (row 3).
+        const tree = try mkTree(allocator, &[_]u32{ 5, 6, 7 }, &[_]i32{ -1, 0, 0 }, &[_]i32{ 4, 5, 5 }, &[_]u8{ 1, 2, 2 });
+        var vt = try forwardVerifyTree(&mt, tree, 4, null);
+        defer vt.deinit(allocator);
+        // Chain references: [anchor, root, b] and [anchor, root, a].
+        var vcb = try forwardVerifyImpl(&mc, &[_]u32{ 4, 5, 7 }, null);
+        defer vcb.deinit(allocator);
+        var vca = try forwardVerifyImpl(&ma, &[_]u32{ 4, 5, 6 }, null);
+        defer vca.deinit(allocator);
+
+        const cmpRow = struct {
+            fn call(c2: EagerContext, big: Array, big_row: i32, small: Array, small_row: i32) !void {
+                const vocab: i32 = big.shape()[2];
+                const ra = try ops.slice(c2, big, &[_]i32{ 0, big_row, 0 }, &[_]i32{ 1, big_row + 1, vocab }, &[_]i32{ 1, 1, 1 });
+                defer ra.deinit();
+                const rb = try ops.slice(c2, small, &[_]i32{ 0, small_row, 0 }, &[_]i32{ 1, small_row + 1, vocab }, &[_]i32{ 1, 1, 1 });
+                defer rb.deinit();
+                const raf = try ops.astype(c2, ra, .float32);
+                defer raf.deinit();
+                const rbf = try ops.astype(c2, rb, .float32);
+                defer rbf.deinit();
+                const g = try raf.dataSlice(f32);
+                const e = try rbf.dataSlice(f32);
+                try std.testing.expectEqual(e.len, g.len);
+                for (e, g) |ev, ov| try std.testing.expectApproxEqAbs(ev, ov, 1e-4);
+            }
+        }.call;
+        // Shared prefix rows and both branches (a-row sees no b and vice versa).
+        try cmpRow(ctx, vt.logits, 0, vcb.logits, 0);
+        try cmpRow(ctx, vt.logits, 1, vcb.logits, 1);
+        try cmpRow(ctx, vt.logits, 3, vcb.logits, 2); // b
+        try cmpRow(ctx, vt.logits, 2, vca.logits, 2); // a
+
+        // Commit path [anchor, root, b] on the tree; chain commits all 3.
+        commitVerifyTree(&mt, &vt, &[_]usize{ 0, 1, 3 });
+        commitVerify(&mc, &vcb, 3);
+        const lt = try mt.forwardTokens(&[_]u32{9});
+        defer lt.deinit();
+        const lc = try mc.forwardTokens(&[_]u32{9});
+        defer lc.deinit();
+        const ltf = try ops.astype(ctx, lt, .float32);
+        defer ltf.deinit();
+        const lcf = try ops.astype(ctx, lc, .float32);
+        defer lcf.deinit();
+        const lg = try ltf.dataSlice(f32);
+        const le = try lcf.dataSlice(f32);
+        for (le, lg) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
     }
 }
 
