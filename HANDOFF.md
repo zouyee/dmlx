@@ -2488,3 +2488,24 @@ Three differentiated bets formally tracked in
   disk-persistent snapshot path shipped in P0.
 
 Ordering: tree-verify catch-up (stage A/B) → R1 (the core of B) → R3 → R2.
+
+## DFlash2 tree verify — negative result, shelved (2026-11-19)
+
+Stage A/B landed a complete tree-verify pipeline (env-gated, default OFF):
+selectTree host selector, masked split verify kernel, depth-synced batched
+GDN tree verify, batched commit, copies injection (DMLX_DF2_TREE=1,
+DMLX_DF2_TREE_NODES/CHILDREN knobs). Correctness is proven (Gate A3 green;
+batched path output byte-identical to chain). Node sweep 8/10/12/15 shows
+E[t] saturates at 6.18 (10 nodes) while round cost grows ~linearly with
+nodes; even the idealized zero-overhead tree (~126ms/round x E[t] 6.18)
+merely ties the chain (47.9 tok/s). Root cause: chain verify already runs at
+the DRAM streaming ceiling (~224 GB/s), so extra verified rows are pure
+overhead in our implementation. The tree stays available behind env gates
+for a future higher-quality drafter. R1 (fused GDN tree kernel) shelved by
+this data.
+
+Tracked dependency: DNeo (arXiv:2611.21925) — same team as DFlash2, +25%
+tau via drafter architecture (MoFA feature encoding, rejection memory,
+fused causal head, prefix-only attention), explicitly WITHOUT draft trees.
+Only Qwen3-4B weights exist (J-sandler/Qwen3-4B-DNeo); watch incoai/z-lab
+for Qwen3.8-27B-DNeo — our DF2 integration path is a drop-in slot.

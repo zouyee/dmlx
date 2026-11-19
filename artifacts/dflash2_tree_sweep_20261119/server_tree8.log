@@ -1,0 +1,67 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: System memory guard: warn at 92% used (critical at 95%), poll 2s
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:8399
+info: [warmup] skipping replay: 17600 tokens exceeds cap 8192 (DMLX_WARMUP_MAX_TOKENS)
+info: [ACCEPT] Connection accepted (accept took 3919.6ms)
+info: [HTTP] Request received: 86 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.0ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 7.6ms)
+info: [HTTP] Request received: 325 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=1.2ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: Qwen3.8 DFlash2: loading drafter from /Users/zouyee/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4
+warning: Failed to cache index: error.StatFailed
+info: Qwen3.8 DFlash2: loaded persisted drafter context (10717 tokens)
+info: [qwen38] persisted snapshot loaded (10717 tokens)
+info: [verify-split] shape gate (d/h/hkv/l/kv_len)
+info: fused GDN verify tail kernel active (d=128)
+info: [verify-split] engaged
+info: [Engine] MTP depth
+info: [Engine] MTP cond-acceptance
+info: [Engine] MTP tree: rounds=34 nodes/round=8.0 E[t]=6.00
+info: [Engine] MTP request 1: acceptance 61.0% (166/272 drafts); ms/round draft=59.1 verify=9.0 accept=264.8 commit=25.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 376ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=796, wait=15707.9ms calls=1
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=68 generated_tokens=200 duration_ms=15707.68 tokens_per_sec=12.73
+info: [TIMING] generateChatCompletion=15710.5ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 15710.7ms
+info: [HTTP] Connection lifetime: 15710.8ms
+info: [ACCEPT] Connection accepted (accept took 15731.6ms)
+info: [HTTP] Request received: 325 bytes (read=0.0ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 68/68 tokens reused
+info: [HTTP] Request 2 submitted to queue (prepare=0.3ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 2 dequeued, queue_wait=0.0ms
+info: [qwen38] prefix snapshot full hit (68 tokens), skipping prefill
+info: [Engine] MTP depth
+info: [Engine] MTP cond-acceptance
+info: [Engine] MTP tree: rounds=34 nodes/round=8.0 E[t]=6.00
+info: [Engine] MTP request 2: acceptance 61.0% (166/272 drafts); ms/round draft=22.7 verify=3.6 accept=231.3 commit=16.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 223ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=796, wait=9317.0ms calls=1
+info: [RequestLog] id=2 model=m streaming=false prompt_tokens=68 generated_tokens=200 duration_ms=9317.01 tokens_per_sec=21.47
+info: [TIMING] generateChatCompletion=9318.6ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 9318.7ms
+info: [HTTP] Connection lifetime: 9318.7ms

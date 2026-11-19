@@ -2529,8 +2529,14 @@ pub const EngineLoop = struct {
             mtp.rollbackTree != null and mtp.verifyTreeArgmax != null and mtp.verifyTreeHidden != null and
             std.c.getenv("DMLX_DF2_TREE") != null;
         const tree_copies = std.c.getenv("DMLX_DF2_TREE_COPIES") != null;
-        const df2_tree_max_nodes: usize = 15;
-        const df2_tree_children: usize = 4;
+        const df2_tree_max_nodes: usize = blk: {
+            const s = std.c.getenv("DMLX_DF2_TREE_NODES") orelse break :blk 15;
+            break :blk std.fmt.parseInt(usize, std.mem.span(s), 10) catch 15;
+        };
+        const df2_tree_children: usize = blk: {
+            const s = std.c.getenv("DMLX_DF2_TREE_CHILDREN") orelse break :blk 4;
+            break :blk std.fmt.parseInt(usize, std.mem.span(s), 10) catch 4;
+        };
         const df2_tree_max_depth: usize = 7; // block_size - 1
         var tree_rounds: usize = 0;
         var tree_nodes: usize = 0;
