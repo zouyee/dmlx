@@ -1259,6 +1259,7 @@ const sdpa_verify_partial_body =
     \\    float scale = as_type<float>(params[4]);
     \\    int t_begin = split * chunk;
     \\    int t_end = min(t_begin + chunk, T);
+    \\    bool use_mask = params[5] != 0;
     \\    const int khs = k_head_stride_in[0];
     \\    const int kss = k_seq_stride_in[0];
     \\    const int vhs = v_head_stride_in[0];
@@ -1309,7 +1310,12 @@ const sdpa_verify_partial_body =
     \\                int c = col / 8;
     \\                int base = t0 + c * 8;
     \\                int key = min(base, T - 8) + (col - c * 8);
-    \\                bool ok = r < L && key >= base && key < t_end && key <= T - L + r;
+    \\                bool ok = r < L && key >= base && key < t_end;
+    \\                // Causal: row r sees keys <= T-L+r. Tree: explicit bool
+    \\                // mask [L, T] (same selection for a degenerate chain, so
+    \\                // both modes are bit-identical on chain inputs).
+    \\                if (use_mask) ok = ok && mask_in[r * T + key];
+    \\                else ok = ok && key <= T - L + r;
     \\                float val = Sp[r * SS + col] + Sp[8 * SS + r * SS + col]
     \\                    + Sp[16 * SS + r * SS + col] + Sp[24 * SS + r * SS + col];
     \\                sv[e] = ok ? val * scale : -INFINITY;
@@ -1418,11 +1424,11 @@ fn getSdpaVerifyKernels(allocator: std.mem.Allocator) ?*SdpaVerifyEntry {
     const header_z = allocator.dupeZ(u8, "") catch return null;
     defer allocator.free(header_z);
 
-    const name1_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_partial") catch return null;
+    const name1_z = allocator.dupeZ(u8, "dmlx_verify_sdpa_split_partial_v2") catch return null;
     defer allocator.free(name1_z);
     const src1_z = allocator.dupeZ(u8, sdpa_verify_partial_body) catch return null;
     defer allocator.free(src1_z);
-    const in1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "q", "k", "v", "params", "k_head_stride_in", "k_seq_stride_in", "v_head_stride_in", "v_seq_stride_in" }) catch return null;
+    const in1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "q", "k", "v", "params", "k_head_stride_in", "k_seq_stride_in", "v_head_stride_in", "v_seq_stride_in", "mask_in" }) catch return null;
     defer _ = c.c.mlx_vector_string_free(in1_vec);
     const out1_vec = qwen38_gdn.makeStringVec(allocator, &.{ "o_part", "ml_part" }) catch return null;
     defer _ = c.c.mlx_vector_string_free(out1_vec);
@@ -1446,6 +1452,10 @@ fn getSdpaVerifyKernels(allocator: std.mem.Allocator) ?*SdpaVerifyEntry {
 /// Split-KV causal SDPA for the verify block: q_pad [1, H, 8, D] bf16
 /// (L valid rows), k/v the contiguous slabs [1, HKV, cap, D]. Returns
 /// [1, H, L, D] bf16, or null when the shape is unsupported / kernel broken.
+/// `mask` (optional) is a [L, kv_len] contiguous bool row-visibility table
+/// (DFlash2 tree verify); null keeps the bottom-right causal predicate.
+/// The masked path selects exactly the same keys as the causal predicate
+/// for a degenerate chain mask, so both modes are bit-identical there.
 fn sdpaVerifySplit(
     ctx: EagerContext,
     q_t: Array, // [1, H, L, D] bf16 contiguous
@@ -1457,11 +1467,13 @@ fn sdpaVerifySplit(
     d: i32,
     l: i32,
     kv_len: i32,
+    mask: ?Array, // [L, kv_len] bool contiguous, or null for causal
 ) !?Array {
     if (sdpaVerifySplitDisabled()) return null;
-    // Hardcoded kernel layout: D=256, GQA=6, H=24, padded to 8 rows.
-    if (d != 256 or h != 24 or hkv != 4 or l < 2 or l > 8) {
-        sdpaVerifyGateLog(1, "shape gate (d/h/hkv/l)");
+    // Hardcoded kernel layout: D=256, GQA=6, H=24, padded to 8 rows. The
+    // 8x8 K tiles clamp to T-8, so kv_len must be >= 8.
+    if (d != 256 or h != 24 or hkv != 4 or l < 1 or l > 8 or kv_len < 8) {
+        sdpaVerifyGateLog(1, "shape gate (d/h/hkv/l/kv_len)");
         return null;
     }
     const dt = dtype_mod.Dtype.bfloat16;
@@ -1477,6 +1489,14 @@ fn sdpaVerifySplit(
     if (!isContiguous4D(k, 1, hkv, cap, d) or !isContiguous4D(v, 1, hkv, cap, d)) {
         sdpaVerifyGateLog(8, "kv slab not contiguous");
         return null;
+    }
+    if (mask) |m| {
+        const ms = m.shape();
+        const mst = m.strides();
+        if (m.dtype() != dtype_mod.Dtype.bool_ or ms.len != 2 or ms[0] != l or ms[1] != kv_len or mst[0] != kv_len or mst[1] != 1) {
+            sdpaVerifyGateLog(32, "mask shape/layout gate");
+            return null;
+        }
     }
     const entry = getSdpaVerifyKernels(ctx.allocator) orelse {
         sdpaVerifyGateLog(16, "kernel compile failed");
@@ -1509,7 +1529,8 @@ fn sdpaVerifySplit(
         @intCast(chunk),
         @intCast(n_splits),
         @bitCast(scale),
-    }, &[_]i32{5});
+        if (mask != null) 1 else 0,
+    }, &[_]i32{6});
     defer params.deinit();
     const khs = try makeI32Scalar(ctx.allocator, cap * d);
     defer khs.deinit();
@@ -1519,6 +1540,13 @@ fn sdpaVerifySplit(
     defer vhs.deinit();
     const vss = try makeI32Scalar(ctx.allocator, d);
     defer vss.deinit();
+    // The kernel always takes a mask input; unused in causal mode.
+    var dummy_mask: ?Array = null;
+    defer if (dummy_mask) |*dm| dm.deinit();
+    const mask_arg = mask orelse blk: {
+        dummy_mask = try Array.fromData(ctx.allocator, bool, &[_]bool{false}, &[_]i32{1});
+        break :blk dummy_mask.?;
+    };
 
     // Pass 1: one 128-thread group per (q head, key split).
     const cfg1 = c.c.mlx_fast_metal_kernel_config_new();
@@ -1530,7 +1558,7 @@ fn sdpaVerifySplit(
 
     const in1_vec = c.c.mlx_vector_array_new();
     defer _ = c.c.mlx_vector_array_free(in1_vec);
-    for ([_]Array{ q8, k, v, params, khs, kss, vhs, vss }) |inp| {
+    for ([_]Array{ q8, k, v, params, khs, kss, vhs, vss, mask_arg }) |inp| {
         try c.check(c.c.mlx_vector_array_append_value(in1_vec, inp.inner));
     }
     var out1_vec = c.c.mlx_vector_array_new();
@@ -1574,6 +1602,59 @@ fn sdpaVerifySplit(
     try c.check(c.c.mlx_vector_array_get(&out_handle, out2_vec, 0));
     sdpa_verify_applies += 1;
     return Array.fromHandle(out_handle);
+}
+
+/// Tree-verify variant: explicit per-row bool mask [L, kv_len] and up to 16
+/// query rows. The partial kernel's tile structure is hardwired to 8 rows
+/// (8x8 simdgroup matrices, 16 softmax threads/row in a 128-thread group),
+/// so rows 9..16 are a second masked launch over the same KV; attention is
+/// exact per row, so concatenating row chunks is lossless. Returns
+/// [1, H, L, D] bf16, or null when unsupported (caller falls back to stock
+/// SDPA + mask).
+fn sdpaVerifySplitTree(
+    ctx: EagerContext,
+    q_t: Array, // [1, H, L, D] bf16 contiguous
+    k: Array,
+    v: Array,
+    scale: f32,
+    h: i32,
+    hkv: i32,
+    d: i32,
+    l: i32,
+    kv_len: i32,
+    mask: Array, // [L, kv_len] bool
+) !?Array {
+    if (l <= 8) return sdpaVerifySplit(ctx, q_t, k, v, scale, h, hkv, d, l, kv_len, mask);
+    if (l > 16) {
+        sdpaVerifyGateLog(64, "tree L > 16");
+        return null;
+    }
+    const l2 = l - 8;
+
+    // Row-chunk slices are head-strided views; the kernel needs contiguous q.
+    const q0_view = try ops.slice(ctx, q_t, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, h, 8, d }, &[_]i32{ 1, 1, 1, 1 });
+    defer q0_view.deinit();
+    const q0 = try ops.copy(ctx, q0_view);
+    defer q0.deinit();
+    const q1_view = try ops.slice(ctx, q_t, &[_]i32{ 0, 0, 8, 0 }, &[_]i32{ 1, h, l, d }, &[_]i32{ 1, 1, 1, 1 });
+    defer q1_view.deinit();
+    const q1 = try ops.copy(ctx, q1_view);
+    defer q1.deinit();
+
+    // Mask row chunks: [8, T] / [l2, T] contiguous views.
+    const m0 = try ops.slice(ctx, mask, &[_]i32{ 0, 0 }, &[_]i32{ 8, kv_len }, &[_]i32{ 1, 1 });
+    defer m0.deinit();
+    const m1 = try ops.slice(ctx, mask, &[_]i32{ 8, 0 }, &[_]i32{ l, kv_len }, &[_]i32{ 1, 1 });
+    defer m1.deinit();
+
+    const a0 = (try sdpaVerifySplit(ctx, q0, k, v, scale, h, hkv, d, 8, kv_len, m0)) orelse return null;
+    errdefer a0.deinit();
+    const a1 = (try sdpaVerifySplit(ctx, q1, k, v, scale, h, hkv, d, l2, kv_len, m1)) orelse {
+        a0.deinit();
+        return null;
+    };
+    defer a1.deinit();
+    return try shape_mod.concatenateAxis(ctx, &[_]Array{ a0, a1 }, 2);
 }
 
 /// Precomputed MRoPE tables for one vision prefill: cos/sin [1, 1, L, RD]
@@ -1993,7 +2074,7 @@ pub const Qwen38Attn = struct {
         // Verify-width split-KV (FlashDecoding-style): one threadgroup per
         // (q head, key split) holds all rows; stock composed SDPA is the
         // fallback for shapes the kernel does not cover.
-        const attn = (try sdpaVerifySplit(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, L, kv_len)) orelse
+        const attn = (try sdpaVerifySplit(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, L, kv_len, null)) orelse
             try fast_mod.scaledDotProductAttention(
                 ctx,
                 q_t,
@@ -2027,10 +2108,11 @@ pub const Qwen38Attn = struct {
 
     /// Tree-verify forward (DFlash2 U2): the prefill branch of `forward`
     /// with an explicit bool mask (context + ancestor visibility) and
-    /// per-row rope positions instead of causal mode + scalar offset.
-    /// Always stock SDPA (skips sdpaVerifySplit); the KV append is
-    /// unchanged — all L nodes land in the slab, commit compaction is a
-    /// later unit's job.
+    /// per-row rope positions instead of causal mode + scalar offset. Takes
+    /// the same group-qmm fusion and split-KV verify kernel (masked, rows
+    /// chunked to 8) as the chain path; stock SDPA + mask is the fallback.
+    /// The KV append is unchanged — all L nodes land in the slab, commit
+    /// compaction is a later unit's job.
     pub fn forwardTree(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache, tree: TreeMask) !Array {
         const ctx = self.ctx;
         const H: i32 = @intCast(self.num_heads);
@@ -2039,12 +2121,36 @@ pub const Qwen38Attn = struct {
         const L: i32 = x.shape()[1];
 
         // Same projection / qk-norm segment as forward's prefill branch,
-        // minus the group-qmm fusion (correctness-first path).
-        const q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+        // including the sg8 group-qmm fusion.
+        var q_lin: Array = undefined;
+        var k_lin: Array = undefined;
+        var v_lin: Array = undefined;
+        if (self.q_scales != null and self.k_scales != null and self.v_scales != null and
+            self.q_biases != null and self.k_biases != null and self.v_biases != null)
+        {
+            const group_qws = [_]quantize_mod.QuantizedWeight{
+                .{ .data = self.q_proj, .scales = self.q_scales.?, .biases = self.q_biases.?, .config = self.q_quant, .original_shape = &[_]i32{} },
+                .{ .data = self.k_proj, .scales = self.k_scales.?, .biases = self.k_biases.?, .config = self.k_quant, .original_shape = &[_]i32{} },
+                .{ .data = self.v_proj, .scales = self.v_scales.?, .biases = self.v_biases.?, .config = self.v_quant, .original_shape = &[_]i32{} },
+            };
+            if (try verify_qmm.maybeGroupQmm(ctx, x, &group_qws)) |*gout| {
+                var go = gout.*;
+                q_lin = go.outs[0];
+                k_lin = go.outs[1];
+                v_lin = go.outs[2];
+                go.count = 0; // ownership moved to the three locals
+            } else {
+                q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+                k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
+                v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
+            }
+        } else {
+            q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+            k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
+            v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
+        }
         defer q_lin.deinit();
-        const k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
         defer k_lin.deinit();
-        const v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
         defer v_lin.deinit();
         const q_resh = try ops.reshape(ctx, q_lin, &[_]i32{ 1, L, H, 2 * D });
         defer q_resh.deinit();
@@ -2089,13 +2195,19 @@ pub const Qwen38Attn = struct {
         try cacheAppend(ctx, cache, k_t, v_t, L, HKV, D);
 
         const kv_len: i32 = cache.len();
-        const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
-        defer k_view.deinit();
-        const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
-        defer v_view.deinit();
-
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn = try fast_mod.scaledDotProductAttention(ctx, q_t, k_view, v_view, scale, "", tree.mask, null);
+        // Fast path: the split-KV verify kernel with the tree mask (rows
+        // chunked to the kernel's 8-row tile); the mask's [1, 1, L, kv_len]
+        // layout is a contiguous [L, kv_len] table when reshaped.
+        const mask2d = try ops.reshape(ctx, tree.mask, &[_]i32{ L, kv_len });
+        defer mask2d.deinit();
+        const attn = (try sdpaVerifySplitTree(ctx, q_t, cache.keys.?, cache.values.?, scale, H, HKV, D, L, kv_len, mask2d)) orelse blk: {
+            const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer k_view.deinit();
+            const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+            defer v_view.deinit();
+            break :blk try fast_mod.scaledDotProductAttention(ctx, q_t, k_view, v_view, scale, "", tree.mask, null);
+        };
         defer attn.deinit(); // [1, H, L, D]
 
         // Back to [1, L, H*D].
@@ -2723,7 +2835,7 @@ test "sdpaVerifySplit matches stock causal SDPA (bf16, split-KV)" {
             const v = try ops.astype(ctx, vf, .bfloat16);
             defer v.deinit();
 
-            const split = (try sdpaVerifySplit(ctx, q, k, v, scale, H, HKV, D, L, T)) orelse
+            const split = (try sdpaVerifySplit(ctx, q, k, v, scale, H, HKV, D, L, T, null)) orelse
                 return error.TestUnexpectedResult; // kernel must apply to this shape
             defer split.deinit();
 
@@ -2858,4 +2970,156 @@ test "Qwen38Attn.forwardTree: chain-degenerate tree matches causal forward" {
     const exp = try ref32.dataSlice(f32);
     try std.testing.expectEqual(exp.len, got.len);
     for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-3);
+}
+
+test "sdpaVerifySplit masked: degenerate chain is bit-identical to causal kernel" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const H: i32 = 24;
+    const HKV: i32 = 4;
+    const D: i32 = 256;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    const fillBuf = struct {
+        fn call(alloc: std.mem.Allocator, n: usize, seed: u64) ![]f32 {
+            const buf = try alloc.alloc(f32, n);
+            var s = seed;
+            for (0..n) |i| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                buf[i] = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(s >> 33)), 2000) - 1000)) / 1000.0;
+            }
+            return buf;
+        }
+    }.call;
+
+    for ([_]i32{ 3, 8 }) |L| {
+        for ([_]i32{ 40, 1500 }) |T| {
+            const cap = T;
+            const qn: usize = @intCast(H * L * D);
+            const qb = try fillBuf(allocator, qn, 11);
+            defer allocator.free(qb);
+            const qf = try Array.fromData(allocator, f32, qb, &[_]i32{ 1, H, L, D });
+            defer qf.deinit();
+            const q = try ops.astype(ctx, qf, .bfloat16);
+            defer q.deinit();
+            const kn: usize = @intCast(HKV * cap * D);
+            const kb = try fillBuf(allocator, kn, 22);
+            defer allocator.free(kb);
+            const vb = try fillBuf(allocator, kn, 33);
+            defer allocator.free(vb);
+            const kf = try Array.fromData(allocator, f32, kb, &[_]i32{ 1, HKV, cap, D });
+            defer kf.deinit();
+            const vf = try Array.fromData(allocator, f32, vb, &[_]i32{ 1, HKV, cap, D });
+            defer vf.deinit();
+            const k = try ops.astype(ctx, kf, .bfloat16);
+            defer k.deinit();
+            const v = try ops.astype(ctx, vf, .bfloat16);
+            defer v.deinit();
+
+            // Chain-degenerate tree mask: parents = [-1, 0, 1, ...] over a
+            // context of T-L tokens == bottom-right causal.
+            const parents = try allocator.alloc(i32, @intCast(L));
+            defer allocator.free(parents);
+            parents[0] = -1;
+            for (1..@intCast(L)) |i| parents[i] = @intCast(i - 1);
+            const mask4 = try buildTreeMask(allocator, parents, T - L);
+            defer mask4.deinit();
+            const mask2d = try ops.reshape(ctx, mask4, &[_]i32{ L, T });
+            defer mask2d.deinit();
+
+            const causal = (try sdpaVerifySplit(ctx, q, k, v, scale, H, HKV, D, L, T, null)) orelse
+                return error.TestUnexpectedResult;
+            defer causal.deinit();
+            const masked = (try sdpaVerifySplitTree(ctx, q, k, v, scale, H, HKV, D, L, T, mask2d)) orelse
+                return error.TestUnexpectedResult;
+            defer masked.deinit();
+
+            const a32 = try ops.astype(ctx, causal, .float32);
+            defer a32.deinit();
+            const b32 = try ops.astype(ctx, masked, .float32);
+            defer b32.deinit();
+            try a32.eval();
+            try b32.eval();
+            const exp = try a32.dataSlice(f32);
+            const got = try b32.dataSlice(f32);
+            try std.testing.expectEqual(exp.len, got.len);
+            // Same kernel, same key selection, same accumulation order.
+            for (exp, got) |e, o| try std.testing.expectEqual(e, o);
+        }
+    }
+}
+
+test "sdpaVerifySplitTree: 15-node branching tree matches stock masked SDPA" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+    const H: i32 = 24;
+    const HKV: i32 = 4;
+    const D: i32 = 256;
+    const L: i32 = 15; // exercises the 8+7 row chunking
+    const T: i32 = 600;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+
+    const fillBuf = struct {
+        fn call(alloc: std.mem.Allocator, n: usize, seed: u64) ![]f32 {
+            const buf = try alloc.alloc(f32, n);
+            var s = seed;
+            for (0..n) |i| {
+                s = s *% 6364136223846793005 +% 1442695040888963407;
+                buf[i] = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(s >> 33)), 2000) - 1000)) / 1000.0;
+            }
+            return buf;
+        }
+    }.call;
+
+    const qn: usize = @intCast(H * L * D);
+    const qb = try fillBuf(allocator, qn, 44);
+    defer allocator.free(qb);
+    const qf = try Array.fromData(allocator, f32, qb, &[_]i32{ 1, H, L, D });
+    defer qf.deinit();
+    const q = try ops.astype(ctx, qf, .bfloat16);
+    defer q.deinit();
+    const kn: usize = @intCast(HKV * T * D);
+    const kb = try fillBuf(allocator, kn, 55);
+    defer allocator.free(kb);
+    const vb = try fillBuf(allocator, kn, 66);
+    defer allocator.free(vb);
+    const kf = try Array.fromData(allocator, f32, kb, &[_]i32{ 1, HKV, T, D });
+    defer kf.deinit();
+    const vf = try Array.fromData(allocator, f32, vb, &[_]i32{ 1, HKV, T, D });
+    defer vf.deinit();
+    const k = try ops.astype(ctx, kf, .bfloat16);
+    defer k.deinit();
+    const v = try ops.astype(ctx, vf, .bfloat16);
+    defer v.deinit();
+
+    // Balanced binary tree: node i's parent is (i-1)/2 (root at 0).
+    var parents: [15]i32 = undefined;
+    parents[0] = -1;
+    for (1..15) |i| parents[i] = @intCast((i - 1) / 2);
+    const mask4 = try buildTreeMask(allocator, &parents, T - L);
+    defer mask4.deinit();
+    const mask2d = try ops.reshape(ctx, mask4, &[_]i32{ L, T });
+    defer mask2d.deinit();
+
+    const fast = (try sdpaVerifySplitTree(ctx, q, k, v, scale, H, HKV, D, L, T, mask2d)) orelse
+        return error.TestUnexpectedResult; // kernel must cover L=15 via chunking
+    defer fast.deinit();
+
+    const stock = try fast_mod.scaledDotProductAttention(ctx, q, k, v, scale, "", mask4, null);
+    defer stock.deinit();
+
+    const fast32 = try ops.astype(ctx, fast, .float32);
+    defer fast32.deinit();
+    const stock32 = try ops.astype(ctx, stock, .float32);
+    defer stock32.deinit();
+    const diff = try ops.subtract(ctx, fast32, stock32);
+    defer diff.deinit();
+    const adiff = try ops.abs(ctx, diff);
+    defer adiff.deinit();
+    const m = try reduce_mod.max(ctx, adiff, false);
+    defer m.deinit();
+    try m.eval();
+    try std.testing.expect(try m.item(f32) <= 2e-2);
 }

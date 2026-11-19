@@ -1,0 +1,25 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: System memory guard: warn at 92% used (critical at 95%), poll 2s
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:18111
+info: [ACCEPT] Connection accepted (accept took 915.9ms)
+info: [HTTP] Request received: 84 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.5ms
+info: [Engine] Shutdown requested
+info: [Engine] Engine loop exiting
+info: Engine stopped, initiating graceful shutdown...
+info: All in-flight requests completed.
+info: Shutting down, cleaning up resources...
+info: Shutdown complete.
