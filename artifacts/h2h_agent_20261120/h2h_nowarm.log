@@ -1,0 +1,707 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: System memory guard: warn at 92% used (critical at 95%), poll 2s
+info: MLX (legacy) mode: starting MLX engine loop
+info: DMLX server listening on http://0.0.0.0:18211
+info: [Engine] Engine loop started
+info: [ACCEPT] Connection accepted (accept took 659.5ms)
+info: [HTTP] Request received: 84 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.8ms
+info: [ACCEPT] Connection accepted (accept took 145.0ms)
+info: [HTTP] Request received: 5491 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=1.0ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: [qwen38] persisted snapshot loaded (16487 tokens)
+info: [verify-split] shape gate (d/h/hkv/l)
+info: [ACCEPT] Connection accepted (accept took 2197.3ms)
+info: [HTTP] Request received: 5414 bytes (read=0.0ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 1202/1202 tokens reused
+info: [HTTP] Request 2 submitted to queue (prepare=0.1ms)
+info: [OpenAI] Waiting for token...
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 212ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=8868.1ms calls=1
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=1202 generated_tokens=1 duration_ms=8866.44 tokens_per_sec=0.11
+info: [Engine] Request 2 dequeued, queue_wait=160.1ms
+info: [TIMING] generateChatCompletion=8870.9ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 8871.2ms
+info: [HTTP] Connection lifetime: 8871.2ms
+info: [ACCEPT] Connection accepted (accept took 6674.7ms)
+info: [qwen38] prefix snapshot full hit (1202 tokens), skipping prefill
+info: [HTTP] Request received: 4711 bytes (read=1.5ms)
+[HTTP] Request received
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 160ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=6676.7ms calls=1
+info: [RequestLog] id=2 model=m streaming=false prompt_tokens=1202 generated_tokens=1 duration_ms=4.79 tokens_per_sec=208.59
+info: [HTTP] Request 3 submitted to queue (prepare=0.8ms)
+info: [OpenAI] Waiting for token...
+info: [TIMING] generateChatCompletion=6678.3ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 6678.3ms
+info: [HTTP] Connection lifetime: 6678.3ms
+info: [Engine] Request 3 dequeued, queue_wait=0.0ms
+info: [warmup] replayed stored prompt (5286 bytes) for prefix snapshot
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 200ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=8373.2ms calls=1
+info: [RequestLog] id=3 model=m streaming=false prompt_tokens=1060 generated_tokens=1 duration_ms=8371.80 tokens_per_sec=0.12
+info: [TIMING] generateChatCompletion=8375.5ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 8377.1ms
+info: [HTTP] Connection lifetime: 8377.1ms
+info: [ACCEPT] Connection accepted (accept took 8378.0ms)
+info: [HTTP] Request received: 4717 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 4 submitted to queue (prepare=0.7ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 4 dequeued, queue_wait=0.0ms
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 198ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=8276.2ms calls=1
+info: [RequestLog] id=4 model=m streaming=false prompt_tokens=1058 generated_tokens=1 duration_ms=8274.89 tokens_per_sec=0.12
+info: [TIMING] generateChatCompletion=8278.4ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 8278.6ms
+info: [HTTP] Connection lifetime: 8278.6ms
+info: [ACCEPT] Connection accepted (accept took 8279.8ms)
+info: [HTTP] Request received: 18022 bytes (read=1.5ms)
+[HTTP] Request received
+info: [HTTP] Request 5 submitted to queue (prepare=2.5ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 5 dequeued, queue_wait=0.0ms
+info: [qwen38] snapshot persisted (4044 tokens, 72 ms)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 729ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=30378.5ms calls=1
+info: [RequestLog] id=5 model=m streaming=false prompt_tokens=4044 generated_tokens=1 duration_ms=30377.98 tokens_per_sec=0.03
+info: [TIMING] generateChatCompletion=30382.5ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 30384.2ms
+info: [HTTP] Connection lifetime: 30384.3ms
+info: [ACCEPT] Connection accepted (accept took 30385.4ms)
+info: [HTTP] Request received: 18056 bytes (read=1.6ms)
+[HTTP] Request received
+info: [HTTP] Request 6 submitted to queue (prepare=5.6ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 6 dequeued, queue_wait=0.0ms
+info: [qwen38] snapshot persisted (4078 tokens, 64 ms)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 729ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=30402.6ms calls=1
+info: [RequestLog] id=6 model=m streaming=false prompt_tokens=4078 generated_tokens=1 duration_ms=30402.39 tokens_per_sec=0.03
+info: [TIMING] generateChatCompletion=30409.8ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 30411.5ms
+info: [HTTP] Connection lifetime: 30411.5ms
+info: [ACCEPT] Connection accepted (accept took 30413.2ms)
+info: [HTTP] Request received: 35388 bytes (read=1.3ms)
+[HTTP] Request received
+info: [HTTP] Request 7 submitted to queue (prepare=8.4ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 7 dequeued, queue_wait=0.0ms
+info: [qwen38] snapshot persisted (8010 tokens, 85 ms)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 1456ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=60684.2ms calls=1
+info: [RequestLog] id=7 model=m streaming=false prompt_tokens=8010 generated_tokens=1 duration_ms=60683.78 tokens_per_sec=0.02
+info: [TIMING] generateChatCompletion=60694.2ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 60695.7ms
+info: [HTTP] Connection lifetime: 60695.7ms
+info: [ACCEPT] Connection accepted (accept took 60697.2ms)
+info: [HTTP] Request received: 35652 bytes (read=1.4ms)
+[HTTP] Request received
+info: [HTTP] Request 8 submitted to queue (prepare=7.3ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 8 dequeued, queue_wait=0.0ms
+info: [qwen38] snapshot persisted (8015 tokens, 81 ms)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 1456ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=60687.4ms calls=1
+info: [RequestLog] id=8 model=m streaming=false prompt_tokens=8015 generated_tokens=1 duration_ms=60687.26 tokens_per_sec=0.02
+info: [TIMING] generateChatCompletion=60696.2ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 60697.7ms
+info: [HTTP] Connection lifetime: 60697.7ms
+info: [ACCEPT] Connection accepted (accept took 60698.7ms)
+info: [HTTP] Request received: 4726 bytes (read=1.5ms)
+[HTTP] Request received
+info: [Engine] Request 9 dequeued, queue_wait=194884.5ms
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 198ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 3ms
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] waitForToken got id=4087 waited 1ms
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] waitForToken got id=1156 waited 1ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 1ms
+info: [Signal] deliverToken id=2570 final=false took 0us
+info: [Signal] waitForToken got id=2570 waited 1ms
+info: [Signal] deliverToken id=3766 final=false took 0us
+info: [Signal] waitForToken got id=3766 waited 1ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=264 waited 1ms
+info: [Signal] deliverToken id=1248 final=false took 0us
+info: [Signal] waitForToken got id=1248 waited 1ms
+info: [Signal] deliverToken id=886 final=false took 0us
+info: [Signal] waitForToken got id=886 waited 1ms
+info: [Signal] deliverToken id=314 final=false took 0us
+info: [Signal] waitForToken got id=314 waited 1ms
+info: [Signal] deliverToken id=17326 final=false took 0us
+info: [Signal] waitForToken got id=17326 waited 1ms
+info: [Signal] deliverToken id=6321 final=false took 0us
+info: [Signal] waitForToken got id=6321 waited 1ms
+info: [Signal] deliverToken id=4874 final=false took 0us
+info: [Signal] waitForToken got id=4874 waited 1ms
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=25 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=8029 final=false took 0us
+info: [Signal] waitForToken got id=8029 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=36346 final=false took 0us
+info: [Signal] waitForToken got id=36346 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=8029 final=false took 0us
+info: [Signal] waitForToken got id=8029 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=37705 final=false took 0us
+info: [Signal] waitForToken got id=37705 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=8029 final=false took 0us
+info: [Signal] waitForToken got id=8029 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=37705 final=false took 0us
+info: [Signal] waitForToken got id=37705 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=36346 final=false took 0us
+info: [Signal] waitForToken got id=36346 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=8029 final=false took 0us
+info: [Signal] waitForToken got id=8029 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=36346 final=false took 0us
+info: [Signal] waitForToken got id=36346 waited 1ms
+info: [Signal] deliverToken id=12102 final=false took 0us
+info: [Signal] waitForToken got id=12102 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=37705 final=false took 0us
+info: [Signal] waitForToken got id=37705 waited 1ms
+info: [Signal] deliverToken id=12102 final=false took 0us
+info: [Signal] waitForToken got id=12102 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=81099 final=false took 0us
+info: [Signal] waitForToken got id=81099 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=37705 final=false took 0us
+info: [Signal] waitForToken got id=37705 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=81099 final=false took 0us
+info: [Signal] waitForToken got id=81099 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=37705 final=false took 0us
+info: [Signal] waitForToken got id=37705 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=17972 final=false took 0us
+info: [Signal] waitForToken got id=17972 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=true took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [RequestLog] id=9 model=m streaming=true prompt_tokens=1035 generated_tokens=128 duration_ms=16829.88 tokens_per_sec=7.61
+info: [HTTP] Handler lifetime: 16836.7ms
+info: [HTTP] Connection lifetime: 16836.7ms
+info: [ACCEPT] Connection accepted (accept took 16836.8ms)
+info: [HTTP] Request received: 4741 bytes (read=1.2ms)
+[HTTP] Request received
+info: [Engine] Request 10 dequeued, queue_wait=195288.5ms
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 198ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 2ms
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] waitForToken got id=4087 waited 1ms
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] waitForToken got id=1156 waited 1ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 1ms
+info: [Signal] deliverToken id=2570 final=false took 0us
+info: [Signal] waitForToken got id=2570 waited 1ms
+info: [Signal] deliverToken id=3766 final=false took 0us
+info: [Signal] waitForToken got id=3766 waited 1ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=264 waited 1ms
+info: [Signal] deliverToken id=1248 final=false took 0us
+info: [Signal] waitForToken got id=1248 waited 1ms
+info: [Signal] deliverToken id=886 final=false took 0us
+info: [Signal] waitForToken got id=886 waited 1ms
+info: [Signal] deliverToken id=314 final=false took 0us
+info: [Signal] waitForToken got id=314 waited 1ms
+info: [Signal] deliverToken id=17326 final=false took 0us
+info: [Signal] waitForToken got id=17326 waited 1ms
+info: [Signal] deliverToken id=6321 final=false took 0us
+info: [Signal] waitForToken got id=6321 waited 1ms
+info: [Signal] deliverToken id=4874 final=false took 0us
+info: [Signal] waitForToken got id=4874 waited 1ms
+info: [Signal] deliverToken id=30 final=false took 0us
+info: [Signal] waitForToken got id=30 waited 1ms
+info: [Signal] deliverToken id=6558 final=false took 0us
+info: [Signal] waitForToken got id=6558 waited 1ms
+info: [Signal] deliverToken id=579 final=false took 0us
+info: [Signal] waitForToken got id=579 waited 1ms
+info: [Signal] deliverToken id=23331 final=false took 0us
+info: [Signal] waitForToken got id=23331 waited 1ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 1ms
+info: [Signal] deliverToken id=1049 final=false took 0us
+info: [Signal] waitForToken got id=1049 waited 1ms
+info: [Signal] deliverToken id=369 final=false took 0us
+info: [Signal] waitForToken got id=369 waited 1ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=264 waited 1ms
+info: [Signal] deliverToken id=8240 final=false took 0us
+info: [Signal] waitForToken got id=8240 waited 1ms
+info: [Signal] deliverToken id=314 final=false took 0us
+info: [Signal] waitForToken got id=314 waited 1ms
+info: [Signal] deliverToken id=17326 final=false took 0us
+info: [Signal] waitForToken got id=17326 waited 1ms
+info: [Signal] deliverToken id=11592 final=false took 0us
+info: [Signal] waitForToken got id=11592 waited 1ms
+info: [Signal] deliverToken id=303 final=false took 0us
+info: [Signal] waitForToken got id=303 waited 1ms
+info: [Signal] deliverToken id=6163 final=false took 0us
+info: [Signal] waitForToken got id=6163 waited 1ms
+info: [Signal] deliverToken id=4874 final=false took 0us
+info: [Signal] waitForToken got id=4874 waited 1ms
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=25 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=81099 final=false took 0us
+info: [Signal] waitForToken got id=81099 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=8668 final=false took 0us
+info: [Signal] waitForToken got id=8668 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=8029 final=false took 0us
+info: [Signal] waitForToken got id=8029 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=36346 final=false took 0us
+info: [Signal] waitForToken got id=36346 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=19638 final=false took 0us
+info: [Signal] waitForToken got id=19638 waited 1ms
+info: [Signal] deliverToken id=36346 final=false took 0us
+info: [Signal] waitForToken got id=36346 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=8668 final=false took 0us
+info: [Signal] waitForToken got id=8668 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=10589 final=false took 0us
+info: [Signal] waitForToken got id=10589 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=81099 final=false took 0us
+info: [Signal] waitForToken got id=81099 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=9197 final=false took 0us
+info: [Signal] waitForToken got id=9197 waited 1ms
+info: [Signal] deliverToken id=31649 final=false took 0us
+info: [Signal] waitForToken got id=31649 waited 1ms
+info: [Signal] deliverToken id=16422 final=false took 0us
+info: [Signal] waitForToken got id=16422 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=21989 final=false took 0us
+info: [Signal] waitForToken got id=21989 waited 1ms
+info: [Signal] deliverToken id=32777 final=false took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [Signal] deliverToken id=12102 final=false took 0us
+info: [Signal] waitForToken got id=12102 waited 1ms
+info: [Signal] deliverToken id=12102 final=false took 0us
+info: [Signal] waitForToken got id=12102 waited 1ms
+info: [Signal] deliverToken id=30349 final=false took 0us
+info: [Signal] waitForToken got id=30349 waited 1ms
+info: [Signal] deliverToken id=24977 final=false took 0us
+info: [Signal] waitForToken got id=24977 waited 1ms
+info: [Signal] deliverToken id=36770 final=false took 0us
+info: [Signal] waitForToken got id=36770 waited 1ms
+info: [Signal] deliverToken id=7613 final=false took 0us
+info: [Signal] waitForToken got id=7613 waited 1ms
+info: [Signal] deliverToken id=291 final=false took 0us
+info: [Signal] waitForToken got id=291 waited 1ms
+info: [Signal] deliverToken id=2176 final=false took 0us
+info: [Signal] waitForToken got id=2176 waited 1ms
+info: [Signal] deliverToken id=1110 final=false took 0us
+info: [Signal] waitForToken got id=1110 waited 1ms
+info: [Signal] deliverToken id=1850 final=false took 0us
+info: [Signal] waitForToken got id=1850 waited 1ms
+info: [Signal] deliverToken id=30183 final=false took 0us
+info: [Signal] waitForToken got id=30183 waited 1ms
+info: [Signal] deliverToken id=20956 final=false took 0us
+info: [Signal] waitForToken got id=20956 waited 1ms
+info: [Signal] deliverToken id=12102 final=false took 0us
+info: [Signal] waitForToken got id=12102 waited 1ms
+info: [Signal] deliverToken id=13053 final=false took 0us
+info: [Signal] waitForToken got id=13053 waited 1ms
+info: [Signal] deliverToken id=30779 final=false took 0us
+info: [Signal] waitForToken got id=30779 waited 1ms
+info: [Signal] deliverToken id=79084 final=false took 0us
+info: [Signal] waitForToken got id=79084 waited 1ms
+info: [Signal] deliverToken id=11495 final=false took 0us
+info: [Signal] waitForToken got id=11495 waited 1ms
+info: [Signal] deliverToken id=32777 final=true took 0us
+info: [Signal] waitForToken got id=32777 waited 1ms
+info: [RequestLog] id=10 model=m streaming=true prompt_tokens=1051 generated_tokens=128 duration_ms=16846.81 tokens_per_sec=7.60
+info: [ACCEPT] Connection accepted (accept took 16850.2ms)
+info: [HTTP] Handler lifetime: 16850.4ms
+info: [HTTP] Connection lifetime: 16850.4ms
+info: [HTTP] Request received: 17991 bytes (read=1.5ms)
+[HTTP] Request received
+info: [HTTP] Request 11 submitted to queue (prepare=2.2ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 11 dequeued, queue_wait=0.0ms
+info: [qwen38] snapshot persisted (4042 tokens, 54 ms)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 728ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=30371.6ms calls=1
+info: [RequestLog] id=11 model=m streaming=false prompt_tokens=4042 generated_tokens=1 duration_ms=30370.66 tokens_per_sec=0.03
+info: [TIMING] generateChatCompletion=30375.3ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 30377.0ms
+info: [HTTP] Connection lifetime: 30377.1ms
+info: [ACCEPT] Connection accepted (accept took 30377.9ms)
+info: [HTTP] Request received: 17991 bytes (read=1.5ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 4042/4042 tokens reused
+info: [HTTP] Request 12 submitted to queue (prepare=0.1ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 12 dequeued, queue_wait=0.0ms
+info: [qwen38] prefix snapshot full hit (4042 tokens), skipping prefill
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 0ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=4.7ms calls=1
+info: [RequestLog] id=12 model=m streaming=false prompt_tokens=4042 generated_tokens=1 duration_ms=4.43 tokens_per_sec=225.75
+info: [TIMING] generateChatCompletion=6.4ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 8.0ms
+info: [HTTP] Connection lifetime: 8.0ms

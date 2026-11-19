@@ -1,0 +1,60 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Indexing shard: model-00003-of-00003.safetensors
+info: Indexing shard: model-00001-of-00003.safetensors
+info: Indexing shard: model-mtp.safetensors
+info: Indexing shard: model-00002-of-00003.safetensors
+info: Qwen3.8 weights resident: 1878 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: System memory guard: warn at 92% used (critical at 95%), poll 2s
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:18211
+info: [ACCEPT] Connection accepted (accept took 703.7ms)
+info: [HTTP] Request received: 84 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 53.4ms)
+info: [HTTP] Request received: 4816 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=2.2ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: Qwen3.8 MTP: loading drafter from /Users/zouyee/models/Qwen3.8-27B-MTP-4bit (7 drafts/round)
+info: Loaded index from cache (31 entries, 0ms)
+info: [MTP] compiled drafter decode step active
+info: [qwen38] persisted snapshot loaded (4042 tokens)
+info: [verify-split] shape gate (d/h/hkv/l)
+info: [ACCEPT] Connection accepted (accept took 2254.8ms)
+info: [HTTP] Request received: 35575 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 2 submitted to queue (prepare=4.1ms)
+info: [OpenAI] Waiting for token...
+info: [MTP] coarse draft head built (2-bit gs128)
+info: fused GDN verify tail kernel active (d=128)
+info: [verify-split] engaged
+warning: System memory pressure HIGH — rejecting new requests (free=2773MB swap=6975MB)
+info: [Engine] MTP depth N=1:1r/39.2ms/tok(E[t]=1.91) N=2:20r/30.1ms/tok(E[t]=2.62) N=3:1r/28.8ms/tok(E[t]=3.07) N=4:5r/30.6ms/tok(E[t]=3.26) N=5:2r/30.4ms/tok(E[t]=3.36) N=6:1r/31.3ms/tok(E[t]=3.41) N=7:12r/31.4ms/tok(E[t]=3.44)
+info: [Engine] MTP cond-acceptance p1=0.987(~9.8/9.9) p2=0.855(~8.3/9.7) p3=0.741(~1.4/2.0) p4=0.339(~0.5/1.4) p5=0.826(~0.1/0.1)
+info: [Engine] MTP request 1: acceptance 51.8% (85/164 drafts); ms/round draft=39.3 verify=301.6 accept=0.4 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 687ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=652, wait=28631.0ms calls=1
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=924 generated_tokens=128 duration_ms=28631.04 tokens_per_sec=4.47
+info: [Engine] Request 2 dequeued, queue_wait=633.0ms
+info: [TIMING] generateChatCompletion=28634.7ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 28634.9ms
+info: [HTTP] Connection lifetime: 28634.9ms
+info: [ACCEPT] Connection accepted (accept took 26411.7ms)
+info: [HTTP] Request received: 4816 bytes (read=1.3ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 1.3ms
+info: [HTTP] Connection lifetime: 1.3ms

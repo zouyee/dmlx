@@ -1,0 +1,28 @@
+info: qwen27: prompt capacity=512 rows, startup stream and scratch reserve=12162531328 bytes
+info: qwen27: lone loop=lanes width=16; lane window=16, lane copies=off
+info: qwen27: 21.7 GiB kept wired between requests, inside 70% of 48 GiB of RAM
+info: qwen27: Neural Engine prompt share requested_columns=0 loaded_columns=0 program_weight_bytes=0 loaded=false exact_output_qualified=false
+info: qwen27: slot 0 keeps a rewind point of 246 MiB at each prompt's history end
+info: prompt cache: 4.7 GiB from 4.7 GiB free under the 70% cap (22.3 GiB in use once loaded and 4.6 GiB reserved outside that reading, 48 GiB of RAM, 2 GiB kept for prompt buffers); default: half the room, at least 16 GiB when available; --prompt-cache-gib overrides it
+info: Qwen3.8-27B: 3 streams of 32768 tokens, DFlash2 drafts for all 3 streams
+[tensorfold] chat template: the checkpoint's
+[tensorfold] prompt chunks of up to 128 tokens, cut at replies 256+ tokens apart
+[tensorfold] profile: stable; registered overrides: none
+[tensorfold] serving Qwen3.8-27B-pi-merged-4bit at http://127.0.0.1:8399/v1 (sampling: temperature 1.0, top_k 20, top_p 0.95; drafts: DFlash2 (/Users/zouyee/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4) + copies; context: 32768; loaded in 5.1s)
+[tensorfold] thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {"enable_thinking": false}
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+info: prompt cache: 53 tokens, resumed at 0, kept 0; 0 states, 0 MiB and 0 MiB spare of 4769 MiB (hits 0, misses 1, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] done chatcmpl-c18c37a8333fb1ac779646df63ad9d27 prompt=53 cached=0 thinking=True effort=none tokens=20 sha=43c5ca16dc9f finish=length rounds=7 accepted=19/49 ttft=0.668 decode=0.786 elapsed=1.454 queued=0.000 tok/s=24.2 seed=5525072979546869270
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 116 tokens, resumed at 0, kept 0; 1 states, 192 MiB and 0 MiB spare of 4769 MiB (hits 0, misses 3, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-9c04c350256f1536c401b23844cf5898 prompt=116 cached=0 thinking=True effort=none tokens=256 sha=c528a0803f4b finish=length rounds=75 accepted=183/540 ttft=1.120 decode=8.873 elapsed=9.993 queued=0.000 tok/s=28.7 seed=5467815024249035351
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 2716 tokens, resumed at 0, kept 2; 4 states, 1088 MiB and 0 MiB spare of 4769 MiB (hits 0, misses 5, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-5e77ff8e0530ea3fe0a5d46a82f84845 prompt=2716 cached=0 thinking=True effort=none tokens=256 sha=46433b5c11a0 finish=length rounds=57 accepted=198/398 ttft=24.565 decode=7.451 elapsed=32.016 queued=0.000 tok/s=34.2 seed=6156357439754688170
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 10716 tokens, resumed at 2688, kept 2; 7 states, 3552 MiB and 0 MiB spare of 4769 MiB (hits 1, misses 5, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-1238ccbf7a1abc5b1bb5331eb7fdd1be prompt=10716 cached=2688 thinking=True effort=none tokens=256 sha=0ea7b83ae7f5 finish=length rounds=80 accepted=178/584 ttft=75.945 decode=13.423 elapsed=89.368 queued=0.000 tok/s=19.0 seed=3694602587883577177

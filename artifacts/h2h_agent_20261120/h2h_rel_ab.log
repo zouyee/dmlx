@@ -1,0 +1,49 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:18211
+info: [ACCEPT] Connection accepted (accept took 691.6ms)
+info: [HTTP] Request received: 84 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.4ms
+info: [ACCEPT] Connection accepted (accept took 75.6ms)
+info: [HTTP] Request received: 4811 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=1.8ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: [verify-split] shape gate (d/h/hkv/l)
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 173ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=7249.9ms calls=1
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=922 generated_tokens=1 duration_ms=7249.30 tokens_per_sec=0.14
+info: [TIMING] generateChatCompletion=7253.5ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 7253.6ms
+info: [HTTP] Connection lifetime: 7253.7ms
+info: [ACCEPT] Connection accepted (accept took 7261.2ms)
+info: [HTTP] Request received: 4785 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Request 2 submitted to queue (prepare=0.8ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 2 dequeued, queue_wait=0.0ms
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 176ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=2, wait=7365.7ms calls=1
+info: [RequestLog] id=2 model=m streaming=false prompt_tokens=936 generated_tokens=1 duration_ms=7365.21 tokens_per_sec=0.14
+info: [TIMING] generateChatCompletion=7368.0ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 7368.1ms
+info: [HTTP] Connection lifetime: 7368.1ms

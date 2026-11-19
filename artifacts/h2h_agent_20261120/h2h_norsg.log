@@ -1,0 +1,64 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: System memory guard: warn at 92% used (critical at 95%), poll 2s
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:8399
+info: [ACCEPT] Connection accepted (accept took 173.6ms)
+info: [HTTP] Request received: 86 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.0ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 8.7ms)
+info: [HTTP] Request received: 337 bytes (read=1.5ms)
+[HTTP] Request received
+info: [HTTP] Request 1 submitted to queue (prepare=0.6ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 1 dequeued, queue_wait=0.0ms
+info: Qwen3.8 DFlash2: loading drafter from /Users/zouyee/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2/snapshots/50307d4c4cde6860d4eee73e2547cd786fe8e8a4
+warning: Failed to cache index: error.StatFailed
+info: Qwen3.8 DFlash2: loaded persisted drafter context (10717 tokens)
+info: [verify-split] shape gate (d/h/hkv/l/kv_len)
+info: fused GDN verify tail kernel active (d=128)
+info: [verify-split] engaged
+info: [warmup] skipping replay: 17600 tokens exceeds cap 8192 (DMLX_WARMUP_MAX_TOKENS)
+info: [Engine] MTP depth N=1:1r/51.8ms/tok(E[t]=1.87) N=2:1r/38.3ms/tok(E[t]=2.64) N=3:1r/33.0ms/tok(E[t]=3.32) N=4:1r/30.8ms/tok(E[t]=3.92) N=5:1r/26.7ms/tok(E[t]=4.45) N=6:1r/25.4ms/tok(E[t]=4.91) N=7:25r/22.0ms/tok(E[t]=5.31)
+info: [Engine] MTP cond-acceptance p1=0.950(~9.1/9.6) p2=0.964(~8.4/8.7) p3=0.994(~8.0/8.1) p4=0.965(~7.8/8.0) p5=0.978(~7.6/7.8) p6=0.973(~7.2/7.4) p7=0.963(~6.8/7.1)
+info: [Engine] MTP request 1: acceptance 84.4% (168/199 drafts); ms/round draft=40.6 verify=78.0 accept=23.5 commit=0.3
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 150ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=707, wait=6257.0ms calls=1
+info: [RequestLog] id=1 model=m streaming=false prompt_tokens=28 generated_tokens=200 duration_ms=6256.22 tokens_per_sec=31.97
+info: [TIMING] generateChatCompletion=6259.1ms writeResponse=0.1ms
+info: [HTTP] Handler lifetime: 6260.8ms
+info: [HTTP] Connection lifetime: 6260.8ms
+info: [ACCEPT] Connection accepted (accept took 6272.2ms)
+info: [HTTP] Request received: 337 bytes (read=0.0ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 28/28 tokens reused
+info: [HTTP] Request 2 submitted to queue (prepare=0.0ms)
+info: [OpenAI] Waiting for token...
+info: [Engine] Request 2 dequeued, queue_wait=0.0ms
+info: [qwen38] prefix snapshot full hit (28 tokens), skipping prefill
+info: [Engine] MTP depth N=7:28r/21.1ms/tok(E[t]=5.48)
+info: [Engine] MTP cond-acceptance p1=0.967(~9.2/9.5) p2=1.000(~9.2/9.2) p3=0.955(~8.7/9.2) p4=1.000(~8.7/8.7) p5=0.942(~8.2/8.7) p6=0.967(~8.0/8.2) p7=0.969(~7.7/8.0)
+info: [Engine] MTP request 2: acceptance 85.5% (171/200 drafts); ms/round draft=24.2 verify=71.4 accept=21.2 commit=0.1
+info: [Signal] deliverToken id=0 final=true took 0us
+info: [Signal] waitForToken got id=0 waited 81ms
+info: [OpenAI] waitForToken returned
+info: [OpenAI] Got token, is_final=true
+info: [OpenAI] Token loop done, all_text.len=701, wait=3397.4ms calls=1
+info: [RequestLog] id=2 model=m streaming=false prompt_tokens=28 generated_tokens=200 duration_ms=3396.91 tokens_per_sec=58.88
+info: [TIMING] generateChatCompletion=3399.0ms writeResponse=0.0ms
+info: [HTTP] Handler lifetime: 3399.1ms
+info: [HTTP] Connection lifetime: 3399.1ms
