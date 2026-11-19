@@ -192,22 +192,30 @@ pub fn topKTopPSampler(
     const data = try logits.dataPtr(f32);
     const vocab_size = logits.size();
 
-    var scored = try allocator.alloc(ScoredToken, vocab_size);
-    defer allocator.free(scored);
-
-    for (0..vocab_size) |i| {
-        scored[i] = .{
-            .token = @intCast(i),
-            .score = data[i] / temperature,
-        };
-    }
-
-    // Apply top-k first (partial selection — see topKSampler).
     const k_actual = @min(k, vocab_size);
     if (k_actual == 0) return greedy(logits, allocator, temperature);
-    const top = try allocator.alloc(ScoredToken, k_actual);
+
+    // Single streaming pass over the raw logits keeping the k highest scores
+    // in a small sorted array. The previous form materialized a ScoredToken
+    // per vocab entry (~3 MB of writes per call at 248k vocab, paid per
+    // drafted token in the MTP loop).
+    var top = try allocator.alloc(ScoredToken, k_actual);
     defer allocator.free(top);
-    selectTopK(scored, top);
+    var top_len: usize = 0;
+    for (0..vocab_size) |i| {
+        const s = data[i] / temperature;
+        // Skip NaN scores so NaN logits don't rank first (greedy's `>`
+        // comparisons never select a NaN either).
+        if (std.math.isNan(s)) continue;
+        if (top_len == k_actual and s < top[top_len - 1].score) continue;
+        var pos: usize = 0;
+        while (pos < top_len and top[pos].score >= s) : (pos += 1) {}
+        if (pos >= k_actual) continue;
+        if (top_len < k_actual) top_len += 1;
+        var j = top_len - 1;
+        while (j > pos) : (j -= 1) top[j] = top[j - 1];
+        top[pos] = .{ .token = @intCast(i), .score = s };
+    }
 
     // Compute probs over top-k
     var probs = try allocator.alloc(f32, k_actual);
@@ -307,6 +315,9 @@ pub const SamplerConfig = struct {
     repetition_penalty: f32 = 1.0,
     /// Token history for repetition penalty (caller manages this).
     context_tokens: ?[]const u32 = null,
+    /// Compute per-token logprob in sample() (full-vocab softmax pass).
+    /// Off by default: no in-tree consumer reads SampleResult.logprob.
+    want_logprob: bool = false,
     prng: std.Random.DefaultPrng,
 
     pub fn init(seed: u64) SamplerConfig {
@@ -342,7 +353,13 @@ pub const SamplerConfig = struct {
         else
             try topKTopPSampler(penalized_logits, allocator, self.temperature, self.top_k, self.top_p, self.prng.random());
 
-        const logprob = try computeLogprob(penalized_logits, token, allocator);
+        // The softmax-normalizing full-vocab pass costs ~248k exp() per call;
+        // nobody consumes SampleResult.logprob unless the request opted into
+        // logprobs, so only pay it then.
+        const logprob: f32 = if (self.want_logprob)
+            try computeLogprob(penalized_logits, token, allocator)
+        else
+            0.0;
         return SampleResult{ .token = token, .logprob = logprob };
     }
 };

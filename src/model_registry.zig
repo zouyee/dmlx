@@ -1242,6 +1242,9 @@ pub const Qwen38VTableAdapter = struct {
     /// sync here — the engine joint-asyncEvals the draft rows with the
     /// verify rows during acceptance.
     fn dflash2ComputeBlockLogits(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!void {
+        const prof = std.c.getenv("DMLX_DF2_PROF") != null;
+        var t0: i128 = 0;
+        if (prof) t0 = df2Now();
         const m = self.dflash2.?;
         const ctx = self.model.ctx;
         const P: i32 = @intCast(m.cfg.block_size - 1);
@@ -1259,6 +1262,11 @@ pub const Qwen38VTableAdapter = struct {
         defer mask.deinit();
         const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
         defer hidden_full.deinit();
+        if (prof) {
+            hidden_full.eval() catch {};
+            std.debug.print("DF2 sample block fwd {d:.1}ms\n", .{@as(f64, @floatFromInt(df2Now() - t0)) / 1e6});
+        }
+        const t1 = df2Now();
         const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
         defer draft_hidden.deinit();
         const lm = self.mtpLmHead();
@@ -1274,6 +1282,9 @@ pub const Qwen38VTableAdapter = struct {
         // pull re-syncs the whole GPU queue (measured 115-200 ms/round at
         // 2k context; the greedy path pays one sync per BLOCK instead).
         try flat.eval();
+        if (prof) {
+            std.debug.print("DF2 sample lm_head+eval {d:.1}ms\n", .{@as(f64, @floatFromInt(df2Now() - t1)) / 1e6});
+        }
         self.df2_block_logits = flat;
         self.df2_block_len = @intCast(P);
         self.df2_block_idx = 0;
