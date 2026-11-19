@@ -3659,7 +3659,10 @@ pub const Qwen38GDN = struct {
         }
     };
 
-    fn prefillFront(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache) !PrefillFront {
+    /// skip_tail_proj (tree-commit): the z projection and everything behind it
+    /// (out gate, out_proj) are unused — z is a lazy zeros dummy that is never
+    /// materialized, saving one qmm per layer per commit.
+    fn prefillFront(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache, skip_tail_proj: bool) !PrefillFront {
         const ctx = self.ctx;
         const L: i32 = @intCast(x.shape()[1]);
         const HV: i32 = @intCast(self.num_value_heads);
@@ -3681,7 +3684,7 @@ pub const Qwen38GDN = struct {
         var b: Array = undefined;
         var z: Array = undefined;
         var grouped = false;
-        if (self.qkv_scales != null and self.a_scales != null and
+        if (!skip_tail_proj and self.qkv_scales != null and self.a_scales != null and
             self.b_scales != null and self.z_scales != null and
             self.qkv_biases != null and self.a_biases != null and
             self.b_biases != null and self.z_biases != null)
@@ -3706,7 +3709,10 @@ pub const Qwen38GDN = struct {
             qkv_lin = try linearQuantParts(ctx, x, self.in_proj_qkv, self.qkv_scales, self.qkv_biases);
             a = try linearQuantParts(ctx, x, self.in_proj_a, self.a_scales, self.a_biases);
             b = try linearQuantParts(ctx, x, self.in_proj_b, self.b_scales, self.b_biases);
-            z = try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
+            z = if (skip_tail_proj)
+                try array_mod.zeros(self.ctx.allocator, &[_]i32{ 1, L, HV * D }, .bfloat16)
+            else
+                try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
         }
         defer qkv_lin.deinit(); // [1, L, QKV]
         defer a.deinit(); // [1, L, HV]
@@ -4050,7 +4056,7 @@ pub const Qwen38GDN = struct {
         const prof = gdnPrefillProfEnabled();
         var t0: i128 = if (prof) nowNs() else 0;
 
-        var front = try self.prefillFront(x, cache);
+        var front = try self.prefillFront(x, cache, false);
         defer front.deinit();
         if (prof) {
             // Force EVERY front output. Evaluating only some of them
@@ -4219,7 +4225,7 @@ pub const Qwen38GDN = struct {
         const hp = std.c.getenv("DMLX_MTP_DEBUG") != null;
         var ht: i128 = if (hp) nowNs() else 0;
 
-        var front = try self.prefillFront(x, cache);
+        var front = try self.prefillFront(x, cache, false);
         defer front.deinit();
         if (hp) {
             gdn_prof.v_front_host_ns += @intCast(nowNs() - ht);
@@ -4527,10 +4533,66 @@ pub const Qwen38GDN = struct {
         res.ssm_states = &.{};
     }
 
+    /// Batched tree-commit (stage B2): replay the accepted root-to-leaf path
+    /// — k rows of x, [1, k, hidden] — through this layer as ONE chain:
+    /// batched projections + whole-chain causal conv (prefillFront), one
+    /// fused recurrence kernel from the cache's untouched root state
+    /// (deltaRulePrefill, eager per-step fallback for ineligible head dims),
+    /// then the terminal conv/ssm states are swapped into the cache.
+    /// Equivalent to k sequential forward() calls because the accepted path
+    /// is a chain: row t's step reads exactly row t-1's post-state, so the
+    /// chain recurrence over the path rows IS the per-node replay. The
+    /// out-gate tail is skipped — commit needs the states, not outputs.
+    pub fn commitChain(self: *Qwen38GDN, allocator: std.mem.Allocator, x: Array, cache: *Qwen38GdnCache) !void {
+        const ctx = self.ctx;
+        const L: i32 = @intCast(x.shape()[1]);
+        if (L < 1) return;
+        const HV: i32 = @intCast(self.num_value_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const K: i32 = @intCast(self.conv_kernel);
+        const QKV: i32 = cache.conv_state.shape()[1];
+
+        var front = try self.prefillFront(x, cache, true);
+        defer front.deinit();
+
+        // Match the decode step's beta rounding (fused tail kernels compute
+        // beta = float(bf16(sigmoid(b))) when b is bf16): prefillFront keeps
+        // beta in f32, which drifts ~4e-3 relative per step against the
+        // per-row replay this replaces. Round-trip through bf16 restores it.
+        var beta_rt: ?Array = null;
+        defer if (beta_rt) |*br| br.deinit();
+        if (self.b_scales != null) {
+            const b16 = try ops.astype(ctx, front.beta, .bfloat16);
+            defer b16.deinit();
+            beta_rt = try ops.astype(ctx, b16, .float32);
+        }
+        const beta = beta_rt orelse front.beta;
+
+        const rec = try deltaRulePrefill(ctx, allocator, cache.ssm_state, front.k_full, front.v, beta, front.g, front.q_full, HV, D);
+        errdefer rec.s_new.deinit();
+        defer rec.y.deinit(); // states only — the readout is not needed
+
+        // Terminal conv state = window rows [L, L+K-1). Slicing the window
+        // (not the raw qkv tail rows) also covers L < K-1, which prefill's
+        // shortcut cannot express.
+        const rows = try ops.slice(ctx, front.window, &[_]i32{ L, 0 }, &[_]i32{ L + K - 1, QKV }, &[_]i32{ 1, 1 });
+        defer rows.deinit();
+        const new_conv = try ops.copy(ctx, rows);
+        errdefer new_conv.deinit();
+
+        // Submit for evaluation; the caller (commitVerifyTree) syncs ONCE
+        // after all layers instead of paying two barriers per layer.
+        try eval_mod.asyncEval(allocator, &[_]Array{ new_conv, rec.s_new });
+        cache.conv_state.deinit();
+        cache.conv_state = new_conv;
+        cache.ssm_state.deinit();
+        cache.ssm_state = rec.s_new;
+    }
+
     /// Tree-verify result: per-node outputs in flat node order plus a copy of
     /// the input rows. Per-node conv/ssm states are deliberately NOT retained
     /// (N × ~3.1 MB per layer); the commit side replays the accepted path from
-    /// the root state + `x_copy` rows (deltaRuleEager).
+    /// the root state + `x_copy` rows as one batched chain (commitChain).
     pub const TreeVerifyResult = struct {
         out: Array, // [1, N, hidden] flat node order
         x_copy: Array, // [1, N, hidden] input copy for commit replay
@@ -5346,6 +5408,87 @@ test "Qwen38GDN.prefillVerifyTree: per-step tree matches per-path chain verify" 
         const got_row = tree_out[node * h .. (node + 1) * h];
         for (exp_row, got_row) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
     }
+}
+
+test "Qwen38GDN.commitChain: batched tree commit matches per-node eager replay" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    const dims = TestDims{};
+    const hidden: i32 = @intCast(dims.hidden);
+    // Tree with 5 nodes: 0 -> {1, 2}, 1 -> {3, 4}; commit path [0, 1, 3].
+    const N: i32 = 5;
+    const buf = try allocator.alloc(f32, @intCast(N * hidden));
+    defer allocator.free(buf);
+    testFill(buf);
+    const x = try Array.fromData(allocator, f32, buf, &[_]i32{ 1, N, hidden });
+    defer x.deinit();
+
+    var g = try makeTestModule(allocator, ctx, dims);
+    defer g.deinit();
+    const qkv_dim: usize = (2 * dims.key_heads + dims.value_heads) * dims.head_dim;
+
+    // Two identically dirtied caches (one warmup token).
+    var cache_eager = try Qwen38GdnCache.init(allocator, dims.conv_kernel, qkv_dim, dims.value_heads, dims.head_dim);
+    defer cache_eager.deinit();
+    var cache_batched = try Qwen38GdnCache.init(allocator, dims.conv_kernel, qkv_dim, dims.value_heads, dims.head_dim);
+    defer cache_batched.deinit();
+    for ([_]*Qwen38GdnCache{ &cache_eager, &cache_batched }) |cache| {
+        const x0 = try ops.slice(ctx, x, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, hidden }, &[_]i32{ 1, 1, 1 });
+        defer x0.deinit();
+        const x0f = try ops.reshape(ctx, x0, &[_]i32{ 1, hidden });
+        defer x0f.deinit();
+        const o0 = try g.forward(x0f, cache);
+        defer o0.deinit();
+        try o0.eval();
+        try cache.conv_state.eval();
+        try cache.ssm_state.eval();
+    }
+
+    // Stage-A reference: per-node eager replay of path rows [0, 1, 3].
+    for ([_]i32{ 0, 1, 3 }) |ri| {
+        const r5 = try ops.slice(ctx, x, &[_]i32{ 0, ri, 0 }, &[_]i32{ 1, ri + 1, hidden }, &[_]i32{ 1, 1, 1 });
+        defer r5.deinit();
+        const flat = try ops.reshape(ctx, r5, &[_]i32{ 1, hidden });
+        defer flat.deinit();
+        const out = try g.forward(flat, &cache_eager);
+        defer out.deinit();
+        try out.eval();
+    }
+    try cache_eager.conv_state.eval();
+    try cache_eager.ssm_state.eval();
+
+    // Batched: gather rows [0, 1, 3] and commit the whole chain in one pass.
+    const idx = try Array.fromData(allocator, i32, &[_]i32{ 0, 1, 3 }, &[_]i32{3});
+    defer idx.deinit();
+    const path_rows = try shape_mod.takeAxis(ctx, x, idx, 1);
+    defer path_rows.deinit();
+    try g.commitChain(allocator, path_rows, &cache_batched);
+
+    const conv_e = try cache_eager.conv_state.dataSlice(f32);
+    const conv_b = try cache_batched.conv_state.dataSlice(f32);
+    try std.testing.expectEqual(conv_e.len, conv_b.len);
+    for (conv_e, conv_b) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+    const ssm_e = try cache_eager.ssm_state.dataSlice(f32);
+    const ssm_b = try cache_batched.ssm_state.dataSlice(f32);
+    try std.testing.expectEqual(ssm_e.len, ssm_b.len);
+    for (ssm_e, ssm_b) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
+
+    // The committed cache must keep decoding identically.
+    const xe = try ops.slice(ctx, x, &[_]i32{ 0, 4, 0 }, &[_]i32{ 1, 5, hidden }, &[_]i32{ 1, 1, 1 });
+    defer xe.deinit();
+    const xef = try ops.reshape(ctx, xe, &[_]i32{ 1, hidden });
+    defer xef.deinit();
+    const oe = try g.forward(xef, &cache_eager);
+    defer oe.deinit();
+    const ob = try g.forward(xef, &cache_batched);
+    defer ob.deinit();
+    try oe.eval();
+    try ob.eval();
+    const oe_s = try oe.dataSlice(f32);
+    const ob_s = try ob.dataSlice(f32);
+    for (oe_s, ob_s) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-4);
 }
 
 test "Qwen38GDN.prefillVerify fused: s_all commit matches prefix prefill" {

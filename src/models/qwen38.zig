@@ -3597,10 +3597,13 @@ pub fn forwardVerifyTree(self: *Qwen38ServingModel, tree: qwen38_dflash2.DraftTr
 /// are verify-row indices (0 = anchor) in root-to-leaf order.
 /// Attention: the verify region [old, old+1+N) of each KV slab is compacted
 /// to the path rows (compactAttnCache), len_ = old + k. GDN: the path's
-/// input rows (TreeVerifyResult.x_copy) are replayed through the layer's
-/// decode step from the cache's untouched root state, leaving conv/ssm at
-/// the path's terminal node — bit-identical to a chain commit of the same
-/// path.
+/// input rows (TreeVerifyResult.x_copy) are replayed from the cache's
+/// untouched root state as ONE batched chain per layer
+/// (Qwen38GDN.commitChain: batched projections + whole-chain conv + one
+/// fused recurrence kernel, out-gate tail skipped), leaving conv/ssm at the
+/// path's terminal node — the accepted path is a chain, so the chain
+/// recurrence over its rows IS the per-node replay. Falls back to the
+/// per-row eager replay when the batched pass errors.
 pub fn commitVerifyTree(self: *Qwen38ServingModel, v: *Qwen38TreeVerifyOut, accepted_path: []const usize) void {
     const ctx = self.ctx;
     const n_rows = v.tree.tokens.len + 1;
@@ -3619,6 +3622,27 @@ pub fn commitVerifyTree(self: *Qwen38ServingModel, v: *Qwen38TreeVerifyOut, acce
         const g = &self.layers[layer].module.gdn;
         const cache = &self.caches[layer].gdn;
         const hidden: i32 = r.x_copy.shape()[2];
+        // Batched chain commit (stage B2): gather the accepted path's rows
+        // into one [1, k, hidden] tensor and replay the whole chain in a
+        // single fused pass per layer (Qwen38GDN.commitChain), replacing the
+        // per-node eager decode-step replay. On any failure the old per-row
+        // eager replay below runs instead; DMLX_DF2_NO_BATCH_COMMIT=1 forces
+        // it (A/B measurement).
+        batched: {
+            if (std.c.getenv("DMLX_DF2_NO_BATCH_COMMIT") != null) break :batched;
+            const idx_buf = self.allocator.alloc(i32, accepted_path.len) catch break :batched;
+            defer self.allocator.free(idx_buf);
+            for (accepted_path, idx_buf) |row, *dst| dst.* = @intCast(row);
+            const idx = Array.fromData(self.allocator, i32, idx_buf, &[_]i32{@intCast(accepted_path.len)}) catch break :batched;
+            defer idx.deinit();
+            const rows = shape_mod.takeAxis(ctx, r.x_copy, idx, 1) catch break :batched;
+            defer rows.deinit();
+            g.commitChain(self.allocator, rows, cache) catch |err| {
+                std.log.err("commitVerifyTree: batched GDN commit failed ({s}); falling back to eager replay", .{@errorName(err)});
+                break :batched;
+            };
+            continue;
+        }
         for (accepted_path) |row| {
             const ri: i32 = @intCast(row);
             const r5 = ops.slice(ctx, r.x_copy, &[_]i32{ 0, ri, 0 }, &[_]i32{ 1, ri + 1, hidden }, &[_]i32{ 1, 1, 1 }) catch |err| {
@@ -3637,7 +3661,12 @@ pub fn commitVerifyTree(self: *Qwen38ServingModel, v: *Qwen38TreeVerifyOut, acce
             };
             defer out.deinit();
         }
-        // Bound the lazy graph: materialize the terminal states now.
+    }
+    // Bound the lazy graph: materialize the terminal states once for all
+    // layers (the batched path submitted them via asyncEval; the eager
+    // fallback's per-row states materialize here too).
+    for (v.gdn_layers) |layer| {
+        const cache = &self.caches[layer].gdn;
         cache.conv_state.eval() catch {};
         cache.ssm_state.eval() catch {};
     }
