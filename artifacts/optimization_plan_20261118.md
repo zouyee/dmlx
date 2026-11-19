@@ -35,3 +35,24 @@
 1. P1（小改动，直接提升 decode 2k/8k 各 ~20-30%）
 2. P0（落盘格式 + 加载 + 校验；以 pi/codex 11k system prompt 为验收场景：重启 server 后首个 agent 请求 TTFT <2s）
 3. P0 完成后复测全天对照矩阵，更新 README/HANDOFF 数字。
+
+## 创新方向立项（2026-11-19 追加）
+
+追平已验证方案是工程基线；以下三条作为 dmlx 的差异化创新立项，独立于追平工作排期。
+
+**R1 — GDN 循环层的 fused 树形递推 kernel**
+- 背景：树形投机 verify 要求 GDN（DeltaNet）层按树拓扑递推（节点状态取 parent 而非前驱行）。现状无公开 fused 实现，已知实现都用 scan+publish 两段式绕开。我们的 qwen38_gdn.zig 已有 verify snapshot+replay 设施，是唯一具备切入口的实现。
+- 产出物：按-parent 索引读状态的 fused Metal kernel + 正确性测试 + 对照实验（E[t] × 树宽 × verify 延迟）。目标是可以对外发布的形态（blog/开源）。
+- 依赖：阶段 A（selectTree + 慢速树 verify）证明 E[t] 增益 ≥ +0.8。
+
+**R2 — acceptance-feedback 动态投机调度**
+- 背景：固定 draft 深度/树宽是行业现状；接受率随内容类型、温度、上下文位置剧烈变化（实测短/长 prompt 75%→36%）。在线按实测 landing rate 定价每流 draft 预算的调度器没人做好过。已有 MtpDepthController（链式在线选深）作为地基。
+- 产出物：树的深度/宽度/预算三维在线调度 + 每请求接受率反馈环；验收标准是长上下文（acceptance 崩到 ~36% 的 regime）下 E[t] 损失减半。
+- 依赖：树 verify 落地（阶段 B）。
+
+**R3 — agent 场景跨会话 KV 常驻复用**
+- 背景：磁盘持久化快照已把跨重启 TTFT 打到 0.41s（P0 已落地）；下一步是"常驻前缀"——agent harness 的 ~11k system prompt + 工具说明在多会话间稳定，常驻为可复用 KV 段，用户 prompt 只 prefill 增量。这是 client 体感 tok/s 提升最大的一类，且我们是唯一已有落盘设施的单机引擎。
+- 产出物：快照段化管理（多段哈希索引、LRU 逐出、部分命中续算）+ pi/codex 真实会话验收（新会话首轮 TTFT < 1s）。
+- 依赖：P0（已落地），无其他前置。
+
+优先级：阶段 A/B 追平（树 verify）> R1（B 的核心，可发布形态）> R3 > R2。

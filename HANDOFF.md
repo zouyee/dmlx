@@ -2467,3 +2467,24 @@ Remaining gaps / follow-ups:
   would buy at most +3-5% end-to-end at high exactness risk. Verify
   kernel work is DONE for this hardware; further decode gains must come
   from acceptance (drafter quality/depth), not verify.
+
+## Future directions — innovation backlog (2026-11-19)
+
+Three differentiated bets formally tracked in
+`artifacts/optimization_plan_20261118.md` (section 创新方向立项):
+
+- **R1 — fused GDN tree-recurrence kernel**: tree-shaped speculative verify
+  needs DeltaNet states indexed by tree parent, not flat row order. No public
+  fused implementation exists (known implementations use scan+publish
+  two-pass). Our qwen38_gdn verify snapshot+replay machinery is the entry
+  point. Publishable-grade target.
+- **R2 — acceptance-feedback dynamic speculation scheduler**: online
+  draft depth/width/budget pricing from measured landing rate
+  (observed acceptance swings 75%→36% across prompt regimes).
+  MtpDepthController is the foundation.
+- **R3 — persistent cross-session KV residency for agents**: segment-managed
+  disk snapshots (hash index, LRU, partial-hit incremental prefill) so an
+  agent's stable ~11k system prompt is prefilled once ever. Builds on the
+  disk-persistent snapshot path shipped in P0.
+
+Ordering: tree-verify catch-up (stage A/B) → R1 (the core of B) → R3 → R2.
