@@ -219,6 +219,17 @@ fn verifySnapshot() bool {
     return v;
 }
 
+var tree_verify_eager: ?bool = null;
+
+/// `DMLX_DF2_GDN_TREE_EAGER=1`: per-node eager tree verify (pre-B3 path),
+/// kept as the A/B fallback for the batched depth-synchronized tree verify.
+fn treeVerifyEager() bool {
+    if (tree_verify_eager) |v| return v;
+    const v = std.c.getenv("DMLX_DF2_GDN_TREE_EAGER") != null;
+    tree_verify_eager = v;
+    return v;
+}
+
 fn gdnPrefillProfEnabled() bool {
     if (gdn_prof_enabled) |v| return v;
     const v = std.c.getenv("DMLX_GDN_PREFILL_PROF") != null;
@@ -3662,19 +3673,32 @@ pub const Qwen38GDN = struct {
     /// skip_tail_proj (tree-commit): the z projection and everything behind it
     /// (out gate, out_proj) are unused — z is a lazy zeros dummy that is never
     /// materialized, saving one qmm per layer per commit.
-    fn prefillFront(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache, skip_tail_proj: bool) !PrefillFront {
+    const PrefillProj = struct {
+        qkv_lin: Array, // [1, L, QKV]
+        a: Array, // [1, L, HV]
+        b: Array, // [1, L, HV]
+        z: Array, // [1, L, HV*D]
+        z_moved: bool = false,
+
+        fn deinit(self: *PrefillProj) void {
+            self.qkv_lin.deinit();
+            self.a.deinit();
+            self.b.deinit();
+            if (!self.z_moved) self.z.deinit();
+        }
+    };
+
+    /// Batched in-projections: [1, L, hidden] -> qkv_lin/a/b/z. First half of
+    /// prefillFront; also the entry point of the batched tree verify.
+    fn prefillProj(self: *Qwen38GDN, x: Array, skip_tail_proj: bool) !PrefillProj {
         const ctx = self.ctx;
         const L: i32 = @intCast(x.shape()[1]);
         const HV: i32 = @intCast(self.num_value_heads);
-        const HK: i32 = @intCast(self.num_key_heads);
         const D: i32 = @intCast(self.head_dim);
-        const K: i32 = @intCast(self.conv_kernel);
-        const QKV: i32 = (2 * HK + HV) * D;
-        const pk = HK * D;
 
         // 1. Batched projections: [1, L, hidden] -> [1, L, *].
         const fp = gdnPrefillProfEnabled();
-        var ft: i128 = if (fp) nowNs() else 0;
+        const ft: i128 = if (fp) nowNs() else 0;
         // While the verify-qmm routing is armed, the four in-projections
         // share this input and go out in ONE sg8 group launch (plan doc:
         // close-decode-gap fusion program F1). Falls back to the four
@@ -3714,10 +3738,10 @@ pub const Qwen38GDN = struct {
             else
                 try linearQuantParts(ctx, x, self.in_proj_z, self.z_scales, self.z_biases);
         }
-        defer qkv_lin.deinit(); // [1, L, QKV]
-        defer a.deinit(); // [1, L, HV]
-        defer b.deinit(); // [1, L, HV]
-        errdefer z.deinit(); // [1, L, HV*D]
+        errdefer qkv_lin.deinit();
+        errdefer a.deinit();
+        errdefer b.deinit();
+        errdefer z.deinit();
 
         if (fp) {
             qkv_lin.eval() catch {};
@@ -3725,11 +3749,29 @@ pub const Qwen38GDN = struct {
             b.eval() catch {};
             z.eval() catch {};
             gdn_prof.f_proj_ns += @intCast(nowNs() - ft);
-            ft = nowNs();
         }
 
+        return .{ .qkv_lin = qkv_lin, .a = a, .b = b, .z = z };
+    }
+
+    /// Projections + whole-chain causal conv + post-conv processing for a
+    /// CHAIN of rows (prefillProj + the chain conv below + prefillPostConv).
+    fn prefillFront(self: *Qwen38GDN, x: Array, cache: *Qwen38GdnCache, skip_tail_proj: bool) !PrefillFront {
+        const ctx = self.ctx;
+        const L: i32 = @intCast(x.shape()[1]);
+        const HK: i32 = @intCast(self.num_key_heads);
+        const HV: i32 = @intCast(self.num_value_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const K: i32 = @intCast(self.conv_kernel);
+        const QKV: i32 = (2 * HK + HV) * D;
+
+        var proj = try self.prefillProj(x, skip_tail_proj);
+        defer proj.deinit();
+
         // 2. Causal depthwise conv over the whole sequence + silu.
-        const qkv_lin2 = try ops.reshape(ctx, qkv_lin, &[_]i32{ L, QKV });
+        const fp = gdnPrefillProfEnabled();
+        var ft: i128 = if (fp) nowNs() else 0;
+        const qkv_lin2 = try ops.reshape(ctx, proj.qkv_lin, &[_]i32{ L, QKV });
         defer qkv_lin2.deinit();
         // The v2 fused conv kernel reads the projection output in BF16
         // directly (widening is exact), so the full-tensor f32 promotion
@@ -3794,6 +3836,60 @@ pub const Qwen38GDN = struct {
             break :blk try ops.copy(ctx, tail);
         };
         errdefer new_conv_state.deinit();
+
+        var post = try self.prefillPostConv(qkv, proj.a, proj.b, L);
+        post.moved = true; // fields move into the result
+        proj.z_moved = true;
+        return .{
+            .qkv = qkv,
+            .q_full = post.q_full,
+            .k_full = post.k_full,
+            .q_heads = post.q_heads,
+            .k_heads = post.k_heads,
+            .v = post.v,
+            .beta = post.beta,
+            .g = post.g,
+            .z = proj.z,
+            .window = window,
+            .new_conv_state = new_conv_state,
+        };
+    }
+
+    const PrefillPostConv = struct {
+        q_full: Array, // [L, HV, D] f32
+        k_full: Array, // [L, HV, D] f32
+        q_heads: Array, // [L, HK, D] f32 — unbroadcast; the pipelined recurrence maps hv -> hv/(HV/HK) itself
+        k_heads: Array, // [L, HK, D] f32
+        v: Array, // [L, HV, D] f32
+        beta: Array, // [L, HV] f32
+        g: Array, // [L, HV] f32
+        moved: bool = false,
+
+        fn deinit(self: *PrefillPostConv) void {
+            if (self.moved) return;
+            self.q_full.deinit();
+            self.k_full.deinit();
+            self.q_heads.deinit();
+            self.k_heads.deinit();
+            self.v.deinit();
+            self.beta.deinit();
+            self.g.deinit();
+        }
+    };
+
+    /// Everything after the causal conv (shared by the chain and tree forms):
+    /// split q/k/v, folded-scale rmsNorms, softplus/sigmoid gates, kv-group
+    /// broadcast. `qkv` is the post-conv+silu [L, QKV] f32 tensor (borrowed);
+    /// `a`/`b` are the [1, L, HV] projections (borrowed).
+    fn prefillPostConv(self: *Qwen38GDN, qkv: Array, a: Array, b: Array, L: i32) !PrefillPostConv {
+        const ctx = self.ctx;
+        const HV: i32 = @intCast(self.num_value_heads);
+        const HK: i32 = @intCast(self.num_key_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const QKV: i32 = @intCast(qkv.shape()[1]);
+        const pk = HK * D;
+        const fp = gdnPrefillProfEnabled();
+        var ft: i128 = if (fp) nowNs() else 0;
 
         // 3. Split q/k/v and apply the weight-less per-head rmsNorm (folded
         // scales) — the norm runs along the last dim, so [L, H, D] works
@@ -3930,7 +4026,6 @@ pub const Qwen38GDN = struct {
         }
 
         return .{
-            .qkv = qkv,
             .q_full = q_full,
             .k_full = k_full,
             .q_heads = q,
@@ -3938,9 +4033,6 @@ pub const Qwen38GDN = struct {
             .v = v,
             .beta = beta,
             .g = g,
-            .z = z,
-            .window = window,
-            .new_conv_state = new_conv_state,
         };
     }
 
@@ -4603,15 +4695,293 @@ pub const Qwen38GDN = struct {
         }
     };
 
-    /// Tree-shaped verify pass: runs the per-step eager recurrence along every
-    /// root-to-node path of a draft tree. `x` holds the N node tokens in flat
-    /// order; `parents[i]` is the flat index of node i's parent (-1 branches
-    /// from the cache's current state). Requires parents[i] < i whenever
-    /// parents[i] >= 0 (topological flat order, which DraftTree's construction
-    /// already guarantees). The cache is NOT modified. Each node's post-state
-    /// is freed as soon as its last child has been processed, so peak state
-    /// memory is bounded by the tree's width, not N.
+    /// Tree-shaped verify pass. Default is the stage-B3 batched form
+    /// (prefillVerifyTreeBatched): three batched layers instead of N eager
+    /// per-node `forward` calls —
+    ///   1. projections: one prefillProj over all N nodes (per-token, no
+    ///      cross-node dependencies);
+    ///   2. causal conv: node i's window is its own raw qkv_lin row plus the
+    ///      K-1 rows preceding it along its root-to-node path (cache
+    ///      conv_state rows when the path is shorter than K-1) — gathered as
+    ///      [N, K, QKV] and tap-summed + silu in ascending tap order, exactly
+    ///      convAccumSeq's accumulation order;
+    ///   3. delta rule: the only true tree dependency (state(node) =
+    ///      f(state(parent), input(node))) runs depth-synchronized: all nodes
+    ///      at one depth form one batch (folded into the fused kernel's head
+    ///      axis), so a depth-≤8 tree costs ≤8 kernel launches per layer
+    ///      instead of N serial per-node steps.
+    /// Per-node states are NOT retained (the commit side replays the accepted
+    /// path via commitChain), so peak state memory is one depth level.
+    /// `DMLX_DF2_GDN_TREE_EAGER=1` restores the per-node eager loop; dims the
+    /// fused delta-rule kernel cannot handle fall back to it too.
     pub fn prefillVerifyTree(
+        self: *Qwen38GDN,
+        allocator: std.mem.Allocator,
+        x: Array, // [1, N, hidden]
+        parents: []const i32,
+        cache: *Qwen38GdnCache,
+    ) !TreeVerifyResult {
+        const N: usize = @intCast(x.shape()[1]);
+        if (parents.len != N) return error.TreeVerifyParentsLen;
+        if (!treeVerifyEager()) {
+            if (self.prefillVerifyTreeBatched(allocator, x, parents, cache)) |res| {
+                return res;
+            } else |err| {
+                if (err != error.TreeBatchedUnavailable) return err;
+            }
+        }
+        return self.prefillVerifyTreeEager(allocator, x, parents, cache);
+    }
+
+    fn prefillVerifyTreeBatched(
+        self: *Qwen38GDN,
+        allocator: std.mem.Allocator,
+        x: Array, // [1, N, hidden]
+        parents: []const i32,
+        cache: *Qwen38GdnCache,
+    ) !TreeVerifyResult {
+        const ctx = self.ctx;
+        const N_i: i32 = @intCast(x.shape()[1]);
+        const N: usize = @intCast(N_i);
+        const HV: i32 = @intCast(self.num_value_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const K: i32 = @intCast(self.conv_kernel);
+        const QKV: i32 = cache.conv_state.shape()[1];
+
+        // The depth-synced recurrence folds the batch into the fused delta
+        // kernel's head axis; ineligible dims take the eager per-node path.
+        if (N == 0) return error.TreeBatchedUnavailable;
+        const tprof = std.c.getenv("DMLX_TREE_PROF") != null;
+        var tprev = nowNs();
+        const tlap = struct {
+            fn f(pprev: *i128, what: []const u8, a: Array) void {
+                a.eval() catch return;
+                const now = nowNs();
+                std.debug.print("[tree-prof] {s}: {d:.1} ms\n", .{ what, @as(f64, @floatFromInt(now - pprev.*)) / 1e6 });
+                pprev.* = now;
+            }
+        }.f;
+        if (@mod(D, 4) != 0 or D < 4 or D > 128) return error.TreeBatchedUnavailable;
+        if (cache.ssm_state.dtype() != .float32 or cache.conv_state.dtype() != .float32) return error.TreeBatchedUnavailable;
+
+        // --- host-side tree structure: depths, depth buckets, gathers -------
+        var depth = try allocator.alloc(i32, N);
+        defer allocator.free(depth);
+        var max_depth: i32 = 0;
+        for (parents, 0..) |p, i| {
+            if (p >= 0) {
+                const pi: usize = @intCast(p);
+                if (pi >= i) return error.TreeVerifyParentOrder;
+                depth[i] = depth[pi] + 1;
+            } else {
+                depth[i] = 0;
+            }
+            max_depth = @max(max_depth, depth[i]);
+        }
+        const n_depths: usize = @intCast(max_depth + 1);
+        var bucket_start = try allocator.alloc(usize, n_depths);
+        defer allocator.free(bucket_start);
+        var bucket_count = try allocator.alloc(usize, n_depths);
+        defer allocator.free(bucket_count);
+        @memset(bucket_count, 0);
+        for (depth) |dep| bucket_count[@intCast(dep)] += 1;
+        bucket_start[0] = 0;
+        for (1..n_depths) |dd| bucket_start[dd] = bucket_start[dd - 1] + bucket_count[dd - 1];
+        var order = try allocator.alloc(i32, N); // node indices, bucket-major
+        defer allocator.free(order);
+        var pos = try allocator.alloc(usize, N); // node's slot in bucket-major order
+        defer allocator.free(pos);
+        {
+            var cursor = try allocator.alloc(usize, n_depths);
+            defer allocator.free(cursor);
+            @memcpy(cursor, bucket_start);
+            for (0..N) |i| {
+                const dd: usize = @intCast(depth[i]);
+                const p = cursor[dd];
+                cursor[dd] = p + 1;
+                order[p] = @intCast(i);
+                pos[i] = p;
+            }
+        }
+        // Conv window gather over all_rows = [conv_state (K-1 rows); qkv_lin
+        // (N rows)]: node i, tap j reads the path row at depth depth[i]+j-(K-1)
+        // — a cache row when negative, the ancestor's raw row otherwise.
+        const Ku: usize = @intCast(K);
+        var conv_idx = try allocator.alloc(i32, N * Ku);
+        defer allocator.free(conv_idx);
+        for (0..N) |i| {
+            var j: i32 = 0;
+            while (j < K) : (j += 1) {
+                const r = depth[i] + j - (K - 1);
+                conv_idx[i * Ku + @as(usize, @intCast(j))] = if (r < 0)
+                    depth[i] + j
+                else blk: {
+                    var cur: usize = i;
+                    while (depth[cur] > r) cur = @intCast(parents[cur]);
+                    break :blk (K - 1) + @as(i32, @intCast(cur));
+                };
+            }
+        }
+
+        // --- 1. batched projections -----------------------------------------
+        var proj = try self.prefillProj(x, false);
+        defer proj.deinit();
+        if (tprof) tlap(&tprev, "proj", proj.qkv_lin);
+
+        // --- 2. tree causal conv + silu --------------------------------------
+        const qkv_lin2 = try ops.reshape(ctx, proj.qkv_lin, &[_]i32{ N_i, QKV });
+        defer qkv_lin2.deinit();
+        const qkv_lin_f32 = try ops.astype(ctx, qkv_lin2, .float32);
+        defer qkv_lin_f32.deinit();
+        const all_rows = try shape_mod.concatenateAxis(ctx, &[_]Array{ cache.conv_state, qkv_lin_f32 }, 0); // [K-1+N, QKV] f32
+        defer all_rows.deinit();
+        const conv_idx_arr = try Array.fromData(allocator, i32, conv_idx, &[_]i32{N_i * K});
+        defer conv_idx_arr.deinit();
+        const gathered = try shape_mod.takeAxis(ctx, all_rows, conv_idx_arr, 0); // [N*K, QKV]
+        defer gathered.deinit();
+        const gath3 = try ops.reshape(ctx, gathered, &[_]i32{ N_i, K, QKV });
+        defer gath3.deinit();
+        const w_f32 = if (self.conv1d_t_f32) |w| w else try ops.astype(ctx, self.conv1d_t, .float32);
+        defer if (self.conv1d_t_f32 == null) w_f32.deinit();
+        var acc: ?Array = null;
+        errdefer if (acc) |aa| aa.deinit();
+        var j: i32 = 0;
+        while (j < K) : (j += 1) {
+            const gj = try ops.slice(ctx, gath3, &[_]i32{ 0, j, 0 }, &[_]i32{ N_i, j + 1, QKV }, &[_]i32{ 1, 1, 1 });
+            defer gj.deinit();
+            const gj2 = try ops.reshape(ctx, gj, &[_]i32{ N_i, QKV });
+            defer gj2.deinit();
+            const wj = try ops.slice(ctx, w_f32, &[_]i32{ j, 0 }, &[_]i32{ j + 1, QKV }, &[_]i32{ 1, 1 });
+            defer wj.deinit();
+            const prod = try ops.multiply(ctx, gj2, wj); // [N, QKV] * [1, QKV]
+            if (acc) |aa| {
+                acc = try ops.add(ctx, aa, prod);
+                aa.deinit();
+                prod.deinit();
+            } else {
+                acc = prod;
+            }
+        }
+        const conv_acc = acc.?;
+        defer conv_acc.deinit();
+        const qkv = try activations.silu(ctx, conv_acc); // [N, QKV] f32
+        defer qkv.deinit();
+
+        var post = try self.prefillPostConv(qkv, proj.a, proj.b, N_i);
+        defer post.deinit();
+        if (tprof) tlap(&tprev, "conv", post.q_full);
+
+        // --- 3. depth-synchronized delta-rule recurrence ---------------------
+        var y_parts = try allocator.alloc(Array, n_depths); // [B_d, HV, D] f32 per depth
+        defer allocator.free(y_parts);
+        var y_made: usize = 0;
+        defer for (y_parts[0..y_made]) |*yp| yp.deinit();
+
+        var s_prev: ?Array = null; // [B*HV, D, D] owned; consumed by the next depth
+        defer if (s_prev) |*sp| sp.deinit();
+
+        var dd: usize = 0;
+        while (dd < n_depths) : (dd += 1) {
+            const bs = bucket_start[dd];
+            const bc = bucket_count[dd];
+            const B: i32 = @intCast(bc);
+            const row_idx = try Array.fromData(allocator, i32, order[bs .. bs + bc], &[_]i32{B});
+            defer row_idx.deinit();
+
+            const k_r = try shape_mod.takeAxis(ctx, post.k_full, row_idx, 0);
+            defer k_r.deinit();
+            const k_b = try ops.reshape(ctx, k_r, &[_]i32{ B * HV, D });
+            defer k_b.deinit();
+            const q_r = try shape_mod.takeAxis(ctx, post.q_full, row_idx, 0);
+            defer q_r.deinit();
+            const q_b = try ops.reshape(ctx, q_r, &[_]i32{ B * HV, D });
+            defer q_b.deinit();
+            const v_r = try shape_mod.takeAxis(ctx, post.v, row_idx, 0);
+            defer v_r.deinit();
+            const v_b = try ops.reshape(ctx, v_r, &[_]i32{ B * HV, D });
+            defer v_b.deinit();
+            const be_r = try shape_mod.takeAxis(ctx, post.beta, row_idx, 0);
+            defer be_r.deinit();
+            const be_b = try ops.reshape(ctx, be_r, &[_]i32{B * HV});
+            defer be_b.deinit();
+            const g_r = try shape_mod.takeAxis(ctx, post.g, row_idx, 0);
+            defer g_r.deinit();
+            const g_b = try ops.reshape(ctx, g_r, &[_]i32{B * HV});
+            defer g_b.deinit();
+
+            var s_in: Array = undefined;
+            if (dd == 0) {
+                if (bc == 1) {
+                    s_in = try ops.copy(ctx, cache.ssm_state);
+                } else {
+                    const e4 = try ops.expandDims(ctx, cache.ssm_state, 0);
+                    defer e4.deinit();
+                    const t4 = try ops.tile(ctx, e4, &[_]i32{ B, 1, 1, 1 });
+                    defer t4.deinit();
+                    s_in = try ops.reshape(ctx, t4, &[_]i32{ B * HV, D, D });
+                }
+            } else {
+                const sp4 = try ops.reshape(ctx, s_prev.?, &[_]i32{ @as(i32, @intCast(bucket_count[dd - 1])), HV, D, D });
+                defer sp4.deinit();
+                // Parent of each bucket node, as a local index into the
+                // previous depth's batch.
+                var par = try allocator.alloc(i32, bc);
+                defer allocator.free(par);
+                for (order[bs .. bs + bc], 0..) |nd, ii| {
+                    par[ii] = @intCast(pos[@intCast(parents[@intCast(nd)])] - bucket_start[dd - 1]);
+                }
+                const par_arr = try Array.fromData(allocator, i32, par, &[_]i32{B});
+                defer par_arr.deinit();
+                const gpar = try shape_mod.takeAxis(ctx, sp4, par_arr, 0); // [B, HV, D, D]
+                defer gpar.deinit();
+                s_in = try ops.reshape(ctx, gpar, &[_]i32{ B * HV, D, D });
+                s_prev.?.deinit();
+                s_prev = null;
+            }
+            defer s_in.deinit();
+
+            const dr = (try deltaRuleFused(ctx, s_in, k_b, v_b, be_b, g_b, q_b, B * HV, D)) orelse
+                return error.TreeBatchedUnavailable;
+            y_parts[dd] = ops.reshape(ctx, dr.y_f32, &[_]i32{ B, HV, D }) catch |e| {
+                dr.s_new.deinit();
+                dr.y_f32.deinit();
+                return e;
+            };
+            dr.y_f32.deinit();
+            y_made += 1;
+            s_prev = dr.s_new;
+        }
+
+        const y_cat = try shape_mod.concatenateAxis(ctx, y_parts[0..y_made], 0); // [N, HV, D] bucket-major
+        for (y_parts[0..y_made]) |*yp| yp.deinit();
+        y_made = 0;
+        defer y_cat.deinit();
+        var perm = try allocator.alloc(i32, N);
+        defer allocator.free(perm);
+        for (0..N) |i| perm[i] = @intCast(pos[i]);
+        const perm_arr = try Array.fromData(allocator, i32, perm, &[_]i32{N_i});
+        defer perm_arr.deinit();
+        const y_all = try shape_mod.takeAxis(ctx, y_cat, perm_arr, 0); // [N, HV, D] flat node order
+        defer y_all.deinit();
+        if (tprof) tlap(&tprev, "recur", y_all);
+
+        const out = try self.prefillTail(y_all, proj.z, qkv.dtype());
+        errdefer out.deinit();
+        if (tprof) tlap(&tprev, "tail", out);
+        const x_copy = try ops.copy(ctx, x);
+        return .{ .out = out, .x_copy = x_copy };
+    }
+
+    /// Per-node eager tree verify (pre-B3 path): runs the per-step eager
+    /// recurrence along every root-to-node path of a draft tree. `x` holds
+    /// the N node tokens in flat order; `parents[i]` is the flat index of
+    /// node i's parent (-1 branches from the cache's current state). Requires
+    /// parents[i] < i whenever parents[i] >= 0 (topological flat order, which
+    /// DraftTree's construction already guarantees). The cache is NOT
+    /// modified. Each node's post-state is freed as soon as its last child
+    /// has been processed, so peak state memory is bounded by the tree's
+    /// width, not N.
+    fn prefillVerifyTreeEager(
         self: *Qwen38GDN,
         allocator: std.mem.Allocator,
         x: Array, // [1, N, hidden]
