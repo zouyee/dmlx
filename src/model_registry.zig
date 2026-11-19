@@ -902,6 +902,10 @@ pub const Qwen38VTableAdapter = struct {
         self.mtp_ops.num_drafts = 7;
         self.mtp_ops.verifyTree = &mtpVerifyTree;
         self.mtp_ops.commitTree = &mtpCommitTree;
+        self.mtp_ops.rollbackTree = &mtpRollbackTree;
+        self.mtp_ops.draftTree = &mtpDraftTree;
+        self.mtp_ops.verifyTreeArgmax = &mtpVerifyTreeArgmax;
+        self.mtp_ops.verifyTreeHidden = &mtpVerifyTreeHidden;
         if (self.dflash2 != null) return true;
         std.log.info("Qwen3.8 DFlash2: loading drafter from {s}", .{dir});
         const m = try self.allocator.create(qwen38_dflash2.DFlash2);
@@ -1560,15 +1564,141 @@ pub const Qwen38VTableAdapter = struct {
         return box;
     }
 
-    /// Commit the accepted path (verify-row indices) and free the handle.
-    /// Drafter-side context bookkeeping is the engine's job (U5); a full
-    /// rollback is model-level `rollbackVerifyTree`, not yet exposed here.
+    /// DFlash2 tree draft (U5): one block forward over [anchor, mask x P]
+    /// against the ring context, then the best-first tree selector
+    /// (selectTree). The greedy chain is always a sub-path of the tree, so
+    /// greedy acceptance over the tree is bitwise-lossless vs chain rounds.
+    fn mtpDraftTree(ctx_ptr: *anyopaque, anchor: u32, max_nodes: usize, children: usize) anyerror!generation.MtpDraftTree {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dflash2 == null) return error.TreeVerifyUnavailable;
+        const m = self.dflash2.?;
+        const ctx = self.model.ctx;
+        const P: i32 = @intCast(m.cfg.block_size - 1);
+        const H: i32 = @intCast(m.cfg.hidden_size);
+
+        const tok_gpu = try Array.fromData(self.allocator, i32, &[_]i32{@intCast(anchor)}, &[_]i32{1});
+        defer tok_gpu.deinit();
+        const mask_ids = try self.allocator.alloc(i32, @intCast(P));
+        defer self.allocator.free(mask_ids);
+        for (mask_ids) |*t| t.* = @intCast(m.cfg.mask_token_id);
+        const mask_arr = try Array.fromData(self.allocator, i32, mask_ids, &[_]i32{P});
+        defer mask_arr.deinit();
+        const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
+        defer block_ids.deinit();
+
+        var ring = &self.df2_ctx.?;
+        if (ring.fed == 0) return error.DFlash2EmptyContext;
+        const anchor_pos = ring.fed;
+        const mask = try ring.draftMask();
+        defer mask.deinit();
+        const hidden_full = try qwen38_dflash2.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids, mask);
+        defer hidden_full.deinit();
+        const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
+        defer draft_hidden.deinit();
+        const logits = try self.mtpLmHead().apply(ctx, draft_hidden); // [1, P, V]
+        defer logits.deinit();
+
+        var tree = try qwen38_dflash2.selectTree(ctx, m, draft_hidden, logits, anchor, anchor_pos, max_nodes, children);
+        // The engine walks the tree via parents/positions; depth is dropped.
+        tree.allocator.free(tree.depth);
+        return .{
+            .tokens = tree.tokens,
+            .parents = tree.parents,
+            .positions = tree.positions,
+            .anchor_pos = anchor_pos,
+            .allocator = tree.allocator,
+        };
+    }
+
+    /// Discard a tree verify pass and free the handle: attention lengths
+    /// truncated back (GDN caches were never touched), tentative ring feed
+    /// (if any) dropped.
+    fn mtpRollbackTree(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) void {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        const v: *qwen38.Qwen38TreeVerifyOut = @ptrCast(@alignCast(handle));
+        qwen38.rollbackVerifyTree(self.model, v);
+        if (self.df2_ctx != null and self.df2_ctx.?.tentative_start >= 0) self.df2_ctx.?.discardTentative();
+        v.deinit(self.allocator);
+        self.allocator.destroy(v);
+    }
+
+    /// Batched argmax over all tree verify rows ([anchor, nodes...]) →
+    /// [1+N] i32, one GPU op + one engine-side sync (chain-path analog of
+    /// mtpVerifyArgmax for the tree handle type).
+    fn mtpVerifyTreeArgmax(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        const v: *qwen38.Qwen38TreeVerifyOut = @ptrCast(@alignCast(handle));
+        const ctx = self.model.ctx;
+        const L: i32 = v.logits.shape()[1];
+        const vocab: i32 = v.logits.shape()[2];
+        const f32l = try ops.astype(ctx, v.logits, .float32);
+        defer f32l.deinit();
+        const flat = try ops.reshape(ctx, f32l, &[_]i32{ L, vocab });
+        defer flat.deinit();
+        return reduce_mod.argmaxAxis(ctx, flat, -1, false); // [L] i32
+    }
+
+    /// Pre-final-norm hidden of tree verify row i → [1, hidden] (owned);
+    /// same trunk-norm treatment as mtpVerifyHidden.
+    fn mtpVerifyTreeHidden(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, i: usize) anyerror!Array {
+        const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        _ = pthread.pthread_mutex_lock(&self.mu);
+        defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        const v: *qwen38.Qwen38TreeVerifyOut = @ptrCast(@alignCast(handle));
+        const ctx = self.model.ctx;
+        const hidden: i32 = v.hidden_pre_norm_all.shape()[2];
+        const row = try ops.slice(ctx, v.hidden_pre_norm_all, &[_]i32{ 0, @intCast(i), 0 }, &[_]i32{ 1, @as(i32, @intCast(i)) + 1, hidden }, &[_]i32{ 1, 1, 1 });
+        defer row.deinit();
+        const flat = try ops.reshape(ctx, row, &[_]i32{ 1, hidden });
+        defer flat.deinit();
+        const flatn = try self.maybeTrunkNorm(flat);
+        defer if (self.trunkPostnormEnabled()) flatn.deinit();
+        return ops.copy(ctx, flatn);
+    }
+
+    /// Commit the accepted path (verify-row indices) and free the handle;
+    /// also feeds the accepted path's tap rows into the drafter ring (U5).
+    /// Rollback is mtpRollbackTree.
     fn mtpCommitTree(ctx_ptr: *anyopaque, handle: generation.MtpVerifyHandle, accepted_path: []const usize) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38TreeVerifyOut = @ptrCast(@alignCast(handle));
         qwen38.commitVerifyTree(self.model, v, accepted_path);
+        // Drafter ring feed (chain-commit analog): the accepted path's tap
+        // rows, in path order. Their absolute positions are consecutive along
+        // the path (anchor at fed, depth d at fed+d), matching observe's
+        // sequential write at the current fed.
+        if (self.df2_ctx != null and self.df2_ctx.?.tentative_start >= 0) {
+            self.df2_ctx.?.discardTentative();
+            self.dflash2ClearPending();
+        }
+        if (self.dflash2 != null and accepted_path.len > 0) {
+            if (v.tap_hidden) |th| {
+                const ctx = self.model.ctx;
+                const idx = self.allocator.alloc(i32, accepted_path.len) catch null;
+                if (idx) |ix| {
+                    defer self.allocator.free(ix);
+                    for (accepted_path, 0..) |row, j| ix[j] = @intCast(row);
+                    if (Array.fromData(self.allocator, i32, ix, &[_]i32{@intCast(ix.len)})) |ia| {
+                        defer ia.deinit();
+                        if (shape_mod.takeAxis(ctx, th, ia, 1)) |rows| {
+                            defer rows.deinit();
+                            self.df2_ctx.?.observe(rows) catch |err| {
+                                std.log.err("EngineLoop: DF2 tree commit ring observe failed: {}", .{err});
+                            };
+                        } else |_| {}
+                    } else |_| {}
+                }
+            }
+        }
+        self.dflash2ClearBlock();
         v.deinit(self.allocator);
         self.allocator.destroy(v);
     }

@@ -152,6 +152,25 @@ pub const VisionOps = struct {
 /// Opaque per-round verify state (model-specific; e.g. Qwen38VerifyOut box).
 pub const MtpVerifyHandle = *anyopaque;
 
+/// Host-side draft tree handed from the drafter (draftTree) to the engine,
+/// which may append extra branches (e.g. ngram copies) before verifyTree.
+/// Slices are allocator-owned; `positions[i]` is the node's absolute rope
+/// position and `anchor_pos` the committed anchor's position (so appended
+/// nodes can derive their own positions as anchor_pos + depth).
+pub const MtpDraftTree = struct {
+    tokens: []u32, // [N] flat topological order, anchor excluded
+    parents: []i32, // [N]: -1 = child of the anchor, else a tokens index
+    positions: []i32, // [N]: absolute rope position
+    anchor_pos: i64,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *MtpDraftTree) void {
+        self.allocator.free(self.tokens);
+        self.allocator.free(self.parents);
+        self.allocator.free(self.positions);
+    }
+};
+
 /// MTP capability: all model state (backbone caches, drafter module + its KV
 /// cache) lives behind `ctx` (the adapter). The engine drives the rounds and
 /// does all sampling/acceptance.
@@ -188,9 +207,21 @@ pub const MtpOps = struct {
     /// [anchor, tokens...] in flat order. Null → tree verify unavailable;
     /// the engine falls back to chain rounds.
     verifyTree: ?*const fn (ctx: *anyopaque, tokens: []const u32, parents: []const i32, positions: []const i32, anchor: u32) anyerror!MtpVerifyHandle = null,
+    /// Build a draft tree for this round (one drafter block forward + tree
+    /// selection), anchored at the last committed token. Null → tree
+    /// drafting unavailable.
+    draftTree: ?*const fn (ctx: *anyopaque, anchor: u32, max_nodes: usize, children: usize) anyerror!MtpDraftTree = null,
     /// Commit an accepted root-to-leaf path of a tree verify (verify-row
     /// indices, 0 = anchor) and free the handle.
     commitTree: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle, accepted_path: []const usize) void = null,
+    /// Discard a tree verify pass and free the handle (backbone caches
+    /// restored to the round's start).
+    rollbackTree: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) void = null,
+    /// Greedy tree acceptance: argmax over ALL tree verify rows
+    /// ([anchor, nodes...] flat order) → i32 [1+N] (owned, unevaled).
+    verifyTreeArgmax: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle) anyerror!Array = null,
+    /// Pre-final-norm hidden of tree verify row i → [1, hidden] (owned).
+    verifyTreeHidden: ?*const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array = null,
     /// Pre-final-norm hidden row i of the verify handle → [1, hidden] (owned).
     verifyHidden: *const fn (ctx: *anyopaque, handle: MtpVerifyHandle, i: usize) anyerror!Array,
     /// Commit `accepted` ∈ 1..L verify positions (backbone + drafter caches).

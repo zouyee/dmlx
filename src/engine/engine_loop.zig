@@ -2517,6 +2517,25 @@ pub const EngineLoop = struct {
         self.mtp_depth.?.resetForRequest(prompt_class);
         const depth_ctl = &self.mtp_depth.?;
 
+        // DMLX_DF2_TREE=1 (greedy only): replace the per-round draft chain
+        // with a best-first tree (max 15 nodes, <=4 children per expansion,
+        // depth <= block_size-1) verified in ONE tree pass, then greedy-walk
+        // the tree. The greedy chain is a sub-path of the tree, so emission
+        // is bitwise-identical to chain rounds. DMLX_DF2_TREE_COPIES=1 hangs
+        // an extra ngram copy chain under the anchor (tree nodes win the
+        // 15-node budget). Predraft is not used in tree mode.
+        var tree_mode = greedy and
+            mtp.draftTree != null and mtp.verifyTree != null and mtp.commitTree != null and
+            mtp.rollbackTree != null and mtp.verifyTreeArgmax != null and mtp.verifyTreeHidden != null and
+            std.c.getenv("DMLX_DF2_TREE") != null;
+        const tree_copies = std.c.getenv("DMLX_DF2_TREE_COPIES") != null;
+        const df2_tree_max_nodes: usize = 15;
+        const df2_tree_children: usize = 4;
+        const df2_tree_max_depth: usize = 7; // block_size - 1
+        var tree_rounds: usize = 0;
+        var tree_nodes: usize = 0;
+        var tree_path_tokens: usize = 0;
+
         // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
         // the drafter's top-k at each depth. top1 reproduces p_i; the top1 ->
         // top2/top4 gap is the headroom a multi-branch draft would capture.
@@ -2549,6 +2568,147 @@ pub const EngineLoop = struct {
             const remaining = gen_config.max_tokens - total_generated;
             const n_round = @max(1, @min(depth_ctl.pick(), remaining));
             const round_t0 = prof_now();
+
+            // ---- DFlash2 tree verify round (DMLX_DF2_TREE=1) ----
+            if (tree_mode) tree_blk: {
+                const anchor = t_next.token;
+                var dt = mtp.draftTree.?(self.model.ptr, anchor, df2_tree_max_nodes, df2_tree_children) catch |err| {
+                    std.log.warn("EngineLoop: DF2 tree draft failed ({}); falling back to chain rounds", .{err});
+                    tree_mode = false;
+                    break :tree_blk;
+                };
+                defer dt.deinit();
+                var ttoks = std.ArrayList(u32).empty;
+                defer ttoks.deinit(allocator);
+                var tpars = std.ArrayList(i32).empty;
+                defer tpars.deinit(allocator);
+                var tposs = std.ArrayList(i32).empty;
+                defer tposs.deinit(allocator);
+                ttoks.appendSlice(allocator, dt.tokens) catch break;
+                tpars.appendSlice(allocator, dt.parents) catch break;
+                tposs.appendSlice(allocator, dt.positions) catch break;
+                if (tree_copies) {
+                    const ng = speculative_mod.NgramDrafter{ .n = 3 };
+                    if (ng.propose(context.items, 8, allocator)) |copy| {
+                        defer allocator.free(copy);
+                        const budget = df2_tree_max_nodes -| ttoks.items.len;
+                        const take = @min(@min(copy.len, budget), df2_tree_max_depth);
+                        for (copy[0..take], 0..) |ct, j| {
+                            const parent: i32 = if (j == 0) -1 else @as(i32, @intCast(ttoks.items.len - 1));
+                            ttoks.append(allocator, ct) catch break;
+                            tpars.append(allocator, parent) catch break;
+                            tposs.append(allocator, @intCast(dt.anchor_pos + 1 + @as(i64, @intCast(j)))) catch break;
+                        }
+                    }
+                }
+                if (ttoks.items.len == 0) {
+                    tree_mode = false;
+                    break :tree_blk;
+                }
+                prof_lap(prof_now, &prof_last, &prof_draft_ns);
+                prof_rounds +|= 1;
+
+                const vh = mtp.verifyTree.?(self.model.ptr, ttoks.items, tpars.items, tposs.items, anchor) catch |err| {
+                    std.log.warn("EngineLoop: DF2 tree verify failed ({}); falling back to chain rounds", .{err});
+                    tree_mode = false;
+                    break :tree_blk;
+                };
+                prof_lap(prof_now, &prof_last, &prof_verify_ns);
+                // The tree handle is freed by commitTree/rollbackTree below —
+                // there is NO freeVerify on this path.
+                const am = mtp.verifyTreeArgmax.?(self.model.ptr, vh) catch {
+                    mtp.rollbackTree.?(self.model.ptr, vh);
+                    tree_mode = false;
+                    break :tree_blk;
+                };
+                defer am.deinit();
+                const ams_opt: ?[]const i32 = blk: {
+                    am.eval() catch break :blk null;
+                    break :blk am.dataSlice(i32) catch null;
+                };
+                const ams = ams_opt orelse {
+                    mtp.rollbackTree.?(self.model.ptr, vh);
+                    tree_mode = false;
+                    break :tree_blk;
+                };
+
+                // Greedy tree walk from the anchor: at each node take the
+                // target's argmax; if a child carries that token, advance,
+                // else stop. The bonus is the last node's target argmax (not
+                // in the tree; next round's anchor, chain-pending semantics).
+                var path = std.ArrayList(usize).empty;
+                defer path.deinit(allocator);
+                path.append(allocator, 0) catch {
+                    mtp.rollbackTree.?(self.model.ptr, vh);
+                    break;
+                };
+                var cur: usize = 0; // verify row (0 = anchor)
+                var stop_hit = false;
+                while (true) {
+                    const targ: u32 = @intCast(ams[cur]);
+                    var nxt: ?usize = null;
+                    for (ttoks.items, 0..) |tk, j| {
+                        const prow: usize = if (tpars.items[j] < 0) 0 else @as(usize, @intCast(tpars.items[j])) + 1;
+                        if (prow == cur and tk == targ) {
+                            nxt = j + 1;
+                            break;
+                        }
+                    }
+                    const nr = nxt orelse break;
+                    path.append(allocator, nr) catch break;
+                    cur = nr;
+                    if (generation_mod.isStopToken(targ, gen_config.stop_tokens)) {
+                        stop_hit = true;
+                        break;
+                    }
+                }
+                var hidden_next: ?Array = mtp.verifyTreeHidden.?(self.model.ptr, vh, cur) catch {
+                    mtp.rollbackTree.?(self.model.ptr, vh);
+                    tree_mode = false;
+                    break :tree_blk;
+                };
+                defer if (hidden_next) |hn| hn.deinit();
+                prof_lap(prof_now, &prof_last, &prof_accept_ns);
+                mtp.commitTree.?(self.model.ptr, vh, path.items);
+                prof_lap(prof_now, &prof_last, &prof_commit_ns);
+
+                tree_rounds += 1;
+                tree_nodes += ttoks.items.len;
+                tree_path_tokens += path.items.len - 1;
+                drafts_proposed += ttoks.items.len;
+                if (std.c.getenv("DMLX_MTP_DEBUG") != null) {
+                    std.debug.print("MTP tree round: N={d} path={d} t={d} t'={d}\n", .{ ttoks.items.len, path.items.len - 1, anchor, ams[cur] });
+                }
+
+                // Emit accepted path tokens (capped at max_tokens), then the
+                // bonus token — same order and caps as the chain path.
+                for (path.items[1..]) |row| {
+                    if (total_generated >= gen_config.max_tokens) break;
+                    const et = ttoks.items[row - 1];
+                    context.append(allocator, et) catch break;
+                    if (streamer) |*s2| s2.emit(et);
+                    total_generated += 1;
+                    drafts_accepted += 1;
+                }
+                if (stop_hit) {
+                    stopped = true;
+                    finish = .stop;
+                    continue;
+                }
+                if (total_generated >= gen_config.max_tokens) continue;
+                t_next = sampling_mod.SampleResult{ .token = @intCast(ams[cur]), .logprob = 0.0 };
+                context.append(allocator, t_next.token) catch break;
+                if (streamer) |*s2| s2.emit(t_next.token);
+                total_generated += 1;
+                hidden.deinit();
+                hidden = hidden_next.?;
+                hidden_next = null;
+                if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
+                    stopped = true;
+                    finish = .stop;
+                }
+                continue;
+            }
 
             // 1. Draft chain.
             var drafts = std.ArrayList(u32).empty;
@@ -3109,6 +3269,16 @@ pub const EngineLoop = struct {
                 p_len += chunk.len;
             }
             std.log.info("[Engine] MTP cond-acceptance{s}", .{p_buf[0..p_len]});
+            if (tree_rounds > 0) {
+                // Tree mode (DMLX_DF2_TREE): nodes/round is the mean tree
+                // size; E[t] counts accepted path tokens + the per-round
+                // bonus, directly comparable to chain E[t].
+                std.log.info("[Engine] MTP tree: rounds={d} nodes/round={d:.1} E[t]={d:.2}", .{
+                    tree_rounds,
+                    @as(f64, @floatFromInt(tree_nodes)) / @as(f64, @floatFromInt(tree_rounds)),
+                    @as(f64, @floatFromInt(tree_path_tokens + tree_rounds)) / @as(f64, @floatFromInt(tree_rounds)),
+                });
+            }
             qwen38_gdn_prof.gdnVerifyProfReport();
             qwen38_gdn_prof.gdnPrefillProfReport(); // front sub-splits during verify (DMLX_GDN_PREFILL_PROF)
             verify_qmm_mod.tallyReport();
