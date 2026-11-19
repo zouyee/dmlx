@@ -1,0 +1,28 @@
+info: qwen27: prompt capacity=512 rows, startup stream and scratch reserve=14572847104 bytes
+info: qwen27: lone loop=plain width=1; lane window=16, lane copies=off
+info: qwen27: 20.3 GiB kept wired between requests, inside 70% of 48 GiB of RAM
+info: qwen27: Neural Engine prompt share requested_columns=0 loaded_columns=0 program_weight_bytes=0 loaded=false exact_output_qualified=false
+info: qwen27: slot 0 keeps a rewind point of 146 MiB at each prompt's history end
+info: prompt cache: 4.3 GiB from 4.3 GiB free under the 70% cap (20.8 GiB in use once loaded and 6.6 GiB reserved outside that reading, 48 GiB of RAM, 2 GiB kept for prompt buffers); default: half the room, at least 16 GiB when available; --prompt-cache-gib overrides it
+info: Qwen3.8-27B: 4 streams of 32768 tokens
+[tensorfold] chat template: the checkpoint's
+[tensorfold] prompt chunks of up to 128 tokens, cut at replies 256+ tokens apart
+[tensorfold] profile: stable; registered overrides: none
+[tensorfold] serving Qwen3.8-27B-pi-merged-4bit at http://127.0.0.1:8399/v1 (sampling: temperature 1.0, top_k 20, top_p 0.95; drafts: copies only; context: 32768; loaded in 3.9s)
+[tensorfold] thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {"enable_thinking": false}
+[tensorfold] 127.0.0.1 "GET /v1/models HTTP/1.1" 200 -
+info: prompt cache: 53 tokens, resumed at 0, kept 0; 0 states, 0 MiB and 0 MiB spare of 4356 MiB (hits 0, misses 1, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] done chatcmpl-9eb408fdd56d3d8e1a83f72908101388 prompt=53 cached=0 thinking=True effort=none tokens=25 sha=305b4f31c83b finish=stop rounds=24 accepted=0/0 ttft=0.635 decode=1.711 elapsed=2.346 queued=0.000 tok/s=14.0 seed=236521006041059793
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 116 tokens, resumed at 0, kept 0; 1 states, 192 MiB and 0 MiB spare of 4356 MiB (hits 0, misses 3, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-576563f8577d4e165701949fb76da4fb prompt=116 cached=0 thinking=True effort=none tokens=256 sha=b33a047f07e3 finish=length rounds=255 accepted=0/0 ttft=1.056 decode=18.073 elapsed=19.129 queued=0.000 tok/s=14.1 seed=6183885033768800673
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 2716 tokens, resumed at 0, kept 2; 4 states, 960 MiB and 0 MiB spare of 4356 MiB (hits 0, misses 5, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-7c0ccc137088d17b3562188b2dc80a43 prompt=2716 cached=0 thinking=True effort=none tokens=256 sha=5a2f9a164a65 finish=length rounds=255 accepted=0/0 ttft=23.580 decode=18.702 elapsed=42.281 queued=0.000 tok/s=13.6 seed=442890214415344584
+[tensorfold] 127.0.0.1 "POST /v1/chat/completions HTTP/1.1" 200 -
+info: prompt cache: 10716 tokens, resumed at 2688, kept 2; 7 states, 3072 MiB and 0 MiB spare of 4356 MiB (hits 1, misses 5, evicted 0, refused 0, failed 0, trimmed 0)
+[tensorfold] warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {"enable_thinking": false} (server: --no-thinking)
+[tensorfold] done chatcmpl-84ae025001ac6602dc392183f75f7c0a prompt=10716 cached=2688 thinking=True effort=none tokens=256 sha=87ba9c2ac4e0 finish=length rounds=255 accepted=0/0 ttft=73.085 decode=20.482 elapsed=93.566 queued=0.000 tok/s=12.5 seed=4001467581366313516

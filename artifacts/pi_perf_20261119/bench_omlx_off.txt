@@ -1,0 +1,3 @@
+omlx-off                 short          prompt~   65tok ttft=  1.14s decode=   4.9 tok/s n=86 wall=  18.5s
+omlx-off                 mid-2k         prompt~ 2133tok ttft= 20.06s decode=   4.9 tok/s n=86 wall=  37.4s
+omlx-off                 long-8k        prompt~ 8493tok ttft= 82.47s decode=   4.7 tok/s n=86 wall= 100.6s

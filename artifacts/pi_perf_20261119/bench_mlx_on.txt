@@ -1,0 +1,3 @@
+mlx-on                   short          prompt~   65tok ttft=  1.22s decode=  14.1 tok/s n=256 wall=  19.3s
+mlx-on                   mid-2k         prompt~ 2133tok ttft= 21.30s decode=  13.8 tok/s n=256 wall=  39.7s
+mlx-on                   long-8k        prompt~ 8493tok ttft= 86.08s decode=  13.3 tok/s n=256 wall= 105.3s

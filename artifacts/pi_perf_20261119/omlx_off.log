@@ -1,0 +1,72 @@
+2026-11-19 10:11:52,089 - omlx.settings - INFO - Saved settings to /Users/zouyee/.omlx/settings.json
+INFO:     Uvicorn running on http://127.0.0.1:8399 (Press CTRL+C to quit)
+2026-11-19 10:11:53,145 - omlx.scheduler - INFO - ChunkedKVCache patch: methods already present upstream, skipped: size
+2026-11-19 10:11:54,444 - omlx.server - INFO - CORS origins: ['*']
+2026-11-19 10:11:54,444 - omlx.model_settings - WARNING - Skipped profile reference repair: Unsupported profile storage format: model_settings.json
+2026-11-19 10:11:54,444 - omlx.model_settings - WARNING - Settings file version 1 differs from current 2
+2026-11-19 10:11:54,445 - omlx.model_settings - INFO - Loaded settings for 7 models
+2026-11-19 10:11:54,460 - omlx.model_discovery - INFO - Discovered model: qwen38-pi-merged (type: vlm, engine: vlm, size: 15.70GB, text-only: 14.80GB)
+2026-11-19 10:11:54,469 - omlx.model_discovery - INFO - Model type 'qwen3' has both embedding and LLM variants, but architecture ['Qwen3ForCausalLM'] is not an embedding architecture — treating as LLM
+2026-11-19 10:11:54,469 - omlx.model_discovery - INFO - Discovered model: mlx-community--Qwen3-1.7B-4bit (type: llm, engine: batched, size: 0.95GB)
+2026-11-19 10:11:54,472 - omlx.model_discovery - INFO - Treating HF cache model as MLX-compatible speculative-decoding helper: z-lab/Qwen3.8-27B-DFlash2
+2026-11-19 10:11:54,472 - omlx.model_discovery - INFO - Model type 'qwen3' has both embedding and LLM variants, but architecture ['DFlash2DraftModel'] is not an embedding architecture — treating as LLM
+2026-11-19 10:11:54,473 - omlx.model_discovery - INFO - Discovered model: z-lab--Qwen3.8-27B-DFlash2 (type: llm, engine: batched, size: 3.76GB)
+2026-11-19 10:11:54,474 - omlx.engine_pool - INFO - Discovered 3 models
+2026-11-19 10:11:54,474 - omlx.server_metrics - INFO - Loaded all-time stats from /Users/zouyee/.omlx/stats.json
+2026-11-19 10:11:54,488 - omlx.server - INFO - Server initialized with 3 models
+2026-11-19 10:11:54,488 - omlx.server - INFO - Default model: qwen38-pi-merged
+2026-11-19 10:11:54,488 - omlx.server - INFO - Memory guard tier: balanced (guard off)
+2026-11-19 10:11:54,488 - omlx.server - INFO - Default max tokens: 32768
+2026-11-19 10:11:54,488 - omlx.server - INFO - HF Downloader initialized
+2026-11-19 10:11:54,488 - omlx.server - INFO - ModelScope SDK not installed, MS downloader disabled
+2026-11-19 10:11:54,490 - omlx.server - INFO - oQ Quantizer initialized
+2026-11-19 10:11:54,494 - omlx.server - INFO - HF Uploader initialized
+INFO:     Started server process [9716]
+INFO:     Waiting for application startup.
+2026-11-19 10:11:54,513 - omlx.process_memory_enforcer - INFO - Process memory enforcer started (tier=balanced, ceiling=0.0GB, interval=1.0s)
+INFO:     Application startup complete.
+2026-11-19 10:11:58,917 - omlx.engine_pool - INFO - Loading model: qwen38-pi-merged
+2026-11-19 10:11:58,919 - omlx.utils.model_loading - INFO - M5 sorted gather_qmm reroute installed (issue #2267)
+2026-11-19 10:11:58,942 - omlx.patches.mlx_lm_mtp.qwen35_model - INFO - Qwen3.5/3.6 MTP model patch applied (PR 990)
+2026-11-19 10:11:58,945 - omlx.patches.mlx_lm_mtp.nemotron_h_chain - INFO - nemotron_h MTP chain patch applied (depth-k drafting, sequential fused verify, replay-free rollback)
+2026-11-19 10:11:58,945 - omlx.patches.qwen35_verify_qmm - INFO - MTP verify qmm patch applied (rows 2..6 split-K, 7..8 sg8, 9..24 mma)
+2026-11-19 10:11:58,946 - omlx.patches.mlx_vlm_mtp.qwen35_vlm_model - INFO - Patched mlx_vlm.models.qwen3_5.Model.sanitize for MTP
+2026-11-19 10:11:58,949 - omlx.patches.mlx_vlm_mtp.qwen35_moe_vlm_model - INFO - Patched mlx_vlm.models.qwen3_5_moe.Model.sanitize for MTP
+2026-11-19 10:11:58,953 - omlx.patches.mlx_vlm_inkling_compat - INFO - Inkling mlx-vlm compatibility patch applied
+2026-11-19 10:11:58,954 - omlx.patches.mlx_vlm_mtp.qwen35_vlm_runtime - INFO - mlx-vlm Qwen3.5 (dense) runtime MTP patch applied
+2026-11-19 10:11:58,954 - omlx.utils.model_loading - INFO - mlx-vlm runtime MTP patch applied for /Users/zouyee/.omlx/bench/qwen38-pi-merged (config declares mtp heads but checkpoint ships no mtp.* weights; MTPModule attachment skipped to keep strict load_weights happy)
+2026-11-19 10:11:58,954 - omlx.patches.qwen35_gdn_prework - INFO - mlx-vlm Qwen3.5 GDN q/k normalization follows mlx-lm normalize_qk
+2026-11-19 10:12:02,464 - omlx.engine.vlm - INFO - Vision feature cache enabled (SSD: disabled)
+2026-11-19 10:12:03,759 - omlx.scheduler - INFO - Loaded 1 additional EOS token(s) from generation_config.json: {248044}
+2026-11-19 10:12:03,761 - omlx.scheduler - INFO - Decode KV cache materialization interval set to 256 tokens
+2026-11-19 10:12:03,761 - omlx.memory_monitor - INFO - MemoryMonitor initialized (estimator-only, eviction disabled)
+2026-11-19 10:12:03,774 - omlx.memory_monitor - INFO - Model info set: 64 layers (16 KVCache), 4 KV heads, 24 Q heads, 256 head_dim. Estimated memory per 64-token block: 4.00 MB
+2026-11-19 10:12:03,774 - omlx.scheduler - INFO - oMLX cache disabled (mlx-lm BatchGenerator manages KV internally)
+2026-11-19 10:12:03,777 - omlx.engine_core - INFO - Engine started
+2026-11-19 10:12:03,779 - omlx.patches.sdpa256_attention - INFO - sdpa256 attention patch applied (head_dim=256 prefill, kv_len>=8192, always force bounded for qualifying calls (#2025))
+2026-11-19 10:12:03,916 - omlx.patches.qwen35_fa256_attention - INFO - Qwen FA-256 dispatch budget auto-calibrated: 5.28e+09 work/s -> 52791311 (target 10ms/dispatch)
+2026-11-19 10:12:03,917 - omlx.patches.qwen35_fa256_attention - INFO - Qwen3.5/3.6 FA-256 steel attention patch applied (min_kv_len=2048, q_block=32, k_block=8, dispatch_budget=52791311)
+2026-11-19 10:12:03,919 - omlx.patches.qwen35_gdn_verify_fused - INFO - GDN verify replay commit patch applied
+2026-11-19 10:12:03,919 - omlx.patches.qwen35_gdn_prework - INFO - Qwen fused GDN prework patch applied
+2026-11-19 10:12:03,919 - omlx.patches.qwen35_verify_sdpa_split - INFO - Qwen3.5/3.6 verify-width causal vector attention patch applied
+2026-11-19 10:12:03,920 - omlx.patches.qwen35_gdn_chunked - INFO - Qwen3.5/3.6 GDN prefill kernel patch applied (Metal, impl=pipelined, min_t=64)
+2026-11-19 10:12:03,920 - omlx.patches.qwen35_q4_mlp - INFO - Qwen quantized MLP prefill patch applied (variant=8, min_tokens=2048, q8_min_tokens=16384)
+2026-11-19 10:12:03,923 - omlx.patches.qwen35_moe_router - INFO - Qwen MoE fused router top-k patch applied
+2026-11-19 10:12:03,924 - omlx.patches.qwen35_moe_routed_decode - INFO - Qwen MoE fused routed-expert decode patch applied
+2026-11-19 10:12:03,925 - omlx.patches.qwen35_moe_weighted_sum - INFO - Qwen3.5/3.6 MoE weighted-sum patch applied (min_tokens=1024)
+2026-11-19 10:12:03,925 - omlx.patches.qwen35_ragged_decode - INFO - qwen3_5 ragged decode threadgroup fallback patch applied
+2026-11-19 10:12:03,926 - omlx.patches.qwen35_padded_row_attention - INFO - qwen3_5 padded-row attention patch applied
+2026-11-19 10:12:04,000 - omlx.engine.vlm - INFO - VLM tool calling enabled: parser=qwen3_coder
+2026-11-19 10:12:04,003 - omlx.engine.vlm - INFO - VLMBatchedEngine loaded: /Users/zouyee/.omlx/bench/qwen38-pi-merged
+2026-11-19 10:12:04,007 - omlx.engine_pool - INFO - Loaded model: qwen38-pi-merged (actual: 15.55GB, local estimate: 15.70GB, full model: 15.70GB, total: 15.70GB)
+2026-11-19 10:12:04,702 - omlx.patches.qwen35_gdn_prework - INFO - Qwen B1/T1 fused GDN prework engaged
+2026-11-19 10:12:06,804 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=10.1ms/1
+2026-11-19 10:12:06,804 - omlx.server - INFO - Chat completion: model=qwen38-pi-merged, 26 tokens in 2.78s (9.3 tok/s), prompt: 53, finish_reason=stop, max_tokens=30, request_max_tokens=30
+2026-11-19 10:12:25,415 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=20.7ms/2
+2026-11-19 10:12:25,416 - omlx.server - INFO - Chat completion: model=qwen38-pi-merged, 256 tokens in 18.48s (14.7 tok/s), prompt: 116, finish_reason=length, max_tokens=256, request_max_tokens=256, stream_model_ttft=1.12s, stream_visible_ttft=1.12s
+2026-11-19 10:12:40,222 - omlx.scheduler - INFO - Reserved prefill capacity for 2716 tokens across 16 caches (+0.05GB)
+2026-11-19 10:13:02,825 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=31.6ms/3
+2026-11-19 10:13:02,826 - omlx.server - INFO - Chat completion: model=qwen38-pi-merged, 256 tokens in 37.40s (14.8 tok/s), prompt: 2716, finish_reason=length, max_tokens=256, request_max_tokens=256, stream_model_ttft=20.05s, stream_visible_ttft=20.05s
+2026-11-19 10:13:18,649 - omlx.scheduler - INFO - Reserved prefill capacity for 10716 tokens across 16 caches (+0.53GB)
+2026-11-19 10:14:43,417 - omlx.scheduler - INFO - Cache phase timings: cleanup_finished_sync=42.1ms/4
+2026-11-19 10:14:43,419 - omlx.server - INFO - Chat completion: model=qwen38-pi-merged, 256 tokens in 100.58s (14.1 tok/s), prompt: 10716, finish_reason=length, max_tokens=256, request_max_tokens=256, stream_model_ttft=82.46s, stream_visible_ttft=82.46s

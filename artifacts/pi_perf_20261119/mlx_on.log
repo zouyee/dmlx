@@ -1,0 +1,44 @@
+/Users/zouyee/venvs/dmlx-omlx/lib/python3.13/site-packages/mlx_lm/server.py:1882: UserWarning: mlx_lm.server is not recommended for production as it only implements basic security checks.
+  warnings.warn(
+2026-11-19 07:33:34,832 - INFO - Starting httpd at 127.0.0.1 on port 8399...
+127.0.0.1 - - [19/Nov/2026 07:33:41] "GET /v1/models HTTP/1.1" 200 -
+127.0.0.1 - - [19/Nov/2026 07:33:41] "GET /v1/models HTTP/1.1" 200 -
+127.0.0.1 - - [19/Nov/2026 07:33:55] "GET /v1/models HTTP/1.1" 200 -
+2026-11-19 07:33:59,667 - INFO - Prompt Cache: 0 sequences, 0.00 GB
+2026-11-19 07:33:59,667 - INFO - - assistant: 0 sequences, 0.00 GB
+2026-11-19 07:33:59,667 - INFO - - user: 0 sequences, 0.00 GB
+2026-11-19 07:33:59,667 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [19/Nov/2026 07:33:59] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-19 07:34:00,286 - INFO - Prompt processing progress: 51/53
+2026-11-19 07:34:00,354 - INFO - Prompt processing progress: 52/53
+2026-11-19 07:34:00,421 - INFO - Prompt processing progress: 53/53
+2026-11-19 07:34:02,591 - INFO - Prompt Cache: 3 sequences, 0.47 GB
+2026-11-19 07:34:02,591 - INFO - - assistant: 2 sequences, 0.32 GB
+2026-11-19 07:34:02,591 - INFO - - user: 1 sequences, 0.16 GB
+2026-11-19 07:34:02,591 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [19/Nov/2026 07:34:02] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-19 07:34:03,585 - INFO - Prompt processing progress: 114/116
+2026-11-19 07:34:03,651 - INFO - Prompt processing progress: 115/116
+2026-11-19 07:34:03,723 - INFO - Prompt processing progress: 116/116
+2026-11-19 07:34:21,889 - INFO - Prompt Cache: 6 sequences, 0.98 GB
+2026-11-19 07:34:21,889 - INFO - - assistant: 4 sequences, 0.66 GB
+2026-11-19 07:34:21,889 - INFO - - user: 2 sequences, 0.32 GB
+2026-11-19 07:34:21,889 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [19/Nov/2026 07:34:21] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-19 07:34:37,733 - INFO - Prompt processing progress: 2048/2716
+2026-11-19 07:34:42,964 - INFO - Prompt processing progress: 2714/2716
+2026-11-19 07:34:43,036 - INFO - Prompt processing progress: 2715/2716
+2026-11-19 07:34:43,104 - INFO - Prompt processing progress: 2716/2716
+2026-11-19 07:35:01,632 - INFO - Prompt Cache: 9 sequences, 1.99 GB
+2026-11-19 07:35:01,632 - INFO - - assistant: 6 sequences, 1.34 GB
+2026-11-19 07:35:01,632 - INFO - - user: 3 sequences, 0.65 GB
+2026-11-19 07:35:01,632 - INFO - - system: 0 sequences, 0.00 GB
+127.0.0.1 - - [19/Nov/2026 07:35:01] "POST /v1/chat/completions HTTP/1.1" 200 -
+2026-11-19 07:35:17,483 - INFO - Prompt processing progress: 2048/10716
+2026-11-19 07:35:33,574 - INFO - Prompt processing progress: 4096/10716
+2026-11-19 07:35:49,930 - INFO - Prompt processing progress: 6144/10716
+2026-11-19 07:36:06,541 - INFO - Prompt processing progress: 8192/10716
+2026-11-19 07:36:23,445 - INFO - Prompt processing progress: 10240/10716
+2026-11-19 07:36:27,458 - INFO - Prompt processing progress: 10714/10716
+2026-11-19 07:36:27,542 - INFO - Prompt processing progress: 10715/10716
+2026-11-19 07:36:27,621 - INFO - Prompt processing progress: 10716/10716

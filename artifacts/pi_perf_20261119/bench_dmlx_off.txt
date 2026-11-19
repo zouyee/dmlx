@@ -1,0 +1,3 @@
+dmlx-off                 short          prompt~   65tok ttft=  1.00s decode=  37.6 tok/s n=75 wall=   3.0s
+dmlx-off                 mid-2k         prompt~ 2133tok ttft= 20.57s decode=  31.5 tok/s n=159 wall=  25.6s
+dmlx-off                 long-8k        prompt~ 8493tok ttft=  3.89s decode=  32.8 tok/s n=144 wall=   8.3s
