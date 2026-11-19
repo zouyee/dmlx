@@ -9,6 +9,12 @@
 const std = @import("std");
 const c = @import("mlx").c;
 const mkdir_c = @cImport(@cInclude("sys/stat.h"));
+const posix_c = @cImport({
+    @cInclude("stdio.h");
+    @cInclude("unistd.h");
+    @cInclude("time.h");
+    @cInclude("sys/stat.h");
+});
 const array_mod = @import("mlx").array;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
@@ -2017,6 +2023,95 @@ pub const Qwen38ServingModel = struct {
     fn snapFilePath(self: *Qwen38ServingModel, dir: []const u8) ![]u8 {
         return std.fmt.allocPrint(self.allocator, "{s}/snap_latest.safetensors", .{dir});
     }
+    fn snapHashPath(self: *Qwen38ServingModel, dir: []const u8, hash: u64) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/snap_{x:0>16}.safetensors", .{ dir, hash });
+    }
+    fn snapIndexPath(self: *Qwen38ServingModel, dir: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/snap_index.json", .{dir});
+    }
+
+    /// On-disk snapshot index: one entry per persisted prefix, keyed by the
+    /// FNV-1a hash of its token ids (verified against the stored tokens on
+    /// load, so collisions only cost a wasted load). Multi-slot since
+    /// R3: an agent's stable system prompt and a growing session history
+    /// coexist; LRU eviction caps total disk usage.
+    pub const SnapIndexEntry = struct {
+        hash: u64,
+        tokens: usize,
+        bytes: u64,
+        last_access: i64, // unix seconds
+    };
+    var snap_index: ?std.ArrayList(SnapIndexEntry) = null;
+
+    fn snapDiskCapBytes() u64 {
+        var mb: u64 = 8192;
+        if (std.c.getenv("DMLX_QWEN38_SNAP_MAX_MB")) |s| {
+            mb = std.fmt.parseInt(u64, std.mem.span(s), 10) catch 8192;
+        }
+        return mb * 1024 * 1024;
+    }
+
+    fn loadSnapIndex(self: *Qwen38ServingModel, dir: []const u8) *std.ArrayList(SnapIndexEntry) {
+        if (snap_index) |*l| return l;
+        var list = std.ArrayList(SnapIndexEntry).empty;
+        const path = self.snapIndexPath(dir) catch {
+            snap_index = list;
+            return &snap_index.?;
+        };
+        defer self.allocator.free(path);
+        if (fileExists(path)) {
+            const z = self.allocator.dupeZ(u8, path) catch null;
+            if (z) |pz| {
+                defer self.allocator.free(pz);
+                const f_opt = posix_c.fopen(pz.ptr, "rb");
+                if (f_opt) |f| {
+                    defer _ = posix_c.fclose(f);
+                    var buf: [65536]u8 = undefined;
+                    const n = posix_c.fread(&buf, 1, buf.len, f);
+                    const parsed = std.json.parseFromSlice([]SnapIndexEntry, self.allocator, buf[0..n], .{}) catch null;
+                    if (parsed) |p| {
+                        defer p.deinit();
+                        for (p.value) |e| list.append(self.allocator, e) catch {};
+                    }
+                }
+            }
+        }
+        snap_index = list;
+        return &snap_index.?;
+    }
+
+    fn saveSnapIndex(self: *Qwen38ServingModel, dir: []const u8) void {
+        const idx = self.loadSnapIndex(dir);
+        const path = self.snapIndexPath(dir) catch return;
+        defer self.allocator.free(path);
+        const json = std.json.Stringify.valueAlloc(self.allocator, idx.items, .{}) catch return;
+        defer self.allocator.free(json);
+        const z = self.allocator.dupeZ(u8, path) catch return;
+        defer self.allocator.free(z);
+        const f_opt = posix_c.fopen(z.ptr, "wb");
+        if (f_opt == null) return;
+        const f = f_opt.?;
+        defer _ = posix_c.fclose(f);
+        _ = posix_c.fwrite(json.ptr, 1, json.len, f);
+    }
+
+    fn nowUnix() i64 {
+        return posix_c.time(null);
+    }
+
+    fn fileBytes(path: []const u8) u64 {
+        const z = std.heap.page_allocator.dupeZ(u8, path) catch return 0;
+        defer std.heap.page_allocator.free(z);
+        var st: posix_c.struct_stat = undefined;
+        if (posix_c.stat(z.ptr, &st) != 0) return 0;
+        return @intCast(st.st_size);
+    }
+
+    fn unlinkFile(path: []const u8) void {
+        const z = std.heap.page_allocator.dupeZ(u8, path) catch return;
+        defer std.heap.page_allocator.free(z);
+        _ = posix_c.unlink(z.ptr);
+    }
 
     /// FNV-1a over the token ids, used only as a cheap sanity tag in metadata.
     fn tokensHash(ids: []const u32) u64 {
@@ -2031,32 +2126,77 @@ pub const Qwen38ServingModel = struct {
     /// Persist the just-stored snapshot (top of prefix_snaps) to disk.
     /// Arrays are already materialized (deepClone/copy eval them), so the
     /// safetensors writer can read them directly.
+    ///
+    /// Multi-slot (R3): each distinct prefix lives at snap_<hash>.safetensors
+    /// with snap_index.json as the lookup table. Writes are bucketed to
+    /// 2048-token steps beyond the last persisted length so a growing agent
+    /// session leaves one checkpoint per 2k of new context instead of one
+    /// file per turn; the LRU cap (DMLX_QWEN38_SNAP_MAX_MB, default 8192)
+    /// bounds total disk.
     fn persistLatestSnapshot(self: *Qwen38ServingModel) void {
         const dir = self.snapDir() orelse return;
         const snap = &self.prefix_snaps.items[self.prefix_snaps.items.len - 1];
         // Only prompts big enough to make a re-prefill hurt are worth disk;
-        // this also keeps small probes from overwriting the valuable entry.
+        // this also keeps small probes from polluting the cache.
         if (snap.prompt_tokens.len < 2048) return;
-        // Single on-disk slot: persist MONOTONICALLY (largest wins). The
-        // latest store is not necessarily the most valuable one — a burst
-        // of smaller prompts after a big agent-session snapshot would
-        // otherwise clobber it (measured: 10.7k snapshot replaced by 2.7k).
-        if (snap.prompt_tokens.len <= self.last_persisted_tokens) return;
+        const hash = tokensHash(snap.prompt_tokens);
+        const idx = self.loadSnapIndex(dir);
+        for (idx.items) |*e| {
+            if (e.hash == hash and e.tokens == snap.prompt_tokens.len) {
+                e.last_access = nowUnix();
+                self.last_persisted_tokens = snap.prompt_tokens.len;
+                self.saveSnapIndex(dir);
+                return; // already on disk
+            }
+        }
+        // Bucket: skip when an existing on-disk entry is already a prefix of
+        // this prompt within 2048 tokens (restore+extend is cheap enough);
+        // a DIFFERENT prefix always persists regardless of its length.
+        for (idx.items) |e| {
+            if (e.tokens > snap.prompt_tokens.len or e.tokens + 2048 < snap.prompt_tokens.len) continue;
+            if (tokensHash(snap.prompt_tokens[0..e.tokens]) == e.hash) return;
+        }
         const t0 = std.c.mach_absolute_time();
-        self.persistLatestSnapshotImpl(dir, snap) catch |err| {
+        const path = self.snapHashPath(dir, hash) catch return;
+        defer self.allocator.free(path);
+        self.persistLatestSnapshotImpl(dir, snap, path) catch |err| {
             std.log.warn("[qwen38] snapshot persist failed: {}", .{err});
             return;
         };
+        const bytes = fileBytes(path);
         const ms = @as(f64, @floatFromInt(std.c.mach_absolute_time() - t0)) * 125.0 / 3_000_000.0;
         self.last_persisted_tokens = snap.prompt_tokens.len;
-        std.log.info("[qwen38] snapshot persisted ({d} tokens, {d:.0} ms)", .{ snap.prompt_tokens.len, ms });
+        idx.append(self.allocator, .{
+            .hash = hash,
+            .tokens = snap.prompt_tokens.len,
+            .bytes = bytes,
+            .last_access = nowUnix(),
+        }) catch return;
+        // LRU eviction: over-cap → drop least-recently-accessed entries
+        // (never the just-written one).
+        var total: u64 = 0;
+        for (idx.items) |e| total += e.bytes;
+        const cap = snapDiskCapBytes();
+        while (total > cap and idx.items.len > 1) {
+            var victim: usize = idx.items.len - 1; // protect the newest
+            for (idx.items[0 .. idx.items.len - 1], 0..) |e, i| {
+                if (e.last_access < idx.items[victim].last_access) victim = i;
+            }
+            const v = idx.items[victim];
+            const vpath = self.snapHashPath(dir, v.hash) catch break;
+            defer self.allocator.free(vpath);
+            unlinkFile(vpath);
+            total -= v.bytes;
+            _ = idx.orderedRemove(victim);
+            std.log.info("[qwen38] snapshot evicted ({d} tokens, {d} bytes, over {d} MB cap)", .{ v.tokens, v.bytes, cap / 1024 / 1024 });
+        }
+        self.saveSnapIndex(dir);
+        std.log.info("[qwen38] snapshot persisted ({d} tokens, {d} bytes, {d:.0} ms)", .{ snap.prompt_tokens.len, bytes, ms });
     }
 
-    fn persistLatestSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8, snap: *const PrefixSnapshot) !void {
+    fn persistLatestSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8, snap: *const PrefixSnapshot, path: []const u8) !void {
         const mlx_io = @import("mlx").io;
         makePathPosix(self.allocator, dir);
-        const path = try self.snapFilePath(dir);
-        defer self.allocator.free(path);
 
         var weights = std.StringHashMap(Array).init(self.allocator);
         defer weights.deinit();
@@ -2110,9 +2250,44 @@ pub const Qwen38ServingModel = struct {
         if (persisted_snap_loaded) return;
         persisted_snap_loaded = true;
         const dir = self.snapDir() orelse return;
+        const idx = self.loadSnapIndex(dir);
+        _ = idx;
         self.loadPersistedSnapshotImpl(dir) catch |err| {
             std.log.warn("[qwen38] persisted snapshot load failed: {}", .{err});
         };
+        // One-time migration: register the legacy single-slot file in the
+        // index under its hash and rename it to the multi-slot name.
+        if (self.prefix_snaps.items.len > 0) {
+            const snap = &self.prefix_snaps.items[self.prefix_snaps.items.len - 1];
+            const hash = tokensHash(snap.prompt_tokens);
+            const idx2 = self.loadSnapIndex(dir);
+            var found = false;
+            for (idx2.items) |e| {
+                if (e.hash == hash and e.tokens == snap.prompt_tokens.len) found = true;
+            }
+            if (!found) {
+                const legacy = self.snapFilePath(dir) catch return;
+                defer self.allocator.free(legacy);
+                if (fileExists(legacy)) {
+                    const newpath = self.snapHashPath(dir, hash) catch return;
+                    defer self.allocator.free(newpath);
+                    const lz = self.allocator.dupeZ(u8, legacy) catch return;
+                    defer self.allocator.free(lz);
+                    const nz = self.allocator.dupeZ(u8, newpath) catch return;
+                    defer self.allocator.free(nz);
+                    if (posix_c.rename(lz.ptr, nz.ptr) == 0) {
+                        idx2.append(self.allocator, .{
+                            .hash = hash,
+                            .tokens = snap.prompt_tokens.len,
+                            .bytes = fileBytes(newpath),
+                            .last_access = nowUnix(),
+                        }) catch {};
+                        self.saveSnapIndex(dir);
+                        std.log.info("[qwen38] legacy snapshot migrated to multi-slot index ({d} tokens)", .{snap.prompt_tokens.len});
+                    }
+                }
+            }
+        }
     }
 
     fn fileExists(path: []const u8) bool {
@@ -2143,13 +2318,19 @@ pub const Qwen38ServingModel = struct {
     }
 
     fn loadPersistedSnapshotImpl(self: *Qwen38ServingModel, dir: []const u8) !void {
-        const mlx_io = @import("mlx").io;
         const path = try self.snapFilePath(dir);
         defer self.allocator.free(path);
         // Missing cache file is the NORMAL first-run path — check before
         // loadSafetensors, whose failure logs at error level (and the test
         // harness fails on unexpected error logs).
         if (!fileExists(path)) return;
+        try self.loadSnapshotFile(path);
+    }
+
+    /// Load one snapshot file into prefix_snaps (legacy single-slot file or
+    /// a multi-slot snap_<hash>.safetensors).
+    fn loadSnapshotFile(self: *Qwen38ServingModel, path: []const u8) !void {
+        const mlx_io = @import("mlx").io;
         var res = mlx_io.loadSafetensors(self.allocator, path) catch return;
         // Weight arrays are adopted into the snapshot below via takeAdopted;
         // whatever remains in the map at scope exit is freed by res.deinit
@@ -2215,6 +2396,69 @@ pub const Qwen38ServingModel = struct {
     }
 
     var persisted_snap_loaded: bool = false;
+
+    /// Restore the longest on-disk snapshot that prefixes `ids` into
+    /// prefix_snaps (index lookup by FNV hash, token-verified after load).
+    /// Returns the in-memory index of the restored snapshot, or null.
+    fn restoreDiskSnapshot(self: *Qwen38ServingModel, ids: []const u32, min_len: usize) ?usize {
+        const dir = self.snapDir() orelse return null;
+        const idx = self.loadSnapIndex(dir);
+        var best: ?usize = null;
+        const debug = std.c.getenv("DMLX_SNAP_DEBUG") != null;
+        for (idx.items, 0..) |e, i| {
+            if (e.tokens <= min_len or e.tokens > ids.len) continue;
+            if (best) |b| {
+                if (e.tokens <= idx.items[b].tokens) continue;
+            }
+            const h = tokensHash(ids[0..e.tokens]);
+            if (debug) std.log.info("[qwen38] disk idx[{d}] tokens={d} hash={x} want={x} match={}", .{ i, e.tokens, e.hash, h, h == e.hash });
+            if (h == e.hash) best = i;
+        }
+        if (debug and best == null) std.log.info("[qwen38] disk restore: no candidate (entries={d}, ids={d})", .{ idx.items.len, ids.len });
+        const bi = best orelse return null;
+        const e = idx.items[bi];
+        const path = self.snapHashPath(dir, e.hash) catch return null;
+        defer self.allocator.free(path);
+        if (!fileExists(path)) {
+            _ = idx.orderedRemove(bi); // stale entry
+            self.saveSnapIndex(dir);
+            return null;
+        }
+        // Same bound as storeSnapshot: keep memory capped before adopting
+        // another full KV set (evict LRU, protecting the largest entry).
+        const max = prefixSnapMax();
+        if (max == 0) return null;
+        while (self.prefix_snaps.items.len >= max) {
+            var oldest: ?usize = null;
+            var largest: usize = 0;
+            for (self.prefix_snaps.items, 0..) |*s, i| {
+                if (s.prompt_tokens.len > self.prefix_snaps.items[largest].prompt_tokens.len) largest = i;
+            }
+            for (self.prefix_snaps.items, 0..) |*s, i| {
+                if (i == largest and self.prefix_snaps.items.len > 1) continue;
+                if (oldest == null or s.last_access < self.prefix_snaps.items[oldest.?].last_access) oldest = i;
+            }
+            const victim = oldest orelse largest;
+            self.prefix_snaps.items[victim].deinit(self.allocator);
+            _ = self.prefix_snaps.orderedRemove(victim);
+        }
+        self.loadSnapshotFile(path) catch return null;
+        // Verify the loaded snapshot really is a prefix of the request
+        // (hash collision or corruption → drop it, never serve wrong KV).
+        const li = self.prefix_snaps.items.len - 1;
+        {
+            const snap = &self.prefix_snaps.items[li];
+            if (snap.prompt_tokens.len != e.tokens or !std.mem.eql(u32, snap.prompt_tokens, ids[0..e.tokens])) {
+                snap.deinit(self.allocator);
+                _ = self.prefix_snaps.orderedRemove(li);
+                return null;
+            }
+        }
+        idx.items[bi].last_access = nowUnix();
+        self.saveSnapIndex(dir);
+        std.log.info("[qwen38] disk snapshot restored ({d} tokens)", .{e.tokens});
+        return li;
+    }
 
     /// Adapter-facing accessor for the disk-cache directory (DFlash2 context
     /// rows persist alongside the backbone snapshot).
@@ -2292,6 +2536,14 @@ pub const Qwen38ServingModel = struct {
                 var mismatch: usize = 0;
                 while (mismatch < plen and s.prompt_tokens[mismatch] == ids[mismatch]) mismatch += 1;
                 std.log.info("[qwen38] snap[{d}] len={d} mismatches at token {d} (snap={d} req={d})", .{ i, plen, mismatch, s.prompt_tokens[mismatch], ids[mismatch] });
+            }
+        }
+        // Disk fallback (multi-slot index): only worth it when the in-memory
+        // hit misses part of a disk-eligible prefix (entries are ≥2048).
+        if (ids.len >= 2048 and best_len < ids.len) {
+            if (self.restoreDiskSnapshot(ids, best_len)) |di| {
+                best = di;
+                best_len = self.prefix_snaps.items[di].prompt_tokens.len;
             }
         }
         // Refresh the hit's recency HERE (not only in the restore path): a
@@ -2847,12 +3099,57 @@ pub const Qwen38ServingModel = struct {
             }
         }
         if (!restored) try self.reset();
+        if (std.c.getenv("DMLX_SNAP_DEBUG") != null) {
+            var cnt: usize = 0;
+            var last: usize = 0;
+            for (ids, 0..) |t, i| {
+                if (t == 248046) {
+                    cnt += 1;
+                    last = i + 1;
+                }
+            }
+            std.log.info("[qwen38] prefill ids.len={d} im_end count={d} last={d} chunk={d}", .{ ids.len, cnt, last, chunk });
+        }
         var hidden_all: ?Array = prefix_hidden;
         errdefer if (hidden_all) |*ha| ha.deinit();
         var logits: ?Array = null;
         while (pos < ids.len) {
-            const end = @min(pos + chunk, ids.len);
+            var end = @min(pos + chunk, ids.len);
+            // Align chunk ends to the last <|im_end|> within the trailing
+            // 512 tokens — including the FINAL chunk: the generation header
+            // is where BPE merges break the token-prefix property across
+            // turns (measured: LCP 4552/4553 on a thinking template), so the
+            // useful snapshot for the NEXT turn is the state right after the
+            // last completed turn's <|im_end|>, not the full prompt.
+            // Special tokens never merge, keeping these snapshots exact
+            // prefixes of every future multi-turn extension.
+            var aligned = false;
+            {
+                var b = end;
+                const lo = if (end > 512) end - 512 else pos + 1;
+                while (b > lo) : (b -= 1) {
+                    if (ids[b - 1] == 248046) { // <|im_end|>
+                        end = b;
+                        aligned = true;
+                        break;
+                    }
+                }
+                if (end == pos) { // no progress — never emit an empty chunk
+                    end = @min(pos + chunk, ids.len);
+                    aligned = false;
+                }
+            }
             const res = try self.forwardTokensCoreCont(ids[pos..end], capture, last_logits_only, pos > 0, null, tap);
+            // A boundary-aligned chunk's post-state is a stable turn-boundary
+            // snapshot: store it so the NEXT turn restores everything up to
+            // the last completed turn instead of stopping at a mergeable
+            // generation-header boundary.
+            if (aligned and prefixSnapMax() > 0) {
+                if (std.c.getenv("DMLX_SNAP_DEBUG") != null)
+                    std.log.info("[qwen38] turn-boundary chunk end at {d}/{d}", .{ end, ids.len });
+                self.storeSnapshot(ids[0..end], res.logits, if (capture == .all) res.hidden else null) catch |err|
+                    std.log.warn("[qwen38] turn-boundary snapshot store failed: {}", .{err});
+            }
             // Only the last chunk's logits are wanted (they are the
             // last-position row either way).
             if (logits) |l| l.deinit();
@@ -2906,6 +3203,20 @@ pub const Qwen38ServingModel = struct {
             if (vision == null and chunk > 0 and ids.len > chunk and
                 (capture == .all or last_logits_only))
             {
+                return self.forwardChunkedPrefill(ids, capture, last_logits_only, tap);
+            }
+            // Multi-turn prompts (contain <|im_end|>) engage the chunked
+            // path even below the opt-in chunk size: turn-boundary-aligned
+            // snapshots are the only merge-proof cross-turn reuse points
+            // (BPE merges at the generation header break exact-prefix reuse
+            // otherwise), and they only exist at chunk ends.
+            if (vision == null and chunk == 0 and ids.len >= 2048 and
+                (capture == .all or last_logits_only) and
+                std.mem.indexOfScalar(u32, ids, 248046) != null)
+            {
+                const saved = cached_prefill_chunk;
+                cached_prefill_chunk = 4096;
+                defer cached_prefill_chunk = saved;
                 return self.forwardChunkedPrefill(ids, capture, last_logits_only, tap);
             }
             // Longest-prefix snapshot restore (text path). Capture .all is
