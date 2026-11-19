@@ -1630,6 +1630,86 @@ fn applyMropeCosSin(ctx: EagerContext, x: Array, mr: MropeApply) !Array {
     return shape_mod.concatenateAxis(ctx, &[_]Array{ emb_x, x_pass }, 3);
 }
 
+/// Explicit bool attention mask + per-row rope positions for DFlash2
+/// tree-verify (`Qwen38Attn.forwardTree`).
+pub const TreeMask = struct {
+    /// [1, 1, L, kv_len_total] bool: context rows all visible; node j sees
+    /// node i iff i == j or i is an ancestor of j.
+    mask: Array,
+    /// [L] i32: absolute rope position of each row.
+    positions: Array,
+};
+
+/// Host-side tree mask: [1, 1, N, kv_len + N] bool. Columns [0, kv_len)
+/// (the committed context) are all true; tree-node column kv_len + i is
+/// visible to row j iff i == j or i is an ancestor of j along `parents`
+/// (parents[t] = -1 marks a root).
+pub fn buildTreeMask(allocator: std.mem.Allocator, parents: []const i32, kv_len: i32) !Array {
+    const n = parents.len;
+    const s: usize = @intCast(kv_len);
+    const total = s + n;
+    const buf = try allocator.alloc(bool, n * total);
+    defer allocator.free(buf);
+    for (0..n) |j| {
+        for (0..s) |col| buf[j * total + col] = true;
+        for (0..n) |col| buf[j * total + s + col] = false;
+        var cur: i32 = @intCast(j);
+        var steps: usize = 0;
+        while (cur >= 0 and steps < n) : (steps += 1) {
+            buf[j * total + s + @as(usize, @intCast(cur))] = true;
+            cur = parents[@intCast(cur)];
+        }
+    }
+    const ni: i32 = @intCast(n);
+    const ti: i32 = @intCast(total);
+    const arr = try Array.fromData(allocator, bool, buf, &[_]i32{ 1, 1, ni, ti });
+    errdefer arr.deinit();
+    try arr.eval();
+    return arr;
+}
+
+/// Text-path per-row rope tables: like qwen38.zig's buildMropeCosSin but
+/// every frequency slot reads the row's own absolute position (no mrope
+/// channel selector). Returns [1, 1, L, rotary_dims] cos/sin in the
+/// half-split ([c, c]) layout applyMropeCosSin expects.
+pub fn buildRowCosSin(
+    allocator: std.mem.Allocator,
+    rotary_dims: usize,
+    rope_theta: f32,
+    positions: []const i32,
+) !MropeApply {
+    const rd = rotary_dims;
+    const half = rd / 2;
+    const L = positions.len;
+    const n = L * rd;
+    const cos_buf = try allocator.alloc(f32, n);
+    defer allocator.free(cos_buf);
+    const sin_buf = try allocator.alloc(f32, n);
+    defer allocator.free(sin_buf);
+    for (0..L) |t| {
+        for (0..half) |j| {
+            const jf: f32 = @floatFromInt(j);
+            const inv_freq = std.math.pow(f32, rope_theta, -2.0 * jf / @as(f32, @floatFromInt(rd)));
+            const angle = @as(f32, @floatFromInt(positions[t])) * inv_freq;
+            const cv = @cos(angle);
+            const sv = @sin(angle);
+            cos_buf[t * rd + j] = cv;
+            cos_buf[t * rd + j + half] = cv;
+            sin_buf[t * rd + j] = sv;
+            sin_buf[t * rd + j + half] = sv;
+        }
+    }
+    const li: i32 = @intCast(L);
+    const ri: i32 = @intCast(rd);
+    const cos_arr = try Array.fromData(allocator, f32, cos_buf, &[_]i32{ 1, 1, li, ri });
+    errdefer cos_arr.deinit();
+    try cos_arr.eval();
+    const sin_arr = try Array.fromData(allocator, f32, sin_buf, &[_]i32{ 1, 1, li, ri });
+    errdefer sin_arr.deinit();
+    try sin_arr.eval();
+    return .{ .cos = cos_arr, .sin = sin_arr };
+}
+
 pub const Qwen38Attn = struct {
     ctx: EagerContext,
     hidden_size: usize,
@@ -1887,6 +1967,98 @@ pub const Qwen38Attn = struct {
                 null,
                 null,
             );
+        defer attn.deinit(); // [1, H, L, D]
+
+        // Back to [1, L, H*D].
+        const attn_t = try ops.transposeAxes(ctx, attn, &[_]i32{ 0, 2, 1, 3 });
+        defer attn_t.deinit();
+        const attn_flat = try ops.reshape(ctx, attn_t, &[_]i32{ 1, L, H * D });
+        defer attn_flat.deinit();
+
+        // Sigmoid output gate.
+        const gated = if (gate) |g| blk: {
+            const g_flat = try ops.reshape(ctx, g, &[_]i32{ 1, L, H * D });
+            defer g_flat.deinit();
+            const sig = try ops.sigmoid(ctx, g_flat);
+            defer sig.deinit();
+            break :blk try ops.multiply(ctx, attn_flat, sig);
+        } else try ops.copy(ctx, attn_flat);
+        defer gated.deinit();
+
+        return self.linear(gated, self.o_proj, self.o_scales, self.o_biases, self.o_quant);
+    }
+
+    /// Tree-verify forward (DFlash2 U2): the prefill branch of `forward`
+    /// with an explicit bool mask (context + ancestor visibility) and
+    /// per-row rope positions instead of causal mode + scalar offset.
+    /// Always stock SDPA (skips sdpaVerifySplit); the KV append is
+    /// unchanged — all L nodes land in the slab, commit compaction is a
+    /// later unit's job.
+    pub fn forwardTree(self: *Qwen38Attn, x: Array, cache: *Qwen38AttnCache, tree: TreeMask) !Array {
+        const ctx = self.ctx;
+        const H: i32 = @intCast(self.num_heads);
+        const HKV: i32 = @intCast(self.num_kv_heads);
+        const D: i32 = @intCast(self.head_dim);
+        const L: i32 = x.shape()[1];
+
+        // Same projection / qk-norm segment as forward's prefill branch,
+        // minus the group-qmm fusion (correctness-first path).
+        const q_lin = try self.linear(x, self.q_proj, self.q_scales, self.q_biases, self.q_quant);
+        defer q_lin.deinit();
+        const k_lin = try self.linear(x, self.k_proj, self.k_scales, self.k_biases, self.k_quant);
+        defer k_lin.deinit();
+        const v_lin = try self.linear(x, self.v_proj, self.v_scales, self.v_biases, self.v_quant);
+        defer v_lin.deinit();
+        const q_resh = try ops.reshape(ctx, q_lin, &[_]i32{ 1, L, H, 2 * D });
+        defer q_resh.deinit();
+        const q_raw = try ops.slice(ctx, q_resh, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, L, H, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer q_raw.deinit();
+        const gate = if (self.output_gate) blk: {
+            const g = try ops.slice(ctx, q_resh, &[_]i32{ 0, 0, 0, D }, &[_]i32{ 1, L, H, 2 * D }, &[_]i32{ 1, 1, 1, 1 });
+            break :blk g;
+        } else null;
+        defer if (gate) |g| g.deinit();
+
+        const k_resh = try ops.reshape(ctx, k_lin, &[_]i32{ 1, L, HKV, D });
+        defer k_resh.deinit();
+        const v_resh = try ops.reshape(ctx, v_lin, &[_]i32{ 1, L, HKV, D });
+        defer v_resh.deinit();
+
+        const q_n = try fast_mod.rmsNorm(ctx, q_raw, self.q_norm, self.rms_norm_eps);
+        defer q_n.deinit();
+        const k_n = try fast_mod.rmsNorm(ctx, k_resh, self.k_norm, self.rms_norm_eps);
+        defer k_n.deinit();
+
+        // Transpose to [1, heads, L, D] (rope treats axis -2 as position).
+        const q_t0 = try ops.transposeAxes(ctx, q_n, &[_]i32{ 0, 2, 1, 3 });
+        defer q_t0.deinit();
+        const k_t0 = try ops.transposeAxes(ctx, k_n, &[_]i32{ 0, 2, 1, 3 });
+        defer k_t0.deinit();
+        const v_t = try ops.transposeAxes(ctx, v_resh, &[_]i32{ 0, 2, 1, 3 });
+        defer v_t.deinit();
+
+        // Per-row rope from the tree's absolute positions.
+        try tree.positions.eval();
+        const pos = try tree.positions.dataSlice(i32);
+        if (pos.len != @as(usize, @intCast(L))) return error.TreePositionsLengthMismatch;
+        var tabs = try buildRowCosSin(ctx.allocator, self.rotary_dims, self.rope_theta, pos);
+        defer tabs.deinit();
+        const q_t = try applyMropeCosSin(ctx, q_t0, tabs);
+        defer q_t.deinit();
+        const k_t = try applyMropeCosSin(ctx, k_t0, tabs);
+        defer k_t.deinit();
+
+        // Slab cache write (same as forward).
+        try cacheAppend(ctx, cache, k_t, v_t, L, HKV, D);
+
+        const kv_len: i32 = cache.len();
+        const k_view = try ops.slice(ctx, cache.keys.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer k_view.deinit();
+        const v_view = try ops.slice(ctx, cache.values.?, &[_]i32{ 0, 0, 0, 0 }, &[_]i32{ 1, HKV, kv_len, D }, &[_]i32{ 1, 1, 1, 1 });
+        defer v_view.deinit();
+
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.head_dim)));
+        const attn = try fast_mod.scaledDotProductAttention(ctx, q_t, k_view, v_view, scale, "", tree.mask, null);
         defer attn.deinit(); // [1, H, L, D]
 
         // Back to [1, L, H*D].
@@ -2541,4 +2713,112 @@ test "sdpaVerifySplit matches stock causal SDPA (bf16, split-KV)" {
             try std.testing.expect(try m.item(f32) <= 2e-2);
         }
     }
+}
+
+test "buildTreeMask: 3-node tree root->{a,b} over 4-token context" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+
+    const parents = [_]i32{ -1, 0, 0 }; // root, a, b
+    const mask = try buildTreeMask(allocator, &parents, 4);
+    defer mask.deinit();
+    const mshape = mask.shape();
+    try std.testing.expectEqual(@as(i32, 1), mshape[0]);
+    try std.testing.expectEqual(@as(i32, 1), mshape[1]);
+    try std.testing.expectEqual(@as(i32, 3), mshape[2]);
+    try std.testing.expectEqual(@as(i32, 7), mshape[3]);
+
+    const m = try mask.dataSlice(bool);
+    const at = struct {
+        fn get(mm: []const bool, row: usize, col: usize) bool {
+            return mm[row * 7 + col];
+        }
+    }.get;
+    // Context columns [0, 4) visible to every row.
+    for (0..3) |row| {
+        for (0..4) |col| try std.testing.expect(at(m, row, col));
+    }
+    // Root sees only itself among tree nodes.
+    try std.testing.expect(at(m, 0, 4));
+    try std.testing.expect(!at(m, 0, 5));
+    try std.testing.expect(!at(m, 0, 6));
+    // a sees root + itself, not b.
+    try std.testing.expect(at(m, 1, 4));
+    try std.testing.expect(at(m, 1, 5));
+    try std.testing.expect(!at(m, 1, 6));
+    // b sees root + itself, not a.
+    try std.testing.expect(at(m, 2, 4));
+    try std.testing.expect(!at(m, 2, 5));
+    try std.testing.expect(at(m, 2, 6));
+}
+
+test "Qwen38Attn.forwardTree: chain-degenerate tree matches causal forward" {
+    c.initErrorHandler();
+    const allocator = std.testing.allocator;
+    const ctx = EagerContext.init(allocator);
+
+    // Shared 3-token context.
+    var ctxbuf: [3 * 16]f32 = undefined;
+    for (&ctxbuf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 13 + 5, 11) - 5)) * 0.1;
+    }
+    // Two verify tokens, chain parents [-1, 0] at positions [3, 4].
+    var vbuf: [2 * 16]f32 = undefined;
+    for (&vbuf, 0..) |*v, i| {
+        v.* = @as(f32, @floatFromInt(@mod(@as(i64, @intCast(i)) * 7 + 3, 11) - 5)) * 0.1;
+    }
+
+    // Reference: existing causal multi-row forward.
+    var attn_ref = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_ref.deinit();
+    var cache_ref = Qwen38AttnCache{};
+    defer cache_ref.deinit();
+    const xc = try Array.fromData(allocator, f32, &ctxbuf, &[_]i32{ 1, 3, 16 });
+    defer xc.deinit();
+    const out_pre = try attn_ref.forward(xc, &cache_ref, null);
+    defer out_pre.deinit();
+    try out_pre.eval();
+    const xv = try Array.fromData(allocator, f32, &vbuf, &[_]i32{ 1, 2, 16 });
+    defer xv.deinit();
+    const out_ref = try attn_ref.forward(xv, &cache_ref, null);
+    defer out_ref.deinit();
+    try out_ref.eval();
+
+    // Tree path: same weights, same cache state, chain-degenerate tree.
+    var attn_t = try Qwen38Attn.makeTestModule(allocator, ctx);
+    defer attn_t.deinit();
+    var cache_t = Qwen38AttnCache{};
+    defer cache_t.deinit();
+    const xc2 = try Array.fromData(allocator, f32, &ctxbuf, &[_]i32{ 1, 3, 16 });
+    defer xc2.deinit();
+    const out_pre2 = try attn_t.forward(xc2, &cache_t, null);
+    defer out_pre2.deinit();
+    try out_pre2.eval();
+
+    const parents = [_]i32{ -1, 0 };
+    const mask = try buildTreeMask(allocator, &parents, 3);
+    defer mask.deinit();
+    const pos_buf = [_]i32{ 3, 4 };
+    const positions = try Array.fromData(allocator, i32, &pos_buf, &[_]i32{2});
+    defer positions.deinit();
+    const xv2 = try Array.fromData(allocator, f32, &vbuf, &[_]i32{ 1, 2, 16 });
+    defer xv2.deinit();
+    const out_tree = try attn_t.forwardTree(xv2, &cache_t, .{ .mask = mask, .positions = positions });
+    defer out_tree.deinit();
+    try out_tree.eval();
+
+    try std.testing.expectEqual(cache_ref.len(), cache_t.len());
+    const tshape = out_tree.shape();
+    try std.testing.expectEqual(@as(i32, 1), tshape[0]);
+    try std.testing.expectEqual(@as(i32, 2), tshape[1]);
+    try std.testing.expectEqual(@as(i32, 16), tshape[2]);
+
+    const ref32 = try ops.astype(ctx, out_ref, .float32);
+    defer ref32.deinit();
+    const tree32 = try ops.astype(ctx, out_tree, .float32);
+    defer tree32.deinit();
+    const got = try tree32.dataSlice(f32);
+    const exp = try ref32.dataSlice(f32);
+    try std.testing.expectEqual(exp.len, got.len);
+    for (exp, got) |e, o| try std.testing.expectApproxEqAbs(e, o, 1e-3);
 }
