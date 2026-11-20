@@ -374,6 +374,12 @@ pub const EngineLoop = struct {
     /// per request so its (content-independent) cost estimates survive
     /// across requests; see `MtpDepthController.resetForRequest`.
     mtp_depth: ?MtpDepthController,
+    /// Cross-request copy-chain trust (DMLX_MTP_COPIES): a bad copy regime
+    /// (hit rate < 20% over 20+ rounds) disables copies for later requests
+    /// instead of re-probing them from scratch each time.
+    mtp_copy_proposed_total: usize,
+    mtp_copy_accepted_total: usize,
+    mtp_copy_trusted: bool,
     /// Prefix cache for skipping prefill on repeated prompts.
     prefix_cache: ?prefix_cache_mod.PrefixCacheManager,
     /// Embedding tasks to execute on the engine thread (null = unsupported).
@@ -405,6 +411,9 @@ pub const EngineLoop = struct {
             .speculative_ngram = config.speculative_ngram,
             .speculative_mtp = config.speculative_mtp,
             .mtp_depth = null,
+            .mtp_copy_proposed_total = 0,
+            .mtp_copy_accepted_total = 0,
+            .mtp_copy_trusted = true,
             .prefix_cache = if (config.prefix_cache_max_entries > 0)
                 prefix_cache_mod.PrefixCacheManager.init(config.allocator, config.prefix_cache_max_entries, config.stream)
             else
@@ -2563,6 +2572,15 @@ pub const EngineLoop = struct {
         var copy_proposed: usize = 0;
         var copy_accepted: usize = 0;
 
+        // Speculation give-up (R2): a streak of zero-acceptance rounds means
+        // the draft+verify overhead buys nothing on this content — a k=0
+        // round costs ~1.5-2x a plain decode step for the same one token.
+        // After exploration has had its say, 12 consecutive k=0 rounds fall
+        // back to plain decode for the rest of the request. Per-request only;
+        // the next request starts speculative again.
+        var low_k_streak: usize = 0;
+        const give_up_streak: usize = 12;
+
         // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
         // the drafter's top-k at each depth. top1 reproduces p_i; the top1 ->
         // top2/top4 gap is the headroom a multi-branch draft would capture.
@@ -2595,6 +2613,29 @@ pub const EngineLoop = struct {
             const remaining = gen_config.max_tokens - total_generated;
             const n_round = @max(1, @min(depth_ctl.pick(), remaining));
             const round_t0 = prof_now();
+
+            // R2 speculation give-up: the draft+verify overhead has bought
+            // nothing for a long streak; finish the request with plain
+            // decode steps (same fallback as the draft-failure path).
+            if (!tree_mode and low_k_streak >= give_up_streak) {
+                std.log.warn("EngineLoop: MTP gave up after {d} consecutive zero-acceptance rounds; finishing with plain decode", .{low_k_streak});
+                hidden.deinit();
+                hidden_freed = true;
+                while (total_generated < gen_config.max_tokens and !stopped) {
+                    if (req.isCancelled()) break;
+                    const arr = array_mod.Array.fromData(allocator, u32, &[_]u32{t_next.token}, &[_]i32{ 1, 1 }) catch break;
+                    const st = generation_mod.generateStep(self.model, arr, caches, &req.sampler, self.ctx) catch break;
+                    t_next = st;
+                    context.append(allocator, t_next.token) catch break;
+                    if (streamer) |*s2| s2.emit(t_next.token);
+                    total_generated += 1;
+                    if (generation_mod.isStopToken(t_next.token, gen_config.stop_tokens)) {
+                        stopped = true;
+                        finish = .stop;
+                    }
+                }
+                break;
+            }
 
             // ---- DFlash2 tree verify round (DMLX_DF2_TREE=1) ----
             if (tree_mode) tree_blk: {
@@ -2743,19 +2784,33 @@ pub const EngineLoop = struct {
             // Copy-chain proposal: when trusted, the matched continuation IS
             // this round's chain and the drafter does not run.
             var copy_round = false;
-            if (copies_on and !topk_probe and n_round >= copy_min_len) {
+            if (copies_on and self.mtp_copy_trusted and !topk_probe and n_round >= copy_min_len) {
                 if (copy_cooldown > 0) {
                     copy_cooldown -= 1;
                 } else {
-                    const ng = speculative_mod.NgramDrafter{ .n = 3 };
-                    if (ng.propose(context.items, n_round, allocator)) |copy| {
-                        defer allocator.free(copy);
-                        if (copy.len >= copy_min_len) {
-                            if (drafts.appendSlice(allocator, copy)) |_| {
-                                copy_round = true;
-                            } else |_| {
-                                drafts.clearRetainingCapacity();
+                    // Longest n-gram first: a 4-gram match is the most
+                    // specific; the 2-gram fallback needs a longer
+                    // continuation to be worth a verify round.
+                    const ng_ns = [_]usize{ 4, 3, 2 };
+                    var copy: ?[]u32 = null;
+                    for (ng_ns) |nn| {
+                        if (context.items.len <= nn) continue;
+                        const ng = speculative_mod.NgramDrafter{ .n = nn };
+                        const min_cont: usize = if (nn == 2) @max(copy_min_len, 4) else copy_min_len;
+                        if (ng.propose(context.items, n_round, allocator)) |cand| {
+                            if (cand.len >= min_cont) {
+                                copy = cand;
+                                break;
                             }
+                            allocator.free(cand);
+                        }
+                    }
+                    if (copy) |cand| {
+                        defer allocator.free(cand);
+                        if (drafts.appendSlice(allocator, cand)) |_| {
+                            copy_round = true;
+                        } else |_| {
+                            drafts.clearRetainingCapacity();
                         }
                     }
                 }
@@ -3292,8 +3347,18 @@ pub const EngineLoop = struct {
                     drafts_proposed -= drafts.items.len;
                     drafts_accepted -= k;
                     if (k == 0) copy_cooldown = copy_cooldown_rounds;
+                    // Relative trust: copies only pay when their per-token
+                    // acceptance is close to the drafter's (a copy round
+                    // skips the draft pass, so a small deficit still wins).
+                    // Losing regimes are parked for the rest of the request.
+                    if (copy_rounds >= 4 and copy_proposed >= 20 and drafts_proposed >= 20) {
+                        const copy_rate = @as(f64, @floatFromInt(copy_accepted)) / @as(f64, @floatFromInt(copy_proposed));
+                        const df2_rate = @as(f64, @floatFromInt(drafts_accepted)) / @as(f64, @floatFromInt(drafts_proposed));
+                        if (copy_rate < 0.85 * df2_rate) copy_cooldown = std.math.maxInt(usize);
+                    }
                 } else {
                     depth_ctl.record(n_round, if (round_ns > 0) @intCast(round_ns) else 0, k);
+                    low_k_streak = if (k == 0) low_k_streak + 1 else 0;
                 }
                 if (std.c.getenv("DMLX_MTP_ROUND_LOG") != null) {
                     std.debug.print("MTP-ROUND r={d} n={d} k={d} ms={d:.1}\n", .{ depth_ctl.rounds, n_round, k, @as(f64, @floatFromInt(round_ns)) / 1e6 });
@@ -3401,6 +3466,16 @@ pub const EngineLoop = struct {
                     copy_accepted,
                     copy_proposed,
                 });
+                self.mtp_copy_proposed_total += copy_proposed;
+                self.mtp_copy_accepted_total += copy_accepted;
+                // Cross-request trust uses the same relative rule as the
+                // in-request parking: copies must stay within 15% of the
+                // drafter's per-token acceptance to be proposed at all.
+                if (self.mtp_copy_proposed_total >= 60 and drafts_proposed > 0) {
+                    const cr = @as(f64, @floatFromInt(self.mtp_copy_accepted_total)) / @as(f64, @floatFromInt(self.mtp_copy_proposed_total));
+                    const dr = @as(f64, @floatFromInt(drafts_accepted)) / @as(f64, @floatFromInt(drafts_proposed));
+                    self.mtp_copy_trusted = cr >= 0.85 * dr;
+                }
             }
         }
 
