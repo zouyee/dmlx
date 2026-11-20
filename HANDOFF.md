@@ -2509,3 +2509,34 @@ tau via drafter architecture (MoFA feature encoding, rejection memory,
 fused causal head, prefix-only attention), explicitly WITHOUT draft trees.
 Only Qwen3-4B weights exist (J-sandler/Qwen3-4B-DNeo); watch incoai/z-lab
 for Qwen3.8-27B-DNeo — our DF2 integration path is a drop-in slot.
+
+## Tree verify on thinking content + copy-chain rounds (2026-11-20)
+
+Live measurement closed the question the offline sim left open: on thinking
+content (greedy, 4.8k-token prompt) the 15-node tree's E[t] is 2.64 vs the
+chain's 2.62 — at ~23% per-draft acceptance, extra branches buy nothing while
+round cost grows ~2.2x (tree verify ~6.1 ms/GDN-layer vs chain ~2.8). Trees
+only pay when acceptance is already high (E[t] 6.38 measured on repetitive
+short content). R1 stays shelved; the premise that a fused tree kernel closes
+the thinking gap is disproved by this data.
+
+Cross-engine acceptance gaps reported earlier (23.5% vs ~50%) were
+cross-PROMPT contamination: on the identical bench (pi_perf_bench.py,
+temp 0.8) the same day, same machine, per-draft acceptance is 30-52% here vs
+30-34% there, and server-side decode is short 26.7 vs 30.4, mid 26.4 vs 26.1,
+long 29.0 vs 20.9 tok/s (both engines at 11GB swap pressure). Their
+"+ copies" design (context-copy branch merged into the verify plan, trust
+gated by hit rate) was confirmed as real but workload-dependent: on a
+repetitive-prompt probe their E[t] dropped to 1.83 vs our chain's 2.62.
+
+Shipped (opt-in, commit "mtp: context copy-chain rounds"): DMLX_MTP_COPIES=1
+runs n-gram context continuations as verify-only rounds (no drafter pass).
+Exact under greedy (argmax equality) and sampling (target-sample equality is
+the point-mass proposal rule; rejection emits a plain target sample).
+Adaptive trust: position-0 miss parks copies for 8 rounds. Greedy output
+byte-identical on/off. Where rounds engage, copy acceptance runs 31-79%;
+round share is 4-14% on the pi bench (limited by exact 3-gram repeats).
+
+Verify remains the DRAM-floor item: full weight streaming per round ~= the
+~85 ms GPU floor, matching the 2026-11-06 verdict that further decode gains
+come from acceptance/drafter quality, not verify kernels.
