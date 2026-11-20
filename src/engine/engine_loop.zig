@@ -2542,6 +2542,27 @@ pub const EngineLoop = struct {
         var tree_nodes: usize = 0;
         var tree_path_tokens: usize = 0;
 
+        // Copy-chain rounds (DMLX_MTP_COPIES=1): an n-gram suffix match over
+        // the context proposes a continuation that is verified directly as
+        // the round's chain, skipping the drafter pass entirely. Exact under
+        // greedy (batched argmax equality) and under sampling (target-sample
+        // equality is the speculative rule for a point-mass proposal; the
+        // rejection token is a plain target sample, no (p-q)+ adjustment).
+        // Trust is adaptive: a position-0 miss parks copies for a cooldown.
+        const copies_on = !tree_mode and std.c.getenv("DMLX_MTP_COPIES") != null;
+        const copy_min_len: usize = blk: {
+            const s = std.c.getenv("DMLX_MTP_COPIES_MINLEN") orelse break :blk 3;
+            break :blk std.fmt.parseInt(usize, std.mem.span(s), 10) catch 3;
+        };
+        const copy_cooldown_rounds: usize = blk: {
+            const s = std.c.getenv("DMLX_MTP_COPIES_COOLDOWN") orelse break :blk 8;
+            break :blk std.fmt.parseInt(usize, std.mem.span(s), 10) catch 8;
+        };
+        var copy_cooldown: usize = 0;
+        var copy_rounds: usize = 0;
+        var copy_proposed: usize = 0;
+        var copy_accepted: usize = 0;
+
         // `DMLX_MTP_TOPK=1`: measure how often the target's own token sits in
         // the drafter's top-k at each depth. top1 reproduces p_i; the top1 ->
         // top2/top4 gap is the headroom a multi-branch draft would capture.
@@ -2719,6 +2740,26 @@ pub const EngineLoop = struct {
             // 1. Draft chain.
             var drafts = std.ArrayList(u32).empty;
             defer drafts.deinit(allocator);
+            // Copy-chain proposal: when trusted, the matched continuation IS
+            // this round's chain and the drafter does not run.
+            var copy_round = false;
+            if (copies_on and !topk_probe and n_round >= copy_min_len) {
+                if (copy_cooldown > 0) {
+                    copy_cooldown -= 1;
+                } else {
+                    const ng = speculative_mod.NgramDrafter{ .n = 3 };
+                    if (ng.propose(context.items, n_round, allocator)) |copy| {
+                        defer allocator.free(copy);
+                        if (copy.len >= copy_min_len) {
+                            if (drafts.appendSlice(allocator, copy)) |_| {
+                                copy_round = true;
+                            } else |_| {
+                                drafts.clearRetainingCapacity();
+                            }
+                        }
+                    }
+                }
+            }
             // DMLX_MTP_AVTRACE: per-step (l_max, margin) features, aligned
             // with `drafts` when the coarse head produced them.
             var draft_feats = std.ArrayList([2]f32).empty;
@@ -2735,8 +2776,10 @@ pub const EngineLoop = struct {
             var draft_err: ?anyerror = null;
             var tok = t_next.token;
             var draft_failed = false;
-            const gpu_chain = greedy and mtp.draftGreedy != null and !topk_probe;
-            if (gpu_chain) blk: {
+            const gpu_chain = !copy_round and greedy and mtp.draftGreedy != null and !topk_probe;
+            if (copy_round) {
+                // Copy chain verified directly; no drafter steps this round.
+            } else if (gpu_chain) blk: {
                 // Greedy GPU-chained chain: token ids stay on GPU (argmax of
                 // each step's logits feeds the next step); ONE sync reads all
                 // N draft tokens at the end. Draft logits are dropped —
@@ -2867,7 +2910,7 @@ pub const EngineLoop = struct {
                 break;
             }
             drafts_proposed += drafts.items.len;
-            defer h_cur.deinit(); // all exits below (incl. error breaks)
+            defer if (h_cur_own) h_cur.deinit(); // all exits below (incl. error breaks); copy rounds never own it
             prof_lap(prof_now, &prof_last, &prof_draft_ns);
             prof_rounds +|= 1;
             if (mem_probe_on and prof_rounds <= 6) _ = c.c.mlx_get_active_memory(&phase_mem[0]);
@@ -3080,6 +3123,22 @@ pub const EngineLoop = struct {
                         stop_in_drafts = true;
                         break;
                     }
+                } else if (copy_round) {
+                    // Point-mass proposal: exact rule is target-sample
+                    // equality; the mismatching sample is the emitted token.
+                    const target = req.sampler.sample(v_i, allocator) catch {
+                        rejected = true;
+                        break;
+                    };
+                    if (target.token != drafts.items[i]) {
+                        rejected = true;
+                        break;
+                    }
+                    k += 1;
+                    if (generation_mod.isStopToken(drafts.items[i], gen_config.stop_tokens)) {
+                        stop_in_drafts = true;
+                        break;
+                    }
                 } else {
                     // Speculative sampling: accept w.p. min(1, p/q); the
                     // rejection resample happens after the loop.
@@ -3144,14 +3203,16 @@ pub const EngineLoop = struct {
                 sampling_mod.SampleResult{ .token = @intCast(greedy_tokens[next_pos]), .logprob = 0.0 }
             else if (rows_ready) blk: {
                 // Row was pre-pulled and joint-evaled above — sync-free.
-                break :blk if (!rejected)
+                break :blk if (!rejected or copy_round)
+                    // Copy rounds: a rejection emits the plain target sample
+                    // (point-mass proposal rule), no (p-q)+ adjustment.
                     req.sampler.sample(verify_rows.items[next_pos], allocator) catch break
                 else
                     mtpResampleAdjusted(verify_rows.items[next_pos], draft_logits.items[k], req.sampler.temperature, &req.sampler.prng, allocator) catch break;
             } else blk: {
                 const v_next = mtp.verifyLogits(self.model.ptr, vh, next_pos) catch break;
                 defer v_next.deinit();
-                break :blk if (greedy or !rejected)
+                break :blk if (greedy or !rejected or copy_round)
                     // Greedy: exact target argmax (rejection) / sampler (bonus).
                     // temp>0 with all drafts accepted: plain bonus sample.
                     req.sampler.sample(v_next, allocator) catch break
@@ -3222,7 +3283,18 @@ pub const EngineLoop = struct {
             // representative of steady-state cost.
             {
                 const round_ns = prof_now() - round_t0;
-                depth_ctl.record(n_round, if (round_ns > 0) @intCast(round_ns) else 0, k);
+                if (copy_round) {
+                    // Copy rounds keep the drafter's depth evidence clean;
+                    // a position-0 miss parks copies for the cooldown.
+                    copy_rounds += 1;
+                    copy_proposed += drafts.items.len;
+                    copy_accepted += k;
+                    drafts_proposed -= drafts.items.len;
+                    drafts_accepted -= k;
+                    if (k == 0) copy_cooldown = copy_cooldown_rounds;
+                } else {
+                    depth_ctl.record(n_round, if (round_ns > 0) @intCast(round_ns) else 0, k);
+                }
                 if (std.c.getenv("DMLX_MTP_ROUND_LOG") != null) {
                     std.debug.print("MTP-ROUND r={d} n={d} k={d} ms={d:.1}\n", .{ depth_ctl.rounds, n_round, k, @as(f64, @floatFromInt(round_ns)) / 1e6 });
                 }
@@ -3321,6 +3393,15 @@ pub const EngineLoop = struct {
                 ms(prof_accept_ns / rounds),
                 ms(prof_commit_ns / rounds),
             });
+            if (copy_rounds > 0) {
+                std.log.info("[Engine] MTP copies: rounds={d} share={d:.0}% acceptance={d:.1}% ({d}/{d})", .{
+                    copy_rounds,
+                    100.0 * @as(f64, @floatFromInt(copy_rounds)) / @as(f64, @floatFromInt(rounds)),
+                    100.0 * @as(f64, @floatFromInt(copy_accepted)) / @as(f64, @floatFromInt(@max(copy_proposed, 1))),
+                    copy_accepted,
+                    copy_proposed,
+                });
+            }
         }
 
         depth_ctl.finishRequest();
