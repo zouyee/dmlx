@@ -34,6 +34,7 @@ const glm53 = @import("models/glm53.zig");
 const qwen38_loader = @import("models/qwen38_loader.zig");
 const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
+const verify_qmm = @import("models/verify_qmm.zig");
 const qwen38_dflash2 = @import("models/qwen38_dflash2.zig");
 const mkdir_c = @cImport(@cInclude("sys/stat.h"));
 const lora_merge = @import("models/lora_merge.zig");
@@ -1112,6 +1113,11 @@ pub const Qwen38VTableAdapter = struct {
             const ms = @as(f64, @floatFromInt(df2Now() - t0)) / 1e6;
             std.debug.print("DF2 block total {d:.1}ms\n", .{ms});
         };
+        // Arm the tuned verify-qmm kernels for the whole block: the drafter's
+        // projections are M<=8 shapes that stock runs at ~half the sg8
+        // bandwidth. Draft-side numerics only shift proposals, never output.
+        verify_qmm.arm();
+        defer verify_qmm.disarm();
         const m = self.dflash2.?;
         const ctx = self.model.ctx;
         const P: i32 = @intCast(m.cfg.block_size - 1);
@@ -1140,6 +1146,7 @@ pub const Qwen38VTableAdapter = struct {
         const draft_hidden = try ops.slice(ctx, hidden_full, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, P + 1, H }, &[_]i32{ 1, 1, 1 });
         defer draft_hidden.deinit();
         const lm = self.mtpLmHead();
+        // lm_head routed to sg8 by the arm at the top of this function.
         const logits = try lm.apply(ctx, draft_hidden);
         defer logits.deinit();
 
@@ -1245,6 +1252,9 @@ pub const Qwen38VTableAdapter = struct {
         const prof = std.c.getenv("DMLX_DF2_PROF") != null;
         var t0: i128 = 0;
         if (prof) t0 = df2Now();
+        // See dflash2ComputeBlock: tuned qmm for the whole block.
+        verify_qmm.arm();
+        defer verify_qmm.disarm();
         const m = self.dflash2.?;
         const ctx = self.model.ctx;
         const P: i32 = @intCast(m.cfg.block_size - 1);
