@@ -2540,3 +2540,46 @@ round share is 4-14% on the pi bench (limited by exact 3-gram repeats).
 Verify remains the DRAM-floor item: full weight streaming per round ~= the
 ~85 ms GPU floor, matching the 2026-11-06 verdict that further decode gains
 come from acceptance/drafter quality, not verify kernels.
+
+## Copy-chain band model (2026-11-25) — shipped opt-in
+
+`DMLX_MTP_COPIES_BANDS=1` (requires `DMLX_MTP_COPIES=1`) ports TensorFold
+`lookup.zig`'s band model to the copy-chain proposal: candidates ranked by
+(band tier of available continuation → suffix n → length/position), depth
+caps 5/6/7 for available ≥8/16/32 (`copy_bands` in `src/speculative.zig`),
+depth = min(7, max(n_round, band_cap)). The cap is pinned at 7 because the
+tuned verify qmm paths stop at M=8.
+
+AB/BA (same binary, n=4/cell/arm): client decode +16%/+2%/+16% (think-off
+short/2k/8k) and +29%/+11%/−6% (think-on); all cells finish length at 256
+both arms. Mechanism: copy round share 16%→23%, copy acceptance 63%→71%,
+verify ms unchanged (~72). The −6% cell's ranges fully overlap — sampling
+noise at n=4/temp 0.8. Gains scale with exact-match opportunities, same
+workload dependence as copies themselves. Full data:
+`artifacts/copy_bands_20261125/REPORT.md` (branch `mtp-copy-bands`).
+
+Also ruled out this session: an omlx `norm_repair.py`-style audit of the
+DFlash2 checkpoint (all 21 RMSNorm means +0.27..+2.66, no missing +1 shift
+signature) — the conversion bug does not apply to our direct HF bf16 load.
+
+## MTP top-k headroom measurement (2026-11-25)
+
+`DMLX_MTP_TOPK=1` first real data (greedy, 12 requests, n≈710/depth) —
+share of verify positions where the target's greedy token is in the
+drafter's top-k:
+
+| depth | top1 | top2 | top4 | top8 |
+|---|---|---|---|---|
+| d1 | 0.834 | 0.916 | 0.956 | 0.974 |
+| d2 | 0.711 | 0.800 | 0.907 | 0.949 |
+| d3 | 0.629 | 0.775 | 0.815 | 0.883 |
+| d4 | 0.549 | 0.663 | 0.753 | 0.852 |
+| d5 | 0.463 | 0.581 | 0.705 | 0.786 |
+
+Chain E[t] at top1 = 3.10; idealized per-depth top2/4/8 marginals give
+3.81/4.44/4.95 — but marginals are not jointly realizable, and the
+2026-11-19/20 tree experiments measured the realized tree gain at ~zero
+under linear verify-byte costs. Conclusion: drafter top-1 quality is the
+binding constraint (p1 0.83 → 0.46 by d5); the top1→top8 gap is the
+ceiling a DNeo-class drafter (better top-1, no trees — see the DNeo note
+above) could approach. Raw: `artifacts/copy_bands_20261125/server_topk.log`.

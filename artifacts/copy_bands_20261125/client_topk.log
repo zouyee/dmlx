@@ -1,0 +1,13 @@
+topk         warmup                 ttft=  3.80s decode=  68.6 n=8 finish=length wall=   3.9s
+topk         think-off/short/r1     ttft=  1.42s decode=  36.4 n=256 finish=length wall=   8.4s
+topk         think-off/short/r2     ttft=  0.12s decode=  36.9 n=256 finish=length wall=   7.0s
+topk         think-off/mid-2k/r1    ttft= 15.52s decode=  40.6 n=256 finish=length wall=  21.8s
+topk         think-off/mid-2k/r2    ttft=  0.15s decode=  40.2 n=256 finish=length wall=   6.5s
+topk         think-off/long-8k/r1   ttft= 66.26s decode=  35.6 n=256 finish=length wall=  73.4s
+topk         think-off/long-8k/r2   ttft=  0.21s decode=  35.9 n=256 finish=length wall=   7.3s
+topk         think-on/short/r1      ttft=  1.44s decode=  39.6 n=256 finish=length wall=   7.9s
+topk         think-on/short/r2      ttft=  0.11s decode=  39.6 n=256 finish=length wall=   6.6s
+topk         think-on/mid-2k/r1     ttft= 15.45s decode=  40.7 n=256 finish=length wall=  21.7s
+topk         think-on/mid-2k/r2     ttft=  0.14s decode=  40.7 n=256 finish=length wall=   6.4s
+topk         think-on/long-8k/r1    ttft= 69.34s decode=  20.1 n=256 finish=length wall=  82.0s
+topk         think-on/long-8k/r2    ttft=  0.37s decode=  34.2 n=256 finish=length wall=   7.8s

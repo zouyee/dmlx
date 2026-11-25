@@ -2787,6 +2787,25 @@ pub const EngineLoop = struct {
             if (copies_on and self.mtp_copy_trusted and !topk_probe and n_round >= copy_min_len) {
                 if (copy_cooldown > 0) {
                     copy_cooldown -= 1;
+                } else if (std.c.getenv("DMLX_MTP_COPIES_BANDS") != null) {
+                    // TensorFold lookup.zig band model: rank candidates by
+                    // continuation evidence (band tier, then suffix size) and
+                    // let a long exact match verify deeper than the depth
+                    // controller's pick — capped at 7 so verify stays at
+                    // M <= 8 where the tuned qmm paths serve every shape.
+                    const ng_ns = [_]usize{ 4, 3, 2 };
+                    const ng_mins = [_]usize{ copy_min_len, copy_min_len, @max(copy_min_len, 4) };
+                    if (speculative_mod.proposeBandCopy(context.items, &ng_ns, &ng_mins, 7, allocator)) |cand| {
+                        defer allocator.free(cand.tokens);
+                        const band_cap = speculative_mod.copyBandCap(cand.available);
+                        const depth = @min(7, @max(n_round, band_cap));
+                        const use = @min(depth, cand.tokens.len);
+                        if (drafts.appendSlice(allocator, cand.tokens[0..use])) |_| {
+                            copy_round = true;
+                        } else |_| {
+                            drafts.clearRetainingCapacity();
+                        }
+                    }
                 } else {
                     // Longest n-gram first: a 4-gram match is the most
                     // specific; the 2-gram fallback needs a longer

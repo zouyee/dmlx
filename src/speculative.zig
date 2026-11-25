@@ -217,6 +217,110 @@ pub const NgramDrafter = struct {
 };
 
 // ============================================================
+// Band copy selection (TensorFold lookup.zig band model port)
+// ============================================================
+
+/// A copy proposal with its evidence: the matched suffix size and how long a
+/// continuation the match actually supplies (before depth capping).
+pub const BandCopy = struct {
+    /// Owned by the caller; free with the proposal allocator.
+    tokens: []u32,
+    /// Suffix size n that produced the match.
+    n: usize,
+    /// Continuation tokens available at the match position (pre-cap).
+    available: usize,
+};
+
+/// TensorFold `lookup.zig` bands: the longer the exact-match continuation,
+/// the higher the per-token acceptance prior, and the deeper a copy chain
+/// is worth verifying. Caps keep verify rows at M <= 8 — the tuned verify
+/// qmm paths (sg8/split-K/mma) stop at M=8 and M>=9 falls back to stock
+/// kernels, so a deeper cap would pay more per byte than the drafter does.
+/// `cap == 0` means "no band override": use the depth controller's pick.
+pub const copy_bands = [_]struct { min_avail: usize, cap: usize }{
+    .{ .min_avail = 32, .cap = 7 },
+    .{ .min_avail = 16, .cap = 6 },
+    .{ .min_avail = 8, .cap = 5 },
+    .{ .min_avail = 0, .cap = 0 },
+};
+
+/// The band cap for an `available`-token continuation.
+pub fn copyBandCap(available: usize) usize {
+    for (copy_bands) |b| {
+        if (available >= b.min_avail) return b.cap;
+    }
+    return 0;
+}
+
+/// Ranked copy-candidate search across suffix sizes `ns` (longest n first),
+/// maximizing continuation evidence before depth capping:
+///   1. band tier of `available` (longer exact continuation = higher prior),
+///   2. suffix size n (a longer match is more specific),
+///   3. available length, then latest position.
+/// `max_depth` bounds the returned chain (verify serves M <= 8). Per-n
+/// minimum-continuation gates mirror the plain copy path: `mins[n]` tokens
+/// required for an n-sized match (a 2-gram is weaker and needs more).
+/// Returns null when no candidate passes its gate.
+pub fn proposeBandCopy(
+    context: []const u32,
+    ns: []const usize,
+    mins: []const usize,
+    max_depth: usize,
+    allocator: std.mem.Allocator,
+) ?BandCopy {
+    std.debug.assert(ns.len == mins.len);
+    if (max_depth == 0) return null;
+
+    var best: ?BandCopy = null;
+    var best_avail: usize = 0;
+    var best_n: usize = 0;
+
+    for (ns, mins) |n, min_cont| {
+        if (context.len <= n + min_cont) continue;
+        const suffix = context[context.len - n ..];
+        const search_end = context.len - n;
+        var match: ?usize = null;
+        var match_avail: usize = 0;
+
+        var i: usize = 0;
+        while (i + n <= search_end) : (i += 1) {
+            if (!std.mem.eql(u32, context[i .. i + n], suffix)) continue;
+            const cont_start = i + n;
+            const avail = search_end - cont_start;
+            if (avail < min_cont) continue;
+            // Longest continuation wins; the latest occurrence breaks ties
+            // (nearest context is the most similar).
+            if (match == null or avail > match_avail) {
+                match = i;
+                match_avail = avail;
+            }
+        }
+
+        const pos = match orelse continue;
+        // Rank by (band tier, n): compare via the band floor each avail falls
+        // into, then specificity. Ties on both fall back to avail/position,
+        // which the scan order (longest n first, latest position last)
+        // approximates; exact tie-breaking is not worth a second pass.
+        const band_floor = copyBandCap(match_avail);
+        const best_floor = if (best) |b| copyBandCap(b.available) else 0;
+        const better = best == null or
+            band_floor > best_floor or
+            (band_floor == best_floor and (n > best_n or (n == best_n and match_avail > best_avail)));
+        if (!better) continue;
+
+        const take = @min(match_avail, max_depth);
+        const tokens = allocator.alloc(u32, take) catch return null;
+        @memcpy(tokens, context[pos + n .. pos + n + take]);
+        if (best) |b| allocator.free(b.tokens);
+        best = .{ .tokens = tokens, .n = n, .available = match_avail };
+        best_avail = match_avail;
+        best_n = n;
+    }
+
+    return best;
+}
+
+// ============================================================
 // PldDrafter — Prompt Lookup Decoding draft token proposal
 // ============================================================
 
@@ -609,6 +713,86 @@ test "NgramDrafter: limits continuation to k tokens" {
     try std.testing.expectEqual(@as(usize, 2), result.?.len);
     try std.testing.expectEqual(@as(u32, 3), result.?[0]);
     try std.testing.expectEqual(@as(u32, 4), result.?[1]);
+}
+
+test "copyBandCap: tier floors and caps" {
+    try std.testing.expectEqual(@as(usize, 0), copyBandCap(0));
+    try std.testing.expectEqual(@as(usize, 0), copyBandCap(7));
+    try std.testing.expectEqual(@as(usize, 5), copyBandCap(8));
+    try std.testing.expectEqual(@as(usize, 5), copyBandCap(15));
+    try std.testing.expectEqual(@as(usize, 6), copyBandCap(16));
+    try std.testing.expectEqual(@as(usize, 6), copyBandCap(31));
+    try std.testing.expectEqual(@as(usize, 7), copyBandCap(32));
+    try std.testing.expectEqual(@as(usize, 7), copyBandCap(1000));
+}
+
+test "proposeBandCopy: returns null when no candidate passes the gates" {
+    // Only a bigram match, with a 3-token continuation below the bigram's
+    // min of 4.
+    const context = [_]u32{ 1, 2, 10, 11, 12, 1, 2 };
+    const ns = [_]usize{ 4, 3, 2 };
+    const mins = [_]usize{ 3, 3, 4 };
+    const result = proposeBandCopy(&context, &ns, &mins, 7, std.testing.allocator);
+    try std.testing.expect(result == null);
+}
+
+test "proposeBandCopy: longest continuation wins within one n" {
+    // Matches for suffix [1,2,3] at pos 0 (avail 9) and pos 4 (avail 5);
+    // the pos-0 continuation is longer and must be picked.
+    const context = [_]u32{ 1, 2, 3, 70, 1, 2, 3, 80, 81, 82, 83, 84, 1, 2, 3 };
+    const ns = [_]usize{3};
+    const mins = [_]usize{3};
+    const result = proposeBandCopy(&context, &ns, &mins, 7, std.testing.allocator);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.tokens);
+    try std.testing.expectEqual(@as(usize, 3), result.?.n);
+    try std.testing.expectEqual(@as(usize, 9), result.?.available);
+    try std.testing.expectEqual(@as(usize, 7), result.?.tokens.len);
+    try std.testing.expectEqual(@as(u32, 70), result.?.tokens[0]);
+}
+
+test "proposeBandCopy: a longer band beats a more specific short match" {
+    // Layout: bigram match at pos 0 with an 11-token continuation span
+    // (tier >= 8); no 4-gram match exists. The tier gate accepts it even
+    // though a hypothetical shorter 4-gram would be more specific.
+    const context = [_]u32{ 3, 4, 50, 51, 52, 53, 54, 55, 56, 57, 58, 1, 2, 3, 4 };
+    const ns = [_]usize{ 4, 2 };
+    const mins = [_]usize{ 3, 4 };
+    const result = proposeBandCopy(&context, &ns, &mins, 7, std.testing.allocator);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.tokens);
+    try std.testing.expectEqual(@as(usize, 2), result.?.n);
+    try std.testing.expectEqual(@as(usize, 11), result.?.available);
+    try std.testing.expectEqual(@as(usize, 7), result.?.tokens.len);
+    try std.testing.expectEqual(@as(u32, 50), result.?.tokens[0]);
+}
+
+test "proposeBandCopy: within one tier the larger n wins over length" {
+    // n=4 match at pos 0: avail 6. n=3 match at pos 1: avail 7. Same tier
+    // (both < 8): specificity beats length.
+    const context = [_]u32{ 1, 2, 3, 4, 60, 61, 2, 3, 4, 70, 1, 2, 3, 4 };
+    const ns = [_]usize{ 4, 3 };
+    const mins = [_]usize{ 3, 3 };
+    const result = proposeBandCopy(&context, &ns, &mins, 7, std.testing.allocator);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.tokens);
+    try std.testing.expectEqual(@as(usize, 4), result.?.n);
+    try std.testing.expectEqual(@as(usize, 6), result.?.available);
+    try std.testing.expectEqual(@as(usize, 6), result.?.tokens.len);
+    try std.testing.expectEqual(@as(u32, 60), result.?.tokens[0]);
+    try std.testing.expectEqual(@as(u32, 70), result.?.tokens[5]);
+}
+
+test "proposeBandCopy: max_depth caps the returned chain" {
+    const context = [_]u32{ 3, 4, 50, 51, 52, 53, 54, 55, 56, 57, 58, 1, 2, 3, 4 };
+    const ns = [_]usize{2};
+    const mins = [_]usize{4};
+    const result = proposeBandCopy(&context, &ns, &mins, 4, std.testing.allocator);
+    try std.testing.expect(result != null);
+    defer std.testing.allocator.free(result.?.tokens);
+    try std.testing.expectEqual(@as(usize, 4), result.?.tokens.len);
+    try std.testing.expectEqual(@as(u32, 50), result.?.tokens[0]);
+    try std.testing.expectEqual(@as(u32, 53), result.?.tokens[3]);
 }
 
 test "NgramDrafter: returns null when no match found" {
