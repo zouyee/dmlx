@@ -204,9 +204,9 @@ pub fn topKTopPSampler(
     var top_len: usize = 0;
     for (0..vocab_size) |i| {
         const s = data[i] / temperature;
-        // Skip NaN scores so NaN logits don't rank first (greedy's `>`
-        // comparisons never select a NaN either).
-        if (std.math.isNan(s)) continue;
+        // NaN and -inf have no sampling probability. Skipping -inf also keeps
+        // sparse draft logits out of the equal-score insertion path below.
+        if (std.math.isNan(s) or s == -std.math.inf(f32)) continue;
         if (top_len == k_actual and s < top[top_len - 1].score) continue;
         var pos: usize = 0;
         while (pos < top_len and top[pos].score >= s) : (pos += 1) {}
@@ -217,24 +217,26 @@ pub fn topKTopPSampler(
         top[pos] = .{ .token = @intCast(i), .score = s };
     }
 
+    if (top_len == 0) return error.NoFiniteLogits;
+
     // Compute probs over top-k
     var probs = try allocator.alloc(f32, k_actual);
     defer allocator.free(probs);
 
     const max_score: f32 = top[0].score;
     var sum_exp: f32 = 0;
-    for (0..k_actual) |i| {
+    for (0..top_len) |i| {
         probs[i] = @exp(top[i].score - max_score);
         sum_exp += probs[i];
     }
-    for (0..k_actual) |i| {
+    for (0..top_len) |i| {
         probs[i] /= sum_exp;
     }
 
     // Then apply top-p on the sorted top-k
     var cumsum: f32 = 0;
-    var cutoff: usize = k_actual;
-    for (0..k_actual) |i| {
+    var cutoff: usize = top_len;
+    for (0..top_len) |i| {
         cumsum += probs[i];
         if (cumsum > p) {
             cutoff = i + 1;
@@ -473,4 +475,25 @@ test "selectTopK: top-k order, stability, NaN skip" {
     try std.testing.expectEqual(@as(u32, 2), top[0].token); // 3.0
     try std.testing.expectEqual(@as(u32, 3), top[1].token); // 3.0 tie → lower id first
     try std.testing.expectEqual(@as(u32, 4), top[2].token); // 2.0
+}
+
+test "topKTopPSampler: sparse logits skip zero-probability entries" {
+    const allocator = std.testing.allocator;
+    const vocab = 256;
+    const logits_data = try allocator.alloc(f32, vocab);
+    defer allocator.free(logits_data);
+    @memset(logits_data, -std.math.inf(f32));
+    logits_data[5] = 0.0;
+    logits_data[9] = -1.0;
+    const logits = try Array.fromData(allocator, f32, logits_data, &[_]i32{vocab});
+    defer logits.deinit();
+    var prng = std.Random.DefaultPrng.init(7);
+    for (0..32) |_| {
+        const token = try topKTopPSampler(logits, allocator, 1.0, 50, 1.0, prng.random());
+        try std.testing.expect(token == 5 or token == 9);
+    }
+    @memset(logits_data, -std.math.inf(f32));
+    const no_finite = try Array.fromData(allocator, f32, logits_data, &[_]i32{vocab});
+    defer no_finite.deinit();
+    try std.testing.expectError(error.NoFiniteLogits, topKTopPSampler(no_finite, allocator, 1.0, 50, 1.0, prng.random()));
 }

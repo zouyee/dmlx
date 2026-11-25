@@ -1,0 +1,7 @@
+greedy-B     warmup                 ttft=  3.46s decode=  69.2 n=8 finish=length wall=   3.6s
+greedy-B     think-off/short/r1     ttft=  1.43s decode=  41.7 n=256 finish=length wall=   7.6s
+greedy-B     think-off/mid-2k/r1    ttft= 15.37s decode=  42.4 n=256 finish=length wall=  21.4s
+greedy-B     think-off/long-8k/r1   ttft= 62.91s decode=  36.4 n=256 finish=length wall=  69.9s
+greedy-B     think-on/short/r1      ttft=  1.41s decode=  42.3 n=256 finish=length wall=   7.4s
+greedy-B     think-on/mid-2k/r1     ttft= 18.84s decode=  39.9 n=256 finish=length wall=  25.2s
+greedy-B     think-on/long-8k/r1    ttft= 61.46s decode=  35.3 n=256 finish=length wall=  68.7s

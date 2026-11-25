@@ -11,6 +11,7 @@ const c = @import("mlx").c;
 const ops = @import("mlx").ops;
 const shape_mod = @import("mlx").shape;
 const reduce_mod = @import("mlx").reduce;
+const eval_mod = @import("mlx").eval;
 const fast_mod = @import("mlx").fast;
 const kvcache = @import("kvcache.zig");
 const array_mod = @import("mlx").array;
@@ -36,6 +37,7 @@ const qwen38 = @import("models/qwen38.zig");
 const qwen38_mtp = @import("models/qwen38_mtp.zig");
 const verify_qmm = @import("models/verify_qmm.zig");
 const qwen38_dflash2 = @import("models/qwen38_dflash2.zig");
+const qwen38_dspine = @import("models/qwen38_dspine.zig");
 const mkdir_c = @cImport(@cInclude("sys/stat.h"));
 const lora_merge = @import("models/lora_merge.zig");
 const qwen38_vit = @import("vision/qwen38_vit.zig");
@@ -665,6 +667,16 @@ pub const Qwen38VTableAdapter = struct {
     df2_pending_tokens: ?Array = null,
     df2_pending_argmax: ?Array = null,
     df2_pending_rows: usize = 0,
+    /// DSpine block=2..8 drafter. Selected only by DMLX_QWEN38_DSPINE_DIR.
+    dspine: ?*qwen38_dspine.DSpine = null,
+    dspine_ctx: ?qwen38_dspine.DSpineContext = null,
+    dspine_block: [7]u32 = undefined,
+    dspine_candidates: [7 * 16]u32 = undefined,
+    dspine_table_host: []f32 = &.{},
+    dspine_block_len: usize = 0,
+    dspine_block_idx: usize = 0,
+    dspine_cache_ids: []u32 = &.{},
+    dspine_cache_rows: ?Array = null,
     /// `DMLX_MTP_CHAIN_DUMP=1`: per-step drafter KV length trace (plan
     /// 2026-10-29-catch-omlx-mtp Task 1). Read once per process; the RoPE
     /// offset of every head forward equals cache.len() before its append,
@@ -843,6 +855,9 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (std.c.getenv("DMLX_QWEN38_DSPINE_DIR")) |d| {
+            return self.dspineEnable(std.mem.span(d));
+        }
         if (std.c.getenv("DMLX_QWEN38_DFLASH2_DIR")) |d| {
             return self.dflash2Enable(std.mem.span(d));
         }
@@ -1382,10 +1397,260 @@ pub const Qwen38VTableAdapter = struct {
         self.dflash2ClearBlock();
     }
 
+    fn dspineEnable(self: *Qwen38VTableAdapter, dir: []const u8) anyerror!bool {
+        const block = try qwen38_dspine.DSpineConfig.parseBlockEnv(if (std.c.getenv("DMLX_DSPINE_BLOCK")) |b| std.mem.span(b) else null);
+        self.mtp_ops.num_drafts = block - 1;
+        if (self.dspine != null) return true;
+        std.log.info("Qwen3.8 DSpine: loading block={d} drafter from {s}", .{ block, dir });
+        const m = try self.allocator.create(qwen38_dspine.DSpine);
+        errdefer self.allocator.destroy(m);
+        const quant_bits: u8 = if (std.c.getenv("DMLX_DSPINE_DRAFTER_BITS")) |b|
+            if (std.mem.eql(u8, std.mem.span(b), "0")) 0 else 4
+        else
+            4;
+        m.* = qwen38_dspine.DSpine.loadBlock(self.allocator, self.model.ctx, dir, quant_bits, block) catch |err| {
+            std.log.warn("Qwen3.8 DSpine drafter load failed at {s} ({})", .{ dir, err });
+            self.allocator.destroy(m);
+            return false;
+        };
+        self.dspine = m;
+        self.dspine_ctx = qwen38_dspine.DSpineContext.init(self.allocator, self.model.ctx, m) catch |err| {
+            std.log.warn("Qwen3.8 DSpine context init failed ({})", .{err});
+            m.deinit();
+            self.allocator.destroy(m);
+            self.dspine = null;
+            return false;
+        };
+        self.dspine_block_len = 0;
+        self.dspine_block_idx = 0;
+        return true;
+    }
+
+    fn dspineClearBlock(self: *Qwen38VTableAdapter) void {
+        if (self.dspine_table_host.len > 0) self.allocator.free(self.dspine_table_host);
+        self.dspine_table_host = &.{};
+        self.dspine_block_len = 0;
+        self.dspine_block_idx = 0;
+    }
+
+    fn updateDSpineCache(self: *Qwen38VTableAdapter, ids: []const u32) !void {
+        if (self.dspine_cache_ids.len > 0) self.allocator.free(self.dspine_cache_ids);
+        self.dspine_cache_ids = try self.allocator.dupe(u32, ids);
+        if (self.dspine_cache_rows) |r| r.deinit();
+        self.dspine_cache_rows = null;
+        if (self.dspine_ctx.?.rowsShadow()) |sh| self.dspine_cache_rows = try ops.copy(self.model.ctx, sh);
+    }
+
+    fn dspinePrefill(self: *Qwen38VTableAdapter, ids: []const u32) anyerror!generation.MtpStepOut {
+        self.dspineClearBlock();
+        self.dspine_ctx.?.reset();
+        const ctx = self.model.ctx;
+        const m = self.dspine.?;
+        var cache_plen: usize = 0;
+        if (self.dspine_cache_rows) |cr| {
+            const n_rows: usize = @intCast(cr.shape()[1]);
+            const max_rows = @min(n_rows, @min(ids.len, self.dspine_cache_ids.len));
+            while (cache_plen < max_rows and self.dspine_cache_ids[cache_plen] == ids[cache_plen]) cache_plen += 1;
+        }
+        const snap_plen = self.model.peekPrefixSnapshotLen(ids);
+        const window: usize = @intCast(m.cfg.sliding_window - 1);
+        const cache_rows_len: usize = if (self.dspine_cache_rows) |cr| @intCast(cr.shape()[1]) else 0;
+        const covered = @min(cache_plen, cache_rows_len);
+        const need = @min(snap_plen, window);
+        const suppress = snap_plen > 0 and covered < need;
+        if (suppress) self.model.suppress_snapshot_restore = true;
+        defer self.model.suppress_snapshot_restore = false;
+        const usable_prefix = if (suppress) 0 else snap_plen;
+        var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&m.cfg.target_layer_ids);
+        errdefer tap.deinit();
+        const res = try self.model.forwardTokensCoreTap(ids, .all, true, &tap);
+        defer res.logits.deinit();
+        defer res.hidden.?.deinit();
+        if (usable_prefix > 0) {
+            const cr = self.dspine_cache_rows.?;
+            const width: i32 = cr.shape()[2];
+            const take: usize = @min(usable_prefix, window);
+            const rows = try ops.slice(ctx, cr, &[_]i32{ 0, @intCast(cache_rows_len - take), 0 }, &[_]i32{ 1, @intCast(cache_rows_len), width }, &[_]i32{ 1, 1, 1 });
+            defer rows.deinit();
+            try self.dspine_ctx.?.seedFromProjectedAt(rows, @intCast(usable_prefix - take));
+        }
+        if (try tap.finish(ctx)) |rows| {
+            defer rows.deinit();
+            if (std.c.getenv("DMLX_DSPINE_TRACE") != null) {
+                const n = rows.shape()[1];
+                const row = try ops.slice(ctx, rows, &[_]i32{ 0, n - 1, 0 }, &[_]i32{ 1, n, 8 }, &[_]i32{ 1, 1, 1 });
+                defer row.deinit();
+                const f = try ops.astype(ctx, row, .float32);
+                defer f.deinit();
+                try f.eval();
+                std.debug.print("DSPINE target_hidden {any}\n", .{try f.dataSlice(f32)});
+            }
+            if (std.c.getenv("DMLX_DSPINE_DUMP_TAP")) |path| {
+                const mlx_io = @import("mlx").io;
+                var weights = std.StringHashMap(Array).init(self.allocator);
+                defer weights.deinit();
+                try weights.put("tap", rows);
+                var metadata = std.StringHashMap([]const u8).init(self.allocator);
+                defer metadata.deinit();
+                try mlx_io.saveSafetensors(self.allocator, std.mem.span(path), weights, metadata);
+            }
+            try self.dspine_ctx.?.observe(rows);
+        }
+        self.updateDSpineCache(ids) catch |err| std.log.warn("DSpine context cache update failed: {}", .{err});
+        if (std.c.getenv("DMLX_DSPINE_TRACE") != null) {
+            if (self.dspine_ctx.?.rowsShadow()) |sh| {
+                const n = sh.shape()[1];
+                const row = try ops.slice(ctx, sh, &[_]i32{ 0, n - 1, 0 }, &[_]i32{ 1, n, 8 }, &[_]i32{ 1, 1, 1 });
+                defer row.deinit();
+                const f = try ops.astype(ctx, row, .float32);
+                defer f.deinit();
+                try f.eval();
+                std.debug.print("DSPINE context {any}\n", .{try f.dataSlice(f32)});
+            }
+        }
+        const lshape = res.logits.shape();
+        const vocab: i32 = lshape[2];
+        const flat = try ops.reshape(ctx, res.logits, &[_]i32{vocab});
+        defer flat.deinit();
+        const logits = try ops.astype(ctx, flat, .float32);
+        errdefer logits.deinit();
+        const hidden_dim: i32 = res.hidden.?.shape()[2];
+        const L: i32 = res.hidden.?.shape()[1];
+        const hrow = try ops.slice(ctx, res.hidden.?, &[_]i32{ 0, L - 1, 0 }, &[_]i32{ 1, L, hidden_dim }, &[_]i32{ 1, 1, 1 });
+        defer hrow.deinit();
+        const hflat = try ops.reshape(ctx, hrow, &[_]i32{ 1, hidden_dim });
+        defer hflat.deinit();
+        const hidden = try ops.copy(ctx, hflat);
+        return .{ .logits = logits, .hidden = hidden };
+    }
+
+    fn dspineComputeBlock(self: *Qwen38VTableAdapter, tok_gpu: Array) anyerror!void {
+        const prof = std.c.getenv("DMLX_DSPINE_PROF") != null;
+        var t0: i128 = 0;
+        if (prof) t0 = df2Now();
+        verify_qmm.arm();
+        defer verify_qmm.disarm();
+        const m = self.dspine.?;
+        const ctx = self.model.ctx;
+        const P: i32 = @intCast(m.cfg.block_size - 1);
+        const mask_ids = try self.allocator.alloc(i32, @intCast(P));
+        defer self.allocator.free(mask_ids);
+        for (mask_ids) |*t| t.* = @intCast(m.cfg.mask_token_id);
+        const mask_arr = try Array.fromData(self.allocator, i32, mask_ids, &[_]i32{P});
+        defer mask_arr.deinit();
+        const block_ids = try shape_mod.concatenateAxis(ctx, &[_]Array{ tok_gpu, mask_arr }, 0);
+        defer block_ids.deinit();
+        const ring = &self.dspine_ctx.?;
+        if (ring.fed == 0) return error.DSpineEmptyContext;
+        var block = try qwen38_dspine.blockHiddenRing(ctx, m, ring, self.model.embed_table_bf16.?, block_ids);
+        defer block.deinit();
+        var t_fwd: i128 = 0;
+        if (prof) {
+            try block.hidden.eval();
+            t_fwd = df2Now();
+        }
+        if (std.c.getenv("DMLX_DSPINE_TRACE") != null) {
+            const row = try ops.slice(ctx, block.hidden, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, 1, 8 }, &[_]i32{ 1, 1, 1 });
+            defer row.deinit();
+            const f = try ops.astype(ctx, row, .float32);
+            defer f.deinit();
+            try f.eval();
+            std.debug.print("DSPINE hidden {any}\n", .{try f.dataSlice(f32)});
+            const raw = try ops.slice(ctx, block.stash.raw, &[_]i32{ 0, 1, 0 }, &[_]i32{ 1, 2, 8 }, &[_]i32{ 1, 1, 1 });
+            defer raw.deinit();
+            const raw_f = try ops.astype(ctx, raw, .float32);
+            defer raw_f.deinit();
+            try raw_f.eval();
+            std.debug.print("DSPINE raw {any}\n", .{try raw_f.dataSlice(f32)});
+        }
+        const lm = self.mtpLmHead();
+        const logits = try lm.apply(ctx, block.hidden);
+        defer logits.deinit();
+        var t1: i128 = 0;
+        if (prof) {
+            try logits.eval();
+            t1 = df2Now();
+        }
+        const candidates = try qwen38_dspine.selectCandidates(ctx, logits, m.cfg.head_topk);
+        defer candidates.deinit();
+        var t2: i128 = 0;
+        if (prof) {
+            try candidates.eval();
+            t2 = df2Now();
+        }
+        const table = try qwen38_dspine.refinementTable(ctx, m, lm, block.hidden, block.stash, candidates, tok_gpu);
+        defer table.deinit();
+        try eval_mod.asyncEval(self.allocator, &[_]Array{ table, candidates });
+        try table.eval();
+        if (prof) {
+            const t3 = df2Now();
+            const ms = struct {
+                fn f(ns: i128) f64 {
+                    return @as(f64, @floatFromInt(ns)) / 1e6;
+                }
+            }.f;
+            std.debug.print("DSPINE prof fwd={d:.2} head={d:.2} topk={d:.2} refine={d:.2} total={d:.2}ms\n", .{ ms(t_fwd - t0), ms(t1 - t_fwd), ms(t2 - t1), ms(t3 - t2), ms(df2Now() - t0) });
+        }
+        const cand_slice = try candidates.dataSlice(i32);
+        for (cand_slice, 0..) |t, i| self.dspine_candidates[i] = @intCast(t);
+        const table_slice = try table.dataSlice(f32);
+        if (self.dspine_table_host.len > 0) self.allocator.free(self.dspine_table_host);
+        self.dspine_table_host = try self.allocator.dupe(f32, table_slice);
+        const positions: usize = m.cfg.block_size - 1;
+        const greedy = try qwen38_dspine.greedyChainFromHost(self.dspine_table_host, self.dspine_candidates[0 .. positions * 16], positions, 16, self.allocator);
+        defer self.allocator.free(greedy);
+        @memcpy(self.dspine_block[0..positions], greedy);
+        if (std.c.getenv("DMLX_DSPINE_TRACE") != null) {
+            std.debug.print("DSPINE fed={d} drafts={any}\n", .{ ring.fed, self.dspine_block[0..positions] });
+            std.debug.print("DSPINE candidates={any}\n", .{self.dspine_candidates[0 .. positions * 16]});
+        }
+        self.dspine_block_len = positions;
+        self.dspine_block_idx = 0;
+    }
+
+    fn dspineDraft(self: *Qwen38VTableAdapter, hidden: Array, token: u32) anyerror!generation.MtpStepOut {
+        if (self.dspine_block_idx >= self.dspine_block_len) {
+            self.dspineClearBlock();
+            const tok_gpu = try Array.fromData(self.allocator, i32, &[_]i32{@intCast(token)}, &[_]i32{1});
+            defer tok_gpu.deinit();
+            try self.dspineComputeBlock(tok_gpu);
+        }
+        const pos = self.dspine_block_idx;
+        const row = try qwen38_dspine.sparseLogitRowFromHost(self.dspine_table_host, self.dspine_candidates[0 .. self.dspine_block_len * 16], pos, token, self.dspine.?.cfg.vocab_size, self.allocator, self.dspine_block_len, 16);
+        defer self.allocator.free(row);
+        const logits = try Array.fromData(self.allocator, f32, row, &[_]i32{@intCast(row.len)});
+        errdefer logits.deinit();
+        self.dspine_block_idx += 1;
+        const h = try ops.copy(self.model.ctx, hidden);
+        return .{ .logits = logits, .hidden = h };
+    }
+
+    fn dspineDraftGreedy(self: *Qwen38VTableAdapter, hidden: Array, tok_gpu: Array) anyerror!generation.MtpGreedyDraftOut {
+        if (self.dspine_block_idx >= self.dspine_block_len) try self.dspineComputeBlock(tok_gpu);
+        const tok = self.dspine_block[self.dspine_block_idx];
+        self.dspine_block_idx += 1;
+        const t = try Array.fromData(self.allocator, i32, &[_]i32{@intCast(tok)}, &[_]i32{1});
+        errdefer t.deinit();
+        const h = try ops.copy(self.model.ctx, hidden);
+        return .{ .tok_gpu = t, .hidden = h };
+    }
+
+    fn dspineCommit(self: *Qwen38VTableAdapter, v: *qwen38.Qwen38VerifyOut, accepted: usize) void {
+        qwen38.commitVerify(self.model, v, accepted);
+        if (v.tap_hidden) |th| {
+            const width: i32 = th.shape()[2];
+            const rows = ops.slice(self.model.ctx, th, &[_]i32{ 0, 0, 0 }, &[_]i32{ 1, @intCast(accepted), width }, &[_]i32{ 1, 1, 1 }) catch return;
+            defer rows.deinit();
+            self.dspine_ctx.?.observe(rows) catch return;
+        }
+        self.dspineClearBlock();
+    }
+
     fn mtpPrefill(ctx_ptr: *anyopaque, ids: []const u32) anyerror!generation.MtpStepOut {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dspine != null) return self.dspinePrefill(ids);
         if (self.dflash2 != null) return self.dflash2Prefill(ids);
         const m = self.mtp.?;
         // Backbone: normal prefill path (reset + fused recurrence — NO
@@ -1410,6 +1675,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dspine != null) return error.DSpineVisionUnsupported;
         const m = self.mtp.?;
         m.cache.deinit();
         m.cache = .{};
@@ -1493,6 +1759,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dspine != null) return self.dspineDraft(hidden, token);
         if (self.dflash2 != null) return self.dflash2Draft(hidden, token);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
@@ -1515,6 +1782,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dspine != null) return self.dspineDraftGreedy(hidden, tok_gpu);
         if (self.dflash2 != null) return self.dflash2DraftGreedy(hidden, tok_gpu);
         const m = self.mtp.?;
         if (self.mtp_round_old_len == null) {
@@ -1534,6 +1802,12 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const box = try self.allocator.create(qwen38.Qwen38VerifyOut);
         errdefer self.allocator.destroy(box);
+        if (self.dspine) |m| {
+            var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&m.cfg.target_layer_ids);
+            errdefer tap.deinit();
+            box.* = try qwen38.forwardVerifyImpl(self.model, ids, &tap);
+            return box;
+        }
         if (self.dflash2 != null) {
             var tap = qwen38.Qwen38ServingModel.HiddenTap.init(&qwen38.Qwen38ServingModel.dflash2_tap_layer_ids);
             errdefer tap.deinit();
@@ -1774,6 +2048,7 @@ pub const Qwen38VTableAdapter = struct {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
+        if (self.dspine != null) return;
         if (self.dflash2 == null) return;
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         return self.dflash2Predraft(v);
@@ -1784,6 +2059,10 @@ pub const Qwen38VTableAdapter = struct {
         _ = pthread.pthread_mutex_lock(&self.mu);
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
+        if (self.dspine != null) {
+            self.dspineCommit(v, accepted);
+            return;
+        }
         if (self.dflash2 != null) {
             self.dflash2Commit(v, accepted);
             return;
@@ -1877,6 +2156,10 @@ pub const Qwen38VTableAdapter = struct {
         defer _ = pthread.pthread_mutex_unlock(&self.mu);
         const v: *qwen38.Qwen38VerifyOut = @ptrCast(@alignCast(handle));
         qwen38.rollbackVerify(self.model, v);
+        if (self.dspine != null) {
+            self.dspineClearBlock();
+            return;
+        }
         if (self.dflash2 != null) {
             // Context rows are only appended on commit, so a rollback needs
             // no drafter-side undo — just drop the round's draft block and
@@ -1900,6 +2183,7 @@ pub const Qwen38VTableAdapter = struct {
             self.df2_ctx.?.discardTentative();
         }
         self.dflash2ClearPending();
+        if (self.dspine != null) self.dspineClearBlock();
         v.deinit(self.allocator);
         self.allocator.destroy(v);
         self.mtp_round_old_len = null; // never leave stale round state
@@ -1907,6 +2191,14 @@ pub const Qwen38VTableAdapter = struct {
 
     fn deinitFn(ctx_ptr: *anyopaque, allocator: std.mem.Allocator) void {
         const self: *Qwen38VTableAdapter = @ptrCast(@alignCast(ctx_ptr));
+        if (self.dspine_cache_ids.len > 0) allocator.free(self.dspine_cache_ids);
+        if (self.dspine_cache_rows) |r| r.deinit();
+        if (self.dspine_table_host.len > 0) allocator.free(self.dspine_table_host);
+        if (self.dspine_ctx) |*cx| cx.deinit();
+        if (self.dspine) |m| {
+            m.deinit();
+            allocator.destroy(m);
+        }
         if (self.df2_cache_ids.len > 0) allocator.free(self.df2_cache_ids);
         if (self.df2_cache_rows) |r| r.deinit();
         if (self.df2_block_logits) |l| l.deinit();

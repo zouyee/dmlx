@@ -1,0 +1,13 @@
+pass1-A      warmup                 ttft=  7.87s decode=  25.6 n=8 finish=length wall=   8.1s
+pass1-A      think-off/short/r1     ttft=  1.61s decode=  31.7 n=256 finish=length wall=   9.6s
+pass1-A      think-off/short/r2     ttft=  0.13s decode=  38.5 n=256 finish=length wall=   6.7s
+pass1-A      think-off/mid-2k/r1    ttft= 15.63s decode=  27.5 n=256 finish=length wall=  24.9s
+pass1-A      think-off/mid-2k/r2    ttft=  0.16s decode=  36.1 n=256 finish=length wall=   7.2s
+pass1-A      think-off/long-8k/r1   ttft= 61.71s decode=  27.1 n=256 finish=length wall=  71.1s
+pass1-A      think-off/long-8k/r2   ttft=  0.29s decode=  24.8 n=256 finish=length wall=  10.6s
+pass1-A      think-on/short/r1      ttft=  1.47s decode=  33.7 n=256 finish=length wall=   9.0s
+pass1-A      think-on/short/r2      ttft=  0.13s decode=  33.2 n=256 finish=length wall=   7.8s
+pass1-A      think-on/mid-2k/r1     ttft= 15.62s decode=  36.1 n=256 finish=length wall=  22.7s
+pass1-A      think-on/mid-2k/r2     ttft=  0.16s decode=  40.7 n=256 finish=length wall=   6.4s
+pass1-A      think-on/long-8k/r1    ttft= 62.20s decode=  25.5 n=256 finish=length wall=  72.2s
+pass1-A      think-on/long-8k/r2    ttft=  0.29s decode=  26.8 n=256 finish=length wall=   9.8s

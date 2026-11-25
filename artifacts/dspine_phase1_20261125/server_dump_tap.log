@@ -1,0 +1,247 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:8094
+info: [ACCEPT] Connection accepted (accept took 895.6ms)
+info: [HTTP] Request received: 83 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 177.6ms)
+info: [HTTP] Request received: 445 bytes (read=0.0ms)
+[HTTP] Request received
+info: [Engine] Request 1 dequeued, queue_wait=2816068.7ms
+info: Qwen3.8 DSpine: loading block=8 drafter from /Users/zouyee/.cache/huggingface/hub/models--tencent--Qwen3.8-27B-DSpine-b16/snapshots/260a6c23070ca873ff1a5f33b7119ac3f6a245ee
+warning: Failed to cache index: error.StatFailed
+info: [verify-split] shape gate (d/h/hkv/l/kv_len)
+info: [warmup] skipping replay: 44548 tokens exceeds cap 8192 (DMLX_WARMUP_MAX_TOKENS)
+DSPINE target_hidden { 0.018798828, -0.057617188, 0.044677734, -0.048583984, -0.015136719, 0.059326172, 0.016479492, -0.07080078 }
+DSPINE context { 1.046875, -0.515625, -0.97265625, 0.94921875, -0.34179688, 0.6015625, 0.43554688, -0.18164062 }
+DSPINE hidden { 0.10888672, 4.90625, 3.890625, 0.9140625, -3.828125, 2.234375, -0.4453125, 2.46875 }
+DSPINE raw { -115, 876, 688, 198, -680, 308, -109, 338 }
+DSPINE fed=69 drafts={ 1144, 4087, 1156, 25, 328, 7734, 264 }
+DSPINE candidates={ 513, 599, 628, 1048, 1144, 1220, 1318, 1902, 2224, 2582, 2597, 3172, 4221, 5125, 14235, 46526, 264, 279, 310, 381, 1156, 1683, 1965, 3165, 3300, 4087, 5707, 7936, 9559, 18018, 34579, 38224, 25, 264, 279, 303, 310, 328, 440, 1156, 1534, 1965, 2570, 3165, 4087, 4145, 5707, 7936, 13, 25, 264, 279, 303, 310, 328, 364, 579, 1156, 1622, 2466, 4439, 6587, 9859, 16561, 13, 25, 264, 328, 579, 1156, 1622, 2570, 3165, 4145, 5952, 6163, 7734, 9357, 12654, 16561, 13, 25, 264, 328, 1622, 1835, 3165, 5328, 7734, 9357, 9947, 12654, 16561, 25337, 29292, 38013, 13, 25, 264, 279, 328, 449, 709, 1622, 2570, 3165, 7734, 9357, 9834, 12654, 14235, 29292 }
+info: fused GDN verify tail kernel active (d=128)
+info: [verify-split] engaged
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 175ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 0ms
+info: [Signal] waitForToken got id=4087 waited 0ms
+info: [Signal] waitForToken got id=1156 waited 0ms
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] waitForToken got id=328 waited 0ms
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] deliverToken id=7734 final=false took 0us
+info: [Signal] waitForToken got id=7734 waited 0ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=264 waited 0ms
+DSPINE hidden { -0.91796875, -1.5, 0.65234375, -3.71875, -4.5625, -0.80078125, 0.10644531, -0.51953125 }
+DSPINE raw { -67, -290, 98, -832, -836, -244, -74, -308 }
+DSPINE fed=77 drafts={ 709, 421, 15339, 449, 1897, 40, 2124 }
+DSPINE candidates={ 220, 264, 281, 523, 709, 999, 1156, 1957, 1970, 2821, 4416, 4536, 7291, 13618, 26959, 32295, 264, 364, 421, 440, 494, 709, 852, 864, 1040, 1076, 1092, 1301, 1649, 2423, 2512, 2844, 1301, 5055, 6526, 12361, 13514, 15339, 15818, 20269, 20539, 21780, 25791, 37780, 42272, 42812, 64376, 68434, 264, 279, 303, 449, 644, 836, 919, 1083, 1330, 1473, 2032, 2361, 2841, 4297, 7843, 35466, 220, 303, 318, 353, 669, 1897, 2032, 2089, 5025, 14007, 22780, 24874, 38834, 77263, 165111, 231243, 35, 40, 41, 42, 43, 46, 50, 56, 353, 669, 1897, 3742, 3793, 4842, 43559, 153084, 220, 272, 523, 999, 1581, 1716, 2124, 2144, 2263, 2446, 3443, 6302, 6343, 6576, 12901, 18455 }
+info: [Signal] deliverToken id=12654 final=false took 0us
+info: [Signal] waitForToken got id=12654 waited 6ms
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] deliverToken id=421 final=false took 0us
+info: [Signal] deliverToken id=15339 final=false took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+info: [Signal] waitForToken got id=421 waited 0ms
+info: [Signal] waitForToken got id=15339 waited 0ms
+info: [Signal] deliverToken id=449 final=false took 0us
+info: [Signal] waitForToken got id=449 waited 0ms
+info: [Signal] deliverToken id=1897 final=false took 0us
+info: [Signal] waitForToken got id=1897 waited 0ms
+info: [Signal] deliverToken id=40 final=false took 0us
+info: [Signal] waitForToken got id=40 waited 0ms
+info: [Signal] deliverToken id=2124 final=false took 0us
+info: [Signal] waitForToken got id=2124 waited 0ms
+DSPINE hidden { 3.65625, -0.99609375, -1.0390625, -0.9140625, -3.796875, 1.1171875, 1.4140625, -2.265625 }
+DSPINE raw { 860, -236, -312, -268, -720, 126, 300, -560 }
+DSPINE fed=85 drafts={ 20359, 321, 10033, 424, 25899, 1149, 14235 }
+DSPINE candidates={ 5902, 8361, 12222, 13733, 20359, 27517, 28488, 49305, 54488, 59661, 74949, 81204, 83309, 88239, 238380, 241295, 11, 13, 30, 220, 318, 321, 364, 440, 539, 1076, 1301, 1962, 2423, 3055, 3449, 7854, 321, 1048, 1179, 1406, 1732, 1910, 3184, 4087, 4123, 10033, 15673, 21019, 27228, 35932, 79091, 98682, 11, 220, 279, 303, 321, 364, 421, 424, 466, 488, 1092, 1141, 2414, 10033, 25899, 96540, 13, 264, 303, 424, 539, 1518, 6449, 7465, 9522, 9781, 13733, 15060, 19020, 25899, 32298, 57728, 13, 303, 364, 1144, 1149, 2725, 3559, 4221, 6889, 10033, 10801, 14235, 15673, 35688, 71391, 79091, 198, 271, 1144, 1165, 1987, 2302, 2570, 2725, 4222, 4543, 7936, 8722, 14235, 26472, 38256, 90410 }
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 2ms
+info: [Signal] deliverToken id=20359 final=false took 0us
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] deliverToken id=10033 final=false took 0us
+info: [Signal] waitForToken got id=20359 waited 0ms
+info: [Signal] waitForToken got id=321 waited 0ms
+info: [Signal] deliverToken id=424 final=false took 0us
+info: [Signal] waitForToken got id=10033 waited 0ms
+info: [Signal] waitForToken got id=424 waited 0ms
+info: [Signal] waitForToken got id=25899 waited 0ms
+info: [Signal] deliverToken id=25899 final=false took 0us
+info: [Signal] deliverToken id=1149 final=false took 0us
+info: [Signal] waitForToken got id=1149 waited 0ms
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE hidden { -1.6328125, -0.91015625, 2.015625, -1.2890625, -1.1953125, -1.609375, 0.8828125, -0.7421875 }
+DSPINE raw { -274, -130, 242, -322, -202, -280, 118, -167 }
+DSPINE fed=93 drafts={ 1970, 13, 14235, 1683, 883, 2124, 13 }
+DSPINE candidates={ 13, 264, 303, 709, 1534, 1957, 1970, 4222, 5148, 5902, 6093, 9834, 12654, 21094, 41643, 61446, 11, 13, 303, 321, 440, 709, 1534, 1608, 1970, 4222, 4507, 6970, 8106, 15673, 21094, 41643, 13, 321, 440, 709, 1165, 1534, 1608, 2725, 4222, 4543, 8722, 12654, 14235, 15673, 26472, 90410, 13, 381, 958, 1381, 1534, 1608, 1683, 2725, 2814, 4222, 4507, 4543, 6970, 7936, 10453, 14235, 13, 303, 883, 958, 1534, 1608, 1683, 2124, 2830, 4087, 4222, 4543, 6088, 6970, 10033, 14235, 13, 25, 303, 440, 883, 958, 1534, 1608, 1683, 2124, 2814, 2830, 4087, 4222, 6970, 14235, 11, 13, 25, 440, 883, 958, 1165, 1534, 1608, 1683, 2124, 2830, 4087, 4222, 6970, 14235 }
+info: [Signal] deliverToken id=3300 final=false took 0us
+info: [Signal] waitForToken got id=3300 waited 2ms
+info: [Signal] deliverToken id=1970 final=false took 0us
+info: [Signal] waitForToken got id=1970 waited 0ms
+DSPINE hidden { -1, 0.13085938, 0.14453125, -0.14453125, -0.18554688, -0.75390625, 0.021606445, -1.5234375 }
+DSPINE raw { -211, 60.5, -28, -33, -64, -207, -34, -420 }
+DSPINE fed=95 drafts={ 15673, 13, 14235, 4222, 4123, 2124, 13 }
+DSPINE candidates={ 709, 2716, 3841, 4145, 7465, 9522, 10033, 10121, 15673, 22134, 25899, 39492, 61446, 83081, 89274, 95225, 11, 13, 292, 303, 362, 709, 1381, 1534, 4222, 9522, 10033, 15673, 25899, 34700, 61446, 95225, 11, 13, 303, 1165, 1381, 1534, 1683, 2725, 4222, 4543, 8722, 14235, 15011, 20500, 26472, 90410, 13, 381, 1165, 1381, 1534, 1683, 2725, 4222, 4543, 5272, 6970, 12650, 14235, 20500, 26472, 90410, 13, 303, 883, 958, 1132, 1534, 1683, 2814, 2830, 4087, 4123, 4222, 6088, 6970, 10453, 14235, 13, 303, 883, 958, 1132, 1534, 1608, 1683, 2124, 4087, 4222, 6163, 10453, 12654, 14235, 21094, 13, 25, 709, 883, 958, 1165, 1534, 1608, 1683, 2124, 2814, 4222, 5272, 6970, 14235, 21094 }
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] waitForToken got id=321 waited 2ms
+info: [Signal] deliverToken id=15673 final=false took 0us
+info: [Signal] waitForToken got id=15673 waited 0ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=14235 waited 0ms
+info: [Signal] deliverToken id=4222 final=false took 0us
+info: [Signal] waitForToken got id=4222 waited 0ms
+DSPINE hidden { 2.40625, -0.13964844, 3.8125, 0.038085938, -0.9140625, -0.71484375, -1.671875, -0.27734375 }
+DSPINE raw { 512, -22, 728, -3, -204, -125, -354, -73 }
+DSPINE fed=100 drafts={ 94076, 10437, 6363, 11, 1301, 2124, 11 }
+DSPINE candidates={ 1407, 1510, 2124, 2556, 5359, 5902, 9834, 11426, 12654, 12901, 16314, 21628, 23336, 51372, 52975, 94076, 11, 13, 30, 321, 466, 707, 1794, 4536, 5169, 5254, 9369, 9779, 10437, 24802, 37547, 94076, 11, 13, 30, 303, 310, 321, 440, 466, 733, 1301, 1643, 1897, 4536, 6363, 9369, 14235, 11, 13, 30, 328, 466, 694, 733, 1301, 3579, 3644, 4536, 5902, 6970, 14235, 20359, 21094, 11, 13, 25, 30, 328, 466, 709, 1301, 2124, 3579, 3644, 5902, 6925, 14235, 20359, 21094, 11, 13, 25, 30, 709, 1301, 1897, 2124, 3579, 3644, 5902, 7167, 11256, 14235, 20359, 21094, 11, 13, 25, 30, 709, 1301, 1897, 2124, 3579, 3644, 6970, 7167, 11256, 14235, 15339, 20359 }
+info: [Signal] deliverToken id=958 final=false took 0us
+info: [Signal] waitForToken got id=958 waited 2ms
+info: [Signal] deliverToken id=94076 final=false took 0us
+info: [Signal] waitForToken got id=94076 waited 0ms
+DSPINE hidden { -1.3984375, -0.51171875, 0.703125, 0.5390625, -2.015625, 2.203125, 1.0546875, -0.57421875 }
+DSPINE raw { -302, -41, 97.5, 94, -508, 432, 228, -219 }
+DSPINE fed=102 drafts={ 14235, 5902, 25, 7167, 3644, 11, 7167 }
+DSPINE candidates={ 328, 733, 1165, 4310, 4734, 5534, 11910, 12222, 12654, 13365, 14235, 15011, 15388, 18139, 20495, 21600, 25, 328, 709, 851, 1301, 3579, 5902, 6088, 6925, 6970, 11256, 13081, 15339, 20359, 21094, 53269, 1, 25, 709, 1301, 1897, 2124, 3579, 3644, 5122, 5902, 6925, 6970, 11256, 13081, 15339, 20359, 1, 11, 25, 709, 763, 999, 1301, 1897, 2124, 3254, 3579, 3644, 6970, 7167, 11256, 13081, 1, 11, 25, 460, 999, 1301, 1362, 2124, 3254, 3579, 3644, 4523, 6970, 7167, 11256, 13081, 11, 13, 25, 30, 460, 999, 1301, 1897, 2124, 3579, 3644, 3768, 6970, 7167, 9801, 11256, 11, 13, 25, 30, 460, 466, 999, 1301, 2124, 3579, 3644, 4523, 6970, 7167, 9801, 11256 }
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 2ms
+DSPINE hidden { -2.78125, -0.14160156, 2.296875, -0.59375, 0.40625, 0.21875, 0.29882812, 2.859375 }
+DSPINE raw { -524, -39.5, 430, -192, 59, -65, 17.75, 506 }
+DSPINE fed=103 drafts={ 25, 3579, 7167, 3644, 11, 3579, 7167 }
+DSPINE candidates={ 25, 30, 283, 709, 1301, 2528, 3254, 5122, 5313, 6970, 7063, 7465, 11256, 13081, 15339, 31128, 25, 460, 709, 874, 958, 1301, 1716, 2213, 3254, 3579, 3644, 4563, 5471, 7167, 11256, 13081, 11, 25, 460, 524, 958, 999, 1301, 1716, 3579, 3644, 3768, 4563, 7167, 9307, 13081, 13486, 11, 25, 999, 1328, 1752, 2124, 3579, 3644, 3768, 6513, 7167, 13486, 13753, 34094, 83934, 92527, 11, 14, 25, 30, 460, 466, 524, 958, 999, 1328, 2905, 3579, 3644, 6513, 6970, 7167, 11, 30, 460, 466, 524, 958, 999, 1328, 1581, 3579, 3644, 5471, 6970, 7167, 9801, 16184, 11, 14, 30, 460, 466, 958, 999, 1328, 1581, 3579, 3644, 6970, 7167, 9801, 13753, 16184 }
+info: [Signal] deliverToken id=21600 final=false took 0us
+info: [Signal] waitForToken got id=21600 waited 2ms
+DSPINE hidden { -1.9765625, 0.8203125, 0.921875, -1.3359375, -0.96875, 0.5546875, -0.6171875, 2.03125 }
+DSPINE raw { -440, 151, 140, -352, -190, 105, -218, 314 }
+DSPINE fed=104 drafts={ 25, 3579, 7167, 13753, 11, 3579, 7167 }
+DSPINE candidates={ 11, 25, 30, 314, 494, 628, 709, 1220, 1362, 3254, 3644, 4222, 5469, 6970, 7063, 13081, 460, 958, 999, 1301, 1459, 1716, 2070, 3579, 4563, 5471, 6970, 7167, 9307, 9738, 11256, 13081, 11, 999, 2124, 3425, 3644, 5787, 7167, 13753, 14953, 16184, 18987, 34094, 36834, 39109, 83934, 92527, 11, 14, 30, 321, 413, 460, 999, 2905, 3425, 3644, 5787, 6513, 6679, 6970, 7167, 13753, 11, 14, 30, 460, 874, 958, 999, 1581, 3579, 3644, 5471, 6970, 7167, 9801, 16184, 34094, 11, 30, 460, 958, 1581, 3579, 3644, 5787, 6970, 7167, 9801, 11256, 16184, 18987, 34094, 36834, 11, 13, 14, 30, 460, 958, 1581, 3579, 3644, 5787, 6970, 7167, 9801, 11256, 13753, 16184 }
+info: [Signal] deliverToken id=5122 final=false took 0us
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=5122 waited 2ms
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] waitForToken got id=3579 waited 0ms
+info: [Signal] waitForToken got id=7167 waited 0ms
+DSPINE hidden { 1.625, 1.234375, 0.8359375, -3.0625, 0.9921875, -0.59765625, -0.30273438, -1.6328125 }
+DSPINE raw { 446, 276, 55.5, -808, 242, -250, -90, -460 }
+DSPINE fed=108 drafts={ 11, 7167, 3644, 11, 8060, 2663, 11 }
+DSPINE candidates={ 11, 14, 30, 2805, 3082, 3336, 6454, 7294, 9325, 17458, 23156, 46070, 46577, 57573, 62238, 83782, 11, 14, 874, 2720, 2904, 3644, 4147, 4531, 5787, 7167, 7634, 8060, 8279, 18987, 29617, 76531, 11, 14, 30, 874, 1328, 2124, 2519, 2720, 2904, 3644, 5787, 6679, 7167, 8060, 13753, 16184, 11, 13, 14, 30, 874, 913, 3644, 4147, 5787, 6970, 7167, 7634, 8060, 8279, 9801, 18987, 11, 13, 30, 874, 1581, 2397, 4147, 4831, 5272, 5787, 6970, 7167, 7634, 8060, 9801, 18987, 11, 13, 30, 460, 1581, 2397, 2663, 4831, 5272, 5787, 6970, 8060, 9801, 10380, 16018, 18987, 11, 13, 30, 460, 958, 1165, 1581, 4831, 5272, 5787, 6970, 8060, 9801, 10380, 14235, 16018 }
+info: [Signal] deliverToken id=999 final=false took 0us
+info: [Signal] waitForToken got id=999 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=7167 waited 0ms
+info: [Signal] waitForToken got id=3644 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+DSPINE hidden { 0.27539062, 2.109375, 1.421875, -0.5390625, 0.62890625, -0.3125, -0.38476562, 1.3671875 }
+DSPINE raw { 198, 500, 276, -276, 110.5, -107, -129, 218 }
+DSPINE fed=113 drafts={ 5787, 11, 6970, 958, 16184, 13, 16018 }
+DSPINE candidates={ 14, 30, 1401, 1412, 2519, 2663, 4562, 4842, 5433, 5787, 7652, 18420, 18987, 19583, 26946, 35282, 11, 13, 14, 26, 30, 440, 460, 2519, 2663, 4831, 5272, 5787, 6970, 7167, 10380, 20359, 11, 30, 460, 958, 1581, 2519, 5272, 5787, 6970, 7167, 8060, 9801, 10380, 16018, 16184, 18987, 11, 13, 30, 440, 460, 958, 1581, 2070, 2519, 2663, 4673, 5272, 5787, 6970, 16184, 21094, 11, 13, 30, 440, 460, 1301, 1581, 5272, 6970, 7167, 9801, 10380, 14235, 16018, 16184, 21094, 11, 13, 30, 440, 460, 466, 709, 1165, 1581, 5272, 6970, 10380, 14235, 16018, 21094, 38256, 11, 13, 30, 440, 460, 466, 709, 1165, 1301, 3644, 6970, 10380, 14235, 16018, 21094, 38256 }
+info: [Signal] deliverToken id=4563 final=false took 0us
+info: [Signal] waitForToken got id=4563 waited 2ms
+info: [Signal] deliverToken id=5787 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] deliverToken id=6970 final=false took 0us
+info: [Signal] waitForToken got id=5787 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=6970 waited 0ms
+DSPINE hidden { -1.6015625, 0.26953125, 1.984375, 0.890625, -1.8125, -0.68359375, -0.11035156, 1.3984375 }
+DSPINE raw { -336, 14, 368, 78, -432, -108, -154, 258 }
+DSPINE fed=117 drafts={ 16184, 13, 14235, 21094, 709, 13, 14235 }
+DSPINE candidates={ 869, 1301, 1581, 2168, 2663, 3439, 3644, 4147, 6249, 6891, 7167, 9801, 13753, 16184, 30917, 31686, 11, 13, 14, 30, 321, 364, 413, 440, 466, 869, 2663, 5972, 6249, 6679, 8796, 16184, 11, 13, 30, 321, 328, 466, 1165, 1581, 5272, 6558, 6679, 6970, 7077, 14235, 16018, 38256, 11, 13, 30, 328, 460, 466, 709, 958, 1165, 1301, 3165, 6970, 7077, 14235, 16018, 21094, 11, 13, 25, 30, 440, 709, 1165, 1301, 3165, 5272, 5534, 6970, 14235, 16018, 21094, 38256, 11, 13, 25, 30, 440, 709, 1165, 1301, 3165, 3644, 5272, 5534, 6970, 14235, 16018, 21094, 11, 13, 25, 30, 440, 709, 1165, 1301, 3165, 3644, 4523, 5902, 6970, 14235, 16018, 21094 }
+info: [Signal] deliverToken id=460 final=false took 0us
+info: [Signal] waitForToken got id=460 waited 2ms
+DSPINE hidden { -3.03125, 2.375, -0.33789062, 0.32617188, -0.07910156, -0.24316406, 1.8984375, -1.3203125 }
+DSPINE raw { -728, 508, -172, 6, 45, -157, 358, -404 }
+DSPINE fed=118 drafts={ 466, 4147, 13, 14235, 6970, 6088, 709 }
+DSPINE candidates={ 11, 13, 14, 30, 314, 364, 413, 430, 440, 466, 494, 1581, 4147, 16184, 28042, 93641, 13, 466, 1165, 1581, 2168, 2519, 2663, 3644, 4147, 4673, 6249, 9801, 11906, 14235, 16018, 16184, 11, 13, 30, 440, 466, 709, 2168, 2663, 3644, 4147, 5902, 6088, 6249, 6679, 6970, 14235, 11, 13, 30, 328, 466, 709, 733, 1165, 5272, 6558, 6970, 12654, 14235, 16018, 28763, 38256, 13, 30, 328, 381, 709, 958, 1165, 2830, 3165, 6088, 6970, 10033, 12654, 14235, 16018, 21094, 13, 25, 30, 328, 381, 709, 958, 1165, 2830, 3165, 5902, 6088, 6970, 14235, 16018, 21094, 11, 13, 25, 30, 328, 440, 709, 1165, 1301, 3644, 5902, 6088, 6970, 14235, 16018, 21094 }
+info: [Signal] deliverToken id=6249 final=false took 0us
+info: [Signal] waitForToken got id=6249 waited 2ms
+DSPINE hidden { -0.44140625, -0.53515625, 1.359375, 0.69921875, -0.984375, 0.23144531, 1.8125, -0.86328125 }
+DSPINE raw { -55.5, -40.5, 198, 116.5, -210, -21, 312, -228 }
+DSPINE fed=119 drafts={ 16018, 6088, 12654, 709, 13, 14235, 6970 }
+DSPINE candidates={ 328, 733, 1165, 5272, 5534, 6558, 7054, 8439, 10380, 11910, 12654, 14235, 16018, 20495, 28763, 38256, 381, 709, 958, 1534, 2814, 2830, 3165, 3300, 4123, 6088, 6762, 6970, 10033, 12654, 21094, 61446, 13, 25, 303, 440, 709, 913, 958, 1301, 1534, 2124, 3010, 5902, 6088, 12654, 21094, 61446, 11, 13, 25, 30, 271, 321, 440, 466, 709, 1301, 2124, 3644, 5272, 6970, 14235, 16018, 11, 13, 25, 30, 271, 321, 440, 466, 709, 1165, 1301, 3644, 6088, 6970, 14235, 16018, 11, 13, 25, 30, 321, 440, 466, 709, 1301, 1534, 2830, 3644, 6088, 6970, 14235, 16018, 11, 13, 25, 30, 440, 466, 709, 1301, 1534, 2830, 3644, 6088, 6970, 14235, 16018, 21094 }
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 2ms
+info: [Signal] deliverToken id=16018 final=false took 0us
+info: [Signal] waitForToken got id=16018 waited 0ms
+DSPINE hidden { 0.17382812, 0.60546875, 5.1875, -0.8828125, -2.265625, -1.0234375, 0.34570312, -0.84765625 }
+DSPINE raw { 55.75, 116, 832, -215, -326, -189, 9.25, -183 }
+DSPINE fed=121 drafts={ 709, 440, 709, 13, 14235, 1534, 440 }
+DSPINE candidates={ 494, 709, 913, 1301, 1380, 1581, 1608, 3010, 6891, 7077, 9801, 9989, 10121, 16184, 21094, 31686, 11, 13, 25, 30, 310, 321, 421, 440, 466, 615, 709, 1301, 5902, 7077, 51105, 53269, 11, 13, 25, 30, 321, 440, 466, 709, 1165, 1301, 3644, 6558, 14235, 15743, 22916, 28320, 11, 13, 30, 381, 466, 1165, 1301, 1534, 1897, 3644, 5790, 6088, 6970, 14235, 15743, 21094, 11, 13, 25, 30, 303, 381, 440, 709, 1534, 1897, 3644, 6088, 6970, 14235, 21094, 61446, 11, 13, 25, 30, 303, 381, 440, 694, 709, 1534, 3644, 6088, 6970, 14235, 21094, 61446, 11, 13, 25, 30, 271, 440, 694, 709, 1534, 3644, 6088, 6970, 14235, 21094, 28320, 61446 }
+info: [Signal] deliverToken id=2830 final=false took 0us
+info: [Signal] waitForToken got id=2830 waited 2ms
+DSPINE hidden { -1.1171875, 3.390625, 2.203125, -0.86328125, -1.9375, -1.8828125, 0.32421875, -0.42382812 }
+DSPINE raw { -132, 728, 448, -284, -326, -472, -29, -142 }
+DSPINE fed=122 drafts={ 29642, 13, 14235, 6970, 6088, 709, 13 }
+DSPINE candidates={ 11, 13, 28, 30, 1716, 11256, 11988, 12910, 13996, 15462, 16184, 21621, 29642, 31144, 31686, 39049, 11, 13, 14, 25, 30, 82, 321, 440, 466, 494, 592, 1581, 6558, 9801, 11906, 14235, 709, 1165, 1581, 5272, 5534, 6558, 6970, 7054, 10380, 11910, 12996, 14235, 28320, 31686, 38256, 82210, 13, 303, 381, 524, 709, 1534, 1683, 3165, 4222, 5790, 6088, 6970, 8106, 10033, 21094, 61446, 11, 13, 25, 30, 303, 440, 694, 709, 1534, 4087, 6088, 6970, 14235, 16908, 21094, 61446, 13, 25, 30, 271, 440, 694, 709, 1165, 1534, 6088, 6970, 10380, 14235, 16908, 28320, 61446, 13, 25, 30, 271, 440, 694, 709, 1165, 1534, 6088, 6970, 12650, 14235, 16908, 28320, 61446 }
+info: [Signal] deliverToken id=913 final=false took 0us
+info: [Signal] waitForToken got id=913 waited 2ms
+info: [Signal] deliverToken id=29642 final=false took 0us
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=29642 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE hidden { 0.46679688, -0.921875, 1.828125, -0.79296875, -1.2109375, -0.68359375, 0.3046875, 0.4765625 }
+DSPINE raw { 119.5, -338, 388, -138, -300, -300, 73.5, 110.5 }
+DSPINE fed=126 drafts={ 61446, 694, 16908, 13, 28320, 709, 13 }
+DSPINE candidates={ 13, 303, 440, 524, 694, 1132, 1965, 4087, 4222, 6970, 9522, 10631, 11346, 16908, 61446, 95225, 11, 13, 440, 694, 1132, 2166, 3213, 3482, 4087, 6163, 9522, 11346, 15673, 16908, 28320, 61446, 13, 198, 271, 694, 3213, 4434, 5222, 9522, 10631, 11346, 13262, 14235, 15673, 16908, 28320, 61446, 13, 381, 524, 694, 709, 874, 3213, 6088, 6970, 9522, 14235, 15673, 16908, 21094, 28320, 61446, 13, 198, 271, 328, 694, 709, 888, 1165, 2166, 6088, 6558, 6970, 10380, 14235, 28320, 82210, 13, 25, 198, 271, 328, 709, 2166, 2814, 5902, 6088, 6970, 10453, 14235, 21094, 28320, 248069, 13, 25, 198, 271, 328, 709, 1683, 2814, 6088, 6558, 6970, 10453, 14235, 16018, 21094, 248069 }
+info: [Signal] deliverToken id=1534 final=false took 0us
+info: [Signal] waitForToken got id=1534 waited 2ms
+info: [Signal] deliverToken id=61446 final=false took 0us
+info: [Signal] deliverToken id=694 final=false took 0us
+info: [Signal] waitForToken got id=61446 waited 0ms
+info: [Signal] waitForToken got id=694 waited 0ms
+DSPINE hidden { -0.18359375, 2, 3.109375, -1.015625, -0.68359375, 0.88671875, 2.453125, -1.03125 }
+DSPINE raw { -5.5, 432, 380, -212, -145, 8, 400, -404 }
+DSPINE fed=129 drafts={ 13, 28320, 709, 25, 271, 1628, 1301 }
+DSPINE candidates={ 13, 30, 318, 440, 553, 1710, 3213, 3447, 4434, 6970, 7472, 9522, 10033, 11346, 15673, 16908, 198, 271, 1165, 2233, 4543, 5272, 6558, 7054, 10380, 14235, 16018, 20495, 20500, 28320, 28763, 82210, 25, 328, 524, 579, 709, 874, 1144, 1534, 1683, 2814, 5790, 6088, 6970, 12654, 22916, 248069, 13, 25, 271, 303, 328, 709, 883, 1683, 2814, 5902, 6088, 6970, 10453, 12654, 19255, 21094, 13, 25, 271, 303, 328, 413, 709, 883, 1608, 6088, 6925, 10453, 12654, 19255, 21094, 71093, 13, 25, 30, 198, 271, 440, 709, 1608, 1628, 2124, 5272, 6558, 10380, 16018, 21094, 248069, 13, 25, 198, 271, 709, 999, 1165, 1301, 2124, 5272, 6558, 6970, 10380, 16018, 94076, 248069 }
+info: [Signal] deliverToken id=3213 final=false took 0us
+info: [Signal] waitForToken got id=3213 waited 2ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 0ms
+DSPINE hidden { -2.03125, -1.1484375, 0.90625, -0.0134887695, -4.90625, -0.3984375, 1.3984375, -0.71484375 }
+DSPINE raw { -318, -138, 145, -46.5, -876, -139, 286, -212 }
+DSPINE fed=131 drafts={ 22916, 1683, 883, 328, 1628, 1301, 94076 }
+DSPINE candidates={ 1165, 1421, 1596, 4987, 6065, 9764, 14162, 14235, 19846, 19860, 22916, 29292, 35944, 37405, 48401, 92306, 25, 381, 579, 1144, 1534, 1683, 2790, 2814, 5790, 6088, 6970, 7936, 8106, 9973, 10453, 25705, 25, 303, 314, 328, 413, 709, 883, 1092, 1472, 1534, 1683, 1786, 6088, 6970, 10453, 12654, 13, 25, 328, 709, 781, 866, 883, 1156, 1534, 1628, 1786, 3481, 4087, 4581, 12654, 21094, 13, 25, 198, 303, 328, 440, 709, 1301, 1608, 1628, 4087, 6970, 12654, 16561, 21094, 23535, 1, 13, 25, 198, 271, 328, 695, 709, 733, 1301, 1628, 2124, 5272, 10380, 12654, 94076, 1, 13, 25, 198, 271, 328, 464, 709, 727, 1301, 1628, 2124, 5359, 5902, 12654, 94076 }
+info: [Signal] deliverToken id=271 final=false took 0us
+info: [Signal] waitForToken got id=271 waited 2ms
+info: [Engine] MTP depth N=1:1r/51.9ms/tok(E[t]=1.67) N=2:1r/42.3ms/tok(E[t]=2.07) N=3:2r/42.3ms/tok(E[t]=2.34) N=4:1r/43.8ms/tok(E[t]=2.46) N=5:2r/42.9ms/tok(E[t]=2.52) N=6:1r/43.0ms/tok(E[t]=2.56) N=7:10r/41.5ms/tok(E[t]=2.58)
+info: [Engine] MTP cond-acceptance p1=0.704(~6.0/8.5) p2=0.638(~3.8/6.0) p3=0.764(~2.9/3.8) p4=0.426(~1.2/2.9) p5=0.449(~0.6/1.2) p6=1.000(~0.6/0.6) p7=1.000(~0.6/0.6)
+info: [Engine] MTP request 1: acceptance 45.0% (45/100 drafts); ms/round draft=94.7 verify=151.2 accept=41.3 commit=0.2
+info: [Signal] deliverToken id=22916 final=true took 0us
+info: [Signal] waitForToken got id=22916 waited 0ms
+info: [RequestLog] id=1 model=m streaming=true prompt_tokens=69 generated_tokens=64 duration_ms=9302.10 tokens_per_sec=6.88
+info: [HTTP] Handler lifetime: 9306.0ms
+info: [HTTP] Connection lifetime: 9306.1ms
+info: [Engine] Shutdown requested
+info: [Engine] Engine loop exiting
+info: Engine stopped, initiating graceful shutdown...
+info: All in-flight requests completed.
+info: Shutting down, cleaning up resources...
+info: [Engine] Shutdown requested
+info: Shutdown complete.

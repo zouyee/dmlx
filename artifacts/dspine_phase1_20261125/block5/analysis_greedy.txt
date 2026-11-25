@@ -1,0 +1,6 @@
+think-off/short        block5=37.2 block8=41.7 delta=+12.1%
+think-off/mid-2k       block5=38.4 block8=42.4 delta=+10.4%
+think-off/long-8k      block5=33.0 block8=36.4 delta=+10.3%
+think-on/short         block5=37.9 block8=42.3 delta=+11.6%
+think-on/mid-2k        block5=38.2 block8=39.9 delta=+4.5%
+think-on/long-8k       block5=33.5 block8=35.3 delta=+5.4%

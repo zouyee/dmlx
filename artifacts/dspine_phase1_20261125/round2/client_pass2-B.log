@@ -1,0 +1,13 @@
+pass2-B      warmup                 ttft=  6.26s decode=   3.3 n=8 finish=length wall=   8.4s
+pass2-B      think-off/short/r1     ttft=  1.63s decode=  37.5 n=256 finish=length wall=   8.4s
+pass2-B      think-off/short/r2     ttft=  0.12s decode=  44.6 n=256 finish=length wall=   5.8s
+pass2-B      think-off/mid-2k/r1    ttft= 15.60s decode=  34.4 n=256 finish=length wall=  23.0s
+pass2-B      think-off/mid-2k/r2    ttft=  0.18s decode=  32.9 n=256 finish=length wall=   7.9s
+pass2-B      think-off/long-8k/r1   ttft= 68.64s decode=  34.3 n=256 finish=length wall=  76.1s
+pass2-B      think-off/long-8k/r2   ttft=  0.30s decode=  31.4 n=256 finish=length wall=   8.4s
+pass2-B      think-on/short/r1      ttft=  1.46s decode=  37.4 n=256 finish=length wall=   8.3s
+pass2-B      think-on/short/r2      ttft=  0.11s decode=  42.4 n=256 finish=length wall=   6.1s
+pass2-B      think-on/mid-2k/r1     ttft= 15.68s decode=  35.7 n=256 finish=length wall=  22.8s
+pass2-B      think-on/mid-2k/r2     ttft=  0.16s decode=  28.5 n=256 finish=length wall=   9.1s
+pass2-B      think-on/long-8k/r1    ttft= 65.47s decode=  36.7 n=256 finish=length wall=  72.4s
+pass2-B      think-on/long-8k/r2    ttft=  0.28s decode=  28.8 n=256 finish=length wall=   9.1s

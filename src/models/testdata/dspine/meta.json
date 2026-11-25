@@ -1,0 +1,28 @@
+{
+  "architectures": ["DSpineDraftModel"],
+  "block_size": 16,
+  "code_bridge_second_pass": {"first_exact": 4, "head_topk": 16, "mode": "serial_table"},
+  "dflash_config": {
+    "draft_block_causal": true,
+    "mask_token_id": 248070,
+    "selected_prefix_code_bridge": {"code_size": 1024, "eps": 1e-6, "rank": 512},
+    "selected_prefix_decode_mode": "serial",
+    "selected_prefix_feature_layers": [1, 2, 3, 4, 5],
+    "selected_prefix_feature_write_mode": "independent",
+    "selected_prefix_feature_writes": true,
+    "selected_prefix_terminal": false,
+    "target_layer_ids": [1, 16, 31, 46, 61]
+  },
+  "head_dim": 128,
+  "hidden_size": 5120,
+  "intermediate_size": 17408,
+  "num_attention_heads": 32,
+  "num_hidden_layers": 5,
+  "num_key_value_heads": 8,
+  "num_target_layers": 64,
+  "rms_norm_eps": 1e-6,
+  "rope_parameters": {"rope_theta": 10000000, "rope_type": "default"},
+  "sliding_window": 8192,
+  "use_sliding_window": true,
+  "vocab_size": 248320
+}

@@ -1,0 +1,6 @@
+think-off/short        A=42.9 B=40.8 delta=-4.9%
+think-off/mid-2k       A=43.7 B=40.8 delta=-6.6%
+think-off/long-8k      A=35.9 B=33.6 delta=-6.4%
+think-on/short         A=40.9 B=39.5 delta=-3.4%
+think-on/mid-2k        A=36.1 B=40.3 delta=+11.6%
+think-on/long-8k       A=27.8 B=25.2 delta=-9.4%

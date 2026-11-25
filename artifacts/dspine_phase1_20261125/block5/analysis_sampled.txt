@@ -1,0 +1,31 @@
+== client decode tok/s (median n=4 [min-max]) ==
+think-off/short        A= 34.30 [25.10-38.50] B= 40.10 [38.70-46.20] delta= +16.9%
+think-off/mid-2k       A= 36.20 [27.50-37.70] B= 39.65 [35.50-43.70] delta=  +9.5%
+think-off/long-8k      A= 25.95 [21.40-28.70] B= 33.10 [31.30-35.50] delta= +27.6%
+think-on/short         A= 35.45 [33.20-38.40] B= 37.20 [32.20-44.30] delta=  +4.9%
+think-on/mid-2k        A= 34.00 [26.80-40.70] B= 41.60 [38.00-42.70] delta= +22.4%
+think-on/long-8k       A= 26.85 [25.50-29.70] B= 35.65 [31.80-38.20] delta= +32.8%
+
+== output comparability ==
+think-off/short        A: n=[256, 256, 256, 256] finish={'length': 4}
+think-off/short        B: n=[256, 256, 256, 256] finish={'length': 4}
+think-off/mid-2k       A: n=[256, 256, 256, 256] finish={'length': 4}
+think-off/mid-2k       B: n=[256, 256, 256, 256] finish={'length': 4}
+think-off/long-8k      A: n=[256, 256, 256, 256] finish={'length': 4}
+think-off/long-8k      B: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/short         A: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/short         B: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/mid-2k        A: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/mid-2k        B: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/long-8k       A: n=[256, 256, 256, 256] finish={'length': 4}
+think-on/long-8k       B: n=[256, 256, 256, 256] finish={'length': 4}
+
+== server mechanism (request medians) ==
+pass1-A (DSpine5): requests=13 accept%=43.0 E[t]=2.73 draft_ms=22.4 verify_ms=68.3 accept_ms=21.2
+  memory: 8118 384160 472969600 (RSS KiB)
+pass2-A (DSpine5): requests=13 accept%=41.7 E[t]=2.72 draft_ms=21.8 verify_ms=73.2 accept_ms=23.3
+  memory: 16172 841392 472950768 (RSS KiB)
+pass1-B (DSpine8): requests=13 accept%=38.6 E[t]=2.83 draft_ms=15.8 verify_ms=68.9 accept_ms=21.0
+  memory: 10889 6324928 474142128 (RSS KiB)
+pass2-B (DSpine8): requests=13 accept%=42.6 E[t]=3.07 draft_ms=16.9 verify_ms=72.9 accept_ms=22.0
+  memory: 13436 159472 472969040 (RSS KiB)

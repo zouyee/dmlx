@@ -1,0 +1,500 @@
+info: Detected architecture: Qwen3_5ForConditionalGeneration
+warning: 'Qwen3_5ForConditionalGeneration' is not supported by the native engine — falling back to legacy MLX path
+info: Loaded index from cache (2180 entries, 3ms)
+info: Qwen3.8 weights resident: 1847 tensors
+info: compiled GDN decode step active
+info: compiled MLP swiglu core active
+info: compiled fused MLP gate_up+swiglu core active
+info: compiled attention pre-cache segment active
+info: Model loaded: Qwen3_5ForConditionalGeneration (64 layers, 1 kv_heads, 256 head_dim, max_seq=8192)
+info: Signal handlers installed (SIGTERM, SIGINT)
+info: MLX (legacy) mode: starting MLX engine loop
+info: [Engine] Engine loop started
+info: DMLX server listening on http://0.0.0.0:8094
+info: [ACCEPT] Connection accepted (accept took 1696.0ms)
+info: [HTTP] Request received: 83 bytes (read=0.0ms)
+[HTTP] Request received
+info: [HTTP] Handler lifetime: 0.1ms
+info: [HTTP] Connection lifetime: 0.1ms
+info: [ACCEPT] Connection accepted (accept took 92.0ms)
+info: [HTTP] Request received: 472 bytes (read=0.0ms)
+[HTTP] Request received
+info: [Engine] Request 1 dequeued, queue_wait=2862281.9ms
+info: Qwen3.8 DSpine: loading block=8 drafter from /Users/zouyee/.cache/huggingface/hub/models--tencent--Qwen3.8-27B-DSpine-b16/snapshots/260a6c23070ca873ff1a5f33b7119ac3f6a245ee
+warning: Failed to cache index: error.StatFailed
+info: [warmup] skipping replay: 44548 tokens exceeds cap 8192 (DMLX_WARMUP_MAX_TOKENS)
+info: [verify-split] shape gate (d/h/hkv/l/kv_len)
+DSPINE prof fwd=753.72 head=10.01 topk=5.23 refine=4.13 total=773.10ms
+info: fused GDN verify tail kernel active (d=128)
+info: [verify-split] engaged
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 212ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] deliverToken id=7734 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 0ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=4087 waited 0ms
+info: [Signal] waitForToken got id=1156 waited 0ms
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] waitForToken got id=328 waited 0ms
+info: [Signal] waitForToken got id=7734 waited 0ms
+info: [Signal] waitForToken got id=264 waited 0ms
+DSPINE prof fwd=1314.87 head=39.48 topk=4.66 refine=5.44 total=1364.45ms
+info: [Signal] deliverToken id=12654 final=false took 0us
+info: [Signal] waitForToken got id=12654 waited 80ms
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] deliverToken id=421 final=false took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+info: [Signal] waitForToken got id=421 waited 0ms
+info: [Signal] waitForToken got id=15339 waited 0ms
+info: [Signal] deliverToken id=15339 final=false took 0us
+info: [Signal] deliverToken id=449 final=false took 0us
+info: [Signal] waitForToken got id=449 waited 0ms
+info: [Signal] deliverToken id=1897 final=false took 0us
+info: [Signal] waitForToken got id=1897 waited 0ms
+info: [Signal] deliverToken id=40 final=false took 0us
+info: [Signal] waitForToken got id=40 waited 0ms
+info: [Signal] deliverToken id=2124 final=false took 0us
+info: [Signal] waitForToken got id=2124 waited 0ms
+DSPINE prof fwd=54.40 head=5.37 topk=1.84 refine=2.82 total=64.43ms
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 6ms
+info: [Signal] deliverToken id=20359 final=false took 0us
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] deliverToken id=10033 final=false took 0us
+info: [Signal] waitForToken got id=20359 waited 0ms
+info: [Signal] waitForToken got id=321 waited 0ms
+info: [Signal] waitForToken got id=10033 waited 0ms
+info: [Signal] waitForToken got id=424 waited 0ms
+info: [Signal] deliverToken id=424 final=false took 0us
+info: [Signal] deliverToken id=25899 final=false took 0us
+info: [Signal] waitForToken got id=25899 waited 0ms
+info: [Signal] deliverToken id=1149 final=false took 0us
+info: [Signal] waitForToken got id=1149 waited 0ms
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE prof fwd=11.73 head=3.79 topk=1.18 refine=2.33 total=19.03ms
+info: [Signal] deliverToken id=3300 final=false took 0us
+info: [Signal] waitForToken got id=3300 waited 2ms
+DSPINE prof fwd=10.82 head=3.85 topk=1.18 refine=2.19 total=18.04ms
+info: [Signal] deliverToken id=12654 final=false took 0us
+info: [Signal] waitForToken got id=12654 waited 2ms
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+DSPINE prof fwd=11.81 head=3.79 topk=1.20 refine=2.00 total=18.80ms
+info: [Signal] deliverToken id=6970 final=false took 0us
+info: [Signal] waitForToken got id=6970 waited 2ms
+info: [Signal] deliverToken id=1608 final=false took 0us
+info: [Signal] deliverToken id=94076 final=false took 0us
+info: [Signal] waitForToken got id=1608 waited 0ms
+info: [Signal] waitForToken got id=94076 waited 0ms
+DSPINE prof fwd=11.11 head=3.80 topk=1.96 refine=0.99 total=17.85ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 2ms
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=3579 waited 0ms
+info: [Signal] waitForToken got id=7167 waited 0ms
+DSPINE prof fwd=11.12 head=3.85 topk=1.17 refine=0.98 total=17.11ms
+info: [Signal] deliverToken id=999 final=false took 0us
+info: [Signal] waitForToken got id=999 waited 2ms
+info: [Signal] deliverToken id=14 final=false took 0us
+info: [Signal] deliverToken id=2720 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=14 waited 0ms
+info: [Signal] waitForToken got id=2720 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+DSPINE prof fwd=12.27 head=3.94 topk=1.32 refine=0.99 total=18.51ms
+info: [Signal] deliverToken id=913 final=false took 0us
+info: [Signal] waitForToken got id=913 waited 2ms
+DSPINE prof fwd=12.97 head=4.01 topk=1.29 refine=1.09 total=19.36ms
+info: [Signal] deliverToken id=47095 final=false took 0us
+info: [Signal] waitForToken got id=47095 waited 2ms
+info: [Signal] deliverToken id=30 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=30 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE prof fwd=12.24 head=4.20 topk=1.26 refine=1.14 total=18.84ms
+info: [Signal] deliverToken id=5902 final=false took 0us
+info: [Signal] waitForToken got id=5902 waited 2ms
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=25 waited 0ms
+DSPINE prof fwd=11.71 head=4.02 topk=1.24 refine=1.22 total=18.18ms
+info: [Signal] deliverToken id=874 final=false took 0us
+info: [Signal] waitForToken got id=874 waited 2ms
+DSPINE prof fwd=12.25 head=3.91 topk=1.28 refine=1.15 total=18.58ms
+info: [Signal] deliverToken id=1970 final=false took 0us
+info: [Signal] waitForToken got id=1970 waited 2ms
+DSPINE prof fwd=11.09 head=3.91 topk=1.32 refine=1.12 total=17.45ms
+info: [Signal] deliverToken id=10993 final=false took 0us
+info: [Signal] waitForToken got id=10993 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] deliverToken id=958 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=958 waited 0ms
+DSPINE prof fwd=11.01 head=4.63 topk=1.25 refine=1.08 total=17.96ms
+info: [Signal] deliverToken id=5359 final=false took 0us
+info: [Signal] waitForToken got id=5359 waited 2ms
+info: [Signal] deliverToken id=6363 final=false took 0us
+info: [Signal] waitForToken got id=6363 waited 0ms
+DSPINE prof fwd=12.07 head=4.71 topk=1.35 refine=1.07 total=19.20ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 2ms
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] waitForToken got id=3579 waited 0ms
+DSPINE prof fwd=11.58 head=3.95 topk=1.19 refine=0.95 total=17.66ms
+info: [Signal] deliverToken id=18987 final=false took 0us
+info: [Signal] waitForToken got id=18987 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+DSPINE prof fwd=11.63 head=3.96 topk=1.25 refine=1.01 total=17.85ms
+info: [Signal] deliverToken id=460 final=false took 0us
+info: [Signal] waitForToken got id=460 waited 2ms
+DSPINE prof fwd=11.43 head=4.64 topk=1.28 refine=1.11 total=18.46ms
+info: [Signal] deliverToken id=6249 final=false took 0us
+info: [Signal] waitForToken got id=6249 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=6970 waited 0ms
+info: [Signal] deliverToken id=6970 final=false took 0us
+DSPINE prof fwd=11.09 head=3.81 topk=1.26 refine=1.14 total=17.31ms
+info: [Signal] deliverToken id=615 final=false took 0us
+info: [Signal] waitForToken got id=615 waited 2ms
+DSPINE prof fwd=11.72 head=3.80 topk=1.28 refine=1.15 total=17.95ms
+info: [Signal] deliverToken id=1328 final=false took 0us
+info: [Signal] waitForToken got id=1328 waited 2ms
+DSPINE prof fwd=11.97 head=3.80 topk=1.28 refine=1.14 total=18.19ms
+info: [Signal] deliverToken id=20359 final=false took 0us
+info: [Signal] waitForToken got id=20359 waited 2ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+info: [Engine] MTP depth N=1:1r/62.3ms/tok(E[t]=1.55) N=2:1r/51.5ms/tok(E[t]=1.87) N=3:1r/53.0ms/tok(E[t]=1.99) N=4:2r/55.9ms/tok(E[t]=2.05) N=5:3r/56.0ms/tok(E[t]=2.09) N=6:1r/58.6ms/tok(E[t]=2.12) N=7:12r/53.1ms/tok(E[t]=2.13)
+info: [Engine] MTP cond-acceptance p1=0.563(~5.0/8.9) p2=0.602(~2.7/4.5) p3=0.298(~0.7/2.2) p4=0.615(~0.4/0.7) p5=1.000(~0.4/0.4) p6=1.000(~0.4/0.4) p7=1.000(~0.4/0.4)
+info: [Engine] MTP request 1: acceptance 34.4% (42/122 drafts); ms/round draft=117.8 verify=269.5 accept=61.2 commit=0.4
+info: [Signal] deliverToken id=9522 final=true took 0us
+info: [Signal] waitForToken got id=9522 waited 0ms
+info: [RequestLog] id=1 model=m streaming=true prompt_tokens=69 generated_tokens=64 duration_ms=14569.49 tokens_per_sec=4.39
+info: [HTTP] Handler lifetime: 14573.0ms
+info: [HTTP] Connection lifetime: 14573.0ms
+info: [ACCEPT] Connection accepted (accept took 14655.7ms)
+info: [HTTP] Request received: 472 bytes (read=0.0ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 69/69 tokens reused
+info: [Engine] Request 2 dequeued, queue_wait=2862633.6ms
+info: [qwen38] prefix snapshot full hit (69 tokens), skipping prefill
+DSPINE prof fwd=13.04 head=3.77 topk=1.29 refine=0.96 total=19.05ms
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 2ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] deliverToken id=310 final=false took 0us
+info: [Signal] deliverToken id=5707 final=false took 0us
+info: [Signal] deliverToken id=310 final=false took 0us
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 0ms
+info: [Signal] waitForToken got id=310 waited 0ms
+info: [Signal] waitForToken got id=5707 waited 0ms
+info: [Signal] waitForToken got id=310 waited 0ms
+info: [Signal] waitForToken got id=1156 waited 0ms
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] waitForToken got id=328 waited 0ms
+DSPINE prof fwd=12.19 head=4.03 topk=1.21 refine=1.02 total=18.45ms
+info: [Signal] deliverToken id=7734 final=false took 0us
+info: [Signal] waitForToken got id=7734 waited 2ms
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] deliverToken id=12654 final=false took 0us
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] waitForToken got id=264 waited 0ms
+info: [Signal] waitForToken got id=12654 waited 0ms
+info: [Signal] waitForToken got id=709 waited 0ms
+info: [Signal] waitForToken got id=421 waited 0ms
+info: [Signal] deliverToken id=421 final=false took 0us
+info: [Signal] deliverToken id=15339 final=false took 0us
+info: [Signal] waitForToken got id=15339 waited 0ms
+info: [Signal] deliverToken id=449 final=false took 0us
+info: [Signal] deliverToken id=1897 final=false took 0us
+info: [Signal] waitForToken got id=449 waited 0ms
+info: [Signal] waitForToken got id=1897 waited 0ms
+DSPINE prof fwd=12.38 head=4.29 topk=1.24 refine=1.10 total=19.02ms
+info: [Signal] deliverToken id=40 final=false took 0us
+info: [Signal] waitForToken got id=40 waited 2ms
+info: [Signal] deliverToken id=2124 final=false took 0us
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] deliverToken id=20359 final=false took 0us
+info: [Signal] waitForToken got id=2124 waited 0ms
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 0ms
+info: [Signal] deliverToken id=10033 final=false took 0us
+info: [Signal] waitForToken got id=20359 waited 0ms
+info: [Signal] waitForToken got id=321 waited 0ms
+info: [Signal] waitForToken got id=10033 waited 0ms
+info: [Signal] deliverToken id=424 final=false took 0us
+info: [Signal] deliverToken id=25899 final=false took 0us
+info: [Signal] waitForToken got id=424 waited 0ms
+info: [Signal] waitForToken got id=25899 waited 0ms
+DSPINE prof fwd=11.61 head=3.82 topk=1.20 refine=1.10 total=17.73ms
+info: [Signal] deliverToken id=1149 final=false took 0us
+info: [Signal] waitForToken got id=1149 waited 2ms
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=14235 waited 0ms
+info: [Signal] deliverToken id=7936 final=false took 0us
+info: [Signal] waitForToken got id=7936 waited 0ms
+info: [Signal] deliverToken id=1534 final=false took 0us
+info: [Signal] waitForToken got id=1534 waited 0ms
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] waitForToken got id=4087 waited 0ms
+info: [Signal] deliverToken id=440 final=false took 0us
+info: [Signal] waitForToken got id=440 waited 0ms
+info: [Signal] deliverToken id=1970 final=false took 0us
+info: [Signal] waitForToken got id=1970 waited 0ms
+DSPINE prof fwd=12.37 head=4.90 topk=1.36 refine=1.41 total=20.04ms
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] waitForToken got id=321 waited 3ms
+DSPINE prof fwd=12.69 head=3.92 topk=1.27 refine=1.09 total=18.98ms
+info: [Signal] deliverToken id=9522 final=false took 0us
+info: [Signal] waitForToken got id=9522 waited 2ms
+info: [Signal] deliverToken id=15673 final=false took 0us
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=15673 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+info: [Signal] deliverToken id=4222 final=false took 0us
+info: [Signal] waitForToken got id=4222 waited 0ms
+info: [Signal] deliverToken id=2830 final=false took 0us
+info: [Signal] waitForToken got id=2830 waited 0ms
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+DSPINE prof fwd=13.29 head=3.85 topk=1.23 refine=1.10 total=19.47ms
+info: [Signal] deliverToken id=1608 final=false took 0us
+info: [Signal] waitForToken got id=1608 waited 2ms
+info: [Signal] deliverToken id=94076 final=false took 0us
+info: [Signal] waitForToken got id=94076 waited 0ms
+DSPINE prof fwd=12.50 head=4.29 topk=1.38 refine=1.29 total=19.46ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 2ms
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=3579 waited 0ms
+info: [Signal] waitForToken got id=7167 waited 0ms
+DSPINE prof fwd=12.09 head=3.86 topk=1.42 refine=1.30 total=18.68ms
+info: [Signal] deliverToken id=999 final=false took 0us
+info: [Signal] waitForToken got id=999 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+DSPINE prof fwd=11.79 head=4.27 topk=1.42 refine=1.34 total=18.82ms
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=7167 waited 2ms
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] deliverToken id=6970 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=6970 waited 0ms
+DSPINE prof fwd=12.35 head=4.23 topk=1.66 refine=1.36 total=19.60ms
+info: [Signal] deliverToken id=7077 final=false took 0us
+info: [Signal] waitForToken got id=7077 waited 3ms
+info: [Signal] deliverToken id=30 final=false took 0us
+info: [Signal] waitForToken got id=30 waited 0ms
+DSPINE prof fwd=12.06 head=4.33 topk=1.48 refine=1.50 total=19.36ms
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] waitForToken got id=328 waited 3ms
+info: [Signal] deliverToken id=218940 final=false took 0us
+info: [Signal] deliverToken id=943 final=false took 0us
+info: [Signal] waitForToken got id=218940 waited 0ms
+info: [Signal] deliverToken id=1 final=false took 0us
+info: [Signal] waitForToken got id=943 waited 0ms
+info: [Signal] waitForToken got id=1 waited 0ms
+DSPINE prof fwd=12.09 head=4.29 topk=1.67 refine=1.37 total=19.41ms
+info: [Signal] deliverToken id=3254 final=false took 0us
+info: [Signal] waitForToken got id=3254 waited 3ms
+DSPINE prof fwd=12.30 head=4.59 topk=1.38 refine=1.49 total=19.76ms
+info: [Signal] deliverToken id=21094 final=false took 0us
+info: [Signal] waitForToken got id=21094 waited 3ms
+DSPINE prof fwd=12.43 head=4.48 topk=1.42 refine=1.49 total=19.82ms
+info: [Signal] deliverToken id=1412 final=false took 0us
+info: [Signal] waitForToken got id=1412 waited 2ms
+info: [Signal] deliverToken id=11256 final=false took 0us
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=11256 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+DSPINE prof fwd=11.57 head=3.98 topk=1.24 refine=1.28 total=18.07ms
+info: [Signal] deliverToken id=16018 final=false took 0us
+info: [Signal] waitForToken got id=16018 waited 2ms
+info: [Signal] deliverToken id=3165 final=false took 0us
+info: [Signal] waitForToken got id=3165 waited 0ms
+info: [Engine] MTP depth N=5:1r/43.8ms/tok(E[t]=2.68) N=6:1r/45.3ms/tok(E[t]=2.75) N=7:13r/43.7ms/tok(E[t]=2.79)
+info: [Engine] MTP cond-acceptance p1=0.741(~5.9/7.9) p2=0.725(~4.3/5.9) p3=0.653(~2.8/4.3) p4=0.526(~1.5/2.8) p5=1.000(~1.5/1.5) p6=1.000(~1.5/1.5) p7=0.522(~0.8/1.5)
+info: [Engine] MTP request 2: acceptance 46.2% (48/104 drafts); ms/round draft=21.5 verify=72.9 accept=24.0 commit=0.6
+info: [Signal] deliverToken id=709 final=true took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+info: [RequestLog] id=2 model=m streaming=true prompt_tokens=69 generated_tokens=64 duration_ms=1907.06 tokens_per_sec=33.56
+info: [HTTP] Handler lifetime: 1908.7ms
+info: [HTTP] Connection lifetime: 1908.8ms
+info: [ACCEPT] Connection accepted (accept took 1965.6ms)
+info: [HTTP] Request received: 472 bytes (read=0.0ms)
+[HTTP] Request received
+info: [openai] token prefix cache hit: 69/69 tokens reused
+info: [Engine] Request 3 dequeued, queue_wait=2862680.7ms
+info: [qwen38] prefix snapshot full hit (69 tokens), skipping prefill
+DSPINE prof fwd=14.39 head=4.34 topk=1.25 refine=0.97 total=20.95ms
+info: [Signal] deliverToken id=1596 final=false took 0us
+info: [Signal] waitForToken got id=1596 waited 2ms
+info: [Signal] deliverToken id=1144 final=false took 0us
+info: [Signal] deliverToken id=4087 final=false took 0us
+info: [Signal] deliverToken id=1156 final=false took 0us
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] deliverToken id=7734 final=false took 0us
+info: [Signal] deliverToken id=264 final=false took 0us
+info: [Signal] waitForToken got id=1144 waited 0ms
+info: [Signal] waitForToken got id=4087 waited 0ms
+info: [Signal] waitForToken got id=1156 waited 0ms
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] waitForToken got id=328 waited 0ms
+info: [Signal] waitForToken got id=7734 waited 0ms
+info: [Signal] waitForToken got id=264 waited 0ms
+DSPINE prof fwd=11.99 head=3.83 topk=1.24 refine=0.95 total=18.01ms
+info: [Signal] deliverToken id=12654 final=false took 0us
+info: [Signal] waitForToken got id=12654 waited 2ms
+info: [Signal] deliverToken id=709 final=false took 0us
+info: [Signal] deliverToken id=421 final=false took 0us
+info: [Signal] deliverToken id=15339 final=false took 0us
+info: [Signal] deliverToken id=449 final=false took 0us
+info: [Signal] waitForToken got id=709 waited 0ms
+info: [Signal] waitForToken got id=421 waited 0ms
+info: [Signal] deliverToken id=1897 final=false took 0us
+info: [Signal] waitForToken got id=15339 waited 0ms
+info: [Signal] waitForToken got id=449 waited 0ms
+info: [Signal] deliverToken id=40 final=false took 0us
+info: [Signal] waitForToken got id=1897 waited 0ms
+info: [Signal] waitForToken got id=40 waited 0ms
+info: [Signal] deliverToken id=2124 final=false took 0us
+info: [Signal] waitForToken got id=2124 waited 0ms
+DSPINE prof fwd=11.19 head=3.99 topk=1.21 refine=0.98 total=17.37ms
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 2ms
+info: [Signal] deliverToken id=20359 final=false took 0us
+info: [Signal] waitForToken got id=20359 waited 0ms
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] deliverToken id=10033 final=false took 0us
+info: [Signal] deliverToken id=424 final=false took 0us
+info: [Signal] waitForToken got id=321 waited 0ms
+info: [Signal] deliverToken id=25899 final=false took 0us
+info: [Signal] waitForToken got id=10033 waited 0ms
+info: [Signal] deliverToken id=1149 final=false took 0us
+info: [Signal] waitForToken got id=424 waited 0ms
+info: [Signal] waitForToken got id=25899 waited 0ms
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=1149 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE prof fwd=11.35 head=3.93 topk=1.24 refine=1.02 total=17.54ms
+info: [Signal] deliverToken id=4222 final=false took 0us
+info: [Signal] waitForToken got id=4222 waited 2ms
+info: [Signal] deliverToken id=3300 final=false took 0us
+info: [Signal] deliverToken id=1970 final=false took 0us
+info: [Signal] waitForToken got id=3300 waited 0ms
+info: [Signal] waitForToken got id=1970 waited 0ms
+DSPINE prof fwd=11.01 head=3.90 topk=1.20 refine=0.97 total=17.07ms
+info: [Signal] deliverToken id=321 final=false took 0us
+info: [Signal] waitForToken got id=321 waited 2ms
+info: [Signal] deliverToken id=15673 final=false took 0us
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] waitForToken got id=15673 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+DSPINE prof fwd=13.18 head=3.87 topk=1.23 refine=1.01 total=19.29ms
+info: [Signal] deliverToken id=1381 final=false took 0us
+info: [Signal] waitForToken got id=1381 waited 2ms
+info: [Signal] deliverToken id=1534 final=false took 0us
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] deliverToken id=14235 final=false took 0us
+info: [Signal] deliverToken id=1683 final=false took 0us
+info: [Signal] waitForToken got id=1534 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Signal] waitForToken got id=14235 waited 0ms
+info: [Signal] waitForToken got id=1683 waited 0ms
+DSPINE prof fwd=13.26 head=3.93 topk=1.32 refine=1.24 total=19.75ms
+info: [Signal] deliverToken id=1092 final=false took 0us
+info: [Signal] waitForToken got id=1092 waited 2ms
+info: [Signal] deliverToken id=328 final=false took 0us
+info: [Signal] waitForToken got id=328 waited 0ms
+DSPINE prof fwd=11.99 head=3.88 topk=2.41 refine=1.69 total=19.97ms
+info: [Signal] deliverToken id=218940 final=false took 0us
+info: [Signal] waitForToken got id=218940 waited 2ms
+info: [Signal] deliverToken id=943 final=false took 0us
+info: [Signal] deliverToken id=1 final=false took 0us
+info: [Signal] waitForToken got id=943 waited 0ms
+info: [Signal] deliverToken id=3254 final=false took 0us
+info: [Signal] waitForToken got id=1 waited 0ms
+info: [Signal] deliverToken id=25 final=false took 0us
+info: [Signal] waitForToken got id=3254 waited 0ms
+info: [Signal] waitForToken got id=25 waited 0ms
+info: [Signal] deliverToken id=958 final=false took 0us
+info: [Signal] waitForToken got id=958 waited 0ms
+info: [Signal] deliverToken id=94076 final=false took 0us
+info: [Signal] waitForToken got id=94076 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] deliverToken id=11 final=false took 0us
+DSPINE prof fwd=13.08 head=3.92 topk=1.32 refine=1.26 total=19.58ms
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] waitForToken got id=3579 waited 2ms
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=7167 waited 0ms
+DSPINE prof fwd=12.23 head=3.91 topk=1.43 refine=1.30 total=18.87ms
+info: [Signal] deliverToken id=999 final=false took 0us
+info: [Signal] waitForToken got id=999 waited 2ms
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=11 waited 0ms
+DSPINE prof fwd=11.65 head=3.89 topk=1.25 refine=1.15 total=17.93ms
+info: [Signal] deliverToken id=7167 final=false took 0us
+info: [Signal] waitForToken got id=7167 waited 2ms
+info: [Signal] deliverToken id=3644 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] waitForToken got id=3644 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] deliverToken id=6970 final=false took 0us
+info: [Signal] waitForToken got id=6970 waited 0ms
+DSPINE prof fwd=12.38 head=3.87 topk=1.28 refine=1.47 total=19.01ms
+info: [Signal] deliverToken id=9307 final=false took 0us
+info: [Signal] waitForToken got id=9307 waited 2ms
+info: [Signal] deliverToken id=6679 final=false took 0us
+info: [Signal] deliverToken id=11 final=false took 0us
+info: [Signal] deliverToken id=460 final=false took 0us
+info: [Signal] waitForToken got id=6679 waited 0ms
+info: [Signal] waitForToken got id=11 waited 0ms
+info: [Signal] waitForToken got id=460 waited 0ms
+DSPINE prof fwd=12.79 head=3.80 topk=1.27 refine=1.16 total=19.02ms
+info: [Signal] deliverToken id=6249 final=false took 0us
+info: [Signal] waitForToken got id=6249 waited 2ms
+info: [Signal] deliverToken id=466 final=false took 0us
+info: [Signal] deliverToken id=3579 final=false took 0us
+info: [Signal] deliverToken id=18987 final=false took 0us
+info: [Signal] waitForToken got id=466 waited 0ms
+info: [Signal] deliverToken id=13 final=false took 0us
+info: [Signal] waitForToken got id=3579 waited 0ms
+info: [Signal] waitForToken got id=18987 waited 0ms
+info: [Signal] waitForToken got id=13 waited 0ms
+info: [Engine] MTP depth N=7:12r/33.4ms/tok(E[t]=3.51)
+info: [Engine] MTP cond-acceptance p1=1.000(~7.2/7.2) p2=0.703(~5.0/7.2) p3=0.915(~4.6/5.0) p4=0.485(~2.2/4.6) p5=0.762(~1.7/2.2) p6=1.000(~1.7/1.7) p7=1.000(~1.7/1.7)
+info: [Engine] MTP request 3: acceptance 57.3% (51/89 drafts); ms/round draft=21.2 verify=69.9 accept=22.3 commit=0.5
+info: [Signal] deliverToken id=16018 final=true took 0us
+info: [Signal] waitForToken got id=16018 waited 0ms
+info: [RequestLog] id=3 model=m streaming=true prompt_tokens=69 generated_tokens=64 duration_ms=1485.95 tokens_per_sec=43.07
+info: [HTTP] Handler lifetime: 1487.5ms
+info: [HTTP] Connection lifetime: 1487.7ms
+info: [Engine] Shutdown requested
+info: [Engine] Engine loop exiting
+info: Engine stopped, initiating graceful shutdown...
+info: All in-flight requests completed.
+info: Shutting down, cleaning up resources...
+info: [Engine] Shutdown requested
+info: Shutdown complete.

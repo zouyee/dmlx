@@ -2583,3 +2583,54 @@ under linear verify-byte costs. Conclusion: drafter top-1 quality is the
 binding constraint (p1 0.83 → 0.46 by d5); the top1→top8 gap is the
 ceiling a DNeo-class drafter (better top-1, no trees — see the DNeo note
 above) could approach. Raw: `artifacts/copy_bands_20261125/server_topk.log`.
+
+
+## DSpine block=8 (2026-11-25) — experimental opt-in, sampled-oriented
+
+`DMLX_QWEN38_DSPINE_DIR` selects the Tencent DSpine drafter ahead of DF2.
+Phase 1 serves block=8 (anchor + seven drafts, M=8 verify), keeps bridge/codebook
+BF16, quantizes the five-layer draft backbone to 4-bit gs=64, and uses target
+taps 1/16/31/46/61. Text only; no DSpine tree/predraft, block>8, or on-disk
+prompt-context persistence. See `src/models/qwen38_dspine.zig` and the DSpine
+branches in `src/model_registry.zig`.
+
+Numerical validation used one exported dmlx target tap in both implementations:
+official dspine_mlx and Zig matched all seven greedy proposals and all 112
+candidate IDs exactly. Official-vs-dmlx target hidden/output differences were
+confirmed separately with a target-only control and were not charged to the
+drafter.
+
+Same-binary sampled AB/BA (n=4/cell/arm, all 256/finish=length) versus
+DF2+copies+bands after optimization: think-off short/2k/8k +10.4%/+5.5%/+9.2%;
+think-on +12.4%/−6.6%/+12.6%. DSpine E[t]=2.90, draft=17.2–18.0 ms. Greedy
+one-repetition controls were −4.9%/−6.6%/−6.4% and −3.4%/+11.6%/−9.4%.
+Verdict: experimental opt-in only; do not default-enable or replace DF2.
+Thinking-on/2k needs more samples before any promotion proposal.
+
+Sampler fix required by sparse K=16 DSpine proposals: `topKTopPSampler` now
+skips -inf and uses the actual retained count. This removed an O(vocab×50)
+insertion path, reducing sampled draft from ~35 ms to ~17–22 ms in the measured
+paths. Sparse and all-`-inf` cases have regression tests.
+
+MLX short-control memory: active 23.52→23.91 GB (+0.39), peak 26.12→26.25 GB
+(+0.13). Full raw evidence, numerical comparison, AB/BA, greedy, memory, and
+optimization records: `artifacts/dspine_phase1_20261125/REPORT.md` (worktree
+`mtp-copy-bands`; uncommitted at the time of writing).
+
+
+### DSpine block-size override and block=5 experiment
+
+`DMLX_DSPINE_BLOCK` accepts 2..8 (default 8), with `num_drafts=block-1` and all
+active forward/refinement lengths derived from it. This was added to test the
+official MLX guide's block=5 recommendation without changing the default.
+
+Same-binary block=5 vs block=8 results: block=8 won all six sampled cells by
++4.9% to +32.8% and all six greedy cells by +4.5% to +12.1%. Sampled E[t] was
+2.72–2.73 (block=5) versus 2.83–3.07 (block=8); smaller verify shapes did not
+lower round latency enough to compensate. Greedy MLX active/peak trajectories
+were identical within 0.01 GB (both 28.47 GB peak). Keep the default at 8 and
+do not add a dynamic controller on this evidence.
+
+Block=5 same-tap validation matched all four proposals and 78/80 candidates;
+two top-16 boundary candidates differed at BF16/kernel-rounding scale. Full
+evidence: `artifacts/dspine_phase1_20261125/block5/REPORT.md`.
